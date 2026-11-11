@@ -81,6 +81,10 @@ pub(crate) const DAEMON_UNAVAILABLE_CODE: ErrorCode = ErrorCode(-32001);
 /// The longest message accepted before `initialize` has succeeded. Requests
 /// before initialization are small; this only bounds a hostile stream.
 const MAX_PRE_INIT_MESSAGE: usize = 1024 * 1024;
+/// One output frame's writes and flush (or shutdown) share this budget. A
+/// client withholding stdout progress loses the bridge, including at EOF.
+/// Healthy EOF still drains responses through the SDK's normal drain path.
+const OUTPUT_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Opens one authenticated daemon session: `Client::connect` in production,
 /// an in-process harness daemon in the tests.
@@ -448,7 +452,7 @@ impl ServerHandler for McpServer {
         request: SubscribeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<(), ErrorData> {
-        let target = resources::parse(&request.uri)?;
+        let target = subscriptions::parse(&request.uri)?;
         let not_executed =
             |reason: NotExecuted| ErrorData::new(NOT_EXECUTED_CODE, reason.to_string(), None);
         self.refuse_new_work(&context.ct).map_err(not_executed)?;
@@ -478,9 +482,27 @@ struct OutputWatch<W> {
     failure: Arc<OnceLock<String>>,
     lost: CancellationToken,
     stop: CancellationToken,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 impl<W> OutputWatch<W> {
+    fn bound(&mut self, cx: &mut Context<'_>) -> std::io::Result<()> {
+        let deadline = self
+            .deadline
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(OUTPUT_DEADLINE)));
+        if deadline.as_mut().poll(cx).is_ready() {
+            let err = std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "MCP stdout write exceeded 5 seconds",
+            );
+            let _ = self.failure.set(err.to_string());
+            self.lost.cancel();
+            self.stop.cancel();
+            return Err(err);
+        }
+        Ok(())
+    }
+
     fn watch<T>(&self, poll: Poll<std::io::Result<T>>) -> Poll<std::io::Result<T>> {
         if let Poll::Ready(Err(err)) = &poll {
             let _ = self.failure.set(err.to_string());
@@ -497,16 +519,28 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for OutputWatch<W> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
+        if let Err(err) = self.bound(cx) {
+            return Poll::Ready(Err(err));
+        }
         let poll = Pin::new(&mut self.inner).poll_write(cx, buf);
         self.watch(poll)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if let Err(err) = self.bound(cx) {
+            return Poll::Ready(Err(err));
+        }
         let poll = Pin::new(&mut self.inner).poll_flush(cx);
+        if matches!(poll, Poll::Ready(Ok(()))) {
+            self.deadline = None;
+        }
         self.watch(poll)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if let Err(err) = self.bound(cx) {
+            return Poll::Ready(Err(err));
+        }
         let poll = Pin::new(&mut self.inner).poll_shutdown(cx);
         self.watch(poll)
     }
@@ -645,7 +679,14 @@ where
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let mut reader = BufReader::new(input);
-    let mut output = output;
+    let failure = Arc::new(OnceLock::new());
+    let mut output = OutputWatch {
+        inner: output,
+        failure: Arc::clone(&failure),
+        lost: server.output_lost.clone(),
+        stop: stop.clone(),
+        deadline: None,
+    };
     let Some(first) = until_daemon(&server, &mut reader, &mut output, &stop).await? else {
         return Ok(());
     };
@@ -655,7 +696,8 @@ where
         inner: tokio::io::AsyncReadExt::chain(std::io::Cursor::new(first), reader),
         closed: server.input_closed.clone(),
     };
-    match server.serve_with_ct((input, output), stop.clone()).await {
+    let shutdown = server.subscriptions.shutdown();
+    let outcome = match server.serve_with_ct((input, output), stop.clone()).await {
         Ok(running) => running
             .waiting()
             .await
@@ -664,7 +706,15 @@ where
         Err(_) if stop.is_cancelled() => Ok(()),
         Err(ServerInitializeError::ConnectionClosed(_)) => Ok(()),
         Err(err) => Err(Error::other(format!("MCP initialization failed: {err}"))),
+    };
+    shutdown.await;
+    if let Some(err) = failure.get() {
+        return Err(Error::other(format!(
+            "cannot write to stdout: {err}; the MCP client can no longer receive responses. \
+             Calls already started may have completed: inspect state before retrying"
+        )));
     }
+    outcome
 }
 
 /// Serve `server` over this process's stdin/stdout until EOF, a signal or
@@ -678,24 +728,10 @@ where
 /// runtime shutdown, because Tokio's stdin read cannot be cancelled.
 pub(crate) async fn serve_stdio(server: McpServer, stop: CancellationToken) -> Result<()> {
     let signals = spawn_signal_task(stop.clone())?;
-    let failure = Arc::new(OnceLock::new());
-    let output = OutputWatch {
-        inner: tokio::io::stdout(),
-        failure: Arc::clone(&failure),
-        lost: server.output_lost.clone(),
-        stop: stop.clone(),
-    };
-    let outcome = serve_transport(server, tokio::io::stdin(), output, stop).await;
+    let outcome = serve_transport(server, tokio::io::stdin(), tokio::io::stdout(), stop).await;
     signals.abort();
     let _ = signals.await;
-    // Checked first: lost output also cancels `stop`, which alone reads as a
-    // clean signal exit.
-    if let Some(err) = failure.get() {
-        return Err(Error::other(format!(
-            "cannot write to stdout: {err}; the MCP client can no longer receive responses. \
-             Calls already started may have completed: inspect state before retrying"
-        )));
-    }
+
     outcome
 }
 
@@ -733,6 +769,105 @@ mod tests {
     use crate::mcp::testing::{Fixture, no_daemon};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::sync::{Notify, mpsc};
+
+    /// Pending/error phases exercise the real transport wrapper independently
+    /// of rmcp: write cancellation alone must not leave flush or shutdown stuck.
+    struct OutputPhase {
+        phase: u8,
+        error: bool,
+    }
+
+    impl OutputPhase {
+        fn poll<T>(&self, phase: u8, value: T) -> Poll<std::io::Result<T>> {
+            if self.phase != phase {
+                return Poll::Ready(Ok(value));
+            }
+            if self.error {
+                Poll::Ready(Err(std::io::Error::other("fixture output failure")))
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl AsyncWrite for OutputPhase {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.poll(0, bytes.len())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.poll(1, ())
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.poll(2, ())
+        }
+    }
+
+    #[tokio::test]
+    async fn output_write_flush_and_shutdown_are_bounded_and_errors_stop_admission() {
+        for phase in 0..3 {
+            for error in [false, true] {
+                let stop = CancellationToken::new();
+                let lost = CancellationToken::new();
+                let failure = Arc::new(OnceLock::new());
+                let mut output = OutputWatch {
+                    inner: OutputPhase { phase, error },
+                    failure: failure.clone(),
+                    lost: lost.clone(),
+                    stop: stop.clone(),
+                    deadline: (!error)
+                        .then(|| Box::pin(tokio::time::sleep(Duration::from_millis(10)))),
+                };
+                let operation = async {
+                    match phase {
+                        0 => output.write_all(b"frame").await,
+                        1 => {
+                            output.write_all(b"frame").await?;
+                            output.flush().await
+                        }
+                        _ => output.shutdown().await,
+                    }
+                };
+                tokio::pin!(operation);
+                if !error {
+                    assert!(futures::poll!(&mut operation).is_pending());
+                }
+                let result = tokio::time::timeout(Duration::from_secs(1), &mut operation)
+                    .await
+                    .expect("pending output exceeded its transport bound");
+                assert!(result.is_err());
+                assert!(failure.get().is_some());
+                assert!(lost.is_cancelled());
+                assert!(stop.is_cancelled());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stop_preserves_healthy_output_drain() {
+        let stop = CancellationToken::new();
+        let failure = Arc::new(OnceLock::new());
+        let mut output = OutputWatch {
+            inner: OutputPhase {
+                phase: 99,
+                error: false,
+            },
+            failure: failure.clone(),
+            lost: CancellationToken::new(),
+            stop: stop.clone(),
+            deadline: None,
+        };
+        stop.cancel();
+        output
+            .write_all(b"completed response")
+            .await
+            .expect("healthy response drains after stop");
+        output.flush().await.unwrap();
+        assert!(failure.get().is_none());
+    }
 
     /// A timer that only fires when the test says so.
     #[derive(Clone, Default)]
