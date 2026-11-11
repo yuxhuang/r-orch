@@ -473,9 +473,9 @@ pub async fn build_full_with_children(
 }
 
 /// Assemble synthetic admission only with a ProcessManager that never forks.
-/// The fail-closed check covers crate-internal real builders only; external
-/// direct Command builders must never opt in. Launch, workspace preparation and
-/// OpenCode effort probes share this domain; other real builders remain global.
+/// Crate-internal real builders fail closed; external direct Command builders must never opt in.
+/// Launch, GitWorkspaceManager git/rsync (preparation, cleanup, changed-files listing)
+/// and OpenCode effort-wire probes share this domain; other real builders, including merge, stay global.
 pub async fn build_full_with_children_and_spawn_domain(
     project_root: impl Into<PathBuf>,
     seams: EngineSeams,

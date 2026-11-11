@@ -99,11 +99,11 @@ impl HarnessBuilder {
         self
     }
 
-    /// Isolate launch, workspace preparation and OpenCode effort probes within
-    /// this harness. Requires `.processes(...)` with a manager that never forks.
-    /// The fail-closed check covers crate-internal real builders only; external
-    /// direct Command builders must never opt in. Doctor, merge, discovery and
-    /// hostname retain process-wide admission. Linux admission is unchanged.
+    /// Isolate launch, GitWorkspaceManager git/rsync (preparation, cleanup,
+    /// changed-files listing) and OpenCode effort-wire probes within this harness.
+    /// Requires a non-forking `.processes(...)` manager. Crate-internal real builders
+    /// fail closed; external direct Command builders must never opt in. Doctor,
+    /// merge, discovery and hostname stay process-wide. Linux admission is unchanged.
     pub fn isolated_fake_spawns(mut self) -> Self {
         self.isolated_fake_spawns = true;
         self

@@ -43,9 +43,9 @@ impl GitWorkspaceManager {
         }
     }
 
-    /// Scope preparation admission only for a ProcessManager that never forks.
-    /// The fail-closed check covers crate-internal real builders only; external
-    /// direct Command builders must never opt in. Merge remains process-wide.
+    /// Scope git/rsync admission for preparation, cleanup and changed-files listing only
+    /// for a ProcessManager that never forks. Crate-internal real builders fail closed;
+    /// external direct Command builders must never opt in. Merge remains process-wide.
     pub fn with_spawn_domain(mut self, domain: SpawnDomain) -> Self {
         self.spawn_domain = domain;
         self
