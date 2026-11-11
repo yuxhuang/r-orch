@@ -93,6 +93,7 @@ impl EventOutput {
         self.ready.notify_one();
     }
 
+    /// Called by the session writer after the acknowledgement is flushed.
     pub(crate) fn activate(&self, id: u64) {
         if let Some(subscription) = lock(&self.state).subscriptions.get_mut(&id) {
             subscription.active = true;
@@ -1267,7 +1268,7 @@ mod tests {
         assert!(committed > baseline);
         assert!(
             output.pop().is_none(),
-            "commit is buffered while terminal ack is not yet queued"
+            "commit is buffered while terminal ack is not yet flushed"
         );
         output.activate(1);
         let event = next(&output);
