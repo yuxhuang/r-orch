@@ -209,9 +209,13 @@ pub async fn probe_version(
     process_manager: &dyn ProcessManager,
     command: &str,
 ) -> std::result::Result<String, String> {
-    let mut child = process_manager
-        .spawn(command, &["--version".to_owned()], SpawnOptions::default())
-        .map_err(|err| spawn_failure_message(command, &err))?;
+    let reservation =
+        crate::process::gate::reserve_spawn(crate::process::gate::SpawnSite::Version).await;
+    let mut child = reservation.run(|| {
+        process_manager
+            .spawn(command, &["--version".to_owned()], SpawnOptions::default())
+            .map_err(|err| spawn_failure_message(command, &err))
+    })?;
     // An abandoned probe (doctor deadline, cancelled request) takes its group
     // with it.
     let mut guard = crate::process::GroupKillGuard::new(process_manager, child.pid);

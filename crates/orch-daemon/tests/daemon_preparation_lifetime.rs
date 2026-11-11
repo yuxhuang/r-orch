@@ -116,6 +116,18 @@ enum Stop {
     CancelShutdown,
 }
 
+// These tests measure ownership release while other scenarios deliberately
+// hold spawn admission. Persist the peer name so successor startup does not
+// queue unrelated hostname discovery behind those blocked fake preparations.
+async fn configure_lifetime_peer(harness: &DaemonHarness) {
+    harness
+        .engine()
+        .config_store
+        .set("peer.name", serde_json::json!("lifetime-test"))
+        .await
+        .unwrap();
+}
+
 async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop, owned: bool) {
     let project = tempfile::tempdir().unwrap();
     let root = project.path().canonicalize().unwrap();
@@ -133,6 +145,7 @@ async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop, owned: bo
     } else {
         builder.start_in(&root).await.unwrap()
     };
+    configure_lifetime_peer(&old).await;
     let root = old.project_root().to_path_buf();
     let mut owner = Raw::session(&old, "cli", "normal").await;
     let created = owner
@@ -319,4 +332,31 @@ async fn cancelled_shutdown_retains_owner_until_preparation_ends() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_owned_project_retains_guard_inode_until_preparation_ends() {
     delayed_preparation(false, true, Stop::Drop, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn successor_start_does_not_queue_hostname_behind_unrelated_preparation() {
+    let old = DaemonHarness::builder()
+        .maintenance_timer(false)
+        .start()
+        .await
+        .unwrap();
+    configure_lifetime_peer(&old).await;
+    let project = old.quiesce().await.unwrap();
+    // The same admission held by another test's synchronous Version probe.
+    // Keep it held through startup: this is a dependency check, not a race.
+    let held =
+        orch_infra::process::gate::reserve_spawn(orch_infra::process::gate::SpawnSite::Version)
+            .await;
+    let successor = tokio::time::timeout(
+        Duration::from_secs(20),
+        DaemonHarness::builder()
+            .maintenance_timer(false)
+            .start_in(project.project_root()),
+    )
+    .await
+    .expect("successor start must not wait for unrelated hostname admission")
+    .unwrap();
+    drop(held);
+    successor.shutdown().await.unwrap();
 }

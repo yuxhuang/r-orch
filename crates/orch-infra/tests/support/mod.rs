@@ -1,8 +1,7 @@
 //! The one shared harness for every adapter test.
 //!
-//! `orch_core::process::SpawnedChild` carries real `tokio::process::Child*`
-//! handles, which cannot be fabricated, so the harness is a **real**
-//! child running a generated `sh` script: scripted stdout, scripted stderr, a
+//! This harness uses real async pipes and a **real** child running a
+//! generated `sh` script: scripted stdout, scripted stderr, a
 //! scripted exit, and an optional stdin capture. That costs a few
 //! milliseconds per case and in exchange every test exercises the real pipe,
 //! decode and reaping path.
@@ -14,7 +13,9 @@
 #![allow(dead_code, reason = "each integration test binary uses a subset")]
 
 use std::collections::{BTreeMap, HashSet};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,7 +24,8 @@ use futures::StreamExt;
 use orch_core::adapter::{AdapterError, AgentEvent, AgentEventKind, ExecuteHandle, ExecuteParams};
 use orch_core::clock::Clock;
 use orch_core::process::{
-    ExitOutcome, ProcessManager, Signal, SpawnOptions, SpawnedChild, StdioMode,
+    EnvInheritance, ExitOutcome, ExitSignal, ProcessManager, REMOTE_ENV_PASSTHROUGH, Signal,
+    SpawnOptions, SpawnedChild, StdioMode, secret_env_names,
 };
 use orch_core::test_support::FixedClock;
 use orch_domain::AgentConfig;
@@ -167,13 +169,77 @@ pub struct ScriptedProcessManager {
     dir: tempfile::TempDir,
     /// Commands whose `spawn` fails with `ENOENT`, for the `test()` probes.
     missing: Mutex<HashSet<String>>,
-    /// Pids this manager actually started. A kill is only forwarded to the OS
-    /// for one of these: a test pid like 5555 is a real pid on a real machine,
-    /// and signalling it (or its process group) would hit something unrelated.
-    own_pids: Mutex<HashSet<u32>>,
+    /// Each group has an unreaped anchor, so numeric group identities cannot
+    /// be recycled before cleanup, even after the scripted child exits.
+    children: Mutex<BTreeMap<u32, OwnedScript>>,
     spawns: Mutex<Vec<SpawnRecord>>,
     kills: Mutex<Vec<(u32, Signal)>>,
     graceful_kills: Mutex<Vec<(u32, Duration)>>,
+}
+
+/// No reaper ever receives the anchor. Its unreaped PID reserves the PGID until
+/// after the last signal. The joined observer owns only the script's wait, not
+/// cleanup; no runtime, detached task, process-table search or PID fallback is
+/// needed. This is fixture lifetime cleanup, not crash/SIGKILL recovery.
+///
+/// ARCHITECTURE §4.8 compatibility exemption: the fixture must retain group
+/// identity *past* the script's reaping. A normal process wrapper owns/reaps the
+/// script itself; std Child plus process_group supplies the separate anchor
+/// without a dependency or changes to the production process port.
+struct OwnedScript {
+    anchor: Child,
+    child: Arc<Mutex<Option<Child>>>,
+    observer: Option<std::thread::JoinHandle<()>>,
+    exit: ExitSignal,
+}
+
+impl OwnedScript {
+    fn signal(&self, signal: Signal) {
+        use nix::sys::signal::{Signal as S, killpg};
+        use nix::unistd::Pid;
+        let signal = match signal {
+            Signal::Term => S::SIGTERM,
+            Signal::Kill => S::SIGKILL,
+            Signal::Int => S::SIGINT,
+            Signal::Hup => S::SIGHUP,
+        };
+        // process_group(0) established this group at spawn. The unreaped
+        // anchor prevents PGID reuse, even if an explicit kill already ran.
+        let pgid = i32::try_from(self.anchor.id()).expect("positive OS pid");
+        debug_assert!(pgid > 0 && Pid::from_raw(pgid) != nix::unistd::getpgrp());
+        let _ = killpg(Pid::from_raw(pgid), signal);
+    }
+}
+
+impl Drop for OwnedScript {
+    fn drop(&mut self) {
+        // Cleanup must not depend on progress of a diagnostic reader.
+        self.signal(Signal::Kill);
+        // Reap the anchor only AFTER signalling; never signal this PGID again.
+        let _ = self.anchor.wait();
+        if let Some(observer) = self.observer.take() {
+            let _ = observer.join();
+        }
+        // Also handles failure before the exit-observer thread was installed.
+        if let Some(mut child) = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for ScriptedProcessManager {
+    fn drop(&mut self) {
+        // Finish owned work before removing the scripts/capture directory.
+        self.children
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 
 impl ScriptedProcessManager {
@@ -183,7 +249,7 @@ impl ScriptedProcessManager {
             script,
             dir: tempfile::tempdir().expect("tempdir"),
             missing: Mutex::new(HashSet::new()),
-            own_pids: Mutex::new(HashSet::new()),
+            children: Mutex::new(BTreeMap::new()),
             spawns: Mutex::new(Vec::new()),
             kills: Mutex::new(Vec::new()),
             graceful_kills: Mutex::new(Vec::new()),
@@ -241,10 +307,6 @@ impl ScriptedProcessManager {
         None
     }
 
-    fn is_own(&self, pid: u32) -> bool {
-        self.own_pids.lock().expect("own pids").contains(&pid)
-    }
-
     fn build_script(&self) -> String {
         let dir = self.dir.path();
         let mut script = String::new();
@@ -296,13 +358,17 @@ impl ScriptedProcessManager {
 #[async_trait]
 impl ProcessManager for ScriptedProcessManager {
     fn is_alive(&self, pid: u32) -> bool {
-        self.inner.is_alive(pid)
+        let children = self.children.lock().expect("children");
+        children.get(&pid).map_or_else(
+            || self.inner.is_alive(pid),
+            |child| child.exit.try_get().is_none(),
+        )
     }
 
     fn kill(&self, pid: u32, signal: Signal) {
         self.kills.lock().expect("kills").push((pid, signal));
-        if self.is_own(pid) {
-            self.inner.kill(pid, signal);
+        if let Some(child) = self.children.lock().expect("children").get(&pid) {
+            child.signal(signal);
         }
     }
 
@@ -311,8 +377,18 @@ impl ProcessManager for ScriptedProcessManager {
             .lock()
             .expect("graceful kills")
             .push((pid, grace));
-        if self.is_own(pid) {
-            self.inner.kill_with_grace(pid, grace).await;
+        let exit = {
+            let children = self.children.lock().expect("children");
+            children.get(&pid).map(|child| {
+                child.signal(Signal::Term);
+                child.exit.clone()
+            })
+        };
+        if let Some(exit) = exit
+            && tokio::time::timeout(grace, exit.wait()).await.is_err()
+            && let Some(child) = self.children.lock().expect("children").get(&pid)
+        {
+            child.signal(Signal::Kill);
         }
     }
 
@@ -338,16 +414,100 @@ impl ProcessManager for ScriptedProcessManager {
             });
         }
 
-        // The adapter's own cwd would usually not exist in a test, and the
-        // scripted child does not care where it runs.
-        let opts = SpawnOptions {
-            cwd: self.dir.path().to_path_buf(),
-            ..opts
+        // A separate, unreaped group leader pins group identity while the
+        // script's exit is delivered normally. Killing a recorded/reaped PID
+        // would race PID reuse; an is_alive/getpgid check cannot close that race.
+        // std Child ownership also makes final cleanup independent of Tokio.
+        let mut anchor = Command::new("/bin/cat");
+        anchor
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let io_error = |source| orch_core::error::Error::Io {
+            context: "spawn scripted fixture".to_owned(),
+            path: None,
+            source,
         };
-        let child = self
-            .inner
-            .spawn("sh", &["-c".to_owned(), self.build_script()], opts)?;
-        self.own_pids.lock().expect("own pids").insert(child.pid);
+        let mut owned = OwnedScript {
+            anchor: anchor.spawn().map_err(io_error)?,
+            child: Arc::new(Mutex::new(None)),
+            observer: None,
+            exit: ExitSignal::resolved(ExitOutcome::default()),
+        };
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", &self.build_script()])
+            .current_dir(self.dir.path())
+            .envs(&opts.env)
+            .process_group(i32::try_from(owned.anchor.id()).expect("positive OS pid"))
+            .stdin(match opts.stdin {
+                StdioMode::Ignore => Stdio::null(),
+                StdioMode::Pipe => Stdio::piped(),
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if opts.inherit_env == EnvInheritance::WithoutSecrets {
+            let passthrough = std::env::var_os(REMOTE_ENV_PASSTHROUGH);
+            for name in secret_env_names(std::env::vars_os(), passthrough.as_deref()) {
+                if !opts.env.contains_key(&name.to_string_lossy().into_owned()) {
+                    command.env_remove(name);
+                }
+            }
+        }
+        let child = command.spawn().map_err(io_error)?;
+        let pid = child.id();
+        let mut slot = owned
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *slot = Some(child);
+        let child = slot.as_mut().expect("just inserted child");
+        let stdout = child
+            .stdout
+            .take()
+            .map(tokio::process::ChildStdout::from_std)
+            .transpose()
+            .map_err(io_error)?;
+        let stderr = child
+            .stderr
+            .take()
+            .map(tokio::process::ChildStderr::from_std)
+            .transpose()
+            .map_err(io_error)?;
+        let stdin = child
+            .stdin
+            .take()
+            .map(tokio::process::ChildStdin::from_std)
+            .transpose()
+            .map_err(io_error)?;
+        drop(slot);
+        let (notifier, exit) = ExitSignal::channel();
+        owned.exit = exit.clone();
+        let slot = Arc::clone(&owned.child);
+        owned.observer = Some(
+            std::thread::Builder::new()
+                .name("scripted-child-exit".to_owned())
+                .spawn(move || {
+                    let mut slot = slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let outcome = slot
+                        .as_mut()
+                        .expect("owned script")
+                        .wait()
+                        .map(|status| ExitOutcome {
+                            code: status.code(),
+                            signal: status.signal(),
+                        })
+                        .unwrap_or_default();
+                    *slot = None;
+                    notifier.notify(outcome);
+                })
+                .map_err(io_error)?,
+        );
+        self.children.lock().expect("children").insert(pid, owned);
+        let child = SpawnedChild::from_tokio(pid, stdout, stderr, stdin, exit);
         Ok(child)
     }
 }

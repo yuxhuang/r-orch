@@ -191,13 +191,27 @@ pub fn default_peer_name() -> String {
             return name;
         }
     }
-    if let Ok(output) = std::process::Command::new("/bin/hostname").output()
+    if let Ok(output) = hostname_output()
         && output.status.success()
         && let Some(name) = short_hostname(&String::from_utf8_lossy(&output.stdout))
     {
         return name;
     }
     "localhost".into()
+}
+
+// `output()` creates capture pipes inside spawn. Wait only after releasing the
+// shared gate; the hostname child's lifetime must not serialize other launches.
+pub(crate) fn hostname_output() -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    let child = crate::process::gate::with_spawn_gate(|| {
+        std::process::Command::new("/bin/hostname")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })?;
+    child.wait_with_output()
 }
 
 fn short_hostname(name: &str) -> Option<String> {
