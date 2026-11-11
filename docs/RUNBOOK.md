@@ -265,7 +265,8 @@ resources, and wakes its own scheduler about half a second after a change
 | Symptom | Cause | Fix |
 |---|---|---|
 | The dashboard re-reads every view at once, or an MCP client gets `notifications/resources/updated` for every subscribed resource | The client fell behind (more than 256 waiting notices on a subscription, or 4 MiB on its connection), a change failed part-way with the affected stores unknown, or the daemon stopped or restarted | Nothing, if reads work: the client is catching up. If they fail with the no-daemon message, start the daemon yourself; nothing restarts it. Frequent resyncs mean a client reads too slowly: close clients you do not need. |
-| `resources/subscribe` is refused for a valid URI | That `orch mcp` process already follows 256 distinct URIs | Unsubscribe from URIs the client no longer needs. |
+| `resources/subscribe` is refused | That `orch mcp` process follows 256 distinct URIs, or the URI exceeds 527 bytes or an identifier/alias exceeds 256 bytes | Unsubscribe to free a slot; for `-32602`, correct the URI. Oversized strings are refused before retention. |
+| The prompt-mode header temporarily shows the old value during an F3 change | Its own asynchronous write is still pending | Wait for its answer. A pushed invalidation received meanwhile is refreshed after the usual debounce on success or refusal, without another key press or event. |
 | With dispatch on, a new or unblocked task does not start within about a second | The task is not eligible: dispatch is off, its goal is paused, its agent is busy, disabled or at capacity, it waits out a retry delay, or a failed preparation is backing off. A long scheduling check can also delay the next one. | `orch daemon status` (dispatch ON?), `orch task show <id>`, `orch logs --task <id>`. The periodic check still runs every `scheduling.poll_interval_ms`; a wake never overrides these checks. |
 
 The engine's per-operation domain-event buffer is not capped: it holds the events of one operation until
@@ -1243,7 +1244,25 @@ exists.
 
 ## A stuck or leftover `orch mcp` process
 
-**Symptom.** A client shows the orch server as not responding; every call is refused with
+**Current daemon bridge.** Check `orch daemon status` first. The bridge admits up to 16 project calls and
+two diagnostic calls; excess calls are refused immediately, while daemon admission and storage can delay
+admitted work. A lost observation is recovered on a later explicit call, with at most one recovery pending.
+There is no background daemon start or mutation replay.
+
+On stdin EOF the bridge stops its observation/recovery tasks and drains healthy responses. A stdout frame's
+writes and flush share a 5 s budget, even with partial progress; pending output shutdown is also bounded.
+Output failure returns `cannot write to stdout` and exit 1, including when the client has already closed stdin
+but keeps output unread. This is not a total-stop deadline or a limit on an already-started daemon operation.
+Inspect state before repeating a call whose answer was lost. Restarting the MCP client does not stop the daemon
+or undo its writes. See [MCP lifecycle](manual/17-mcp-server.md#exit-codes-and-startup-errors).
+
+### Legacy direct-writer MCP recovery (0.12–0.13)
+
+The observations and procedure below describe the old direct-writer server, which ran its own probes and FIFO.
+They are retained for older installations; the exit times are historical observations, not deadlines for the
+daemon bridge. Its probes now run in the daemon: do not apply the legacy probe-cleanup procedure to them.
+
+**Legacy symptom.** A client shows the orch server as not responding; every call is refused with
 `Not executed: timed out after 10 s waiting for the store queue; retry later`; or an `orch mcp` process is still
 running after its client quit.
 

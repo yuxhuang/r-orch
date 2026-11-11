@@ -124,19 +124,21 @@ Every startup failure is printed to stderr, with stdout empty.
 | No project found, or `--project-root` is missing, cannot be read or is not a project | `✕ Not initialized` / `Run: orch init` | 3 |
 | `--read-only` together with `--allow-destructive` (checked before the project, so also outside one) | `error: the argument '--read-only' cannot be used with '--allow-destructive'`, then the usage line | 1 |
 | `--agent` is empty or only spaces | `✕ --agent must not be blank` | 2 |
-| stdin closes, before or after `initialize` | none | 0 |
-| SIGINT, SIGTERM or SIGHUP, before or after `initialize`, even while the client keeps stdin open | none | 0 |
-| A write to stdout fails, before or after `initialize`, for example because the client stopped reading | `✕ cannot write to stdout: Broken pipe (os error 32); the MCP client can no longer receive responses. Calls already started may have completed: inspect state before retrying` | 1 |
+| stdin closes, before or after `initialize`, and output drains successfully | none | 0 |
+| SIGINT, SIGTERM or SIGHUP, before or after `initialize`, even while the client keeps stdin open, with healthy output | none | 0 |
+| A stdout write, flush or shutdown fails or exceeds its output budget, before or after `initialize` | `✕ cannot write to stdout: …; the MCP client can no longer receive responses. Calls already started may have completed: inspect state before retrying` | 1 |
 | SIGKILL | none | killed by the signal (a shell shows 137) |
 
-A `config.yml` that cannot be loaded does not stop the server from starting, and it still exits 0 when stdin
-closes. Each request reports the error instead: see
+A `config.yml` that cannot be loaded does not stop the server from starting, and with healthy output it still
+exits 0 when stdin closes. Each request reports the error instead: see
 [Each call sees current configuration](#each-call-sees-current-configuration).
 
-After stdin closes or a signal arrives, the server gives calls that are already running up to 5 s (stdin closed)
-or 2 s (signal) to answer, then exits without answering the rest. A call left unanswered may still have saved its
-change; see [A lost response is not a failed change](#results-and-errors). After a failed write to stdout the
-server runs no further call, even one it has already read, and exits.
+When stdin closes, observation and recovery tasks stop and healthy responses drain through the MCP transport.
+A frame's writes and flush share a 5 s output budget; partial progress does not reset it, and pending output
+shutdown is bounded too. A client that keeps stdout open without reading cannot hold that drain indefinitely,
+even after stdin closes. This output budget is not a deadline for an already-started daemon operation or total
+shutdown. A call left unanswered may still have saved its change; see
+[A lost response is not a failed change](#results-and-errors). Output failure stops new admission and exits 1.
 
 **Processes.** `orch mcp` starts no process: the `doctor` probes run in the daemon
 ([`doctor` runs programs](#doctor-runs-programs)), so stopping or killing `orch mcp` leaves no probe behind.
@@ -631,11 +633,15 @@ with `resources/read`:
   unknown URI is refused too. Unsubscribe first to make room. The cap error is `-32000`,
   `Not executed: at most 256 resources can be subscribed at once; unsubscribe one first`. A malformed URI
   gets `-32602`; an unknown resource class gets `-32002`.
+- **Subscription strings are bounded before retention.** The full URI is at most 527 bytes; its identifier
+  and remote alias, when present, are each at most 256 bytes. Oversized subscriptions get `-32602` and retain
+  no URI. These limits apply to subscriptions; ordinary resource reads keep their existing URI parser.
 - **When the daemon goes away or starts over.** If the daemon stops, or tells the server it fell behind, the
   server sends `notifications/resources/updated` for every URI you subscribed to. While no daemon runs, each
   `resources/read` and tool call fails with the [no-daemon message](#when-no-daemon-is-running). After you start
   the daemon, the server subscribes again on a resource read, tool call or new resource subscription, and sends
-  the notifications once more;
+  the notifications once more. At most one background recovery is pending, including while waiting to connect;
+  repeated calls do not queue extra recovery tasks. A later call may try again after a failed attempt;
   read the resources then. The server never starts or restarts the daemon, and never repeats a request that
   changed the project.
   Subscriptions end with the server process.
@@ -713,9 +719,9 @@ parsed JSON (same keys, same order of list items), not the same whitespace as `o
 | Missing, unknown or wrongly typed argument; `file: "-"`; a bad `since`; `logs` with no selector; `agent_update` with no form or mixed forms; `goal_status` with `force: true` outside allow-destructive mode | JSON-RPC error `-32602`, for example ``Invalid arguments for status: unknown field `bogus`: expected a declared field``, ``Invalid arguments for task_add: field `priority`: expected i64`` (for `"priority": "2"`), `Invalid since duration: expected ASCII digits followed by s, m, h, or d within the supported time range` (for `"since": "15w"`) or `file must be a nonempty regular file path; '-' would consume protocol stdin`. The text names the argument and the type or form it expects, never the value sent; with `RUST_LOG=warn` the server's stderr line carries the same text | No |
 | `msg_send` or `msg_broadcast` without `from`, or `msg_inbox` without `agent_id`, and no identity | JSON-RPC error `-32602` naming the missing argument | No |
 | orch refuses or fails a valid call (blank title, illegal transition, not found, unknown sender, locked definition, corrupt file, I/O error, index lock timeout) | Tool result with `isError: true`: the CLI's message, for example `Task not found: tsk_nope` or `Task title is required`, then `Hint: …` when the CLI has a hint | **Possibly, as with the CLI.** The error can come after the entity file was saved; see [Before you retry a tool error](#before-you-retry-a-tool-error) |
-| Too much work queued: 16 calls already admitted (2 for `doctor`), or 10 s waiting for a turn | Tool result with `isError: true`, `Not executed: …; retry later` | No |
+| The bridge already has 16 project calls admitted (2 for `doctor`), or the daemon refuses admission | Tool result with `isError: true`, `Not executed: …; retry later`, or the daemon's admission error | No |
 | The server is shutting down (stdin closed or a signal) and the call had to wait | Tool result with `isError: true`, `Not executed: the server is shutting down` | No |
-| The server stopped while the call was running, and the call did not finish in the shutdown time (5 s after stdin closed, 2 s after a signal), or the server was killed | No reply | **Possibly**: the change may have been saved |
+| The bridge stopped or was killed before delivering the call's response | No reply | **Possibly**: the change may have been saved |
 | The client stopped reading stdout | No reply to that call or any later one; the server exits with code 1 | Calls already running: **possibly**. Later calls: no, they are not run |
 | The client cancelled the call (`notifications/cancelled`) before it started | Tool result with `isError: true`, `Not executed: the request was cancelled` | No |
 | `doctor` runs longer than 120 s | Tool result with `isError: true`, `doctor did not finish within 120 s; its probes were stopped` | No |
@@ -733,17 +739,14 @@ was created, changed or deleted. Reads can still rebuild a missing or corrupt in
 
 A failed call never ends the session. Error texts carry no colours and no stack traces.
 
-**The server runs one project call at a time.** Tool calls and resource reads share one queue per server: one
-runs while up to 15 wait, and a call waits at most 10 s for its turn. A call refused as `Not executed` did nothing
-and can be retried.
+**The bridge admits up to 16 project calls at once.** It refuses excess calls immediately; it has no local FIFO.
+The daemon orders state operations shared by all clients. A call refused as `Not executed` did nothing and can
+be retried.
 
-**The 10 s limit covers only the wait, not the call.** Once a tool call or resource read has its turn, it has no
-time limit of its own: it keeps the turn until orch's services return. A call held up by the file system, such as
-a slow or hung network mount, keeps everything behind it waiting, and those calls are refused after their 10 s,
-until the slow call ends or the server is stopped. Two waits inside the services do have limits: a write gives up
-after 5 s waiting for another process's `.index.lock` ([example below](#before-you-retry-a-tool-error)), and
-`doctor` stops each probe after 10 s and the whole call after 120 s. `doctor` has its own queue of 2. It joins the
-main queue only to load the project, then runs its probes outside it, so slow probes do not hold up other calls.
+**Admission is not completion.** An ordinary daemon operation can wait up to 10 s for its state boundary;
+once started, that admission deadline no longer limits its execution. Slow or hung storage can delay other
+operations. Stopping the bridge does not roll a daemon write back. `doctor` has a separate two-call admission
+lane and a 120 s whole-call deadline; its probes run in the daemon outside the state boundary.
 
 **Calls you send together can run in any order.** Waiting calls run in the order they joined the queue, and that
 is not always the order you sent them: the server starts a separate task for each request it reads, and those
@@ -944,8 +947,9 @@ The owner accepted them as designed; there is no flag to change them.
   MCP client acts for the user who launched the server, with that user's file access, so confining the sources
   would not be a boundary against that user. Attached copies are stored inside the project, and `orch://`
   resource reads never leave it.
-- **Only the server's own queue is bounded.** One call runs while up to 15 wait, for at most 10 s each
-  ([Results and errors](#results-and-errors)), and a protocol line is capped at 16 MiB; the MCP SDK's backlog of
+- **Admission and subscriptions are bounded.** The bridge admits 16 project calls and two diagnostic calls
+  ([Results and errors](#results-and-errors)), subscription strings/counts have the bounds above, and a protocol
+  line is capped at 16 MiB; the MCP SDK's backlog of
   unread requests and the size of unpaginated results are not limited. Reason: the only peer is the local client
   process the user started, which already has the user's access. Hardening against a hostile client is
   deferred, and that is accepted.
@@ -974,7 +978,7 @@ The owner accepted them as designed; there is no flag to change them.
 | `Not executed: … retry later` | Too many calls queued, or a slow call ahead | Retry; send fewer calls at once |
 | A read sent right after a write returns `null` or the old value, with `isError: false` | The client sent both before the write's response arrived; the server can run them in either order | Wait for the write's response before sending the read ([Calls you send together can run in any order](#results-and-errors)) |
 | Tasks, context entries or other records are gone after a directory under `.orchestry/` was removed | The files went with the directory. The daemon recreates the directory at its next write into it, so later calls work without a restart, but nothing brings the old files back | Restore the lost records from a backup with the normal commands. Do not remove directories under `.orchestry/` while the daemon runs |
-| Every call is refused with `Not executed: timed out after 10 s waiting for the store queue` | A call ahead of them is stuck, for example on a hung file system | Fix the storage, or stop the server ([A stuck or leftover `orch mcp` process](../RUNBOOK.md#a-stuck-or-leftover-orch-mcp-process)); inspect state before retrying |
+| Calls fail with a bridge queue-full or daemon admission error | All bridge permits are occupied, or daemon work is waiting on its state boundary, for example on slow storage | Reduce concurrent calls and check daemon/storage health; inspect state before retrying an unknown outcome ([A stuck or leftover `orch mcp` process](../RUNBOOK.md#a-stuck-or-leftover-orch-mcp-process)) |
 | The client reports the server gone; captured stderr ends with `cannot write to stdout` | The client stopped reading the server's output; the server exits with code 1 by design | Restart the client. Check the calls that were in flight before you repeat them |
 | An `orch mcp` process is still running after its client quit, or never answers | A stuck server, or a leftover after a hard kill | [A stuck or leftover `orch mcp` process](../RUNBOOK.md#a-stuck-or-leftover-orch-mcp-process) |
 | There is no trace of what the server did | The server logs nothing by default | [Capture its stderr](../RUNBOOK.md#capturing-orch-mcp-diagnostics) |

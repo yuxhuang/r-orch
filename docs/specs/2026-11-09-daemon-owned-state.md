@@ -106,6 +106,11 @@ The following are verbatim excerpts of the owner's request recorded in the goal,
 
 ## Requirements
 
+**Owner amendment, 2026-11-10.** PR 3 burst performance is accepted on a no-regression basis against the
+same-harness comparator. The former 100-successful-commits-in-500-ms throughput objective is deferred to
+separate storage work after this goal; it is not a PR 3, PR 4 or push gate. See
+[PR 3 performance acceptance](#pr-3-performance-acceptance-owner-amended-2026-11-10).
+
 The PR 1 pointers below were checked against frozen `b1216ce452876f84f8c75270cb3cbe189403b565`. `crate/target::function` identifies an exact package, integration target (`crates/<crate>/tests/<target>.rs`) and test function; `crate/lib::module::tests::function` identifies a library unit test. The [command index](#pr-1-acceptance-command-index) gives runnable commands for every listed target, including the required daemon feature. These are coverage pointers, not pass claims or certification of an entire R-row. **Planned PR 2–4** targets do not yet establish acceptance; **fix round 1, verify at I1b** targets must be verified on the next frozen integration SHA. Test owners must update renamed pointers at integration. Existing suites stay required. Source numbers refer to the numbered quotations above.
 
 | Id | Requirement | Source | Priority | Acceptance check (test or command; platform) |
@@ -133,7 +138,7 @@ The PR 1 pointers below were checked against frozen `b1216ce452876f84f8c75270cb3
 | R21 | Before runtime/threads start, capture sanitized env using the named denylist below; never mutate runtime process env. Spawn via env_clear plus snapshot/config env/explicit inserts; requests carry no env/PATH/cwd/argv/adapter-command execution overrides. Status exposes removed names only; document daemon-start credential lifetime and require security gate. | item 11; SE-12/13; W0 Q4 | must | PR 1 existing: `orch-cli/daemon_security::the_start_environment_is_sanitised_before_any_agent_sees_it`; `orch-daemon/lib::env::tests::denylist_removes_identity_routing_and_debug_names_only`; `orch-daemon/lib::env::tests::forced_routing_names_the_project_and_socket`; `orch-proto/daemon_protocol::every_request_dto_denies_unknown_fields`. Fix round 1, verify at I1b: diagnostic child env_clear/snapshot and stderr canaries (security F2/F3); the base agent-env test does not cover diagnostic children. Mandatory frozen-commit security review remains required. macOS + Linux CI. |
 | R22 | Publish this spec, plan, accepted ADR0012, ARCHITECTURE §2/§3.1, lifecycle/no-daemon/recovery RUNBOOK, daemon manual chapter and changed command chapters, MCP chapter, README upgrade instructions and CHANGELOG Unreleased. Supersede ADR0011 d7/D10 explicitly; no-auto-start reason is the owner wanting to know when a long-lived process starts. | item 12 | must | PR 4 planned: Fact-check report at frozen PR4 commit covering every named file and command; `git diff --name-only <base>..HEAD`; macOS; source/markdown checks on Linux CI |
 | R23 | Runtime discovery/coordination files may be added but existing YAML/index/config.yml/org template/run-event schemas and orch-core storage traits remain unchanged unless separately approved. The concurrency claim shall explicitly exclude crash transactionality/external writers. | item 14, 15, 16 | must | PR 1 existing: `cargo test -p orch-cli --test yaml_contract`; `cargo test -p orch-peer` (serialization/compatibility suites). PR 2 planned: `crates/orch-cli/tests/daemon_contract.rs::stored_formats_unchanged`; macOS + Linux CI. |
-| R24 | Every PR shall pass the CI set on macOS and Linux CI; a cold gate shall pass on macOS for lifecycle/layering/security changes. No base failure is reported as a pass. | item 17, 23 | must | `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo test --workspace`; `cargo xtask crate-graph`; `cargo deny check`; cold `./xtask/gate.sh` (macOS), Linux CI each PR |
+| R24 | Every PR shall pass direct macOS checks and Linux GitHub CI under the owner-amended verification policy below. No base failure is reported as a pass. | item 17, 23; owner amendment 2026-11-10 | must | Direct macOS: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo xtask crate-graph`; `cargo test --workspace --no-fail-fast`. GitHub CI also retains its lockfile and cargo-deny checks; three complete green executions at each identified head/tree before readiness. |
 | R25 | Provide an in-process harness and explicit isolated binary test daemons; migrate MCP/binary fixtures, never reach real daemon/global state. ORCH_TEST_SOCKET_ROOT restricts every resolved endpoint to the validated test root without changing credentials/version checks; it is child/test configuration only, never cargo-wide env. | item 18; T0 §8.4/5 | must | PR 1 existing: `orch-daemon/lib::testing::tests::duplex_harness_serves_the_production_session_and_shuts_down_cleanly`; `orch-daemon/lib::testing::tests::socket_harness_binds_a_short_private_path_and_publishes_discovery`; `orch-client/boundary::test_root_confinement_checks_components_and_resolves_symlink_parents`. PR 2 planned: migrate `yaml_contract`, routing and `mcp_stdio` binary fixtures to explicit daemons; final cold-gate home hygiene required. macOS + Linux CI. |
 | R26 | At PR 2 head and final integration, run real orch tui in isolated tmux plus 4 CLI and 2 MCP clients concurrently with dispatch/collectors/expiry, N seconds (10 default, 60 acceptance); drive actual TUI mutations and web PTY routing/preflight. Assert ordered field updates, entity/index equality and retained renewals with no swallowed errors. | item 19; RT1 | must | PR 2 and final integration planned: `ORCH_STRESS_SECONDS=60 cargo test -p orch-cli --test daemon_stress real_tui_cli_mcp_share_state_order -- --exact`; `all_clients_share_state_order`; `web_daemon.rs::pty_uses_selected_daemon`; `startup_and_live_outage`; macOS + Linux CI (tmux), record N and operations per frontend |
 | R27 | No-daemon matrix covers CLI read/write, TUI, web, MCP initialize/tool × no endpoint, stale socket and incompatible protocol, with binary-version mismatch both directions too. Assert same message/code channel, no spawn and no unlink; lifecycle includes race, kill mid-run, explicit recovery and stale replacement. | item 20 | must | PR 1 existing: `orch-cli/daemon_lifecycle::two_explicit_starts_one_owner`; `orch-cli/daemon_lifecycle::crash_requires_explicit_start`; `orch-cli/daemon_lifecycle::stale_socket_is_replaced_on_start`; `orch-cli/daemon_lifecycle_nospawn::detector_flags_a_daemon_that_is_started`. R4 supplies existing PR 1 control-command no-spawn vectors. PR 2 planned: `cargo test -p orch-cli --test daemon_no_daemon` for CLI reads/writes, TUI, web and MCP; no claim of that matrix at PR 1. macOS + Linux CI. |
@@ -325,11 +330,45 @@ PR 3 delivers push (R16–R18) and restores prompt dispatch after a change ([Com
 
 Each push and wake target must also fail once against a deliberately broken signal, cursor or timer condition before its green run. No-polling proof is behavioural (an idle dashboard crosses several former refresh intervals with no state read, then a pushed change refreshes it) as well as a source check that `disk_observer` is gone.
 
+### PR 3 performance acceptance (owner amended 2026-11-10)
+
+The owner accepts all seven performance groups at `9277f832281d1c9734ce9ef03e8096389ae4ddc9` against
+`b97fc59a5b1f32ec3f8d3fb1685a5cccb9bf9533`, with **only the burst criterion amended to no regression** on
+the same harness. Retained data: 100 unique successful acknowledgements eventually, 38/100 within 500 ms,
+last acknowledgement at 1318.192250 ms; comparator diagnostic controls reached 39–40/100 within 500 ms.
+The owner accepts that spread as run-to-run noise. This is an acceptance amendment, not a statistical
+equivalence proof, remeasurement or throughput improvement. The original fixed-throughput failure remains a
+failure; the former 100-commit coalescing test is not claimed to have passed.
+
+The other six contracts remain: launch measurements (30 per side), continuous 60-second traffic, paired
+fan-out intervals containing zero, qualified RSS occupancy, live peer heartbeat, and collector
+delivery/reconstruction. Retain the collector's original failure and qualified offline reconstruction;
+this amendment does not turn it into a clean original campaign. Only the no-op and `record_event`
+held-permit p50/p95 measurements remain deferred to PR 4, with acquisition/release tracing and independent
+measurement. Source qualification at `67ee5017eee36af8dc665ecb9c00c92a51b7a51a` is a separate lineage;
+neither that source nor these measurements certify the forthcoming integrated candidate.
+
+The 100-successful-commits-in-500-ms objective belongs to a separate post-goal storage design, potentially
+amortized/batched persistence. It must define durability, error visibility, ordering, publication and crash
+recovery before implementation. It cannot be satisfied by early acknowledgement, removing promised syncs,
+widening the window or counting submissions as commits. No storage change is authorized here.
+
+Code, security, resilience, actual PR 2 production/test integration, PR 3 re-freeze and exact-SHA delta reviews,
+direct macOS checks, QA and GitHub CI remain required. The uncapped event-buffer obligation remains in PR 4;
+the storage deferral does not move that work beyond this goal.
+
 ## Verification environment
 
 Test engineer owns automated daemon/protocol/state/concurrency tests; CLI test owner migrates binary/MCP fixtures; qa-engineer owns manual acceptance; release engineer runs the CI set and cold gate at a frozen integration commit. All tests use temp projects and explicit short isolated ORCH_SOCKET, fake shell agents and isolated ORCHESTRY_GLOBAL_CONFIG_PATH. Pure engine/domain/TUI tests retain in-process fakes. Do not use production `.orchestry` or real AI CLIs in automated tests.
 
-Linux CI on every PR covers Unix sockets, Linux SO_PEERCRED, file modes, subprocess/signal lifecycle, existing suites and new concurrency/no-daemon matrix. macOS local verification covers the corresponding peer credential implementation and short-path boundary; cold `./xtask/gate.sh` runs on macOS. An injected different-UID case is not evidence of a real second-UID run: mark actual cross-user checks env-limited if unavailable and obtain owner disposition.
+Linux GitHub CI on every PR covers Unix sockets, Linux SO_PEERCRED, file modes, subprocess/signal lifecycle,
+existing suites and new concurrency/no-daemon matrix. Under the owner's amended gate policy, macOS runs the
+four R24 commands directly, with tmux on PATH, plain command timeouts and observational process snapshots;
+custom test runners and local Linux/Docker checks are not prerequisites. GitHub CI supplies Linux coverage
+after a qualified draft push. Keep each identified head/tree draft until three complete green CI executions
+and the other applicable gates pass; the lead reports readiness and the owner merges. No release, tag or
+version bump is part of this goal. An injected different-UID case is not evidence of a real second-UID run:
+mark actual cross-user checks env-limited if unavailable and obtain owner disposition.
 
 TUI acceptance uses `tmux -L <unique-socket> -f /dev/null` with temp project, pinned terminal type, bounded polling, capture-pane and cleanup guard. r/q, disconnected state, reconnect after explicit owner start and push updates require real binary tmux tests, not FakeBackend alone. Process-level SIGHUP remains portable-pty as existing tests require. Native terminal profiles, native clipboard and actual browser rendering are not covered by tmux; qa-engineer records owner-Mac results. A real Claude Code MCP session needs the owner's Mac/account and explicit test-project permission; no automated test launches it. R28 cannot be called pass from a simulated MCP transport alone.
 
@@ -420,7 +459,7 @@ Large inbound arguments cannot be silently dropped by peer's oversize policy. `t
 
 Connection/admission limits (G3/SE refinements; numeric defaults pinned here for owner approval): separate 16 pre-handshake slots (2 s lifetime), 64 ordinary sessions, 16 in-flight ids per connection, 128 ordinary queued state operations and 64 MiB encoded queued-request bytes per project, 10 s admission deadline, 8 subscriptions/connection, 256 queued events/subscription with total queued-byte cap 4 MiB/connection, 256 distinct subscribed resource URIs per `orch mcp` process (one observation session regardless of URI count). Readers stop admitting before memory grows beyond caps; reject overloaded work as not_executed. Keep a reserved internal/control lane so stop/cancel cannot be starved. Writes time out after 5 s; handshake 2 s; connect 1 s. Long-running streams have no total run deadline but do have bounded write/inactivity handling. Doctor retains two admitted jobs and existing 120 s deadline outside the state permit.
 
-Commit identity metadata is limited to 256 entries / 64 KiB and degrades to store-wide invalidations beyond that. These limits and the subscription/session caps do not cap the engine's per-operation domain-event buffer: it holds one operation's events until that operation releases the permit and grows with the number of events the operation emits. This is a PR 3 known limitation; follow-up R-evbuf needs an overflow design for in-process listeners.
+Commit identity metadata is limited to 256 entries / 64 KiB and degrades to store-wide invalidations beyond that. These limits and the subscription/session caps do not cap the engine's per-operation domain-event buffer: it holds one operation's events until that operation releases the permit and grows with the number of events the operation emits. This is a PR 3 known limitation. PR 4 must resolve it with a bounded lossless overflow design for in-process listeners or an explicit owner-approved supported envelope; it is not deferred beyond this goal.
 
 ### Frozen stop intent
 
@@ -516,5 +555,16 @@ Subscribe to tasks/goals/agents/messages/context and optionally teams/runs/confi
 Two numbers, two meanings. The **cursor** is per subscription: the subscribe result's `seq` is its origin, always 0, and the first event has `seq` 1; a client detects a gap by comparing each event's `seq` with the previous one. The **baseline** is the subscribe call's terminal `commit_seq`: a client compares it, and each event's `commit_seq`, with the `commit_seq` of the reads it made, never with a cursor value.
 
 Initial sync: register subscription under coordinator and obtain baseline commit_seq (the subscribe call's terminal `commit_seq`); acknowledge with cursor origin 0; buffer pushed events; fetch views via normal reads; apply/refetch invalidations whose `commit_seq` is after the `commit_seq` a view was read at, then continue. Never fetch first and subscribe second. A gap, explicit resync marker, changed instance or lost connection invalidates every subscribed cache. Client resubscribes and refetches; no durable replay promise. Multiple read calls need not be one snapshot, but each carries commit_seq; buffered invalidations prevent a missed update. `ui.bootstrap` and status aggregates use one coordinator operation where a consistent view is needed.
+
+The session writer activates a subscription only after its acknowledgement is successfully written and flushed;
+buffered inactive events remain subject to the same budgets. Failed acknowledgement output cannot activate it.
+A pending dashboard prompt-mode write cannot consume an external invalidation: completion, including refusal,
+rearms the existing debounce while that view remains dirty, without periodic state reads.
+
+MCP subscription strings are validated before retention: 527 bytes per complete URI and 256 bytes per
+identifier/alias component. At most one recovery is scheduled, including connection-mutex waiters; stop/EOF
+cancels it and shutdown joins owned tasks. Healthy responses drain, while stdout write/flush/shutdown is
+bounded (5 s shared across a frame's writes and flush, not reset by partial writes). These are output bounds,
+not a total-stop deadline or permission to replay a mutation.
 
 The TUI reads only its in-memory event receiver: no file observer and no periodic state RPC; clock-driven columns animate from sampled values. Web preserves existing PTY design: its `orch tui` child uses the same socket subscriptions; web parent also holds a lightweight observation connection to report outage before creating sessions, and keeps no entity cache of its own. Web auth, Host/Origin controls and PTY limits remain. MCP resources/subscribe tracks requested `orch://` URIs and sends `notifications/resources/updated`; collection URIs invalidate on any member change, item URIs on relevant id changes, a goal item also on a linked task or progress change, status on task/agent/run/state/dispatch changes, inbox on relevant message changes (recipient, read state, broadcast), context on set/delete/expiry. One `orch mcp` process tracks at most 256 distinct canonical URIs: a duplicate subscribe is free, the 257th is refused with an explicit JSON-RPC error (never a silent drop), and unsubscribe is idempotent. The bridge holds one daemon observation session for all its URIs, in its own caller identity and mode, subscribed by store, and maps events to URIs locally; notifications are coalesced per URI so a write burst cannot become an unbounded stdout stream, and a slow MCP client cannot stall the daemon. Gaps, resync, a changed instance and a lost connection send `resources/updated` for every subscribed URI; callers refetch. The bridge re-establishes its observation session on a resource read, tool call or new resource subscription, never starts or repairs a daemon and never replays a mutation. Accepted MCP protocol versions are unchanged; resource subscriptions use the `initialize` lifecycle, and `subscriptions/listen` is not implemented. Remove redundant MCP store FIFO; preserve bounded bridge admission and doctor limits without a second serialization lock.
