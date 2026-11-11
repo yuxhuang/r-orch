@@ -558,3 +558,147 @@ fn p022_a_bootstrap_read_failure_is_visible_and_recovers_on_push() {
         }
     }
 }
+
+// ── Pending prompt writes defer, rather than consume, invalidations ────────
+
+fn defer_prompt_refresh(h: &mut Harness, observation: Observation) {
+    use orch_domain::PromptMode;
+    h.app.request_prompt_mode(Some(PromptMode::Eco));
+    push(h, observation);
+    h.advance(0);
+    h.advance(REFRESH_DEBOUNCE_MS);
+    assert!(h.app.state.prompt_mode_pending);
+    assert_eq!(h.app.backend.read_count(Read::PromptMode), 0);
+    assert_eq!(h.app.state.refresh_at, None, "the first debounce expired");
+    h.app.backend.reads.clear();
+    // The skipped read must not keep rearming itself while the write waits.
+    for _ in 0..5 {
+        h.advance(REFRESH_DEBOUNCE_MS);
+        assert_eq!(h.app.state.refresh_at, None);
+    }
+    assert!(reads(h).is_empty(), "no polling while pending");
+}
+
+fn settle_deferred_prompt_refresh(h: &mut Harness, expected: orch_domain::PromptMode) {
+    h.advance(0);
+    assert!(!h.app.state.prompt_mode_pending);
+    assert!(reads(h).is_empty(), "completion uses the debounce");
+    h.advance(REFRESH_DEBOUNCE_MS - 1);
+    assert!(reads(h).is_empty(), "no early read");
+    h.advance(1);
+    assert_eq!(reads(h), vec![Read::PromptMode]);
+    assert_eq!(
+        h.app.state.prompt_mode, expected,
+        "read the newest backend value"
+    );
+    assert_eq!(h.app.state.refresh_at, None);
+    h.app.backend.reads.clear();
+    for _ in 0..10 {
+        h.advance(1_000);
+    }
+    assert!(reads(h).is_empty(), "no periodic refresh after settling");
+}
+
+#[test]
+fn p023_a_refused_prompt_write_rearms_the_deferred_config_refresh() {
+    use orch_domain::PromptMode;
+    let mut h = harness();
+    assert_eq!(h.app.state.prompt_mode, PromptMode::Normal);
+    // Another client commits Eco; our local request is subsequently refused.
+    h.app.backend.prompt_mode = PromptMode::Eco;
+    h.app.backend.commit_seq = Some(11);
+    defer_prompt_refresh(&mut h, changed(ObservedStore::Config, 11));
+    h.app.backend.prompt_mode_fail = Some("injected request refusal".into());
+    assert!(h.app.backend.complete_prompt_mode());
+    settle_deferred_prompt_refresh(&mut h, PromptMode::Eco);
+    assert!(
+        h.text().contains("injected request refusal"),
+        "retain refusal feedback"
+    );
+    // The refreshed view observed 11: its repeated push needs no extra RPC.
+    push(&mut h, changed(ObservedStore::Config, 11));
+    h.advance(0);
+    h.advance(REFRESH_DEBOUNCE_MS);
+    assert!(reads(&h).is_empty());
+}
+
+#[test]
+fn p024_a_successful_prompt_write_does_not_retire_a_newer_external_value() {
+    use orch_domain::PromptMode;
+    let mut h = harness();
+    defer_prompt_refresh(&mut h, changed(ObservedStore::Config, 11));
+    // The successful reply carries Eco, but another client then writes Normal
+    // before the UI polls that reply. Completion must not clear the dirty bit.
+    assert!(h.app.backend.complete_prompt_mode());
+    h.app.backend.prompt_mode = PromptMode::Normal;
+    h.app.backend.commit_seq = Some(12);
+    // Its push has not arrived yet; the earlier invalidation still requires a read.
+    settle_deferred_prompt_refresh(&mut h, PromptMode::Normal);
+}
+
+#[test]
+fn p025_a_resync_while_a_prompt_write_is_pending_defers_its_read_until_completion() {
+    use orch_domain::PromptMode;
+    let mut h = harness();
+    defer_prompt_refresh(&mut h, Observation::Resynced);
+    assert!(h.app.backend.complete_prompt_mode());
+    h.app.backend.prompt_mode = PromptMode::Normal;
+    h.app.backend.commit_seq = Some(12);
+    settle_deferred_prompt_refresh(&mut h, PromptMode::Normal);
+}
+
+#[test]
+fn p026_a_clean_prompt_write_completion_needs_no_refresh_on_success_or_refusal() {
+    use orch_domain::PromptMode;
+    for refusal in [false, true] {
+        let mut h = harness();
+        h.app.request_prompt_mode(Some(PromptMode::Eco));
+        if refusal {
+            h.app.backend.prompt_mode_fail = Some("request refused".into());
+        }
+        assert!(h.app.backend.complete_prompt_mode());
+        h.advance(0);
+        assert!(!h.app.state.prompt_mode_pending);
+        assert_eq!(h.app.state.refresh_at, None);
+        assert_eq!(
+            h.app.state.prompt_mode,
+            if refusal {
+                PromptMode::Normal
+            } else {
+                PromptMode::Eco
+            }
+        );
+        h.advance(30_000);
+        assert!(reads(&h).is_empty(), "a clean completion never polls");
+    }
+}
+
+#[test]
+fn review_pending_prompt_write_does_not_strand_a_pushed_change_after_refusal() {
+    use orch_domain::PromptMode;
+    let mut h = harness();
+    assert_eq!(h.app.state.prompt_mode, PromptMode::Normal);
+    h.app.request_prompt_mode(Some(PromptMode::Eco));
+    assert!(h.app.state.prompt_mode_pending);
+    // A different client commits while our asynchronous request is pending.
+    h.app.backend.prompt_mode = PromptMode::Eco;
+    h.app.backend.commit_seq = Some(11);
+    push(&mut h, changed(ObservedStore::Config, 11));
+    h.advance(0);
+    h.advance(REFRESH_DEBOUNCE_MS);
+    assert!(
+        !reads(&h).contains(&Read::PromptMode),
+        "must not race the pending write"
+    );
+    // Our request is refused. Its completion must release the deferred read.
+    h.app.backend.prompt_mode_fail = Some("injected request refusal".into());
+    assert!(h.app.backend.complete_prompt_mode());
+    h.advance(0);
+    h.advance(REFRESH_DEBOUNCE_MS);
+    assert!(!h.app.state.prompt_mode_pending);
+    assert_eq!(
+        h.app.state.prompt_mode,
+        PromptMode::Eco,
+        "the earlier Config invalidation must be serviced after the pending write finishes"
+    );
+}

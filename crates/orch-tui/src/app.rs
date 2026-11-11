@@ -1631,6 +1631,12 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             }
             Err(err) => self.prompt_mode_failed(&err),
         }
+        // A pushed refresh may have skipped this view while the write was
+        // pending. Its result cannot retire an external invalidation: read
+        // the current mode after the usual debounce, even on refusal.
+        if self.freshness.dirty().contains(View::PromptMode) {
+            self.schedule_refresh();
+        }
     }
 
     /// A refused or failed write: state is untouched, the reason is shown.
