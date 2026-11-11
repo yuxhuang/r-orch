@@ -489,6 +489,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use futures::FutureExt;
     use orch_client::testing::{FakeServer, fake_transport};
     use orch_client::{Client, Project};
     use orch_proto::bounded::Id;
@@ -1453,7 +1454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gap_resync_new_instance_and_loss_update_every_uri_and_resubscribe_on_the_next_call() {
+    async fn gap_new_instance_and_loss_update_every_uri_and_resubscribe_on_the_next_call() {
         let all = ["orch://context", "orch://tasks/tsk_a"];
         let mut b = bridge(Mode::Default, 1 << 20).await;
         for uri in all {
@@ -1506,23 +1507,6 @@ mod tests {
             .call("resources/read", json!({"uri": "orch://context"}))
             .await;
         assert!(read.get("result").is_some(), "{read}");
-        let mut o = b.daemon.session().await;
-        b.updated_all(&all).await;
-
-        // An explicit daemon resync.
-        let seq = o.next_seq;
-        let instance = o.instance.clone();
-        o.event(
-            seq,
-            instance,
-            EventBody::Resync {
-                reason: ResyncReason::Lagged,
-            },
-        )
-        .await;
-        b.updated_all(&all).await;
-        o.closed().await;
-        b.status().await;
         let o = b.daemon.session().await;
         b.updated_all(&all).await;
 
@@ -1533,8 +1517,159 @@ mod tests {
         b.status().await;
         let _o = b.daemon.session().await;
         b.updated_all(&all).await;
-        assert_eq!(b.daemon.opened(), 5);
+        assert_eq!(b.daemon.opened(), 4);
         b.server.abort();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ResyncRecovery {
+        ResourceRead,
+        ToolCall,
+        NewSubscription,
+    }
+
+    async fn server_resync_recovers_on_the_next_eligible_call(
+        reason: ResyncReason,
+        recovery: ResyncRecovery,
+    ) {
+        let all = ["orch://context", "orch://tasks/tsk_a"];
+        let mut b = bridge(Mode::Default, 1 << 20).await;
+        for uri in all {
+            b.subscribed(uri).await;
+        }
+        let mut old = b.daemon.session().await;
+        let old_subscription = old.subscription;
+
+        // Inject the wire marker directly: no healthy producer operation can
+        // accidentally remove this precondition from the test.
+        old.event(
+            old.next_seq,
+            old.instance.clone(),
+            EventBody::Resync { reason },
+        )
+        .await;
+        assert_eq!(b.updated_all(&all).await, all, "{reason:?}");
+        old.closed().await;
+
+        // A later relevant change cannot reach the ended observation, even
+        // though the daemon fixture and stdio server are still running.
+        let later = EventFrame {
+            ev: Event {
+                subscription: old_subscription,
+                instance: old.instance.clone(),
+                seq: old.next_seq + 1,
+                body: EventBody::Change {
+                    store: Store::Tasks,
+                    id: Some(Id::new("tsk_a").unwrap()),
+                    kind: ChangeKind::Updated,
+                    commit_seq: 9002,
+                },
+            },
+        };
+        assert!(
+            old.peer.send(&later).await.is_err(),
+            "old handle stayed open"
+        );
+
+        // Neither ping nor a duplicate subscription revives observation.
+        // Their replies are output barriers, not elapsed-time guesses.
+        let ping = b.call("ping", json!({})).await;
+        assert_eq!(ping["result"], json!({}), "{ping}");
+        b.subscribed(all[0]).await;
+        assert_eq!(b.daemon.opened(), 1, "no autonomous or duplicate recovery");
+        assert!(b.pending.is_empty(), "passive updates after {reason:?}");
+        assert!(
+            b.lines.next_line().now_or_never().is_none(),
+            "later passive output after {reason:?}"
+        );
+
+        match recovery {
+            ResyncRecovery::ResourceRead => {
+                let read = b
+                    .call("resources/read", json!({"uri": "orch://context"}))
+                    .await;
+                assert!(read.get("result").is_some(), "{read}");
+            }
+            ResyncRecovery::ToolCall => b.status().await,
+            ResyncRecovery::NewSubscription => b.subscribed("orch://agents/agt_new").await,
+        }
+        // Read/tool replies need not wait for the background reconnect. The
+        // acknowledged observation, rather than that reply, is the barrier.
+        let mut fresh = b.daemon.session().await;
+        assert_ne!(fresh.subscription, old_subscription, "{recovery:?}");
+        assert_eq!(b.daemon.opened(), 2, "one fresh observation");
+        assert_eq!(b.updated_all(&all).await, all, "{reason:?}, {recovery:?}");
+        fresh
+            .change(Store::Tasks, Some("tsk_a"), ChangeKind::Updated)
+            .await;
+        assert_eq!(b.updated().await, "orch://tasks/tsk_a");
+        if matches!(recovery, ResyncRecovery::NewSubscription) {
+            fresh
+                .change(Store::Agents, Some("agt_new"), ChangeKind::Updated)
+                .await;
+            assert_eq!(b.updated().await, "orch://agents/agt_new");
+        }
+        b.writer.take().unwrap().shutdown().await.unwrap();
+        tokio::time::timeout(WAIT, &mut b.server)
+            .await
+            .expect("bridge stops after EOF")
+            .unwrap()
+            .unwrap();
+        fresh.closed().await;
+    }
+
+    #[tokio::test]
+    async fn lagged_resync_marker_recovers_on_resource_read() {
+        server_resync_recovers_on_the_next_eligible_call(
+            ResyncReason::Lagged,
+            ResyncRecovery::ResourceRead,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn uncertain_store_set_resync_marker_recovers_on_resource_read() {
+        server_resync_recovers_on_the_next_eligible_call(
+            ResyncReason::StoreSetUncertain,
+            ResyncRecovery::ResourceRead,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn lagged_resync_marker_recovers_on_tool_call() {
+        server_resync_recovers_on_the_next_eligible_call(
+            ResyncReason::Lagged,
+            ResyncRecovery::ToolCall,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn uncertain_store_set_resync_marker_recovers_on_tool_call() {
+        server_resync_recovers_on_the_next_eligible_call(
+            ResyncReason::StoreSetUncertain,
+            ResyncRecovery::ToolCall,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn lagged_resync_marker_recovers_on_new_subscription() {
+        server_resync_recovers_on_the_next_eligible_call(
+            ResyncReason::Lagged,
+            ResyncRecovery::NewSubscription,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn uncertain_store_set_resync_marker_recovers_on_new_subscription() {
+        server_resync_recovers_on_the_next_eligible_call(
+            ResyncReason::StoreSetUncertain,
+            ResyncRecovery::NewSubscription,
+        )
+        .await;
     }
 
     #[tokio::test]
