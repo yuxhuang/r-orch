@@ -17,9 +17,16 @@
 //!   parseable root whose identity would change.
 //!
 //! Every test owns a sandbox: throwaway `HOME`, throwaway global config (and
-//! so user template root), throwaway project that is never initialised unless
-//! a test deploys, and a `PATH` that holds no agent CLI. Nothing here reads or
+//! so user template root), an initialized throwaway project with its own
+//! test daemon, and a `PATH` that holds no agent CLI. Nothing here reads or
 //! writes outside the sandbox and no agent is ever started.
+//!
+//! Every `orch` command is a daemon client (S2a-cli), including `org
+//! template update` / `patch`: `sandbox()` runs `orch init` and then starts
+//! an explicit test daemon on an isolated socket (see
+//! `tests/common/daemon.rs`), stopped with a process-table check when the
+//! sandbox drops. `bare_sandbox()` owns neither a project nor a daemon, for
+//! the one case that is about their absence.
 
 #![cfg(unix)]
 
@@ -32,6 +39,10 @@ use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::TestDaemon;
+
 use assert_cmd::prelude::*;
 use serde_json::{Value, json};
 
@@ -41,10 +52,26 @@ use serde_json::{Value, json};
 const RUN_BUDGET: Duration = Duration::from_secs(60);
 
 struct Sandbox {
+    // Declared first: dropped first, so the daemon stops before its project
+    // directory is removed.
+    daemon: Option<TestDaemon>,
     dir: tempfile::TempDir,
 }
 
+/// An initialized project with its own test daemon already running: every
+/// `org template` mutation needs both.
 fn sandbox() -> Sandbox {
+    let mut sb = bare_sandbox();
+    sb.ok(&["init", "--name", "proj", "--adapter", "claude"]);
+    let daemon = TestDaemon::start(&sb.project(), &sb.home());
+    daemon::register_project(&sb.project(), &daemon);
+    sb.daemon = Some(daemon);
+    sb
+}
+
+/// A sandbox whose project directory is never initialized and owns no
+/// daemon: for the one case about what happens before `orch init`.
+fn bare_sandbox() -> Sandbox {
     let dir = tempfile::Builder::new()
         .prefix("orch-template-mutations-")
         .tempdir()
@@ -58,7 +85,13 @@ fn sandbox() -> Sandbox {
     for sub in ["home", "project", "work"] {
         fs::create_dir_all(dir.path().join(sub)).expect("sandbox dirs");
     }
-    Sandbox { dir }
+    Sandbox { daemon: None, dir }
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        daemon::unregister_project(&self.project());
+    }
 }
 
 impl Sandbox {
@@ -93,6 +126,7 @@ impl Sandbox {
             .env("TERM", "xterm-256color")
             // No agent CLI exists on this PATH.
             .env("PATH", "/usr/bin:/bin");
+        daemon::apply_for(&self.project(), &mut command);
         command
     }
 
@@ -119,10 +153,6 @@ impl Sandbox {
         let mut all = args.to_vec();
         all.push("--json");
         parse_json(&self.ok(&all))
-    }
-
-    fn init_project(&self) {
-        self.ok(&["init", "--name", "proj", "--adapter", "claude"]);
     }
 
     /// `show` as authoring data (never resolved).
@@ -642,7 +672,7 @@ fn assert_oversized_json_add_rejected(stdin: bool, suffix: &str) {
         let output = mutate(&sb, true, "add", &org_sel(&root), &doc, &extra);
         assert_eq!(output.status.code(), Some(2), "{}", transcript(&output));
         let diagnostic = if stdin {
-            "-: expected 1–1048576 bytes"
+            "<stdin>: document exceeds 1 MiB"
         } else {
             "exceeds 1 MiB"
         };
@@ -818,7 +848,6 @@ fn a_changed_member_update_rewrites_only_that_file_and_keeps_skills_presence() {
 #[test]
 fn show_update_resolve_deploy_agree_for_absent_empty_and_listed_skills() {
     let sb = sandbox();
-    sb.init_project();
     let root = skills_team(&sb);
     for name in ["boss", "empty", "own"] {
         let echo = shown_member(&sb, &root, name);
@@ -849,7 +878,6 @@ fn show_update_resolve_deploy_agree_for_absent_empty_and_listed_skills() {
 #[test]
 fn deployed_skills_after_updates_are_inherit_disable_and_replace() {
     let sb = sandbox();
-    sb.init_project();
     let root = skills_team(&sb);
     for name in ["boss", "empty", "own"] {
         let echo = shown_member(&sb, &root, name);
@@ -1018,6 +1046,13 @@ fn pty_orch(sb: &Sandbox, args: &[&str]) -> Pty {
     command.env("TERM", "xterm-256color");
     command.env("PATH", "/usr/bin:/bin");
     command.env("NO_COLOR", "1");
+    // `CommandBuilder` is not a `std::process::Command`, so it cannot use
+    // `daemon::apply_for`; aim it at the registered daemon by hand.
+    for env_pair in daemon::env_pairs_for(&sb.project()) {
+        if let Some((key, value)) = env_pair.split_once('=') {
+            command.env(key, value);
+        }
+    }
     let child = pair.slave.spawn_command(command).expect("spawn on a pty");
     drop(pair.slave);
     let mut reader = pair.master.try_clone_reader().expect("pty reader");
@@ -1085,7 +1120,6 @@ impl Drop for Pty {
 #[test]
 fn shop_installs_equal_the_resolved_preview_after_skills_were_mutated() {
     let sb = sandbox();
-    sb.init_project();
     let root = skills_team(&sb);
     // Cover all three cases after real mutations: absent → patched list,
     // [] → null (inherit), [qa] → full update omitting skills (inherit).
@@ -1108,7 +1142,13 @@ fn shop_installs_equal_the_resolved_preview_after_skills_were_mutated() {
         }
         pty.expect(&format!("▸ {name}"));
         pty.send(ENTER);
-        assert_eq!(pty.finish(), 0, "shop install of {name}");
+        let code = pty.finish();
+        assert_eq!(
+            code,
+            0,
+            "shop install of {name}: {}",
+            String::from_utf8_lossy(&pty.seen)
+        );
     }
 
     let installed = sb.json(&["agent", "list"]);
@@ -1938,28 +1978,82 @@ fn builtin_and_unknown_templates_are_read_only_for_update_and_patch() {
 }
 
 #[test]
-fn mutations_need_no_project_and_create_no_project_state() {
-    let sb = sandbox();
-    let root = small_team(&sb, "noproj");
-    echoed(patch_agent(
-        &sb,
-        &root,
-        "worker",
-        &json!({"description": "x"}),
-    ));
-    echoed(update_agent(
-        &sb,
-        &root,
-        "worker",
-        &json!({"name": "worker", "role": "r"}),
-    ));
-    echoed(patch_org(&sb, &root, &json!({"description": "x"})));
-    echoed(update_org(
-        &sb,
-        &root,
-        &json!({"schema_version": 1, "name": "noproj", "lead": "lead"}),
-    ));
-    assert!(!sb.project().join(".orchestry").exists());
+fn template_commands_require_a_project_before_parsing_or_contacting_a_daemon() {
+    use std::os::unix::net::UnixListener;
+
+    let sb = bare_sandbox();
+    let sockets = tempfile::Builder::new()
+        .prefix("ot-")
+        .tempdir_in("/tmp")
+        .expect("short socket directory");
+    let socket = sockets.path().join("s");
+    let listener = UnixListener::bind(&socket).expect("listen for unexpected daemon contact");
+    listener.set_nonblocking(true).expect("nonblocking socket");
+
+    for args in [
+        vec!["list"],
+        vec!["show", "a-team"],
+        vec!["init", "new-team"],
+        vec!["edit", "a-team"],
+        vec!["update", "a-team", "--file", "-"],
+        vec!["patch", "a-team", "--file", "-"],
+        vec!["agent", "list", "a-team"],
+        vec!["agent", "add", "a-team", "--file", "-"],
+        vec!["agent", "edit", "a-team", "worker"],
+        vec!["agent", "update", "a-team", "worker", "--file", "-"],
+        vec!["agent", "patch", "a-team", "worker", "--file", "-"],
+        vec!["agent", "delete", "a-team", "worker"],
+        // The routing guard must also precede help and usage errors. These
+        // distinguish it from the project lookup inside Rpc::connect.
+        vec!["--help"],
+        vec!["patch", "--unknown-option"],
+    ] {
+        let output = run_bounded(
+            sb.command()
+                .env("ORCH_SOCKET", &socket)
+                .env("ORCH_TEST_SOCKET_ROOT", sockets.path())
+                .args(["org", "template"])
+                .args(&args),
+            None,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "org template {args:?}: {}",
+            transcript(&output)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            "  ✕ Not initialized\n    Run: orch init\n",
+            "org template {args:?}"
+        );
+        assert!(output.stdout.is_empty(), "{}", transcript(&output));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "org template {args:?} contacted a daemon before rejecting the missing project"
+        );
+        assert!(
+            fs::read_dir(sb.home())
+                .expect("sandbox directory")
+                .next()
+                .is_none(),
+            "org template {args:?} created home state"
+        );
+        assert!(
+            fs::read_dir(sb.project())
+                .expect("sandbox directory")
+                .next()
+                .is_none(),
+            "org template {args:?} created project state"
+        );
+        assert!(
+            fs::read_dir(sb.work())
+                .expect("sandbox directory")
+                .next()
+                .is_none(),
+            "org template {args:?} created template state"
+        );
+    }
 }
 
 #[test]

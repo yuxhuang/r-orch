@@ -153,8 +153,13 @@ const PLATFORM_SKIPS: &[(Quirk, &str, &str)] = &[
     ),
     (
         Quirk::ProcessWritesHome,
-        "listing_showing_and_agent_listing_need_no_project_and_create_nothing",
+        "listing_showing_and_agent_listing_are_read_only_and_create_nothing_new",
         "crates/orch-cli/tests/org_templates.rs",
+    ),
+    (
+        Quirk::ProcessWritesHome,
+        "template_commands_require_a_project_before_parsing_or_contacting_a_daemon",
+        "crates/orch-cli/tests/org_template_mutations.rs",
     ),
     (
         Quirk::SpawnStartsMissingBinary,

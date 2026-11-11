@@ -13,6 +13,11 @@
 //!    `--yaml` parses to exactly the value `--json` parses to. Equality of
 //!    the *parsed* values is the contract; the byte layout is not.
 //!
+//! Binary-level fixtures start an explicit test daemon on an isolated short
+//! socket right after `orch init` (see `tests/common/daemon.rs`) and stop it,
+//! with a process-table check, when the `Project` drops. The uninitialised
+//! project fixtures have no project to own a daemon and run without one.
+//!
 //! Errors are part of the contract: `--yaml` must fail the way `--json` does
 //! (same exit code, same stdout, byte-identical stderr). Existing failures
 //! print the same human text in every output mode; `--yaml` adds no error
@@ -20,6 +25,10 @@
 
 use std::path::Path;
 use std::process::{Command, Output};
+
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::TestDaemon;
 
 use assert_cmd::prelude::*;
 use clap::{CommandFactory, Parser};
@@ -187,6 +196,8 @@ const CROSS_PARSER_TITLES: &[&str] = &[
 ];
 
 struct Project {
+    /// Dropped first: the daemon is stopped before its project directory goes.
+    daemon: Option<TestDaemon>,
     dir: tempfile::TempDir,
     agent: String,
     other_agent: String,
@@ -196,7 +207,7 @@ struct Project {
     run: Option<String>,
 }
 
-fn orch_in(dir: &Path, cwd: &Path) -> Command {
+fn orch_in(dir: &Path, cwd: &Path, daemon: Option<&TestDaemon>) -> Command {
     let mut command = Command::cargo_bin("orch").expect("the orch binary");
     command
         .current_dir(cwd)
@@ -211,7 +222,16 @@ fn orch_in(dir: &Path, cwd: &Path) -> Command {
         // `true`, and `doctor`-style probes find nothing real to exec.
         .env("PATH", "/usr/bin:/bin")
         .env_remove("RUST_LOG")
+        // The test runner can itself be an orchestrated agent: do not inherit
+        // its identity (the daemon refuses an agent context; `msg send` uses
+        // it as the sender).
+        .env_remove("ORCH_AGENT_ID")
+        .env_remove("ORCH_AGENT_NAME")
+        .env_remove("ORCH_TASK_ID")
         .env_remove("ORCHESTRY_DEBUG");
+    if let Some(daemon) = daemon {
+        daemon.apply(&mut command);
+    }
     command
 }
 
@@ -237,7 +257,16 @@ impl Project {
     }
 
     fn orch(&self) -> Command {
-        orch_in(self.dir.path(), &self.root())
+        orch_in(self.dir.path(), &self.root(), self.daemon.as_ref())
+    }
+
+    /// Start the project's explicit test daemon (the project is initialised).
+    fn start_daemon(&mut self) {
+        assert!(self.daemon.is_none(), "daemon already started");
+        self.daemon = Some(TestDaemon::start(
+            &self.root(),
+            &self.dir.path().join("home"),
+        ));
     }
 
     /// `orch <args> --json`, parsed.
@@ -330,6 +359,7 @@ fn project(with_run: bool) -> Project {
     let dir = scratch();
     let root = dir.path().join("p");
     let mut p = Project {
+        daemon: None,
         dir,
         agent: String::new(),
         other_agent: String::new(),
@@ -343,8 +373,11 @@ fn project(with_run: bool) -> Project {
             .args(["init", "--name", "contract", "--adapter", "shell"]),
     );
     seed_commit(p.dir.path(), &root);
-    let agent = |name: &str, role: &str| {
-        id_of(&parse_json(&success(orch_in(p.dir.path(), &root).args([
+    // Every command (including `run <id>`) is a daemon client: the explicit
+    // test daemon runs before the first seeding command.
+    p.start_daemon();
+    let agent = |p: &Project, name: &str, role: &str| {
+        id_of(&parse_json(&success(p.orch().args([
             "agent",
             "add",
             name,
@@ -357,8 +390,10 @@ fn project(with_run: bool) -> Project {
             "--json",
         ]))))
     };
-    p.agent = agent("alpha", "plain role");
-    p.other_agent = agent("beta", "colon: role\nwith a second line");
+    let alpha = agent(&p, "alpha", "plain role");
+    let beta = agent(&p, "beta", "colon: role\nwith a second line");
+    p.agent = alpha;
+    p.other_agent = beta;
     for title in TRICKY_TITLES {
         success(p.orch().args(["task", "add", title, "--json"]));
     }
@@ -476,7 +511,8 @@ yaml_equals_json!(logs_run_events_yaml_equals_json, true, |p| {
 #[test]
 fn empty_collections_round_trip_to_empty_sequences() {
     let dir = scratch();
-    let p = Project {
+    let mut p = Project {
+        daemon: None,
         dir,
         agent: String::new(),
         other_agent: String::new(),
@@ -489,6 +525,7 @@ fn empty_collections_round_trip_to_empty_sequences() {
         p.orch()
             .args(["init", "--name", "empty", "--adapter", "shell"]),
     );
+    p.start_daemon();
     for args in [
         ["agent", "list"],
         ["task", "list"],
@@ -652,9 +689,14 @@ fn write_commands_print_the_same_shape_in_yaml_as_in_json() {
 /// The failing invocation `args` behaves the same with `--yaml` as with
 /// `--json` and with neither flag: same exit code, same stdout bytes and the
 /// same stderr bytes. Returns the (shared) stderr for further assertions.
-fn assert_same_error_across_formats(cwd: &Path, home: &Path, args: &[&str]) -> Vec<u8> {
+fn assert_same_error_across_formats(
+    cwd: &Path,
+    home: &Path,
+    daemon: Option<&TestDaemon>,
+    args: &[&str],
+) -> Vec<u8> {
     let run = |flag: Option<&str>| {
-        let mut command = orch_in(home, cwd);
+        let mut command = orch_in(home, cwd, daemon);
         command.args(args);
         if let Some(flag) = flag {
             command.arg(flag);
@@ -689,26 +731,40 @@ fn assert_same_error_across_formats(cwd: &Path, home: &Path, args: &[&str]) -> V
 #[test]
 fn a_missing_agent_fails_under_yaml_like_under_json() {
     let p = project(false);
-    assert_same_error_across_formats(&p.root(), p.dir.path(), &["agent", "show", "agt_nope"]);
+    assert_same_error_across_formats(
+        &p.root(),
+        p.dir.path(),
+        p.daemon.as_ref(),
+        &["agent", "show", "agt_nope"],
+    );
 }
 
 #[test]
 fn a_missing_task_fails_under_yaml_like_under_json() {
     let p = project(false);
-    assert_same_error_across_formats(&p.root(), p.dir.path(), &["task", "show", "tsk_nope"]);
+    assert_same_error_across_formats(
+        &p.root(),
+        p.dir.path(),
+        p.daemon.as_ref(),
+        &["task", "show", "tsk_nope"],
+    );
 }
 
 #[test]
 fn an_uninitialized_project_fails_under_yaml_like_under_json() {
     let dir = scratch();
-    assert_same_error_across_formats(&dir.path().join("p"), dir.path(), &["task", "list"]);
+    assert_same_error_across_formats(&dir.path().join("p"), dir.path(), None, &["task", "list"]);
 }
 
 #[test]
 fn a_missing_agent_prints_identical_stderr_under_yaml_json_and_human() {
     let p = project(false);
-    let err =
-        assert_same_error_across_formats(&p.root(), p.dir.path(), &["agent", "show", "agt_nope"]);
+    let err = assert_same_error_across_formats(
+        &p.root(),
+        p.dir.path(),
+        p.daemon.as_ref(),
+        &["agent", "show", "agt_nope"],
+    );
     assert_eq!(
         String::from_utf8_lossy(&err),
         "  \u{2715} Agent not found: agt_nope\n"
@@ -718,8 +774,12 @@ fn a_missing_agent_prints_identical_stderr_under_yaml_json_and_human() {
 #[test]
 fn a_missing_task_prints_identical_stderr_under_yaml_json_and_human() {
     let p = project(false);
-    let err =
-        assert_same_error_across_formats(&p.root(), p.dir.path(), &["task", "show", "tsk_nope"]);
+    let err = assert_same_error_across_formats(
+        &p.root(),
+        p.dir.path(),
+        p.daemon.as_ref(),
+        &["task", "show", "tsk_nope"],
+    );
     assert_eq!(
         String::from_utf8_lossy(&err),
         "  \u{2715} Task not found: tsk_nope\n"
@@ -731,8 +791,12 @@ fn an_uninitialized_project_prints_identical_two_line_stderr_under_yaml_json_and
     // The message spans two lines; it is not a YAML document and must not be
     // reshaped into one under --yaml.
     let dir = scratch();
-    let err =
-        assert_same_error_across_formats(&dir.path().join("p"), dir.path(), &["task", "list"]);
+    let err = assert_same_error_across_formats(
+        &dir.path().join("p"),
+        dir.path(),
+        None,
+        &["task", "list"],
+    );
     assert_eq!(
         String::from_utf8_lossy(&err),
         "  \u{2715} Not initialized\n    Run: orch init\n"

@@ -47,6 +47,10 @@ A message sent to all agents, or to the members of one team. See [Messages](02-c
 **cancelled**
 The task status after you cancel a task. You can retry it. See [Task lifecycle](02-concepts.md#task-lifecycle).
 
+**client**
+Any orch command, the dashboard, `orch web` or `orch mcp` that asks the project's daemon to do its work. A
+client never opens the project's files and never starts a daemon. See [The orch daemon](18-daemon.md).
+
 **context**
 A shared key-value store that agents and you read and write with `orch context`. See
 [Context](02-concepts.md#context).
@@ -56,12 +60,22 @@ The machine that sends tasks to remote workers. See [Remote agents](11-remote-ag
 
 ## D
 
+**daemon**
+The one orch process that owns a project: it reads and writes `.orchestry/`, starts and stops the agents and runs
+the orchestrator. You start it yourself with `orch daemon start`, `orch serve` or `orch run --watch`. See
+[The orch daemon](18-daemon.md).
+
 **dashboard**
 The terminal interface you open with `orch tui`. See [Dashboard](08-dashboard.md).
 
 **dependency**
 A task that must be `done` before another task can start. You set it with `--depends-on`. See
 [Tasks](02-concepts.md#tasks).
+
+**dispatch**
+Whether the daemon starts waiting tasks by itself. Off when a daemon starts, unless you ask for it; turn it on or
+off with `orch daemon dispatch on|off` or the dashboard's watch toggle. See
+[How `serve`, `run` and the dashboard map to the daemon](18-daemon.md#how-serve-run-and-the-dashboard-map-to-the-daemon).
 
 **disabled**
 An agent status. A disabled agent gets no work until you enable it. See
@@ -148,12 +162,8 @@ A copy of a controller's task on a worker. The worker runs the mirror and report
 
 ## O
 
-**observer**
-A dashboard that shows a project without running its orchestrator, because another process already does. See
-[The orchestrator](02-concepts.md#the-orchestrator).
-
 **orchestrator**
-orch's scheduling loop. It starts ready tasks on idle agents, retries failures and stops stalled runs. Some other documents call it the "engine". See
+orch's scheduling loop, inside the daemon. It starts ready tasks on idle agents, retries failures and stops stalled runs. Some other documents call it the "engine". See
 [The orchestrator](02-concepts.md#the-orchestrator).
 
 **OSC 52**

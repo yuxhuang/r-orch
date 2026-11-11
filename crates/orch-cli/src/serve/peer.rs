@@ -31,6 +31,63 @@ mod tests {
     use orch_core::storage::ConfigStore;
     use orch_infra::storage::{FileConfigStore, Paths};
 
+    /// A signal landing on the reading thread interrupts a timed read with
+    /// EINTR before any byte could arrive, which says nothing about whether a
+    /// Hello was answered. Retry until the deadline so only a real answer or
+    /// a timeout is reported.
+    fn read_retrying_interrupts(
+        window: std::time::Duration,
+        mut read: impl FnMut(std::time::Duration) -> std::io::Result<usize>,
+    ) -> std::io::Result<usize> {
+        let deadline = std::time::Instant::now() + window;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::ErrorKind::TimedOut.into());
+            }
+            match read(remaining) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => return other,
+            }
+        }
+    }
+
+    #[test]
+    fn an_interrupted_read_is_retried_until_the_deadline_answer() {
+        let mut calls = 0;
+        let result = read_retrying_interrupts(std::time::Duration::from_secs(5), |_| {
+            calls += 1;
+            if calls < 3 {
+                Err(std::io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!((result.unwrap(), calls), (7, 3));
+    }
+
+    #[test]
+    fn a_read_interrupted_past_the_deadline_reports_a_timeout() {
+        let result = read_retrying_interrupts(std::time::Duration::from_millis(20), |_| {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            Err(std::io::ErrorKind::Interrupted.into())
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_non_interrupt_read_error_is_returned_unretried() {
+        let mut calls = 0;
+        let result = read_retrying_interrupts(std::time::Duration::from_secs(5), |_| {
+            calls += 1;
+            Err(std::io::ErrorKind::ConnectionReset.into())
+        });
+        assert_eq!(
+            (result.unwrap_err().kind(), calls),
+            (std::io::ErrorKind::ConnectionReset, 1)
+        );
+    }
+
     // A listener that accepts during the first tick can exhaust descriptors
     // before startup's fallible filesystem work has completed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -74,12 +131,13 @@ mod tests {
                 let mut client =
                     std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)).unwrap();
                 client
-                    .set_read_timeout(Some(Duration::from_millis(250)))
-                    .unwrap();
-                client
                     .write_all(b"{\"t\":\"hello\",\"proto\":1,\"instance_id\":\"early\",\"name\":\"early\",\"os\":\"linux\",\"agents\":[]}\n")
                     .unwrap();
-                *recorded.lock().unwrap() = Some(client.read(&mut [0u8; 1]));
+                let result = read_retrying_interrupts(Duration::from_millis(250), |remaining| {
+                    client.set_read_timeout(Some(remaining))?;
+                    client.read(&mut [0u8; 1])
+                });
+                *recorded.lock().unwrap() = Some(result);
             },
         );
         let runtime = start_watch(
@@ -210,11 +268,20 @@ mod tests {
             skip_autonomous_seeding: true,
             handle_signals: false,
         };
-        let status = || crate::commands::remote::listener_status(&paths, true);
+        // The published listener record (the daemon reports it through
+        // remote.status; this in-process runtime has no daemon to ask).
+        let record = paths.remotes_dir().join("_listener.json");
+        let published = || async {
+            let listener: Option<serde_json::Value> =
+                orch_infra::storage::fs_utils::read_json(&record)
+                    .await
+                    .unwrap();
+            listener.and_then(|value| value["listen_addr"].as_str().map(str::to_owned))
+        };
         let runtime = start_watch(Arc::clone(&engine), options()).await.unwrap();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         let addr = loop {
-            if let Some(addr) = status().await.unwrap().addr {
+            if let Some(addr) = published().await {
                 break addr;
             }
             assert!(
@@ -232,11 +299,8 @@ mod tests {
         // The TUI's `/pause`: stop the engine, then drop its peer runtime.
         engine.orchestrator.stop().await.unwrap();
         drop(runtime);
-        assert_eq!(
-            status().await.unwrap(),
-            crate::commands::remote::ListenerStatus::default()
-        );
-        assert!(!paths.remotes_dir().join("_listener.json").exists());
+        assert_eq!(published().await, None);
+        assert!(!record.exists());
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::net::TcpStream::connect(&addr).await.is_ok() {
             assert!(tokio::time::Instant::now() < deadline, "socket stayed open");

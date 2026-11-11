@@ -3,8 +3,19 @@
 //! Every websocket connection gets its own pseudo-terminal running `orch tui`
 //! ([`pty`]), bridged to an xterm.js page. Binary frames carry raw terminal
 //! bytes both ways; text frames carry JSON control messages
-//! ([`parse_resize`]). Extra tabs are not shared sessions: the TUI's own lock
-//! fallback makes the second and later ones observers.
+//! ([`parse_resize`]). Extra tabs are not shared sessions: each one's
+//! `orch tui` is its own client of the project's daemon, and they all see the
+//! same state because the daemon is its only writer.
+//!
+//! `orch web` is a daemon client too (plan Q0b): it checks for the project's
+//! daemon before it listens (none: the frozen NoDaemon message and exit 7),
+//! and again before every page and websocket it serves. When the daemon has
+//! gone away meanwhile, those answer **HTTP 503** with the same message, so a
+//! browser tab that is already open learns why; a session that is already
+//! running shows the TUI's own no-daemon screen. Nothing here starts a daemon
+//! (goal row 3). The 503 body names the project only to a request that
+//! presented the credential; with `--no-auth` it is the generic
+//! `orch daemon unavailable` (design D5).
 //!
 //! This is remote code execution as the user (agents may run with permission
 //! checks off), so the safety rules are the point of the module:
@@ -49,6 +60,7 @@ use axum::routing::get;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use orch_core::error::{Error, Result};
+use orch_proto::handshake::CallerKind;
 use portable_pty::PtySize;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -107,6 +119,7 @@ pub struct WebOptions<'a> {
     pub env_password: Option<String>,
     pub no_auth: bool,
     pub allow_hosts: &'a [String],
+    /// The removed `--observe`; refused by [`WebArgs::parse`].
     pub observe: bool,
 }
 
@@ -115,13 +128,19 @@ pub struct WebArgs {
     pub bind: SocketAddr,
     pub auth: Auth,
     pub allow_hosts: Vec<String>,
-    pub observe: bool,
 }
 
 impl WebArgs {
     /// Apply the bind/credential rules. An empty password counts as unset, so
     /// an empty `ORCH_WEB_PASSWORD` cannot silently change the mode.
     pub fn parse(options: WebOptions<'_>) -> std::result::Result<Self, String> {
+        if options.observe {
+            return Err(
+                "orch web --observe was removed: every dashboard is a client of the \
+                        project's daemon"
+                    .to_owned(),
+            );
+        }
         let bind: SocketAddr = options.bind.parse().map_err(|_| {
             format!(
                 "Invalid --bind \"{}\". Expected <addr>:<port>",
@@ -164,7 +183,6 @@ impl WebArgs {
             bind,
             auth,
             allow_hosts,
-            observe: options.observe,
         })
     }
 
@@ -308,6 +326,9 @@ pub struct WebState {
     failures: FailureTracker,
     slots: Arc<AtomicUsize>,
     shutdown: CancellationToken,
+    /// Opens a session to the project's daemon: the preflight before every
+    /// page and websocket.
+    daemon: crate::tui::Connector,
 }
 
 struct Secret {
@@ -325,7 +346,14 @@ impl Secret {
 }
 
 impl WebState {
-    pub fn new(auth: &Auth, hosts: HostPolicy, spawn: SpawnSpec) -> Self {
+    /// `daemon` is how the server checks for the project's daemon; `orch web`
+    /// passes the production connector, tests an in-process harness one.
+    pub fn new(
+        auth: &Auth,
+        hosts: HostPolicy,
+        spawn: SpawnSpec,
+        daemon: crate::tui::Connector,
+    ) -> Self {
         let secret = |value: &str, accepts_query_token| {
             Some(Secret {
                 digest: Sha256::digest(value.as_bytes()).into(),
@@ -343,6 +371,27 @@ impl WebState {
             failures: FailureTracker::default(),
             slots: Arc::new(AtomicUsize::new(0)),
             shutdown: CancellationToken::new(),
+            daemon,
+        }
+    }
+
+    /// Is the project's daemon answering? `Err` carries the frozen text in
+    /// this server's variant (owner or agent).
+    pub async fn daemon_check(&self) -> std::result::Result<(), DaemonDown> {
+        match tokio::time::timeout(PREFLIGHT_TIMEOUT, self.daemon.connect()).await {
+            Ok(Ok(_session)) => Ok(()),
+            Ok(Err(error)) => Err(DaemonDown {
+                message: error.render(self.daemon.agent_context()),
+                exit_code: error.exit_code(),
+            }),
+            Err(_) => Err(DaemonDown {
+                message: orch_client::NoDaemon::no_daemon(
+                    &self.daemon.project_root().to_string_lossy(),
+                    orch_proto::error::NoDaemonDetail::Timeout,
+                )
+                .render(self.daemon.agent_context()),
+                exit_code: 7,
+            }),
         }
     }
 
@@ -356,6 +405,41 @@ impl WebState {
         self.shutdown.cancel();
     }
 }
+
+/// The command line of a session's `orch tui`: the root `--agent` goes before
+/// the command, as on the user's own command line. `agent` was validated by
+/// [`orch_client::ClientConfig::with_agent`] (a bounded id), and is passed as
+/// one argv element, never through a shell.
+fn tui_child_args(agent: Option<&str>) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(agent) = agent {
+        args.push("--agent".into());
+        args.push(agent.into());
+    }
+    args.push("tui".into());
+    args
+}
+
+/// Why the daemon check failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonDown {
+    /// The frozen two-line message (spec R5/R6).
+    pub message: String,
+    /// 7 for every NoDaemon form; 3 when the directory is not a project.
+    pub exit_code: i32,
+}
+
+/// The 503 body for a request that did not present a credential (only
+/// possible with `--no-auth`): no project path, no socket path (design D5).
+pub const DAEMON_UNAVAILABLE: &str = "orch daemon unavailable\n";
+
+/// The bound on one preflight: the client's own deadlines already bound it
+/// (its busy wait, then one last dial and handshake); this is the outer guard
+/// for a socket that accepts and stalls. Shorter, it would cut the busy wait
+/// and report a busy daemon as absent.
+const PREFLIGHT_TIMEOUT: Duration = orch_client::BUSY_WAIT
+    .saturating_add(orch_proto::handshake::CONNECT_TIMEOUT)
+    .saturating_add(orch_proto::handshake::HANDSHAKE_TIMEOUT);
 
 /// A JSON text frame from the browser. Anything that does not parse, or has an
 /// out-of-range size, is ignored by [`parse_resize`].
@@ -386,6 +470,9 @@ pub fn router(state: Arc<WebState>) -> Router {
             get(|| async { Html(include_str!("assets/index.html")) }),
         )
         .route("/ws", get(ws_handler))
+        // Innermost: only a request that passed the credential check (or an
+        // open server) reaches the daemon preflight.
+        .route_layer(middleware::from_fn_with_state(state.clone(), daemon_guard))
         .route_layer(middleware::from_fn_with_state(state.clone(), auth));
     // Compiled in and immutable; they carry no secret.
     let assets = Router::new()
@@ -474,6 +561,38 @@ async fn host_guard(
         return reply(StatusCode::FORBIDDEN, "host not allowed\n");
     }
     next.run(request).await
+}
+
+/// The daemon preflight for the page and the websocket: 503 with the frozen
+/// message when the project's daemon is not answering (plan Q0b). Runs after
+/// [`auth`], so the project path is only ever shown to a request that
+/// presented the credential; an open server answers the generic text.
+async fn daemon_guard(
+    State(state): State<Arc<WebState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match state.daemon_check().await {
+        Ok(()) => next.run(request).await,
+        Err(down) => {
+            eprintln!(
+                "orch web: answered {peer} with 503: {}",
+                down.message.lines().next().unwrap_or_default().trim()
+            );
+            let body = if state.secret.is_some() {
+                format!("{}\n", down.message)
+            } else {
+                DAEMON_UNAVAILABLE.to_owned()
+            };
+            let mut response = (StatusCode::SERVICE_UNAVAILABLE, body).into_response();
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            response
+        }
+    }
 }
 
 /// Credentials for the page and the websocket.
@@ -762,22 +881,42 @@ async fn shutdown_signal() {
 
 /// `orch web`: serve until interrupted, then give open sessions their
 /// shutdown grace (so their agents are stopped, not orphaned) and exit.
+///
+/// Preflights the project's daemon first: with none answering it prints the
+/// frozen message and exits 7 without listening (plan Q0b).
 pub async fn run(args: WebArgs, cwd: PathBuf) -> Result<ExitCode> {
+    run_as_agent(args, cwd, None).await
+}
+
+/// `orch [--agent <id>] web`: [`run`] as the caller `agent` names (the root
+/// `--agent`, design R8). The preflight runs as that caller, and every
+/// session's `orch tui` gets the same `--agent` on its command line; nothing
+/// in this process's environment is changed.
+pub async fn run_as_agent(args: WebArgs, cwd: PathBuf, agent: Option<&str>) -> Result<ExitCode> {
     let program = std::env::current_exe()
         .map_err(|err| Error::io("locate the orch executable", &cwd, err))?;
-    let mut tui_args = vec!["tui".into()];
-    if args.observe {
-        tui_args.push("--observe".into());
-    }
+    let config = orch_client::ClientConfig::from_env(cwd.clone())
+        .and_then(|config| config.with_agent(agent))
+        .map_err(|err| Error::invalid_arguments(err.to_string()))?;
+    let daemon = crate::tui::Connector::from_config(config, CallerKind::Web);
+    // Every session's `orch tui` inherits this environment, so it reaches the
+    // same daemon (ORCH_SOCKET / ORCH_PROJECT_ROOT) as the same caller
+    // (ORCH_AGENT_ID, or the `--agent` passed on), exactly as before.
+    let child_args = tui_child_args(agent);
     let state = Arc::new(WebState::new(
         &args.auth,
         HostPolicy::new(args.bind.ip().is_loopback(), args.allow_hosts.clone()),
         SpawnSpec {
             program,
-            args: tui_args,
+            args: child_args,
             cwd: cwd.clone(),
         },
+        daemon,
     ));
+    if let Err(down) = state.daemon_check().await {
+        eprintln!("{}", down.message);
+        return Ok(ExitCode::from(u8::try_from(down.exit_code).unwrap_or(1)));
+    }
 
     let listener = tokio::net::TcpListener::bind(args.bind)
         .await
@@ -848,6 +987,17 @@ mod tests {
             bind,
             ..WebOptions::default()
         }
+    }
+
+    #[test]
+    fn a_session_tui_carries_the_root_agent_before_the_command() {
+        assert_eq!(tui_child_args(None), vec![std::ffi::OsString::from("tui")]);
+        assert_eq!(
+            tui_child_args(Some("agt_x")),
+            ["--agent", "agt_x", "tui"]
+                .map(std::ffi::OsString::from)
+                .to_vec()
+        );
     }
 
     #[test]

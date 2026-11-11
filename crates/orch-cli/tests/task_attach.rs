@@ -5,6 +5,15 @@
 //! Every case drives the real binary in a throwaway project with a throwaway
 //! `HOME`, `PATH=/usr/bin:/bin` and only the `shell` adapter configured; no
 //! scheduler runs, so nothing is dispatched.
+//!
+//! `task add` is a daemon RPC since S2a-cli, so `Project::new` starts an
+//! explicit test daemon on an isolated socket right after `orch init` (see
+//! `tests/common/daemon.rs`). `--attach` paths are absolutised by the client
+//! (relative to its own cwd) before the request crosses the socket, so the
+//! daemon opens an absolute path regardless of its own cwd; the
+//! byte-identical and basename assertions below read `.orchestry` straight
+//! off disk from the test process, which is fine — those reads never write,
+//! and the daemon is the only writer.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -12,8 +21,20 @@ use std::process::{Command, Output};
 use assert_cmd::prelude::*;
 use serde_json::Value;
 
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::TestDaemon;
+
 struct Project {
+    // Dropped first: the daemon stops before its project directory goes.
+    daemon: Option<TestDaemon>,
     dir: tempfile::TempDir,
+}
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        daemon::unregister_project(&self.root());
+    }
 }
 
 impl Project {
@@ -31,12 +52,17 @@ impl Project {
         for sub in ["home", "p", "files"] {
             std::fs::create_dir_all(dir.path().join(sub)).expect("scratch dir");
         }
-        let project = Project { dir };
+        let mut project = Project { daemon: None, dir };
         success(
             project
                 .orch()
                 .args(["init", "--name", "attach", "--adapter", "shell"]),
         );
+        // `task add` is a daemon RPC: the explicit test daemon runs before
+        // any seeding command issues.
+        let daemon = TestDaemon::start(&project.root(), &project.dir.path().join("home"));
+        daemon::register_project(&project.root(), &daemon);
+        project.daemon = Some(daemon);
         project
     }
 
@@ -65,6 +91,7 @@ impl Project {
             .env("PATH", "/usr/bin:/bin")
             .env_remove("RUST_LOG")
             .env_remove("ORCHESTRY_DEBUG");
+        daemon::apply_for(&self.root(), &mut command);
         command
     }
 

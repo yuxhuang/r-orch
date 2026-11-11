@@ -11,12 +11,19 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 
 | Symptom | Go to |
 |---|---|
+| `No orch daemon is running for <project root>` (exit 7), from any command, the dashboard, `orch web` or an MCP client | [No orch daemon is running](#no-orch-daemon-is-running-for-project-root) |
+| How do I start, see or stop the daemon? | [Start, check and stop the daemon](#start-check-and-stop-the-daemon) |
+| `orch daemon start` exits 2 naming the socket, or `connection refused` in the no-daemon detail | [A stale or stuck socket](#a-stale-or-stuck-socket) |
+| The daemon crashed or was killed | [After a daemon crash](#after-a-daemon-crash-or-kill--9) |
+| `daemon is orch … protocol …, this client is orch …`, or upgrading orch | [Version skew and upgrading](#version-skew-and-upgrading-orch) |
+| Commands time out, or `orch daemon stop` says the PID is still running | [A hung daemon](#a-hung-daemon) |
+| `orch` commands, the dashboard or MCP tools are slow while many tasks fail to start | [Commands are slow while many tasks fail to start](#orch-commands-are-slow-while-many-tasks-fail-to-start) |
 | `Orchestrator already running (PID: undefined)` and nothing is running | [Corrupt lock file](#corrupt-lock-file) |
 | `serve --once` never exits | [`serve --once` hangs on review](#serve---once-hangs-on-a-task-in-review) |
-| `task show <id>` works but `task list` omits the task | [Rebuilding an index](#rebuilding-an-index-after-a-lost-update) |
+| `task show <id>` works but `task list` omits the task | [Rebuilding an index](#rebuilding-an-index-after-a-lost-update) (legacy procedure) |
 | Every command fails after a crash or power loss | [state.json recovery](#statejson-parse-failure) |
 | `.state.json.*.tmp` files piling up | [Temp-file litter](#state-file-temp-litter) |
-| `serve:started` logged but the daemon is not up | [serve:started ordering](#servestarted-precedes-the-lock-check) |
+| `serve:started` logged but the daemon is not up | [serve:started ordering](#servestarted-precedes-the-batch-check) |
 | Need to see what r-orch is doing internally | [Debugging](#debugging) |
 | Agent processes still running after a cancel | [Stray agent subprocesses](#stray-agent-subprocesses-after-a-cancel) |
 | An agent has run for hours and nothing stopped it | [`timeout_ms` is not a timeout](#timeout_ms-is-not-a-timeout) |
@@ -34,10 +41,265 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | `org deploy` failed half way, or a template will not load or change | [Organization templates: failures and recovery](#organization-templates-failures-and-recovery) |
 | A task stays `todo` with `configuration preflight` or the eco/custom-template message, or a run fails before start with `effort preparation failed` | [Prompt mode and effort failures](#prompt-mode-and-effort-failures) |
 | A goal was resumed but its checkpoint or continuation stays `cancelled` and the tasks after it never start | [A resumed goal leaves cancelled tasks cancelled](#a-resumed-goal-leaves-cancelled-tasks-cancelled) |
-| Data lost or overwritten while `orch mcp` clients and other writers shared a project | [Recovering after concurrent MCP writers](#recovering-after-concurrent-mcp-writers) |
-| Every `orch mcp` tool and resource call fails with a configuration error | [Restoring a configuration broken through the MCP server](#restoring-a-configuration-broken-through-the-mcp-server) |
+| Data lost or overwritten while orch 0.13.0 `orch mcp` clients and other writers shared a project | [Recovering after concurrent MCP writers](#recovering-after-concurrent-mcp-writers) (legacy) |
+| `orch status`, `orch task list` or the MCP `status` tool fails with `parse <project>/.orchestry/config.yml`, or a new `orch mcp` session fails `initialize` with it | [Restoring a broken configuration](#restoring-a-broken-configuration) |
 | No trace of what an `orch mcp` server did, or its client discards stderr | [Capturing `orch mcp` diagnostics](#capturing-orch-mcp-diagnostics) |
 | An `orch mcp` server does not answer, every call is `Not executed: timed out …`, or a server outlives its client | [A stuck or leftover `orch mcp` process](#a-stuck-or-leftover-orch-mcp-process) |
+
+---
+
+## The orch daemon
+
+<!-- W2 (PR 2, tsk_M9AsDfP): written to wave-c-brief.md "PR 2 contract" items 1-4 and 7, spec "Normative recovery
+table" and "Uniform failure contract" (R5, R6, R14, R18, R35), design D3/D5/D13 and ADR 0012. Refusal texts are
+from crates/orch-daemon/src/lifecycle.rs and crates/orch-proto/src/error.rs at the PR 1 frozen SHA 6a7a6481.
+The board-2 fact-check (tsk_eVo3agZ) checked the rest at run time at the PR 2 head f70fc707. -->
+
+Every orch command that reads or changes a project, the dashboard, `orch web` and `orch mcp` talk to the project's
+daemon. **Nothing starts the daemon but you.** The operator's reference is [manual chapter 18](manual/18-daemon.md);
+the normative contract is the spec's
+[recovery table](specs/2026-11-09-daemon-owned-state.md#normative-recovery-table). These entries are the
+procedures.
+
+### Start, check and stop the daemon
+
+| To | Run | Expect |
+|---|---|---|
+| Start it in this terminal, dispatch off | `orch daemon start` | `listening <socket>`, then the dispatch state; it runs until stopped |
+| Start it in the background | `orch daemon start --detach` | Returns 0 only once the daemon is ready; output goes to `.orchestry/daemon.log` |
+| Start it with dispatch on | `orch serve`, `orch run --watch` or `orch daemon start --dispatch on` | As above, dispatch on |
+| See it | `orch daemon status` | `orch daemon PID <pid> · dispatch ON\|OFF`, then its socket, instance, running tasks and ownership; exit 7 if none answers |
+| Turn dispatch on or off | `orch daemon dispatch on` / `off` | Off does not stop running agents |
+| Stop it | `orch daemon stop` | Returns once the daemon has confirmed its cleanup and released the project, by exiting or by releasing its ownership lock (at most 30 s); agents get the usual 10 s grace and their runs end `cancelled` |
+
+`Ctrl+C`, SIGTERM and SIGHUP (closing the terminal or tmux pane of a foreground daemon) stop it cleanly, like
+`orch daemon stop`. A detached daemon survives closing its terminal or pane; it does not survive a reboot, and orch
+supplies no launchd job, watchdog or restart.
+
+To see which orch processes run, `pgrep -fl orch` lists the daemon (`orch daemon start`, `orch serve` or
+`orch run --watch`) and its clients (`orch mcp`, `orch tui`, `orch web`) separately.
+
+### `No orch daemon is running for <project root>`
+
+**Symptom.** A command, the dashboard, `orch web` or an MCP client reports, with exit 7 (`exit_code` 7 in MCP):
+
+```text
+  ✕ No orch daemon is running for <project root> (<detail>)
+    Start it with: orch daemon start
+```
+
+**Cause.** No daemon answers for this project. The detail says why: `no daemon.json`, `no socket`,
+`connection refused` (a socket left by a daemon that exited or was killed), `timed out`, `permission denied`,
+`handshake failed`, `connection lost` or `daemon is stopping`. Clients never start, restart or repair a daemon, and
+never delete its socket or `daemon.json`.
+
+**Fix.**
+
+1. Check that the project is the one you expect: the message names its root. If not, check `ORCH_PROJECT_ROOT`,
+   `ORCH_SOCKET` and your working directory ([Which project](manual/18-daemon.md#which-project)).
+2. Start the daemon: `orch daemon start` (or `--detach`).
+3. Retry the command. In an MCP client, reconnect or restart the MCP session: not every client re-initialises by
+   itself.
+
+**In an agent's environment** (`ORCH_TASK_ID` or `ORCH_AGENT_ID` set) the message reads
+`The orch daemon for <root> is not running. Do not start it; report this to the owner and stop.` The agent is
+meant to stop and report; you start the daemon, then inspect the task, its run and what it changed before you
+retry it. A restart does not resume the agent's conversation. `orch daemon start`, `orch serve` and
+`orch run --watch` refuse to start from such an environment (exit 2); each accepts `--from-agent` to override
+that on purpose.
+
+**Not this entry:** `daemon_busy` (the daemon runs but found no room for the client within 10 s, for a session
+or for the connection itself, so the count can read `1/64 sessions`: close clients and retry), `wrong_project` (the socket
+belongs to another project: fix `ORCH_SOCKET`/`ORCH_PROJECT_ROOT`), `Cannot confirm the orch request outcome`
+(the reply was lost: read the state before you retry; see
+[the manual](manual/18-daemon.md#when-no-daemon-answers)).
+
+### A stale or stuck socket
+
+**Symptom.** `connection refused` in the no-daemon detail, or `orch daemon start` exits 2 naming the socket path.
+
+**Cause and fix.** Only an explicit start replaces a socket, and only one it can prove dead:
+
+| `orch daemon start` says | Meaning | Fix |
+|---|---|---|
+| nothing; it starts | Connecting to the old socket was refused, so nobody listens: the start replaced it | None |
+| `<path> already has a live listener; another daemon or program uses it. Set ORCH_SOCKET to a different path` | Something answers on that path | `orch daemon status`. If a daemon of this project runs, use it. If another program owns the path, give this project its own `ORCH_SOCKET` |
+| `<path> could not be probed (<reason>), so it may still have a live listener; it was left alone. Check its owner and mode, or set ORCH_SOCKET to a different path` | The connect failed with something other than connection refused, for example permission denied | Check the socket's owner and mode (`ls -l <path>`). Remove it yourself only after `orch daemon status` and `pgrep -fl orch` show no daemon for this project |
+| `<path> is a symbolic link` (or `a regular file`, `not a socket`, `a socket owned by another user`)`; it is never removed automatically. Remove it yourself or set ORCH_SOCKET to a different path` | The path is not this user's socket | Inspect it and remove it yourself if it is yours and unused |
+
+Never delete `.orchestry/run/orch.sock` or `.orchestry/daemon.json` while a daemon runs: its clients find it
+through them, and it cannot republish them.
+
+**Give each project its own socket.** A project is identified by the device and inode of its `.orchestry/`
+directory. On a file system that reuses inodes, two projects pointed at one `ORCH_SOCKET` path can, in a narrow
+window, have one daemon remove the other's socket. Set `ORCH_SOCKET` per project, or leave it unset.
+<!-- ADR 0012 decision 9 note (ruling 8.15, architect message): (dev,ino) weaker on inode-reusing filesystems;
+remove_if_same safe under the project guard; residual ABA = two projects sharing a misconfigured ORCH_SOCKET. -->
+
+### After a daemon crash or `kill -9`
+
+**Symptom.** Every client reports no daemon (`connection refused` or `no socket`); nothing restarts it.
+
+**Fix.**
+
+1. Confirm no daemon of this project runs: `orch daemon status` exits 7, and `pgrep -fl orch` shows no
+   `orch daemon start`, `orch serve` or `orch run --watch` for it.
+2. Start it: `orch daemon start`. It starts with dispatch **off**, whatever it ran with before.
+3. At start it reconciles what the dead daemon left: stale claims are cleared; a run whose local agent died is
+   recorded `cancelled` and its agent `idle`; a run that was still preparing is cancelled; remote runs stay
+   unknown until their peer syncs. It also rebuilds any missing or corrupt `_index.json`.
+4. Inspect before you go on: `orch task list`, `orch logs --task <id>`, `orch daemon status`. Retry what needs it
+   (`orch task retry <id>`), then `orch daemon dispatch on`.
+
+If the start fails with exit 1 naming a write, recovery could not save a change (permissions, disk full). Fix the
+cause and start again; the state it needs is kept.
+
+### Version skew and upgrading orch
+
+**Symptom.** Every command fails with exit 7 and:
+
+```text
+  ✕ No orch daemon is running for <project root> (daemon is orch <a> protocol <n>, this client is orch <b> protocol <m>)
+    Start it with: orch daemon stop, then orch daemon start
+```
+
+**Cause.** The running daemon is a different orch or protocol version from the `orch` you ran. They refuse to talk,
+before any request is read, so nothing changed.
+
+**Fix (also the upgrade procedure).**
+
+1. `orch daemon stop`. It works with either binary, even after the old one was deleted. It stops the running agents
+   (10 s grace) and records their runs as `cancelled`: an upgrade is not transparent to running work, so do it when
+   nothing important runs.
+2. Install the new orch.
+3. `orch daemon start` (or `--detach`), then `orch daemon status`.
+4. Restart MCP sessions so that they run the new `orch mcp`.
+
+Developers: two builds with the same version and protocol cannot tell each other apart. Stop the daemon before
+you switch builds; `orch daemon status` shows the executable and start time of the one that runs.
+
+**Upgrading from orch 0.13.0** adds one step before the first start: stop **every** orch 0.13.0 process of the
+project, including `orch mcp` servers held by IDE, Claude Code or Codex sessions. They write `.orchestry/` without
+the daemon's locks. `pgrep -fl orch` must show none. See the [README](../README.md#upgrading-from-v0130).
+
+### A hung daemon
+
+orch never kills a daemon for you, and the PID in `daemon.json` is only a hint. Which fix applies depends on
+whether you already asked it to stop.
+
+**Symptom A.** Commands time out (`timed out`), and you have not run `orch daemon stop`.
+
+**Fix.** Signal it yourself, only after you verify it:
+
+1. Read the candidate PID: the `pid` field of `.orchestry/daemon.json`.
+2. `ps -p <pid> -o command=` must show an orch daemon (`orch daemon start`, `orch serve` or `orch run --watch`) for
+   this project. If it does not, or you cannot tell, **do not signal it**.
+3. `kill -TERM <pid>`: the same clean stop as `orch daemon stop`.
+4. When it has exited, `orch daemon start`.
+
+**Symptom B.** `orch daemon stop` reports `daemon accepted stop but PID <pid> is still running after 30 s`
+(exit 7), and `orch daemon start` then exits 4 with `orch daemon already running (PID <pid>)`.
+
+**Cause.** The daemon is finishing an operation it already accepted, such as a hung `git worktree add`, and owns
+the project until that call returns. Its shutdown is already under way, so **`kill -TERM` does nothing**.
+
+**Fix.** Wait: the daemon exits by itself when the call returns. To end it now, follow
+[manual 18, Recovery, row "`orch daemon stop` timed out"](manual/18-daemon.md#recovery):
+
+1. `ps -p <pid> -o command=` must show an orch daemon for this project. If it does not, **do not signal it**.
+2. List its child processes: `pgrep -P <pid>`.
+3. `kill -KILL <pid>`. Its children are not killed with it.
+4. Check each child with `ps -p <child-pid> -o command=` and stop it too, or wait until it has exited.
+5. `orch daemon start`. The new daemon reconciles the killed one's work as after a crash.
+<!-- Symptom B: N1 06a4ae1e (manual 18 "After a timeout the daemon can still own the project" and the Recovery
+row); stop-timeout text crates/orch-proto/src/error.rs:278 at f70fc707; release-eng measured the extra SIGTERM
+at cd0fd4c0 (tech-writer-stop-timeout-n1-ba1c717.md). Not reproduced at f70fc707 (needs a hung git worktree add). -->
+
+### A process is waiting to start
+
+On macOS the daemon admits complete process spawns one at a time. A diagnostic
+waiting or stuck in spawn does not make a queued agent launch hold the project
+operation boundary. Reads, queued task cancellation and goal pause can still
+complete. A task cancelled or paused while queued is checked again before launch.
+
+The private daemon log reports `process spawn pending` with `stage=Waiting` or
+`stage=Entered`, a generated `spawn_id`, fixed `site`, and monotonic `elapsed_ms`.
+The first warning is after 1 s; persistent warnings are at least 5 s apart per
+record. These are warning thresholds, not execution timeouts. Records are bounded
+(128 individual entries plus fixed overflow counts); the log includes no command,
+arguments, environment, prompt or process output. Records clear when that stage
+ends, including cancellation and spawn errors.
+
+With neither `RUST_LOG` nor `ORCHESTRY_DEBUG` set, explicit daemon starts
+(`daemon start`, detached starts, `serve`, and `run --watch`) enable these
+warnings alone. Foreground warnings go to stderr; detached warnings go to the
+existing private capped `.orchestry/daemon.log`. Other commands keep their quiet
+default. An explicit logging filter takes precedence, including `RUST_LOG=off`;
+SDK debug/trace payloads remain excluded even with a specific SDK directive.
+
+`Entered` means the actual synchronous spawn has begun. The OS call cannot be
+interrupted safely by dropping its caller. Stop first terminates registered agent
+groups; an unresolved entered diagnostic makes stop report incomplete and keeps
+project ownership until the late child has been killed/reaped and accepted work
+has drained. Do not start a second daemon while ownership is retained. An actual
+agent already inside spawn can still hold the final project boundary; this is
+separate from waiting behind an unrelated diagnostic. Use [A hung daemon](#a-hung-daemon)
+for owner-directed recovery.
+
+### `orch` commands are slow while many tasks fail to start
+
+**Symptom.** Dispatch is on and many tasks fail before their agent starts, for example because their workspace
+cannot be prepared. Meanwhile `orch task list`, `orch status`, the dashboard and MCP tools take noticeably longer
+than usual. In the [measured burst](manual/18-daemon.md#why-a-daemon), every sampled read succeeded; other requests
+can be refused at admission.
+
+**Cause.** Reads such as `orch task list` and `orch status` share a FIFO operation boundary with failure-record
+writes: each read waits behind operations already queued to acquire that boundary. This orders boundary
+acquisition, not every request's network arrival; some external operations do work outside it. These store
+writes await file sync and attempt a best-effort parent-directory sync before releasing the boundary. Read times
+depending on writes are a stated non-guarantee: see
+[What the daemon does not promise](manual/18-daemon.md#why-a-daemon).
+
+**What to check.**
+
+1. `orch daemon status` answers and shows `dispatch ON`. If it does not answer, this is not the entry: see
+   [No orch daemon is running](#no-orch-daemon-is-running-for-project-root).
+2. `orch task list --status retrying` lists tasks waiting for another attempt and exhausted tasks awaiting
+   final-failure recording; `orch task show <id>` shows the attempts already used, for example
+   `retrying · attempt 1/3`.
+3. Why they fail: `orch --json status` shows each waiting retry's error in `state.retry_queue[].error`, for
+   example `"error": "workspace_mode \"worktree\" requires a git repository"`. Once terminal `failed` is recorded,
+   the failed task and status retry queue no longer retain its workspace failure reason (pending PR-4 fix,
+   task tsk_R3FGvVF, continuing tsk_ajCzJGN). An exhausted `retrying · attempt 3/3` can still carry the reason
+   while final-failure recording is pending, so read it while the task is still `retrying`.
+
+**Fix.** For a finite burst with working storage, preparations stop at each task's attempt limit (`max_attempts`,
+3 unless set; [How orch retries by itself](manual/04-tasks.md#how-orch-retries-by-itself)). After final-failure
+recording succeeds, those tasks are `failed` and the burst's writes cease. Queueing alone needs no state
+recovery. This does not promise convergence or normal read times with failed or hung storage. If a cascade-list
+read fails during final recording, a task can remain exhausted `retrying` with its error and back-off; subsequent
+back-offs retry the recording without another workspace preparation. Resolve storage errors first. Two
+consecutive preparation-release errors can retain an agent reservation; cancelling the task does not free it.
+After storage recovery, explicitly stop and start the daemon to clear the reservation; this recovery is
+code-audited, not an end-to-end fault-recovery test result.
+
+To stop future starts and retries sooner, use `orch daemon dispatch off`; it does not cancel a preparation
+already executing or free a retained reservation. Fix the cause the errors name, then `orch task retry <id>`
+for each failed task and `orch daemon dispatch on`.
+
+If the error is `daemon operation queue is full or admission timed out` (`Overloaded`, `NotExecuted`), the
+request was not run and can be retried. An ordinary request still waiting to acquire the boundary after 10 s
+is refused this way; this is not a completion deadline for work already started. If the error instead says
+`request outcome unknown`, inspect state before retrying: the request may have applied. Exit 7 or elapsed time
+alone does not establish that nothing ran.
+<!-- A6 (tsk_I57BLvA). Queue and durable writes: see the comment under manual 18 "What the daemon does not promise".
+Steps 1-3 and the dispatch-off line run on a throwaway project with release a08fad1b (worktree agent in a non-git
+project); retry_queue error from orch --json status; reason gone once terminal failed is recorded:
+tsk_ajCzJGN (PR-4 continuation tsk_R3FGvVF). Corrections at 8a4c9eb4: dispatch.rs:313-346 and daemon.rs:278-283
+keep exhausted retrying/back-off after a cascade-list read error, retrying only recording. Reservation:
+daemon.rs:167-169,889-905; daemon/shutdown.rs:98-114; recovery.rs:368-371. Safe retry:
+coordinator.rs:150-190; orch-client/src/call.rs:62-65; orch-proto/src/error.rs:250-254,292-307.
+Fact-check tsk_FUuRgp8 reused isolated runtime evidence; restart recovery is code-audited only. -->
 
 ---
 
@@ -123,6 +385,15 @@ fail it, which is the worse failure mode.
 ---
 
 ## Rebuilding an index after a lost update
+
+> **Legacy procedure.** This entry describes orch 0.13.0, where several processes wrote the stores. With the
+> daemon as the only writer, two writers can no longer leave an index behind its files; a crash of the daemon
+> between the two writes still can. The daemon rebuilds a **missing or corrupt** `_index.json` at start, but not
+> one that is stale and still valid. The procedure with a daemon: `orch daemon stop`, remove the affected
+> `_index.json`, `orch daemon start`; never remove an index while the daemon runs. The 0.13.0 text below is
+> removed in a later release.
+<!-- W2: spec recovery table row "Crash between entity/index writes"; dissent-log W0 Q3; PR 2 contract item 7
+(mark legacy; deletion is PR 4). -->
 
 **Symptom.** `orch task show <id>` returns the task, but `orch task list` and `orch status` do not show it,
 and the orchestrator never dispatches it. The entity's `.yml` file exists on disk.
@@ -213,14 +484,15 @@ long-lived deployment.
 
 ---
 
-## `serve:started` precedes the lock check
+## `serve:started` precedes the batch check
 
-**Do not treat `serve:started` as "the daemon is up."** `orch serve` emits that record **before** acquiring
-the lock, so a `serve` that is about to exit 4 on a lock conflict still logs exactly one `serve:started` and
-no error record — the failure leaves by a path that bypasses the log pump.
+A foreground `orch serve` is the daemon and writes no `serve:started` record; treat it as up once it prints
+`listening <socket>`, or once `orch daemon status` exits 0.
 
-For monitoring, treat the daemon as up only once you see a record that implies the loop is running — an
-`orchestrator:tick`, or any `agent:*` record. The shape of the log contract is the reason this was not changed.
+`orch serve --once` logs `serve:started` after it has reached the daemon but before the daemon accepts the batch.
+When dispatch is on (exit 2) or another batch runs (exit 4) you get one `serve:started`, possibly `serve:diagnostic`
+records, no `serve:finished`, and the refusal on stderr. Treat a batch as running only after a later record, and
+check the exit code.
 
 ---
 
@@ -697,19 +969,21 @@ correction for a resize received together with a keypress; heading state-machine
 ## Structured output for `doctor`, `logs --follow` and `serve`
 
 **Symptom.** `orch --json doctor` (or `--yaml doctor`) piped into a parser fails on the first line;
-`orch --yaml logs --follow` or `orch --yaml serve` prints text or JSON Lines, not YAML.
+`orch --yaml logs --follow` or `orch --yaml serve --once` prints text or JSON Lines, not YAML.
 
 **Cause.**
 - `doctor` prints its human header (`  orch doctor · checking adapters and dependencies`) to **stdout** before the
   structured document, whichever of `--json` or `--yaml` is given. The header is older than `--yaml` (master
   prints it under `--json` too), and `--yaml` does not change it. Outside a project, `doctor` ignores both flags
   and prints the text report.
-- `logs --follow` prints a text banner and then live events; `serve` writes JSON Lines (`--log-format json`, the
-  default) or text. `--yaml` changes neither, and it never changes the on-disk `.jsonl` logs.
+- `logs --follow` prints a text banner and then live events; `serve --once` writes JSON Lines
+  (`--log-format json`, the default) or text. `--yaml` changes neither, and it never changes the on-disk `.jsonl`
+  logs. A foreground `serve` is the daemon: it prints `listening <socket>` and `dispatch on`, no event lines, and
+  its diagnostics go to stderr only with `RUST_LOG` (to `.orchestry/daemon.log` when detached).
 - A failing command prints its error as text on stderr under every output flag; stdout is empty.
 
 **Fix.** For `doctor`, drop the leading header lines before parsing: `orch --json doctor | sed '1,2d'`. For
-streams, parse the JSON Lines `serve` writes, or poll `orch --yaml logs --task <id>` for run metadata. To tell an
+streams, parse the JSON Lines `serve --once` writes, or poll `orch --yaml logs --task <id>` for run metadata. To tell an
 error from output, check the exit code; never parse stderr as YAML or JSON.
 
 ## File mutations: `update` and `patch` failures
@@ -840,8 +1114,15 @@ work to continue.
 
 ## Recovering after concurrent MCP writers
 
+> **Legacy procedure, for orch 0.13.0 only.** With the daemon every client, `orch mcp` included, goes through one
+> writer, so this hazard no longer arises between orch processes of this release
+> ([One writer: the daemon](manual/17-mcp-server.md#one-writer-the-daemon)). Use this entry only to repair a
+> project that orch 0.13.0 processes shared. The entry is removed in a later release.
+<!-- W2: goal row 9; ADR 0012 supersedes ADR 0011 decision 7 / D10; PR 2 contract item 7 (deletion is PR 4). -->
+
 Applies to projects that `orch mcp` clients share with other writers: `orch run --watch`, `orch serve`, the
-dashboard, other `orch mcp` processes and one-off `orch` commands ([manual](manual/17-mcp-server.md#concurrent-writers)).
+dashboard, other `orch mcp` processes and one-off `orch` commands of orch 0.13.0 (the 0.13.0 manual's "Concurrent
+writers" section; this release replaces it with [One writer: the daemon](manual/17-mcp-server.md#one-writer-the-daemon)).
 
 **Symptom.** A field you set through a tool, the CLI or the orchestrator is back to an older value (a task's
 status or assignee, an agent setting); a context key that was just set or renewed is gone; a task exists as a file
@@ -857,7 +1138,7 @@ the hazards of any two orch processes on one project:
 | Task/other whole-record updates | Single-file atomic writes; some authored-definition paths have `.definition.lock` | Concurrent owner status advancement and task assignment can overwrite one another's whole records. No compare-and-swap promise. |
 | Context expiry | list/get can delete expired entity files and list publishes a computed keep-list | Another writer's newly indexed key may disappear from that list; a renewal of an expired key may be deleted. Read-only sessions also participate. |
 | Messages | Store transaction holds its mutation lock across entity/index operations | Do not generalize weaker task/context guarantees to messages or imply a multi-service transaction. |
-| Process directory cache | Fresh Engines refresh config/service defaults, but `ensure_dir` retains a process-global set | Removing a cached directory can make later operations fail until process restart. |
+| Process directory cache | Fresh Engines refresh config/service defaults, but `ensure_dir` retains a process-global set | In orch 0.13.0, removing a cached directory can make later operations fail until process restart. The daemon of this release recreates the directory at its next write into it and needs no restart. |
 
 These interleavings are traced from the code; none is a measured failure rate. `--read-only` sessions are
 included: their context reads delete expired entries.
@@ -884,38 +1165,46 @@ included: their context reads delete expired entries.
    agents' outputs. Use the normal commands (`orch task assign`, `orch agent update`, `orch context set`), one
    writer at a time.
 7. Restart the orchestrator owner, then **every** MCP session (restart each client, or its MCP server). A restart
-   is required after a directory under `.orchestry/` was removed or replaced: each `orch mcp` process remembers the
-   directories it has created, and only a new process forgets them.
+   is required after a directory under `.orchestry/` was removed or replaced: each orch 0.13.0 `orch mcp` process
+   remembers the directories it has created, and only a new process forgets them. (The daemon of this release
+   recreates such a directory at its next write into it.)
 
 **Prevention.** Do not remove or replace directories under `.orchestry/` while anything runs. Make bulk or
 consistency-sensitive changes (configuration, many tasks, team changes) while the other writers and any client
 that reads context are stopped. This is advice, not a lock: nothing enforces it.
 
-## Restoring a configuration broken through the MCP server
+## Restoring a broken configuration
 
-**Symptom.** Every `orch mcp` tool and resource call fails with the same error,
-`parse <project>/.orchestry/config.yml`, while the session stays connected. A new `orch mcp` refuses to start with
-that error (exit 1), and the CLI fails the same way: `orch status` and even `orch config get` print it.
+**Symptom.** `orch status` and `orch task list` fail with `✕ parse <project>/.orchestry/config.yml` (exit 1), while
+other commands such as `orch agent list`, `orch context list` and `orch config get` still work. In an open
+`orch mcp` session, `status` and the `orch://status` resource fail with the same error and other tools still
+answer. A new `orch mcp` starts but answers every request, `initialize` included, with that error (JSON-RPC
+`-32001`, `exit_code` 1). If the file is not valid YAML at all, the error reads
+`<project>/.orchestry/config.yml is not valid YAML: …` instead.
 
-**Cause.** `config_set`, like `orch config set`, validates only the prompt-related keys and stores any other value
-as given: a JSON-parsable string becomes a number, boolean or object, anything else a string. A wrongly typed value
-for a known key is saved, and from then on every engine build, and so every MCP call, fails. No tool can repair
-it, because every tool needs a working configuration.
+**Cause.** `config.yml` holds a value of the wrong type for a known key, or invalid YAML, written by a hand edit
+or another program. orch's own writers do not store a wrongly typed value: `orch config set` and `config_set`
+reject it with `config: missing required field or invalid known field type/enum` (the CLI exits 2), `config_patch`
+with `<file>: config.<key>: invalid field type`, and the file is left unchanged.
 
 **Fix.**
 
 1. Find the bad key. The error does not name it: compare with a backup
-   (`diff <backup>/config.yml .orchestry/config.yml`), or look in the file for the value the client set last. For
-   example, `config_set` with key `scheduling.poll_interval_ms` and value `hello` stores the string `"hello"`
-   where a number belongs.
-2. Restore a valid file: copy back your backup, or edit `.orchestry/config.yml` by hand and put the value back to
-   the right type.
-3. Check with the CLI: `orch status` succeeds again.
-4. Call the tool again. The server reads the configuration for every call, so no restart is needed.
+   (`diff <backup>/config.yml .orchestry/config.yml`), or check the values you edited last. `orch config get <key>`
+   still prints the stored value, for example `scheduling.poll_interval_ms = "hello"` where a number belongs.
+2. Restore a valid file: copy back your backup, or edit `.orchestry/config.yml` by hand. For a wrongly typed value
+   you can also set that key to a valid value, `orch config set scheduling.poll_interval_ms 10000`; setting any other
+   key fails while the file is broken, and on invalid YAML `orch config set` fails too.
+3. Check with the CLI: `orch status` succeeds again. The daemon needs no restart.
+4. An open MCP session sees the repair at its next call. A session whose `initialize` failed must initialise
+   again: reconnect the server, or restart the client's session.
 
-**Prevention.** Back up `.orchestry/config.yml` before letting a client change configuration, or register clients
-that should not change it with `--read-only`. With Codex, `disabled_tools` can hide `config_set`, `config_update`
-and `config_patch`.
+**Prevention.** Change configuration with `orch config set` (or `config_set`) rather than by hand, and back up
+`.orchestry/config.yml` before a hand edit.
+<!-- Captured at f70fc707 (fact-check tsk_eVo3agZ evidence/mcp-badcfg.txt, mcp-handcfg.txt; tsk_J8tJF2x): CLI and MCP
+config_set "hello" rejected, file byte-identical; config_patch {scheduling: {poll_interval_ms: hello}} rejected
+`invalid field type`; hand-broken file: status/task list exit 1, agent/context/goal list and config get exit 0;
+config set of the broken key repairs it, of max_concurrent_agents exit 2; invalid YAML: status and config set exit 1. -->
 
 ## Capturing `orch mcp` diagnostics
 

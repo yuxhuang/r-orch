@@ -19,6 +19,12 @@
 //! Every test owns a sandbox: throwaway `HOME`, throwaway global config (and
 //! so user template root), a `PATH` that holds no agent CLI. No agent is ever
 //! started and nothing outside the sandbox is read or written.
+//!
+//! Every `orch` command is a daemon client (S2a-cli), including `org
+//! template update` / `patch`: `sandbox()` runs `orch init` and then starts
+//! an explicit test daemon on an isolated socket (see
+//! `tests/common/daemon.rs`), stopped with a process-table check when the
+//! sandbox drops.
 
 #![cfg(unix)]
 
@@ -29,6 +35,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::TestDaemon;
+
 use assert_cmd::prelude::*;
 use serde_json::{Value, json};
 
@@ -38,9 +48,14 @@ use serde_json::{Value, json};
 const RUN_BUDGET: Duration = Duration::from_secs(60);
 
 struct Sandbox {
+    // Declared first: dropped first, so the daemon stops before its project
+    // directory is removed.
+    daemon: Option<TestDaemon>,
     dir: tempfile::TempDir,
 }
 
+/// An initialized project with its own test daemon already running: every
+/// `org template` mutation needs both.
 fn sandbox() -> Sandbox {
     let dir = tempfile::Builder::new()
         .prefix("orch-template-root-repair-")
@@ -55,12 +70,28 @@ fn sandbox() -> Sandbox {
     for sub in ["home", "project", "work"] {
         fs::create_dir_all(dir.path().join(sub)).expect("sandbox dirs");
     }
-    Sandbox { dir }
+    let mut sb = Sandbox { daemon: None, dir };
+    let output = sb.run(&["init", "--name", "proj", "--adapter", "claude"]);
+    assert!(output.status.success(), "{}", transcript(&output));
+    let daemon = TestDaemon::start(&sb.project(), &sb.home());
+    daemon::register_project(&sb.project(), &daemon);
+    sb.daemon = Some(daemon);
+    sb
+}
+
+impl Drop for Sandbox {
+    fn drop(&mut self) {
+        daemon::unregister_project(&self.project());
+    }
 }
 
 impl Sandbox {
     fn home(&self) -> PathBuf {
         self.dir.path().join("home")
+    }
+
+    fn project(&self) -> PathBuf {
+        self.dir.path().join("project")
     }
 
     fn work(&self) -> PathBuf {
@@ -75,7 +106,7 @@ impl Sandbox {
     fn command(&self) -> Command {
         let mut command = Command::cargo_bin("orch").expect("the orch binary");
         command
-            .current_dir(self.dir.path().join("project"))
+            .current_dir(self.project())
             .env_clear()
             .env("HOME", self.home())
             .env(
@@ -86,6 +117,7 @@ impl Sandbox {
             .env("TERM", "xterm-256color")
             // No agent CLI exists on this PATH.
             .env("PATH", "/usr/bin:/bin");
+        daemon::apply_for(&self.project(), &mut command);
         command
     }
 

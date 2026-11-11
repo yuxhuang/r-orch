@@ -25,6 +25,10 @@ path = "src/bin/orchestry.rs"
 name = "ao"
 path = "src/bin/ao.rs"
 
+# Forwards the orch-proto test seam; never in `default`.
+[features]
+skew-seam = ["orch-proto/skew-seam"]
+
 [dependencies]
 orch-domain.workspace = true
 orch-core.workspace = true

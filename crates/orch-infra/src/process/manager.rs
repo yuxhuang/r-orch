@@ -129,7 +129,7 @@ impl ProcessManager for SystemProcessManager {
     }
 
     fn spawn(&self, command: &str, args: &[String], opts: SpawnOptions) -> Result<SpawnedChild> {
-        spawn_with(command, args, opts, None)
+        spawn_with(command, args, opts, None, None)
     }
 }
 
@@ -146,6 +146,7 @@ impl ProcessManager for SystemProcessManager {
 #[derive(Debug, Clone)]
 pub struct SnapshotEnvProcessManager {
     snapshot: Arc<EnvSnapshot>,
+    work: Option<Arc<super::gate::SpawnWork>>,
 }
 
 /// The environment a [`SnapshotEnvProcessManager`] spawns with.
@@ -161,7 +162,12 @@ impl SnapshotEnvProcessManager {
     pub fn new(snapshot: EnvSnapshot) -> Self {
         SnapshotEnvProcessManager {
             snapshot: Arc::new(snapshot),
+            work: None,
         }
+    }
+    pub fn with_spawn_work(mut self, work: Arc<super::gate::SpawnWork>) -> Self {
+        self.work = Some(work);
+        self
     }
 }
 
@@ -180,7 +186,13 @@ impl ProcessManager for SnapshotEnvProcessManager {
     }
 
     fn spawn(&self, command: &str, args: &[String], opts: SpawnOptions) -> Result<SpawnedChild> {
-        spawn_with(command, args, opts, Some(&self.snapshot))
+        spawn_with(
+            command,
+            args,
+            opts,
+            Some(&self.snapshot),
+            self.work.as_ref(),
+        )
     }
 }
 
@@ -190,61 +202,71 @@ fn spawn_with(
     args: &[String],
     opts: SpawnOptions,
     snapshot: Option<&EnvSnapshot>,
+    work: Option<&Arc<super::gate::SpawnWork>>,
 ) -> Result<SpawnedChild> {
-    let mut cmd = tokio::process::Command::new(command);
-    cmd.args(args)
-        .stdin(match opts.stdin {
-            StdioMode::Ignore => Stdio::null(),
-            StdioMode::Pipe => Stdio::piped(),
+    let lease = work
+        .map(|work| {
+            work.track()
+                .ok_or_else(|| Error::other("spawn admission closed"))
         })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .transpose()?;
+    let mut child = super::gate::with_spawn_gate(|| {
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(args)
+            .stdin(match opts.stdin {
+                StdioMode::Ignore => Stdio::null(),
+                StdioMode::Pipe => Stdio::piped(),
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
-    if !opts.cwd.as_os_str().is_empty() {
-        cmd.current_dir(&opts.cwd);
-    }
-    match snapshot {
-        None => {
-            if opts.inherit_env == EnvInheritance::WithoutSecrets {
-                let passthrough = std::env::var_os(REMOTE_ENV_PASSTHROUGH);
-                for name in secret_env_names(std::env::vars_os(), passthrough.as_deref()) {
-                    cmd.env_remove(name);
+        if !opts.cwd.as_os_str().is_empty() {
+            cmd.current_dir(&opts.cwd);
+        }
+        match snapshot {
+            None => {
+                if opts.inherit_env == EnvInheritance::WithoutSecrets {
+                    let passthrough = std::env::var_os(REMOTE_ENV_PASSTHROUGH);
+                    for name in secret_env_names(std::env::vars_os(), passthrough.as_deref()) {
+                        cmd.env_remove(name);
+                    }
+                }
+            }
+            Some(snapshot) => {
+                cmd.env_clear();
+                let removed = if opts.inherit_env == EnvInheritance::WithoutSecrets {
+                    let passthrough = snapshot
+                        .base
+                        .iter()
+                        .find(|(name, _)| name == REMOTE_ENV_PASSTHROUGH)
+                        .map(|(_, value)| value.as_os_str());
+                    secret_env_names(snapshot.base.iter().cloned(), passthrough)
+                } else {
+                    Vec::new()
+                };
+                for (name, value) in &snapshot.base {
+                    if !removed.contains(name) {
+                        cmd.env(name, value);
+                    }
                 }
             }
         }
-        Some(snapshot) => {
-            cmd.env_clear();
-            let removed = if opts.inherit_env == EnvInheritance::WithoutSecrets {
-                let passthrough = snapshot
-                    .base
-                    .iter()
-                    .find(|(name, _)| name == REMOTE_ENV_PASSTHROUGH)
-                    .map(|(_, value)| value.as_os_str());
-                secret_env_names(snapshot.base.iter().cloned(), passthrough)
-            } else {
-                Vec::new()
-            };
-            for (name, value) in &snapshot.base {
-                if !removed.contains(name) {
-                    cmd.env(name, value);
-                }
-            }
-        }
-    }
-    for (key, value) in &opts.env {
-        cmd.env(key, value);
-    }
-    if let Some(snapshot) = snapshot {
-        for (key, value) in &snapshot.forced {
+        for (key, value) in &opts.env {
             cmd.env(key, value);
         }
-    }
+        if let Some(snapshot) = snapshot {
+            for (key, value) in &snapshot.forced {
+                cmd.env(key, value);
+            }
+        }
 
-    // node's `detached: true`: a new process group whose pgid is the
-    // child's pid, which is what makes `kill(-pid)` reach the whole tree.
-    cmd.process_group(0);
+        // node's `detached: true`: a new process group whose pgid is the
+        // child's pid, which is what makes `kill(-pid)` reach the whole tree.
+        cmd.process_group(0);
 
-    let mut child = cmd.spawn().map_err(|source| spawn_error(command, source))?;
+        cmd.spawn()
+    })
+    .map_err(|source| spawn_error(command, source))?;
     // A child with no pid is reported as `Failed to spawn process: <command>`;
     // here that case is the `Err` above, and
     // a successfully spawned child always has one until it is reaped.
@@ -262,6 +284,7 @@ fn spawn_with(
     // the child outlives us exactly as node's `proc.unref()` allows.
     let (notifier, exit) = ExitSignal::channel();
     tokio::spawn(async move {
+        let _lease = lease;
         let outcome = match child.wait().await {
             Ok(status) => ExitOutcome {
                 code: status.code(),
@@ -279,6 +302,40 @@ fn spawn_with(
     });
 
     Ok(SpawnedChild::from_tokio(pid, stdout, stderr, stdin, exit))
+}
+
+/// SIGKILLs a probe child's whole process group when dropped before
+/// [`GroupKillGuard::disarm`]. A diagnostic whose caller gave up (deadline,
+/// cancelled request, closed session) drops its future; without this the
+/// child, and anything it forked, would outlive the request that asked for
+/// it. The kill goes through `manager`, so a fake manager never sees a real
+/// signal for its fake pids.
+pub struct GroupKillGuard<'a> {
+    manager: &'a dyn ProcessManager,
+    pid: Option<u32>,
+}
+
+impl<'a> GroupKillGuard<'a> {
+    /// Arm for `pid`, which must lead its own process group.
+    pub fn new(manager: &'a dyn ProcessManager, pid: u32) -> Self {
+        Self {
+            manager,
+            pid: Some(pid),
+        }
+    }
+
+    /// The child has been waited for: nothing is left to kill.
+    pub fn disarm(&mut self) {
+        self.pid = None;
+    }
+}
+
+impl Drop for GroupKillGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            self.manager.kill(pid, Signal::Kill);
+        }
+    }
 }
 
 fn spawn_error(command: &str, source: std::io::Error) -> Error {

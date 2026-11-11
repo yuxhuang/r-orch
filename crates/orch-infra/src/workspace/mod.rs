@@ -66,8 +66,10 @@ pub(crate) async fn run(
     command: &str,
     args: &[String],
 ) -> Result<Captured, String> {
-    let child = pm
-        .spawn(
+    let reservation =
+        crate::process::gate::reserve_spawn(crate::process::gate::SpawnSite::Workspace).await;
+    let child = reservation.run(|| {
+        pm.spawn(
             command,
             args,
             SpawnOptions {
@@ -75,13 +77,16 @@ pub(crate) async fn run(
                 ..Default::default()
             },
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+    })?;
+    let mut guard = crate::process::GroupKillGuard::new(pm, child.pid);
     let buffers = Mutex::new(Buffers::default());
     tokio::join!(
         pump(child.stdout, &buffers, true),
         pump(child.stderr, &buffers, false),
     );
     let outcome = child.exit.wait().await;
+    guard.disarm();
     let b = buffers.into_inner().unwrap_or_else(PoisonError::into_inner);
     Ok(Captured {
         stdout: b.stdout,

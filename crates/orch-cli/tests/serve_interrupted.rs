@@ -6,6 +6,11 @@
 //! each dispatch, and on SIGTERM it must not emit
 //! `{"event":"serve:finished","result":"all_done","exit_code":0}`.
 //!
+//! Since S2a-cli `serve --once` is a client of the daemon (it runs one
+//! dispatch pass over the socket), so each scenario starts an explicit test
+//! daemon on an isolated socket (`tests/common/daemon.rs`). The signal goes to
+//! the client; the daemon, which owns `orchestry.lock`, keeps running.
+//!
 //! This goes through the real binary rather than `run_once` directly, because
 //! the three things that matter here are process-level: the exit code the shell
 //! sees, the record on stdout, and whether `orchestry.lock` is released. A unit
@@ -17,11 +22,31 @@ use std::time::{Duration, Instant};
 
 use assert_cmd::prelude::*;
 
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::TestDaemon;
+
+/// `orch daemon status` against `daemon`: whether it is still serving.
+fn status_of(daemon: &TestDaemon, dir: &Path) -> std::process::ExitStatus {
+    let mut status = orch(dir);
+    daemon.apply(&mut status);
+    status
+        .args(["daemon", "status"])
+        .stdout(Stdio::null())
+        .status()
+        .expect("daemon status")
+}
+
 fn orch(dir: &Path) -> Command {
     let mut command = Command::cargo_bin("orch").expect("the orch binary");
     command
         .current_dir(dir)
         .env("NO_COLOR", "1")
+        .env("HOME", dir.join(".test-home"))
+        .env(
+            "ORCHESTRY_GLOBAL_CONFIG_PATH",
+            dir.join(".test-home/global.yml"),
+        )
         // No agent CLI on PATH: the gate forbids a test exec'ing a real one,
         // and nothing here needs an agent to run.
         .env("PATH", "/usr/bin:/bin")
@@ -36,13 +61,11 @@ fn orch(dir: &Path) -> Command {
 /// status that will never arrive — which is the state a signal has to
 /// interrupt. Corrupting the file rather than inventing a slow agent keeps the
 /// test free of timing assumptions about an adapter.
-fn project_with_an_unreadable_task() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("tempdir");
-    orch(dir.path())
-        .args(["init", "--name", "p", "--adapter", "claude"])
-        .output()
-        .expect("init");
-    let added = orch(dir.path())
+fn project_with_an_unreadable_task() -> (TestDaemon, tempfile::TempDir) {
+    let (dir, daemon) = initialised_project();
+    let mut add = orch(dir.path());
+    daemon.apply(&mut add);
+    let added = add
         .args(["task", "add", "a task", "--quiet"])
         .output()
         .expect("task add");
@@ -53,14 +76,29 @@ fn project_with_an_unreadable_task() -> tempfile::TempDir {
         "{{{ not yaml\n",
     )
     .expect("plant the unreadable task");
-    dir
+    (daemon, dir)
+}
+
+/// `orch init` in a fresh project, then its explicit test daemon (dispatch
+/// off). The daemon is returned first so it is dropped (stopped, process
+/// table checked) before the project directory is removed.
+fn initialised_project() -> (tempfile::TempDir, TestDaemon) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    orch(dir.path())
+        .args(["init", "--name", "p", "--adapter", "claude"])
+        .output()
+        .expect("init");
+    let daemon = TestDaemon::start(dir.path(), &dir.path().join(".test-home"));
+    (dir, daemon)
 }
 
 #[test]
 fn a_signal_with_work_outstanding_reports_interrupted_and_exits_one() {
-    let dir = project_with_an_unreadable_task();
+    let (daemon, dir) = project_with_an_unreadable_task();
 
-    let child = orch(dir.path())
+    let mut serve = orch(dir.path());
+    daemon.apply(&mut serve);
+    let child = serve
         .args(["serve", "--once", "--log-format", "json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -92,16 +130,18 @@ fn a_signal_with_work_outstanding_reports_interrupted_and_exits_one() {
          achieve. stdout:\n{stdout}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // The client dies of the signal it was sent (the conventional 128 + 15);
+    // it no longer exits 1 as the in-process orchestrator did.
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "every non-success --once outcome exits 1"
+        Some(143),
+        "an interrupted --once client exits 128 + the signal"
     );
-    // The lock is the reason the wind-down runs on this path at all: an
-    // interrupted run must not wedge the project.
+    // The daemon, not the client, owns `orchestry.lock`: interrupting the
+    // client must neither wedge the project nor stop the daemon.
     assert!(
-        !dir.path().join(".orchestry/orchestry.lock").exists(),
-        "orchestry.lock was left behind by an interrupted run"
+        status_of(&daemon, dir.path()).success(),
+        "the daemon stopped when its client was interrupted"
     );
 }
 
@@ -109,16 +149,14 @@ fn a_signal_with_work_outstanding_reports_interrupted_and_exits_one() {
 /// terminal, a stop is an ordinary completion and the output is unchanged.
 #[test]
 fn a_finished_project_still_reports_all_done_and_exits_zero() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    orch(dir.path())
-        .args(["init", "--name", "p", "--adapter", "claude"])
-        .output()
-        .expect("init");
+    let (dir, daemon) = initialised_project();
 
     // No tasks at all: `--once` takes its "empty project exits immediately"
     // path, which is the cheapest way to reach a genuine completion without an
     // agent. The interrupted path is unreachable here by construction.
-    let output = orch(dir.path())
+    let mut serve = orch(dir.path());
+    daemon.apply(&mut serve);
+    let output = serve
         .args(["serve", "--once", "--log-format", "json"])
         .output()
         .expect("serve --once");
@@ -129,5 +167,8 @@ fn a_finished_project_still_reports_all_done_and_exits_zero() {
         "a completed run must still say all_done. stdout:\n{stdout}"
     );
     assert_eq!(output.status.code(), Some(0));
-    assert!(!dir.path().join(".orchestry/orchestry.lock").exists());
+    assert!(
+        status_of(&daemon, dir.path()).success(),
+        "the daemon stopped when its client finished"
+    );
 }

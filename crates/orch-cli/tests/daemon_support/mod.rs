@@ -6,14 +6,14 @@
 //!   isolated `HOME`, `ORCHESTRY_GLOBAL_CONFIG_PATH` and a short
 //!   `ORCH_SOCKET` (≤100 bytes, under a 0700 `/tmp/dl-*` dir), so it cannot
 //!   reach a developer's daemon, `~/.orchestry` or a real project;
-//! * `ORCH_DAEMON_DEVELOPMENTAL=1` exists only in the child env, never in
-//!   the test process;
 //! * agents are `sleep` stand-ins on `PATH=/usr/bin:/bin`, never a real AI CLI;
 //! * every spawned daemon is owned by a [`DaemonChild`] whose `Drop` kills its
 //!   process group, so a failed assertion cannot leak a daemon;
 //! * every wait has a deadline and is driven by an observable event (the
 //!   `listening <socket>` line, an exit status, a file), never a fixed sleep.
 #![allow(dead_code, reason = "each daemon_lifecycle* test crate uses a subset")]
+
+pub mod frontends;
 
 use serde_json::Value;
 use std::fs;
@@ -22,7 +22,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const READY: Duration = Duration::from_secs(30);
@@ -105,25 +107,38 @@ impl Sandbox {
         .unwrap();
     }
 
-    /// Seed one task assigned to a `sleep 120` stand-in, with the legacy
-    /// direct-store CLI (no daemon exists yet). Returns `(agent, task)` ids.
+    /// Seed one task assigned to a `sleep 120` stand-in through a throwaway
+    /// daemon (dispatch OFF), then stop it. The CLI is a daemon client, so
+    /// seeding goes through a running daemon. Returns `(agent, task)` ids.
     pub fn seed_sleeper(&self) -> (String, String) {
+        self.seed_agent_task("sleeper", "sleep 120", "long job")
+    }
+
+    /// Seed one shell agent running `command` plus one task assigned to it,
+    /// through a throwaway daemon (dispatch OFF) that is stopped afterwards.
+    /// Returns `(agent, task)` ids.
+    pub fn seed_agent_task(&self, name: &str, command: &str, title: &str) -> (String, String) {
+        let mut seeder = start_ready(self, &[], "seed");
         let out = self.run(&[
             "agent",
             "add",
-            "sleeper",
+            name,
             "--adapter",
             "shell",
             "--command",
-            "sleep 120",
+            command,
             "--json",
         ]);
         assert!(out.status.success(), "{}", text(&out.stderr));
         let agent: Value = serde_json::from_slice(&out.stdout).unwrap();
         let agent = agent["id"].as_str().unwrap().to_owned();
-        let out = self.run(&["task", "add", "long job", "--assignee", &agent, "--quiet"]);
+        let out = self.run(&["task", "add", title, "--assignee", &agent, "--quiet"]);
         assert!(out.status.success(), "{}", text(&out.stderr));
-        (agent, text(&out.stdout).trim().to_owned())
+        let task = text(&out.stdout).trim().to_owned();
+        let stop = self.run(&["daemon", "stop"]);
+        assert!(stop.status.success(), "{}", text(&stop.stderr));
+        assert_eq!(seeder.wait_exit(READY).code(), Some(0));
+        (agent, task)
     }
 
     pub fn state_json(&self) -> Option<Value> {
@@ -165,7 +180,17 @@ impl Sandbox {
 /// An `orch` command with an explicit, cleared environment aimed at `socket`
 /// and confined to `test_root`. `root` also receives `HOME`.
 pub fn orch_command(root: &Path, socket: &Path, test_root: &Path) -> Command {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_orch"));
+    orch_command_with(
+        Path::new(env!("CARGO_BIN_EXE_orch")),
+        root,
+        socket,
+        test_root,
+    )
+}
+
+/// [`orch_command`] for another `orch` executable (the two-binary skew test).
+pub fn orch_command_with(exe: &Path, root: &Path, socket: &Path, test_root: &Path) -> Command {
+    let mut cmd = Command::new(exe);
     cmd.env_clear()
         .current_dir(root)
         .env("HOME", root.join("home"))
@@ -176,7 +201,6 @@ pub fn orch_command(root: &Path, socket: &Path, test_root: &Path) -> Command {
         .env("ORCH_PROJECT_ROOT", root)
         .env("ORCH_SOCKET", socket)
         .env("ORCH_TEST_SOCKET_ROOT", test_root)
-        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
         .process_group(0);
     cmd
 }
@@ -197,18 +221,10 @@ pub fn output_and_pid(mut cmd: Command, within: Duration) -> (Output, u32) {
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().unwrap();
     let pid = child.id();
-    let mut stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
-    let out = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let err = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
-        buf
-    });
+    let (out, err) = (
+        spawn_drain(child.stdout.take().unwrap()),
+        spawn_drain(child.stderr.take().unwrap()),
+    );
     let deadline = Instant::now() + within;
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
@@ -224,14 +240,55 @@ pub fn output_and_pid(mut cmd: Command, within: Duration) -> (Output, u32) {
         }
         std::thread::sleep(Duration::from_millis(5));
     };
+    // The child has exited, so everything it wrote is already in the pipe.
+    // EOF can still be withheld: a process spawned concurrently by another
+    // thread (an `orch mcp` bridge, a tmux server) may have inherited this
+    // pipe's write end between its creation and its close-on-exec flag (the
+    // pipe is not created atomically on macOS), and it holds it for as long
+    // as it lives. Wait for EOF only briefly, then take what was read.
+    let grace = Instant::now() + EOF_GRACE;
+    while !(out.done.load(Ordering::SeqCst) && err.done.load(Ordering::SeqCst))
+        && Instant::now() < grace
+    {
+        std::thread::sleep(Duration::from_millis(2));
+    }
     (
         Output {
             status,
-            stdout: out.join().unwrap(),
-            stderr: err.join().unwrap(),
+            stdout: std::mem::take(&mut out.buf.lock().unwrap()),
+            stderr: std::mem::take(&mut err.buf.lock().unwrap()),
         },
         pid,
     )
+}
+
+/// How long a finished child's output pipes may stay open before the output
+/// read so far is taken as complete.
+const EOF_GRACE: Duration = Duration::from_secs(2);
+
+/// A pipe being read to EOF on its own thread; `buf` is readable at any time.
+struct Drain {
+    buf: Arc<Mutex<Vec<u8>>>,
+    done: Arc<AtomicBool>,
+}
+
+fn spawn_drain(mut pipe: impl Read + Send + 'static) -> Drain {
+    let drain = Drain {
+        buf: Arc::default(),
+        done: Arc::default(),
+    };
+    let (buf, done) = (drain.buf.clone(), drain.done.clone());
+    std::thread::spawn(move || {
+        let mut chunk = [0_u8; 8192];
+        while let Ok(n) = pipe.read(&mut chunk) {
+            if n == 0 {
+                break;
+            }
+            buf.lock().unwrap().extend_from_slice(&chunk[..n]);
+        }
+        done.store(true, Ordering::SeqCst);
+    });
+    drain
 }
 
 /// Poll `probe` until it yields a value (an external effect with no push

@@ -45,7 +45,9 @@ Remote agents are leaf executors that use the worker's own resources.
 - Hand results back through summaries or messages.
 - A remote agent must not run `orch task add`, `orch goal` or `orch context` expecting to change the controller's project. Those commands change the worker's own project.
 
-A controller can connect to several workers. Each worker accepts one controller at a time. Only the orch process that runs the orchestrator for the project (`orch serve`, `orch run --watch`, or a dashboard started without `--observe` while no other orch process runs the orchestrator) opens peer connections. A dashboard that finds another orch process already running the orchestrator only observes it.
+A controller can connect to several workers. Each worker accepts one controller at a time. Only the project's [daemon](18-daemon.md) opens peer connections. Every other orch command, the dashboard included, is a client of that daemon, and the daemon must be running on both machines.
+<!-- W2 (PR 2): design D8 ("Peer listener flags are start options"); spec R38; PR 2 contract item 1. Peer protocol
+unchanged (goal row 10). -->
 
 ## Restrict who can connect
 
@@ -73,13 +75,13 @@ A bare `--listen` binds `127.0.0.1:7690`, a loopback address that only the same 
 
 Before you start: the worker has the project initialized (`orch init`), its agents added, and the agent CLIs installed and signed in.
 
-1. Start the orchestrator with a listen address and a name:
+1. Start the daemon with a listen address and a name:
 
    ```sh
    orch serve --listen 192.168.1.20:7690 --peer-name worker-linux
    ```
 
-   `--listen` also works with `orch run --watch` and `orch tui`. A `--listen` flag applies to that run only.
+   `--listen` also works with `orch run --watch` and `orch daemon start` (which starts with dispatch off). A `--listen` flag applies to that daemon only. A daemon that already runs cannot start listening: `orch serve --listen` against it exits 4; stop it (`orch daemon stop`) and start it again with `--listen`.
 
 2. To make listening a saved preference for later starts, run:
 
@@ -87,15 +89,23 @@ Before you start: the worker has the project initialized (`orch init`), its agen
    orch remote listen on 192.168.1.20:7690
    ```
 
-   Without an address, `on` saves `127.0.0.1:7690`. `orch remote listen off` turns it off. Both take effect the next time an orchestrator starts, not on one that is running.
+   Without an address, `on` saves `127.0.0.1:7690`. `orch remote listen off` turns it off. Both take effect the next time the daemon starts, not on one that is running.
 
 3. Check with `orch remote status`. The `Listen:` line shows the address.
 
-A dashboard that only observes another orchestrator cannot enable listening. `orch tui --listen` then stops with `--listen requires the engine owner; another orchestrator holds the lock`. "Engine owner" in that message means the orch process that runs the orchestrator.
+`orch tui --listen` was removed: the dashboard never listens; only the daemon does.
 
 ### On the controller
 
-1. Register the worker. The alias uses lower-case letters, digits and hyphens. The port defaults to 7690.
+1. Start the daemon, if it is not running:
+
+   ```sh
+   orch serve --peer-name controller
+   ```
+
+   `orch remote add` and every other command below are clients of that daemon, so run them in another terminal.
+
+2. Register the worker. The alias uses lower-case letters, digits and hyphens. The port defaults to 7690.
 
    ```sh
    orch remote add w1 192.168.1.20
@@ -103,12 +113,6 @@ A dashboard that only observes another orchestrator cannot enable listening. `or
 
    ```text
      ✓ Added remote w1
-   ```
-
-2. Start the orchestrator, if it is not running:
-
-   ```sh
-   orch serve --peer-name controller
    ```
 
 3. Check the link:
@@ -246,7 +250,7 @@ So `ANTHROPIC_API_KEY`, `GITHUB_TOKEN` and `SSH_AUTH_SOCK` are dropped, and so i
 
 > **Warning:** Name-based filtering is not a security boundary. Do not keep secrets in variables with innocent names on a worker that accepts remote tasks.
 
-The effect: if a worker's `claude` or `codex` signs in through an environment variable, or git needs `SSH_AUTH_SOCK`, remote tasks fail to authenticate while the same agent works locally. Allow chosen variables by exact name when you start the worker's orchestrator:
+The effect: if a worker's `claude` or `codex` signs in through an environment variable, or git needs `SSH_AUTH_SOCK`, remote tasks fail to authenticate while the same agent works locally. Allow chosen variables by exact name when you start the worker's daemon. The daemon keeps the environment it was started with, so set them before the start, and restart the daemon after you change them:
 
 ```sh
 ORCH_REMOTE_ENV_PASSTHROUGH=ANTHROPIC_API_KEY,SSH_AUTH_SOCK orch serve --listen 192.168.1.20:7690
@@ -283,9 +287,9 @@ Then `orch remote status` on both machines shows the other as online and as `Con
 | `orch remote remove ALIAS` | Unregisters a remote. Its in-flight tasks fail with an unknown outcome. |
 | `orch remote list` | Lists remotes with address and online state. |
 | `orch remote status` | Shows the listen address, controller and each remote's state. |
-| `orch remote listen on [ADDR]` / `off` | Saves the incoming-connection preference for the next time an orchestrator starts. |
-| `--listen [ADDR]` on `serve`, `run` and `tui` | Listens for this run only. Overrides the saved preference. |
-| `--peer-name NAME` on `serve`, `run` and `tui` | Sets the name other machines see. |
+| `orch remote listen on [ADDR]` / `off` | Saves the incoming-connection preference for the next time the daemon starts. |
+| `--listen [ADDR]` on `orch daemon start`, `orch serve` and `orch run --watch` | Listens for this daemon only. Overrides the saved preference. |
+| `--peer-name NAME` on `orch daemon start`, `orch serve` and `orch run --watch` | Sets the name other machines see. |
 
 All of them accept `--json`, `--yaml` and `--quiet`. An invalid alias is refused:
 
@@ -296,7 +300,7 @@ All of them accept `--json`, `--yaml` and `--quiet`. An invalid alias is refused
 ## Upgrade notes
 
 - Run the same orch version on every machine. Upgrade the controller and the workers together.
-- Upgrade the orch process that runs the orchestrator and the `orch` command on the same machine together.
+- Upgrade the daemon and the `orch` command on the same machine together: a client and a daemon of different versions refuse to talk ([Version skew](18-daemon.md#version-skew)).
 - If your agents need a credential from the environment on a worker, set `ORCH_REMOTE_ENV_PASSTHROUGH` (see [The environment of remote runs](#the-environment-of-remote-runs)). Remote tasks also wait for approval on the worker (see [Approve work on the worker](#approve-work-on-the-worker)).
 - Before you install an older orch version on a machine, make sure no remote runs are in flight. Older versions cancel them.
 

@@ -16,7 +16,7 @@ Runnable inputs are in [examples/org-templates/](../examples/org-templates/). De
 
 ## Quick start
 
-No project is needed to list, show, create or change a template. Deploying and the shop need one (`orch init`).
+Every `orch org template` command, like deploying and the shop, needs a project (`orch init`) and its running daemon (`orch daemon start`); outside a project it prints `Not initialized` and exits 3.
 
 ```bash
 orch org template list                                   # embedded, legacy and your own templates
@@ -178,8 +178,8 @@ change the copy. The ten legacy presets (`startup-mvp`, `pr-review-corp`, …) c
 | `orch agent shop [--template NAME \| --template-dir PATH] [--list]` | Install one member ([below](#the-agent-shop)). |
 
 Every command takes `--json` or `--yaml`. Without either, `list` prints a table and the others print YAML: `init`
-prints `name` and `path`, `delete` prints `deleted: NAME`, and the rest print the resulting definition. None of the
-`org template` commands needs a project (`show --resolved` uses the project's defaults when there is one).
+prints `name` and `path`, `delete` prints `deleted: NAME`, and the rest print the resulting definition. Every
+`org template` command needs a project and its running daemon (`show --resolved` uses the project's defaults).
 
 `-f FILE_OR_DASH` reads a file or stdin. The language is `--input-format json|yaml` if given; otherwise `.json` is
 JSON, `.yml` and `.yaml` are YAML, and anything else, stdin included, is JSON when the first non-blank byte is `{`

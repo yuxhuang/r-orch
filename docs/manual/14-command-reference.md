@@ -7,11 +7,15 @@ right command; use the chapter for steps and examples. For every option of a com
 orch task add --help
 ```
 
-> **Note:** Only `orch --help`, `orch --version`, `orch init`, `orch doctor`, `orch update`, `orch mcp --help` and
-> the `orch org template` commands work outside a project. Every other command, even with `--help`, needs a
-> project: run it in a directory where `orch init` has run, or in a subdirectory of one. Otherwise it prints
-> `Not initialized` and exits with code 3. `orch mcp --project-root <path>` serves the project at `<path>` from
-> any directory.
+> **Note:** Every command that reads or changes state needs a project **and its running daemon**: run it in a
+> directory where `orch init` has run, or in a subdirectory of one, after `orch daemon start`. Without a project it
+> prints `Not initialized` and exits with code 3; without a daemon it prints `No orch daemon is running for
+> <project root>` and exits with code 7 ([The orch daemon](18-daemon.md)). This now includes commands that used to
+> work outside a project, such as `orch org template` and `orch config global`. `orch --help`, `orch --version`,
+> `orch init` and `orch update` need neither, and `orch doctor` runs its local checks anywhere
+> ([Check your setup](07-running-and-monitoring.md#check-your-setup)). `orch <command> --help` needs a project but no
+> daemon, except for `init`, `update`, `doctor`, `daemon` and `mcp`, whose help works anywhere. `orch mcp --project-root <path>` serves the project at `<path>` from
+> any directory, through that project's daemon.
 
 How to read the usage column:
 
@@ -149,11 +153,26 @@ Run tasks. Explained in [Running and monitoring](07-running-and-monitoring.md).
 
 ### orch serve
 
-Headless daemon mode — structured logs to stdout. Explained in [Running and monitoring](07-running-and-monitoring.md).
+Start the daemon in the foreground with dispatch on, like `orch run --watch`; it writes no event log. `--once`
+runs a batch in the running daemon instead and writes structured logs to stdout. Explained in
+[Running and monitoring](07-running-and-monitoring.md).
 
 | Command | What it does | Usage |
 |---|---|---|
-| `orch serve` | Headless daemon mode — structured logs to stdout | `orch serve [OPTIONS]` |
+| `orch serve` | Start the daemon in the foreground with dispatch ON (--once: run a batch in the running daemon with structured logs) | `orch serve [OPTIONS]` |
+<!-- tsk_RP30qgK: about-text verbatim from crates/orch-cli/src/tree.rs (Command::Serve doc comment) at ecb5f1bd,
+and from `orch --help` / `orch serve --help` of a binary built at cb4e0042. -->
+
+### orch daemon
+
+Start, check, stop and toggle dispatch in the project's daemon. Explained in [The orch daemon](18-daemon.md).
+
+| Command | What it does | Usage |
+|---|---|---|
+| `orch daemon start` | Start the project daemon explicitly | `orch daemon start [OPTIONS]` |
+| `orch daemon status` | Show live daemon status | `orch daemon status [OPTIONS]` |
+| `orch daemon stop` | Stop and reconcile the project daemon, including across version skew | `orch daemon stop [OPTIONS]` |
+| `orch daemon dispatch` | Enable or disable future automatic dispatch | `orch daemon dispatch [OPTIONS] <MODE>` (`on` or `off`) |
 
 ### orch status
 

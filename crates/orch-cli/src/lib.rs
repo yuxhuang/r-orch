@@ -35,29 +35,49 @@ pub mod update_check;
 pub mod web;
 
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use clap::{CommandFactory, Parser};
 use orch_core::error::{Error, Result};
-use orch_core::storage::RunStore;
 use orch_domain::{SUPPORTED_ADAPTERS, TaskStatus};
-use orch_infra::storage::FileRunStore;
 
 use crate::context::{CliContext, EnvFlags};
 use crate::output::{Styles, print_error};
 use crate::routing::ArgvShape;
 use crate::tree::{
     AgentCmd, AgentSub, Cli, Command, ConfigCmd, ConfigGlobalCmd, ConfigGlobalSub, ConfigSub,
-    ContextCmd, ContextSub, GoalCmd, GoalSub, InitCmd, MsgCmd, MsgSub, RunCmd, ServeCmd, TaskCmd,
-    TaskSub, TeamCmd, TeamSub, WebCmd,
+    ContextCmd, ContextSub, GoalCmd, GoalSub, InitCmd, MsgCmd, MsgSub, RunCmd, TaskCmd, TaskSub,
+    TeamCmd, TeamSub, WebCmd,
 };
 
 /// The single entry point behind the `orch`, `orchestry` and `ao` binaries.
 pub fn run() -> ExitCode {
-    init_tracing();
     let env = EnvFlags::from_env();
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    let shape = ArgvShape::of(&argv);
+    let mut routing_argv = Vec::new();
+    let mut skip_identity = false;
+    let mut before_command = true;
+    for (index, arg) in argv.iter().enumerate() {
+        if index == 0 {
+            routing_argv.push(arg);
+            continue;
+        }
+        if skip_identity {
+            skip_identity = false;
+            continue;
+        }
+        if before_command && arg == "--agent" {
+            skip_identity = true;
+            continue;
+        }
+        if before_command && arg.to_string_lossy().starts_with("--agent=") {
+            continue;
+        }
+        if !arg.to_string_lossy().starts_with('-') {
+            before_command = false;
+        }
+        routing_argv.push(arg);
+    }
+    let shape = ArgvShape::of(&routing_argv);
 
     // `--version` prints the bare version string, where clap would prefix it
     // with the program name.
@@ -110,33 +130,55 @@ pub fn run() -> ExitCode {
 /// Whether the project root is initialized, checked synchronously: this runs
 /// before the runtime exists.
 fn is_initialized(cwd: &std::path::Path) -> bool {
-    let root = orch_infra::storage::find_project_root(cwd);
-    root.join(orch_infra::storage::ORCHESTRY_DIR).is_dir()
+    let root = context::project_root(cwd);
+    root.join(".orchestry").is_dir()
 }
 
-fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
+fn dispatch_parsed(mut cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
+    init_tracing(cli.command.as_ref());
     let styles = styles_for(&cli, env);
 
     // `orch mcp` owns its runtime: its shutdown must be bounded, and nothing
     // of the ordinary command path may write to stdout.
+    inherit_root_agent(&mut cli);
     if let Some(Command::Mcp(args)) = &cli.command {
         return mcp::run(args, &styles);
     }
 
-    // Explicit daemon startup captures its sanitized environment before any
-    // runtime worker exists. Legacy serve/run --watch retain their own path.
-    if let Some(Command::Daemon(args)) = &cli.command {
-        return match std::env::current_dir() {
-            Ok(cwd) => commands::daemon::run(&cli, args, &cwd),
+    // Owner starts capture the environment before Tokio creates workers.
+    let owner_command = match &cli.command {
+        Some(Command::Daemon(args)) => Some(args),
+        _ => None,
+    };
+    // Refused before any connect or lifecycle call, never silently ignored.
+    let rejected = match &cli.command {
+        Some(Command::Serve(args)) => args.rejected_flag(),
+        Some(Command::Run(args)) => args.rejected_flag(),
+        _ => None,
+    };
+    if let Some(message) = rejected {
+        print_error(&styles, message, None);
+        return ExitCode::from(2);
+    }
+    let foreground = foreground_start(cli.command.as_ref());
+    if owner_command.is_some() || foreground.is_some() {
+        let cwd = match std::env::current_dir() {
+            Ok(cwd) => cwd,
             Err(error) => {
                 print_error(
                     &styles,
                     &format!("cannot read the working directory: {error}"),
                     None,
                 );
-                ExitCode::from(1)
+                return ExitCode::from(1);
             }
         };
+        if let Some(args) = owner_command {
+            return commands::daemon::run(&cli, args, &cwd);
+        }
+        if let Some((peer, from_agent)) = foreground {
+            return commands::daemon::foreground(&cli, peer, from_agent, &cwd);
+        }
     }
 
     let runtime = match tokio::runtime::Runtime::new() {
@@ -154,6 +196,12 @@ fn dispatch_parsed(cli: Cli, env: EnvFlags, shape: ArgvShape) -> ExitCode {
     match runtime.block_on(dispatch(&cli, env, &shape)) {
         Ok(code) => code,
         Err(err) => {
+            if let Some(error) = commands::rpc::recover_client_error(&err) {
+                let agent_context = std::env::var_os("ORCH_TASK_ID").is_some()
+                    || std::env::var_os("ORCH_AGENT_ID").is_some();
+                eprintln!("{}", error.render(agent_context));
+                return ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(1));
+            }
             print_error(&styles, &err.to_string(), err.hint().as_deref());
             if std::env::var_os("ORCHESTRY_DEBUG").is_some() {
                 eprintln!("{err:?}");
@@ -174,21 +222,15 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
 
     match &cli.command {
         Some(Command::Init(args)) => run_init(cli, env, &cwd, args).await,
+        // Container-less: the version check reads no project state, so it
+        // needs neither a project nor a daemon.
         Some(Command::Update(args)) => {
             update::run(&styles_for(cli, env), args.check);
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Doctor) => {
             let styles = styles_for(cli, env);
-            // `doctor` runs in either tier: container-less it probes five
-            // adapters, with a project it probes eight.
-            let project = if is_initialized(&cwd) {
-                let (ctx, _, engine) = build(cli, env, &cwd).await?;
-                Some((ctx, engine))
-            } else {
-                None
-            };
-            doctor::run(&styles, &cwd, cli.output(), project.as_ref()).await
+            commands::run::doctor(cli, &styles, &cwd).await
         }
 
         Some(Command::Task(TaskCmd { command })) => {
@@ -385,12 +427,8 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
 
         Some(Command::Logs(args)) => {
             let (ctx, styles, engine) = build(cli, env, &cwd).await?;
-            let runs: Arc<dyn RunStore> = Arc::new(FileRunStore::new(engine.paths.clone()));
-            logs::run(
-                &logs::LogsDeps {
-                    runs,
-                    events: Arc::clone(&engine.events),
-                },
+            commands::run::logs::run(
+                &engine,
                 &ctx,
                 &styles,
                 &logs::LogsArgs {
@@ -404,7 +442,10 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
             .await
         }
 
-        Some(Command::Serve(args)) => run_serve(cli, env, &cwd, args).await,
+        Some(Command::Serve(args)) => {
+            let (_, _, client) = build(cli, env, &cwd).await?;
+            commands::run::serve_once(&client, args).await
+        }
 
         Some(Command::Web(args)) => run_web(cli, env, &cwd, args).await,
 
@@ -666,82 +707,48 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
         Some(Command::Run(RunCmd {
             task_id,
             all,
-            watch,
-            verbose,
+            once,
+            watch: _,
+            from_agent: _,
+            verbose: _,
+            tick_interval: _,
             peer,
         })) => {
-            // The argument check is the command's own, and it exits 2 before
-            // anything else happens.
-            if !*watch && !*all && task_id.is_none() {
-                print_error(
-                    &styles_for(cli, env),
-                    "Specify a task ID, --all, or --watch",
-                    None,
-                );
-                return Ok(ExitCode::from(2));
-            }
-            // The full tier: every mode drives the orchestrator.
-            let ctx =
-                CliContext::resolve(&cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
-            let styles = ctx.styles(env);
-            if peer.listen.is_some() && !*watch {
-                return Err(orch_core::Error::invalid_arguments(
-                    "--listen requires run --watch",
+            if !*all && !*once && task_id.is_none() {
+                return Err(Error::invalid_arguments(
+                    "Specify a task ID, --all, --once, or --watch",
                 ));
             }
-            let engine =
-                orch_engine::build_full_with_peer(ctx.project_root.clone(), peer.config()).await?;
-            // Read-only diagnostics before any unattended dispatch: legacy
-            // or uncertain effort requests and eco/custom-template conflicts,
-            // one line per affected agent, on stderr.
-            commands::run::report_startup_diagnostics(&engine, &styles).await;
-            // `--watch` wins over `--all`, which wins over a task id, as the
-            // original's if/else chain does.
-            if *watch {
-                if let Some(listen) = &engine.config.peer.listen {
-                    commands::remote::warn_if_exposed(&styles, listen);
-                }
-                commands::run::watch(std::sync::Arc::new(engine), &styles, *verbose).await
-            } else if *all {
+            if peer.listen.is_some() || peer.peer_name.is_some() {
+                return Err(Error::invalid_arguments(
+                    "--listen and --peer-name require run --watch",
+                ));
+            }
+            let (ctx, styles, engine) = build(cli, env, &cwd).await?;
+            commands::run::report_startup_diagnostics(&engine, &styles).await?;
+            if *all {
                 commands::run::all(&engine, &styles).await
+            } else if *once {
+                commands::run::once(&engine, &ctx, &styles).await
             } else {
                 commands::run::single(&engine, &styles, task_id.as_deref().expect("checked above"))
                     .await
             }
         }
-        Some(Command::Tui(args)) => {
+
+        Some(Command::Tui(_args)) => {
             let ctx =
                 CliContext::resolve(&cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
-            // The dashboard needs the orchestrator, so this is the one command
-            // that builds the full container up front.
-            tui::run_with_peer(
-                ctx.project_root,
-                version(),
-                args.observe,
-                args.peer.config(),
-                args.peer.listen.is_some(),
-            )
-            .await
+            // The dashboard is another socket client, as the root `--agent`.
+            tui::run_as_agent(ctx.project_root, version(), cli.agent.as_deref()).await
         }
 
-        // Bare `orch` is the first-run experience: it inits
-        // if needed and launches the dashboard. `is_bare` is the routing
-        // guard's own answer to "no arguments at all", which is what
-        // decides whether to append `tui` — the arm that
-        // landed on master guessed it from `args_os().count()` pending this.
+        // A bare invocation is another dashboard client. Initialization is
+        // explicit, so this path cannot create a project behind the owner.
         None if shape.is_bare => {
-            tui::first_run(
-                &styles_for(cli, env),
-                &cwd,
-                &commands::init::InitArgs {
-                    name: None,
-                    adapter: None,
-                    prompt_mode: None,
-                    interactive: env.stdout_is_tty && env.stdin_is_tty,
-                },
-                version(),
-            )
-            .await
+            let ctx =
+                CliContext::resolve(&cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
+            tui::run_as_agent(ctx.project_root, version(), cli.agent.as_deref()).await
         }
 
         // Flags but no subcommand (`orch --json`): `tui` is appended
@@ -810,46 +817,6 @@ async fn run_init(
     Ok(ExitCode::SUCCESS)
 }
 
-async fn run_serve(
-    cli: &Cli,
-    env: EnvFlags,
-    cwd: &std::path::Path,
-    args: &ServeCmd,
-) -> Result<ExitCode> {
-    let styles = styles_for(cli, env);
-
-    let Some(format) = serve::LogFormat::parse(&args.log_format) else {
-        print_error(
-            &styles,
-            &format!(
-                "Unknown --log-format \"{}\". Valid: json, text",
-                args.log_format
-            ),
-            None,
-        );
-        return Ok(ExitCode::from(2));
-    };
-
-    // The full tier: `serve` is the orchestrator.
-    let ctx = CliContext::resolve(cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
-    let engine =
-        orch_engine::build_full_with_peer(ctx.project_root.clone(), args.peer.config()).await?;
-    if let Some(listen) = &engine.config.peer.listen {
-        commands::remote::warn_if_exposed(&styles, listen);
-    }
-    serve::run(
-        engine,
-        serve::ServeArgs {
-            once: args.once,
-            tick_interval: args.tick_interval.clone(),
-            log_file: args.log_file.clone(),
-            format,
-            verbose: args.verbose,
-        },
-    )
-    .await
-}
-
 async fn run_web(
     cli: &Cli,
     env: EnvFlags,
@@ -870,7 +837,27 @@ async fn run_web(
             return Ok(ExitCode::from(2));
         }
     };
-    web::run(web_args, cwd.to_path_buf()).await
+    web::run_as_agent(web_args, cwd.to_path_buf(), cli.agent.as_deref()).await
+}
+
+/// `orch serve` (without `--once`) and `orch run --watch` are explicit
+/// foreground daemon starts: their peer flags and `--from-agent` override.
+fn foreground_start(command: Option<&Command>) -> Option<(&tree::PeerFlags, bool)> {
+    match command {
+        Some(Command::Serve(args)) if !args.once => Some((&args.peer, args.from_agent)),
+        Some(Command::Run(args)) if args.watch => Some((&args.peer, args.from_agent)),
+        _ => None,
+    }
+}
+
+/// Root `--agent` is the caller identity for every client (over
+/// ORCH_AGENT_ID); `mcp --agent` is the more specific spelling and wins.
+fn inherit_root_agent(cli: &mut Cli) {
+    if let Some(Command::Mcp(args)) = &mut cli.command
+        && args.agent.is_none()
+    {
+        args.agent.clone_from(&cli.agent);
+    }
 }
 
 /// The version the dashboard reports, which is the one `--version` prints.
@@ -878,7 +865,8 @@ fn version() -> &'static str {
     tree::VERSION
 }
 
-/// Send `tracing` output to **stderr**, and only when asked for.
+/// Send `tracing` output to **stderr**. Explicit daemon starts also enable
+/// the fixed, payload-free spawn warnings when neither logging variable exists.
 ///
 /// Until now nothing installed a subscriber, so every `tracing::warn!` in the
 /// engine, the adapters and the stores went nowhere: the swallowed-error paths
@@ -890,21 +878,31 @@ fn version() -> &'static str {
 ///
 /// 1. **stderr, never stdout.** Stdout is the contract: it is compared
 ///    byte for byte and `--json` output has to stay parseable, so a diagnostic there would corrupt both.
-/// 2. **Silent by default**, so no invocation's output changes.
+/// 2. Clients are silent by default. Daemon starts enable only the exact
+///    `orch_infra::process::spawn` target at WARN.
 /// 3. `RUST_LOG` takes an `EnvFilter` for anyone who knows what they want;
 ///    `ORCHESTRY_DEBUG` — which already exists, as the flag that prints an
 ///    error's cause chain — turns on `debug` without one.
 ///
 /// One cap sits above all three: the MCP SDK's `debug` and `trace` events are
 /// never recorded, whatever `RUST_LOG` says (see [`sdk_event_carries_no_payload`]).
-fn init_tracing() {
+fn init_tracing(command: Option<&Command>) {
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::layer::SubscriberExt as _;
     use tracing_subscriber::util::SubscriberInitExt as _;
 
+    let daemon_default = std::env::var_os("RUST_LOG").is_none()
+        && std::env::var_os("ORCHESTRY_DEBUG").is_none()
+        && (matches!(
+            command,
+            Some(Command::Daemon(commands::daemon::DaemonCmd {
+                command: commands::daemon::DaemonSub::Start(_),
+            }))
+        ) || foreground_start(command).is_some());
     let filter = match std::env::var("RUST_LOG") {
         Ok(spec) if !spec.trim().is_empty() => EnvFilter::new(spec),
         _ if std::env::var_os("ORCHESTRY_DEBUG").is_some() => EnvFilter::new("debug"),
+        _ if daemon_default => EnvFilter::new("warn"),
         // No targets enabled: the subscriber is installed but records nothing,
         // which costs a filter check per call site and nothing else.
         _ => EnvFilter::new("off"),
@@ -918,9 +916,10 @@ fn init_tracing() {
         .with_target(true)
         .without_time()
         .finish()
-        .with(tracing_subscriber::filter::filter_fn(
-            sdk_event_carries_no_payload,
-        ))
+        .with(tracing_subscriber::filter::filter_fn(move |metadata| {
+            sdk_event_carries_no_payload(metadata)
+                && (!daemon_default || metadata.target() == "orch_infra::process::spawn")
+        }))
         .try_init();
 }
 
@@ -950,17 +949,15 @@ fn styles_for(cli: &Cli, env: EnvFlags) -> Styles {
     }
 }
 
-/// Resolve the context and build the light engine. The `require_init` inside
-/// `build_light` is what produces exit 3 for an uninitialized directory, and
-/// the pre-parse guard in [`run`] is what makes that happen before parsing.
+/// Resolve presentation flags and connect one serialized daemon session.
 async fn build(
     cli: &Cli,
     env: EnvFlags,
     cwd: &std::path::Path,
-) -> Result<(CliContext, Styles, orch_engine::Engine)> {
+) -> Result<(CliContext, Styles, commands::rpc::Rpc)> {
     let ctx = CliContext::resolve(cwd, cli.output(), cli.quiet, cli.no_color, cli.ascii, env);
     let styles = ctx.styles(env);
-    let engine = orch_engine::build_light(ctx.project_root.clone()).await?;
+    let engine = commands::rpc::Rpc::connect(cli, cwd).await?;
     Ok((ctx, styles, engine))
 }
 
@@ -1050,6 +1047,69 @@ where
 mod tests {
     use super::*;
 
+    fn mcp_agent(argv: &[&str]) -> Option<String> {
+        let mut cli = Cli::try_parse_from(argv).expect("parses");
+        inherit_root_agent(&mut cli);
+        match cli.command {
+            Some(Command::Mcp(args)) => args.agent,
+            _ => panic!("mcp"),
+        }
+    }
+
+    #[test]
+    fn root_agent_reaches_mcp_and_the_mcp_flag_is_more_specific() {
+        assert_eq!(
+            mcp_agent(&["orch", "--agent", "agt_r", "mcp"]).as_deref(),
+            Some("agt_r")
+        );
+        assert_eq!(
+            mcp_agent(&["orch", "--agent", "agt_r", "mcp", "--agent", "agt_m"]).as_deref(),
+            Some("agt_m")
+        );
+        assert_eq!(mcp_agent(&["orch", "mcp"]), None);
+    }
+
+    fn foreground(argv: &[&str]) -> Option<bool> {
+        let cli = Cli::try_parse_from(argv).expect("parses");
+        foreground_start(cli.command.as_ref()).map(|(_, from_agent)| from_agent)
+    }
+
+    /// W2b B1 / spec R31: `serve` and `run --watch` are explicit starts and
+    /// take `daemon start`'s `--from-agent`; it reaches the start the
+    /// agent-context guard checks. A batch or one-shot run is no start.
+    #[test]
+    fn foreground_starts_forward_from_agent_and_batches_refuse_it() {
+        assert_eq!(foreground(&["orch", "serve"]), Some(false));
+        assert_eq!(foreground(&["orch", "serve", "--from-agent"]), Some(true));
+        assert_eq!(foreground(&["orch", "run", "--watch"]), Some(false));
+        assert_eq!(
+            foreground(&["orch", "run", "--watch", "--from-agent"]),
+            Some(true)
+        );
+        assert_eq!(foreground(&["orch", "serve", "--once"]), None);
+        assert_eq!(foreground(&["orch", "run", "--once"]), None);
+        assert_eq!(foreground(&["orch", "run", "tsk_1"]), None);
+
+        use clap::error::ErrorKind;
+        for (refused, kind) in [
+            (
+                &["orch", "serve", "--once", "--from-agent"][..],
+                ErrorKind::ArgumentConflict,
+            ),
+            (
+                &["orch", "run", "--from-agent", "tsk_1"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["orch", "run", "--once", "--from-agent"],
+                ErrorKind::MissingRequiredArgument,
+            ),
+        ] {
+            let error = Cli::try_parse_from(refused).expect_err("refused");
+            assert_eq!(error.kind(), kind, "{refused:?}");
+        }
+    }
+
     #[test]
     fn parse_int_rejects_a_non_numeric_value_with_exit_2() {
         let err = parse_int("abc", "max-attempts").expect_err("rejected");
@@ -1088,5 +1148,368 @@ mod tests {
         let err = parse_enum::<TaskStatus>(Some("nope"), "status").expect_err("rejected");
         assert_eq!(err.to_string(), "Invalid --status: \"nope\"");
         assert_eq!(err.exit_code(), 2);
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod spawn_subscriber_tests {
+    use super::*;
+    use orch_infra::models::{DiscoveryRuntime, SnapshotDiscoveryRuntime};
+    use orch_infra::process::gate::{SpawnObservation, SpawnObserver, SpawnSite, SpawnStage};
+    use std::io::{BufRead, Write};
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::{Duration, Instant};
+
+    const LIMIT: Duration = Duration::from_secs(20);
+    const CHILD: &str = "ORCH_TEST_PRODUCTION_SPAWN_SUBSCRIBER";
+
+    struct OwnedChild(std::process::Child);
+    impl std::ops::Deref for OwnedChild {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for OwnedChild {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            // The unreaped Child handle retains our process identity.
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+
+    struct Park {
+        entered: mpsc::Sender<()>,
+        release: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+    impl SpawnObserver for Park {
+        fn observe(&self, event: SpawnObservation) {
+            if event.stage == SpawnStage::Entered
+                && let Some(release) = self
+                    .release
+                    .lock()
+                    .expect("isolated spawn subscriber fixture")
+                    .take()
+            {
+                let _ = self.entered.send(());
+                let _ = release.recv_timeout(3 * LIMIT);
+            }
+        }
+    }
+
+    #[test]
+    fn production_subscriber_child() {
+        let Some(root) = std::env::var_os(CHILD) else {
+            return;
+        };
+        let root = std::path::Path::new(&root);
+        let args: Vec<String> = serde_json::from_str(
+            &std::env::var("ORCH_TEST_TRACE_ARGS").expect("isolated spawn subscriber fixture"),
+        )
+        .expect("isolated spawn subscriber fixture");
+        let cli = Cli::try_parse_from(args).expect("isolated spawn subscriber fixture");
+        // Exactly the production initializer used by dispatch_parsed, before
+        // anything can capture a subscriber. No replacement filter/subscriber.
+        init_tracing(cli.command.as_ref());
+        if std::env::var_os("ORCH_TEST_DETACHED_LOG").is_some() {
+            commands::daemon::with_test_detached_stderr(root, || parked(root));
+        } else {
+            parked(root);
+        }
+    }
+
+    fn parked(root: &std::path::Path) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("isolated spawn subscriber fixture");
+        let discovery = Arc::new(SnapshotDiscoveryRuntime::new(
+            orch_infra::process::EnvSnapshot {
+                base: vec![
+                    ("HOME".into(), root.join("home").into_os_string()),
+                    ("PATH".into(), root.join("bin").into_os_string()),
+                ],
+                forced: vec![],
+            },
+        ));
+        let (entered, did_enter) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        discovery.set_spawn_observer(Arc::new(Park {
+            entered,
+            release: Mutex::new(Some(released)),
+        }));
+        struct Release(Option<mpsc::Sender<()>>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let release = Release(Some(release));
+        let diagnostic = runtime.spawn(async move {
+            discovery
+                .run_command("secret-program", &["sensitive-argument"])
+                .await
+        });
+        did_enter
+            .recv_timeout(LIMIT)
+            .expect("isolated spawn subscriber fixture");
+        let (waiting, did_wait) = mpsc::channel();
+        let queued = runtime.spawn(async move {
+            // Poll once to register the real waiting observation before the
+            // parent starts looking for warnings. The permit remains held.
+            let admission = orch_infra::process::gate::reserve_spawn(SpawnSite::Version);
+            tokio::pin!(admission);
+            assert!(futures::poll!(&mut admission).is_pending());
+            waiting.send(()).expect("isolated spawn subscriber fixture");
+            admission.await
+        });
+        did_wait
+            .recv_timeout(LIMIT)
+            .expect("isolated spawn subscriber fixture");
+        tracing::warn!(target: "unrelated-target", "UNRELATED_PAYLOAD");
+        tracing::warn!(target: "orch_infra::process::spawn::other", "PREFIX_PAYLOAD");
+        tracing::debug!(target: "rmcp::service", "SDK_SECRET_DEBUG");
+        tracing::trace!(target: "rmcp::service::client", "SDK_SECRET_TRACE");
+        println!("PARKED");
+        std::io::stdout()
+            .flush()
+            .expect("isolated spawn subscriber fixture");
+        let mut line = String::new();
+        std::io::stdin()
+            .read_line(&mut line)
+            .expect("isolated spawn subscriber fixture");
+        queued.abort();
+        drop(release);
+        runtime.block_on(async {
+            let _ = queued.await;
+            assert!(
+                diagnostic
+                    .await
+                    .expect("isolated spawn subscriber fixture")
+                    .is_ok()
+            );
+        });
+        assert!(orch_infra::process::gate::pending_spawns().is_empty());
+        println!("DRAINED");
+    }
+
+    fn check(args: &[&str], extra: &[(&str, &str)], enabled: bool, narrow: bool, detached: bool) {
+        let root = tempfile::tempdir().expect("isolated spawn subscriber fixture");
+        for dir in [
+            root.path().join("home"),
+            root.path().join("bin"),
+            root.path().join(".orchestry"),
+        ] {
+            std::fs::create_dir_all(dir).expect("isolated spawn subscriber fixture");
+        }
+        let script = root.path().join("bin/secret-program");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'SENSITIVE_CHILD_OUTPUT'\n")
+            .expect("isolated spawn subscriber fixture");
+        std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o700))
+            .expect("isolated spawn subscriber fixture");
+        let stderr_path = root.path().join(if detached {
+            ".orchestry/daemon.log"
+        } else {
+            "stderr"
+        });
+        let stderr = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&stderr_path)
+            .expect("isolated spawn subscriber fixture");
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("isolated spawn subscriber fixture"),
+        );
+        command
+            .args([
+                "--exact",
+                "spawn_subscriber_tests::production_subscriber_child",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env(CHILD, root.path())
+            .env(
+                "ORCH_TEST_TRACE_ARGS",
+                serde_json::to_string(args).expect("isolated spawn subscriber fixture"),
+            )
+            .env("HOME", root.path().join("home"))
+            .env("PATH", root.path().join("bin"))
+            .env(
+                "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                root.path().join("home/global.yml"),
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(stderr);
+        for (key, value) in extra {
+            command.env(key, value);
+        }
+        if detached {
+            command.env("ORCH_TEST_DETACHED_LOG", "1");
+        }
+        let mut child = OwnedChild(command.spawn().expect("isolated spawn subscriber fixture"));
+        let (send, receive) = mpsc::channel();
+        let stdout = child
+            .stdout
+            .take()
+            .expect("isolated spawn subscriber fixture");
+        let reader = std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let line = line.expect("isolated spawn subscriber fixture");
+                let _ = send.send(line);
+            }
+        });
+        let deadline = Instant::now() + LIMIT;
+        let mut parked = false;
+        while Instant::now() < deadline {
+            if let Ok(line) = receive.recv_timeout(Duration::from_millis(100))
+                && line == "PARKED"
+            {
+                parked = true;
+                break;
+            }
+            if child
+                .try_wait()
+                .expect("isolated spawn subscriber fixture")
+                .is_some()
+            {
+                break;
+            }
+        }
+        let observed = Instant::now();
+        let mut log = String::new();
+        while parked && Instant::now() < deadline {
+            log = std::fs::read_to_string(&stderr_path).expect("isolated spawn subscriber fixture");
+            if enabled && log.contains("Waiting") && log.contains("Entered") {
+                break;
+            }
+            if !enabled && observed.elapsed() >= Duration::from_millis(1500) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Release/drain even when the saved parked-stage assertions are RED.
+        let _ = child
+            .stdin
+            .take()
+            .expect("isolated spawn subscriber fixture")
+            .write_all(b"release\n");
+        let drain_deadline = Instant::now() + LIMIT;
+        while Instant::now() < drain_deadline
+            && child
+                .try_wait()
+                .expect("isolated spawn subscriber fixture")
+                .is_none()
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let watchdog = child
+            .try_wait()
+            .expect("isolated spawn subscriber fixture")
+            .is_none();
+        if watchdog {
+            let _ = child.kill();
+        }
+        let status = child.wait().expect("isolated spawn subscriber fixture");
+        reader.join().expect("isolated spawn subscriber fixture");
+        let lines: Vec<_> = receive.try_iter().collect();
+        assert!(
+            !watchdog && status.success(),
+            "child failed: {status}; {log}"
+        );
+        assert!(parked && lines.iter().any(|line| line == "DRAINED"));
+        assert_eq!(
+            log.contains("Waiting") && log.contains("Entered"),
+            enabled,
+            "production Waiting/Entered warnings missing before diagnostic release: {args:?} {extra:?}: {log}"
+        );
+        if narrow {
+            assert!(
+                !log.contains("UNRELATED_PAYLOAD") && !log.contains("PREFIX_PAYLOAD"),
+                "{log}"
+            );
+        }
+        for secret in [
+            "secret-program",
+            "sensitive-argument",
+            "SENSITIVE_CHILD_OUTPUT",
+            "SDK_SECRET_DEBUG",
+            "SDK_SECRET_TRACE",
+        ] {
+            assert!(
+                !log.contains(secret),
+                "sensitive marker {secret} leaked: {log}"
+            );
+        }
+        for line in log.lines().filter(|line| line.contains("spawn_id=")) {
+            for field in ["site=", "stage=", "elapsed_ms=", "overflow="] {
+                assert!(line.contains(field), "{line}");
+            }
+        }
+        assert!(
+            std::fs::metadata(stderr_path)
+                .expect("isolated spawn subscriber fixture")
+                .len()
+                <= 10 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn real_default_subscriber_routes_only_parsed_owner_starts() {
+        for args in [
+            vec!["orch", "daemon", "start"],
+            vec!["orch", "daemon", "start", "--detach"],
+            vec!["orch", "serve"],
+            vec!["orch", "run", "--watch"],
+        ] {
+            check(&args, &[], true, true, args.contains(&"--detach"));
+        }
+        // Detached re-exec removes --detach, but retains the parsed start.
+        check(
+            &["orch", "daemon", "start"],
+            &[("ORCH_DAEMON_DETACHED_CHILD", "1")],
+            true,
+            true,
+            true,
+        );
+        for args in [
+            vec!["orch", "status"],
+            vec!["orch", "mcp"],
+            vec!["orch", "daemon", "status"],
+            vec!["orch", "daemon", "stop"],
+            vec!["orch", "serve", "--once"],
+            vec!["orch", "run", "--once"],
+        ] {
+            check(&args, &[], false, true, false);
+        }
+    }
+
+    #[test]
+    fn explicit_filters_and_independent_sdk_exclusion_survive() {
+        for (extra, enabled) in [
+            (vec![("RUST_LOG", "off")], false),
+            (vec![("RUST_LOG", "")], false),
+            (vec![("RUST_LOG", "warn")], true),
+            (vec![("ORCHESTRY_DEBUG", "1")], true),
+            (vec![("RUST_LOG", "trace,rmcp::service=trace")], true),
+            (
+                vec![("RUST_LOG", "debug,rmcp::service::client=trace")],
+                true,
+            ),
+        ] {
+            check(&["orch", "daemon", "start"], &extra, enabled, false, false);
+        }
     }
 }

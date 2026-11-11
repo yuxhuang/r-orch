@@ -6,6 +6,13 @@
 //! that are never run. Failure cases assert the strongest "nothing happened"
 //! evidence the store offers: the entity file, the index and `config.yml` are
 //! byte-identical afterwards.
+//!
+//! Every mutation command is a daemon RPC since S2a-cli, so `project()` starts
+//! an explicit test daemon on an isolated socket right after `orch init` (see
+//! `tests/common/daemon.rs`) and stops it, process-table checked, when the
+//! `Project` drops. Reading `.orchestry` directly from the test process for
+//! the byte/mtime snapshots below is still fine: those reads never write, and
+//! the daemon is the only writer.
 
 use std::fs;
 use std::io::Write;
@@ -17,10 +24,22 @@ use std::time::SystemTime;
 use assert_cmd::prelude::*;
 use serde_json::{Value, json};
 
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::TestDaemon;
+
 // ── Harness ────────────────────────────────────────────────────────────────
 
 struct Project {
+    // Dropped first: the daemon stops before its project directory goes.
+    daemon: Option<TestDaemon>,
     dir: tempfile::TempDir,
+}
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        daemon::unregister_project(&self.root());
+    }
 }
 
 /// Restores write permission on drop so a failed assertion cannot leave an
@@ -45,8 +64,13 @@ fn project() -> Project {
     );
     fs::create_dir_all(dir.path().join("home")).expect("home");
     fs::create_dir_all(dir.path().join("p")).expect("project dir");
-    let p = Project { dir };
+    let mut p = Project { daemon: None, dir };
     p.ok(&["init", "--name", "up", "--adapter", "shell"]);
+    // `agent|task|config update|patch` are daemon RPCs since S2a-cli: the
+    // explicit test daemon runs before any mutation is issued.
+    let daemon = TestDaemon::start(&p.root(), &p.dir.path().join("home"));
+    daemon::register_project(&p.root(), &daemon);
+    p.daemon = Some(daemon);
     p
 }
 
@@ -72,6 +96,7 @@ impl Project {
             .env("PATH", "/usr/bin:/bin")
             .env_remove("RUST_LOG")
             .env_remove("ORCHESTRY_DEBUG");
+        daemon::apply_for(&self.root(), &mut command);
         command
     }
 

@@ -4,7 +4,7 @@ mod completion;
 mod shutdown;
 mod startup;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,6 +21,21 @@ use super::dispatch::{
 use super::{CANCEL_KILL_GRACE, Orchestrator};
 
 impl Orchestrator {
+    async fn daemon_launch_cancelled(
+        &self,
+        token: &tokio_util::sync::CancellationToken,
+        guard: &AtomicBool,
+    ) {
+        tokio::select! {
+            () = token.cancelled() => (),
+            () = async {
+                while !guard.load(Ordering::SeqCst) && !self.is_shutting_down() {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            } => (),
+        }
+    }
+
     pub fn enable_daemon_mode(&self) {
         self.inner.daemon_mode.store(true, Ordering::SeqCst);
     }
@@ -118,7 +133,7 @@ impl Orchestrator {
                 break;
             }
             if let Err(error) = self
-                .daemon_launch_task_with_guard(&task_id, Arc::clone(&cancelled))
+                .daemon_launch_task_with_guard(&task_id, Arc::clone(&cancelled), false)
                 .await
             {
                 self.emit_error(error, format!("dispatch task {task_id}"));
@@ -237,14 +252,18 @@ impl Orchestrator {
 
     /// A deliberate dispatch request, independent of the persistent switch.
     pub async fn daemon_launch_task(&self, task_id: &str) -> Result<()> {
-        self.daemon_launch_task_with_guard(task_id, Arc::new(AtomicBool::new(false)))
+        self.daemon_launch_task_with_guard(task_id, Arc::new(AtomicBool::new(false)), true)
             .await
     }
 
+    /// `override_retry_wait` is the explicit `orch run <id>`: like v0.13 it
+    /// starts a `retrying` task before its back-off is due (the launch
+    /// consumes the queued retry). Batch launches leave the wait to the tick.
     pub async fn daemon_launch_task_with_guard(
         &self,
         task_id: &str,
         cancelled: Arc<AtomicBool>,
+        override_retry_wait: bool,
     ) -> Result<()> {
         let boundary = self.deps().events.operation_boundary();
         let selected = boundary
@@ -263,7 +282,19 @@ impl Orchestrator {
                     return Ok(None);
                 }
                 let task = self.deps().task_service.get(task_id).await?;
-                if !self.daemon_task_eligible(&task, state).await? {
+                if !self
+                    .daemon_task_eligible(&task, state, override_retry_wait)
+                    .await?
+                {
+                    return Ok(None);
+                }
+                // Its last attempt already failed before spawn; only the
+                // record is missing. Finish that instead of probing again.
+                if super::dispatch::final_failure_unrecorded(&task) {
+                    if self.finish_unrecorded_final_failure(state, task_id).await {
+                        self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
+                        self.save_state(state).await?;
+                    }
                     return Ok(None);
                 }
                 let agents = self.dispatch_agent_directory().await?;
@@ -294,8 +325,24 @@ impl Orchestrator {
                 else {
                     return Ok(None);
                 };
+                // The directory comes from the agent index; the pre-spawn
+                // re-validation reads the agent file. Launch from the file, so
+                // an index entry older than its file (hand edit, or a crash
+                // between the two writes) cannot invalidate every preparation.
+                let agent = if agent.remote.is_none() {
+                    match self.deps().agent_store.get(&agent.id).await? {
+                        Some(current) if current.status == AgentStatus::Idle => current,
+                        _ => return Ok(None),
+                    }
+                } else {
+                    agent
+                };
                 drop(preparing);
                 state.claimed.insert(task_id.to_owned());
+                // Starting consumes the due retry, as in v0.13: `enqueue_retry`
+                // deduplicates by task id, so a leftover entry would swallow
+                // the back-off of a failure before spawn.
+                state.retry_queue.retain(|retry| retry.task_id != task_id);
                 let generation = self.inner.preparation_seq.fetch_add(1, Ordering::SeqCst) + 1;
                 self.inner
                     .preparing_agents
@@ -327,15 +374,29 @@ impl Orchestrator {
                     branch: None,
                 })
             } else {
-                self.deps()
-                    .workspace
-                    .prepare(&task, &agent, &launch_config)
-                    .await
+                tokio::select! {
+                    biased;
+                    () = self.daemon_launch_cancelled(&cancel, &cancelled) => {
+                        self.daemon_release_preparation(task_id, generation).await?;
+                        return Ok(());
+                    }
+                    prepared = self.deps().workspace.prepare(&task, &agent, &launch_config) => prepared,
+                }
             };
             let workspace = match prepared {
                 Ok(workspace) => workspace,
                 Err(error) => {
-                    self.daemon_release_preparation(task_id, generation).await?;
+                    // As in v0.13: a workspace that cannot be prepared costs an
+                    // attempt and backs off. Released with no record, the task
+                    // stays dispatchable and every tick repeats the failure.
+                    // That holds for every preparation error, not only the
+                    // workspace domain errors: a workspaces directory that
+                    // cannot be created is an I/O error and a failed isolated
+                    // copy a plain one. None of them means the preparation was
+                    // invalidated; the recorder checks that itself (generation,
+                    // and a terminal task under the dispatch gate).
+                    self.daemon_record_workspace_failure(task_id, generation, &error)
+                        .await?;
                     return Err(error);
                 }
             };
@@ -448,17 +509,21 @@ impl Orchestrator {
             // Network/probe preparation cannot block task edits, goal pause, cancel,
             // expiry, or agent-run client requests.
             let preparation = if agent.remote.is_none() {
-                Some(
-                    adapter
+                let prepare = async { adapter
                         .as_ref()
                         .expect("local adapter resolved")
                         .prepare_effort(&params)
-                        .await
-                        .and_then(|prepared| check_preparation(&params.config, prepared)),
-                )
-            } else {
-                None
-            };
+                        .await };
+                let prepared = tokio::select! {
+                    biased;
+                    () = self.daemon_launch_cancelled(&cancel, &cancelled) => {
+                        self.daemon_release_preparation(task_id, generation).await?;
+                        return Ok(());
+                    }
+                    prepared = prepare => prepared,
+                };
+                Some(prepared.and_then(|prepared| check_preparation(&params.config, prepared)))
+            } else { None };
             if let (Some(preparation), Some(adapter)) = (preparation, adapter.as_ref()) {
                 let preparation = match preparation {
                     Ok(preparation) => preparation,
@@ -486,6 +551,20 @@ impl Orchestrator {
                 }
                 self.report_effort_diagnostics(&run.id, &agent.id, &diagnostics);
             }
+
+            // Admission precedes the project boundary and state mutex. A queued
+            // launch owns no blocking worker and cannot outlive cancellation.
+            let admission = self.spawn_admission();
+            let reservation = if agent.remote.is_none() {
+                tokio::select! {
+                    biased;
+                    () = self.daemon_launch_cancelled(&cancel, &cancelled) => {
+                        self.daemon_release_preparation(task_id, generation).await?;
+                        return Ok(());
+                    }
+                    permit = admission.reserve() => Some(permit),
+                }
+            } else { None };
 
             let launched = boundary
                 .run(true, async {
@@ -582,10 +661,13 @@ impl Orchestrator {
                         .await;
                         return Ok(true);
                     }
-                    let handle = match self.execute_prepared(
-                        adapter.as_ref().expect("local adapter resolved").as_ref(),
-                        params,
-                    ) {
+                    let execution = {
+                        let _scope = reservation.expect("local launch reservation").enter();
+                        self.execute_prepared(
+                            adapter.as_ref().expect("local adapter resolved").as_ref(), params,
+                        )
+                    };
+                    let handle = match execution {
                         Ok(handle) => handle,
                         Err(error) => {
                             self.fail_before_spawn(
@@ -706,7 +788,12 @@ impl Orchestrator {
         result
     }
 
-    async fn daemon_task_eligible(&self, task: &Task, state: &OrchestratorState) -> Result<bool> {
+    async fn daemon_task_eligible(
+        &self,
+        task: &Task,
+        state: &OrchestratorState,
+        override_retry_wait: bool,
+    ) -> Result<bool> {
         if !is_dispatchable(task.status) || task.awaits_approval() {
             return Ok(false);
         }
@@ -717,11 +804,8 @@ impl Orchestrator {
         }
 
         if task.status == TaskStatus::Retrying
-            && state.retry_queue.iter().any(|retry| {
-                retry.task_id == task.id
-                    && super::tick::epoch_ms_from_iso(&retry.due_at)
-                        .is_none_or(|due| self.deps().clock.now_ms() < due)
-            })
+            && !override_retry_wait
+            && super::dispatch::retry_pending(state, &task.id, self.deps().clock.now_ms())
         {
             return Ok(false);
         }
@@ -733,12 +817,20 @@ impl Orchestrator {
         {
             return Ok(false);
         }
+        // Only dependencies and scope reservations need the other tasks. A
+        // backlog of independent tasks must not parse the whole index per
+        // candidate while holding the boundary.
+        let reserved = state
+            .running
+            .keys()
+            .chain(state.claimed.iter())
+            .any(|id| id != &task.id);
+        let scoped = task.scope.as_deref().is_some_and(|scope| !scope.is_empty());
+        if task.depends_on.is_empty() && !(scoped && reserved) {
+            return Ok(true);
+        }
         let tasks = self.deps().task_store.list(&Default::default()).await?;
-        let map: HashMap<String, Task> = tasks
-            .iter()
-            .map(|task| (task.id.clone(), task.clone()))
-            .collect();
-        if is_blocked(task, &map) {
+        if is_blocked(task, tasks.as_slice()) {
             return Ok(false);
         }
         if tasks.iter().any(|running| {
@@ -799,38 +891,91 @@ impl Orchestrator {
         Ok(true)
     }
 
+    /// Whether this generation still owns the task's preparation. A
+    /// generation is never reissued, so once false it stays false.
+    async fn owns_preparation(&self, task_id: &str, generation: u64) -> bool {
+        self.inner
+            .preparing_agents
+            .lock()
+            .await
+            .get(task_id)
+            .is_some_and(|(current, _)| *current == generation)
+    }
+
     async fn daemon_release_preparation(&self, task_id: &str, generation: u64) -> Result<()> {
+        // Already released (a workspace failure releases as it records): do
+        // not queue for the boundary only to commit nothing.
+        if !self.owns_preparation(task_id, generation).await {
+            return Ok(());
+        }
         self.deps()
             .events
             .operation_boundary()
             .run(true, async {
-                if self.is_shutting_down() {
-                    return Ok(());
-                }
-                if !self
-                    .inner
-                    .preparing_agents
-                    .lock()
-                    .await
-                    .get(task_id)
-                    .is_some_and(|(current, _)| *current == generation)
-                {
+                if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
                     return Ok(());
                 }
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
-                for run in self.deps().run_store.list_for_task(task_id).await? {
-                    if run.status == RunStatus::Preparing {
-                        self.deps()
-                            .run_service
-                            .finish(&run.id, RunStatus::Cancelled, None, None)
-                            .await?;
-                    }
+                self.release_preparation_locked(state, task_id).await?;
+                self.save_state(state).await
+            })
+            .await
+            .value
+    }
+
+    /// Cancel the preparing runs and drop the claim; the caller saves state.
+    async fn release_preparation_locked(
+        &self,
+        state: &mut OrchestratorState,
+        task_id: &str,
+    ) -> Result<()> {
+        for run in self.deps().run_store.list_for_task(task_id).await? {
+            if run.status == RunStatus::Preparing {
+                self.deps()
+                    .run_service
+                    .finish(&run.id, RunStatus::Cancelled, None, None)
+                    .await?;
+            }
+        }
+        state.claimed.shift_remove(task_id);
+        self.inner.preparing_agents.lock().await.remove(task_id);
+        self.drop_cancel(task_id).await;
+        Ok(())
+    }
+
+    /// Account a workspace failure for the preparation this call still owns
+    /// and release it in the same operation: one state write per failed
+    /// candidate, not one for the retry and another for the release.
+    async fn daemon_record_workspace_failure(
+        &self,
+        task_id: &str,
+        generation: u64,
+        error: &Error,
+    ) -> Result<()> {
+        self.deps()
+            .events
+            .operation_boundary()
+            .run(true, async {
+                if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
+                    return Ok(());
                 }
-                state.claimed.shift_remove(task_id);
-                self.inner.preparing_agents.lock().await.remove(task_id);
-                self.drop_cancel(task_id).await;
+                let mut slot = self.inner.state.lock().await;
+                self.load_state(&mut slot).await?;
+                let state = slot.as_mut().expect("state loaded");
+                if self
+                    .record_workspace_dispatch_failure(state, task_id, None, error)
+                    .await
+                {
+                    // The task is saved `retrying` (on a final attempt: with
+                    // its record pending), but its back-off exists only here
+                    // until the save below. If the release or that save
+                    // fails, the next `load_state` must write this state
+                    // rather than replace it, or the retry runs with no wait.
+                    self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
+                }
+                self.release_preparation_locked(state, task_id).await?;
                 self.save_state(state).await
             })
             .await

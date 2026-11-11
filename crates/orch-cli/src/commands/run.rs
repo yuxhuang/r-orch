@@ -1,214 +1,256 @@
-//! `orch run`.
-//!
-//! # Why this waits explicitly
-//!
-//! The dispatch calls return as soon as the dispatch is done, while the
-//! agent's child process and the reactive-dispatch timer keep working. The run
-//! has to finish, its collector has to write the task and run records, and
-//! the exit code set from the `agent:completed` handler is what the shell
-//! sees.
-//!
-//! Rust has no such implicit lifetime: returning here would drop the runtime
-//! and kill the agent mid-run. So the wait is explicit and reproduces exactly
-//! those two handles — the in-flight runs, and (for `--all` only) the 500 ms
-//! debounce in which a completion can start the next task. `run <id>` needs no
-//! such window: the orchestrator records it as a single-task run and suppresses
-//! reactive dispatch.
-//!
-//! # Why `run <id>` and `run --all` catch SIGINT/SIGTERM
-//!
-//! Watch, serve and the TUI install termination handlers; these two did not,
-//! so a signal killed orch outright. During a dispatch that orphaned the
-//! OpenCode effort probe's process group (gate-resilience F1): its deadline
-//! and kill guard live in this runtime, and the probe pid is deliberately not
-//! in the model-pid slot startup recovery reads. Both paths now latch the
-//! signal ([`StandaloneSignals`]), let the bounded dispatch critical section
-//! finish — the orchestrator cancels an in-flight preparation, which kills and
-//! reaps its group, and starts no model child — then stop this process's runs
-//! and settle their records before exiting `128 + signal`.
+//! Explicit scheduling over the daemon socket. Disconnecting an observer
+//! leaves its runs owned by the daemon; task cancel is the only kill command.
+pub mod logs;
 
-use std::collections::HashSet;
-use std::future::Future;
-use std::process::ExitCode;
-use std::time::Duration;
-
-use orch_core::error::Result;
-use orch_domain::OrchestratorEvent;
-use orch_engine::{EventSubscription, FullEngine, Orchestrator};
-
+use super::rpc::{Rpc, client_error};
+use crate::context::CliContext;
 use crate::output::{Color, Icon, Styles, print_error, print_success};
+use orch_client::Progress;
+use orch_core::error::{Error, Result};
+use orch_domain::OrchestratorEvent;
+use orch_proto::ops::{Op, args};
+use std::process::ExitCode;
 
-/// The reactive-dispatch debounce (500 ms) plus room for the dispatch itself.
-/// Only `--all` waits it out; see the module docs.
-const REACTIVE_DISPATCH_WINDOW: Duration = Duration::from_millis(1_500);
+pub async fn report_startup_diagnostics(engine: &Rpc, styles: &Styles) -> Result<()> {
+    let bootstrap = engine.request(args::UiBootstrapArgs {}).await?;
+    for warning in bootstrap.startup_warnings {
+        eprintln!("  {} {warning}", styles.paint(Color::Yellow, "⚠"));
+    }
+    Ok(())
+}
 
-/// How long `run <id>` sits on a silent bus before asking the run record
-/// whether it missed the completion.
-///
-/// Deliberately far longer than any agent's gap between events: the check is a
-/// backstop for a *lost* completion, not a poll loop, and ending the wait
-/// early would truncate the stream.
-const LOST_COMPLETION_POLL: Duration = Duration::from_secs(60);
+pub async fn single(engine: &Rpc, styles: &Styles, task_id: &str) -> Result<ExitCode> {
+    let task = engine
+        .call::<args::TaskGetArgs>(serde_json::json!({"id":task_id}))
+        .await?;
+    println!(
+        "\n  {} · running {task_id} \"{}\"\n",
+        styles.paint(Color::Amber, "orch"),
+        task.title
+    );
+    let args =
+        super::rpc::arguments::<args::DispatchRunTaskArgs>(serde_json::json!({"task_id":task_id}))?;
+    let mut target_run = None;
+    let mut failed = false;
+    let (outcome, signal) = stream(engine, args, |event| {
+        handle_single(styles, event, task_id, &mut target_run, &mut failed);
+    })
+    .await?;
+    Ok(code(outcome.exit_code, signal))
+}
 
-/// Print the engine's read-only startup diagnostics to **stderr**: one line
-/// per affected agent for effort requests dispatch will ignore, clamp or
-/// cannot confirm, the Codex managed-model coupling, and agents that would
-/// render eco against a custom template. Nothing is spawned or written; a
-/// store read failure is itself reported and does not stop the run, whose own
-/// preflight decides.
-pub async fn report_startup_diagnostics(engine: &FullEngine, styles: &Styles) {
-    let agents = match engine.agent_service.list().await {
-        Ok(agents) => agents,
-        Err(err) => {
-            print_error(
-                styles,
-                &format!("Could not check agent diagnostics: {err}"),
-                None,
+pub async fn all(engine: &Rpc, styles: &Styles) -> Result<ExitCode> {
+    println!(
+        "\n  {} · running all todo tasks\n",
+        styles.paint(Color::Amber, "orch")
+    );
+    let (outcome, signal) = stream(engine, args::DispatchRunAllArgs {}, |_| {}).await?;
+    Ok(code(outcome.exit_code, signal))
+}
+
+pub async fn once(engine: &Rpc, ctx: &CliContext, styles: &Styles) -> Result<ExitCode> {
+    let (outcome, signal) = stream(engine, args::DispatchTickArgs {}, |event| {
+        if ctx.output.is_none() && !ctx.quiet {
+            print_event(styles, event);
+        }
+    })
+    .await?;
+    if let Some(format) = ctx.output {
+        format.print(&outcome)?;
+    }
+    Ok(code(0, signal))
+}
+
+pub async fn serve_once(engine: &Rpc, flags: &crate::tree::ServeCmd) -> Result<ExitCode> {
+    let format = crate::serve::LogFormat::parse(&flags.log_format).ok_or_else(|| {
+        Error::invalid_arguments(format!(
+            "Unknown --log-format \"{}\". Valid: json, text",
+            flags.log_format
+        ))
+    })?;
+    let logger = crate::serve::StructuredLogger::new(
+        format,
+        flags.verbose,
+        std::sync::Arc::new(orch_infra::clock::SystemClock),
+        crate::serve::open_sinks(flags.log_file.as_deref())?,
+    );
+    logger.log(
+        crate::serve::LogLevel::Info,
+        "serve:started",
+        vec![("mode", serde_json::json!("once"))],
+    );
+    log_startup_diagnostics(engine, &logger).await;
+    let (result, signal) = stream(engine, args::DispatchUntilTerminalArgs {}, |event| {
+        logger.handle(event)
+    })
+    .await?;
+    let exit = match result {
+        orch_proto::ops::results::BatchResult::AllDone => 0,
+        _ => 1,
+    };
+    logger.log(
+        crate::serve::LogLevel::Info,
+        "serve:finished",
+        vec![
+            ("result", serde_json::json!(result)),
+            ("exit_code", serde_json::json!(exit)),
+        ],
+    );
+    logger.flush();
+    Ok(code(exit, signal))
+}
+
+/// The daemon's startup diagnostics as `warn` records, one `serve:diagnostic`
+/// per warning, before the batch starts any work: the set `run` prints to
+/// stderr, in the chosen `--log-format` so they reach the `--log-file` and
+/// never break the JSON stream. A failed read is logged and does not stop the
+/// batch; dispatch's own preflight decides.
+async fn log_startup_diagnostics(engine: &Rpc, logger: &crate::serve::StructuredLogger) {
+    let warnings = match engine.request(args::UiBootstrapArgs {}).await {
+        Ok(bootstrap) => bootstrap.startup_warnings,
+        Err(error) => {
+            logger.log(
+                crate::serve::LogLevel::Warn,
+                "serve:diagnostics_unavailable",
+                vec![("error", serde_json::json!(error.to_string()))],
             );
             return;
         }
     };
-    let glyph = styles.paint(Color::Yellow, styles.icon(Icon::Warning));
-    for diagnostic in orch_engine::prompt_mode::startup_diagnostics(&engine.config, &agents) {
-        eprintln!(
-            "  {glyph} {} ({}): {}",
-            diagnostic.agent_name, diagnostic.agent_id, diagnostic.message
+    if warnings.is_empty() {
+        return;
+    }
+    // Only for the agentId/agentName split; without it each record still
+    // carries the whole warning as its message.
+    let agents = engine
+        .request(args::AgentListArgs {})
+        .await
+        .unwrap_or_default();
+    for warning in &warnings {
+        logger.log(
+            crate::serve::LogLevel::Warn,
+            "serve:diagnostic",
+            diagnostic_fields(warning, &agents),
         );
     }
 }
 
-/// `run <task-id>` — dispatch one task and stream its events.
-pub async fn single(engine: &FullEngine, styles: &Styles, task_id: &str) -> Result<ExitCode> {
-    let task = engine.task_service.get(task_id).await?;
-    println!();
-    println!(
-        "  {} · running {task_id} \"{}\"",
-        styles.paint(Color::Amber, "orch"),
-        task.title
-    );
-
-    // Installed before the dispatch: from here a signal is latched, never
-    // the default immediate death (module docs).
-    let mut signals = StandaloneSignals::install();
-    // Subscribed before the dispatch, so `agent:started` cannot be missed.
-    let mut events = engine.events.subscribe();
-    let mut target_run: Option<String> = None;
-    let mut failed = false;
-
-    let (dispatched, interrupted) = settle_dispatch(
-        &engine.orchestrator,
-        engine.orchestrator.run_task(task_id),
-        &mut signals,
-    )
-    .await;
-    if let Some(signal) = interrupted {
-        return interrupted_exit(engine, styles, signal, dispatched.err()).await;
+/// Split a `ui.bootstrap` startup warning, `"{agent_name} ({agent_id}):
+/// {message}"`, back into the 0.13.0 record fields. The agent is matched by
+/// its exact prefix, never guessed from the text; the longest match wins.
+fn diagnostic_fields(
+    warning: &str,
+    agents: &[orch_domain::Agent],
+) -> Vec<(&'static str, serde_json::Value)> {
+    let matched = agents
+        .iter()
+        .filter_map(|agent| {
+            warning
+                .strip_prefix(&format!("{} ({}): ", agent.name, agent.id))
+                .map(|message| (agent, message))
+        })
+        .min_by_key(|(_, message)| message.len());
+    match matched {
+        Some((agent, message)) => vec![
+            ("agentId", serde_json::json!(agent.id)),
+            ("agentName", serde_json::json!(agent.name)),
+            ("message", serde_json::json!(message)),
+        ],
+        None => vec![("message", serde_json::json!(warning))],
     }
-    dispatched?;
+}
 
-    // Everything the dispatch emitted is already buffered, so this decides
-    // correctly whether a run started at all — the `if (!targetRunId)` of the
-    // original, which is reached for a terminal or non-dispatchable task.
-    let mut completed = false;
-    for event in events.try_drain() {
-        completed |= handle_single(styles, &event, task_id, &mut target_run, &mut failed);
+fn code(exit: i32, signal: Option<u8>) -> ExitCode {
+    ExitCode::from(signal.unwrap_or_else(|| u8::try_from(exit).unwrap_or(1)))
+}
+
+fn print_event(styles: &Styles, event: &OrchestratorEvent) {
+    if let Some(line) = crate::logs::format_live_event(styles, event, &crate::logs::now_time()) {
+        println!("{line}");
     }
+}
 
-    // The original's closing `console.log()` runs here, right after
-    // `await runTask(...)` — *before* the agent's output arrives, since the
-    // dispatch returns as soon as the child is spawned. So the blank line
-    // sits under the header rather than at the end of the stream.
-    println!();
-
-    // `!completed` because the completion can already be in the batch above:
-    // without it this waits for a second one that never comes, and `run <id>`
-    // hangs after printing its result.
-    if target_run.is_some() && !completed {
-        let mut dropped = 0;
-        loop {
-            let next = tokio::select! {
-                signal = signals.next() => {
-                    return interrupted_exit(engine, styles, signal, None).await;
+/// Install all observer signal handlers before dispatch. Cancellation is a
+/// protocol request and bounded by orch-client; it never kills an agent.
+async fn stream<A: Op>(
+    engine: &Rpc,
+    args: A,
+    mut render: impl FnMut(&OrchestratorEvent),
+) -> Result<(A::Output, Option<u8>)> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())
+        .map_err(|e| Error::other(format!("cannot listen for SIGINT: {e}")))?;
+    let mut terminate = signal(SignalKind::terminate())
+        .map_err(|e| Error::other(format!("cannot listen for SIGTERM: {e}")))?;
+    let mut hangup = signal(SignalKind::hangup())
+        .map_err(|e| Error::other(format!("cannot listen for SIGHUP: {e}")))?;
+    let mut lane = engine.lane().await;
+    let mut call = lane.start(args).await.map_err(client_error)?;
+    loop {
+        let signal = tokio::select! {
+            result = call.next() => {
+                match result.map_err(client_error)? {
+                    Progress::Event(event) => render(&event),
+                    Progress::Done(value) => return Ok((value,None)),
                 }
-                next = tokio::time::timeout(LOST_COMPLETION_POLL, events.recv()) => next,
-            };
-            match next {
-                Ok(Some(event)) => {
-                    let ended =
-                        handle_single(styles, &event, task_id, &mut target_run, &mut failed);
-                    let lost = crate::logs::report_dropped_events(&mut dropped, &events);
-                    // Only the completion ends the wait — and a dropped event
-                    // may *be* the completion, so check the record too.
-                    if ended
-                        || (lost
-                            && finish_from_record(engine, styles, &target_run, &mut failed).await)
-                    {
-                        break;
-                    }
-                }
-                // The bus outlives this call, so `None` means shutdown.
-                Ok(None) => break,
-                Err(_elapsed) => {
-                    // Long silence. An agent can be quiet for minutes, so this
-                    // ends the wait only if the run is already finished on
-                    // disk — in which case its `agent:completed` is never
-                    // coming and waiting is waiting forever.
-                    if finish_from_record(engine, styles, &target_run, &mut failed).await {
-                        break;
-                    }
-                }
+                continue;
             }
-        }
+            _ = interrupt.recv() => 130,
+            _ = terminate.recv() => 143,
+            _ = hangup.recv() => 129,
+        };
+        return call
+            .cancel()
+            .await
+            .map(|value| (value, Some(signal)))
+            .map_err(client_error);
     }
-    if target_run.is_some() {
-        // `agent:completed` is emitted when the *run* is finished, from the
-        // middle of the collector — the task's status change, the agent's
-        // stats and the workspace cleanup all come after it. Returning here
-        // would drop the runtime mid-collector. Outside the branch above
-        // because it is owed whenever a run started, including when its
-        // completion arrived before the wait.
-        engine.orchestrator.wait_for_collectors().await;
-    }
-
-    Ok(if failed {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    })
 }
 
-/// Finish the wait from the run record when its `agent:completed` never
-/// arrived, printing the same `Done`/`Failed` the event handler would.
-///
-/// Returns whether the run is over. `false` keeps the caller waiting, which is
-/// the right answer while the run is still in flight.
-async fn finish_from_record(
-    engine: &FullEngine,
+/// Local executable/dependency checks remain available before owner startup;
+/// project checks run only inside the daemon.
+pub async fn doctor(
+    cli: &crate::tree::Cli,
     styles: &Styles,
-    target_run: &Option<String>,
-    failed: &mut bool,
-) -> bool {
-    let Some(run_id) = target_run.as_deref() else {
-        return false;
-    };
-    let Ok(Some(run)) = engine.run_service.get(run_id).await else {
-        // A record we cannot read is not evidence the run ended.
-        return false;
-    };
-    use orch_domain::RunStatus;
-    match run.status {
-        RunStatus::Succeeded => print_success(styles, "Done"),
-        RunStatus::Failed | RunStatus::Cancelled | RunStatus::TimedOut => {
-            print_error(styles, "Failed", None);
-            *failed = true;
+    cwd: &std::path::Path,
+) -> Result<ExitCode> {
+    let client = match Rpc::connect(cli, cwd).await {
+        Ok(client) => client,
+        Err(error) => {
+            crate::doctor::run(styles, cwd, cli.output(), None).await?;
+            if super::rpc::recover_client_error(&error).is_some_and(|e| {
+                matches!(
+                    e,
+                    orch_client::ClientError::Connection(orch_client::NoDaemon::NotInitialized)
+                )
+            }) {
+                return Ok(ExitCode::SUCCESS);
+            }
+            return Err(error);
         }
-        // Still in flight; keep waiting for the event.
-        RunStatus::Preparing | RunStatus::Running => return false,
+    };
+    let report = client.request(args::DoctorRunArgs {}).await?;
+    let report: orch_engine::DoctorReport = super::rpc::arguments(report)?;
+    print!("{}", crate::doctor::render_header(styles));
+    if let Some(format) = cli.output() {
+        format.print(&crate::doctor::DoctorJson::from(&report))?;
+    } else {
+        let status = client.request(args::StatusGetArgs {}).await?;
+        print!(
+            "{}",
+            crate::doctor::render_report(
+                styles,
+                &report,
+                &crate::doctor::ProjectLine::Initialized {
+                    agents: status.agents.len(),
+                    tasks: status.tasks.len()
+                }
+            )
+        );
     }
-    true
+    Ok(ExitCode::SUCCESS)
 }
 
-/// Print what this event shows and report whether it ended the target run.
 fn handle_single(
     styles: &Styles,
     event: &OrchestratorEvent,
@@ -263,310 +305,8 @@ fn handle_single(
     false
 }
 
-/// `run --all` — dispatch every todo task and wait for the queue to drain.
-pub async fn all(engine: &FullEngine, styles: &Styles) -> Result<ExitCode> {
-    println!();
-    println!(
-        "  {} · running all todo tasks",
-        styles.paint(Color::Amber, "orch")
-    );
-    println!();
-
-    let mut signals = StandaloneSignals::install();
-    let mut events = engine.events.subscribe();
-    let (dispatched, interrupted) = settle_dispatch(
-        &engine.orchestrator,
-        engine.orchestrator.run_all(),
-        &mut signals,
-    )
-    .await;
-    if let Some(signal) = interrupted {
-        return interrupted_exit(engine, styles, signal, dispatched.err()).await;
-    }
-    dispatched?;
-    tokio::select! {
-        () = drain_runs(&mut events) => {}
-        signal = signals.next() => {
-            return interrupted_exit(engine, styles, signal, None).await;
-        }
-    }
-    // The last completion event arrives from inside a collector; this waits
-    // for the work that follows it.
-    engine.orchestrator.wait_for_collectors().await;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// The `SIGINT`/`SIGTERM` arms of the standalone paths.
-///
-/// Creating an arm replaces the default disposition for the rest of the
-/// process, so they are installed once per command and kept until it returns.
-/// An arm that cannot be installed is reported and leaves that signal's
-/// default behaviour in place.
-struct StandaloneSignals {
-    interrupt: Option<tokio::signal::unix::Signal>,
-    terminate: Option<tokio::signal::unix::Signal>,
-}
-
-impl StandaloneSignals {
-    fn install() -> Self {
-        use tokio::signal::unix::{SignalKind, signal};
-        let install = |kind: SignalKind, name: &str| {
-            signal(kind)
-                .inspect_err(|err| tracing::warn!(%err, "could not install the {name} handler"))
-                .ok()
-        };
-        StandaloneSignals {
-            interrupt: install(SignalKind::interrupt(), "SIGINT"),
-            terminate: install(SignalKind::terminate(), "SIGTERM"),
-        }
-    }
-
-    /// The next signal. Pending forever when neither arm exists.
-    async fn next(&mut self) -> Signal {
-        match (self.interrupt.as_mut(), self.terminate.as_mut()) {
-            (Some(interrupt), Some(terminate)) => tokio::select! {
-                _ = interrupt.recv() => Signal::Interrupt,
-                _ = terminate.recv() => Signal::Terminate,
-            },
-            (Some(interrupt), None) => {
-                interrupt.recv().await;
-                Signal::Interrupt
-            }
-            (None, Some(terminate)) => {
-                terminate.recv().await;
-                Signal::Terminate
-            }
-            (None, None) => std::future::pending().await,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Signal {
-    Interrupt,
-    Terminate,
-}
-
-impl Signal {
-    fn name(self) -> &'static str {
-        match self {
-            Signal::Interrupt => "SIGINT",
-            Signal::Terminate => "SIGTERM",
-        }
-    }
-
-    /// The shell convention for death by this signal.
-    fn exit_code(self) -> ExitCode {
-        ExitCode::from(match self {
-            Signal::Interrupt => 130,
-            Signal::Terminate => 143,
-        })
-    }
-}
-
-/// Await a dispatch to completion even when a signal arrives meanwhile.
-///
-/// The dispatch is never dropped: it may be between two persisted writes, and
-/// abandoning it there is exactly the half-written critical section the
-/// orchestrator's own stop path refuses to produce. A signal instead latches
-/// the orchestrator's interrupt, which bounds what is left (an effort probe in
-/// flight is killed and reaped, no model child starts), and the dispatch's own
-/// result is still returned.
-async fn settle_dispatch(
-    orchestrator: &Orchestrator,
-    dispatch: impl Future<Output = Result<()>>,
-    signals: &mut StandaloneSignals,
-) -> (Result<()>, Option<Signal>) {
-    tokio::pin!(dispatch);
-    tokio::select! {
-        biased;
-        result = &mut dispatch => (result, None),
-        signal = signals.next() => {
-            orchestrator.interrupt();
-            (dispatch.await, Some(signal))
-        }
-    }
-}
-
-/// Stop this process's runs after a signal, report it, and pick the exit code.
-async fn interrupted_exit(
-    engine: &FullEngine,
-    styles: &Styles,
-    signal: Signal,
-    dispatch_error: Option<orch_core::Error>,
-) -> Result<ExitCode> {
-    let stopped = engine
-        .orchestrator
-        .stop_interrupted_runs(signal.name())
-        .await;
-    println!();
-    print_error(
-        styles,
-        &format!(
-            "Interrupted by {}: stopped the runs this command started",
-            signal.name()
-        ),
-        None,
-    );
-    for err in dispatch_error.iter().chain(stopped.as_ref().err()) {
-        print_error(styles, &err.to_string(), None);
-    }
-    Ok(signal.exit_code())
-}
-
-/// Wait until no run is in flight and no reactive dispatch starts another.
-///
-/// `--all` prints nothing per event — no listener is registered in
-/// this mode — so this only tracks the set of live runs.
-async fn drain_runs(events: &mut EventSubscription) {
-    let mut in_flight: HashSet<String> = HashSet::new();
-
-    for event in events.try_drain() {
-        track(&event, &mut in_flight);
-    }
-
-    loop {
-        match tokio::time::timeout(REACTIVE_DISPATCH_WINDOW, events.recv()).await {
-            Ok(Some(event)) => track(&event, &mut in_flight),
-            // The bus outlives this call, so `None` only happens at shutdown.
-            Ok(None) => return,
-            // Nothing happened for a whole debounce window. With a run still
-            // in flight that is just a quiet agent; with none, the queue has
-            // drained, so there is nothing left to wait for.
-            Err(_elapsed) => {
-                if in_flight.is_empty() {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-fn track(event: &OrchestratorEvent, in_flight: &mut HashSet<String>) {
-    match event {
-        OrchestratorEvent::AgentStarted { run_id, .. } => {
-            in_flight.insert(run_id.clone());
-        }
-        OrchestratorEvent::AgentCompleted { run_id, .. } => {
-            in_flight.remove(run_id);
-        }
-        _ => {}
-    }
-}
-
-/// `run --watch` — the continuous orchestration loop, with a live log stream.
-pub async fn watch(
-    engine: std::sync::Arc<FullEngine>,
-    styles: &Styles,
-    verbose: bool,
-) -> Result<ExitCode> {
-    println!(
-        "{} · watching · poll interval {}s",
-        styles.paint(Color::Amber, "orch"),
-        // Integer division: `/ 1000` on a round number.
-        engine.config.scheduling.poll_interval_ms / 1000
-    );
-    println!("{}", "━".repeat(43));
-    println!();
-
-    let events = engine.events.subscribe();
-    // Ended by a token rather than `abort()`, and drained afterwards. The
-    // shutdown emits a burst — `orchestrator:shutdown`, then a run, task and
-    // agent event per entry the wind-down finishes — and aborting the pump
-    // discards whatever it has not printed yet, including the last line
-    // (`Shutting down...`).
-    let done = tokio_util::sync::CancellationToken::new();
-    let pump = tokio::spawn({
-        let styles = *styles;
-        let done = done.clone();
-        async move {
-            crate::logs::pump_until_cancelled(events, done, |event| {
-                print_watch_event(&styles, event, verbose);
-            })
-            .await;
-        }
-    });
-
-    let peer_runtime = crate::serve::peer::start_watch(
-        std::sync::Arc::clone(&engine),
-        orch_engine::WatchOptions::watching(),
-    )
-    .await?;
-    engine.orchestrator.wait_for_stop().await;
-    drop(peer_runtime);
-
-    done.cancel();
-    let _ = pump.await;
-    Ok(ExitCode::SUCCESS)
-}
-
-fn print_watch_event(styles: &Styles, event: &OrchestratorEvent, verbose: bool) {
-    // Minutes, not seconds: watch mode's clock is coarser than `run <id>`'s.
-    let time = styles.dim(&crate::logs::now_time_minutes());
-    match event {
-        OrchestratorEvent::AgentOutput { data, .. } => {
-            if verbose {
-                println!(
-                    "{time}  {} {}",
-                    styles.icon(Icon::AgentAction),
-                    slice_60(data)
-                );
-            }
-        }
-        OrchestratorEvent::AgentCompleted {
-            run_id, success, ..
-        } => {
-            if *success {
-                println!("{time}  {} DONE  {run_id}", styles.icon(Icon::Done));
-            } else {
-                println!("{time}  {} FAIL  {run_id}", styles.icon(Icon::Failed));
-            }
-        }
-        OrchestratorEvent::RunRetry {
-            attempt, delay_ms, ..
-        } => {
-            println!(
-                "{time}  {} RETRY  attempt {attempt} · next in {}s",
-                styles.icon(Icon::Retrying),
-                // `Math.round`, so 1500 ms is 2s.
-                (*delay_ms as f64 / 1000.0).round() as u64
-            );
-        }
-        OrchestratorEvent::OrchestratorTick { running, queued } => {
-            // Overwrites itself with `\r`, and keeps the trailing spaces that
-            // clear a longer previous line.
-            print!(
-                "\r{} · watching · {running} running · {queued} queued    ",
-                styles.paint(Color::Amber, "orch")
-            );
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
-        OrchestratorEvent::OrchestratorStallDetected { run_id } => {
-            println!("{time}  {} STALL  {run_id}", styles.icon(Icon::Warning));
-        }
-        OrchestratorEvent::OrchestratorShutdown { .. } => {
-            println!("\n{}", styles.dim("Shutting down..."));
-        }
-        // Includes shutdown's unacknowledged remote cancels, which name the
-        // peer and execution that may still be running.
-        OrchestratorEvent::OrchestratorError { error, context, .. } => {
-            println!(
-                "{}",
-                crate::logs::format_orchestrator_error(styles, &time, error, context)
-            );
-        }
-        _ => {}
-    }
-}
-
-/// `String.prototype.slice(0, 80)` over UTF-16 units, dropping a character
-/// that would straddle the cut.
 fn slice_80(data: &str) -> String {
     slice_utf16(data, 80)
-}
-
-fn slice_60(data: &str) -> String {
-    slice_utf16(data, 60)
 }
 
 fn slice_utf16(data: &str, max_units: usize) -> String {
@@ -589,173 +329,117 @@ fn slice_utf16(data: &str, max_units: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use orch_daemon::testing::DaemonHarness;
+    use orch_proto::handshake::{Caller, CallerKind, SessionMode};
+    use serde_json::Value;
 
-    /// A project with one finished run, so the backstop has a record to read.
-    async fn engine_with_run(
-        status: orch_domain::RunStatus,
-    ) -> (tempfile::TempDir, FullEngine, String) {
-        let temp = tempfile::tempdir().expect("tempdir");
-        orch_infra::storage::fs_utils::clear_ensured_dirs();
-        let paths = orch_infra::storage::Paths::new(temp.path());
-        std::fs::create_dir_all(paths.root()).expect("create .orchestry");
-        orch_core::storage::ConfigStore::write(
-            &orch_infra::storage::FileConfigStore::new(paths.clone()),
-            &orch_domain::default_config(),
-        )
-        .await
-        .expect("write config");
+    fn agent(id: &str, name: &str) -> orch_domain::Agent {
+        let mut agent = orch_core::test_support::make_agent();
+        agent.id = id.into();
+        agent.name = name.into();
+        agent
+    }
 
-        let engine = orch_engine::build_full_with(
-            temp.path(),
-            orch_engine::EngineSeams {
-                global_config_path: Some(paths.root().join("global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("build_full");
-
-        let run = engine
-            .run_service
-            .create(orch_engine::CreateRunInput {
-                task_id: "tsk_1".to_owned(),
-                agent_id: "agt_1".to_owned(),
-                attempt: 1,
-                prompt: "p".to_owned(),
-                workspace_path: "/ws".to_owned(),
-            })
+    /// Runs `serve --once`'s startup step against an in-process daemon
+    /// holding `agents` and returns the JSON records it wrote.
+    async fn startup_records(agents: Vec<orch_domain::Agent>) -> Vec<Value> {
+        let daemon = DaemonHarness::builder()
+            .maintenance_timer(false)
+            .start()
             .await
-            .expect("create run");
-        if status != orch_domain::RunStatus::Preparing {
-            engine
-                .run_service
-                .finish(&run.id, status, None, None)
+            .expect("harness daemon");
+        for agent in &agents {
+            daemon
+                .engine()
+                .agents
+                .save(agent)
                 .await
-                .expect("finish run");
+                .expect("save agent");
         }
-        (temp, engine, run.id)
+        let endpoint = daemon.connect().await.expect("connect");
+        let project = orch_client::Project::discover(daemon.project_root(), None).expect("project");
+        let caller = Caller {
+            kind: CallerKind::Cli,
+            agent_id: None,
+            pid: None,
+        };
+        let client = orch_client::Client::from_stream(
+            project,
+            endpoint.into_stream(),
+            caller,
+            SessionMode::Normal,
+        )
+        .await
+        .expect("handshake");
+        let engine = Rpc::from_client(daemon.project_root().to_path_buf(), client);
+
+        let log = tempfile::tempdir().expect("tempdir");
+        let path = log.path().join("serve.log");
+        let logger = crate::serve::StructuredLogger::new(
+            crate::serve::LogFormat::Json,
+            false,
+            std::sync::Arc::new(orch_infra::clock::SystemClock),
+            crate::serve::open_sinks(Some(&path.to_string_lossy())).expect("sink"),
+        );
+        log_startup_diagnostics(&engine, &logger).await;
+        logger.flush();
+        std::fs::read_to_string(&path)
+            .expect("read log")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("every record is JSON"))
+            .collect()
     }
 
-    /// The backstop for an `agent:completed` that never arrives — dropped by a
-    /// lagging bus, or lost outright. Without it, `run <id>` waits forever on
-    /// an event that is not coming.
+    /// W2b B2: `serve --once` logs the 0.13.0 `serve:diagnostic` record per
+    /// startup warning, with the agent split back out of the bootstrap line.
     #[tokio::test]
-    async fn a_finished_run_record_ends_the_wait_and_sets_the_exit_code() {
-        use orch_domain::RunStatus;
-        let styles = Styles::plain();
+    async fn serve_once_logs_one_diagnostic_record_per_startup_warning() {
+        let mut cursor = agent("agt_cur2", "cur2");
+        cursor.adapter = "cursor".into();
+        cursor.config.effort = Some(orch_domain::ReasoningEffort::High);
+        let records = startup_records(vec![cursor, agent("agt_clean", "clean")]).await;
 
-        for (status, expect_failed) in [
-            (RunStatus::Succeeded, false),
-            (RunStatus::Failed, true),
-            (RunStatus::Cancelled, true),
-            (RunStatus::TimedOut, true),
-        ] {
-            let (_temp, engine, run_id) = engine_with_run(status).await;
-            let mut failed = false;
-            assert!(
-                finish_from_record(&engine, &styles, &Some(run_id), &mut failed).await,
-                "{status:?} is terminal and must end the wait"
-            );
-            assert_eq!(failed, expect_failed, "{status:?} exit code");
-        }
+        assert_eq!(records.len(), 1, "one warning, for cur2 only: {records:#?}");
+        let record = &records[0];
+        assert_eq!(record["event"], "serve:diagnostic");
+        assert_eq!(record["level"], "warn");
+        assert_eq!(record["agentId"], "agt_cur2");
+        assert_eq!(record["agentName"], "cur2");
+        let message = record["message"].as_str().expect("message");
+        assert!(message.starts_with("legacy-ignored"), "{record}");
     }
 
     #[tokio::test]
-    async fn an_unfinished_run_keeps_the_wait_open() {
-        let styles = Styles::plain();
-        let (_temp, engine, run_id) = engine_with_run(orch_domain::RunStatus::Preparing).await;
-        let mut failed = false;
-        // Still in flight: ending here would truncate the stream.
-        assert!(!finish_from_record(&engine, &styles, &Some(run_id), &mut failed).await);
-        // And an id with no record at all is not evidence of anything.
-        assert!(
-            !finish_from_record(
-                &engine,
-                &styles,
-                &Some("run_missing".to_owned()),
-                &mut failed
-            )
-            .await
-        );
-        assert!(!finish_from_record(&engine, &styles, &None, &mut failed).await);
-        assert!(!failed);
-    }
-
-    fn started(run_id: &str, task_id: &str) -> OrchestratorEvent {
-        OrchestratorEvent::AgentStarted {
-            agent_id: "agt_1".to_owned(),
-            task_id: task_id.to_owned(),
-            run_id: run_id.to_owned(),
-        }
-    }
-
-    fn completed(run_id: &str, success: bool) -> OrchestratorEvent {
-        OrchestratorEvent::AgentCompleted {
-            run_id: run_id.to_owned(),
-            agent_id: "agt_1".to_owned(),
-            success,
-        }
+    async fn serve_once_logs_no_diagnostic_when_no_agent_is_affected() {
+        let records = startup_records(vec![agent("agt_clean", "clean")]).await;
+        assert!(records.is_empty(), "{records:#?}");
     }
 
     #[test]
-    fn only_the_targets_completion_ends_the_wait() {
-        let styles = Styles::plain();
-        let mut target = None;
-        let mut failed = false;
-
-        // Another task's run neither becomes the target nor ends the wait.
-        handle_single(
-            &styles,
-            &started("run_other", "tsk_other"),
-            "tsk_1",
-            &mut target,
-            &mut failed,
+    fn a_warning_is_split_only_at_an_exact_agent_prefix() {
+        let agents = [agent("agt_a", "a"), agent("agt_b", "a (agt_a): x")];
+        let fields = |warning| -> Vec<(&str, Value)> { diagnostic_fields(warning, &agents) };
+        assert_eq!(
+            fields("a (agt_a): legacy-ignored: m"),
+            vec![
+                ("agentId", Value::from("agt_a")),
+                ("agentName", Value::from("a")),
+                ("message", Value::from("legacy-ignored: m")),
+            ]
         );
-        assert_eq!(target, None);
-        assert!(!handle_single(
-            &styles,
-            &completed("run_other", true),
-            "tsk_1",
-            &mut target,
-            &mut failed
-        ));
-
-        handle_single(
-            &styles,
-            &started("run_1", "tsk_1"),
-            "tsk_1",
-            &mut target,
-            &mut failed,
+        // The longest (most specific) prefix wins over a shorter one.
+        assert_eq!(
+            fields("a (agt_a): x (agt_b): m"),
+            vec![
+                ("agentId", Value::from("agt_b")),
+                ("agentName", Value::from("a (agt_a): x")),
+                ("message", Value::from("m")),
+            ]
         );
-        assert_eq!(target.as_deref(), Some("run_1"));
-        assert!(handle_single(
-            &styles,
-            &completed("run_1", false),
-            "tsk_1",
-            &mut target,
-            &mut failed
-        ));
-        assert!(failed, "a failed run exits 1");
-    }
-
-    #[test]
-    fn in_flight_tracking_pairs_starts_with_completions() {
-        let mut in_flight = HashSet::new();
-        track(&started("run_1", "tsk_1"), &mut in_flight);
-        track(&started("run_2", "tsk_2"), &mut in_flight);
-        assert_eq!(in_flight.len(), 2);
-        track(&completed("run_1", true), &mut in_flight);
-        assert_eq!(in_flight.len(), 1);
-        track(&completed("run_2", false), &mut in_flight);
-        assert!(in_flight.is_empty(), "a failed run is finished too");
-    }
-
-    #[test]
-    fn output_is_cut_at_the_slice_width_in_utf16_units() {
-        assert_eq!(slice_80("short"), "short");
-        assert_eq!(slice_80(&"x".repeat(100)).len(), 80);
-        assert_eq!(slice_60(&"x".repeat(100)).len(), 60);
-        // 41 astral characters are 82 units, so 40 whole ones survive.
-        assert_eq!(slice_80(&"\u{1f600}".repeat(41)).chars().count(), 40);
+        // No known agent: the whole line is the message, nothing is guessed.
+        assert_eq!(
+            fields("gone (agt_gone): m"),
+            vec![("message", Value::from("gone (agt_gone): m"))]
+        );
     }
 }

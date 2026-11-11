@@ -3,12 +3,40 @@
 //! Driven through the real binary, each test with its own temp project and
 //! its own `global.yml` (never the shared `target/test-global` file, which
 //! parallel tests would race on).
+//!
+//! `config global set|get|show` are daemon RPCs since S2a-cli (the global
+//! config store is read and written from inside the daemon process), so
+//! `project()` starts an explicit test daemon on an isolated socket right
+//! after `orch init` (see `tests/common/daemon.rs`) and `Project::drop` stops
+//! it, process-table checked.
 
 use std::path::Path;
 use std::process::{Command, Output};
 
 use assert_cmd::prelude::*;
 use orch_domain::TUI_PALETTE_NAMES;
+
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::TestDaemon;
+
+struct Project {
+    // Dropped first: the daemon stops before its project directory goes.
+    _daemon: Option<TestDaemon>,
+    root: tempfile::TempDir,
+}
+
+impl Project {
+    fn path(&self) -> &Path {
+        self.root.path()
+    }
+}
+
+impl Drop for Project {
+    fn drop(&mut self) {
+        daemon::unregister_project(&self.path().join("project"));
+    }
+}
 
 fn orch(root: &Path) -> Command {
     let mut command = Command::cargo_bin("orch").expect("the orch binary");
@@ -20,10 +48,11 @@ fn orch(root: &Path) -> Command {
         .env("PATH", "/usr/bin:/bin")
         .env_remove("RUST_LOG")
         .env_remove("ORCHESTRY_DEBUG");
+    daemon::apply_for(&root.join("project"), &mut command);
     command
 }
 
-fn project() -> tempfile::TempDir {
+fn project() -> Project {
     let root = tempfile::Builder::new()
         .prefix("orch-palette-")
         .tempdir()
@@ -34,7 +63,13 @@ fn project() -> tempfile::TempDir {
         .args(["init", "--name", "p", "--adapter", "shell"])
         .assert()
         .success();
-    root
+    let project_root = root.path().join("project");
+    let daemon = TestDaemon::start(&project_root, &root.path().join("home"));
+    daemon::register_project(&project_root, &daemon);
+    Project {
+        _daemon: Some(daemon),
+        root,
+    }
 }
 
 fn text(output: &Output) -> String {

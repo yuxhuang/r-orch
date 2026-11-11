@@ -1,15 +1,22 @@
-//! Shared context tools retain lazy expiry and missing-key null results.
+//! Shared context tools keep missing-key null results. Reads hide expired
+//! entries and never delete them; expiry is the daemon's own step.
 use crate::mcp::registry::EmptyArgs;
 use crate::mcp::{
     projections,
-    registry::{CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolMeta},
+    registry::{
+        CallContext, Class, Execution, Identity, Mode, Registry, ToolArgs, ToolMeta, ToolResult,
+        json, wire,
+    },
 };
-use orch_core::{Error, Result};
-use orch_infra::storage::context::MAX_TTL_MS;
+use orch_core::Result;
+use orch_proto::ops::args as rpc;
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::sync::Arc;
+
+/// The longest TTL a context entry may have: 30 days, in milliseconds.
+const MAX_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ContextSetArgs {
@@ -74,7 +81,7 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
     registry.add(
         meta(
             "context_get",
-            "Read a context entry or null (orch context get). Expired entries may be purged.",
+            "Read a context entry or null (orch context get). Expired entries read as null.",
             Class::Read,
             false,
             true,
@@ -85,7 +92,7 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
     registry.add(
         meta(
             "context_list",
-            "List live context entries (orch context list). Expired entries may be purged.",
+            "List live context entries (orch context list). Expired entries are omitted.",
             Class::Read,
             false,
             true,
@@ -107,67 +114,50 @@ pub(crate) fn register(registry: &mut Registry) -> Result<()> {
     Ok(())
 }
 
-async fn set(cx: Arc<CallContext>, args: ContextSetArgs) -> Result<Value> {
-    cx.engine
-        .context
-        .set(&args.key, &args.value, args.ttl)
+async fn set(cx: Arc<CallContext>, args: ContextSetArgs) -> ToolResult {
+    let entry = cx
+        .request(wire::<rpc::ContextSetArgs>(json!({
+            "key": args.key,
+            "value": args.value,
+            "ttl_ms": args.ttl,
+        }))?)
         .await?;
-    let entry = cx.engine.context.get(&args.key).await.map_err(|err| {
-        Error::other(format!(
-            "Context mutation may already have committed; failed to re-read {}: {err}",
-            args.key
-        ))
-    })?;
-    serde_json::to_value(entry).map_err(|_| Error::other("serialize context entry"))
+    json(&entry, "context entry")
 }
-async fn get(cx: Arc<CallContext>, args: ContextGetArgs) -> Result<Value> {
-    serde_json::to_value(cx.engine.context.get(&args.key).await?)
-        .map_err(|_| Error::other("serialize context entry"))
+async fn get(cx: Arc<CallContext>, args: ContextGetArgs) -> ToolResult {
+    let entry = cx
+        .request(wire::<rpc::ContextGetArgs>(json!({"key": args.key}))?)
+        .await?;
+    json(&entry, "context entry")
 }
-async fn list(cx: Arc<CallContext>, _: EmptyArgs) -> Result<Value> {
-    projections::context(&cx.engine).await
+async fn list(cx: Arc<CallContext>, _: EmptyArgs) -> ToolResult {
+    projections::context(&cx).await
 }
-async fn delete(cx: Arc<CallContext>, args: ContextDeleteArgs) -> Result<Value> {
-    cx.engine.context.delete(&args.key).await?;
+async fn delete(cx: Arc<CallContext>, args: ContextDeleteArgs) -> ToolResult {
+    cx.request(wire::<rpc::ContextDeleteArgs>(json!({"key": args.key}))?)
+        .await?;
     Ok(Value::Null)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
     fn args<A: serde::de::DeserializeOwned + ToolArgs>(value: Value) -> A {
         let args: A = serde_json::from_value(value).unwrap();
         args.validate(&Identity::of(Some("cli")), Mode::AllowDestructive)
             .unwrap();
         args
     }
-    async fn fixture() -> (tempfile::TempDir, Arc<CallContext>) {
-        let dir = tempfile::tempdir().unwrap();
-        tokio::fs::create_dir_all(dir.path().join(".orchestry"))
-            .await
-            .unwrap();
-        let engine = orch_engine::build_light_with(
-            dir.path(),
-            orch_engine::EngineSeams {
-                global_config_path: Some(dir.path().join(".orchestry/global.yml")),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        let cx = Arc::new(CallContext {
-            engine: Arc::new(engine),
-            project_root: dir.path().to_owned(),
-            identity: Identity::of(Some("cli")),
-            mode: Mode::AllowDestructive,
-        });
-        (dir, cx)
+    async fn fixture() -> (crate::mcp::testing::Fixture, Arc<CallContext>) {
+        let fx = crate::mcp::testing::Fixture::start().await;
+        let cx = fx.context(Some("cli"), Mode::AllowDestructive);
+        (fx, cx)
     }
 
     #[tokio::test]
     async fn all_four_context_tools_validate_and_project() {
-        let (_dir, cx) = fixture().await;
+        let (_fx, cx) = fixture().await;
         assert_eq!(
             get(cx.clone(), args(json!({"key":"missing"})))
                 .await
@@ -203,7 +193,7 @@ mod tests {
         );
     }
     #[test]
-    fn ttl_is_checked_before_engine_and_outer_arguments_are_strict() {
+    fn ttl_is_checked_before_the_daemon_and_outer_arguments_are_strict() {
         for ttl in [0, MAX_TTL_MS + 1, u64::MAX] {
             let args: ContextSetArgs =
                 serde_json::from_value(json!({"key":"k","value":"v","ttl":ttl})).unwrap();
@@ -252,53 +242,6 @@ mod tests {
                     json!({"readOnlyHint": *class == Class::Read, "destructiveHint": destructive, "idempotentHint": idempotent, "openWorldHint": open})
                 );
                 assert_eq!(value["inputSchema"]["additionalProperties"], false);
-            }
-        }
-    }
-    struct AfterSet {
-        inner: Arc<dyn orch_core::storage::ContextStore>,
-        fail: bool,
-    }
-    #[async_trait::async_trait]
-    impl orch_core::storage::ContextStore for AfterSet {
-        async fn get(&self, _: &str) -> Result<Option<orch_core::storage::ContextEntry>> {
-            if self.fail {
-                Err(Error::other("injected reread failure"))
-            } else {
-                Ok(None)
-            }
-        }
-        async fn set(&self, key: &str, value: &str, ttl: Option<u64>) -> Result<()> {
-            self.inner.set(key, value, ttl).await
-        }
-        async fn delete(&self, key: &str) -> Result<()> {
-            self.inner.delete(key).await
-        }
-        async fn list(&self) -> Result<Vec<orch_core::storage::ContextEntry>> {
-            self.inner.list().await
-        }
-        async fn get_all(&self) -> Result<indexmap::IndexMap<String, String>> {
-            self.inner.get_all().await
-        }
-    }
-    #[tokio::test]
-    async fn set_distinguishes_concurrent_absence_from_postcommit_read_failure() {
-        for fail in [false, true] {
-            let (_dir, mut cx) = fixture().await;
-            let engine = Arc::get_mut(&mut Arc::get_mut(&mut cx).unwrap().engine).unwrap();
-            let inner = engine.context.clone();
-            engine.context = Arc::new(AfterSet {
-                inner: inner.clone(),
-                fail,
-            });
-            let result = set(cx, args(json!({"key":"k","value":"stored"}))).await;
-            assert_eq!(inner.get("k").await.unwrap().unwrap().value, "stored");
-            if fail {
-                let err = result.unwrap_err().to_string();
-                assert!(err.contains("may already have committed"));
-                assert!(err.contains("injected reread failure"));
-            } else {
-                assert_eq!(result.unwrap(), Value::Null);
             }
         }
     }

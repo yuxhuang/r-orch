@@ -131,6 +131,11 @@ impl ServiceHandler {
         }
     }
 
+    #[cfg(feature = "testing")]
+    pub fn observe_spawns(&self, observer: Arc<dyn orch_infra::process::gate::SpawnObserver>) {
+        self.diagnostics.set_spawn_observer(observer);
+    }
+
     pub fn coordinator(&self) -> &Arc<ProjectCoordinator> {
         &self.coordinator
     }
@@ -138,11 +143,44 @@ impl ServiceHandler {
     /// Permanently reject new requests before releasing project ownership.
     pub(crate) fn seal_requests(&self) {
         self.requests.seal();
+        self.diagnostics.spawn_work().seal();
     }
 
     /// Includes detached operation tasks, not just their socket observers.
     pub(crate) async fn drain_requests(&self) {
         self.requests.wait_idle().await;
+        self.diagnostics.spawn_work().wait_idle().await;
+    }
+
+    /// Run a probe under its deadline, and end it as soon as nobody waits
+    /// for it: its request was cancelled, its session closed, or the daemon
+    /// is stopping. A probe has no state effect, so it ends with its caller
+    /// rather than holding the session drain and shutdown for its full
+    /// deadline; dropping the probe future kills its child's process group.
+    /// Callers box this: inlined in every generated arm it would grow each
+    /// operation's future.
+    async fn diagnostic<T>(
+        &self,
+        ctx: &OpContext,
+        probe: impl Future<Output = OpResult<T>>,
+    ) -> OpResult<T> {
+        use orch_proto::error::{ErrorCode, Execution};
+        let abandoned = async {
+            while !ctx.is_cancelled() && !self.coordinator.is_stopping() {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        };
+        let deadline = tokio::time::timeout(std::time::Duration::from_secs(120), probe);
+        tokio::select! {
+            output = deadline => output.map_err(|_| {
+                ErrorBody::new(ErrorCode::General, "diagnostic deadline exceeded", Execution::Unknown)
+            })?,
+            () = abandoned => Err(ErrorBody::new(
+                ErrorCode::Conflict,
+                "diagnostic cancelled",
+                Execution::Unknown,
+            )),
+        }
     }
 
     /// Session teardown discards transfers/observers; accepted state work is
@@ -213,6 +251,14 @@ fn external_operation(name: &str) -> bool {
             | "dispatch.run_all"
             | "dispatch.until_terminal"
             | "logs.follow"
+            // Template edits write only the template directory, serialised by
+            // its own `.template.lock`, which another project's daemon may
+            // hold for up to its 5 s budget. Waiting for it under the project
+            // permit would starve every other caller into `Overloaded`.
+            | "org.template.definition.apply"
+            | "org.template.agent.add"
+            | "org.template.agent.definition.apply"
+            | "org.template.agent.delete"
     )
 }
 
@@ -306,8 +352,7 @@ macro_rules! implement_handler {
                         match request {
                             $( Request::$variant(args) => {
                                 let output = if matches!(name,"doctor.run" | "models.catalog") {
-                                    tokio::time::timeout(std::time::Duration::from_secs(120), ServiceHandler::$method(self,&ctx,args)).await
-                                        .map_err(|_| ErrorBody::new(orch_proto::error::ErrorCode::General,"diagnostic deadline exceeded",orch_proto::error::Execution::Unknown))??
+                                    Box::pin(self.diagnostic(&ctx, ServiceHandler::$method(self,&ctx,args))).await?
                                 } else { ServiceHandler::$method(self,&ctx,args).await? };
                                 encode(output)
                             }, )*

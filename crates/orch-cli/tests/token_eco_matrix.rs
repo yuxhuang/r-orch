@@ -111,7 +111,10 @@ fn cell(row: &Row, effort: Option<&str>) -> String {
 }
 
 fn seeded(reader: &Reader, row: &Row, effort: Option<&str>) -> (Sandbox, String) {
-    let sb = Sandbox::new(reader);
+    seeded_in(Sandbox::new_owned(reader), reader, row, effort)
+}
+
+fn seeded_in(sb: Sandbox, reader: &Reader, row: &Row, effort: Option<&str>) -> (Sandbox, String) {
     let id = sb.seed_agent(reader, "Subject", row.adapter, row.model, effort);
     (sb, id)
 }
@@ -461,7 +464,7 @@ fn downgrade_of_new_spellings_fails_in_the_old_reader_and_repairs_by_clearing_ef
     ] {
         total += 1;
         let c = format!("{adapter}/{effort}");
-        let sb = Sandbox::new(&new);
+        let sb = Sandbox::new_owned(&new);
         let add = sb.run(
             &new,
             &[
@@ -655,6 +658,8 @@ struct Dispatched {
 }
 
 fn dispatch(reader: &Reader, row: &Row, effort: Option<&str>) -> (Sandbox, Dispatched) {
+    // `orch run` below is a daemon RPC since S2a-cli, so this cell needs an
+    // owned daemon rather than the old unowned-until-S2a-cli sandbox.
     let (sb, id) = seeded(&new_reader(), row, effort);
     let task = sb.run(
         reader,
@@ -1054,7 +1059,7 @@ fn an_inherit_update_waiting_on_the_definition_lock_is_refused_after_a_concurren
     use std::process::Stdio;
 
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    let sb = Sandbox::new_owned(&new);
     let list = sb.run(&new, &["--json", "agent", "list"], None);
     let listed: serde_json::Value = serde_json::from_str(&list.stdout).expect("agent list json");
     for agent in listed.as_array().expect("array") {
@@ -1151,7 +1156,7 @@ fn an_inherit_update_waiting_on_the_definition_lock_is_refused_after_a_concurren
 /// agent created now inherits normal and is accepted; the same agent under
 /// project eco renders eco against the custom template and is refused.
 fn empty_project_with_custom_template(new: &Reader) -> Sandbox {
-    let sb = Sandbox::new(new);
+    let sb = Sandbox::new_owned(new);
     let list = sb.run(new, &["--json", "agent", "list"], None);
     let listed: serde_json::Value = serde_json::from_str(&list.stdout).expect("agent list json");
     for agent in listed.as_array().expect("array") {
@@ -1279,86 +1284,40 @@ fn a_bundle_org_deploy_waits_on_the_definition_lock_and_is_refused_after_a_concu
 }
 
 /// `agent shop --template/--template-dir` (`template_shop.rs`): the picker
-/// needs a terminal, so this drives the post-picker step in process. The
-/// engine and the picked input come from before the lock (project normal);
-/// the install waits on the lock and is refused against the eco config it
-/// reads inside it.
+/// needs a terminal, and its post-pick step sends exactly one `AgentCreate`
+/// request to the daemon, the same request `orch agent add` sends. So this
+/// drives that request through the binary: it waits on the daemon's
+/// definition lock and is refused against the eco config the daemon reads
+/// inside it.
 #[test]
-fn a_template_shop_install_waits_on_the_definition_lock_and_is_refused_after_a_concurrent_switch_to_eco()
+fn an_agent_create_from_the_shop_waits_on_the_definition_lock_and_is_refused_after_a_concurrent_switch_to_eco()
  {
     let new = new_reader();
     let sb = empty_project_with_custom_template(&new);
-    let project = sb.root().parent().unwrap().to_path_buf();
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let engine = runtime
-        .block_on(orch_engine::build_light_with(
-            &project,
-            orch_engine::EngineSeams {
-                // Light tier only, so no global-config store is built.
-                global_config_path: None,
-                ..Default::default()
-            },
-        ))
-        .expect("build engine");
-    let bundle = runtime
-        .block_on(orch_infra::storage::org_templates::builtin("a-team"))
-        .expect("a-team bundle");
-    let input = orch_engine::org_templates::resolve_inputs(
-        &bundle,
-        &engine.config,
-        None,
-        None,
-        orch_infra::storage::org_templates::validate_record_size,
-    )
-    .expect("resolve a-team")
-    .into_iter()
-    .next()
-    .expect("a-team has agents");
+    let (waiting, status, text) = deploy_while_a_mode_writer_holds_the_lock(
+        &sb,
+        &new,
+        &[
+            "agent",
+            "add",
+            "Subject",
+            "--adapter",
+            "claude",
+            "--workspace-mode",
+            "shared",
+        ],
+    );
 
-    let held = runtime
-        .block_on(orch_infra::storage::fs_utils::mutation_lock(
-            &sb.root().join(".definition.lock"),
-        ))
-        .expect("hold the definition lock");
-    let engine = std::sync::Arc::new(engine);
-    let install = runtime.spawn({
-        let engine = engine.clone();
-        let project = project.clone();
-        async move {
-            let ctx = orch_cli::context::CliContext::new(
-                project,
-                None,
-                true,
-                true,
-                false,
-                orch_cli::context::EnvFlags::default(),
-            );
-            orch_cli::template_shop::install(
-                &engine,
-                &ctx,
-                &orch_cli::output::Styles::plain(),
-                input,
-            )
-            .await
-        }
-    });
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    let waiting = !install.is_finished();
-
-    switch_project_to_eco_on_disk(&sb);
-    drop(held);
-
-    let result = runtime.block_on(install).expect("join install");
-    assert!(waiting, "the install must wait for the held lock");
-    let err = result.expect_err("an inheriting agent after a concurrent switch to eco");
-    assert!(err.to_string().contains("inherits project eco"), "{err}");
+    assert!(waiting, "the create must wait for the held lock: {text}");
+    assert!(
+        !status.success(),
+        "an inheriting agent after a concurrent switch to eco must be refused: {text}"
+    );
+    assert!(text.contains("inherits project eco"), "{text}");
     assert_eq!(
         agent_count(&sb, &new),
         0,
-        "the refused install left an agent"
+        "the refused create left an agent"
     );
 }

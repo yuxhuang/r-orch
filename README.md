@@ -4,8 +4,9 @@ An AI agent orchestrator: a CLI, a terminal dashboard, and a runtime that drives
 (`claude`, `codex`, `cursor`, `opencode`, `pi`, `grok`, `agy`) as child processes, moves tasks through a state
 machine, and keeps everything in plain files under `.orchestry/`.
 
-No database or daemon to install. One engine process per project, guarded by a PID lock file; optional
-peer connections let it delegate work to other installations.
+No database to install. One orch **daemon** per project, which you start yourself, owns those files and runs
+the agents; every other orch command, the dashboard, `orch web` and `orch mcp` is its client. Optional peer
+connections let it delegate work to other installations.
 
 r-orch was originally a port of [`oxgeneral/ORCH`](https://github.com/oxgeneral/ORCH) and is developed
 independently; it makes no compatibility promise with that project or its npm package.
@@ -81,14 +82,21 @@ r-orch without an AI CLI, and what the test suite uses.
 
 ```bash
 cd your-project
-orch init                                   # creates .orchestry/
+orch init                                   # creates .orchestry/ and prints how to start the daemon
+orch daemon start --detach                  # you start the daemon; nothing else ever does
 orch agent add builder --adapter claude --model claude-sonnet-4-6 --approval-policy auto
 orch task add "Add input validation to the signup form" --assignee builder
-orch run --watch                            # or: orch serve      (headless)
+orch daemon dispatch on                     # start running tasks
 orch                                        # the TUI dashboard
+orch daemon stop                            # when you are done
 ```
 
-Bare `orch` launches the dashboard. In a directory with no `.orchestry/`, it initialises one first.
+Every command after `orch init` needs the running daemon: without one it prints
+`No orch daemon is running for <project root>` and exits 7. A daemon starts with dispatch off, so you can queue
+work first; `orch serve` or `orch run --watch` instead starts one in the foreground with dispatch on. See
+[the orch daemon](docs/manual/18-daemon.md).
+
+Bare `orch` launches the dashboard, like `orch tui`. It never creates a project: with no `.orchestry/` in the current directory or a parent it prints `Not initialized` and exits 3. Without a daemon it shows the no-daemon message; `r` retries and `q` quits.
 
 **Mouse.** Click tabs, list rows, `+ add …` rows, filter chips and the footer hint buttons;
 double-click a row to open its detail; the wheel moves the selection. Everything is also a key —
@@ -141,8 +149,9 @@ $ orch --yaml task list
   `--yaml`, `--json` and neither; stdout stays empty. Passing both flags is a usage error (exit 1, nothing on
   stdout): `error: the argument '--yaml' cannot be used with '--json'`.
 - **Commands that never printed JSON ignore `--yaml` too** (for example `agent shop`, which prints its table).
-  `logs --follow` still streams text and `serve` still writes JSON Lines; `serve --log-format` is unrelated to
-  `--yaml`, and persisted logs do not change format.
+  `logs --follow` still streams text and `serve --once` writes JSON Lines; `serve --log-format` is unrelated to
+  `--yaml`, and persisted logs do not change format. A foreground `serve` is the daemon and writes no event lines;
+  its diagnostics go to stderr via `RUST_LOG`.
 - **`orch doctor` is the exception.** Inside a project it prints its human header line on stdout before the
   structured document, under `--json` as well as `--yaml`, so the output does not parse as one document.
   Outside a project it prints text only. See the [runbook](docs/RUNBOOK.md#structured-output-for-doctor-logs---follow-and-serve).
@@ -385,8 +394,10 @@ inputs are in [examples/org-templates/](examples/org-templates/).
 
 `orch mcp` serves the project to an MCP client (Claude Code, Codex, Cursor, the MCP Inspector) over stdin and
 stdout: typed tools for tasks, goals, agents, messages, context, teams, logs, `doctor` and configuration, and
-read-only `orch://` resources. No socket, no daemon, no orchestrator lock; the tools change stored state, and
-`orch run --watch`, `orch serve` or the dashboard still runs the work.
+read-only `orch://` resources. It is a client of the project's daemon: it passes every call to the daemon over
+its socket and never starts one, so without a running daemon its first call fails with the no-daemon message
+until you start it and reconnect the session. The tools change state; the daemon runs the work when dispatch is
+on.
 
 ```bash
 claude mcp add orch -- orch mcp                          # Claude Code, project from its working directory
@@ -400,19 +411,18 @@ The default mode registers 45 read and ordinary change tools (`--read-only`: 18,
 the same JSON as `orch --json` (or the changed entity, for commands that print only a message); `task_cancel`,
 `goal_delete`, `agent_remove`, `team_disband`, `context_delete`, and forcing a goal (`force`) need
 `--allow-destructive`; pausing a goal works in the default mode and cancels only that goal's pending autonomous
-tasks. `task_cancel` only marks the task: it does not stop an orphan agent process when no orchestrator is
-running. The identity is attribution, not authentication, and no mode is a sandbox. The server is not transactional: next to
-other writers it has the same hazards as two `orch` processes. Client configurations, the worker setup that passes
-on `ORCH_AGENT_ID`, the tool catalogue and the limitations are in [the manual](docs/manual/17-mcp-server.md);
-recovery is in the [runbook](docs/RUNBOOK.md#recovering-after-concurrent-mcp-writers).
+tasks. `task_cancel` stops the task's running agent through the daemon. The identity is attribution, not
+authentication, and no mode is a sandbox. The daemon is the only writer, so MCP clients no longer race other orch
+processes; calls are still not transactions. Client configurations, the worker setup that passes on
+`ORCH_AGENT_ID`, the tool catalogue and the limitations are in [the manual](docs/manual/17-mcp-server.md).
 
 ---
 
 ## Remote agents
 
 Peers use plain TCP on a trusted LAN, **without authentication or encryption**. Listening is off by
-default. Only the process that owns the project engine opens peer connections; a TUI observing an
-existing owner cannot enable listening.
+default. Only the project's daemon opens peer connections, and listening is chosen when you start it
+(`--listen` on `orch daemon start`, `orch serve` or `orch run --watch`); the dashboard cannot listen.
 
 > [!WARNING]
 > **A listening worker runs whatever a connecting peer sends it.** Any host that can reach the port can
@@ -428,25 +438,25 @@ address other than loopback, `orch remote listen on`, `orch serve` and `orch run
 warning on stderr, and `orch remote status` and the TUI header show the address as
 `(EXPOSED, no auth)`.
 
-On the worker, start an engine with a unique display name and an explicit listen address:
+On the worker, start the daemon with a unique display name and an explicit listen address:
 
 ```bash
 orch serve --listen 192.168.1.20:7690 --peer-name worker-linux   # the worker's own LAN IP
 # Or every interface: orch serve --listen 0.0.0.0:7690 --peer-name worker-linux
-# Also supported: orch run --watch --listen ... or orch tui --listen ...
+# Also supported: orch run --watch --listen ... or orch daemon start --listen ...
 ```
 
-To persist the preference for future engine starts, use `orch remote listen on 192.168.1.20:7690`
+To persist the preference for future daemon starts, use `orch remote listen on 192.168.1.20:7690`
 (without an address it saves `127.0.0.1:7690`); `orch remote listen off` disables it on the next
 start. A `--listen` flag applies to that invocation.
 Use `--peer-name` or `peer.name` in `.orchestry/config.yml` to distinguish installations.
 
-On the controller, register the worker and run the engine:
+On the controller, register the worker and start the daemon:
 
 ```bash
-orch remote add w1 worker-host:7690
 orch serve --peer-name controller
-# In another terminal:
+# In another terminal (every command below is a client of that daemon):
+orch remote add w1 worker-host:7690
 orch remote status
 orch agent list
 orch task add "Run the worker's checks" --assignee 'agt_x@w1'
@@ -542,7 +552,7 @@ needs `SSH_AUTH_SOCK`, remote-submitted tasks fail on authentication while the s
 Re-admit variables explicitly, by exact name (no wildcards):
 
 ```bash
-# On the worker, for the orch process that owns the engine (serve, run --watch or tui):
+# On the worker, in the environment you start the daemon from (orch daemon start, serve or run --watch):
 ORCH_REMOTE_ENV_PASSTHROUGH=ANTHROPIC_API_KEY,SSH_AUTH_SOCK orch serve --listen 192.168.1.20:7690
 ```
 
@@ -626,6 +636,62 @@ talking to a v0.5.0 worker still sees the v0.5.0 failures. Changes you may notic
 Rolling back to v0.5.0 cancels remote runs in flight (stop with none in flight first), and v0.5.0 never
 cleans up leftover task copies on a worker. See [docs/RUNBOOK.md](docs/RUNBOOK.md) for each message.
 
+### Upgrading from v0.13.0
+
+<!-- W2 (PR 2): goal row 12; PR 2 contract items 1-4 and 7; spec R35 and the normative recovery table; ADR 0012
+decision 2 (no auto-start, owner decision). -->
+**This is a behaviour change: no orch command that reads or changes a project works without a running daemon.**
+One orch daemon per project now owns `.orchestry/` and runs the agents; every other command, the dashboard,
+`orch web` and `orch mcp` asks it over a private Unix socket. **Nothing starts the daemon for you**: no command,
+client, retry or `orch init` does. That is the owner's decision ([ADR 0012](docs/decisions/0012-daemon-owned-state.md)):
+you should know when a long-lived process starts on your machine. Without a daemon, a command prints
+`No orch daemon is running for <project root>` with `Start it with: orch daemon start` and exits 7, a new exit
+code. No file format changed.
+
+Upgrade
+1. Stop **every** orch 0.13.0 process of the project, including `orch mcp` servers held open by IDE, Claude Code
+   or Codex sessions, `orch serve`, `orch run --watch` and dashboards. They write `.orchestry/` without the
+   daemon's locks. `pgrep -fl orch` must show none.
+2. Install the new orch.
+3. Start the daemon, and see it:
+
+   ```bash
+   orch daemon start --detach      # or `orch daemon start` in a pane you keep open
+   orch daemon status              # PID, dispatch ON/OFF, socket, running tasks
+   ```
+
+   It starts with dispatch **off**. Turn it on with `orch daemon dispatch on`, or start with `orch serve` (or
+   `orch run --watch`), which is now a foreground daemon with dispatch on.
+4. Restart your MCP sessions so that they run the new `orch mcp`.
+5. Stop it with `orch daemon stop`.
+
+What else changes
+- `orch serve` and `orch run --watch` start the daemon (exit 4 with `Use: orch daemon dispatch on` if one already
+  runs). `orch run <task-id>`, `orch run --all`, `orch run --once` and `orch serve --once` ask the running daemon;
+  `orch serve --once` needs dispatch off, and stopping it no longer stops the agents it started.
+- The dashboard and `orch web` are clients: they never run the orchestrator themselves, and their watch toggle turns
+  the daemon's dispatch on or off. `orch tui --observe` and `orch tui --listen` are gone; listening is a daemon
+  start option (`--listen`).
+- A cancel, from any client, stops the running agent; a goal pause, from any client, is ordered with dispatch.
+- `orch doctor` is a client too: without a daemon it runs its local checks, then reports the no-daemon message
+  and exits 7 (outside a project it exits 0).
+- `orch org template` and `orch config global` now need a project and its daemon, like every other command:
+  outside a project they print `Not initialized` and exit 3. Run them inside a project after `orch daemon start`.
+- Agents get the agent variant of the message (`Do not start it; report this to the owner and stop.`), and
+  `orch daemon start`, `orch serve` and `orch run --watch` refuse to start from an agent's environment (exit 2).
+  All three take `--from-agent` to override that on purpose.
+- A foreground `orch serve` or `orch run --watch` is the daemon, so it refuses `--tick-interval`, `--log-file`,
+  `--verbose` and a `--log-format` other than `json` (exit 2); `serve --once` keeps its log options. The interval
+  is `scheduling.poll_interval_ms` (`orch config set`), and events stream with `orch logs --follow`.
+- Scripts and cron jobs must start the daemon themselves, or fail visibly; see
+  [Recovery](docs/manual/18-daemon.md#recovery).
+
+Roll back by stopping the daemon (`orch daemon stop`) and reinstalling v0.13.0; the files are unchanged. The
+daemon's runtime files (`run/`, `daemon.json`, `daemon.log`, `daemon.log.1` and `.daemon-owner.lock` in
+`.orchestry/`) are ignored by v0.13.0. The full guide is
+[Upgrading from orch 0.13.0](docs/manual/18-daemon.md#upgrading-from-orch-0130); recovery is in the
+[runbook](docs/RUNBOOK.md#the-orch-daemon).
+
 ### Upgrading from v0.12.0
 
 v0.13.0 narrows what pausing a goal cancels: only the assignee's waiting (`todo` or `retrying`) autonomous
@@ -705,7 +771,7 @@ drafts last only for the dashboard session).
 | Document | For |
 |---|---|
 | **[docs/manual/](docs/manual/README.md)** | **Users.** The user manual: installing, concepts, every command, the dashboard and web dashboard, templates, remote agents, the MCP server and troubleshooting, with screenshots |
-| **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | **Operators.** Recovery procedures and known gotchas — corrupt locks, hung `--once`, index rebuilds, state recovery, concurrent MCP writers, debugging, secrets |
+| **[docs/RUNBOOK.md](docs/RUNBOOK.md)** | **Operators.** Recovery procedures and known gotchas — the daemon (no daemon, stale socket, crash, version skew), corrupt locks, hung `--once`, index rebuilds, state recovery, debugging, secrets |
 | [docs/file-mutations.md](docs/file-mutations.md) | `update` / `patch` from JSON or YAML files: input rules, writable fields, errors, locking |
 | [docs/org-templates.md](docs/org-templates.md) | Organization templates: directory format, rules, precedence, deploy, shop, `update`/`patch`, repair, the a-team and its prerequisites |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | The Rust design: crate boundaries, traits, concurrency model, error model, test strategy |

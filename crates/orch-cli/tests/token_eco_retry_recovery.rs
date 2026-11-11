@@ -107,7 +107,8 @@ fn runs_of(sb: &Sandbox, reader: &Reader, task: &str) -> Vec<Value> {
 /// ready for its retry.
 fn scenario(mode: &str, failures: usize, events_for: impl Fn(usize) -> Vec<Value>) -> Scenario {
     let new = new_reader();
-    let sb = Sandbox::new(&new);
+    // `orch run` below is a daemon RPC since S2a-cli.
+    let sb = Sandbox::new_owned(&new);
     if mode != "normal" {
         let out = sb.run(
             &new,

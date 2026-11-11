@@ -26,7 +26,7 @@ pub const ALL_KNOWN_COMMANDS: [&str; 20] = [
 ];
 
 /// Commands that bypass the legacy container guard. `daemon` performs its
-/// own discovery after parsing and the developmental gate; `doctor` also
+/// own discovery after parsing; `doctor` also
 /// takes a container when a project exists.
 pub const CONTAINER_LESS_COMMANDS: [&str; 4] = ["init", "update", "doctor", "daemon"];
 
@@ -39,6 +39,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// `parse`, the tests) gets it.
 #[derive(Debug)]
 pub struct Cli {
+    /// Caller identity; supplied before the command to distinguish filter flags.
+    pub agent: Option<String>,
     pub json: bool,
     pub yaml: bool,
     pub quiet: bool,
@@ -59,6 +61,12 @@ pub struct Cli {
     disable_help_flag = false
 )]
 struct RawCli {
+    #[arg(
+        long,
+        value_name = "agent-id",
+        help = "Caller identity (overrides ORCH_AGENT_ID; place before the command)"
+    )]
+    agent: Option<String>,
     #[arg(long, global = true, help = "Output as JSON")]
     json: bool,
     #[arg(long, global = true, conflicts_with = "json", help = "Output as YAML")]
@@ -95,6 +103,7 @@ impl clap::FromArgMatches for Cli {
     /// all visible here, after parsing.
     fn from_arg_matches_mut(matches: &mut clap::ArgMatches) -> Result<Self, clap::Error> {
         let RawCli {
+            agent,
             json,
             yaml,
             quiet,
@@ -109,6 +118,7 @@ impl clap::FromArgMatches for Cli {
             ));
         }
         Ok(Cli {
+            agent,
             json,
             yaml,
             quiet,
@@ -163,9 +173,9 @@ pub enum Command {
     Doctor,
     /// Launch interactive TUI dashboard
     Tui(TuiCmd),
-    /// Headless daemon mode — structured logs to stdout
+    /// Start the daemon in the foreground with dispatch ON (--once: run a batch in the running daemon with structured logs)
     Serve(ServeCmd),
-    /// Manage the developmental project daemon
+    /// Manage the project daemon
     Daemon(crate::commands::daemon::DaemonCmd),
     /// Serve the TUI dashboard in a browser (xterm.js over a websocket)
     Web(WebCmd),
@@ -679,7 +689,11 @@ pub enum MsgSub {
         body: String,
         #[arg(short, long, value_name = "subject", help = "Message subject")]
         subject: Option<String>,
-        #[arg(long, value_name = "agent-id", help = "Sender agent ID (default: cli)")]
+        #[arg(
+            long,
+            value_name = "agent-id",
+            help = "Sender agent ID (default: the caller: --agent, else ORCH_AGENT_ID, else cli)"
+        )]
         from: Option<String>,
         #[arg(long, value_name = "ms", help = "TTL in milliseconds")]
         ttl: Option<String>,
@@ -692,7 +706,11 @@ pub enum MsgSub {
         body: String,
         #[arg(short, long, value_name = "subject", help = "Message subject")]
         subject: Option<String>,
-        #[arg(long, value_name = "agent-id", help = "Sender agent ID (default: cli)")]
+        #[arg(
+            long,
+            value_name = "agent-id",
+            help = "Sender agent ID (default: the caller: --agent, else ORCH_AGENT_ID, else cli)"
+        )]
         from: Option<String>,
         #[arg(long, value_name = "team-id", help = "Limit broadcast to team members")]
         team: Option<String>,
@@ -928,25 +946,80 @@ pub struct RunCmd {
     pub task_id: Option<String>,
     #[arg(long, help = "Run all todo tasks")]
     pub all: bool,
-    #[arg(long, help = "Watch mode: continuous orchestration")]
+    #[arg(long, help = "Run one scheduling tick through the running daemon")]
+    pub once: bool,
+    #[arg(long, help = "Start a foreground daemon with dispatch ON")]
     pub watch: bool,
-    #[arg(long, help = "Include agent output in watch mode")]
+    #[arg(long = "from-agent", requires = "watch", help = FROM_AGENT_HELP)]
+    pub from_agent: bool,
+    #[arg(
+        long,
+        help = "Not accepted with --watch (use RUST_LOG or orch logs --follow)"
+    )]
     pub verbose: bool,
+    /// Never accepted: parsed only so the refusal can name the config key.
+    #[arg(long = "tick-interval", value_name = "ms", hide = true)]
+    pub tick_interval: Option<String>,
+}
+
+/// A foreground `run --watch` / `serve` *is* the daemon start, so it takes the
+/// same agent-context override as `orch daemon start` (spec R31).
+const FROM_AGENT_HELP: &str = "Allow the daemon start from an agent's environment \
+(ORCH_TASK_ID or ORCH_AGENT_ID set); only when the owner deliberately intends this";
+
+/// A foreground `run --watch` / `serve` *is* the daemon start, so there is no
+/// client left to honour the legacy logging and interval flags (D8 refinement,
+/// s2a-cli-decisions §2). They are refused before any connect or lifecycle
+/// call rather than silently ignored; the first rejected flag wins.
+const REJECT_TICK_INTERVAL: &str = "--tick-interval is not accepted: the daemon uses \
+scheduling.poll_interval_ms from config.yml (orch config set scheduling.poll_interval_ms <ms>)";
+const REJECT_LOG_FILE: &str = "--log-file is not accepted by a daemon start; the foreground \
+daemon logs to stderr (RUST_LOG), a detached one to .orchestry/daemon.log. Follow events with: \
+orch logs --follow";
+const REJECT_LOG_FORMAT: &str = "--log-format is not accepted by a daemon start; the foreground \
+daemon logs to stderr (RUST_LOG), a detached one to .orchestry/daemon.log. Follow events with: \
+orch logs --follow";
+const REJECT_VERBOSE: &str =
+    "--verbose is not accepted by a daemon start; use RUST_LOG or orch logs --follow";
+
+impl RunCmd {
+    /// The exit-2 message for a flag this invocation cannot honour.
+    pub fn rejected_flag(&self) -> Option<&'static str> {
+        if self.tick_interval.is_some() {
+            Some(REJECT_TICK_INTERVAL)
+        } else {
+            (self.watch && self.verbose).then_some(REJECT_VERBOSE)
+        }
+    }
+}
+
+impl ServeCmd {
+    /// The exit-2 message for a flag this invocation cannot honour. A batch
+    /// (`--once`) keeps its client-rendered log flags; only the interval,
+    /// which the batch operation takes no argument for, is refused there.
+    pub fn rejected_flag(&self) -> Option<&'static str> {
+        if self.tick_interval.is_some() {
+            return Some(REJECT_TICK_INTERVAL);
+        }
+        if self.once {
+            return None;
+        }
+        if self.log_file.is_some() {
+            Some(REJECT_LOG_FILE)
+        } else if self.log_format != "json" {
+            Some(REJECT_LOG_FORMAT)
+        } else if self.verbose {
+            Some(REJECT_VERBOSE)
+        } else {
+            None
+        }
+    }
 }
 
 // ── tui ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Args)]
-pub struct TuiCmd {
-    #[command(flatten)]
-    pub peer: PeerFlags,
-    #[arg(
-        long,
-        help = "Do not start the orchestrator; watch the project as an observer. \
-                Not read-only: tasks and agents can still be changed and run from here"
-    )]
-    pub observe: bool,
-}
+pub struct TuiCmd {}
 
 // ── serve ──────────────────────────────────────────────────────────────────
 
@@ -956,26 +1029,28 @@ pub struct ServeCmd {
     pub peer: PeerFlags,
     #[arg(long, help = "Process todo tasks and exit when all are terminal")]
     pub once: bool,
+    #[arg(long = "from-agent", conflicts_with = "once", help = FROM_AGENT_HELP)]
+    pub from_agent: bool,
     #[arg(
         long = "tick-interval",
         value_name = "ms",
-        help = "Override polling interval (ms)"
+        help = "Not accepted: the daemon uses scheduling.poll_interval_ms from config.yml"
     )]
     pub tick_interval: Option<String>,
     #[arg(
         long = "log-file",
         value_name = "path",
-        help = "Also write logs to file (append mode)"
+        help = "With --once: also write logs to file (append mode)"
     )]
     pub log_file: Option<String>,
     #[arg(
         long = "log-format",
         value_name = "format",
         default_value = "json",
-        help = "Log format: json or text (default: json)"
+        help = "With --once: log format json or text (default: json)"
     )]
     pub log_format: String,
-    #[arg(long, help = "Include high-frequency agent:output events")]
+    #[arg(long, help = "With --once: include high-frequency agent:output events")]
     pub verbose: bool,
 }
 
@@ -1040,11 +1115,8 @@ pub struct WebCmd {
         help = "Accept this Host header name (repeatable, exact match, no port). Needed behind a reverse proxy or DNS name"
     )]
     pub allow_host: Vec<String>,
-    #[arg(
-        long,
-        help = "Run each tab's dashboard with `orch tui --observe`: the orchestrator is not started. \
-                Not read-only: tasks and agents can still be changed and run from the page"
-    )]
+    /// Removed: parsed only so the refusal can say so, and hidden from help.
+    #[arg(long, hide = true)]
     pub observe: bool,
 }
 
@@ -1240,23 +1312,23 @@ mod tests {
             &["[task-id]"],
             &[
                 "--all",
+                "--once",
                 "--watch",
+                "--from-agent",
                 "--verbose",
+                "--tick-interval <ms>",
                 "--listen <ADDR>",
                 "--peer-name <NAME>",
             ],
         ),
         ("doctor", &[], &[]),
-        (
-            "tui",
-            &[],
-            &["--observe", "--listen <ADDR>", "--peer-name <NAME>"],
-        ),
+        ("tui", &[], &[]),
         (
             "serve",
             &[],
             &[
                 "--once",
+                "--from-agent",
                 "--tick-interval <ms>",
                 "--log-file <path>",
                 "--log-format <format>",
@@ -1278,6 +1350,48 @@ mod tests {
         ),
         ("update", &[], &["--check"]),
     ];
+
+    #[test]
+    fn caller_identity_precedes_the_command_and_does_not_replace_log_filters() {
+        let cli = Cli::try_parse_from([
+            "orch",
+            "--agent",
+            "agt_caller",
+            "logs",
+            "--agent",
+            "agt_filter",
+        ])
+        .unwrap();
+        assert_eq!(cli.agent.as_deref(), Some("agt_caller"));
+        let Some(Command::Logs(args)) = cli.command else {
+            panic!("logs command")
+        };
+        assert_eq!(args.agent.as_deref(), Some("agt_filter"));
+    }
+
+    #[test]
+    fn run_once_is_a_parsed_rpc_mode_and_the_dashboard_has_no_owner_flags() {
+        let cli = Cli::try_parse_from(["orch", "run", "--once"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Run(RunCmd { once: true, .. }))
+        ));
+        assert!(Cli::try_parse_from(["orch", "tui", "--observe"]).is_err());
+        assert!(Cli::try_parse_from(["orch", "tui", "--listen"]).is_err());
+    }
+
+    /// `orch web --observe` still parses so `WebArgs::parse` can explain the
+    /// removal, but the help no longer offers it.
+    #[test]
+    fn web_observe_is_parsed_for_its_refusal_but_not_offered_in_help() {
+        let cli = Cli::try_parse_from(["orch", "web", "--observe"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Web(WebCmd { observe: true, .. }))
+        ));
+        let help = find("web").render_long_help().to_string();
+        assert!(!help.contains("--observe"), "{help}");
+    }
 
     /// Walk to the clap subcommand a dotted path names.
     fn find(path: &str) -> clap::Command {
@@ -1306,11 +1420,7 @@ mod tests {
             panic!("run")
         };
         assert_eq!(args.peer.listen.as_deref(), Some("127.0.0.1:1234"));
-        let cli = Cli::try_parse_from(["orch", "tui", "--listen"]).unwrap();
-        let Some(Command::Tui(args)) = cli.command else {
-            panic!("tui")
-        };
-        assert_eq!(args.peer.listen.as_deref(), Some("127.0.0.1:7690"));
+        assert!(Cli::try_parse_from(["orch", "tui", "--listen"]).is_err());
     }
 
     #[test]
@@ -1774,5 +1884,87 @@ mod file_mutation_tests {
             panic!("agent add");
         };
         assert_eq!(flags.prompt_mode.as_deref(), Some("inherit"));
+    }
+
+    fn rejected(argv: &[&str]) -> Option<&'static str> {
+        match Cli::try_parse_from(argv).expect("parses").command {
+            Some(Command::Serve(args)) => args.rejected_flag(),
+            Some(Command::Run(args)) => args.rejected_flag(),
+            _ => panic!("serve or run"),
+        }
+    }
+
+    /// s2a-cli-decisions §2: one vector per rejected combination, plus the
+    /// accepted forms that must keep working.
+    #[test]
+    fn foreground_aliases_refuse_flags_a_daemon_start_cannot_honour() {
+        let interval = Some(REJECT_TICK_INTERVAL);
+        assert_eq!(
+            rejected(&["orch", "serve", "--tick-interval", "50"]),
+            interval
+        );
+        assert_eq!(
+            rejected(&["orch", "serve", "--once", "--tick-interval", "x"]),
+            interval
+        );
+        assert_eq!(
+            rejected(&["orch", "serve", "--log-file", "l"]),
+            Some(REJECT_LOG_FILE)
+        );
+        assert_eq!(
+            rejected(&["orch", "serve", "--log-format", "text"]),
+            Some(REJECT_LOG_FORMAT)
+        );
+        assert_eq!(
+            rejected(&["orch", "serve", "--verbose"]),
+            Some(REJECT_VERBOSE)
+        );
+        assert_eq!(
+            rejected(&["orch", "run", "--watch", "--verbose"]),
+            Some(REJECT_VERBOSE)
+        );
+        assert_eq!(
+            rejected(&["orch", "run", "--watch", "--tick-interval", "250"]),
+            interval
+        );
+        // The first rejected flag wins.
+        assert_eq!(
+            rejected(&[
+                "orch",
+                "serve",
+                "--verbose",
+                "--log-file",
+                "l",
+                "--tick-interval",
+                "1"
+            ]),
+            interval
+        );
+        assert_eq!(
+            rejected(&["orch", "serve", "--verbose", "--log-file", "l"]),
+            Some(REJECT_LOG_FILE)
+        );
+
+        for accepted in [
+            &["orch", "serve"][..],
+            &["orch", "serve", "--log-format", "json"],
+            &["orch", "serve", "--listen", "--peer-name", "n"],
+            &["orch", "serve", "--once", "--log-file", "l"],
+            &[
+                "orch",
+                "serve",
+                "--once",
+                "--log-format",
+                "text",
+                "--verbose",
+            ],
+            &["orch", "run", "--watch"],
+            &["orch", "serve", "--from-agent"],
+            &["orch", "run", "--watch", "--from-agent"],
+            &["orch", "run", "--verbose", "tsk_1"],
+            &["orch", "run", "--once", "--verbose"],
+        ] {
+            assert_eq!(rejected(accepted), None, "{accepted:?}");
+        }
     }
 }

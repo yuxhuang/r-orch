@@ -10,6 +10,10 @@
 
 #![cfg(unix)]
 
+#[path = "common/daemon.rs"]
+mod daemon;
+use daemon::OwnedDir;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -131,16 +135,17 @@ impl Drop for Tmux {
 }
 
 fn orch(dir: &Path, args: &[&str]) {
-    let output = Command::new(orch_binary())
+    let mut command = Command::new(orch_binary());
+    command
         .args(args)
         .current_dir(dir)
         .env_clear()
         .env("HOME", dir.join("home"))
         .env("PATH", "/usr/bin:/bin")
         .env("ORCHESTRY_GLOBAL_CONFIG_PATH", global_config(dir))
-        .env("NO_COLOR", "1")
-        .output()
-        .expect("orch runs");
+        .env("NO_COLOR", "1");
+    daemon::apply_for(dir, &mut command);
+    let output = command.output().expect("orch runs");
     assert!(
         output.status.success(),
         "orch {args:?} failed: {}",
@@ -154,15 +159,17 @@ fn global_config(dir: &Path) -> PathBuf {
 
 /// Two local agents (the default one `init` creates, and `local-bot`) and a
 /// registered remote `w1` whose cached status lists `rover`.
-fn project() -> tempfile::TempDir {
+fn project() -> OwnedDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::create_dir_all(dir.path().join("home")).expect("home");
     orch(
         dir.path(),
         &["init", "--name", "proj", "--adapter", "claude"],
     );
+    // Every command is a daemon client: the daemon runs before the CLI seeds.
+    let mut owned = OwnedDir::adopt(dir);
     orch(
-        dir.path(),
+        owned.path(),
         &[
             "agent",
             "add",
@@ -173,19 +180,23 @@ fn project() -> tempfile::TempDir {
             "true",
         ],
     );
-    let root = dir.path().join(".orchestry");
-    std::fs::write(
-        root.join("remotes.yml"),
-        "- alias: w1\n  addr: 127.0.0.1:9\n  added_at: '2026-10-18T00:00:00Z'\n",
-    )
-    .expect("remotes.yml");
-    std::fs::create_dir_all(root.join("remotes")).expect("remotes dir");
-    std::fs::write(
-        root.join("remotes").join("w1.json"),
-        r#"{"alias":"w1","addr":"127.0.0.1:9","online":false,"last_seen":null,"last_error":null,"peer_name":null,"instance_id":null,"os":null,"agents":[{"id":"rover","name":"rover","adapter":"claude","status":"idle"}]}"#,
-    )
-    .expect("w1 status");
-    dir
+    // Hand-written files go in while no daemon owns the state; the fresh
+    // daemon reads them at start.
+    owned.with_daemon_stopped(|project| {
+        let root = project.join(".orchestry");
+        std::fs::write(
+            root.join("remotes.yml"),
+            "- alias: w1\n  addr: 127.0.0.1:9\n  added_at: '2026-10-18T00:00:00Z'\n",
+        )
+        .expect("remotes.yml");
+        std::fs::create_dir_all(root.join("remotes")).expect("remotes dir");
+        std::fs::write(
+            root.join("remotes").join("w1.json"),
+            r#"{"alias":"w1","addr":"127.0.0.1:9","online":false,"last_seen":null,"last_error":null,"peer_name":null,"instance_id":null,"os":null,"agents":[{"id":"rover","name":"rover","adapter":"claude","status":"idle"}]}"#,
+        )
+        .expect("w1 status");
+    });
+    owned
 }
 
 fn launch(dir: &Path, socket: String) -> Tmux {
@@ -203,7 +214,7 @@ fn launch(dir: &Path, socket: String) -> Tmux {
     let cwd = dir.display().to_string();
     let command = format!("'{}' tui", orch_binary().display());
     // The adapters' model probes find no AI CLI on this PATH.
-    tmux.run(&[
+    let mut args: Vec<String> = [
         "start-server",
         ";",
         "set-option",
@@ -227,8 +238,15 @@ fn launch(dir: &Path, socket: String) -> Tmux {
         &global,
         "-e",
         "PATH=/usr/bin:/bin",
-        &command,
-    ]);
+    ]
+    .map(String::from)
+    .into();
+    // Point the dashboard at this project's test daemon.
+    for pair in daemon::env_pairs_for(dir) {
+        args.extend(["-e".to_owned(), pair]);
+    }
+    args.push(command);
+    tmux.run(&args.iter().map(String::as_str).collect::<Vec<_>>());
     let path = tmux.run(&["display-message", "-p", "-t", "dash", "#{socket_path}"]);
     tmux.socket_path = Some(PathBuf::from(
         String::from_utf8_lossy(&path.stdout).trim().to_string(),

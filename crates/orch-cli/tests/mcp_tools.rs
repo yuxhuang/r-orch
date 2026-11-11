@@ -27,8 +27,9 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use mcp_common::{
-    DESTRUCTIVE, EXPECTED, McpServer, READ_ONLY, Rendezvous, error_code, initialized_project,
-    initialized_project_named, orch_command, output_of, spawn_bounded, tool_text,
+    DESTRUCTIVE, EXPECTED, McpServer, ProjectDir, READ_ONLY, Rendezvous, error_code,
+    initialized_project, initialized_project_unowned, orch_command, output_of, spawn_bounded,
+    tool_text,
 };
 use serde_json::{Value, json};
 
@@ -38,7 +39,7 @@ use serde_json::{Value, json};
 struct Fx {
     // Declared first so the server is killed before its directory is removed.
     server: McpServer,
-    dir: tempfile::TempDir,
+    dir: ProjectDir,
 }
 
 impl Fx {
@@ -58,7 +59,7 @@ impl Fx {
 
     /// A server on an already prepared project, for tests whose identity must
     /// name an agent that has to exist before the server starts.
-    fn on(dir: tempfile::TempDir, args: &[&str], envs: &[(&str, Option<&str>)]) -> Self {
+    fn on(dir: ProjectDir, args: &[&str], envs: &[(&str, Option<&str>)]) -> Self {
         let mut server = McpServer::spawn_with(dir.path(), args, envs);
         server.initialize();
         Self { server, dir }
@@ -432,10 +433,19 @@ fn task_cancel_of_a_finished_task_is_a_tool_error_and_keeps_its_status() {
 fn task_cancel_never_starts_an_orchestrator_or_leaves_a_project_lock() {
     let mut fx = Fx::destructive();
     let id = fx.task("t");
-    fx.ok("task_cancel", json!({"id": id}));
     let lock = fx.root().join(".orchestry/orchestrator.lock");
-    assert!(!lock.exists(), "task_cancel must be store-only");
-    assert!(!fx.root().join(".orchestry/state.json").exists());
+    let state = fx.root().join(".orchestry/state.json");
+    let read = |path: &Path| std::fs::read(path).ok();
+    let (lock_before, state_before) = (read(&lock), read(&state));
+    fx.ok("task_cancel", json!({"id": id}));
+    // The project's test daemon owns the lock and state; the cancel must not
+    // touch either (it is store-only until the daemon-routed cancel lands).
+    assert_eq!(
+        read(&lock),
+        lock_before,
+        "task_cancel changed the project lock"
+    );
+    assert_eq!(read(&state), state_before, "task_cancel changed state.json");
 }
 
 #[test]
@@ -774,7 +784,7 @@ fn msg_send_delivers_one_message_with_the_same_shape_as_the_cli() {
 }
 
 /// A project with agents `me` and `rx` (ids returned), no server yet.
-fn project_with_sender_and_receiver() -> (tempfile::TempDir, String, String) {
+fn project_with_sender_and_receiver() -> (ProjectDir, String, String) {
     let dir = initialized_project();
     let make = |name: &str| {
         cli_json(
@@ -1941,8 +1951,22 @@ fn config_update_and_patch_with_file_dash_are_invalid_params() {
 
 #[test]
 fn remote_list_and_status_equal_the_cli_for_a_registered_peer() {
-    let mut fx = Fx::new();
+    // The daemon advances a registered peer's link even with dispatch off.
+    // Park it before its first dial and await its publication, so both clients
+    // read one stable state, including every link field in remote_status.
+    let mut dir = initialized_project_unowned("p");
+    let block = dir.path().join("peer-block");
+    std::fs::write(&block, b"").expect("write the peer block file");
+    dir.start_daemon_with_env(&[("ORCH_TEST_PEER_BLOCK_FILE", &block)]);
+    let mut fx = Fx::on(dir, &[], &[]);
     fx.cli_plain(&["remote", "add", "peer", "127.0.0.1:9"]);
+    assert!(
+        mcp_common::wait_until(mcp_common::TIMEOUT, || {
+            fx.ok("remote_status", json!({}))["remotes"][0]["last_error"]
+                == "Peer link blocked by test hook"
+        }),
+        "the daemon's link to the registered peer never parked on the test hook"
+    );
     let listed = fx.ok("remote_list", json!({}));
     assert_eq!(listed[0]["alias"], "peer");
     assert_eq!(listed, fx.cli(&["remote", "list"]));
@@ -1971,8 +1995,24 @@ fn remote_list_and_status_read_the_registry_without_connecting_to_a_registered_p
         .set_nonblocking(true)
         .expect("non-blocking observer");
     let address = observer.local_addr().expect("observer address").to_string();
-    let mut fx = Fx::new();
+    // The daemon's own peer runtime links to every registered remote, dispatch
+    // on or off, within a registry tick of `remote add`; that dial is not the
+    // tools'. The link hook parks the link before its first dial, so the only
+    // dial left to observe is one the tools make.
+    let mut dir = initialized_project_unowned("p");
+    let block = dir.path().join("peer-block");
+    std::fs::write(&block, b"").expect("write the peer block file");
+    dir.start_daemon_with_env(&[("ORCH_TEST_PEER_BLOCK_FILE", &block)]);
+    let mut fx = Fx::on(dir, &[], &[]);
     fx.cli_plain(&["remote", "add", "peer", &address]);
+    // The link has picked the registration up and is parked, not yet to come.
+    assert!(
+        mcp_common::wait_until(mcp_common::TIMEOUT, || {
+            fx.ok("remote_status", json!({}))["remotes"][0]["last_error"]
+                == "Peer link blocked by test hook"
+        }),
+        "the daemon's link to the registered peer never parked on the test hook"
+    );
     assert_eq!(fx.ok("remote_list", json!({}))[0]["alias"], "peer");
     assert_eq!(
         fx.ok("remote_status", json!({}))["remotes"][0]["alias"],
@@ -2435,7 +2475,7 @@ fn malformed_yaml_is_a_tool_error_and_changes_nothing() {
 
 /// A server whose working directory is `project/sub`, so a relative path means
 /// different files depending on what it is resolved against.
-fn server_in_subdirectory() -> (tempfile::TempDir, McpServer) {
+fn server_in_subdirectory() -> (ProjectDir, McpServer) {
     let dir = initialized_project();
     let sub = dir.path().join("sub");
     std::fs::create_dir(&sub).expect("subdir");
@@ -2475,29 +2515,51 @@ fn a_relative_attachment_path_resolves_against_the_project_root_not_the_server_c
 
 // ── remote agents in the agent tools ──────────────────────────────────────
 
-/// A registered peer `peer` with a stored snapshot holding one agent, which is
-/// a copy of the local agent `local` renamed. Returns the remote agent's id.
-fn project_with_remote_snapshot(fx: &Fx, local: &str) -> String {
+/// A local agent and a registered peer `peer` whose stored snapshot holds a
+/// renamed copy. Returns the fixture and the remote agent's id.
+fn project_with_remote_snapshot() -> (Fx, String) {
+    let fx = Fx::new();
+    let local = fx.agent("near");
     fx.cli_plain(&["remote", "add", "peer", "127.0.0.1:9"]);
-    let mut remote_agent = fx.cli(&["agent", "status", local]);
+    let mut remote_agent = fx.cli(&["agent", "status", &local]);
     remote_agent["id"] = json!("agt_remote1");
     remote_agent["name"] = json!("far-away");
     let mut status = fx.cli(&["remote", "status"])["remotes"][0].clone();
     status["agents"] = json!([remote_agent]);
-    std::fs::create_dir_all(fx.root().join(".orchestry/remotes")).expect("remotes dir");
+    // The link owns this file and republishes its cached status even while
+    // blocked by the test hook. Seed it with no daemon running, so the new
+    // link loads our agent before its first publication, then keep it offline.
+    let Fx { server, mut dir } = fx;
+    drop(server);
+    dir.stop_daemon();
+    std::fs::create_dir_all(dir.path().join(".orchestry/remotes")).expect("remotes dir");
     std::fs::write(
-        fx.root().join(".orchestry/remotes/peer.json"),
+        dir.path().join(".orchestry/remotes/peer.json"),
         status.to_string(),
     )
     .expect("write snapshot");
-    "agt_remote1".to_owned()
+    let block = dir.path().join("peer-block");
+    std::fs::write(&block, b"").expect("write the peer block file");
+    dir.start_daemon_with_env(&[("ORCH_TEST_PEER_BLOCK_FILE", &block)]);
+    let mut fx = Fx::on(dir, &[], &[]);
+    assert!(
+        mcp_common::wait_until(mcp_common::TIMEOUT, || {
+            fx.ok("remote_status", json!({}))["remotes"][0]["last_error"]
+                == "Peer link blocked by test hook"
+        }),
+        "the daemon's link never republished the seeded snapshot on the test hook"
+    );
+    assert_eq!(
+        fx.cli(&["remote", "status"])["remotes"][0]["agents"][0]["id"],
+        "agt_remote1",
+        "the link must retain the seeded agent when it republishes status"
+    );
+    (fx, "agt_remote1".to_owned())
 }
 
 #[test]
 fn agent_list_includes_stored_remote_snapshots_exactly_as_the_cli_does() {
-    let mut fx = Fx::new();
-    let local = fx.agent("near");
-    project_with_remote_snapshot(&fx, &local);
+    let (mut fx, _) = project_with_remote_snapshot();
     let listed = fx.ok("agent_list", json!({}));
     assert_eq!(listed, fx.cli(&["agent", "list"]));
     assert_eq!(listed.as_array().expect("agents").len(), 2, "{listed}");
@@ -2505,9 +2567,7 @@ fn agent_list_includes_stored_remote_snapshots_exactly_as_the_cli_does() {
 
 #[test]
 fn agent_show_resolves_a_qualified_remote_agent_like_the_cli() {
-    let mut fx = Fx::new();
-    let local = fx.agent("near");
-    let remote = project_with_remote_snapshot(&fx, &local);
+    let (mut fx, remote) = project_with_remote_snapshot();
     let qualified = format!("{remote}@peer");
     assert_eq!(
         fx.ok("agent_show", json!({"id": qualified})),
@@ -2517,9 +2577,7 @@ fn agent_show_resolves_a_qualified_remote_agent_like_the_cli() {
 
 #[test]
 fn a_remote_agent_cannot_be_mutated_through_the_agent_tools() {
-    let mut fx = Fx::new();
-    let local = fx.agent("near");
-    let remote = project_with_remote_snapshot(&fx, &local);
+    let (mut fx, remote) = project_with_remote_snapshot();
     let qualified = format!("{remote}@peer");
     fx.tool_error("agent_enable", json!({"id": qualified}));
     fx.tool_error(
@@ -2641,71 +2699,39 @@ fn two_servers_creating_distinct_tasks_at_once_both_keep_every_index_entry() {
 }
 
 #[test]
-fn a_removed_context_directory_keeps_failing_in_the_same_process_and_a_restart_recovers() {
-    // Design D10: the ensured-directory cache is process-global, so removing a
-    // directory a running server has used breaks that server until it restarts.
+fn a_removed_context_directory_is_recreated_by_the_next_write() {
+    // Design D10 residual, closed: the daemon's ensured-directory cache
+    // forgets a directory that vanished underneath it, so the next write
+    // recreates it instead of failing until the daemon restarts.
     let mut fx = Fx::new();
     fx.ok("context_set", json!({"key": "k", "value": "v"}));
     std::fs::remove_dir_all(fx.root().join(".orchestry/context")).expect("remove context dir");
-    let broken = fx.call("context_set", json!({"key": "k2", "value": "v"}));
-    assert_eq!(
-        broken["result"]["isError"],
-        json!(true),
-        "the failure is visible as a tool error: {broken}"
-    );
-    assert!(
-        fx.ok("status", json!({})).is_object(),
-        "the process itself lives"
-    );
-    let Fx { server, dir } = fx;
-    drop(server);
-    let mut restarted = McpServer::spawn(dir.path());
-    restarted.initialize();
-    let response = restarted.call_tool("context_set", json!({"key": "k3", "value": "v"}));
-    assert_eq!(response["result"]["isError"], json!(false), "{response}");
+    fx.ok("context_set", json!({"key": "k2", "value": "v"}));
+    let got = fx.ok("context_get", json!({"key": "k2"}));
+    assert_eq!(got["value"], json!("v"), "{got}");
 }
 
 #[test]
-fn a_wrong_typed_known_config_key_poisons_later_calls_but_not_the_process_and_a_restore_heals() {
+fn a_wrong_typed_known_config_key_is_refused_and_leaves_the_config_and_the_server_working() {
+    // The daemon validates `config_set` (it owns the only writer), so the old
+    // "accepted, then poisons every later call" state cannot be reached
+    // through the tool any more.
     let mut fx = Fx::new();
     let config = fx.root().join(".orchestry/config.yml");
-    let backup = std::fs::read(&config).expect("config backup");
-    // config_set accepts the raw value for a non-prompt key (design D10).
-    fx.ok(
+    let before = std::fs::read(&config).expect("config before");
+    let response = fx.call(
         "config_set",
         json!({"key": "defaults.task.max_attempts", "value": "not-a-number"}),
     );
+    assert_eq!(response["result"]["isError"], json!(true), "{response}");
+    assert_eq!(
+        std::fs::read(&config).expect("config after"),
+        before,
+        "a refused config_set must leave config.yml byte-identical"
+    );
     for tool in ["task_list", "status", "agent_list"] {
-        let message = fx.tool_error(tool, json!({}));
-        assert!(!message.is_empty(), "{tool}");
+        fx.ok(tool, json!({}));
     }
-    // Catalogue requests need no Engine and still work.
-    let listed = fx.server.request("tools/list", json!({}));
-    assert!(
-        listed["result"]["tools"]
-            .as_array()
-            .is_some_and(|t| !t.is_empty()),
-        "{listed}"
-    );
-    // The operator restores the file outside the server; no restart needed.
-    std::fs::write(&config, backup).expect("restore config");
-    assert!(fx.ok("task_list", json!({})).is_array());
-}
-
-#[test]
-fn a_poisoned_config_is_repairable_by_a_fresh_server_too() {
-    let mut fx = Fx::new();
-    let config = fx.root().join(".orchestry/config.yml");
-    let backup = std::fs::read(&config).expect("config backup");
-    fx.ok(
-        "config_set",
-        json!({"key": "defaults.task.max_attempts", "value": "x"}),
-    );
-    std::fs::write(&config, backup).expect("restore config");
-    let mut fresh = McpServer::spawn(fx.root());
-    fresh.initialize();
-    let response = fresh.call_tool("task_list", json!({}));
-    assert_eq!(response["result"]["isError"], json!(false), "{response}");
 }
 
 // ── worker matrix (design D19) ────────────────────────────────────────────
@@ -2720,8 +2746,12 @@ fn a_poisoned_config_is_repairable_by_a_fresh_server_too() {
 
 /// A project that also works as a git repository, so `worktree` and
 /// `isolated` workspaces can be created.
-fn git_project(name: &str) -> tempfile::TempDir {
-    let dir = initialized_project_named(name);
+///
+/// The project's explicit test daemon is started last, after the git
+/// repository exists: workers run through `orch run <id>`, an RPC to that
+/// daemon, which prepares the workspace and spawns the worker.
+fn git_project(name: &str) -> ProjectDir {
+    let mut dir = initialized_project_unowned(name);
     let git = |args: &[&str]| {
         // The fixture's own private HOME and the system directories only: no
         // developer-machine PATH entry, no inherited user git config.
@@ -2753,6 +2783,7 @@ fn git_project(name: &str) -> tempfile::TempDir {
         "-m",
         "init",
     ]);
+    dir.start_daemon();
     dir
 }
 
@@ -3093,9 +3124,11 @@ fn a_client_that_does_not_forward_the_environment_cannot_send_without_an_explici
 }
 
 #[test]
-fn a_registration_pinned_to_project_a_makes_a_worker_in_b_write_into_a() {
+fn a_registration_pinned_to_project_a_is_refused_for_a_worker_in_b_and_writes_nowhere() {
     // Why design D19 forbids a user-global entry with --project-root: the pin
-    // wins over the worker's cwd, so B's worker silently mutates A.
+    // wins over the worker's cwd. Before the daemon, B's worker silently
+    // mutated A. Now the worker inherits B's daemon socket, and the daemon
+    // refuses a bridge that names another project, so nothing is written.
     let a = git_project("proj-a");
     let b = git_project("proj-b");
     let pin = format!("--project-root {}", a.path().display());
@@ -3108,12 +3141,15 @@ fn a_registration_pinned_to_project_a_makes_a_worker_in_b_write_into_a() {
             forget_identity: false,
         },
     );
+    let refusal = run.responses[&1]["error"]["message"]
+        .as_str()
+        .unwrap_or_default();
     assert!(
-        run.instructions().contains("orch project: \"proj-a\""),
-        "the wrong-root instruction is how an operator notices: {}",
-        run.instructions()
+        refusal.contains("wrong_project"),
+        "initialize must be refused as the wrong project: {}",
+        run.responses[&1]
     );
-    assert!(task_titles(a.path()).contains(&"pinned-wrongly".to_owned()));
+    assert!(!task_titles(a.path()).contains(&"pinned-wrongly".to_owned()));
     assert!(!task_titles(b.path()).contains(&"pinned-wrongly".to_owned()));
 }
 

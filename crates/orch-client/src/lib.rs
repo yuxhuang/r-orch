@@ -1,5 +1,21 @@
-//! Local daemon control plane. No store fallback and no lifecycle side effects.
-//! Production connections verify kernel credentials before sending any bytes.
+//! The daemon client every frontend uses: discovery, the connect state
+//! machine (design D5), the typed operation surface (D7, in `api`) and the
+//! frozen stop. No store fallback and no lifecycle side effects: nothing here
+//! starts, forks or executes a process (R4, enforced by `cargo xtask
+//! crate-graph`). Production connections verify kernel credentials before
+//! sending any bytes.
+//!
+//! ```ignore
+//! let config = ClientConfig::from_env(cwd)?.with_agent(cli.agent.as_deref())?;
+//! let mut client = match Client::connect(&config).await {
+//!     Ok(client) => client,
+//!     Err(error) => {
+//!         eprintln!("{}", error.render(config.agent_context));
+//!         return Err(error.exit_code()); // 7 for every NoDaemon form
+//!     }
+//! };
+//! let task = client.task_get(args::TaskGetArgs { id: Id::new("tsk_1")? }).await?;
+//! ```
 #![deny(
     unreachable_pub,
     clippy::unwrap_used,
@@ -7,12 +23,15 @@
     clippy::print_stderr
 )]
 
+mod api;
+mod call;
 mod discovery;
+pub use call::{Call, MAX_STREAMED_RESULT_BYTES, Progress};
 pub use discovery::Project;
 pub use orch_proto::error::ConnectFailure as NoDaemon;
 
 use orch_proto::error::{ErrorBody, NoDaemonDetail};
-use orch_proto::frame::{MAX_FRAME_BYTES, RequestFrame, RequestId, ServerFrame};
+use orch_proto::frame::limits;
 use orch_proto::handshake::{
     self, Caller, CallerKind, HandshakeReply, Hello, HelloFrame, Intent, Reply, SessionMode,
     StopState, VersionSkew, Welcome,
@@ -21,9 +40,9 @@ use orch_proto::ndjson::{self, FrameReader};
 use orch_proto::ops::{Request, args, results};
 use orch_proto::path::WirePath;
 use serde::de::DeserializeOwned;
-use std::num::NonZeroU64;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader, ReadHalf, WriteHalf};
 
 use tokio::net::UnixStream;
@@ -116,6 +135,35 @@ impl ClientConfig {
     pub fn project(&self) -> Result<Project, ClientError> {
         Project::discover(&self.cwd, self.project_root.as_deref())
     }
+
+    /// R8: an explicit `--agent` wins over `ORCH_AGENT_ID`; `None` keeps the
+    /// environment's identity. Identity is fixed for the session's lifetime.
+    pub fn with_agent(mut self, flag: Option<&str>) -> Result<Self, ClientError> {
+        if let Some(flag) = flag {
+            let id = orch_proto::bounded::Id::new(flag)
+                .map_err(|_| ClientError::InvalidArguments("invalid --agent".into()))?;
+            self.caller.agent_id = Some(id);
+        }
+        let kind = self.caller.kind;
+        Ok(self.with_frontend(kind))
+    }
+
+    /// The frontend opening the session. The daemon admits an MCP session
+    /// only to the MCP surface, so the bridge must say so. An MCP bridge with
+    /// a resolved agent identity renders failures in the agent variant.
+    pub fn with_frontend(mut self, kind: CallerKind) -> Self {
+        self.caller.kind = kind;
+        if kind == CallerKind::Mcp && self.caller.agent_id.is_some() {
+            self.agent_context = true;
+        }
+        self
+    }
+
+    /// Session admission mode; only MCP uses anything but `Normal`.
+    pub fn with_mode(mut self, mode: SessionMode) -> Self {
+        self.mode = mode;
+        self
+    }
 }
 
 /// Injectable byte stream for an explicitly constructed test transport. Real
@@ -132,13 +180,42 @@ pub struct Client {
     project: Project,
     pub welcome: Welcome,
     next_id: u64,
+    last_commit_seq: Option<u64>,
     // Set before writing: cancellation or a partial write leaves the outcome
     // unknown and the lane poisoned until a correlated terminal reply arrives.
     request_may_have_been_sent: bool,
 }
 
+/// How long `connect` keeps retrying a daemon that answers busy before it
+/// returns `daemon_busy`: the spec's admission deadline. One budget covers
+/// every attempt; a slow or absent daemon is never retried.
+pub const BUSY_WAIT: Duration = limits::ADMISSION_TIMEOUT;
+const BUSY_BACKOFF_FIRST: Duration = Duration::from_millis(25);
+const BUSY_BACKOFF_CAP: Duration = Duration::from_millis(500);
+
 impl Client {
+    /// Busy (session cap, or the pre-handshake budget full and the connection
+    /// dropped before any reply) is decided before a request frame exists, so
+    /// redialling cannot apply anything twice. Every other failure returns at
+    /// once, with the latency it had before.
     pub async fn connect(config: &ClientConfig) -> Result<Self, ClientError> {
+        let deadline = tokio::time::Instant::now() + BUSY_WAIT;
+        let mut backoff = BUSY_BACKOFF_FIRST;
+        loop {
+            let busy = match Self::connect_once(config).await {
+                Err(busy @ ClientError::Connection(NoDaemon::Busy { .. })) => busy,
+                other => return other,
+            };
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Err(busy);
+            }
+            tokio::time::sleep(jittered(backoff).min(left)).await;
+            backoff = (backoff * 2).min(BUSY_BACKOFF_CAP);
+        }
+    }
+
+    async fn connect_once(config: &ClientConfig) -> Result<Self, ClientError> {
         let (project, stream, pid) = dial(config).await?;
         Self::handshake(
             project,
@@ -195,20 +272,24 @@ impl Client {
                 handshake::MAX_HANDSHAKE_BYTES,
             )
             .await
-            .map_err(|_| {
-                project.failure(if intent == Intent::Stop {
-                    NoDaemonDetail::RequestOutcomeUnknown
-                } else {
-                    NoDaemonDetail::HandshakeFailed
-                })
-            })?;
-            read_reply(&mut io, &project, pid).await.map_err(|error| {
+            .map_err(|_| -> ClientError {
                 if intent == Intent::Stop {
-                    unknown_outcome(error, &project, NoDaemonDetail::RequestOutcomeUnknown)
+                    project
+                        .failure(NoDaemonDetail::RequestOutcomeUnknown)
+                        .into()
                 } else {
-                    error
+                    closed_before_reply(&project, pid)
                 }
-            })
+            })?;
+            read_reply(&mut io, &project, pid, intent)
+                .await
+                .map_err(|error| {
+                    if intent == Intent::Stop {
+                        unknown_outcome(error, &project, NoDaemonDetail::RequestOutcomeUnknown)
+                    } else {
+                        error
+                    }
+                })
         })
         .await
         .map_err(|_| {
@@ -249,8 +330,20 @@ impl Client {
             project,
             welcome,
             next_id: 1,
+            last_commit_seq: None,
             request_may_have_been_sent: false,
         })
+    }
+
+    /// The project this session is bound to.
+    pub fn project(&self) -> &Project {
+        &self.project
+    }
+
+    /// The daemon-instance-scoped commit ordinal of the last completed
+    /// request: the one assigned to a mutation or observed by a read.
+    pub fn last_commit_seq(&self) -> Option<u64> {
+        self.last_commit_seq
     }
 
     pub async fn status(&mut self) -> Result<results::DaemonStatus, ClientError> {
@@ -278,56 +371,6 @@ impl Client {
             .await
             .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?
     }
-
-    /// Generic terminal response plumbing for closed D7 requests. Streaming
-    /// and subscription APIs are added with their consumers in PR 2/3.
-    pub async fn call<T: DeserializeOwned>(&mut self, req: Request) -> Result<T, ClientError> {
-        if self.request_may_have_been_sent {
-            return Err(self
-                .project
-                .failure(NoDaemonDetail::RequestOutcomeUnknown)
-                .into());
-        }
-        // Reserve the id and poison the lane before the first await: cancelling
-        // this future must never let a later call consume its unknown reply.
-        let id = NonZeroU64::new(self.next_id)
-            .ok_or_else(|| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
-        self.next_id = self.next_id.checked_add(1).unwrap_or(0);
-        self.request_may_have_been_sent = true;
-        let frame = RequestFrame {
-            id: RequestId(id),
-            req,
-        };
-        ndjson::write_frame(&mut self.writer, &frame, MAX_FRAME_BYTES)
-            .await
-            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
-        let bytes = self
-            .io
-            .read_line(MAX_FRAME_BYTES)
-            .await
-            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?
-            .ok_or_else(|| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
-        ndjson::check_depth(&bytes, orch_proto::frame::MAX_DEPTH)
-            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
-        let frame = ServerFrame::decode(&bytes)
-            .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
-        match frame {
-            ServerFrame::Ok(frame) if frame.id.0 == id => {
-                let result = ndjson::decode(frame.ok.get().as_bytes())
-                    .map_err(|_| self.project.failure(NoDaemonDetail::RequestOutcomeUnknown))?;
-                self.request_may_have_been_sent = false;
-                Ok(result)
-            }
-            ServerFrame::Err(frame) if frame.id.0 == id => {
-                self.request_may_have_been_sent = false;
-                Err(ClientError::Remote(frame.err))
-            }
-            _ => Err(self
-                .project
-                .failure(NoDaemonDetail::RequestOutcomeUnknown)
-                .into()),
-        }
-    }
 }
 
 /// Frozen stop intent: versions are reported but never prevent shutdown.
@@ -345,13 +388,13 @@ pub async fn stop(config: &ClientConfig) -> Result<results::StopOutcome, ClientE
     // One deadline covers both the terminal frame and release of ownership.
     let deadline = tokio::time::Instant::now() + handshake::STOP_COMPLETION_TIMEOUT;
     let owner_pid = client.welcome.pid;
-    let completed =
-        tokio::time::timeout_at(deadline, read_reply(&mut client.io, &client.project, pid))
-            .await
-            .map_err(|_| stop_timeout(&client.project, owner_pid))?
-            .map_err(|error| {
-                unknown_outcome(error, &client.project, NoDaemonDetail::StopOutcomeUnknown)
-            })?;
+    let completed = tokio::time::timeout_at(
+        deadline,
+        read_reply(&mut client.io, &client.project, pid, Intent::Stop),
+    )
+    .await
+    .map_err(|_| stop_timeout(&client.project, owner_pid))?
+    .map_err(|error| unknown_outcome(error, &client.project, NoDaemonDetail::StopOutcomeUnknown))?;
     if completed.instance != client.welcome.instance
         || completed.pid != owner_pid
         || completed.stop_state != Some(StopState::Completed)
@@ -368,6 +411,16 @@ pub async fn stop(config: &ClientConfig) -> Result<results::StopOutcome, ClientE
     drop(client.writer);
     wait_for_owner_release(project, owner_pid, deadline).await?;
     Ok(results::StopOutcome { clean: true })
+}
+
+/// Equal jitter: half of `delay` plus a random share of the other half, so a
+/// burst of clients turned away together does not redial in lockstep.
+fn jittered(delay: Duration) -> Duration {
+    use std::hash::BuildHasher;
+    let half = delay / 2;
+    let span = u64::try_from(half.as_nanos()).unwrap_or(u64::MAX).max(1);
+    let random = std::collections::hash_map::RandomState::new().hash_one(std::time::Instant::now());
+    half + Duration::from_nanos(random % span)
 }
 
 fn unknown_outcome(error: ClientError, project: &Project, detail: NoDaemonDetail) -> ClientError {
@@ -453,25 +506,52 @@ fn authenticate_peer(
     project: &Project,
     expected_uid: u32,
 ) -> Result<Option<u32>, ClientError> {
-    let cred = stream
-        .peer_cred()
-        .map_err(|_| project.failure(NoDaemonDetail::PermissionDenied))?;
+    check_peer(stream.peer_cred(), project, expected_uid)
+}
+
+fn check_peer(
+    cred: std::io::Result<tokio::net::unix::UCred>,
+    project: &Project,
+    expected_uid: u32,
+) -> Result<Option<u32>, ClientError> {
+    // macOS answers LOCAL_PEEREPID with ENOTCONN once the accepted peer has
+    // closed. Nothing has been sent, and absence is already ruled out.
+    let cred = cred.map_err(|_| closed_before_reply(project, None))?;
     if cred.uid() != expected_uid {
         return Err(project.failure(NoDaemonDetail::PermissionDenied).into());
     }
     Ok(cred.pid().and_then(|p| u32::try_from(p).ok()))
 }
 
+/// `connect` succeeded, so a listener was alive: a peer that closes before any
+/// handshake reply is capacity, never absence. The daemon drops connections
+/// beyond its pre-handshake budget without replying (SE-6), so the session
+/// count is unknown here.
+fn closed_before_reply(project: &Project, pid: Option<u32>) -> ClientError {
+    NoDaemon::Busy {
+        project_root: orch_proto::path::escape_controls(&project.root.to_string_lossy()),
+        pid,
+        sessions: 0,
+        cap: 0,
+    }
+    .into()
+}
+
 async fn read_reply(
     io: &mut Reader,
     project: &Project,
     pid: Option<u32>,
+    intent: Intent,
 ) -> Result<Welcome, ClientError> {
-    let reply: HandshakeReply = io
-        .read(handshake::MAX_HANDSHAKE_BYTES)
-        .await
-        .map_err(|_| project.failure(NoDaemonDetail::HandshakeFailed))?
-        .ok_or_else(|| project.failure(NoDaemonDetail::HandshakeFailed))?;
+    let reply: HandshakeReply = match io.read(handshake::MAX_HANDSHAKE_BYTES).await {
+        Ok(Some(reply)) => reply,
+        // A stop hello may already have been acted on; its callers classify
+        // this as an unknown outcome instead.
+        Ok(None) | Err(ndjson::CodecError::Io(_)) if intent == Intent::Session => {
+            return Err(closed_before_reply(project, pid));
+        }
+        Ok(None) | Err(_) => return Err(project.failure(NoDaemonDetail::HandshakeFailed).into()),
+    };
     match reply.into_reply() {
         Some(Reply::Welcome(welcome)) => {
             if welcome.project_id != project.id {
@@ -530,6 +610,24 @@ mod tests {
             server.try_read(&mut byte).unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
         );
+    }
+
+    #[test]
+    fn lost_peer_credential_after_connect_is_busy_not_absence() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".orchestry")).unwrap();
+        let project = Project::discover(root.path(), None).unwrap();
+        let uid = nix::unistd::geteuid().as_raw();
+        let lost = std::io::Error::from(std::io::ErrorKind::NotConnected);
+        let error = check_peer(Err(lost), &project, uid).unwrap_err();
+        assert_eq!(error.exit_code(), 7);
+        for agent_context in [false, true] {
+            let text = error.render(agent_context);
+            assert!(text.contains("daemon_busy"), "{text}");
+            assert!(text.contains("PID unavailable"), "{text}");
+            assert!(!text.contains("No orch daemon is running"), "{text}");
+            assert!(!text.contains("permission denied"), "{text}");
+        }
     }
 }
 

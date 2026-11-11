@@ -8,7 +8,7 @@ The web dashboard (`orch web`) shows the [dashboard](08-dashboard.md) in a brows
 - [Log in](#log-in)
 - [Reach it from another machine](#reach-it-from-another-machine)
 - [Run it behind a proxy](#run-it-behind-a-proxy)
-- [Observe without dispatching](#observe-without-dispatching)
+- [Dispatch from the web dashboard](#dispatch-from-the-web-dashboard)
 - [Use tabs and sessions](#use-tabs-and-sessions)
 - [Copy text in the browser](#copy-text-in-the-browser)
 - [Stop it](#stop-it)
@@ -18,7 +18,9 @@ The web dashboard (`orch web`) shows the [dashboard](08-dashboard.md) in a brows
 
 ## Start it and open it
 
-Before you start: run the command inside a project (a directory with `.orchestry/`). Outside a project it stops with `Not initialized`.
+Before you start: run the command inside a project (a directory with `.orchestry/`), and start the project's [daemon](18-daemon.md) (`orch daemon start --detach`). Outside a project `orch web` stops with `Not initialized`. Without a daemon it prints the [no-daemon message](18-daemon.md#when-no-daemon-answers) and exits 7; it never starts a daemon.
+<!-- W2 (PR 2, tsk_M9AsDfP): PR 2 contract items 1 and 3 (web preflight + HTTP 503, plan Q0b), spec R18, SE-17.
+Written ahead of S2c; checked at run time at f70fc707 (board-2 fact-check tsk_eVo3agZ, tsk_J8tJF2x). -->
 
 1. Start the server:
 
@@ -42,6 +44,8 @@ Before you start: run the command inside a project (a directory with `.orchestry
 The server listens on `127.0.0.1:7681` by default. That address is reachable only from your own machine. Each browser tab runs its own `orch tui` on the server, so the page behaves exactly like the terminal dashboard, including all keys and the mouse.
 
 The token is new every time you start `orch web`. Keep the terminal open; the server stops when you close it.
+
+**If the daemon goes away** while `orch web` runs, the server keeps running. A new page or tab gets HTTP 503 with the no-daemon message as plain text; with `--no-auth` it gets only `orch daemon unavailable`, without the project or socket path. A tab whose dashboard is already open shows the dashboard's own no-daemon screen (`r` retry, `q` quit). Start the daemon again and reload the page.
 
 ## Log in
 
@@ -149,20 +153,18 @@ Use a proxy that provides TLS (encryption for the connection), and keep the acce
 
 > **Warning:** Every name you allow is an exception to the protection against DNS rebinding (a hostile name that points at your machine). Add only names whose DNS you control.
 
-## Observe without dispatching
+## Dispatch from the web dashboard
 
-```sh
-orch web --observe
-```
+Each tab runs a dashboard that is a client of the daemon, so the web dashboard never dispatches by itself. Dispatch belongs to the daemon: while it is on, the daemon starts waiting tasks, and the page's watch toggle, like `orch daemon dispatch on` and `off`, changes it for every client of the project.
 
-With `--observe`, each tab runs `orch tui --observe`: the dashboard does not start the orchestrator, so the watch loop does not start, so it does not dispatch tasks by itself. Use it to watch a project that `orch serve` runs.
+> **Warning:** Anyone with the login can turn dispatch on, or press `R` on a task, and so start real, paid agent runs.
 
-> **Warning:** `--observe` is not read-only. Pressing `R` on a task, or clicking run, still dispatches that task from the page, so anyone with the login can start real, paid agent runs while the header says `OBSERVING`.
+`orch web --observe` was removed with `orch tui --observe`: there is no dashboard that owns the orchestrator, so there is nothing to observe instead. `orch web --observe` now refuses with `orch web --observe was removed: every dashboard is a client of the project's daemon` and exits 2.
 
 ## Use tabs and sessions
 
 - Each browser tab opens its own session with its own `orch tui` process on the server.
-- Extra tabs are not shared views. A project has one orchestrator owner. The first dashboard becomes the owner (unless you used `--observe`); later tabs fall back to observers (`OBSERVING` in the header).
+- All tabs show the same project through the same daemon; no tab owns the orchestrator.
 - The server allows at most 8 sessions at a time.
 - Closing a tab ends that session. A browser that stops answering for 60 seconds is dropped.
 - The page resizes the terminal to fit the window.
@@ -183,7 +185,7 @@ Click **Dismiss** to close the panel.
 
 Press `Ctrl+C` in the terminal that runs `orch web`, or send it `SIGTERM` (the standard "please stop" signal, for example from `kill`).
 
-1. The server stops accepting connections and tells each session to close. Each session's `orch tui` stops its own agents.
+1. The server stops accepting connections and tells each session to close. The daemon, and the agents it runs, keep running; stop them with `orch daemon stop`.
 2. It waits up to about 17 seconds for sessions to finish.
 3. Press `Ctrl+C` again to exit at once.
 
@@ -196,6 +198,5 @@ Press `Ctrl+C` in the terminal that runs `orch web`, or send it `SIGTERM` (the s
 | `ORCH_WEB_PASSWORD` | The same, from the environment. | not set |
 | `--no-auth` | No login. Refused on wildcard addresses. | off |
 | `--allow-host NAME` | Accepts this `Host` name. Repeat for more. | none |
-| `--observe` | Runs each tab as `orch tui --observe`. | off |
 
 For the output flags (`--json`, `--quiet` and so on) see [Configuration and output](12-configuration-and-output.md).

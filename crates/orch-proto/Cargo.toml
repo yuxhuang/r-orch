@@ -22,5 +22,9 @@ tokio = { workspace = true, features = ["io-util", "time"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "time"] }
 
+# Test seam only (T2a two-executable skew vector); never in `default`.
+[features]
+skew-seam = []
+
 [lints]
 workspace = true

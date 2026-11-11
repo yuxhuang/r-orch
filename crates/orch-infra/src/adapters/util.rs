@@ -209,9 +209,16 @@ pub async fn probe_version(
     process_manager: &dyn ProcessManager,
     command: &str,
 ) -> std::result::Result<String, String> {
-    let mut child = process_manager
-        .spawn(command, &["--version".to_owned()], SpawnOptions::default())
-        .map_err(|err| spawn_failure_message(command, &err))?;
+    let reservation =
+        crate::process::gate::reserve_spawn(crate::process::gate::SpawnSite::Version).await;
+    let mut child = reservation.run(|| {
+        process_manager
+            .spawn(command, &["--version".to_owned()], SpawnOptions::default())
+            .map_err(|err| spawn_failure_message(command, &err))
+    })?;
+    // An abandoned probe (doctor deadline, cancelled request) takes its group
+    // with it.
+    let mut guard = crate::process::GroupKillGuard::new(process_manager, child.pid);
 
     // Both pipes are drained together: reading them in sequence would deadlock
     // on a chatty `--version`.
@@ -238,6 +245,7 @@ pub async fn probe_version(
     let stderr = String::from_utf8_lossy(&stderr);
 
     let outcome = child.exit.wait().await;
+    guard.disarm();
     if outcome.success() {
         return Ok(stdout.trim().to_owned());
     }
@@ -563,9 +571,20 @@ mod tests {
         let path = temp.path().join("probe");
         let pm = crate::process::SystemProcessManager::new();
         for code in [0, 2] {
-            std::fs::write(&path, format!(
+            // Let a child write the script: a write descriptor in this process
+            // could be inherited by another test's fork and cause ETXTBSY
+            // (rust-lang/rust#114554). Waiting reaps the sole writer before exec.
+            assert!(std::process::Command::new("/bin/sh")
+                .env_clear()
+                .args(["-c", "printf '%s' \"$1\" > \"$2\"", "sh"])
+                .arg(format!(
                 "#!/bin/sh\nprintf VERSION_CANARY\n/usr/bin/yes v | /usr/bin/head -c 12582912\nprintf STDERR_CANARY >&2\n/usr/bin/yes e | /usr/bin/head -c 12582912 >&2\nexit {code}\n"
-            )).unwrap();
+                ))
+                .arg(&path)
+                .stdin(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success());
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
             let result = probe_version(&pm, path.to_str().unwrap()).await;
             if code == 0 {

@@ -331,7 +331,7 @@ orch agent autonomous agt_NnBifRi --on
 
 If you pass both, `--on` wins.
 
-When the orchestrator runs, the new task has a title that starts with `[auto]`. This is what `orch serve --log-format text` logged within a second of starting, with a goal assigned to the agent:
+When the daemon's dispatch is on, the new task has a title that starts with `[auto]`. This is what `orch serve --log-format text` of orch 0.13.0 logged within a second of starting, with a goal assigned to the agent (a foreground `orch serve` no longer logs events and refuses `--log-format text`; follow events with `orch logs --follow`):
 
 ```text
 23:09:14.906 INFO  task:created  taskId=tsk_cf6OMmd title=[auto] noter: Keep notes fresh

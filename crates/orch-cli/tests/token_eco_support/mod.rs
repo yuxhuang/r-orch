@@ -63,9 +63,20 @@ impl Out {
     }
 }
 
+// The shared test-daemon helper (`tests/common/daemon.rs`).
+#[path = "../common/daemon.rs"]
+pub mod daemon;
+use daemon::TestDaemon;
+
 /// One disposable project plus its private home, fake-agent `PATH` and
 /// recording directory.
 pub struct Sandbox {
+    /// Dropped first: stopped, with a process-table check, before the project
+    /// directory it serves is removed. `None` only for a sandbox that has not
+    /// yet adopted a daemon ([`Sandbox::new`]); every `orch` command but
+    /// `init` is a daemon client since S2a-cli, so a sandbox that runs one
+    /// needs [`Sandbox::new_owned`].
+    daemon: Option<TestDaemon>,
     _parent: tempfile::TempDir,
     /// Always `<canonical tmp>/proj`, so the project name in a prompt is stable.
     pub project: PathBuf,
@@ -99,12 +110,22 @@ fn write_script(path: &Path, body: &str) {
 }
 
 impl Sandbox {
-    /// A fresh initialised project. `init` always runs with `init_reader`.
+    /// A fresh initialised project **without a daemon**. `init` always runs
+    /// with `init_reader`.
+    ///
+    /// Every other `orch` command is a daemon client since S2a-cli, so a test
+    /// that goes on to run one (including `orch run` / `orch serve --once`)
+    /// needs [`Sandbox::new_owned`] instead. This constructor exists for the
+    /// rare fixture that wants a bare initialised project (for example, to
+    /// exercise the "no daemon running" exit 7) or that starts a foreground
+    /// `orch serve` / `orch run --watch` itself, which *is* a daemon start and
+    /// must not also own this one.
     pub fn new(init_reader: &Reader) -> Sandbox {
         let parent = tempfile::tempdir().unwrap();
         let project = parent.path().canonicalize().unwrap().join("proj");
         fs::create_dir(&project).unwrap();
         let sb = Sandbox {
+            daemon: None,
             _parent: parent,
             project,
             home: tempfile::tempdir().unwrap(),
@@ -115,6 +136,71 @@ impl Sandbox {
         let out = sb.run(init_reader, &["init"], None);
         assert!(out.ok(), "init failed: {}", out.all());
         sb
+    }
+
+    /// [`Sandbox::new`] plus an explicit test daemon on an isolated short
+    /// socket. The daemon gets the sandbox's fake-agent `PATH` and recording
+    /// directory, so an agent it spawns after the CLI cutover finds the same
+    /// fakes the CLI used to.
+    pub fn new_owned(init_reader: &Reader) -> Sandbox {
+        Self::new_owned_with_version(init_reader, "2.1.2")
+    }
+
+    /// [`Sandbox::new_owned`] whose daemon (the process that spawns agents and
+    /// probes their CLI) sees the fake CLIs at `version`. A version is a
+    /// property of the *daemon's* environment now, not of the CLI command.
+    ///
+    /// The project's retry back-off is set to 1 ms: `orch run <id>` on a task
+    /// that is still inside its (default 10 s) back-off window is refused as
+    /// "not eligible for launch", and these fixtures re-run failed tasks
+    /// immediately.
+    pub fn new_owned_with_version(init_reader: &Reader, version: &str) -> Sandbox {
+        let mut sb = Sandbox::new(init_reader);
+        sb.start_daemon(version);
+        let out = sb.run(
+            init_reader,
+            &["config", "set", "scheduling.retry_base_delay_ms", "1"],
+            None,
+        );
+        assert!(out.ok(), "retry back-off: {}", out.all());
+        sb
+    }
+
+    fn start_daemon(&mut self, version: &str) {
+        let path = std::ffi::OsString::from(format!("{}:/usr/bin:/bin", self.bin.path().display()));
+        let path = PathBuf::from(path);
+        self.daemon = Some(TestDaemon::start_with_env(
+            &self.project,
+            self.home.path(),
+            &[
+                ("PATH", path.as_path()),
+                ("ORCH_T1_REC", self.rec.path()),
+                ("ORCH_FAKE_VERSION", Path::new(version)),
+            ],
+        ));
+    }
+
+    /// Stop the sandbox's daemon (process table checked) and leave none, for a
+    /// fixture that then starts a foreground `serve` / `run --watch` (itself a
+    /// daemon start) on its own socket.
+    pub fn stop_daemon(&mut self) {
+        self.daemon
+            .take()
+            .expect("this sandbox owns a daemon")
+            .shutdown();
+    }
+
+    /// Stop the daemon (process table checked), run `edit` on the quiescent
+    /// project, and start a fresh daemon that reads what `edit` wrote. For
+    /// state a test writes by hand under `.orchestry/`: a running daemon owns
+    /// it and would not see the edit.
+    pub fn with_daemon_stopped(&mut self, edit: impl FnOnce()) {
+        self.daemon
+            .take()
+            .expect("this sandbox owns a daemon")
+            .shutdown();
+        edit();
+        self.start_daemon("2.1.2");
     }
 
     fn install_fakes(&self) {
@@ -181,6 +267,9 @@ impl Sandbox {
             .env("NO_COLOR", "1")
             .env("EDITOR", "false")
             .env("ORCH_FAKE_VERSION", "2.1.2");
+        if let Some(daemon) = &self.daemon {
+            daemon.apply(&mut c);
+        }
         c
     }
 

@@ -1,26 +1,20 @@
 //! ARCHITECTURE A2: what happens when several `orch` processes mutate
 //! `_index.json` at once.
 //!
-//! A2 claims **single writer**: the PID lock means one process mutates
-//! orchestrator state, and the index read-modify-write is mutex-protected only
-//! *within* a process. One-shot commands like `task add` do **not** take the
-//! lock, so two of them racing is reachable — and the outcome is a lost
-//! update, not corruption.
+//! Up to 0.13.0 every one-shot `task add` wrote the index itself, so two of
+//! them racing lost an update (D10). Since the daemon owns the project, each
+//! `orch` process is a client and the daemon is the only writer, so
+//! concurrent adds from separate processes now lose nothing. The harness
+//! starts an explicit test daemon on a private short socket, as every
+//! binary-level test does; the stress test in orch-cli
+//! (`tests/stress_single_writer.rs`) is the broader proof.
 //!
-//! This test **documents** that rather than asserting it away. Three
-//! properties hold regardless of how the race lands, and they are what is
-//! asserted:
+//! Asserted:
 //!
-//! 1. Every task **file** survives. Each is an independent atomic write, so
-//!    nothing is lost on disk.
-//! 2. `_index.json` is always valid JSON and always a **subset** of the files.
-//!    A lost update drops entries; it never invents or corrupts one.
-//! 3. Deleting the index recovers everything, because a missing index triggers
-//!    a rebuild from the files.
-//!
-//! The consequence worth stating plainly: after a race, `task list` can
-//! under-report while the task's own file sits on disk. Nothing in the system
-//! notices until the index is rebuilt.
+//! 1. Every task **file** survives (each is an independent atomic write).
+//! 2. `_index.json` is valid JSON and names exactly the files: no lost update.
+//! 3. The offline recovery still works: with the daemon stopped, deleting the
+//!    index and starting again rebuilds it from the files.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -32,6 +26,9 @@ struct Harness {
     project: tempfile::TempDir,
     home: PathBuf,
     rust: PathBuf,
+    /// Short directory for `ORCH_SOCKET`: a temp project path can exceed the
+    /// 104-byte Unix socket limit on macOS.
+    socket_dir: tempfile::TempDir,
 }
 
 /// Where cargo put this build's binaries.
@@ -87,10 +84,21 @@ impl Harness {
         )
         .expect("seed update cache");
 
+        let socket_dir = tempfile::Builder::new()
+            .prefix("a2")
+            .tempdir_in("/tmp")
+            .expect("socket dir");
+        // The daemon refuses a socket directory others can read.
+        std::fs::set_permissions(
+            socket_dir.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("socket dir mode");
         let harness = Harness {
             project,
             home,
             rust,
+            socket_dir,
         };
         harness.git(&["init", "--initial-branch=main"]);
         harness.git(&["config", "user.email", "a2@r-orch.test"]);
@@ -119,16 +127,48 @@ impl Harness {
                 "ORCHESTRY_GLOBAL_CONFIG_PATH",
                 self.home.join(".orchestry/global.yml"),
             )
+            .env("ORCH_SOCKET", self.socket_dir.path().join("s"))
             .env("CI", "1")
             .env("NO_COLOR", "1")
+            .env_remove("ORCH_AGENT_ID")
+            .env_remove("ORCH_AGENT_NAME")
+            .env_remove("ORCH_TASK_ID")
             .stdin(std::process::Stdio::null());
         command
+    }
+
+    /// Start the project's daemon explicitly (nothing starts one implicitly).
+    fn start_daemon(&self) {
+        let output = self.run_rust(&["daemon", "start", "--detach"]);
+        assert!(
+            output.status.success(),
+            "daemon start failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn stop_daemon(&self) {
+        let output = self.run_rust(&["daemon", "stop"]);
+        assert!(
+            output.status.success(),
+            "daemon stop failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     fn run_rust(&self, args: &[&str]) -> std::process::Output {
         self.command().args(args).output().expect("run orch")
     }
+}
 
+impl Drop for Harness {
+    /// Never leave a daemon behind, even when an assertion failed.
+    fn drop(&mut self) {
+        let _ = self.run_rust(&["daemon", "stop"]);
+    }
+}
+
+impl Harness {
     fn tasks_dir(&self) -> PathBuf {
         self.project.path().join(".orchestry/tasks")
     }
@@ -174,10 +214,12 @@ impl Harness {
 }
 
 /// Fire `task add` from separate processes at once and check the three
-/// invariants. Separate processes, so the in-process mutex cannot help.
+/// invariants. Separate processes, so only the single daemon writer can keep
+/// the index complete.
 #[test]
-fn concurrent_index_mutation_loses_updates_without_corrupting_anything() {
+fn concurrent_index_mutation_through_the_daemon_loses_nothing() {
     let harness = Harness::new();
+    harness.start_daemon();
 
     let mut children = Vec::new();
     for n in 0..TASKS {
@@ -204,33 +246,19 @@ fn concurrent_index_mutation_loses_updates_without_corrupting_anything() {
         "a task file went missing — atomic writes should make that impossible"
     );
 
-    // 2. The index is valid and a subset of the files. A lost update drops
-    //    entries; it must never invent or corrupt one.
-    assert!(
-        indexed.is_subset(&files),
-        "the index names tasks that have no file: {:?}",
-        indexed.difference(&files).collect::<Vec<_>>()
-    );
-
-    // What actually happened, recorded rather than asserted — the race may or
-    // may not land on any given run.
-    let lost = files.len() - indexed.len();
-    eprintln!(
-        "A2: {} of {TASKS} task files reached the index; {lost} update(s) lost to the race",
-        indexed.len()
-    );
-
-    // 3. `task list` reads the index, so it reports exactly what the index
-    //    holds — under-reporting when updates were lost.
+    // 2. One writer: the index is valid and names exactly the files.
+    assert_eq!(indexed, files, "an index update was lost or invented");
     assert_eq!(
         harness.listed_ids(),
         indexed,
         "task list must mirror the index"
     );
 
-    // And the documented recovery: removing the index rebuilds it from the
-    // files, so nothing is permanently invisible.
+    // 3. The documented offline recovery: with the daemon stopped, removing
+    //    the index and starting again rebuilds it from the files.
+    harness.stop_daemon();
     std::fs::remove_file(harness.tasks_dir().join("_index.json")).expect("remove index");
+    harness.start_daemon();
     assert_eq!(
         harness.listed_ids(),
         files,
@@ -238,12 +266,12 @@ fn concurrent_index_mutation_loses_updates_without_corrupting_anything() {
     );
 }
 
-/// The same adds run strictly sequentially, as the control: with one writer at
-/// a time nothing is lost, which is what makes the concurrent result
-/// attributable to the race rather than to a bug.
+/// The same adds run strictly sequentially, as the control for the helpers
+/// and the daemon start-up above.
 #[test]
 fn sequential_adds_lose_nothing() {
     let harness = Harness::new();
+    harness.start_daemon();
 
     for n in 0..6 {
         let title = format!("task {n}");
@@ -271,9 +299,10 @@ fn the_helpers_read_the_directory_they_claim_to() {
         "a fresh project has no tasks"
     );
 
-    // `init` deliberately creates no index, so the first
-    // list builds one from an empty directory.
+    // `init` deliberately creates no index; the daemon builds one from the
+    // empty directory, at start-up or on the first list.
     assert!(!harness.tasks_dir().join("_index.json").exists());
+    harness.start_daemon();
     assert!(harness.listed_ids().is_empty());
     assert!(harness.tasks_dir().join("_index.json").exists());
 

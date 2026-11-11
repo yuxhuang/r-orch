@@ -173,7 +173,7 @@ A goal changes work in three ways:
 2. **It turns on autonomous mode.** Creating a goal with `--assignee` makes that agent autonomous. Pausing, finishing or deleting the goal turns it off again when the agent has no other `active` goal.
 3. **It orders and informs tasks.** Among tasks of the same priority, tasks linked to a goal start first. An agent that runs a linked task sees the goal in its prompt.
 
-A goal never starts work when no orchestrator runs. A goal without an assignee does nothing until some autonomous agent picks it up.
+A goal never starts work while the daemon's dispatch is off. A goal without an assignee does nothing until some autonomous agent picks it up.
 
 ### Create a goal
 

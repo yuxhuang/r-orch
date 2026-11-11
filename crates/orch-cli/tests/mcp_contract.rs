@@ -478,16 +478,17 @@ LEAF org deploy
 LEAF run
   <task_id>
   --all flag
+  --from-agent flag
   --listen
+  --once flag
   --peer-name
+  --tick-interval hidden
   --verbose flag
   --watch flag
 LEAF doctor
 LEAF tui
-  --listen
-  --observe flag
-  --peer-name
 LEAF serve
+  --from-agent flag
   --listen
   --log-file
   --log-format default=json
@@ -510,7 +511,7 @@ LEAF web
   --allow-host multi
   --bind default=127.0.0.1:7681
   --no-auth flag
-  --observe flag
+  --observe flag hidden
   --password
 LEAF mcp
   --agent

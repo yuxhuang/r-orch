@@ -41,7 +41,6 @@ fn endpoint_safety_child() {
         from_agent: false,
         listen: None,
         peer_name: None,
-        developmental: true,
     };
     let code = match orch_daemon::prepare_start(options) {
         Err(error) => {

@@ -239,53 +239,6 @@ impl<'de> Visitor<'de> for StrictValue {
     }
 }
 
-/// Strip only equal known read-only echoes from full entity-show replacements.
-/// Patches reject all read-only fields. Unknown fields cannot disappear in merge.
-pub(crate) fn writable_input(
-    input: &Value,
-    current: &Value,
-    writable: &[&str],
-    readonly: &[&str],
-    kind: MutationKind,
-) -> Result<Value> {
-    require_object(input)?;
-    let mut result = serde_json::Map::new();
-    for (key, value) in input.as_object().expect("object checked") {
-        if writable.contains(&key.as_str()) {
-            result.insert(key.clone(), value.clone());
-        } else if readonly.contains(&key.as_str()) {
-            if kind == MutationKind::Patch || current.get(key) != Some(value) {
-                return Err(Error::invalid_arguments(format!("{key}: read-only field")));
-            }
-        } else {
-            return Err(Error::invalid_arguments(format!("{key}: unknown field")));
-        }
-    }
-    Ok(Value::Object(result))
-}
-
-pub(crate) fn reject_nulls(value: &Value, path: &str) -> Result<()> {
-    match value {
-        Value::Null => {
-            return Err(Error::invalid_arguments(format!(
-                "{path}: null is not allowed; omit the field"
-            )));
-        }
-        Value::Object(map) => {
-            for (key, value) in map {
-                reject_nulls(value, &format!("{path}.{key}"))?;
-            }
-        }
-        Value::Array(items) => {
-            for value in items {
-                reject_nulls(value, path)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

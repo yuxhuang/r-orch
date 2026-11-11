@@ -103,8 +103,9 @@ orch does not know.
 >   ✕ <stdin>: config: runtime limits and concurrency must be positive
 > ```
 
-orch reads `config.yml` when it starts. To be sure a running orchestrator uses a changed value, stop and start it
-again.
+The daemon reads `config.yml` when it starts, and again after a change made with `orch config set`, `update` or
+`patch`. After you edit the file by hand, stop and start the daemon (`orch daemon stop`, then `orch daemon start`)
+to be sure it uses the new value.
 
 ### Replace or patch from a file
 
@@ -122,7 +123,7 @@ See [Update definitions from files](#update-definitions-from-files).
 | `defaults.agent.approval_policy` | The approval policy a new agent gets: `suggest`, `auto` or `manual`. | `auto` |
 | `defaults.agent.max_turns` | The turn limit a new agent gets. | `50` |
 | `defaults.agent.timeout_ms` | The timeout a new agent gets, in milliseconds. orch stores it but does not enforce it. | `3600000` |
-| `defaults.agent.stall_timeout_ms` | How long a run may produce no output before orch stops it, in milliseconds. Applies while the orchestrator loop runs. | `600000` |
+| `defaults.agent.stall_timeout_ms` | How long a run may produce no output before orch stops it, in milliseconds. Applies in the daemon to the runs it dispatches. | `600000` |
 | `defaults.agent.workspace_mode` | The workspace mode when neither the task nor the agent sets one: `shared`, `worktree` or `isolated`. | `worktree` |
 | `defaults.agent.prompt_mode` | The prompt mode for agents that have no `config.prompt_mode` of their own: `normal` or `eco`. Read again at every run. See [Eco mode](16-eco-mode-and-effort.md). | `normal`, or `--prompt-mode` on `orch init` |
 | `defaults.task.max_attempts` | The attempt limit a new task gets. | `3` |
@@ -272,8 +273,10 @@ Details:
   code, whatever you choose. Standard output stays empty.
 - Commands that never print JSON ignore `--yaml` too. `orch agent shop` is one.
 - `orch doctor` prints a header line before its structured document, so its output is not one document.
-- `orch logs --follow` still streams text, and `orch serve` still writes JSON Lines. `serve --log-format` is a
-  separate option. See [Running and monitoring](07-running-and-monitoring.md).
+- `orch logs --follow` still streams text, and `orch serve --once` writes JSON Lines. `serve --log-format` is a
+  separate option of `serve --once`. A foreground `orch serve` is the daemon: it writes no event lines, and logs its
+  own diagnostics to standard error only when `RUST_LOG` is set. See
+  [Daemon logs and events](07-running-and-monitoring.md#daemon-logs-and-events).
 
 ### Quiet
 

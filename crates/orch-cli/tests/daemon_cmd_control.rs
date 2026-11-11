@@ -1,4 +1,4 @@
-//! PR 1 daemon verbs are opt-in. Every child has explicit isolated routing;
+//! `orch daemon *` verbs need no opt-in env. Every child has explicit isolated routing;
 //! none of the client error fixtures starts a daemon or inherits an agent CLI.
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -37,11 +37,10 @@ fn stderr(out: &Output) -> String {
 }
 
 #[test]
-fn every_daemon_verb_refuses_without_developmental_gate() {
-    let root = tempfile::tempdir().unwrap();
+fn daemon_verbs_need_no_opt_in_env_and_never_mention_the_removed_gate() {
+    let root = project();
     let sock = short_dir();
     for verb in [
-        vec!["start"],
         vec!["status"],
         vec!["stop"],
         vec!["dispatch", "on"],
@@ -49,14 +48,48 @@ fn every_daemon_verb_refuses_without_developmental_gate() {
     ] {
         let out = orch(root.path(), &sock.path().join("s"), sock.path())
             .arg("daemon")
-            .args(verb)
+            .args(&verb)
             .output()
             .unwrap();
-        assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+        let err = stderr(&out);
+        // The verb runs and reaches the client path: a client verb with no
+        // daemon reports the uniform no-daemon failure, never a gate refusal.
+        assert!(err.contains("No orch daemon is running"), "{verb:?}: {err}");
         assert!(
-            stderr(&out).contains("developmental in this build; set ORCH_DAEMON_DEVELOPMENTAL=1")
+            !err.to_lowercase().contains("developmental"),
+            "{verb:?}: {err}"
         );
-        assert!(!root.path().join(".orchestry").exists());
+        assert!(
+            !err.contains("ORCH_DAEMON_DEVELOPMENTAL"),
+            "{verb:?}: {err}"
+        );
+        assert!(!root.path().join(".orchestry/daemon.json").exists());
+    }
+}
+
+#[test]
+fn daemon_help_never_mentions_the_removed_gate() {
+    let root = tempfile::tempdir().unwrap();
+    let sock = short_dir();
+    for args in [
+        vec!["--help"],
+        vec!["daemon", "--help"],
+        vec!["daemon", "start", "--help"],
+    ] {
+        let out = orch(root.path(), &sock.path().join("s"), sock.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), stderr(&out));
+        assert!(
+            !text.contains("ORCH_DAEMON_DEVELOPMENTAL"),
+            "{args:?}: {text}"
+        );
+        assert!(
+            !text.to_lowercase().contains("developmental"),
+            "{args:?}: {text}"
+        );
     }
 }
 
@@ -66,7 +99,6 @@ fn explicit_start_refuses_agent_context_before_project_or_socket_work() {
     let sock = short_dir();
     for identity in ["ORCH_TASK_ID", "ORCH_AGENT_ID"] {
         let out = orch(root.path(), &sock.path().join("s"), sock.path())
-            .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
             .env(identity, "test-id")
             .args(["daemon", "start"])
             .output()
@@ -97,7 +129,6 @@ fn absent_stale_file_and_refused_socket_share_nodaemon_exit_and_text() {
         }
         for verb in ["status", "stop"] {
             let out = orch(root.path(), &socket, short.path())
-                .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
                 .args(["daemon", verb])
                 .output()
                 .unwrap();
@@ -127,7 +158,6 @@ fn agent_nodaemon_text_instructs_report_and_stop() {
     let root = project();
     let short = short_dir();
     let out = orch(root.path(), &short.path().join("s"), short.path())
-        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
         .env("ORCH_TASK_ID", "test-task")
         .args(["daemon", "status"])
         .output()
@@ -169,7 +199,6 @@ async fn status_dispatch_and_stop_use_the_explicit_harness_socket() {
     let socket = daemon.socket().unwrap();
     let parent = socket.parent().unwrap();
     let out = orch(root, socket, parent)
-        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
         .args(["--json", "daemon", "status"])
         .output()
         .unwrap();
@@ -178,7 +207,6 @@ async fn status_dispatch_and_stop_use_the_explicit_harness_socket() {
         serde_json::from_slice(&out.stdout).unwrap();
     assert!(!status.dispatch.dispatch_on);
     let out = orch(root, socket, parent)
-        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
         .args(["daemon", "status"])
         .output()
         .unwrap();
@@ -196,7 +224,6 @@ async fn status_dispatch_and_stop_use_the_explicit_harness_socket() {
     // agent launch. Both switches are covered with a private fake transport
     // in orch-client/tests/transport.rs.
     let out = orch(root, socket, parent)
-        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
         .args(["--json", "daemon", "dispatch", "off"])
         .output()
         .unwrap();
@@ -206,7 +233,6 @@ async fn status_dispatch_and_stop_use_the_explicit_harness_socket() {
     assert!(!state.dispatch_on);
 
     let out = orch(root, socket, parent)
-        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
         .args(["daemon", "stop"])
         .output()
         .unwrap();
@@ -227,7 +253,6 @@ async fn protocol_skew_names_both_versions_and_frozen_stop_still_works() {
     let socket = daemon.socket().unwrap();
     let parent = socket.parent().unwrap();
     let out = orch(root, socket, parent)
-        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
         .args(["daemon", "status"])
         .output()
         .unwrap();
@@ -243,7 +268,6 @@ async fn protocol_skew_names_both_versions_and_frozen_stop_still_works() {
     };
     assert_eq!(stderr(&out), format!("{}\n", expected.render(false)));
     let out = orch(root, socket, parent)
-        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
         .args(["daemon", "stop"])
         .output()
         .unwrap();
@@ -262,10 +286,7 @@ fn init_and_rerun_print_start_hint_without_creating_runtime_files() {
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", stderr(&out));
-        assert!(
-            String::from_utf8_lossy(&out.stdout)
-                .contains("Start the daemon explicitly with: orch daemon start")
-        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("Next: orch daemon start"));
         assert!(!socket.exists());
         assert!(!root.path().join(".orchestry/daemon.json").exists());
         assert!(!root.path().join(".orchestry/orchestry.lock").exists());
@@ -282,7 +303,7 @@ impl Drop for ForegroundDaemon {
 }
 
 #[test]
-fn explicit_foreground_start_has_one_banner_and_sanitized_environment() {
+fn explicit_foreground_start_prints_no_banner_and_sanitizes_the_environment() {
     use std::io::BufRead;
     use std::time::Duration;
 
@@ -292,7 +313,6 @@ fn explicit_foreground_start_has_one_banner_and_sanitized_environment() {
     let errors = short.path().join("stderr");
     let mut daemon = ForegroundDaemon(
         orch(root.path(), &socket, short.path())
-            .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
             .env("DEBUG", "private-debug-value")
             .args(["daemon", "start", "--peer-name", "test-owner"])
             .stdout(std::process::Stdio::piped())
@@ -319,7 +339,6 @@ fn explicit_foreground_start_has_one_banner_and_sanitized_environment() {
         format!("listening {}", socket.display())
     );
     let out = orch(root.path(), &socket, short.path())
-        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
         .args(["--json", "daemon", "status"])
         .output()
         .unwrap();
@@ -329,7 +348,6 @@ fn explicit_foreground_start_has_one_banner_and_sanitized_environment() {
     assert!(!status.dispatch.dispatch_on);
     assert!(status.removed_env.iter().any(|name| name == "DEBUG"));
     let out = orch(root.path(), &socket, short.path())
-        .env("ORCH_DAEMON_DEVELOPMENTAL", "1")
         .args(["daemon", "stop"])
         .output()
         .unwrap();
@@ -337,8 +355,7 @@ fn explicit_foreground_start_has_one_banner_and_sanitized_environment() {
     assert!(daemon.0.wait().unwrap().success());
     reader.join().unwrap();
     let errors = fs::read_to_string(errors).unwrap();
-    assert_eq!(errors.lines().count(), 1, "{errors}");
-    assert_eq!(errors.trim(), orch_daemon::lifecycle::DEVELOPMENTAL_BANNER);
+    assert!(!errors.to_lowercase().contains("developmental"), "{errors}");
     assert!(!errors.contains("private-debug-value"));
     assert!(!socket.exists());
     assert!(!root.path().join(".orchestry/daemon.json").exists());
