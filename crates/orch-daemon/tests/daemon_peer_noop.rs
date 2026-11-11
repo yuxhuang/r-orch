@@ -349,14 +349,27 @@ async fn read_only_and_conditionally_write_free_bursts_stay_silent_then_real_and
     assert!(event["ev"].get("resync").is_none(), "{event}");
     assert_eq!(event["ev"]["commit_seq"], seq + 1);
     // The entity write succeeds; replacing a directory with the index fails.
-    // This exercises actual storage failure rather than manufacturing a note.
+    // Bound the damaged-index window under the permit so a tick cannot race
+    // the fixture setup/cleanup. Release it while the frame runs.
+    let boundary = daemon.engine().operation_boundary();
     let index = daemon.engine().paths.messages_dir().join("_index.json");
-    std::fs::remove_file(&index).unwrap();
-    std::fs::create_dir(&index).unwrap();
-    let seq = daemon.engine().operation_boundary().current_commit_seq();
+    let seq = boundary
+        .run(false, async {
+            std::fs::remove_file(&index).unwrap();
+            std::fs::create_dir(&index).unwrap();
+            boundary.current_commit_seq()
+        })
+        .await
+        .value;
     peer.send(&message("partial_mutation", "cli")).await;
     fence(&mut peer).await;
-    std::fs::remove_dir(&index).unwrap();
+    let end = boundary
+        .run(false, async {
+            std::fs::remove_dir(&index).unwrap();
+            boundary.current_commit_seq()
+        })
+        .await
+        .value;
     assert!(
         daemon
             .engine()
@@ -367,11 +380,110 @@ async fn read_only_and_conditionally_write_free_bursts_stay_silent_then_real_and
             .is_some(),
         "entity persisted before index failure"
     );
-    let event = observer.recv().await.unwrap();
-    assert_eq!(event["ev"]["store"], "messages", "{event}");
-    assert_eq!(event["ev"]["id"], "partial_mutation", "{event}");
-    assert!(event["ev"].get("resync").is_none(), "{event}");
-    assert_eq!(event["ev"]["commit_seq"], seq + 1);
+    // Each failed session-tick purge can publish exactly one store-wide
+    // Messages update. Require every ordinal in the window and exactly one
+    // entity change: nothing unrelated, missing, duplicated or resynchronised.
+    assert!(end > seq, "partial persistence must publish");
+    let mut partial_writes = 0;
+    for ordinal in seq + 1..=end {
+        let event = observer.recv().await.unwrap();
+        let ev = &event["ev"];
+        assert_eq!(ev["store"], "messages", "{event}");
+        assert!(ev.get("resync").is_none(), "{event}");
+        assert_eq!(ev["commit_seq"], ordinal, "{event}");
+        if ev.get("id").is_some() {
+            assert_eq!(ev["id"], "partial_mutation", "{event}");
+            assert_eq!(ev["kind"], "created", "{event}");
+            partial_writes += 1;
+        } else {
+            assert_eq!(ev["kind"], "updated", "{event}");
+        }
+    }
+    assert_eq!(
+        partial_writes, 1,
+        "one partial entity write, plus failed purges"
+    );
+    drop((peer, observer, control));
+    daemon.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn worker_reads_announce_task_index_repairs_but_healthy_reads_stay_silent() {
+    let (daemon, mut peer) = fixture().await;
+    let mut task = daemon
+        .engine()
+        .task_service
+        .create(CreateTaskInput {
+            title: "terminal mirror".into(),
+            labels: Some(vec![
+                "remote-ctl:controller".into(),
+                "exec:existing".into(),
+                "remote-finished-ack".into(),
+            ]),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    task.status = TaskStatus::Cancelled;
+    daemon.engine().tasks.save(&task).await.unwrap();
+    let mut observer = subscribe(&daemon).await;
+    let mut control = Raw::session(&daemon, "cli", "normal").await;
+    let frames = [
+        Frame::Attach {
+            exec_key: "existing".into(),
+            after_seq: 0,
+        },
+        Frame::Sync {
+            active: vec!["existing".into()],
+        },
+        Frame::Cancel {
+            exec_key: "absent".into(),
+        },
+        Frame::FinishedAck {
+            exec_key: "existing".into(),
+        },
+        Frame::Submit {
+            exec_key: "existing".into(),
+            agent_id: "absent".into(),
+            from: "lead".into(),
+            prompt: "prompt".into(),
+            title: "title".into(),
+            priority: 2,
+            review_criteria: vec![],
+            goal_id: None,
+        },
+    ];
+    let index = daemon.engine().paths.tasks_dir().join("_index.json");
+    let boundary = daemon.engine().operation_boundary();
+    for frame in frames {
+        silent_burst(&daemon, &mut peer, &mut observer, &mut control, &frame).await;
+        for damage in [None, Some(b"corrupt".as_slice()), Some(b"{}".as_slice())] {
+            let seq = boundary
+                .run(false, async {
+                    if let Some(bytes) = damage {
+                        std::fs::write(&index, bytes).unwrap();
+                    } else {
+                        std::fs::remove_file(&index).unwrap();
+                    }
+                    boundary.current_commit_seq()
+                })
+                .await
+                .value;
+            peer.send(&frame).await;
+            fence(&mut peer).await;
+            let restored: Vec<orch_domain::Task> =
+                serde_json::from_slice(&std::fs::read(&index).unwrap()).unwrap();
+            assert_eq!(restored, vec![task.clone()], "{frame:?}");
+            assert_eq!(boundary.current_commit_seq(), seq + 1, "repair {frame:?}");
+            let event = observer.recv().await.unwrap();
+            assert_eq!(event["ev"]["store"], "tasks", "{event}");
+            assert_eq!(event["ev"]["kind"], "updated", "{event}");
+            assert!(event["ev"].get("id").is_none(), "{event}");
+            assert!(event["ev"].get("resync").is_none(), "{event}");
+            assert_eq!(event["ev"]["commit_seq"], seq + 1, "{event}");
+            silent_burst(&daemon, &mut peer, &mut observer, &mut control, &frame).await;
+        }
+    }
     drop((peer, observer, control));
     daemon.shutdown().await.unwrap();
 }

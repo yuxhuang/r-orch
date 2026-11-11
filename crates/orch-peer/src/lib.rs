@@ -889,6 +889,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_raw_rejection_still_declares_messages() {
+        use orch_engine::container::commit::CommitChange;
+        let (_temp, ctx) = metadata_context().await;
+        let message = queued_message("partial_rejection");
+        ctx.engine.messages.save(&message).await.unwrap();
+        let index = ctx.engine.paths.messages_dir().join("_index.json");
+        std::fs::remove_file(&index).unwrap();
+        std::fs::create_dir(&index).unwrap();
+        let records = capture_commits(&ctx.engine.events);
+        let boundary = ctx.engine.operation_boundary();
+        let seq = boundary.current_commit_seq();
+        ctx.msg_ack("controller", &message.id, Some("no recipient"))
+            .await
+            .unwrap();
+        assert!(index.is_dir(), "index update really failed");
+        let rejected = ctx.engine.messages.get(&message.id).await.unwrap().unwrap();
+        assert_eq!(rejected.status, MessageStatus::Delivered);
+        assert!(rejected.subject.starts_with("[rejected] "));
+        assert!(rejected.body.starts_with("[rejected by controller: "));
+        assert_eq!(boundary.current_commit_seq(), seq + 1);
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, CommitSource::Peer);
+        assert!(!records[0].store_set_uncertain);
+        assert_eq!(
+            records[0].changes,
+            vec![CommitChange::store_wide(CommitStore::Messages)]
+        );
+    }
+
+    #[tokio::test]
     async fn real_expiry_sweep_invalidates_once_and_zero_sweep_is_silent() {
         let (_temp, ctx) = metadata_context().await;
         let mut message = queued_message("msg_expired");

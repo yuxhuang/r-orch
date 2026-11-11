@@ -1275,3 +1275,93 @@ async fn attach_replays_events_without_a_commit() {
     assert_eq!(boundary.current_commit_seq(), seq);
     assert!(commits.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn failed_agents_write_still_declares_remote() {
+    use orch_engine::container::commit::{CommitChange, CommitSource, CommitStore};
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_temp, worker, _agent) = fixture().await;
+    let inbound = InboundStatus {
+        controller_name: "C1".into(),
+        instance_id: "controller".into(),
+        connected_since: worker.ctx.engine.clock.now_iso(),
+        agents: vec![],
+        controller_version: None,
+    };
+    worker.ctx.store.write_inbound(&inbound).await.unwrap();
+    let dir = worker.ctx.engine.paths.remotes_dir();
+    let permissions = std::fs::metadata(&dir).unwrap().permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let commits = frame_commits(&worker);
+    let boundary = worker.ctx.engine.operation_boundary();
+    let seq = boundary.current_commit_seq();
+    let result = worker
+        .handle_ordered("controller", "C1", Frame::Agents { agents: vec![] })
+        .await;
+    // Restore before assertions so fixture cleanup also works on failure.
+    std::fs::set_permissions(&dir, permissions).unwrap();
+    result.unwrap(); // Storage faults are reported, not fatal to the session.
+    assert_eq!(
+        worker.ctx.store.read_inbound().await.unwrap(),
+        Some(inbound)
+    );
+    assert!(
+        worker
+            .faults()
+            .reported
+            .contains_key("record inbound agents")
+    );
+    assert_eq!(boundary.current_commit_seq(), seq + 1);
+    let commits = commits.lock().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].source, CommitSource::Peer);
+    assert!(!commits[0].store_set_uncertain);
+    assert_eq!(
+        commits[0].changes,
+        vec![CommitChange::store_wide(CommitStore::Remote)]
+    );
+}
+
+#[tokio::test]
+async fn failed_task_index_repair_is_declared() {
+    use orch_engine::container::commit::{CommitChange, CommitSource, CommitStore};
+    let (_temp, worker, agent) = fixture().await;
+    worker
+        .handle_ordered("controller", "C1", submit("existing", &agent))
+        .await
+        .unwrap();
+    let index = worker.ctx.engine.paths.tasks_dir().join("_index.json");
+    std::fs::remove_file(&index).unwrap();
+    std::fs::create_dir(&index).unwrap();
+    let commits = frame_commits(&worker);
+    let boundary = worker.ctx.engine.operation_boundary();
+    let seq = boundary.current_commit_seq();
+    worker
+        .handle_ordered(
+            "controller",
+            "C1",
+            Frame::Attach {
+                exec_key: "existing".into(),
+                after_seq: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(index.is_dir(), "repair really failed");
+    assert!(
+        worker
+            .faults()
+            .reported
+            .contains_key("read mirrors for attach")
+    );
+    assert_eq!(boundary.current_commit_seq(), seq + 1);
+    let commits = commits.lock().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].source, CommitSource::Peer);
+    assert!(!commits[0].store_set_uncertain);
+    assert_eq!(
+        commits[0].changes,
+        vec![CommitChange::store_wide(CommitStore::Tasks)]
+    );
+}
