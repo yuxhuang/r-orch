@@ -44,16 +44,7 @@ use crate::agent_service::AgentService;
 use crate::events::EventBus;
 use crate::task_service::TaskService;
 
-/// The fields `goal update` can change.
-///
-/// `None` means "not supplied", so only the fields the user named are touched.
-/// For `assignee`, `Some("")` **clears** the assignee.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct UpdateGoalFields {
-    pub title: Option<String>,
-    pub description: Option<String>,
-    pub assignee: Option<String>,
-}
+pub use orch_domain::goal::UpdateGoalFields;
 
 /// Goal lifecycle, the achieved guard, and autonomous-mode side effects.
 pub struct GoalService {
