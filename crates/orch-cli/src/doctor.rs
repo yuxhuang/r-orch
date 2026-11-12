@@ -30,15 +30,14 @@ impl<'a> From<&'a DoctorReport> for DoctorJson<'a> {
     }
 }
 
-/// How the project line is rendered, which depends on both the project state
-/// and whether a container was built.
+/// Project facts returned by the connected daemon, or a rendering-only marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectLine {
-    /// `exists · N agents · M tasks` — initialized **and** a container.
+    /// `exists · N agents · M tasks` from a connected daemon.
     Initialized { agents: usize, tasks: usize },
     /// `not found — run: orch init`.
     Missing,
-    /// Initialized but no container: the line is omitted entirely.
+    /// The report has no project line.
     Omitted,
 }
 

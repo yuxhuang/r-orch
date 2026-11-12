@@ -1,15 +1,7 @@
-//! The clap command tree, output rendering and the single error boundary.
-//!
-//! WP-0b wired the walking-skeleton slice — `init`, `agent add`, `task add`,
-//! `task list` — end to end. WP-5 extends the tree in place: [`tree`] now
-//! carries all seventeen commands, and [`routing`] holds the three routing
-//! properties (container-before-parse, the help fast path, the usage exit
-//! codes).
-//!
-//! Commands whose behaviour needs WP-4's services land with those services;
-//! until then they parse (so the surface check is honest) and report that
-//! they are not wired rather than pretending to work. [`not_wired`] is the one
-//! place that happens, and `crates/orch-cli/TEST-MAP.md` lists them.
+//! The command-line frontend: parse requests, connect to the project daemon,
+//! and render its replies. Explicit daemon lifecycle commands and offline
+//! initialization use the narrow daemon facade; ordinary commands are clients.
+//! Routing preserves the project guard, root help fast path and usage errors.
 
 // Stricter than the workspace lints, for library code only (integration tests are separate crates and
 // `clippy.toml` allows unwrap inside `#[cfg(test)]`). This crate renders to the terminal, so printing is
@@ -98,7 +90,7 @@ pub fn run() -> ExitCode {
         };
     }
 
-    // The container is built **before** parsing, so an uninitialized project
+    // Project discovery runs **before** parsing, so an uninitialized project
     // beats a usage error, an unknown command and `--help` on a subcommand.
     if shape.requires_initialized_project() {
         let styles = Styles {
@@ -514,7 +506,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
                     Some(ConfigGlobalSub::Show) => {
                         commands::config::global_show(&engine, &ctx, &styles).await?;
                     }
-                    // Handled above, before the container is built.
+                    // Handled above, before connecting to the daemon.
                     None => unreachable!("the empty group prints help"),
                 },
             }
@@ -881,7 +873,7 @@ fn version() -> &'static str {
 /// 1. **stderr, never stdout.** Stdout is the contract: it is compared
 ///    byte for byte and `--json` output has to stay parseable, so a diagnostic there would corrupt both.
 /// 2. Clients are silent by default. Daemon starts enable only the exact
-///    `orch_infra::process::spawn` target at WARN.
+///    process-spawn tracing target at WARN.
 /// 3. `RUST_LOG` takes an `EnvFilter` for anyone who knows what they want;
 ///    `ORCHESTRY_DEBUG` — which already exists, as the flag that prints an
 ///    error's cause chain — turns on `debug` without one.
