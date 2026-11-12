@@ -39,6 +39,7 @@
 mod collect;
 mod daemon;
 mod dispatch;
+mod preparation_cleanup;
 mod recovery;
 mod remote;
 mod tick;
@@ -242,6 +243,10 @@ struct Inner {
     daemon_mode: AtomicBool,
     daemon_batch_active: AtomicBool,
     preparing_agents: Mutex<HashMap<String, (u64, String)>>,
+    /// Failed releases retain their generation and reservation until both run
+    /// finalization and the claim removal are durable. Restart uses the
+    /// existing claimed/preparing-run sweep instead of a persisted ledger.
+    pending_preparation_cleanup: Mutex<HashMap<String, u64>>,
     preparation_seq: std::sync::atomic::AtomicU64,
     spawn_admission: std::sync::RwLock<Arc<dyn orch_core::process::SpawnAdmission>>,
     deferred_kills: Mutex<Vec<(String, orch_domain::RunningEntry, String)>>,
@@ -333,6 +338,7 @@ impl Orchestrator {
                 daemon_mode: AtomicBool::new(false),
                 daemon_batch_active: AtomicBool::new(false),
                 preparing_agents: Mutex::new(HashMap::new()),
+                pending_preparation_cleanup: Mutex::new(HashMap::new()),
                 preparation_seq: std::sync::atomic::AtomicU64::new(0),
                 spawn_admission: std::sync::RwLock::new(Arc::new(
                     orch_core::process::NoopSpawnAdmission,

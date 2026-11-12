@@ -930,7 +930,7 @@ impl Orchestrator {
 
     /// Whether this generation still owns the task's preparation. A
     /// generation is never reissued, so once false it stays false.
-    async fn owns_preparation(&self, task_id: &str, generation: u64) -> bool {
+    pub(super) async fn owns_preparation(&self, task_id: &str, generation: u64) -> bool {
         self.inner
             .preparing_agents
             .lock()
@@ -952,22 +952,45 @@ impl Orchestrator {
                 if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
                     return Ok(());
                 }
+                self.inner
+                    .pending_preparation_cleanup
+                    .lock()
+                    .await
+                    .insert(task_id.to_owned(), generation);
                 let mut slot = self.inner.state.lock().await;
+                // The previous release reached its final state write. Leave
+                // that failed write for the next operation, as the recorder's
+                // dirty-state contract requires, instead of flushing it from
+                // the launch's immediate error-path release.
+                if self.inner.remote_state_dirty.load(Ordering::SeqCst)
+                    && slot
+                        .as_ref()
+                        .is_some_and(|state| !state.claimed.contains(task_id))
+                {
+                    return Err(Error::other("Preparation cleanup awaits state persistence"));
+                }
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
-                self.release_preparation_locked(state, task_id).await?;
-                self.save_state(state).await
+                self.release_preparation_locked(state, task_id, generation)
+                    .await
             })
             .await
             .value
     }
 
-    /// Cancel the preparing runs and drop the claim; the caller saves state.
-    async fn release_preparation_locked(
+    /// Retain the reservation until run finalization and claim removal are
+    /// durable. Every caller holds the project boundary and the state lock.
+    pub(super) async fn release_preparation_locked(
         &self,
         state: &mut OrchestratorState,
         task_id: &str,
+        generation: u64,
     ) -> Result<()> {
+        self.inner
+            .pending_preparation_cleanup
+            .lock()
+            .await
+            .insert(task_id.to_owned(), generation);
         for run in self.deps().run_store.list_for_task(task_id).await? {
             if run.status == RunStatus::Preparing {
                 self.deps()
@@ -977,8 +1000,16 @@ impl Orchestrator {
             }
         }
         state.claimed.shift_remove(task_id);
+        // A failed write must not reload the old claim or lose a recorder's
+        // queued retry. The preparation still reserves the task and agent.
+        self.save_remote_state(state).await?;
         self.inner.preparing_agents.lock().await.remove(task_id);
         self.drop_cancel(task_id).await;
+        self.inner
+            .pending_preparation_cleanup
+            .lock()
+            .await
+            .remove(task_id);
         Ok(())
     }
 
@@ -1015,8 +1046,8 @@ impl Orchestrator {
                     // rather than replace it, or the retry runs with no wait.
                     self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
                 }
-                self.release_preparation_locked(state, task_id).await?;
-                self.save_state(state).await?;
+                self.release_preparation_locked(state, task_id, generation)
+                    .await?;
                 Ok(PreparationFailureOutcome::Failed)
             })
             .await

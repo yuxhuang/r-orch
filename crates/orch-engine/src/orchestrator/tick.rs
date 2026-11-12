@@ -83,6 +83,7 @@ impl Orchestrator {
     /// Check PID liveness, detect stalls, fix stale agents and orphaned tasks,
     /// and dispatch anything whose retry has come due.
     pub(super) async fn reconcile(&self, state: &mut OrchestratorState) -> Result<()> {
+        self.reconcile_preparation_cleanup(state).await;
         let now = self.deps().clock.now_ms();
         let entries: Vec<(String, RunningEntry)> = state
             .running
