@@ -207,8 +207,8 @@ async fn stream<A: Op>(
     }
 }
 
-/// Local executable/dependency checks remain available before owner startup;
-/// project checks run only inside the daemon.
+/// Checks run only inside the daemon; an unavailable daemon permits only
+/// discovery facts before returning the original client error.
 pub async fn doctor(
     cli: &crate::tree::Cli,
     styles: &Styles,
@@ -217,15 +217,7 @@ pub async fn doctor(
     let client = match Rpc::connect(cli, cwd).await {
         Ok(client) => client,
         Err(error) => {
-            crate::doctor::run(styles, cwd, cli.output(), None).await?;
-            if super::rpc::recover_client_error(&error).is_some_and(|e| {
-                matches!(
-                    e,
-                    orch_client::ClientError::Connection(orch_client::NoDaemon::NotInitialized)
-                )
-            }) {
-                return Ok(ExitCode::SUCCESS);
-            }
+            crate::doctor::discovery_only(styles, cwd).await;
             return Err(error);
         }
     };
