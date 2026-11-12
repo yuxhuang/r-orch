@@ -494,15 +494,15 @@ fn valid_dimension(value: u32) -> Option<u16> {
 
 pub fn router(state: Arc<WebState>) -> Router {
     // Credentials are decided by the router: only these two routes are layered.
+    let page = get(|| async { Html(include_str!("assets/index.html")) })
+        .layer(middleware::from_fn_with_state(state.clone(), daemon_guard));
+    let websocket = get(ws_handler)
+        .layer(middleware::from_fn_with_state(state.clone(), daemon_guard))
+        // Origin rejection must not depend on the daemon being available.
+        .layer(middleware::from_fn(ws_origin_guard));
     let authed = Router::new()
-        .route(
-            "/",
-            get(|| async { Html(include_str!("assets/index.html")) }),
-        )
-        .route("/ws", get(ws_handler))
-        // Innermost: only a request that passed the credential check (or an
-        // open server) reaches the daemon preflight.
-        .route_layer(middleware::from_fn_with_state(state.clone(), daemon_guard))
+        .route("/", page)
+        .route("/ws", websocket)
         .route_layer(middleware::from_fn_with_state(state.clone(), auth));
     // Compiled in and immutable; they carry no secret.
     let assets = Router::new()
@@ -759,18 +759,26 @@ fn initial_size(query: Option<&str>) -> PtySize {
     }
 }
 
+/// Websocket-only policy, after Host/auth and before the daemon preflight.
+async fn ws_origin_guard(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let origin = header_str(request.headers(), header::ORIGIN);
+    if !origin_allowed(origin, header_str(request.headers(), header::HOST)) {
+        eprintln!("orch web: rejected {peer}: cross-origin websocket from {origin:?}");
+        return reply(StatusCode::FORBIDDEN, "cross-origin websocket rejected\n");
+    }
+    next.run(request).await
+}
+
 async fn ws_handler(
     State(state): State<Arc<WebState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     RawQuery(query): RawQuery,
-    headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let origin = header_str(&headers, header::ORIGIN);
-    if !origin_allowed(origin, header_str(&headers, header::HOST)) {
-        eprintln!("orch web: rejected {peer}: cross-origin websocket from {origin:?}");
-        return reply(StatusCode::FORBIDDEN, "cross-origin websocket rejected\n");
-    }
     let Some(slot) = SessionSlot::acquire(&state.slots, MAX_SESSIONS) else {
         eprintln!("orch web: rejected {peer}: {MAX_SESSIONS} sessions already open");
         return reply(StatusCode::SERVICE_UNAVAILABLE, "too many sessions\n");
