@@ -2256,6 +2256,21 @@ mod tests {
                 );
             }
         }
+        // Inactive optional declarations still grant a production capability;
+        // the edge check must not rely on an owner's active default closure.
+        for kind in ["normal", "build"] {
+            let mut metadata = feature_fixture(
+                kind,
+                true,
+                serde_json::json!({"default":["testing"], "testing":[]}),
+            );
+            metadata["packages"][0]["dependencies"][0]["optional"] = serde_json::json!(true);
+            assert!(
+                promoted_test_features(&metadata)
+                    .join("\n")
+                    .contains("orch-daemon/testing")
+            );
+        }
         assert!(
             promoted_test_features(&feature_fixture(
                 "dev",
