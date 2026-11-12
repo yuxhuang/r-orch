@@ -1287,3 +1287,44 @@ async fn events_carry_the_instance_of_the_daemon_that_pushed_them() {
     first.shutdown().await.unwrap();
     second.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_ticks_push_only_the_tick_bus_event() {
+    let daemon = harness().await;
+    let mut control = Wire::open(&daemon, "cli").await;
+    let mut observer = Wire::open(&daemon, "mcp").await;
+    observer
+        .subscribe(json!({"stores": ["state", "context"], "bus": true}))
+        .await;
+    let before = daemon.engine().operation_boundary().current_commit_seq();
+    for _ in 0..2 {
+        control.ok("dispatch.tick", json!({})).await;
+    }
+    assert_eq!(
+        daemon.engine().operation_boundary().current_commit_seq(),
+        before
+    );
+    let (_, marker) = control
+        .commit(
+            "context.set",
+            json!({"key": "after-ticks", "value": "done"}),
+        )
+        .await;
+    let mut ticks = 0;
+    loop {
+        let event = observer.event().await;
+        assert!(event.get("resync").is_none(), "{event}");
+        assert_ne!(
+            event["store"], "state",
+            "clean tick announced State: {event}"
+        );
+        if event["store"] == "context" {
+            assert_eq!(event["commit_seq"], marker);
+            break;
+        }
+        assert!(event.get("bus").is_some(), "{event}");
+        ticks += 1;
+    }
+    assert_eq!(ticks, 2);
+    daemon.shutdown().await.unwrap();
+}

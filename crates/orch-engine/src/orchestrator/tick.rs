@@ -338,7 +338,7 @@ impl Orchestrator {
             self.process_retry_queue(state).await?;
         }
         self.prune_remote_clocks(state).await;
-        self.save_state(state).await
+        self.save_reconciled_state(state).await
     }
 
     /// Agents stuck in `running` with no running entry — the mirror image of

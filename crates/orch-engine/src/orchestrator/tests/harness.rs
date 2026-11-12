@@ -233,6 +233,11 @@ pub(crate) struct HarnessBuilder {
         reason = "test-only store wrappers; each signature is spelled out where it is used"
     )]
     wrap_runs: Option<Box<dyn FnOnce(Arc<FakeRunStore>) -> Arc<dyn RunStore>>>,
+    #[allow(
+        clippy::type_complexity,
+        reason = "test-only store wrapper, matching the other store seams"
+    )]
+    wrap_state: Option<Box<dyn FnOnce(Arc<FakeStateStore>) -> Arc<dyn StateStore>>>,
     workspace_impl: Option<Arc<dyn orch_core::workspace::WorkspaceManager>>,
 }
 
@@ -264,6 +269,7 @@ impl HarnessBuilder {
             wrap_tasks: None,
             wrap_agents: None,
             wrap_runs: None,
+            wrap_state: None,
             workspace_impl: None,
         }
     }
@@ -294,6 +300,14 @@ impl HarnessBuilder {
         wrap: impl FnOnce(Arc<FakeRunStore>) -> Arc<dyn RunStore> + 'static,
     ) -> Self {
         self.wrap_runs = Some(Box::new(wrap));
+        self
+    }
+
+    pub(crate) fn wrap_state_store(
+        mut self,
+        wrap: impl FnOnce(Arc<FakeStateStore>) -> Arc<dyn StateStore> + 'static,
+    ) -> Self {
+        self.wrap_state = Some(Box::new(wrap));
         self
     }
 
@@ -479,11 +493,15 @@ impl HarnessBuilder {
                 .push(event.clone())
         });
 
+        let state_store = self.wrap_state.map_or_else(
+            || state.clone() as Arc<dyn StateStore>,
+            |wrap| wrap(state.clone()),
+        );
         let deps = OrchestratorDeps {
             task_store: Arc::clone(&task_store),
             agent_store: Arc::clone(&agent_store),
             run_store,
-            state_store: Arc::clone(&state) as Arc<dyn StateStore>,
+            state_store,
             adapters: Arc::new(registry),
             workspace: self.workspace_impl.unwrap_or_else(|| {
                 Arc::clone(&workspace) as Arc<dyn orch_core::workspace::WorkspaceManager>
