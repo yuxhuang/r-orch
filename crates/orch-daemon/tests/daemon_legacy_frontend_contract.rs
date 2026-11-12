@@ -146,14 +146,14 @@ async fn dispatch_off_interrupts_the_wait_with_a_pending_task() {
 }
 
 #[tokio::test]
-async fn a_shutdown_after_everything_is_terminal_preserves_all_done() {
+async fn a_finished_all_done_reply_is_not_retracted_by_later_shutdown() {
     let (daemon, reply) = terminal_batch(&[TaskStatus::Done]).await;
     daemon.shutdown().await.unwrap();
     assert_eq!(ok(&reply), "all_done");
 }
 
 #[tokio::test]
-async fn a_failure_with_a_late_shutdown_preserves_has_failed() {
+async fn a_finished_has_failed_reply_is_not_retracted_by_later_shutdown() {
     let (daemon, reply) = terminal_batch(&[TaskStatus::Failed]).await;
     daemon.shutdown().await.unwrap();
     assert_eq!(ok(&reply), "has_failed");
@@ -405,63 +405,4 @@ async fn explicit_shutdown_closes_the_listener_and_unpublishes_its_status() {
             .exists()
     );
     assert!(tokio::net::TcpStream::connect(addr).await.is_err());
-}
-
-mod interrupted_reads {
-    /// A signal landing on the reading thread interrupts a timed read with
-    /// EINTR before any byte could arrive, which says nothing about whether a
-    /// Hello was answered. Retry until the deadline so only a real answer or
-    /// a timeout is reported.
-    fn read_retrying_interrupts(
-        window: std::time::Duration,
-        mut read: impl FnMut(std::time::Duration) -> std::io::Result<usize>,
-    ) -> std::io::Result<usize> {
-        let deadline = std::time::Instant::now() + window;
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                return Err(std::io::ErrorKind::TimedOut.into());
-            }
-            match read(remaining) {
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                other => return other,
-            }
-        }
-    }
-
-    #[test]
-    fn an_interrupted_read_is_retried_until_the_deadline_answer() {
-        let mut calls = 0;
-        let result = read_retrying_interrupts(std::time::Duration::from_secs(5), |_| {
-            calls += 1;
-            if calls < 3 {
-                Err(std::io::ErrorKind::Interrupted.into())
-            } else {
-                Ok(7)
-            }
-        });
-        assert_eq!((result.unwrap(), calls), (7, 3));
-    }
-
-    #[test]
-    fn a_read_interrupted_past_the_deadline_reports_a_timeout() {
-        let result = read_retrying_interrupts(std::time::Duration::from_millis(20), |_| {
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            Err(std::io::ErrorKind::Interrupted.into())
-        });
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
-    }
-
-    #[test]
-    fn a_non_interrupt_read_error_is_returned_unretried() {
-        let mut calls = 0;
-        let result = read_retrying_interrupts(std::time::Duration::from_secs(5), |_| {
-            calls += 1;
-            Err(std::io::ErrorKind::ConnectionReset.into())
-        });
-        assert_eq!(
-            (result.unwrap_err().kind(), calls),
-            (std::io::ErrorKind::ConnectionReset, 1)
-        );
-    }
 }
