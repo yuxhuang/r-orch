@@ -163,7 +163,7 @@ The PR 1 pointers below were checked against frozen `b1216ce452876f84f8c75270cb3
 | W7 | No web/TUI SQL console. | item 16 | won't | No SQL backend or console requested. |
 | W8 | No idle exit, watchdog or automatic process replacement after crash/skew. | item 7, 13 | won't | Owner controls daemon lifetime; failure is observable until explicit action. |
 | W9 | No release, tag, package-version bump or unapproved PR merge. | item 23 | won't | Separate owner-controlled release; this goal supplies stacked PRs only. |
-| W10 | No direct-store fallback, offline state read lane or socket cleanup in clients. | item 2, 3, 15 | won't | Would recreate multiple writers and hide failed ownership; R3/R4 enforce absence. |
+| W10 | No direct-store fallback, offline state read lane or socket cleanup in clients. | item 2, 3, 15 | won't | Would recreate multiple writers and hide failed ownership; R3/R4 require absence; the automatic check and its limits are in ADR 0012, decision 16. |
 
 ## Non-goals
 

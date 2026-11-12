@@ -69,7 +69,7 @@ authorize client recovery side effects, release or merge.
    declared dev/build edges, while tests/ may use the daemon testing API and the source-site rule scans src/
    only. TUI remains domain-only. The CLI's desktop editor, clipboard and web PTY concerns remain frontend
    effects, while all agent execution belongs to the daemon. No daemon API re-exports stores or arbitrary
-   execution closures to clients.
+   execution closures to clients. The limits of the automatic check are in decision 16.
 
 5. **Reuse orch-peer's bounded NDJSON framing, not its protocol enum.** Lift generic reader/serializer code
    into orch-proto; retain the 1 MiB line bound. Local messages are typed hello/welcome/reject, req, ok/err,
@@ -224,7 +224,7 @@ authorize client recovery side effects, release or merge.
     README upgrade and CHANGELOG; PR 3 subscriptions/TUI+web push/MCP resources/delete disk observer/QA1; PR
     4 crate/source capability gates, remove obsolete dependencies/FIFO/dead code, architecture/runbook/
     manual sweep/QA2. PR 2's >3,000-line size is justified by the mixed-writer failure of splitting it. The
-    single-writer behavior must hold at PR 2 head; PR 4 enforces it structurally. The owner approved regrouping
+    single-writer behavior must hold at PR 2 head; PR 4 adds the structural check described, with its limits, in decision 16. The owner approved regrouping
     at gate 2 and merges each green PR. SE-20 developmental gating ends in PR 2, not the old PR 4 proposal.
 
 14. **With no daemon, `orch doctor` is discovery-only, and the CLI's local store and execution frontends are
@@ -300,6 +300,27 @@ authorize client recovery side effects, release or merge.
     agent; it is not a barrier against a process of the same user, which can unset the variables. The
     same-user peer-credential check and the project check on every connection are unchanged.
 
+16. **The client boundary is checked by `cargo xtask crate-graph`, and the owner accepted that check with the
+    gaps its documentation lists.** Decision 4 sets the crate boundaries between the clients and the stores and
+    checks them with the crate graph and a source-site allowlist. This decision records how far that check
+    reaches and what was accepted.
+
+    What the check covers for the CLI. `cargo xtask crate-graph` checks the CLI crate's declared dependencies
+    and scans its production source against the rules in
+    [ARCHITECTURE.md section 3.1](../ARCHITECTURE.md#31-dependency-direction): the paragraph on the CLI's
+    dependencies and the `orch-cli → orch-daemon` row of its table. This entry does not restate that row.
+
+    Its limits. The source half is a text check. The same row lists the cases it does not catch, under **Not
+    caught**, and says of its checks that they "flag architectural changes for review; they do not hold against
+    an author deliberately defeating the scan". The cases are in that row; this entry adds nothing to them.
+
+    What the owner accepted. On 2026-11-12 the owner accepted the check with those documented gaps. The security
+    review rated them Medium (CWE-184), and its block on the check stands, as accepted by the owner. The owner
+    chose not to rewrite the check's parser. The block is not lifted: this entry records the owner's
+    acceptance, not a reviewer's clearance.
+
+    The check does not analyse what code in a crate the client may depend on does with the filesystem. No automatic check rejects project-state access placed in a helper of such a crate; that is covered by source review only.
+
 ## Alternatives considered
 
 - **Keep multiple writers and patch locks individually:** does not provide one ownership boundary across
@@ -315,7 +336,7 @@ authorize client recovery side effects, release or merge.
 - **Hold a project mutex for an entire run:** agents issue orch calls and cancellation must reach them, so this
   can deadlock progress. Hold only state transitions and the final ordered spawn decision.
 - **A separate orchd executable:** packaging cost without a needed boundary; the existing orch binary has
-  explicit bootstrap wrappers, with crate/source gates enforcing capability separation.
+  explicit bootstrap wrappers, with crate/source gates checking capability separation (their limits are in decision 16).
 - **Strictly reject stop on skew:** advertised recovery fails after installed-binary replacement (RT2).
   A retained old binary is not reliable; automatic PID signalling is less safe than SE-8's authenticated
   same-project stop. Only that frozen intent crosses skew; no general compatibility negotiation is added.
@@ -354,8 +375,8 @@ authorize client recovery side effects, release or merge.
 - Tests mostly retain their in-process model. Binary tests explicitly start an isolated test daemon and never
   connect to a real project or real global configuration. Mac QA and Linux CI cover different OS boundaries.
 - Four stacked PRs deliver the transition under decision 13. PR 1 is explicitly developmental; PR 2 has no
-  supported mixed-writer frontend, with real-path stress evidence at that head. PR 3/4 finish push and structural
-  enforcement. Owner merges; no release/tag/version bump here.
+  supported mixed-writer frontend, with real-path stress evidence at that head. PR 3/4 finish push and the structural
+  check (its limits are in decision 16). Owner merges; no release/tag/version bump here.
 - Rollback requires explicit owner stop and verification that agent children are reconciled, then selecting
   the previous binary. File formats remain readable; the old multiple-writer limitations return.
 - At stance 0.5, choose shared operation coordination and coarse push over a per-entity transactional framework:
