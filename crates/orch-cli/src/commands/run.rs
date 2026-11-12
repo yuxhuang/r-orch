@@ -71,7 +71,7 @@ pub async fn serve_once(engine: &Rpc, flags: &crate::tree::ServeCmd) -> Result<E
     let logger = crate::serve::StructuredLogger::new(
         format,
         flags.verbose,
-        std::sync::Arc::new(orch_infra::clock::SystemClock),
+        std::sync::Arc::new(crate::clock::SystemClock),
         crate::serve::open_sinks(flags.log_file.as_deref())?,
     );
     logger.log(
@@ -207,8 +207,8 @@ async fn stream<A: Op>(
     }
 }
 
-/// Local executable/dependency checks remain available before owner startup;
-/// project checks run only inside the daemon.
+/// Checks run only inside the daemon; an unavailable daemon permits only
+/// discovery facts before returning the original client error.
 pub async fn doctor(
     cli: &crate::tree::Cli,
     styles: &Styles,
@@ -217,20 +217,12 @@ pub async fn doctor(
     let client = match Rpc::connect(cli, cwd).await {
         Ok(client) => client,
         Err(error) => {
-            crate::doctor::run(styles, cwd, cli.output(), None).await?;
-            if super::rpc::recover_client_error(&error).is_some_and(|e| {
-                matches!(
-                    e,
-                    orch_client::ClientError::Connection(orch_client::NoDaemon::NotInitialized)
-                )
-            }) {
-                return Ok(ExitCode::SUCCESS);
-            }
+            crate::doctor::discovery_only(styles, cwd).await;
             return Err(error);
         }
     };
     let report = client.request(args::DoctorRunArgs {}).await?;
-    let report: orch_engine::DoctorReport = super::rpc::arguments(report)?;
+    let report: orch_domain::DoctorReport = super::rpc::arguments(report)?;
     print!("{}", crate::doctor::render_header(styles));
     if let Some(format) = cli.output() {
         format.print(&crate::doctor::DoctorJson::from(&report))?;
@@ -378,7 +370,7 @@ mod tests {
         let logger = crate::serve::StructuredLogger::new(
             crate::serve::LogFormat::Json,
             false,
-            std::sync::Arc::new(orch_infra::clock::SystemClock),
+            std::sync::Arc::new(crate::clock::SystemClock),
             crate::serve::open_sinks(Some(&path.to_string_lossy())).expect("sink"),
         );
         log_startup_diagnostics(&engine, &logger).await;

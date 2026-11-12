@@ -4,12 +4,12 @@
 //! shop-template expansion remain in this presentation layer.
 
 use crate::commands::rpc::{Rpc, argument_error, arguments, client_error};
+use orch_core::agent_factory::template_to_agent_input;
 use orch_core::error::Result;
 use orch_domain::{
     AGENT_SHOP_TEMPLATES, Agent, CreateAgentInput, EFFORT_REQUEST_ONLY_NOTE, EffortSelection,
     PromptModeSelection, PromptModeSource,
 };
-use orch_engine::agent_factory::template_to_agent_input;
 use orch_proto::ops::results::AgentDiagnostic;
 use orch_proto::ops::{args, results};
 use serde_json::json;
@@ -42,7 +42,7 @@ pub(crate) fn report_diagnostics(
 }
 
 fn effort_diagnostics(agents: &[Agent]) -> Vec<AgentDiagnostic> {
-    orch_engine::prompt_mode::agent_effort_diagnostics(agents)
+    orch_domain::agent_effort_diagnostics(agents)
         .into_iter()
         .map(|d| AgentDiagnostic {
             agent_id: d.agent_id,
