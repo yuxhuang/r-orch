@@ -1198,6 +1198,10 @@ fn production_tokens<'a>(tokens: &[Token<'a>]) -> Vec<Token<'a>> {
                         prefix = group_end(tokens, prefix);
                     }
                 }
+                // Rust let statements always require a semicolon, including
+                // block initializers and let-else. Generic commas and blocks
+                // cannot end the attributed statement or begin its successor.
+                let let_statement = tokens.get(prefix).is_some_and(|t| t.text == "let");
                 let item = tokens.get(prefix).is_some_and(|t| {
                     matches!(
                         t.text,
@@ -1222,7 +1226,10 @@ fn production_tokens<'a>(tokens: &[Token<'a>]) -> Vec<Token<'a>> {
                         break;
                     }
                     i = group_end(tokens, i);
-                    if text == ";" || (item && text == "{") || (!item && text == ",") {
+                    if text == ";"
+                        || (item && text == "{")
+                        || (!item && !let_statement && text == ",")
+                    {
                         break;
                     }
                     // Neither `else`, postfix `?`, nor a single postfix `.`
@@ -1231,6 +1238,7 @@ fn production_tokens<'a>(tokens: &[Token<'a>]) -> Vec<Token<'a>> {
                     // `..`, so keep only a dot not followed by another dot.
                     // An early stop otherwise only exposes tokens.
                     if !item
+                        && !let_statement
                         && text == "{"
                         && !tokens.get(i).is_some_and(|t| {
                             (t.text == "else" && !t.raw_identifier)
@@ -2760,6 +2768,20 @@ mod tests {
     }
 
     #[test]
+    fn cfg_test_let_statements_end_only_at_their_semicolon() {
+        for text in [
+            "fn f() { #[cfg(test)] let _m: Map<u8, u8> = { orch_infra::Paths; make() }; }",
+            "fn f() { #[cfg(test)] let Some(x): Option<Map<u8, u8>> = make(orch_infra::Paths) else { return }; }",
+            "fn f() { #[cfg(test)] let x = if b { orch_infra::Paths } else { orch_infra::Paths }; }",
+        ] {
+            assert!(cli_file_problems("lib.rs", text).is_empty(), "{text}");
+            let with_production =
+                format!("{text} fn production() {{ orch_daemon::prepare_start(o); }}");
+            assert!(!cli_file_problems("lib.rs", &with_production).is_empty());
+        }
+    }
+
+    #[test]
     fn cfg_inside_macro_arguments_cannot_hide_production_references() {
         for text in [
             "strip!(#[cfg(test)] orch_daemon::prepare_start(o));",
@@ -3045,6 +3067,16 @@ mod tests {
             (
                 "raw identifier",
                 "type r#Outcome = r#InitOutcome;",
+                "impl r#Outcome { fn local_tasks() {} }",
+            ),
+            (
+                "raw declaration plain receiver",
+                "type r#Outcome = InitOutcome;",
+                "impl Outcome { fn local_tasks() {} }",
+            ),
+            (
+                "plain declaration raw receiver",
+                "type Outcome = InitOutcome;",
                 "impl r#Outcome { fn local_tasks() {} }",
             ),
             (
