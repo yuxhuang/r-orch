@@ -13,9 +13,9 @@
 //! daemon (dispatch stays as it was; running agents are the daemon's). So
 //! there is no wind-down on exit any more, and SIGHUP/SIGTERM simply end the
 //! draw loop. **No path here starts a daemon** (goal row 3, spec R4).
-//! [`first_run`] is the bare-`orch` path on top of it.
+//! A bare `orch` opens this same dashboard client; initialization is explicit.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,38 +27,10 @@ use orch_proto::handshake::CallerKind;
 use super::backend::DaemonBackend;
 use super::connect::Connector;
 use super::no_daemon::{self, Choice, Screen};
-use crate::commands::init;
-use crate::output::Styles;
 
 /// The exit status of `q` on the no-daemon screen, and of a non-interactive
 /// `orch tui` with no daemon: the NoDaemon code (spec R5).
 const NO_DAEMON_EXIT: u8 = 7;
-
-/// The project's state directory. A cwd-local probe, see [`first_run`].
-const STATE_DIR: &str = ".orchestry";
-
-/// Bare `orch`: the first-run experience.
-///
-/// With no `.orchestry/` in this directory, initialize one, then open the
-/// dashboard — which, since `init` never starts a daemon, shows the
-/// no-daemon screen naming the command to start one. In an initialized
-/// project it opens straight into the dashboard (or that screen).
-///
-/// The probe is deliberately **`cwd`-local**, and project-root resolution
-/// happens **after** the init, because discovery walks up, so checking or
-/// resolving first would silently adopt an ancestor project and leave the
-/// user's new directory un-initialized.
-pub async fn first_run(
-    styles: &Styles,
-    cwd: &Path,
-    init_args: &init::InitArgs,
-    version: &str,
-) -> Result<ExitCode> {
-    if !cwd.join(STATE_DIR).is_dir() {
-        init::run(styles, cwd, init_args).await?;
-    }
-    run(cwd.to_path_buf(), version, false).await
-}
 
 /// `orch tui`. `observe` is the removed `--observe`, refused here so the
 /// command line and this entry point agree whichever lands first.
