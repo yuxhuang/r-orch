@@ -397,8 +397,9 @@ impl Orchestrator {
                 let launch_config = self.config();
                 let cancel = self.register_cancel(task_id).await;
                 if let Err(error) = self.save_state(state).await {
-                    // No launch began. The next reload discards the claim;
-                    // release only this selection's in-memory reservation.
+                    state.claimed.shift_remove(task_id);
+                    // No launch began. Roll back before a collector's debounced
+                    // save can persist the claim, then release this reservation.
                     let mut preparing = self.inner.preparing_agents.lock().await;
                     if preparing
                         .get(task_id)

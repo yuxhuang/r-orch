@@ -246,3 +246,88 @@ async fn stop_after_a_failed_debounced_save_still_signals_live_children() {
         "stop did not signal the live child"
     );
 }
+
+/// A collector update must not make a failed selection durable, whether the
+/// next owner operation flushes it or the debounce timer fires on its own.
+async fn debounced_failed_selection_recovers(agents: usize, via_timer: bool) {
+    let h = failed_selection(agents).await;
+    // collect_events arms this on another live run's event, without reloading.
+    h.orchestrator.save_state_lazy().await;
+    if via_timer {
+        let writes_before = h.state.written().len();
+        // The paused clock auto-advances past the debounce. Its slot clears
+        // before the write, so also wait for the fake store to record it.
+        tokio::time::sleep(super::super::DEBOUNCE + Duration::from_millis(1)).await;
+        let mut completed = false;
+        for _ in 0..1000 {
+            let lazy = h.orchestrator.inner.lazy_save.lock().await;
+            if !lazy.dirty && lazy.timer.is_none() && h.state.written().len() > writes_before {
+                completed = true;
+                break;
+            }
+            drop(lazy);
+            tokio::task::yield_now().await;
+        }
+        assert!(completed, "debounce did not finish its write");
+    } else {
+        {
+            let lazy = h.orchestrator.inner.lazy_save.lock().await;
+            assert!(lazy.dirty && lazy.timer.is_some(), "debounce must be armed");
+        }
+        h.orchestrator
+            .daemon_reconcile_dead_local_runs()
+            .await
+            .unwrap();
+    }
+    assert!(
+        h.persisted_state().claimed.is_empty(),
+        "debounced save persisted the failed selection's claim"
+    );
+    assert!(
+        h.in_memory_state().await.claimed.is_empty(),
+        "failed selection retained an in-memory claim"
+    );
+    assert!(
+        h.orchestrator
+            .inner
+            .preparing_agents
+            .lock()
+            .await
+            .is_empty(),
+        "failed selection retained a preparing entry"
+    );
+    assert!(
+        h.orchestrator.inner.cancels.lock().await.is_empty(),
+        "failed selection retained a cancel token"
+    );
+    assert!(
+        h.orchestrator
+            .inner
+            .pending_preparation_cleanup
+            .lock()
+            .await
+            .is_empty(),
+        "failed selection retained a cleanup obligation"
+    );
+    h.orchestrator
+        .daemon_launch_task("tsk_test1")
+        .await
+        .unwrap();
+    h.orchestrator.daemon_tick(true).await.unwrap();
+    assert_eq!(h.runs.snapshot().len(), 1, "task must start exactly once");
+}
+
+#[tokio::test(start_paused = true)]
+async fn debounced_failed_selection_flush_with_one_agent() {
+    debounced_failed_selection_recovers(1, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn debounced_failed_selection_flush_with_two_agents() {
+    debounced_failed_selection_recovers(2, false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn debounced_failed_selection_timer_without_another_operation() {
+    debounced_failed_selection_recovers(1, true).await;
+}
