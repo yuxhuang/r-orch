@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-11-09
-- Revision: 2, after round-1 challenge; accepted by the owner at gate 2, 2026-11-09
+- Revision: 2, after round-1 challenge; accepted by the owner at gate 2, 2026-11-09. Decision 14 added in PR 4, 2026-11-11
 - Supersedes: ADR [0011](0011-mcp-server.md) decision 7 and the D10 concurrent-writer acceptance, when the client conversion is complete. Other MCP decisions remain except where the implementation is explicitly replaced below.
 
 ## Context
@@ -113,7 +113,7 @@ authorize client recovery side effects, release or merge.
    until-terminal result semantics, distinct from one tick (G3/RT5). TUI watch controls toggle dispatch, not
    process lifecycle. Expiry and peer handling remain active with dispatch OFF. Start/status and TUI/web
    show dispatch state; restart defaults OFF. tui --observe/--listen are removed; peer listening is a daemon
-   start option. Doctor is a client, with discovery-only NoDaemon diagnosis; help/version remain offline.
+   start option. Doctor is a client, with discovery-only NoDaemon diagnosis (decision 14); help/version remain offline.
 
 8. **One shared state-operation boundary closes in-process races.** Services, dispatch/spawn decisions,
    collectors, peer persistence and expiry serialize entire read/validate/modify/save transitions. Long
@@ -227,6 +227,55 @@ authorize client recovery side effects, release or merge.
     single-writer behavior must hold at PR 2 head; PR 4 enforces it structurally. The owner approved regrouping
     at gate 2 and merges each green PR. SE-20 developmental gating ends in PR 2, not the old PR 4 proposal.
 
+14. **With no daemon, `orch doctor` is discovery-only, and the CLI's local store and execution frontends are
+    removed.** Two PR 4 behaviour changes that make the code match decisions 4 and 7 and spec row R38.
+
+    *`orch doctor` without a daemon.* Until PR 4 a failed connection made doctor run its own checks first: it
+    version-probed five adapters (claude, shell, pi, grok, antigravity; codex, cursor and opencode were not
+    probed), ran `git`, the git-repository, `.gitignore` and toolchain checks in the current directory, looked
+    for `.orchestry/`, printed `N of 5 adapters ready`, and only then returned the no-daemon error. Now, when
+    the connection fails, doctor starts no child process (no adapter, git or shell probe) and opens no store.
+    It prints a header and two facts and returns the client error unchanged, with no exit-code mapping of its
+    own:
+
+    | Where doctor runs | Facts printed | Error and exit |
+    |---|---|---|
+    | Initialized project, no daemon | `project root: <root>` and `daemon discovery: available` or `unavailable` | the uniform no-daemon message and `Start it with: orch daemon start`, exit 7 |
+    | Directory with no project | `project discovery: unavailable` | the existing `Not initialized` diagnosis and `Run: orch init`, exit 3 |
+
+    `daemon discovery` says whether the client could read the project's `daemon.json` record with the same
+    bounded reader that connection setup uses; it does not say that a daemon answers, and nothing is probed to
+    find out. The adapter and dependency checks exist only inside the daemon, so a connected doctor is
+    unchanged (eight adapters, project line, exit 0 even when checks fail), and so is the MCP `doctor` tool.
+    The spec's R38 sentence names exit 7 only. The no-project case exits 3 because that is what every other
+    client gives in a directory with no project, and a start hint there would name a command that itself
+    exits 3; this is the reading built.
+
+    *Legacy frontends under the CLI's `serve` path.* PR 2 moved every command onto the socket but left the
+    v0.13.0 in-process paths compiled and uncalled: `serve::run` and `run_with` over a `FullEngine` (stores,
+    orchestrator and peer runtime built inside the CLI process), the `--once` terminal-state rule, the CLI's
+    peer-runtime starter, the in-process log pump and the local `logs` reader, and the bare-`orch` first-run
+    initializer (`tui::first_run`). No command reached any of them. PR 4 deletes them with their unit tests.
+    What stays is the structured logger and its sink options, the event formatting functions, offline `orch
+    init` behind the daemon's bootstrap facade, and the socket-backed `serve`, `run` and `logs` commands. The
+    contracts the old tests pinned (the terminal-batch rule, start-up diagnostics, ordered and complete log
+    delivery, peer lifecycle, and a finished client batch leaving the daemon up) are now pinned by daemon
+    tests instead.
+
+    Reasons: R38 and goal row 2 say no client links the stores. Decision 4's crate-graph and source gates
+    cannot be tightened while `orch-cli` still contains code that builds a store container, starts the
+    orchestrator or spawns a probe, even uncalled. Deleting it also removes any code a later change could
+    reach for as a "fallback" when no daemon answers, which the owner ruled out in decision 1.
+
+    Consequences for the owner: to learn which agent CLIs are installed, start the daemon first (it starts
+    with dispatch off), then run `orch doctor`; before that, doctor only says where the project is and
+    whether it left a discovery record. A script that expected exit 0 from `orch doctor` in a directory with
+    no project, or the `of 5 adapters ready` line, must change: it now gets exit 3 or exit 7 and no probe
+    summary. With `--json`, the offline output is the same plain-text note, not JSON; the JSON report needs the daemon. No other command
+    changes: the deleted frontends had no caller, so `orch serve`, `orch run`, `orch logs` and bare `orch`
+    behave as decisions 2, 3 and 7 describe. The unpublished `orch_cli` library no longer exports
+    `serve::run`, `serve::run_with`, `ServeOrchestrator`, `OnceResult`, `logs::run` or `tui::first_run`.
+
 ## Alternatives considered
 
 - **Keep multiple writers and patch locks individually:** does not provide one ownership boundary across
@@ -252,6 +301,13 @@ authorize client recovery side effects, release or merge.
   discipline plus provenance covers the supported developer workflow, single-host topology is explicit.
 - **Socket-presence or PID age as sole authority:** stale metadata and a suspended live daemon invalidate that
   inference. Clients never decide ownership, and explicit start needs a sound exclusion primitive (G2).
+- **Keep the local probes in offline doctor:** useful on a machine with no project yet, but it makes a
+  client spawn adapter processes and look in the project directory, which decision 1 (no client reads `.orchestry`
+  beyond discovery metadata) and R38 exclude, and a second set of checks (five adapters) would drift from the
+  daemon's (eight). The daemon's report is the single source.
+- **Keep the uncalled in-process `serve` as a reference or emergency path:** kept compiled, it is the
+  direct-store fallback decision 1 excludes, one wiring mistake away, and it keeps the CLI's dependency on the
+  stores that decision 4 removes. Rejected.
 
 ## Consequences
 
@@ -266,6 +322,9 @@ authorize client recovery side effects, release or merge.
 - The owner must explicitly start a daemon before state commands or the first MCP call succeed. Strict ordinary skew
   increases upgrade cost, but the approved frozen stop defines recovery with either binary; two-executable acceptance remains unmet at
   PR 1 and is assigned to PR 2 T2a (harness skew is not that evidence).
+- With no daemon, `orch doctor` tells the owner where the project is and whether a discovery record exists,
+  and nothing about installed agent CLIs; those checks need a running daemon (decision 14). The CLI no longer
+  contains any code that builds stores, runs the orchestrator or probes adapters in its own process.
 - Tests mostly retain their in-process model. Binary tests explicitly start an isolated test daemon and never
   connect to a real project or real global configuration. Mac QA and Linux CI cover different OS boundaries.
 - Four stacked PRs deliver the transition under decision 13. PR 1 is explicitly developmental; PR 2 has no
