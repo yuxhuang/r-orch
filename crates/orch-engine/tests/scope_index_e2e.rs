@@ -20,8 +20,7 @@ use orch_domain::{
 use orch_engine::{FullEngine, build_full};
 use orch_infra::storage::{FileConfigStore, Paths};
 
-/// Long enough that two runs dispatched in the same tick are both still alive
-/// when the next tick looks, short enough to keep the test quick.
+/// Keep the shell workload short after any coordination with the test.
 const WORKLOAD_MS: u64 = 350;
 
 /// A project with a written `config.yml` and nothing else.
@@ -53,7 +52,15 @@ async fn project() -> (tempfile::TempDir, FullEngine) {
 #[tokio::test(flavor = "multi_thread")]
 async fn overlapping_scopes_serialize_while_disjoint_work_fills_the_free_slots() {
     let (temp, runtime) = project().await;
-    let command = format!("sleep {}; echo scope-e2e-done", WORKLOAD_MS as f64 / 1000.0);
+    // Every child waits for the same marker in its shared project root. Only
+    // observing both scope heads releases them: serial dispatch cannot make
+    // progress by waiting for the first head to finish. Removing the project
+    // on a failed test also releases the waiting children with an error.
+    let release = temp.path().join("scope-heads-started");
+    let command = format!(
+        "while [ ! -f scope-heads-started ]; do [ -d .orchestry ] || exit 1; sleep 0.01; done; sleep {}; echo scope-e2e-done",
+        WORKLOAD_MS as f64 / 1000.0
+    );
 
     for index in 1..=4 {
         runtime
@@ -140,12 +147,27 @@ async fn overlapping_scopes_serialize_while_disjoint_work_fills_the_free_slots()
 
     // Every task reaches `done` (the agents are auto-approve).
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut heads_released = false;
     loop {
         runtime
             .orchestrator
             .daemon_tick(true)
             .await
             .expect("daemon tick");
+        if !heads_released {
+            let both_started = {
+                let trace = trace.lock().unwrap();
+                [&auth_child.id, &db_parent.id]
+                    .iter()
+                    .all(|id| trace.contains(&format!("started:{id}")))
+            };
+            if both_started {
+                tokio::fs::write(&release, b"")
+                    .await
+                    .expect("release scope heads");
+                heads_released = true;
+            }
+        }
         let mut all_done = true;
         for id in &task_ids {
             let task = runtime.task_service.get(id).await.expect("read task");
