@@ -84,6 +84,66 @@ pub async fn run_as_agent(cwd: PathBuf, version: &str, agent: Option<&str>) -> R
 
 /// The loop in the module diagram, over any [`Connector`].
 pub async fn run_dashboard(connector: Connector, cwd: PathBuf, version: &str) -> Result<ExitCode> {
+    run_dashboard_with_ui(connector, cwd, version, TerminalUi::default()).await
+}
+
+/// UI boundary only: every implementation uses the same connection loop,
+/// draw thread and orch-tui runner entry.
+pub(super) trait DashboardUi {
+    type Driver: orch_tui::DashboardDriver + Send + 'static;
+    fn driver(&mut self) -> Self::Driver;
+    fn leave_screen(&mut self);
+    async fn ask(&mut self, failure: &str, stop: Arc<AtomicBool>) -> Result<Option<Choice>>;
+}
+
+#[derive(Default)]
+struct TerminalUi {
+    screen: Option<Screen>,
+}
+
+impl DashboardUi for TerminalUi {
+    type Driver = orch_tui::TerminalDashboard;
+
+    fn driver(&mut self) -> Self::Driver {
+        orch_tui::TerminalDashboard::default()
+    }
+
+    fn leave_screen(&mut self) {
+        drop(self.screen.take());
+    }
+
+    async fn ask(&mut self, failure: &str, stop: Arc<AtomicBool>) -> Result<Option<Choice>> {
+        if !Screen::available() {
+            return Ok(None);
+        }
+        let mut active = match self.screen.take() {
+            Some(active) => active,
+            None => Screen::open()
+                .map_err(|err| Error::other(format!("cannot show the no-daemon screen: {err}")))?,
+        };
+        let failure = failure.to_owned();
+        let (mut active, choice, failure) = tokio::task::spawn_blocking(move || {
+            let choice = active.ask(&failure, &stop);
+            (active, choice, failure)
+        })
+        .await
+        .map_err(|err| Error::other(format!("the no-daemon screen was cancelled: {err}")))?;
+        let choice =
+            choice.map_err(|err| Error::other(format!("the no-daemon screen failed: {err}")))?;
+        if choice == Choice::Retry {
+            let _ = active.draw(&failure, no_daemon::CONNECTING);
+            self.screen = Some(active);
+        }
+        Ok(Some(choice))
+    }
+}
+
+pub(super) async fn run_dashboard_with_ui(
+    connector: Connector,
+    cwd: PathBuf,
+    version: &str,
+    mut ui: impl DashboardUi,
+) -> Result<ExitCode> {
     // SIGHUP (the terminal went away) and SIGTERM end the draw loop and the
     // no-daemon screen the way `q` does. Installed before the first connect,
     // so a signal during it is honoured rather than killing the terminal mode.
@@ -91,8 +151,8 @@ pub async fn run_dashboard(connector: Connector, cwd: PathBuf, version: &str) ->
     let signalled = Arc::new(AtomicBool::new(false));
     watch_termination(Arc::clone(&stop), Arc::clone(&signalled));
 
-    let mut screen: Option<Screen> = None;
-    let mut filters = orch_tui::KeywordFilters::default();
+    let mut intent = orch_tui::ViewIntent::default();
+    let mut retried = false;
     loop {
         let failure =
             match DaemonBackend::launch(connector.clone(), version, cwd.clone(), Arc::clone(&stop))
@@ -100,11 +160,12 @@ pub async fn run_dashboard(connector: Connector, cwd: PathBuf, version: &str) ->
             {
                 Ok(backend) => {
                     // Leave the screen before the dashboard enters its own.
-                    drop(screen.take());
+                    ui.leave_screen();
                     let loss = backend.session_loss();
                     let (outcome, retained) =
-                        run_draw_loop(backend, Arc::clone(&stop), filters).await?;
-                    filters = retained;
+                        run_draw_loop(backend, Arc::clone(&stop), intent, retried, ui.driver())
+                            .await?;
+                    intent = retained;
                     if signalled.load(Ordering::SeqCst) {
                         return Ok(ExitCode::SUCCESS);
                     }
@@ -127,40 +188,11 @@ pub async fn run_dashboard(connector: Connector, cwd: PathBuf, version: &str) ->
             eprintln!("{failure}");
             return Ok(ExitCode::from(NO_DAEMON_EXIT));
         }
-        if !Screen::available() {
-            // Nothing to show a screen on: say why, with the frozen text,
-            // and exit with its code.
-            eprintln!("{failure}");
-            return Ok(ExitCode::from(NO_DAEMON_EXIT));
-        }
-        let mut active = match screen.take() {
-            Some(active) => active,
-            None => Screen::open()
-                .map_err(|err| Error::other(format!("cannot show the no-daemon screen: {err}")))?,
-        };
-        // The key wait blocks, so it runs on the blocking pool; the screen
-        // (and the terminal mode it holds) comes back with the answer.
-        let asked = {
-            let stop = Arc::clone(&stop);
-            let failure = failure.clone();
-            tokio::task::spawn_blocking(move || {
-                let choice = active.ask(&failure, &stop);
-                (active, choice)
-            })
-            .await
-            .map_err(|err| Error::other(format!("the no-daemon screen was cancelled: {err}")))?
-        };
-        let (mut active, choice) = asked;
-        let choice =
-            choice.map_err(|err| Error::other(format!("the no-daemon screen failed: {err}")))?;
-        match choice {
-            Choice::Retry => {
-                let _ = active.draw(&failure, no_daemon::CONNECTING);
-                screen = Some(active);
-            }
-            Choice::Quit => {
-                drop(active);
-                // Leave the reason in the scrollback.
+        match ui.ask(&failure, Arc::clone(&stop)).await? {
+            Some(Choice::Retry) => retried = true,
+            Some(Choice::Quit) | None => {
+                ui.leave_screen();
+                // Leave the reason in the scrollback, including non-TTY exits.
                 eprintln!("{failure}");
                 return Ok(ExitCode::from(NO_DAEMON_EXIT));
             }
@@ -190,22 +222,24 @@ fn client_error(error: ClientError) -> Error {
     }
 }
 
-/// Run `orch_tui::run_until` on a plain thread and wait for it.
+/// Run `orch_tui::run_until_with_view_intent` on a plain thread and wait for it.
 ///
 /// The draw loop must not run on a runtime thread: `TuiBackend` is
 /// synchronous and its methods call `Handle::block_on`, which panics inside a
 /// runtime context. A plain `std::thread` has no such context, so the handle
 /// the backend carries resolves against the runtime this task is running on.
-async fn run_draw_loop(
+async fn run_draw_loop<D: orch_tui::DashboardDriver + Send + 'static>(
     backend: DaemonBackend,
     stop: Arc<AtomicBool>,
-    mut filters: orch_tui::KeywordFilters,
-) -> Result<(ExitCode, orch_tui::KeywordFilters)> {
+    mut intent: orch_tui::ViewIntent,
+    retried: bool,
+    driver: D,
+) -> Result<(ExitCode, orch_tui::ViewIntent)> {
     let draw = std::thread::Builder::new()
         .name("orch-tui".to_owned())
         .spawn(move || {
-            orch_tui::run_until_with_filters(backend, &stop, &mut filters)
-                .map(|exit| (exit, filters))
+            orch_tui::run_until_with_view_intent(backend, &stop, &mut intent, retried, driver)
+                .map(|exit| (exit, intent))
         })
         .map_err(|err| Error::other(format!("cannot start the dashboard thread: {err}")))?;
     // `join` blocks, so it goes to the blocking pool rather than a worker:
@@ -221,7 +255,7 @@ async fn run_draw_loop(
             panic_message(&panic)
         ))),
         Ok(Err(err)) => Err(Error::other(format!("dashboard: {err}"))),
-        Ok(Ok((_, filters))) => Ok((ExitCode::SUCCESS, filters)),
+        Ok(Ok((_, intent))) => Ok((ExitCode::SUCCESS, intent)),
     }
 }
 
