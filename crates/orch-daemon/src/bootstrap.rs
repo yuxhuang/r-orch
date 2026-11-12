@@ -113,7 +113,13 @@ async fn initialize_project(options: InitOptions) -> Result<InitOutcome> {
         .mode(0o700)
         .create(paths.root())
         .await
-        .map_err(|err| Error::io("create project state directory", paths.root(), err))?;
+        .map_err(|err| {
+            Error::io(
+                format!("create {}", paths.root().display()),
+                paths.root(),
+                err,
+            )
+        })?;
     for dir in [
         paths.tasks_dir(),
         paths.agents_dir(),

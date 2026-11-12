@@ -206,3 +206,25 @@ fn t4_advice_preserves_hostile_path_bytes_when_executed_by_posix_sh() {
         }
     }
 }
+
+#[test]
+fn t5_init_creation_failure_names_state_directory_and_preserves_dangling_link() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.root();
+    let state = sandbox.state_dir();
+    let target = root.join("missing-state");
+    std::os::unix::fs::symlink(&target, &state).unwrap();
+
+    let out = run(&sandbox, &root, &["init", "--adapter", "shell"], "022");
+    let stderr = text(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains(state.to_str().unwrap()), "{stderr}");
+    assert!(
+        fs::symlink_metadata(&state)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_link(&state).unwrap(), target);
+    assert!(!target.exists());
+}
