@@ -2,7 +2,7 @@
 //!
 //! Everything is real except the model: file-backed stores in a disposable
 //! project directory, the real run/task/agent services, the real Liquid
-//! template engine and the real `Orchestrator::run_all` dispatch path. The
+//! template engine and the real `Orchestrator::daemon_tick` dispatch path. The
 //! only fake is [`ProbeAdapter`], which records exactly what dispatch hands an
 //! adapter and replays scripted events. No AI CLI is ever executed and
 //! nothing outside the temporary directory is touched.
@@ -449,6 +449,7 @@ impl Rig {
                 )) as Arc<dyn orch_core::skills::SkillLoader>
             }),
         });
+        orchestrator.enable_daemon_mode();
         if spec.config_store {
             orchestrator.set_config_store(Arc::clone(&engine.config_store));
         }
@@ -481,13 +482,13 @@ impl Rig {
 
     /// One dispatch pass: everything dispatchable runs, collectors drain.
     pub async fn dispatch(&self) {
-        let _ = self.orchestrator.run_all().await;
+        let _ = self.orchestrator.daemon_tick(true).await;
         self.adapter.release();
         self.orchestrator.wait_for_collectors().await;
     }
 
     pub async fn dispatch_result(&self) -> orch_core::error::Result<()> {
-        let result = self.orchestrator.run_all().await;
+        let result = self.orchestrator.daemon_tick(true).await;
         self.adapter.release();
         self.orchestrator.wait_for_collectors().await;
         result
