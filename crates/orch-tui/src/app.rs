@@ -2672,7 +2672,7 @@ mod retry_gesture_tests {
             let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
             let mut hits = None;
             terminal
-                .draw(|frame| hits = Some(crate::views::draw(frame, &mut app)))
+                .draw(|frame| hits = Some(crate::views::draw(frame, &app)))
                 .unwrap();
             app.set_hits(hits.unwrap());
             let rect = app
