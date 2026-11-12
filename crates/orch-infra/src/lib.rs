@@ -16,7 +16,6 @@
 )]
 
 pub mod adapters;
-pub mod clipboard;
 pub mod clock;
 pub mod ids;
 pub mod models;

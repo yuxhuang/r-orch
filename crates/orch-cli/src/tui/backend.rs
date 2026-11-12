@@ -42,6 +42,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::clipboard::{
+    NativeCopyStatus, NativeCopySubmitError, NativeCopyWorker, TextClipboardOpener,
+};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use orch_client::{
@@ -50,9 +53,6 @@ use orch_client::{
 use orch_domain::{
     Agent, CreateGoalInput, CreateTeamInput, Goal, GoalStatus, NotificationPreferences,
     OrchestratorEvent, OrchestratorState, PromptMode, ReasoningEffort, Task, Team, TuiPaletteName,
-};
-use orch_infra::clipboard::{
-    NativeCopyStatus, NativeCopySubmitError, NativeCopyWorker, TextClipboardOpener,
 };
 use orch_proto::bounded::{BoundedString, BoundedVec, Id};
 use orch_proto::error::NoDaemonDetail;
@@ -1532,15 +1532,14 @@ impl TuiBackend for DaemonBackend {
     /// daemon as a sealed transfer; `attachment.stage_image` keeps it in a
     /// daemon-owned private file whose path the task then attaches.
     fn paste_image(&mut self) -> BackendResult<ClipboardPaste> {
-        use orch_infra::clipboard::ClipboardContentType;
+        use crate::clipboard::ClipboardContentType;
 
         let handle = self.handle.clone();
-        match handle.block_on(orch_infra::clipboard::detect_clipboard_type()) {
+        match handle.block_on(crate::clipboard::detect_clipboard_type()) {
             ClipboardContentType::Text => Ok(ClipboardPaste::Text),
             ClipboardContentType::Empty => Ok(ClipboardPaste::Empty),
             ClipboardContentType::Image => {
-                let Some(image) = handle.block_on(orch_infra::clipboard::get_clipboard_image())
-                else {
+                let Some(image) = handle.block_on(crate::clipboard::get_clipboard_image()) else {
                     return Err("Failed to read clipboard image".to_owned());
                 };
                 if image.ext != "png" {
@@ -1720,7 +1719,7 @@ impl CopyTransport {
             Box::new(ProcessEnv),
             Box::new(StdoutSink),
             Box::new(SystemClock),
-            orch_infra::clipboard::system_text_clipboard_opener(),
+            crate::clipboard::system_text_clipboard_opener(),
         )
     }
 
@@ -2004,7 +2003,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
 
-    use orch_infra::clipboard::TextClipboard;
+    use crate::clipboard::TextClipboard;
     use orch_tui::backend::copy::{
         self, CopyEnv, FAIL_BUSY, FAIL_NATIVE_TIMEOUT, FAIL_NATIVE_TOO_LARGE,
         FAIL_NATIVE_UNAVAILABLE, FAIL_TERMINAL_TOO_LARGE, GUIDANCE_AUTO_FALLBACK,

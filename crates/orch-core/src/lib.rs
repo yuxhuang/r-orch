@@ -18,7 +18,9 @@
 )]
 
 pub mod adapter;
+pub mod agent_factory;
 pub mod clock;
+pub mod definition_yaml;
 pub mod error;
 pub mod ids;
 pub mod process;

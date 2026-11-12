@@ -44,6 +44,7 @@ orch-daemon.workspace = true
 
 # anyhow is allowed here and in xtask only — never in a library signature.
 anyhow.workspace = true
+arboard.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -59,6 +60,7 @@ json-patch.workspace = true
 jiff.workspace = true
 nanoid.workspace = true
 portable-pty.workspace = true
+png.workspace = true
 # `orch mcp`: the stdio MCP server and its tool input schemas.
 rmcp.workspace = true
 schemars.workspace = true
