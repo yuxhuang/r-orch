@@ -2795,35 +2795,42 @@ mod tests {
             );
         }
         std::fs::remove_file(&file).unwrap();
-        // The exact reviewed copy cannot authorize a changed live definition.
-        for (file, old, live, reviewed) in [
-            (
-                "lifecycle.rs",
-                "pub enum DispatchMode {",
-                "pub enum DispatchMode { Hook(fn(&Path)),",
-                "#[cfg(test)] pub enum DispatchMode { Off, On, }",
-            ),
-            (
-                "lifecycle.rs",
-                "pub struct StartOptions {",
-                "pub struct StartOptions { pub hook: fn(),",
-                "#[cfg(test)] pub struct StartOptions { pub project_root: PathBuf, pub socket: Option<PathBuf>, pub detach: bool, pub dispatch: DispatchMode, pub from_agent: bool, pub listen: Option<String>, pub peer_name: Option<String>, }",
-            ),
-        ] {
-            let path = fixture.0.join("crates/orch-daemon/src").join(file);
-            let original = std::fs::read_to_string(&path).unwrap();
-            std::fs::write(
-                &path,
-                format!("{}\n{reviewed}", original.replacen(old, live, 1)),
-            )
-            .unwrap();
-            let problems = bootstrap_contracts(&fixture.0).unwrap().join("\n");
-            assert!(
-                problems.contains("exactly one raw") && problems.contains("BOOTSTRAP_TYPES"),
-                "{problems}"
-            );
-            std::fs::write(&path, original).unwrap();
-        }
+    }
+
+    // The exact reviewed copy cannot authorize a changed live definition.
+    fn assert_duplicate_bootstrap_definition_rejected(old: &str, live: &str, reviewed: &str) {
+        let fixture = daemon_fixture();
+        let path = fixture.0.join("crates/orch-daemon/src/lifecycle.rs");
+        let original = std::fs::read_to_string(&path).unwrap();
+        assert!(original.contains(old));
+        std::fs::write(
+            &path,
+            format!("{}\n{reviewed}", original.replacen(old, live, 1)),
+        )
+        .unwrap();
+        let problems = bootstrap_contracts(&fixture.0).unwrap().join("\n");
+        assert!(
+            problems.contains("exactly one raw") && problems.contains("BOOTSTRAP_TYPES"),
+            "{problems}"
+        );
+    }
+
+    #[test]
+    fn a_cfg_gated_enum_copy_cannot_authorize_a_changed_live_enum() {
+        assert_duplicate_bootstrap_definition_rejected(
+            "pub enum DispatchMode {",
+            "pub enum DispatchMode { Hook(fn(&Path)),",
+            "#[cfg(test)] pub enum DispatchMode { Off, On, }",
+        );
+    }
+
+    #[test]
+    fn a_cfg_gated_struct_copy_cannot_authorize_a_changed_live_struct() {
+        assert_duplicate_bootstrap_definition_rejected(
+            "pub struct StartOptions {",
+            "pub struct StartOptions { pub hook: fn(),",
+            "#[cfg(test)] pub struct StartOptions { pub project_root: PathBuf, pub socket: Option<PathBuf>, pub detach: bool, pub dispatch: DispatchMode, pub from_agent: bool, pub listen: Option<String>, pub peer_name: Option<String>, }",
+        );
     }
 
     #[test]
