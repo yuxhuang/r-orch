@@ -175,7 +175,12 @@ async fn capture(kind: &str, p: ExecuteParams) -> Value {
     }
     let stdin_mode = format!("{:?}", record.stdin);
     let stdin_bytes = if stdin_mode == "Pipe" {
-        pm.stdin_capture().await.map(|s| {
+        let observed = if kind == "pi" {
+            pm.stdin_open_frame().await
+        } else {
+            pm.stdin_capture().await
+        };
+        observed.map(|s| {
             s.strip_suffix(STDIN_EOF_MARKER)
                 .map(str::to_owned)
                 .unwrap_or(s)
