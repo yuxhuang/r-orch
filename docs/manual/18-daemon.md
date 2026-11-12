@@ -76,7 +76,7 @@ What the daemon does **not** promise:
 | Command | What it does | Exit codes |
 |---|---|---|
 | `orch daemon start [--detach] [--dispatch on\|off] [--from-agent]` | Starts the daemon for the project, in the foreground unless `--detach`. Dispatch is **off** unless `--dispatch on`. Peer-link listener options are start options too; `orch daemon start --help` lists them. | 0 after a clean stop (foreground) or after readiness (`--detach`); 2, 3, 4 on refusal |
-| `orch daemon status` | Asks the running daemon for its live status. | 0; 7 when no compatible daemon answers |
+| `orch daemon status` | Asks the running daemon for its live status. | 0; 1 with `request cancelled before execution` when the daemon lost ownership of the project while the request was waiting ([Lost ownership](#status)); 7 when no compatible daemon answers |
 | `orch daemon stop` | Asks the daemon to shut down cleanly and waits until it confirms its cleanup and has released the project (its process has exited or it has released its ownership lock), for at most 30 s. Works across a version mismatch. | 0 on a completed clean stop; 7 when no daemon answers, the outcome is unknown or the wait times out (with a message of its own) |
 | `orch daemon dispatch on\|off` | Turns dispatching of future work on or off in the running daemon. | 0; 7 when no compatible daemon answers |
 
@@ -244,6 +244,12 @@ turns dispatch off and refuses `orch daemon dispatch on` with `daemon ownership 
 recreate the lock. Plain `orch daemon status` then prints `ownership: LOST — stop and restart the daemon`;
 `--json` and `--yaml` show `ownership` as `lost`. To recover, stop the daemon and start it again.
 
+A request that the daemon had accepted before it lost ownership, and had not started to execute, is refused with
+`request cancelled before execution`: the command prints it on stderr and exits 1, and nothing was executed.
+`orch daemon status` is one of the commands this can happen to, at the moment of the change. orch does not retry
+the request and does not restart anything; repeat the command. A request made after the change is answered, and
+`orch daemon status` then prints `ownership: LOST`.
+
 ### Dispatch on and off
 
 `orch daemon dispatch on` lets the daemon start waiting tasks, as `orch run --watch` does; `orch daemon dispatch
@@ -293,7 +299,7 @@ orch's exit codes, with the one this work adds:
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | General error |
+| 1 | General error; also a request that was accepted but had not started when the daemon lost ownership of the project (`request cancelled before execution`) |
 | 2 | Invalid arguments; for a daemon start (`orch daemon start`, `orch serve`, `orch run --watch`): agent context without `--from-agent`, a user who does not own the project, or a socket that the start cannot prove stale; a foreground `orch serve` or `orch run --watch` given `--tick-interval`, `--log-file`, `--verbose` or a non-`json` `--log-format`, and `--tick-interval` on any `serve` or `run`; also `orch serve --once` while dispatch is on |
 | 3 | Not initialized: no project found |
 | 4 | Lock conflict: another daemon or live orchestrator owns the project, including `orch serve` or `orch run --watch` while a daemon runs; a second `orch serve --once` batch |
