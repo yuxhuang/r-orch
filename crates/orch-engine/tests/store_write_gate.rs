@@ -1,8 +1,9 @@
-//! The daemon's store handles serialize each whole entity-and-index mutation.
-//! A separately spawned save and delete of one id must wait for the same gate.
+//! Store saves and deletes wait for and stay under the operation gate.
+//! After delete then save of one id, entity contents and index must agree.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use orch_core::error::Result;
@@ -13,8 +14,9 @@ use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 // A held gate cannot produce an early completion, regardless of host load.
-// The only timing risk is missing a bypass on a slow host. The fixed 250 ms
-// observation window is checked by removing the gate and each store wrapper.
+// This negative check can miss a bypass on a slow host. Its fixed 250 ms
+// window is checked by removing the gate and each store wrapper; separate
+// probes below check that each whole call stays under the gate without timing.
 // Startup/release use signals, never sleeps. Ten seconds bounds positive waits.
 const OBSERVE_BLOCKED: Duration = Duration::from_millis(250);
 const COMPLETE: Duration = Duration::from_secs(10);
@@ -52,12 +54,18 @@ impl Record {
     }
 }
 
-async fn delete_and_save(record: Record, boundary: Arc<OperationBoundary>, held: bool) {
+async fn delete_and_save(
+    store: &str,
+    record: Record,
+    boundary: Arc<OperationBoundary>,
+    held: bool,
+) {
     let (release, released) = oneshot::channel();
     let holder = if held {
         let (started, entered) = oneshot::channel();
+        let holder_boundary = Arc::clone(&boundary);
         let holder = tokio::spawn(async move {
-            boundary
+            holder_boundary
                 .run(false, async {
                     started.send(()).unwrap();
                     released.await.unwrap();
@@ -74,23 +82,53 @@ async fn delete_and_save(record: Record, boundary: Arc<OperationBoundary>, held:
     };
 
     let mut writers = JoinSet::new();
-    let (delete_started, deleting) = oneshot::channel();
-    let deleting_record = record.clone();
-    writers.spawn(async move {
-        delete_started.send(()).unwrap();
-        ("delete", deleting_record.delete().await)
-    });
-    let (save_started, saving) = oneshot::channel();
-    writers.spawn(async move {
-        save_started.send(()).unwrap();
-        ("save", record.save().await)
-    });
-    tokio::time::timeout(COMPLETE, async {
-        deleting.await.unwrap();
-        saving.await.unwrap();
-    })
-    .await
-    .expect("both separately spawned writers must start");
+    let mut probes = JoinSet::new();
+    // Tokio's mutex grants waiters in arrival order. On this current_thread
+    // runtime, sending a start signal does not yield: the task continues to its
+    // first pending await, queuing at the held gate before the observer resumes.
+    // Waiting for each signal before spawning the next task fixes the order:
+    // holder, delete, delete probe, save, save probe. The probes have no IO
+    // before the gate, and neither writer has an operation context to inherit.
+    // After the raw store call returns, permit release, wrapper return and the
+    // done flag happen in one poll with no intervening pending await. A woken
+    // probe cannot run between them on this runtime. Host scheduling therefore
+    // cannot make a correctly gated call falsely red at the probe assertion.
+    for operation in ["delete", "save"] {
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_done = Arc::clone(&done);
+        let writer_record = record.clone();
+        let (started, entered) = oneshot::channel();
+        writers.spawn(async move {
+            started.send(()).unwrap();
+            let result = if operation == "delete" {
+                writer_record.delete().await
+            } else {
+                writer_record.save().await
+            };
+            writer_done.store(true, Ordering::SeqCst);
+            (operation, result)
+        });
+        tokio::time::timeout(COMPLETE, entered)
+            .await
+            .expect("each separately spawned writer must start")
+            .unwrap();
+        if held {
+            let probe_boundary = Arc::clone(&boundary);
+            let (started, entered) = oneshot::channel();
+            probes.spawn(async move {
+                started.send(()).unwrap();
+                let seen = probe_boundary
+                    .run(false, async { done.load(Ordering::SeqCst) })
+                    .await
+                    .value;
+                (operation, seen)
+            });
+            tokio::time::timeout(COMPLETE, entered)
+                .await
+                .expect("each probe must queue before the next writer starts")
+                .unwrap();
+        }
+    }
 
     // current_thread makes each writer advance from its startup signal to its
     // first pending await before this observer resumes. Neither task inherits
@@ -125,6 +163,14 @@ async fn delete_and_save(record: Record, boundary: Arc<OperationBoundary>, held:
     })
     .await
     .expect("save and delete must finish once the gate is available");
+    let mut observations = Vec::new();
+    tokio::time::timeout(COMPLETE, async {
+        while let Some(observation) = probes.join_next().await {
+            observations.push(observation.unwrap());
+        }
+    })
+    .await
+    .expect("both probes must finish once the gate is available");
     assert!(
         !completed_while_held,
         "a store write completed while the operation gate was held: {outcomes:?}"
@@ -132,6 +178,12 @@ async fn delete_and_save(record: Record, boundary: Arc<OperationBoundary>, held:
     assert_eq!(outcomes.len(), 2, "both store calls must complete");
     for (operation, result) in outcomes {
         result.unwrap_or_else(|error| panic!("{operation} failed: {error}"));
+    }
+    for (operation, finished) in observations {
+        assert!(
+            finished,
+            "{store} {operation} must return before the next gate operation enters"
+        );
     }
 }
 
@@ -169,8 +221,9 @@ async fn assert_files_equal_index(directory: &Path, id: &str) {
     files.sort();
     indexed.sort();
     assert_eq!(files, indexed, "entity contents and index must agree");
-    // Save then delete: absent and unlisted. Delete then save: present and
-    // listed. Neither a ghost index entry nor an unlisted file is legal.
+    // This schedule grants delete then save, producing present and listed.
+    // Absent and unlisted is also legal, but is not produced by this schedule.
+    // Neither a ghost index entry nor an unlisted file is legal.
     assert!(
         files.is_empty() || files == [id],
         "only absent/unlisted or present/listed is legal: {files:?}"
@@ -230,7 +283,7 @@ async fn exercise(store: &str, held: bool) {
         _ => panic!("unknown test store"),
     };
     let id = record.id().to_owned();
-    delete_and_save(record, boundary, held).await;
+    delete_and_save(store, record, boundary, held).await;
     if held {
         assert_files_equal_index(&temp.path().join(".orchestry").join(store), &id).await;
     }
