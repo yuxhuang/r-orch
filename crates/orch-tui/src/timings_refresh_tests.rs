@@ -480,3 +480,44 @@ fn stale_tasks_or_goals_notification_on_a_dirty_view_does_not_bypass_the_limiter
         assert_eq!(app.backend.read_count(Read::Timings), 3, "no polling");
     }
 }
+
+#[test]
+fn stale_tasks_or_goals_notification_on_a_clean_view_does_not_bypass_the_limiter() {
+    for (store, read) in [
+        (ObservedStore::Tasks, Read::Tasks),
+        (ObservedStore::Goals, Read::Goals),
+    ] {
+        let mut app = app();
+        push(&mut app, ObservedStore::Runs, 1);
+        advance(&mut app, REFRESH_DEBOUNCE_MS);
+        app.clock.set_ms(200);
+        push(&mut app, ObservedStore::Runs, 2);
+        app.clock
+            .set_ms(REFRESH_DEBOUNCE_MS + TIMINGS_REFRESH_INTERVAL_SECS * 1_000);
+        app.tick();
+        assert_eq!(app.backend.read_count(Read::Timings), 2);
+        app.clock.set_ms(6_000);
+        push(&mut app, ObservedStore::Runs, 3);
+        let deadline = app.run_timings_refresh_at.unwrap();
+        advance(&mut app, 1);
+        // Timings already read commit 2; the semantic view has not. Its
+        // first late notification must not accelerate the Runs-only read.
+        push(&mut app, store, 2);
+        advance(&mut app, REFRESH_DEBOUNCE_MS);
+        assert_eq!(
+            app.backend.read_count(read),
+            1,
+            "{store:?} keeps its debounce"
+        );
+        assert_eq!(
+            app.backend.read_count(Read::Timings),
+            2,
+            "stale {store:?} does not bypass"
+        );
+        app.clock.set_ms(deadline - 1);
+        app.tick();
+        assert_eq!(app.backend.read_count(Read::Timings), 2, "not early");
+        advance(&mut app, 1);
+        assert_eq!(app.backend.read_count(Read::Timings), 3, "trailing read");
+    }
+}

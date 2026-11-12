@@ -363,9 +363,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 let semantic_timings = matches!(store, ObservedStore::Tasks | ObservedStore::Goals)
                     && self.freshness.is_new_for(View::Timings, commit_seq);
                 if self.freshness.changed(store, commit_seq) || semantic_timings {
-                    if matches!(store, ObservedStore::Tasks | ObservedStore::Goals)
-                        && self.freshness.dirty().contains(View::Timings)
-                    {
+                    if semantic_timings && self.freshness.dirty().contains(View::Timings) {
                         self.timings_debounce_pending = true;
                         self.run_timings_refresh_at = None;
                     } else if matches!(store, ObservedStore::Runs | ObservedStore::State)
