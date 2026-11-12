@@ -54,7 +54,7 @@ async fn env(existing: bool) -> Env {
     let temp = tempfile::tempdir().expect("temp project");
     orch_infra::storage::fs_utils::clear_ensured_dirs();
     let paths = Paths::new(temp.path());
-    tokio::fs::create_dir_all(paths.root()).await.expect("root");
+    tui_support::create_state_dir(temp.path());
     let mut config = default_config();
     config.defaults.agent.adapter = "shell".into();
     config.defaults.agent.workspace_mode = WorkspaceMode::Shared;

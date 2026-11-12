@@ -49,9 +49,7 @@ async fn project_tree() -> tempfile::TempDir {
     orch_core::test_support::assert_hermetic(temp.path());
     orch_infra::storage::fs_utils::clear_ensured_dirs();
     let paths = Paths::new(temp.path());
-    tokio::fs::create_dir_all(paths.root())
-        .await
-        .expect("create .orchestry");
+    tui_support::create_state_dir(temp.path());
 
     let mut config = default_config();
     config.project.name = "tui-e2e".into();
