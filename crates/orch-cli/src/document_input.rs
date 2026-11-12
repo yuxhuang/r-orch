@@ -79,7 +79,7 @@ pub async fn read_document(file: &Path, format: Option<InputFormat>) -> Result<V
     let value = match format {
         InputFormat::Json => parse_json(source, &bytes)?,
         InputFormat::Yaml => {
-            orch_infra::storage::fs_utils::parse_definition_yaml_bytes(source, &bytes).await?
+            orch_core::definition_yaml::parse_definition_yaml_bytes(source, &bytes).await?
         }
     };
     require_object(&value).map_err(|_| invalid(source, "document root: expected an object"))?;

@@ -481,7 +481,7 @@ pub(crate) async fn edit_document(document: &str) -> Result<Value> {
     if edited.len() > MAX_DOCUMENT_BYTES {
         return Err(Error::invalid_arguments("<editor>: document exceeds 1 MiB"));
     }
-    orch_infra::storage::fs_utils::parse_definition_yaml_bytes(
+    orch_core::definition_yaml::parse_definition_yaml_bytes(
         Path::new("<editor>"),
         edited.as_bytes(),
     )

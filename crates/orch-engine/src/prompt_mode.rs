@@ -24,8 +24,8 @@ use std::path::Path;
 use orch_core::error::{Error, Result};
 use orch_core::storage::AgentStore;
 use orch_domain::{
-    Agent, AgentConfig, EffortDispatch, OrchestratorConfig, PromptConfig, PromptMode, deep_merge,
-    default_config, effective_prompt_mode, plan_effort_dispatch, set_by_path,
+    Agent, AgentConfig, OrchestratorConfig, PromptConfig, PromptMode, deep_merge, default_config,
+    effective_prompt_mode, set_by_path,
 };
 use serde_json::Value;
 
@@ -267,50 +267,7 @@ async fn update_project_prompt_mode(
     Ok(mode)
 }
 
-/// One read-only diagnostic for one agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentDiagnostic {
-    pub agent_id: String,
-    pub agent_name: String,
-    pub message: String,
-}
-
-/// What dispatch will do with each agent's stored effort, without spawning
-/// anything: warnings for legacy-ignored, clamp/override/unknown statuses and
-/// the Codex managed-model coupling, and the configuration error a new
-/// invalid value will raise. The plain request-only note is not reported.
-///
-/// OpenCode's bounded wire check is **not** run here; its outcome is reported
-/// at dispatch, where the probe runs immediately before the spawn.
-pub fn agent_effort_diagnostics(agents: &[Agent]) -> Vec<AgentDiagnostic> {
-    let mut out = Vec::new();
-    for agent in agents.iter().filter(|agent| agent.remote.is_none()) {
-        let push = |out: &mut Vec<AgentDiagnostic>, message: String| {
-            out.push(AgentDiagnostic {
-                agent_id: agent.id.clone(),
-                agent_name: agent.name.clone(),
-                message,
-            });
-        };
-        match plan_effort_dispatch(
-            &agent.adapter,
-            agent.config.model.as_deref(),
-            agent.config.effort,
-        ) {
-            EffortDispatch::Unset => {}
-            EffortDispatch::Reject(error) => {
-                push(&mut out, format!("configuration error: {error}"))
-            }
-            EffortDispatch::IgnoreLegacy { diagnostics }
-            | EffortDispatch::Forward { diagnostics, .. } => {
-                for diagnostic in diagnostics.into_iter().filter(|d| d.is_warning()) {
-                    push(&mut out, diagnostic.to_string());
-                }
-            }
-        }
-    }
-    out
-}
+pub use orch_domain::effort::{AgentDiagnostic, agent_effort_diagnostics};
 
 /// Every read-only startup diagnostic: effort, plus the eco/custom-template
 /// conflict dispatch will refuse.
@@ -336,7 +293,7 @@ pub fn startup_diagnostics(config: &OrchestratorConfig, agents: &[Agent]) -> Vec
 mod tests {
     use super::*;
     use orch_core::test_support::{FakeAgentStore, make_agent};
-    use orch_domain::{ReasoningEffort, RemoteRef};
+    use orch_domain::RemoteRef;
 
     fn agent(id: &str, mode: Option<PromptMode>) -> Agent {
         let mut agent = make_agent();
@@ -410,41 +367,6 @@ mod tests {
         assert!(check_agent_candidate(&config, "a", "A", &eco).is_err());
         assert!(check_agent_candidate(&config, "a", "A", &AgentConfig::default()).is_ok());
         assert!(check_agent_candidate(&default_config(), "a", "A", &eco).is_ok());
-    }
-
-    #[test]
-    fn effort_diagnostics_skip_unset_and_plain_request_notes() {
-        let mut unset = make_agent();
-        unset.adapter = "claude".into();
-        let mut known = unset.clone();
-        known.id = "known".into();
-        known.config.model = Some("claude-opus-5-5".into());
-        known.config.effort = Some(ReasoningEffort::High);
-        assert!(agent_effort_diagnostics(&[unset, known]).is_empty());
-    }
-
-    #[test]
-    fn effort_diagnostics_report_legacy_ignores_and_new_value_errors() {
-        let mut cursor = make_agent();
-        cursor.id = "cursor".into();
-        cursor.adapter = "cursor".into();
-        cursor.config.effort = Some(ReasoningEffort::High);
-        let mut codex_ultra = make_agent();
-        codex_ultra.id = "codex".into();
-        codex_ultra.adapter = "codex".into();
-        codex_ultra.config.effort = Some(ReasoningEffort::Ultra);
-        let diagnostics = agent_effort_diagnostics(&[cursor, codex_ultra]);
-        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
-        assert_eq!(diagnostics[0].agent_id, "cursor");
-        assert!(
-            diagnostics[0].message.starts_with("legacy-ignored"),
-            "{diagnostics:?}"
-        );
-        assert_eq!(diagnostics[1].agent_id, "codex");
-        assert!(
-            diagnostics[1].message.starts_with("configuration error:"),
-            "{diagnostics:?}"
-        );
     }
 
     #[tokio::test]

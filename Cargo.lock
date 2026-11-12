@@ -1679,6 +1679,7 @@ name = "orch-cli"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "assert_cmd",
  "async-trait",
  "axum",
@@ -1701,6 +1702,7 @@ dependencies = [
  "orch-peer",
  "orch-proto",
  "orch-tui",
+ "png",
  "portable-pty",
  "ratatui",
  "rmcp",
@@ -1743,8 +1745,10 @@ dependencies = [
  "futures",
  "indexmap",
  "orch-domain",
+ "saphyr-parser",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

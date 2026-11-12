@@ -27,26 +27,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// The warning for a listen address other hosts may reach, or `None` for a
-/// loopback IP. Anything that does not parse as one (a hand-edited
-/// `peer.listen` such as `localhost:7690`) warns rather than guess.
-pub fn exposure_warning(addr: &str) -> Option<String> {
-    let parsed = addr.parse::<std::net::SocketAddr>().ok();
-    if parsed.is_some_and(|parsed| parsed.ip().is_loopback()) {
-        return None;
-    }
-    let reach = if parsed.is_some_and(|parsed| parsed.ip().is_unspecified()) {
-        "on ALL network interfaces"
-    } else {
-        "beyond this host"
-    };
-    Some(format!(
-        "Peer listener {addr} accepts connections {reach} with no authentication \
-         or encryption: any host that can reach it can run tasks on this instance's \
-         agents, including shell commands. Use it only on a trusted network; bind \
-         127.0.0.1 to keep it local."
-    ))
-}
+pub use orch_domain::remote::exposure_warning;
 
 /// While an owner is running, expired messages (including removed aliases)
 /// are physically pruned at startup and every 30 seconds, plus storage/lock
