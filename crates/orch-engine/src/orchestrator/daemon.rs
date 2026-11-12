@@ -589,7 +589,8 @@ impl Orchestrator {
             if let (Some(preparation), Some(adapter)) = (preparation, adapter.as_ref()) {
                 let preparation = match preparation {
                     Ok(preparation) => preparation,
-                    Err(error) => {
+                    Err(mut error) => {
+                        error.message = format!("effort preparation failed: {error}");
                         if let PreparationFailureOutcome::Cancelled = self.daemon_fail_preparation(
                             &task, &agent, generation, &run.id, &error, &workspace,
                         )
