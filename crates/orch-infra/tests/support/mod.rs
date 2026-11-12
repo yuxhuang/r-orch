@@ -291,18 +291,16 @@ impl ScriptedProcessManager {
         self.graceful_kills.lock().expect("graceful kills").clone()
     }
 
-    /// What the adapter wrote to the child's stdin, once the capture has seen
-    /// it and stopped growing. `None` if nothing arrived within the timeout.
+    /// What the adapter wrote to the child's stdin, including the EOF marker.
+    /// `None` if the capture did not complete within the timeout.
     pub async fn stdin_capture(&self) -> Option<String> {
         let path = self.dir.path().join("stdin");
-        let mut previous = String::new();
         for _ in 0..200 {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let contents = std::fs::read_to_string(&path).unwrap_or_default();
-            if !contents.is_empty() && contents == previous {
+            if contents.ends_with(STDIN_EOF_MARKER) {
                 return Some(contents);
             }
-            previous = contents;
         }
         None
     }
@@ -650,5 +648,63 @@ pub fn exited(code: i32) -> ExitOutcome {
     ExitOutcome {
         code: Some(code),
         signal: None,
+    }
+}
+
+#[cfg(test)]
+mod stdin_capture_tests {
+    use super::{Duration, STDIN_EOF_MARKER, ScriptedProcessManager};
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn unchanged_prefix_waits_for_the_rest_and_returns_the_complete_capture() {
+        let pm = ScriptedProcessManager::silent();
+        let path = pm.dir.path().join("stdin");
+        std::fs::write(&path, "prefix").expect("write prefix");
+        let complete = format!("prefix\nrest{STDIN_EOF_MARKER}");
+
+        let writer = async {
+            // The prefix is unchanged at the 10, 20 and 30 ms polls.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            std::fs::write(&path, &complete).expect("complete capture");
+        };
+        let (captured, ()) = tokio::join!(pm.stdin_capture(), writer);
+
+        assert_eq!(captured.as_deref(), Some(complete.as_str()));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn missing_capture_returns_none_at_the_existing_bound() {
+        let pm = ScriptedProcessManager::silent();
+        let started = tokio::time::Instant::now();
+
+        let captured = pm.stdin_capture().await;
+
+        assert_eq!(
+            (captured, started.elapsed()),
+            (None, Duration::from_secs(2))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn capture_without_a_marker_returns_none_within_the_existing_bound() {
+        let pm = ScriptedProcessManager::silent();
+        std::fs::write(pm.dir.path().join("stdin"), "unfinished").expect("write prefix");
+        let started = tokio::time::Instant::now();
+
+        let captured = pm.stdin_capture().await;
+
+        assert_eq!(
+            (captured, started.elapsed() <= Duration::from_secs(2)),
+            (None, true)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn completed_empty_input_returns_the_marker_unchanged() {
+        let pm = ScriptedProcessManager::silent();
+        std::fs::write(pm.dir.path().join("stdin"), STDIN_EOF_MARKER)
+            .expect("write completed empty capture");
+
+        assert_eq!(pm.stdin_capture().await.as_deref(), Some(STDIN_EOF_MARKER));
     }
 }
