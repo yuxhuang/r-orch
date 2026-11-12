@@ -71,7 +71,7 @@ pub async fn serve_once(engine: &Rpc, flags: &crate::tree::ServeCmd) -> Result<E
     let logger = crate::serve::StructuredLogger::new(
         format,
         flags.verbose,
-        std::sync::Arc::new(orch_infra::clock::SystemClock),
+        std::sync::Arc::new(crate::clock::SystemClock),
         crate::serve::open_sinks(flags.log_file.as_deref())?,
     );
     logger.log(
@@ -230,7 +230,7 @@ pub async fn doctor(
         }
     };
     let report = client.request(args::DoctorRunArgs {}).await?;
-    let report: orch_engine::DoctorReport = super::rpc::arguments(report)?;
+    let report: orch_domain::DoctorReport = super::rpc::arguments(report)?;
     print!("{}", crate::doctor::render_header(styles));
     if let Some(format) = cli.output() {
         format.print(&crate::doctor::DoctorJson::from(&report))?;
@@ -378,7 +378,7 @@ mod tests {
         let logger = crate::serve::StructuredLogger::new(
             crate::serve::LogFormat::Json,
             false,
-            std::sync::Arc::new(orch_infra::clock::SystemClock),
+            std::sync::Arc::new(crate::clock::SystemClock),
             crate::serve::open_sinks(Some(&path.to_string_lossy())).expect("sink"),
         );
         log_startup_diagnostics(&engine, &logger).await;

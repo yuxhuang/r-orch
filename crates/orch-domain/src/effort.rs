@@ -27,7 +27,7 @@
 //! The table is dated contract data. Expanding it is a reviewed row change
 //! with fixtures, after re-checking the CLI's help and primary docs.
 
-use crate::agent::ReasoningEffort;
+use crate::agent::{Agent, ReasoningEffort};
 use crate::model_tiers::AdapterKind;
 
 use ReasoningEffort as E;
@@ -1897,6 +1897,127 @@ mod tests {
         assert_eq!(
             note.to_string(),
             format!("request-only: {EFFORT_REQUEST_ONLY_NOTE}")
+        );
+    }
+}
+
+/// One read-only diagnostic for one agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDiagnostic {
+    pub agent_id: String,
+    pub agent_name: String,
+    pub message: String,
+}
+
+/// What dispatch will do with each agent's stored effort, without spawning
+/// anything: warnings for legacy-ignored, clamp/override/unknown statuses and
+/// the Codex managed-model coupling, and the configuration error a new
+/// invalid value will raise. The plain request-only note is not reported.
+///
+/// OpenCode's bounded wire check is **not** run here; its outcome is reported
+/// at dispatch, where the probe runs immediately before the spawn.
+pub fn agent_effort_diagnostics(agents: &[Agent]) -> Vec<AgentDiagnostic> {
+    let mut out = Vec::new();
+    for agent in agents.iter().filter(|agent| agent.remote.is_none()) {
+        let push = |out: &mut Vec<AgentDiagnostic>, message: String| {
+            out.push(AgentDiagnostic {
+                agent_id: agent.id.clone(),
+                agent_name: agent.name.clone(),
+                message,
+            });
+        };
+        match plan_effort_dispatch(
+            &agent.adapter,
+            agent.config.model.as_deref(),
+            agent.config.effort,
+        ) {
+            EffortDispatch::Unset => {}
+            EffortDispatch::Reject(error) => {
+                push(&mut out, format!("configuration error: {error}"))
+            }
+            EffortDispatch::IgnoreLegacy { diagnostics }
+            | EffortDispatch::Forward { diagnostics, .. } => {
+                for diagnostic in diagnostics.into_iter().filter(|d| d.is_warning()) {
+                    push(&mut out, diagnostic.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod agent_diagnostic_tests {
+    use super::*;
+    use crate::{AgentConfig, AgentStats, AgentStatus, ApprovalPolicy, ReasoningEffort};
+    fn make_agent() -> Agent {
+        Agent {
+            id: "agt_test1".into(),
+            name: "TestAgent".into(),
+            adapter: "shell".into(),
+            role: None,
+            config: AgentConfig {
+                command: None,
+                model: None,
+                effort: None,
+                approval_policy: Some(ApprovalPolicy::Auto),
+                max_turns: Some(50),
+                timeout_ms: Some(3_600_000),
+                stall_timeout_ms: Some(300_000),
+                env: None,
+                system_prompt: None,
+                workspace_mode: None,
+                skills: None,
+                prompt_mode: None,
+                role_summary: None,
+            },
+            status: AgentStatus::Idle,
+            current_task: None,
+            autonomous: None,
+            stats: AgentStats {
+                tasks_completed: 0,
+                tasks_failed: 0,
+                total_runs: 0,
+                total_runtime_ms: 0,
+                tokens_used: None,
+            },
+            last_error: None,
+            capabilities: Vec::new(),
+            remote: None,
+        }
+    }
+    #[test]
+    fn effort_diagnostics_skip_unset_and_plain_request_notes() {
+        let mut unset = make_agent();
+        unset.adapter = "claude".into();
+        let mut known = unset.clone();
+        known.id = "known".into();
+        known.config.model = Some("claude-opus-5-5".into());
+        known.config.effort = Some(ReasoningEffort::High);
+        assert!(agent_effort_diagnostics(&[unset, known]).is_empty());
+    }
+
+    #[test]
+    fn effort_diagnostics_report_legacy_ignores_and_new_value_errors() {
+        let mut cursor = make_agent();
+        cursor.id = "cursor".into();
+        cursor.adapter = "cursor".into();
+        cursor.config.effort = Some(ReasoningEffort::High);
+        let mut codex_ultra = make_agent();
+        codex_ultra.id = "codex".into();
+        codex_ultra.adapter = "codex".into();
+        codex_ultra.config.effort = Some(ReasoningEffort::Ultra);
+        let diagnostics = agent_effort_diagnostics(&[cursor, codex_ultra]);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].agent_id, "cursor");
+        assert!(
+            diagnostics[0].message.starts_with("legacy-ignored"),
+            "{diagnostics:?}"
+        );
+        assert_eq!(diagnostics[1].agent_id, "codex");
+        assert!(
+            diagnostics[1].message.starts_with("configuration error:"),
+            "{diagnostics:?}"
         );
     }
 }

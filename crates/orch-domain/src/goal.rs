@@ -186,3 +186,14 @@ mod tests {
         }
     }
 }
+
+/// The fields `goal update` can change.
+///
+/// `None` means "not supplied", so only the fields the user named are touched.
+/// For `assignee`, `Some("")` **clears** the assignee.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateGoalFields {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub assignee: Option<String>,
+}
