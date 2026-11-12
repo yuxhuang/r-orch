@@ -201,7 +201,8 @@ message for a request that presented the credential and `orch daemon unavailable
 without `--once` and `orch run --watch` are a foreground `orch daemon start` with dispatch on that forwards
 `--from-agent` and the peer flags (`commands/daemon.rs`, `foreground`); `orch serve --once`, `orch run --once` and
 `orch run <id>` are requests to a running daemon. The commands that do not need a daemon are `init`, `update`,
-`daemon` and the local checks of `doctor` (`tree.rs`, `CONTAINER_LESS_COMMANDS`).
+`daemon`, and `doctor`, which without a daemon prints only a discovery note and exits 7, or 3 outside a project
+(`tree.rs`, `CONTAINER_LESS_COMMANDS`).
 
 The CLI's normal workspace dependencies are client, core, daemon, domain, proto and TUI. Engine and infra
 are dev dependencies only, and peer is absent. The gate checks declared dependency kinds, aliases,
@@ -1217,9 +1218,10 @@ history; its regression tests are institutional memory, so add the test before c
 
 **Holds:** the clap command tree; `output` (glyphs, ASCII fallback, `print_table` with its exact padding,
 `print_key_value`, the formatters); every command module with human, `--json` and `--yaml` rendering; the error
-boundary and exit codes; `init`; `doctor`; `serve` with the structured logger, `--once` runner and disk
-observer; `update`/update-check; `editor` and `shop_picker`. It implements `TuiBackend` over the container
-(§3.1).
+boundary and exit codes; `init`; `doctor` (the daemon's report, or a discovery note when none answers); `serve`
+as the structured logger and its sink options (`serve/`), with `orch run`, `orch serve --once` and `orch logs` as
+requests to the daemon (`commands/run.rs`); `update`/update-check; `editor` and `shop_picker`. It implements
+`TuiBackend` over the daemon (`tui/backend.rs`, `DaemonBackend`) (§3.1).
 
 ### WP-6 — TUI
 

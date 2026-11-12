@@ -28,7 +28,8 @@ project by looking for `.orchestry/` in the current directory and then in each p
 commands from any subdirectory.
 
 Outside a project, most commands print `Not initialized` and exit with code 3. Only `orch --help`,
-`orch --version`, `orch init`, `orch doctor` (local checks only) and `orch update` work anywhere.
+`orch --version`, `orch init` and `orch update` work anywhere. `orch doctor` also runs outside a project, but it
+only reports that it found none and exits 3 like the others.
 
 Everything orch knows about the project is stored as plain files in `.orchestry/`:
 

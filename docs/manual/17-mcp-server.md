@@ -909,7 +909,7 @@ the daemon cannot promise that its process has died.
 closed and output captured. Each git check is limited to 10 s; an adapter probe has no limit of its own; the whole
 call is limited to 120 s. The daemon runs them, with the environment it
 was started with, not `orch mcp`. The git checks run in the project root, as they do for `orch doctor` when a daemon
-answers (without one, `orch doctor` checks the directory it is started in). A failed check is part of the report, not an error. No tool runs an agent directly.
+answers (without one, `orch doctor` runs no git check). A failed check is part of the report, not an error. No tool runs an agent directly.
 
 ### Not available as tools
 

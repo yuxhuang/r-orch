@@ -247,7 +247,7 @@ authorize client recovery side effects, release or merge.
     bounded reader that connection setup uses; it does not say that a daemon answers, and nothing is probed to
     find out. The adapter and dependency checks exist only inside the daemon, so a connected doctor is
     unchanged (eight adapters, project line, exit 0 even when checks fail), and so is the MCP `doctor` tool.
-    The spec's R38 sentence names exit 7 only. The no-project case exits 3 because that is what every other
+    The spec's R38 sentence names exit 7 and, for a directory with no project, exit 3. The no-project case exits 3 because that is what every other
     client gives in a directory with no project, and a start hint there would name a command that itself
     exits 3; this is the reading built.
 

@@ -379,7 +379,7 @@ Three cases are not "no daemon" and say so:
 | The dashboard (`orch`, `orch tui`) | Shows the message full-screen. `r` tries to connect again, `q` quits with exit 7. It never starts anything. |
 | `orch web` | At start: prints the message and exits 7. If the daemon goes away while it serves: a new page or tab gets HTTP 503 with the message as plain text, after the usual login; with `--no-auth` it gets only `orch daemon unavailable`, never the project or socket path. A tab whose dashboard is already open shows the dashboard's own no-daemon screen. |
 | `orch mcp` | Stays running. `initialize` and every tool call return the message as an MCP error with `exit_code` 7, so a new MCP session's first call fails until you start the daemon. It exits 0 when its client closes stdin. See [the MCP chapter](17-mcp-server.md#when-no-daemon-is-running). |
-| `orch doctor` | Runs its local checks (five adapters, git, the git repository, `.gitignore`, the toolchain) in the current directory, then prints the message and exits 7. It never reads the project's state. Outside a project it prints the checks and `.orchestry/ not found — run: orch init`, and exits 0. |
+| `orch doctor` | Runs no check and starts no process. Prints `orch doctor · discovery only (daemon unavailable)`, the project root and `daemon discovery: available` or `unavailable`, then the message, and exits 7. Outside a project it prints `project discovery: unavailable`, then `Not initialized` and `Run: orch init`, and exits 3. See [Check your setup](07-running-and-monitoring.md#check-your-setup). |
 
 `orch --help`, `orch --version` and `orch init` never need a daemon.
 
@@ -513,7 +513,7 @@ other way of running work asks the running daemon:
 | `orch serve --once` | Run in the running daemon until every tracked task is final (below). Needs dispatch off. |
 | Dashboard start and stop watch | `orch daemon dispatch on` and `off`; never starts or stops a process. |
 | `orch tui --observe`, `orch tui --listen` | Removed: the dashboard is always a client; peer listening is a start option of the daemon. |
-| `orch doctor` | A client: with no daemon it runs its local checks, then prints the no-daemon message and exits 7; outside a project it exits 0. |
+| `orch doctor` | A client: with no daemon it runs no check, prints a discovery note and the no-daemon message, and exits 7; outside a project it prints `Not initialized` and exits 3. |
 | `orch init`, `--help`, `--version` | Need no daemon. `orch init` prints how to start one and never starts it; running it again changes nothing in an existing project. |
 
 **Dispatch follows changes.** With dispatch on, a change to the project wakes the daemon's scheduler: a new or

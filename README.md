@@ -152,9 +152,9 @@ $ orch --yaml task list
   `logs --follow` still streams text and `serve --once` writes JSON Lines; `serve --log-format` is unrelated to
   `--yaml`, and persisted logs do not change format. A foreground `serve` is the daemon and writes no event lines;
   its diagnostics go to stderr via `RUST_LOG`.
-- **`orch doctor` is the exception.** Inside a project it prints its human header line on stdout before the
+- **`orch doctor` is the exception.** With a daemon it prints its human header line on stdout before the
   structured document, under `--json` as well as `--yaml`, so the output does not parse as one document.
-  Outside a project it prints text only. See the [runbook](docs/RUNBOOK.md#structured-output-for-doctor-logs---follow-and-serve).
+  Without a daemon it prints text only, and no document. See the [runbook](docs/RUNBOOK.md#structured-output-for-doctor-logs---follow-and-serve).
 
 ### Reading, navigating and editing in the dashboard
 
@@ -673,8 +673,9 @@ What else changes
   the daemon's dispatch on or off. `orch tui --observe` and `orch tui --listen` are gone; listening is a daemon
   start option (`--listen`).
 - A cancel, from any client, stops the running agent; a goal pause, from any client, is ordered with dispatch.
-- `orch doctor` is a client too: without a daemon it runs its local checks, then reports the no-daemon message
-  and exits 7 (outside a project it exits 0).
+- `orch doctor` is a client too: without a daemon it runs no check and starts no process. It prints a short
+  discovery note and then the no-daemon message, and exits 7; in a directory with no project it prints
+  `Not initialized` and exits 3.
 - `orch org template` and `orch config global` now need a project and its daemon, like every other command:
   outside a project they print `Not initialized` and exit 3. Run them inside a project after `orch daemon start`.
 - Agents get the agent variant of the message (`Do not start it; report this to the owner and stop.`), and

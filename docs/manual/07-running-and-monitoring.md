@@ -3,7 +3,8 @@
 Tasks do nothing until the orchestrator starts them, and the orchestrator runs inside the project's [daemon](18-daemon.md). Read this chapter to start work, to watch what happens, to stop safely, and to find the logs. It covers `orch run`, `orch serve`, `orch status`, `orch logs`, `orch doctor` and `orch update`.
 
 Every command in this chapter needs a running daemon, except `orch update`, the daemon starts `orch run --watch` and
-`orch serve` (without `--once`), and the local checks of `orch doctor`. Without one it prints `No orch daemon is running for <project root>` and exits 7 ([When no daemon answers](18-daemon.md#when-no-daemon-answers)).
+`orch serve` (without `--once`), and `orch doctor`, which without a daemon prints only a discovery note
+([Check your setup](#check-your-setup)). Without one it prints `No orch daemon is running for <project root>` and exits 7 ([When no daemon answers](18-daemon.md#when-no-daemon-answers)).
 
 ## In this chapter
 
@@ -379,7 +380,8 @@ orch logs --task tsk_wsk8eC3 --json
 
 ## Check your setup
 
-`orch doctor` reports which adapter tools are installed, and whether the project is ready.
+`orch doctor` reports which adapter tools are installed, and whether the project is ready. The daemon runs the
+checks, so the report below needs a running daemon.
 
 ```sh
 orch doctor
@@ -408,7 +410,20 @@ orch doctor
 
 A `✕` next to an adapter matters only if you use that adapter. A `✕` next to `git repo` means the `worktree` and `isolated` modes fail; run `git init` or use `--workspace-mode shared`.
 
-`orch doctor` is a client of the daemon. With a daemon it exits with 0, even when it reports problems. Without one it runs its local checks (five adapters instead of eight, git, the git repository, `.gitignore`, the toolchain) in the current directory, without the `.orchestry/` line, then prints the [no-daemon message](18-daemon.md#when-no-daemon-answers) and exits 7. Outside a project it prints the checks and `.orchestry/ not found — run: orch init`, and exits 0. Without a daemon, `--json` prints text. It never reads the project's state. It does not check locks, saved state or disk space.
+`orch doctor` is a client of the daemon. With a daemon it exits with 0, even when it reports problems.
+
+Without a daemon it runs no check: it starts no process (no adapter, `git` or shell probe) and opens no project store. In a project it prints a header, the project root and whether the daemon left its discovery file, then the [no-daemon message](18-daemon.md#when-no-daemon-answers), and exits 7:
+
+```text
+  orch doctor · discovery only (daemon unavailable)
+
+  project root: /path/to/project
+  daemon discovery: unavailable
+```
+
+`daemon discovery` is `available` when the client could read the project's `daemon.json`. It does not say that a daemon answers: nothing is probed to find out. In a directory with no project it prints `project discovery: unavailable`, then `Not initialized` and `Run: orch init`, and exits 3. To see which agent CLIs are installed, start the daemon and run `orch doctor` again.
+
+The `(daemon unavailable)` header is printed for every failure to connect, including one caused by an invalid `--agent` (exit 2), an unusable `ORCH_SOCKET` (exit 2) or a project that cannot be found (exit 3), so it can stand above an exit-2 error. With a daemon, `orch doctor` does not check locks, saved state or disk space.
 
 > **Note:** `orch --json doctor` prints its header line before the JSON, so the output is not one JSON document.
 
