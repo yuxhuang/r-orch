@@ -162,10 +162,7 @@ impl Freshness {
             if !views_of(store).contains(view) || self.dirty.contains(view) {
                 continue;
             }
-            let observed = view.ordinal_applies()
-                && !self.failed.contains(view)
-                && self.read_at[view as usize].is_some_and(|seen| commit_seq <= seen);
-            if !observed {
+            if self.is_new_for(view, commit_seq) {
                 self.dirty.insert(view);
                 newly = true;
             }
@@ -196,6 +193,14 @@ impl Freshness {
     /// Whether `view`'s last read failed.
     pub fn failed(&self, view: View) -> bool {
         self.failed.contains(view)
+    }
+
+    /// Whether this commit still needs a read for `view`. A failed or
+    /// unknown read cannot retire a change, even if the view is already dirty.
+    pub(crate) fn is_new_for(&self, view: View, commit_seq: u64) -> bool {
+        !(view.ordinal_applies()
+            && !self.failed.contains(view)
+            && self.read_at[view as usize].is_some_and(|seen| commit_seq <= seen))
     }
 
     /// The views waiting for a read.

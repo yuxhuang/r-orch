@@ -358,7 +358,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             Observation::Changed {
                 store, commit_seq, ..
             } => {
-                if self.freshness.changed(store, commit_seq) {
+                // A newer Tasks/Goals commit still owes a timing read when
+                // an earlier notification already dirtied every affected view.
+                let semantic_timings = matches!(store, ObservedStore::Tasks | ObservedStore::Goals)
+                    && self.freshness.is_new_for(View::Timings, commit_seq);
+                if self.freshness.changed(store, commit_seq) || semantic_timings {
                     if matches!(store, ObservedStore::Tasks | ObservedStore::Goals)
                         && self.freshness.dirty().contains(View::Timings)
                     {
