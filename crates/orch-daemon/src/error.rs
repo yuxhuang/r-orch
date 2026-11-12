@@ -63,10 +63,6 @@ impl DaemonError {
             | DaemonError::Unimplemented { .. } => exit::GENERAL,
         }
     }
-
-    pub(crate) fn unimplemented(what: &'static str, owner: &'static str) -> Self {
-        DaemonError::Unimplemented { what, owner }
-    }
 }
 
 impl From<&DaemonError> for ErrorBody {

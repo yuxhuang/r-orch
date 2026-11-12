@@ -9,14 +9,6 @@
 //! `orch init` shares ([`RUNTIME_GITIGNORE_ENTRIES`]) and, behind the `testing`
 //! feature, [`testing::DaemonHarness`]. Nothing here re-exports a store implementation or an arbitrary execute closure.
 //!
-//! **PR 1 skeleton (S1a-api).** Signatures only; bodies return
-//! [`DaemonError::Unimplemented`] naming the task that fills them:
-//!
-//! | Module | Owner task |
-//! |---|---|
-//! | [`lifecycle`], `guard`, `discovery`, `listener`, `session`, [`testing`] | S1a-impl (senior-eng) |
-//! | [`coordinator`], [`ops`] handlers | S1b (senior-eng-2) |
-//! | [`dispatch`] loop, [`peer`] runtime, NDJSON lift in orch-peer | S1d (senior-eng) |
 
 // Stricter than the workspace lints, for library code only (integration tests are separate crates and
 // `clippy.toml` allows unwrap and print inside `#[cfg(test)]`). See AGENTS.md, "Rust coding standards".
@@ -26,6 +18,9 @@
     clippy::print_stdout,
     clippy::print_stderr
 )]
+
+mod bootstrap;
+pub use bootstrap::is_initialized;
 
 pub mod coordinator;
 mod detach;

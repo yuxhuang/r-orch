@@ -792,39 +792,7 @@ async fn heartbeat(lock: Arc<PidLock>, handler: ServiceHandler, mut quit: watch:
     }
 }
 
-/// Options of `orch init`, the only project-creation path. Mirrors the CLI's
-/// existing `InitArgs`.
-#[derive(Debug, Clone, Default)]
-pub struct InitOptions {
-    pub project_root: PathBuf,
-    /// `--name`.
-    pub name: Option<String>,
-    /// `--adapter`.
-    pub adapter: Option<String>,
-    /// `--prompt-mode`; omitted writes `normal`.
-    pub prompt_mode: Option<orch_domain::PromptMode>,
-    /// Both stdout and stdin are a TTY (gates the multi-adapter prompt in the
-    /// CLI; the daemon API itself never prompts).
-    pub interactive: bool,
-}
-
-/// What [`initialize`] did, so the CLI can print the start hint.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InitOutcome {
-    /// Re-run on an initialized project: nothing was overwritten.
-    pub already_initialized: bool,
-    pub adapter: String,
-}
-
-/// Create `.orchestry/` (idempotently). Starts no server, never mutates a
-/// live daemon's state, and leaves printing `orch daemon start` to the CLI.
-pub async fn initialize(options: InitOptions) -> Result<InitOutcome, DaemonError> {
-    let _ = options;
-    Err(DaemonError::unimplemented(
-        "orch_daemon::initialize",
-        "S1a-impl",
-    ))
-}
+pub use crate::bootstrap::{InitOptions, InitOutcome, initialize};
 
 /// Test daemons for this crate's unit tests: a temp project, a private
 /// scratch dir under `/tmp` (socket, `global.yml`), production code paths.
