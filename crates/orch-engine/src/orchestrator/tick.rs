@@ -277,12 +277,14 @@ impl Orchestrator {
         self.save_reconciled_state(state).await
     }
 
-    /// Reap only collectorless local deaths. This is safe with dispatch off:
-    /// no stalls, remote deadlines, orphan sweeps, seeding or retry execution.
+    /// Retry owned preparation releases and reap collectorless local deaths.
+    /// Safe with dispatch off: no stalls, remote deadlines, orphan sweeps,
+    /// seeding or retry execution.
     pub(super) async fn reconcile_dead_local_runs(
         &self,
         state: &mut OrchestratorState,
     ) -> Result<()> {
+        self.reconcile_preparation_cleanup(state).await;
         let entries: Vec<_> = state
             .running
             .iter()

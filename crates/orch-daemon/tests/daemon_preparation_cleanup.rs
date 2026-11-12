@@ -78,3 +78,81 @@ async fn storage_recovery_releases_the_claim_without_repeating_the_attempt() {
     assert_eq!(ok(&reply)["attempts"], 2);
     daemon.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_releases_pending_preparation_with_dispatch_off() {
+    let clock = TestClock::new();
+    let daemon = DaemonHarness::builder()
+        .clock(clock.clone())
+        .start()
+        .await
+        .unwrap();
+    let mut raw = Raw::session(&daemon, "cli", "normal").await;
+    assert_eq!(
+        ok(&raw.request(1_200, "daemon.status", json!({})).await)["dispatch"]["dispatch_on"],
+        false
+    );
+    let id = candidate(&mut raw, &daemon).await;
+    let runs = daemon.project_root().join(".orchestry/runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    let broken = runs.join("unreadable.json");
+    std::fs::write(&broken, b"invalid json").unwrap();
+    daemon.step_dispatch().await.unwrap();
+    let before = state(&daemon);
+    assert!(before.claimed.contains(&id));
+    assert_eq!(
+        ok(&raw.request(1_201, "task.get", json!({"id": id})).await)["attempts"],
+        1
+    );
+    std::fs::remove_file(broken).unwrap();
+    // No tick and no dispatch-mode change after the failed release.
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        loop {
+            if daemon
+                .engine()
+                .state
+                .read()
+                .await
+                .unwrap()
+                .claimed
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("maintenance parked a preparation-cleanup obligation");
+    let after = state(&daemon);
+    assert!(after.running.is_empty());
+    assert_eq!(
+        after.retry_queue, before.retry_queue,
+        "maintenance must not retry tasks"
+    );
+    assert_eq!(
+        ok(&raw.request(1_202, "task.get", json!({"id": id})).await)["attempts"],
+        1
+    );
+    assert_eq!(
+        ok(&raw.request(1_203, "daemon.status", json!({})).await)["dispatch"]["dispatch_on"],
+        false
+    );
+    assert_eq!(
+        daemon
+            .engine()
+            .tasks
+            .list(&Default::default())
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "no seeding"
+    );
+    let runs = daemon.engine().runs.list_for_task(&id).await.unwrap();
+    assert!(
+        runs.is_empty(),
+        "workspace failure must not start an agent: {runs:?}"
+    );
+    daemon.shutdown().await.unwrap();
+}
