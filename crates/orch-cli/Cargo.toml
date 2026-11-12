@@ -92,6 +92,7 @@ tracing-subscriber.workspace = true
 nix = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 orch-engine.workspace = true
 orch-infra.workspace = true
 orch-daemon = { workspace = true, features = ["testing"] }
