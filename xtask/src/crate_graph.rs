@@ -388,6 +388,8 @@ pub fn run(repo_root: &Path) -> Result<()> {
     problems.extend(bootstrap_contracts(repo_root)?);
     problems.extend(pure_source_sites(repo_root)?);
     problems.extend(promoted_test_features(&metadata));
+    problems.extend(boundary_build_targets(&metadata));
+    problems.extend(boundary_source_loading(repo_root)?);
     println!("crate graph ({} crates):", actual.len());
     for (name, deps) in &actual {
         for dep in deps {
@@ -433,6 +435,7 @@ struct Edge {
     target: Option<String>,
     optional: bool,
     features: Vec<String>,
+    uses_default_features: bool,
 }
 
 type Edges = BTreeMap<String, Vec<Edge>>;
@@ -466,6 +469,7 @@ fn workspace_edges(metadata: &Value) -> Result<Edges> {
                     rename: dep["rename"].as_str().map(str::to_owned),
                     target: dep["target"].as_str().map(str::to_owned),
                     optional: dep["optional"].as_bool().unwrap_or(false),
+                    uses_default_features: dep["uses_default_features"].as_bool().unwrap_or(true),
                     features: dep["features"]
                         .as_array()
                         .into_iter()
@@ -539,7 +543,7 @@ fn graph_problems(actual: &Edges) -> Vec<String> {
                 && edge
                     .features
                     .iter()
-                    .any(|f| ["testing", "test-support"].contains(&f.as_str()))
+                    .any(|f| TEST_API_FEATURES.iter().any(|(_, feature)| *feature == f))
             {
                 problems.push(format!(
                     "`{name}` -> `{}` promotes a test API into {} dependencies",
@@ -594,6 +598,102 @@ fn graph_problems(actual: &Edges) -> Vec<String> {
     problems
 }
 
+/// Test APIs are permitted through dev edges only.
+const TEST_API_FEATURES: &[(&str, &str)] =
+    &[("orch-daemon", "testing"), ("orch-core", "test-support")];
+
+/// Cargo's local aliases and dependency forwarding form a finite fixed point.
+/// Resolve declared edges rather than resolved nodes (which unify dev features).
+fn selected_workspace_features(
+    metadata: &Value,
+    edges: &Edges,
+    root: &Edge,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let packages: BTreeMap<_, _> = metadata["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| Some((p["name"].as_str()?, p)))
+        .collect();
+    let mut selected = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut active = BTreeSet::<(String, usize)>::new();
+    select_edge_features(&mut selected, root);
+    loop {
+        let before = (selected.clone(), active.clone());
+        for (name, features) in &before.0 {
+            let deps = edges.get(name).map_or(&[][..], Vec::as_slice);
+            for (i, dep) in deps.iter().enumerate().filter(|(_, d)| d.kind != "dev") {
+                if !dep.optional {
+                    active.insert((name.clone(), i));
+                }
+            }
+            let Some(package) = packages.get(name.as_str()) else {
+                continue;
+            };
+            for feature in features {
+                for value in package["features"][feature]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                {
+                    if let Some((alias, forwarded)) = value.split_once('/') {
+                        let weak = alias.ends_with('?');
+                        let alias = alias.trim_end_matches('?');
+                        for (i, dep) in deps.iter().enumerate().filter(|(_, d)| {
+                            d.kind != "dev" && d.rename.as_deref().unwrap_or(&d.name) == alias
+                        }) {
+                            if !weak {
+                                active.insert((name.clone(), i));
+                            }
+                            if active.contains(&(name.clone(), i)) {
+                                selected
+                                    .entry(dep.name.clone())
+                                    .or_default()
+                                    .insert(forwarded.to_owned());
+                            }
+                        }
+                    } else if let Some(alias) = value.strip_prefix("dep:") {
+                        for (i, _) in deps.iter().enumerate().filter(|(_, d)| {
+                            d.kind != "dev" && d.rename.as_deref().unwrap_or(&d.name) == alias
+                        }) {
+                            active.insert((name.clone(), i));
+                        }
+                    } else {
+                        selected
+                            .entry(name.clone())
+                            .or_default()
+                            .insert(value.to_owned());
+                        // Older Cargo's implicit optional-dependency feature.
+                        for (i, _) in deps.iter().enumerate().filter(|(_, d)| {
+                            d.kind != "dev"
+                                && d.optional
+                                && d.rename.as_deref().unwrap_or(&d.name) == value
+                        }) {
+                            active.insert((name.clone(), i));
+                        }
+                    }
+                }
+            }
+        }
+        for (name, i) in &active {
+            select_edge_features(&mut selected, &edges[name][*i]);
+        }
+        if before == (selected.clone(), active.clone()) {
+            break;
+        }
+    }
+    selected
+}
+
+fn select_edge_features(selected: &mut BTreeMap<String, BTreeSet<String>>, edge: &Edge) {
+    let features = selected.entry(edge.name.clone()).or_default();
+    features.extend(edge.features.iter().cloned());
+    if edge.uses_default_features {
+        features.insert("default".to_owned());
+    }
+}
+
 fn promoted_test_features(metadata: &Value) -> Vec<String> {
     let mut problems = Vec::new();
     for package in metadata["packages"].as_array().into_iter().flatten() {
@@ -608,14 +708,45 @@ fn promoted_test_features(metadata: &Value) -> Vec<String> {
                 .flatten()
                 .filter_map(Value::as_str)
             {
-                if feature
-                    .split_once('/')
-                    .is_some_and(|(_, name)| ["testing", "test-support"].contains(&name))
-                {
+                if feature.split_once('/').is_some_and(|(_, name)| {
+                    TEST_API_FEATURES
+                        .iter()
+                        .any(|(_, feature)| *feature == name)
+                }) {
                     problems.push(format!(
                         "{} feature `{feature}` promotes a dependency test API into production",
                         package["name"]
                     ));
+                }
+            }
+        }
+    }
+    if let Ok(edges) = workspace_edges(metadata) {
+        for (owner, deps) in &edges {
+            // A package's default may forward an alias into a dependency even
+            // when that dependency has default-features=false on its edge.
+            let default_root = Edge {
+                name: owner.clone(),
+                kind: "normal".to_owned(),
+                rename: None,
+                target: None,
+                optional: false,
+                features: Vec::new(),
+                uses_default_features: true,
+            };
+            let defaults = selected_workspace_features(metadata, &edges, &default_root);
+            for (package, feature) in TEST_API_FEATURES {
+                if *package != owner && defaults.get(*package).is_some_and(|s| s.contains(*feature))
+                {
+                    problems.push(format!("`{owner}` default feature closure selects dependency test API `{package}/{feature}` (TEST_API_FEATURES)"));
+                }
+            }
+            for edge in deps.iter().filter(|e| e.kind != "dev") {
+                let selected = selected_workspace_features(metadata, &edges, edge);
+                for (package, feature) in TEST_API_FEATURES {
+                    if selected.get(*package).is_some_and(|s| s.contains(*feature)) {
+                        problems.push(format!("`{owner}` -> `{}` selects test API `{package}/{feature}` through its {} feature closure (TEST_API_FEATURES)", edge.name, edge.kind));
+                    }
                 }
             }
         }
@@ -648,6 +779,114 @@ fn pure_source_sites(repo_root: &Path) -> Result<Vec<String>> {
                         token.line,
                         token.text
                     ));
+                }
+            }
+        }
+    }
+    Ok(problems)
+}
+
+const BOUNDARY_CRATES: &[&str] = &["orch-cli", "orch-client", "orch-proto", "orch-tui"];
+/// Exact (crate, source path) approvals. No boundary crate has a build script.
+const BOUNDARY_BUILD_TARGETS: &[(&str, &str)] = &[];
+
+fn boundary_build_targets(metadata: &Value) -> Vec<String> {
+    let mut problems = Vec::new();
+    for package in metadata["packages"].as_array().into_iter().flatten() {
+        let name = package["name"].as_str().unwrap_or("");
+        if !BOUNDARY_CRATES.contains(&name) {
+            continue;
+        }
+        for target in package["targets"].as_array().into_iter().flatten() {
+            if target["kind"]
+                .as_array()
+                .is_some_and(|k| k.iter().any(|k| k == "custom-build"))
+            {
+                let path = target["src_path"].as_str().unwrap_or("<missing source>");
+                if !BOUNDARY_BUILD_TARGETS.contains(&(name, path)) {
+                    problems.push(format!("`{name}` custom-build target `{path}` is unreviewed (BOUNDARY_BUILD_TARGETS)"));
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// Plain string paths only. Escaped/computed paths fail closed; data-loading
+/// macros do not compile Rust and are intentionally outside this rule.
+fn source_path_literal<'a>(token: &Token<'a>) -> Option<&'a str> {
+    if !token.literal {
+        return None;
+    }
+    if let Some(path) = token
+        .text
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+    {
+        return (!path.contains('\\')).then_some(path);
+    }
+    let raw = token.text.strip_prefix('r')?;
+    let hashes = raw.bytes().take_while(|c| *c == b'#').count();
+    raw.get(hashes..)?
+        .strip_prefix('"')?
+        .strip_suffix(&format!("\"{}", "#".repeat(hashes)))
+}
+
+fn boundary_source_loading(repo_root: &Path) -> Result<Vec<String>> {
+    let mut problems = Vec::new();
+    for name in BOUNDARY_CRATES {
+        let src = repo_root.join("crates").join(name).join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        let mut files = Vec::new();
+        collect_rust_files(&src, &mut files)?;
+        let enumerated: BTreeSet<_> = files
+            .iter()
+            .map(std::fs::canonicalize)
+            .collect::<std::io::Result<_>>()?;
+        let canonical_src = src.canonicalize()?;
+        for file in files {
+            let relative = file
+                .strip_prefix(&src)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if *name == "orch-cli" && CLI_TEST_ROOTS.iter().any(|(root, _, _)| *root == relative) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file)?;
+            let tokens = production_tokens(&rust_tokens(&text));
+            for (i, token) in tokens.iter().enumerate().filter(|(_, t)| !t.literal) {
+                let arg = if token.text == "include"
+                    && tokens.get(i + 1).is_some_and(|t| t.text == "!")
+                    && tokens
+                        .get(i + 2)
+                        .is_some_and(|t| matches!(t.text, "(" | "[" | "{"))
+                {
+                    Some(&tokens[i + 3..group_end(&tokens, i + 2).saturating_sub(1)])
+                } else if token.text == "#"
+                    && tokens.get(i + 1).is_some_and(|t| t.text == "[")
+                    && tokens.get(i + 2).is_some_and(|t| t.text == "path")
+                    && tokens.get(i + 3).is_some_and(|t| t.text == "=")
+                {
+                    Some(&tokens[i + 4..group_end(&tokens, i + 1).saturating_sub(1)])
+                } else {
+                    None
+                };
+                let Some(arg) = arg else { continue };
+                let arg = if arg.last().is_some_and(|t| t.text == ",") {
+                    &arg[..arg.len() - 1]
+                } else {
+                    arg
+                };
+                let target = (arg.len() == 1)
+                    .then(|| source_path_literal(&arg[0]))
+                    .flatten()
+                    .and_then(|path| file.parent()?.join(path).canonicalize().ok());
+                if !target.is_some_and(|p| {
+                    p.starts_with(&canonical_src) && p.is_file() && enumerated.contains(&p)
+                }) {
+                    problems.push(format!("crates/{name}/src/{relative}:{}: production code loading must be a plain literal naming a file inside the enumerated crate source root (BOUNDARY_SOURCE_LOADING)", token.line));
                 }
             }
         }
@@ -894,11 +1133,40 @@ fn production_tokens<'a>(tokens: &[Token<'a>]) -> Vec<Token<'a>> {
                 i = end;
             }
             if test_only {
-                // Skip this item only, never the containing production file.
+                // Fields/arms end at a comma or their enclosing closer. Items
+                // can contain generic commas (Result<(), E>) before the body.
+                let mut prefix = i;
+                if tokens.get(prefix).is_some_and(|t| t.text == "pub") {
+                    prefix += 1;
+                    if tokens.get(prefix).is_some_and(|t| t.text == "(") {
+                        prefix = group_end(tokens, prefix);
+                    }
+                }
+                let item = tokens.get(prefix).is_some_and(|t| {
+                    matches!(
+                        t.text,
+                        "fn" | "mod"
+                            | "use"
+                            | "impl"
+                            | "struct"
+                            | "enum"
+                            | "const"
+                            | "static"
+                            | "type"
+                            | "trait"
+                            | "extern"
+                            | "async"
+                            | "unsafe"
+                            | "macro_rules"
+                    )
+                });
                 while i < tokens.len() {
                     let text = tokens[i].text;
+                    if matches!(text, ")" | "]" | "}") {
+                        break;
+                    }
                     i = group_end(tokens, i);
-                    if text == "{" || text == ";" {
+                    if text == ";" || (item && text == "{") || (!item && text == ",") {
                         break;
                     }
                 }
@@ -925,8 +1193,29 @@ fn cli_file_problems(file: &str, text: &str) -> Vec<String> {
         .find(|(f, _)| *f == file)
         .map(|(_, names)| *names);
     for (i, token) in tokens.iter().enumerate().filter(|(_, t)| !t.literal) {
+        if token.text == "use" {
+            let end = (i + 1..tokens.len())
+                .find(|&j| tokens[j].text == ";")
+                .unwrap_or(tokens.len());
+            let import = &tokens[i + 1..end];
+            let mut begin = i;
+            while begin > 0 && !matches!(tokens[begin - 1].text, ";" | "{" | "}") {
+                begin -= 1;
+            }
+            let visible = tokens[begin..i].iter().any(|t| t.text == "pub");
+            let renamed = import.iter().any(|t| t.text == "as");
+            let exception = file == "commands/init.rs"
+                && same_tokens(
+                    &tokens[begin..end],
+                    &rust_tokens("pub use orch_daemon::InitOutcome"),
+                );
+            if import.iter().any(|t| t.text == "orch_daemon") && (visible || renamed) && !exception
+            {
+                problems.push(format!("crates/orch-cli/src/{file}:{}: bootstrap use visibility or alias is unreviewed (CLI_DAEMON_SITES)", token.line));
+            }
+        }
         if ["orch_infra", "orch_engine", "orch_peer"].contains(&token.text) {
-            problems.push(format!("crates/orch-cli/src/{file}:{}: production owner import `{}` is forbidden (CLI_SOURCE_SITES)", token.line, token.text));
+            problems.push(format!("crates/orch-cli/src/{file}:{}: production owner import `{}` is forbidden (CLI_DAEMON_SITES: no production owner imports)", token.line, token.text));
         }
         if token.text == "orch_daemon" {
             let symbol = tokens.get(i + 3).map(|t| t.text);
@@ -1055,6 +1344,14 @@ fn bootstrap_contracts(repo_root: &Path) -> Result<Vec<String>> {
     for (file, contract) in [
         (
             "bootstrap.rs",
+            "pub struct InitOptions { pub project_root: PathBuf, pub name: Option<String>, pub adapter: Option<String>, pub prompt_mode: Option<orch_domain::PromptMode>, pub interactive: bool, }",
+        ),
+        (
+            "lifecycle.rs",
+            "pub struct StartOptions { pub project_root: PathBuf, pub socket: Option<PathBuf>, pub detach: bool, pub dispatch: DispatchMode, pub from_agent: bool, pub listen: Option<String>, pub peer_name: Option<String>, }",
+        ),
+        (
+            "bootstrap.rs",
             "pub async fn initialize(options: InitOptions) -> std::result::Result<InitOutcome, DaemonError>",
         ),
         (
@@ -1119,6 +1416,201 @@ fn bootstrap_contracts(repo_root: &Path) -> Result<Vec<String>> {
             {
                 problems.push(format!("crates/orch-daemon/src/{file}:{}: unreviewed public bootstrap function or method; no store/engine escape or generic execution facade", token.line));
             }
+        }
+    }
+    problems.extend(bootstrap_impls(repo_root)?);
+    Ok(problems)
+}
+
+/// Every daemon type named by CLI_DAEMON_SITES, plus PreparedStart returned
+/// by prepare_start. No source module may add an unreviewed implementation.
+const BOOTSTRAP_TYPES: &[&str] = &[
+    "InitOutcome",
+    "InitOptions",
+    "StartOptions",
+    "DaemonExit",
+    "PreparedStart",
+    "DispatchMode",
+    "DaemonError",
+];
+const BOOTSTRAP_IMPLS: &[(&str, &str, &[&str])] = &[
+    (
+        "lifecycle.rs",
+        "impl DaemonExit",
+        &["pub const CLEAN: DaemonExit"],
+    ),
+    (
+        "lifecycle.rs",
+        "impl PreparedStart",
+        &[
+            "pub async fn run(mut self) -> Result<DaemonExit, DaemonError>",
+            "fn bring_up(self) -> BringUp",
+        ],
+    ),
+    (
+        "error.rs",
+        "impl DaemonError",
+        &["pub fn exit_code(&self) -> i32"],
+    ),
+    (
+        "error.rs",
+        "impl From<&DaemonError> for ErrorBody",
+        &["fn from(error: &DaemonError) -> Self"],
+    ),
+];
+
+/// Follow explicit type/import aliases before inspecting impl headers. Rust
+/// permits inherent impls through aliases; a spelling change grants no API.
+fn bootstrap_type_aliases(sources: &[(String, String)]) -> BTreeMap<String, String> {
+    let mut aliases: BTreeMap<_, _> = BOOTSTRAP_TYPES
+        .iter()
+        .map(|t| (t.to_string(), t.to_string()))
+        .collect();
+    loop {
+        let before = aliases.clone();
+        for (_, text) in sources {
+            let tokens = rust_tokens(text);
+            for (i, token) in tokens.iter().enumerate().filter(|(_, t)| !t.literal) {
+                if token.text == "type" && tokens.get(i + 2).is_some_and(|t| t.text == "=") {
+                    let end = (i + 3..tokens.len())
+                        .find(|&j| tokens[j].text == ";")
+                        .unwrap_or(tokens.len());
+                    if let Some(target) = tokens[i + 3..end].iter().find_map(|t| before.get(t.text))
+                    {
+                        aliases
+                            .entry(tokens[i + 1].text.to_owned())
+                            .or_insert_with(|| target.clone());
+                    }
+                }
+                if token.text == "as"
+                    && i > 0
+                    && let Some(target) = before.get(tokens[i - 1].text)
+                    && let Some(alias) = tokens.get(i + 1)
+                {
+                    aliases
+                        .entry(alias.text.to_owned())
+                        .or_insert_with(|| target.clone());
+                }
+            }
+        }
+        if before == aliases {
+            return aliases;
+        }
+    }
+}
+
+fn bootstrap_impls(repo_root: &Path) -> Result<Vec<String>> {
+    let src = repo_root.join("crates/orch-daemon/src");
+    let mut files = Vec::new();
+    collect_rust_files(&src, &mut files)?;
+    let sources: Vec<_> = files
+        .iter()
+        .map(|file| {
+            Ok((
+                file.strip_prefix(&src)?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+                std::fs::read_to_string(file)?,
+            ))
+        })
+        .collect::<Result<_>>()?;
+    let aliases = bootstrap_type_aliases(&sources);
+    let mut seen = BTreeSet::new();
+    let mut problems = Vec::new();
+    for (relative, text) in &sources {
+        let tokens = rust_tokens(text);
+        for (i, token) in tokens.iter().enumerate().filter(|(_, t)| !t.literal) {
+            if token.text == "struct"
+                && tokens.get(i + 1).is_some_and(|t| t.text == "PreparedStart")
+            {
+                let body = (i + 2..tokens.len()).find(|&j| tokens[j].text == "{");
+                if let Some(body) = body
+                    && tokens[body + 1..group_end(&tokens, body).saturating_sub(1)]
+                        .iter()
+                        .any(|t| !t.literal && t.text == "pub")
+                {
+                    problems.push(format!("crates/orch-daemon/src/{relative}:{}: bootstrap type boundary changed: PreparedStart must have no pub field", token.line));
+                }
+            }
+            if token.text != "impl" {
+                continue;
+            }
+            // An impl Trait argument/return is not an implementation block.
+            if i > 0
+                && !matches!(
+                    tokens[i - 1].text,
+                    ";" | "{" | "}" | "]" | "unsafe" | "default"
+                )
+            {
+                continue;
+            }
+            let Some(body) = (i + 1..tokens.len()).find(|&j| tokens[j].text == "{") else {
+                continue;
+            };
+            let header = &tokens[i..body];
+            let types: BTreeSet<_> = header
+                .iter()
+                .filter(|t| !t.literal)
+                .filter_map(|t| aliases.get(t.text))
+                .collect();
+            if types.is_empty() {
+                continue;
+            }
+            let end = group_end(&tokens, body).saturating_sub(1);
+            let mut members = Vec::new();
+            let mut signatures = Vec::new();
+            let mut next = body + 1;
+            while next < end {
+                let begin = next;
+                let mut member = None;
+                let mut signature_end = None;
+                while next < end {
+                    if matches!(tokens[next].text, "fn" | "const" | "type")
+                        && let Some(name) = tokens.get(next + 1)
+                    {
+                        member = Some(format!("{} {}", tokens[next].text, name.text));
+                    }
+                    let text = tokens[next].text;
+                    if matches!(text, "{" | ";" | "=") && signature_end.is_none() {
+                        signature_end = Some(next);
+                    }
+                    next = group_end(&tokens, next);
+                    if matches!(text, "{" | ";") {
+                        break;
+                    }
+                }
+                members.push(
+                    member.unwrap_or_else(|| format!("unreviewed member {}", tokens[begin].text)),
+                );
+                signatures.push(&tokens[begin..signature_end.unwrap_or(next)]);
+                if next < end && tokens[next].text == ";" {
+                    next += 1;
+                }
+            }
+            let entry = BOOTSTRAP_IMPLS
+                .iter()
+                .enumerate()
+                .find(|(_, (file, expected, _))| {
+                    file == relative && same_tokens(header, &rust_tokens(expected))
+                });
+            if let Some((index, (_, _, expected))) = entry
+                && seen.insert(index)
+                && signatures.len() == expected.len()
+                && signatures
+                    .iter()
+                    .zip(*expected)
+                    .all(|(got, expected)| same_tokens(got, &rust_tokens(expected)))
+            {
+                continue;
+            }
+            problems.push(format!("crates/orch-daemon/src/{relative}:{}: unreviewed impl/method on bootstrap type(s) {}: [{}] (BOOTSTRAP_IMPLS)", token.line, types.into_iter().map(String::as_str).collect::<Vec<_>>().join(", "), members.join(", ")));
+        }
+    }
+    for (i, (file, header, _)) in BOOTSTRAP_IMPLS.iter().enumerate() {
+        if !seen.contains(&i) {
+            problems.push(format!(
+                "crates/orch-daemon/src/{file}: stale BOOTSTRAP_IMPLS entry `{header}`"
+            ));
         }
     }
     Ok(problems)
@@ -1215,6 +1707,7 @@ mod tests {
                             rename: None,
                             target: None,
                             optional: false,
+                            uses_default_features: true,
                             features: vec![],
                         })
                         .collect(),
@@ -1229,6 +1722,7 @@ mod tests {
                     rename: None,
                     target: None,
                     optional: false,
+                    uses_default_features: true,
                     features: match *dep {
                         "orch-core" => vec!["test-support".into()],
                         "orch-daemon" => vec!["testing".into()],
@@ -1254,6 +1748,7 @@ mod tests {
                             rename: (variant == 1).then(|| "harmless".into()),
                             target: (variant == 2).then(|| "cfg(target_os = \"none\")".into()),
                             optional: variant == 3,
+                            uses_default_features: true,
                             features: vec![],
                         });
                         let problems = graph_problems(&actual).join("\n");
@@ -1285,7 +1780,7 @@ mod tests {
     #[test]
     fn metadata_keeps_inactive_declared_edge_identity_and_unprefixed_members() {
         let metadata = serde_json::json!({"workspace_members":["cli", "helper"], "packages":[
-            {"id":"cli", "name":"orch-cli", "dependencies":[{"name":"helper", "kind":"build", "rename":"innocent", "target":"cfg(no_such_target)", "optional":true, "features":["testing"]}]},
+            {"id":"cli", "name":"orch-cli", "dependencies":[{"name":"helper", "kind":"build", "rename":"innocent", "target":"cfg(no_such_target)", "optional":true, "uses_default_features":false, "features":["testing"]}]},
             {"id":"helper", "name":"helper", "dependencies":[]},
             {"id":"external", "name":"external", "dependencies":[]}
         ]});
@@ -1295,6 +1790,7 @@ mod tests {
         assert_eq!(edge.rename.as_deref(), Some("innocent"));
         assert_eq!(edge.target.as_deref(), Some("cfg(no_such_target)"));
         assert!(edge.optional);
+        assert!(!edge.uses_default_features);
         assert_eq!(edge.features, ["testing"]);
         assert!(!actual.contains_key("external"));
         assert!(
@@ -1313,6 +1809,7 @@ mod tests {
             rename: None,
             target: None,
             optional: false,
+            uses_default_features: true,
             features: vec![],
         });
         actual.insert(
@@ -1323,6 +1820,7 @@ mod tests {
                 rename: None,
                 target: None,
                 optional: false,
+                uses_default_features: true,
                 features: vec![],
             }],
         );
@@ -1395,7 +1893,8 @@ mod tests {
             ] {
                 let problems = cli_file_problems(file, text).join("\n");
                 assert!(
-                    problems.contains(file) && problems.contains("CLI_SOURCE_SITES"),
+                    problems.contains(file)
+                        && problems.contains("CLI_DAEMON_SITES: no production owner imports"),
                     "{text}: {problems}"
                 );
             }
@@ -1545,7 +2044,7 @@ mod tests {
             .join("crates/orch-daemon/src");
         let dest = fixture.0.join("crates/orch-daemon/src");
         std::fs::create_dir_all(&dest).unwrap();
-        for file in ["bootstrap.rs", "lifecycle.rs", "discovery.rs"] {
+        for file in ["bootstrap.rs", "lifecycle.rs", "discovery.rs", "error.rs"] {
             std::fs::copy(src.join(file), dest.join(file)).unwrap();
         }
         assert!(bootstrap_contracts(&fixture.0).unwrap().is_empty());
@@ -1590,6 +2089,333 @@ mod tests {
         }
     }
 
+    // Reverting the element bound must expose each following production use.
+    #[test]
+    fn cfg_test_fields_and_match_arms_do_not_hide_production_references() {
+        for text in [
+            "struct S { #[cfg(test)] hidden: u8, value: u8 } fn f() { orch_daemon::initialize(o); }",
+            "struct S { #[cfg(test)] pub hidden: u8, value: u8 } fn f() { orch_daemon::initialize(o); }",
+            "fn f() { S { #[cfg(test)] hidden: 1, value: { orch_infra::Paths; 2 } }; }",
+            "fn f() { match n { #[cfg(test)] 0 => 0, _ => { orch_infra::Paths; 1 } } }",
+            "struct S { #[cfg(test)] hidden: u8 } fn f() { orch_daemon::initialize(o); }",
+        ] {
+            let problems = cli_file_problems("commands/task.rs", text).join("\n");
+            assert!(
+                problems.contains("production owner import")
+                    || problems.contains("CLI_DAEMON_SITES"),
+                "{text}: {problems}"
+            );
+        }
+        for text in [
+            "#[cfg(test)] pub async fn f() -> Result<(), E> { orch_infra::Paths; }",
+            "#[cfg(test)] impl<T, E> Trait<T, E> for S { fn f() { orch_infra::Paths; } }",
+        ] {
+            assert!(cli_file_problems("lib.rs", text).is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn site_imports_cannot_reexport_or_rename_the_bootstrap_api() {
+        for text in [
+            "pub use orch_daemon::initialize;",
+            "pub(crate) use orch_daemon::initialize;",
+            "pub(in crate::commands) use orch_daemon::initialize;",
+            "use orch_daemon::initialize as local_init;",
+            "pub use orch_daemon::InitOutcome as Outcome;",
+            "pub use ::orch_daemon::initialize as local_init;",
+        ] {
+            let problems = cli_file_problems("commands/init.rs", text).join("\n");
+            assert!(problems.contains("CLI_DAEMON_SITES"), "{text}: {problems}");
+        }
+        assert!(
+            cli_file_problems("commands/init.rs", "pub use orch_daemon::InitOutcome;").is_empty()
+        );
+        assert!(cli_file_problems("commands/init.rs", "use orch_daemon::initialize;").is_empty());
+    }
+
+    fn daemon_fixture() -> SourceFixture {
+        let fixture = SourceFixture::new();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("crates/orch-daemon/src");
+        let dest = fixture.0.join("crates/orch-daemon/src");
+        std::fs::create_dir_all(&dest).unwrap();
+        for file in ["bootstrap.rs", "lifecycle.rs", "discovery.rs", "error.rs"] {
+            std::fs::copy(src.join(file), dest.join(file)).unwrap();
+        }
+        fixture
+    }
+
+    #[test]
+    fn bootstrap_impls_are_checked_across_the_entire_daemon_source_tree() {
+        let fixture = daemon_fixture();
+        assert!(bootstrap_contracts(&fixture.0).unwrap().is_empty());
+        let extra = fixture.0.join("crates/orch-daemon/src/nested");
+        std::fs::create_dir(&extra).unwrap();
+        for text in [
+            "impl InitOutcome { pub fn local_tasks() -> Store { todo!() } }",
+            "impl crate::InitOutcome { pub fn local_tasks() -> Store { todo!() } }",
+            "impl<T> AsRef<T> for InitOutcome { fn local_tasks(&self) -> &T { todo!() } }",
+            "impl InitOutcome {}",
+            "#[cfg(test)] impl InitOutcome { fn local_tasks() {} }",
+            "type Outcome = InitOutcome; impl Outcome { fn local_tasks() -> Store { todo!() } }",
+            "use crate::InitOutcome as Outcome; impl Outcome { fn local_tasks() -> Store { todo!() } }",
+            "impl StartOptions { fn local_tasks() -> Store { todo!() } }",
+            "impl InitOptions { fn local_tasks() -> Store { todo!() } }",
+            "impl DispatchMode { fn local_tasks() -> Store { todo!() } }",
+            "impl DaemonExit { fn local_tasks() -> Store { todo!() } }",
+            "impl DaemonError { fn local_tasks() -> Store { todo!() } }",
+            "impl PreparedStart { fn local_tasks() -> Store { todo!() } }",
+        ] {
+            std::fs::write(extra.join("escape.rs"), text).unwrap();
+            let problems = bootstrap_contracts(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("BOOTSTRAP_IMPLS") && problems.contains("escape.rs"),
+                "{text}: {problems}"
+            );
+            if text.contains("local_tasks") {
+                assert!(problems.contains("local_tasks"), "{problems}");
+            }
+        }
+        std::fs::remove_file(extra.join("escape.rs")).unwrap();
+        let file = fixture.0.join("crates/orch-daemon/src/lifecycle.rs");
+        let original = std::fs::read_to_string(&file).unwrap();
+        std::fs::write(
+            &file,
+            original.replacen(
+                "impl PreparedStart {",
+                "impl PreparedStart { pub fn local_tasks() {}",
+                1,
+            ),
+        )
+        .unwrap();
+        assert!(
+            bootstrap_contracts(&fixture.0)
+                .unwrap()
+                .join("\n")
+                .contains("local_tasks")
+        );
+    }
+
+    #[test]
+    fn bootstrap_options_are_exact_and_prepared_start_fields_stay_private() {
+        let fixture = daemon_fixture();
+        for (file, old, new) in [
+            (
+                "lifecycle.rs",
+                "pub struct PreparedStart {",
+                "pub struct PreparedStart { pub engine: Arc<orch_engine::Container>,",
+            ),
+            (
+                "lifecycle.rs",
+                "pub struct StartOptions {",
+                "pub struct StartOptions { pub on_ready: Option<Box<dyn FnOnce(&dyn Any) + Send>>,",
+            ),
+            (
+                "bootstrap.rs",
+                "pub struct InitOptions {",
+                "pub struct InitOptions { pub store: Store,",
+            ),
+        ] {
+            let path = fixture.0.join("crates/orch-daemon/src").join(file);
+            let original = std::fs::read_to_string(&path).unwrap();
+            assert!(original.contains(old));
+            std::fs::write(&path, original.replacen(old, new, 1)).unwrap();
+            let problems = bootstrap_contracts(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("bootstrap type boundary changed"),
+                "{new}: {problems}"
+            );
+            std::fs::write(&path, original).unwrap();
+        }
+    }
+
+    fn feature_fixture(kind: &str, defaults: bool, daemon_features: Value) -> Value {
+        serde_json::json!({"workspace_members":["cli", "daemon", "core"], "packages":[
+            {"id":"cli", "name":"orch-cli", "features":{}, "dependencies":[
+                {"name":"orch-daemon", "kind":kind, "uses_default_features":defaults, "features":[]}]},
+            {"id":"daemon", "name":"orch-daemon", "features":daemon_features, "dependencies":[
+                {"name":"orch-core", "kind":null, "uses_default_features":true, "features":[]}]},
+            {"id":"core", "name":"orch-core", "features":{"test-support":[]}, "dependencies":[]}
+        ]})
+    }
+
+    #[test]
+    fn selected_default_and_local_alias_features_cannot_enable_test_apis() {
+        for kind in ["normal", "build"] {
+            for features in [
+                serde_json::json!({"default":["testing"], "testing":[]}),
+                serde_json::json!({"default":["fixture-alias"], "fixture-alias":["testing"], "testing":[]}),
+            ] {
+                let metadata = feature_fixture(kind, true, features);
+                let problems = promoted_test_features(&metadata).join("\n");
+                assert!(
+                    problems.contains("orch-cli") && problems.contains("orch-daemon/testing"),
+                    "{kind}: {problems}"
+                );
+            }
+        }
+        assert!(
+            promoted_test_features(&feature_fixture(
+                "dev",
+                true,
+                serde_json::json!({"default":["testing"], "testing":[]})
+            ))
+            .is_empty()
+        );
+        let mut metadata = feature_fixture(
+            "normal",
+            false,
+            serde_json::json!({"default":["testing"], "fixture-alias":["testing"], "testing":[]}),
+        );
+        assert!(promoted_test_features(&metadata).is_empty());
+        metadata["packages"][0]["dependencies"][0]["features"] =
+            serde_json::json!(["fixture-alias"]);
+        assert!(
+            promoted_test_features(&metadata)
+                .join("\n")
+                .contains("orch-daemon/testing")
+        );
+        metadata["packages"][0]["dependencies"][0]["features"] = serde_json::json!([]);
+        metadata["packages"][2]["features"]["default"] = serde_json::json!(["test-support"]);
+        assert!(
+            promoted_test_features(&metadata)
+                .join("\n")
+                .contains("orch-core/test-support")
+        );
+    }
+
+    #[test]
+    fn owner_default_forwarding_cannot_select_a_dependency_test_alias() {
+        let mut metadata = feature_fixture(
+            "normal",
+            false,
+            serde_json::json!({"bridge":["testing"], "testing":[]}),
+        );
+        metadata["packages"][0]["features"] =
+            serde_json::json!({"default":["forward"], "forward":["orch-daemon/bridge"]});
+        let problems = promoted_test_features(&metadata).join("\n");
+        assert!(
+            problems.contains("orch-cli") && problems.contains("orch-daemon/testing"),
+            "{problems}"
+        );
+        metadata["packages"][0]["dependencies"][0]["kind"] = serde_json::json!("dev");
+        assert!(promoted_test_features(&metadata).is_empty());
+    }
+
+    #[test]
+    fn selected_feature_closure_follows_aliases_and_weak_dependency_forwarding() {
+        for forwarding in ["ports/bridge", "ports?/bridge"] {
+            let mut metadata = feature_fixture(
+                "normal",
+                true,
+                serde_json::json!({
+                    "default":["cycle"], "cycle":["next"], "next":["cycle", forwarding]
+                }),
+            );
+            metadata["packages"][1]["dependencies"][0]["rename"] = serde_json::json!("ports");
+            metadata["packages"][2]["features"]["bridge"] = serde_json::json!(["test-support"]);
+            let problems = promoted_test_features(&metadata).join("\n");
+            assert!(
+                problems.contains("orch-core/test-support"),
+                "{forwarding}: {problems}"
+            );
+            let edges = workspace_edges(&metadata).unwrap();
+            let selected = selected_workspace_features(&metadata, &edges, &edges["orch-cli"][0]);
+            assert!(selected["orch-core"].contains("test-support"));
+        }
+        let mut metadata = feature_fixture(
+            "normal",
+            true,
+            serde_json::json!({"default":["ports?/bridge"]}),
+        );
+        metadata["packages"][1]["dependencies"][0]["rename"] = serde_json::json!("ports");
+        metadata["packages"][1]["dependencies"][0]["optional"] = serde_json::json!(true);
+        metadata["packages"][2]["features"]["bridge"] = serde_json::json!(["test-support"]);
+        let edges = workspace_edges(&metadata).unwrap();
+        let selected = selected_workspace_features(&metadata, &edges, &edges["orch-cli"][0]);
+        assert!(
+            !selected.contains_key("orch-core"),
+            "weak forwarding must not activate an optional dependency"
+        );
+        metadata["packages"][1]["features"]["default"] =
+            serde_json::json!(["ports?/bridge", "dep:ports"]);
+        let edges = workspace_edges(&metadata).unwrap();
+        let selected = selected_workspace_features(&metadata, &edges, &edges["orch-cli"][0]);
+        assert!(selected["orch-core"].contains("test-support"));
+    }
+
+    #[test]
+    fn boundary_code_loading_is_literal_and_inside_the_scanned_source_root() {
+        let fixture = SourceFixture::new();
+        fixture.write("shared.rs", "fn shared() {}");
+        fixture.write("shared.txt", "fn unscanned() {}");
+        std::fs::write(fixture.0.join("crates/outside.rs"), "fn outside() {}").unwrap();
+        for text in [
+            "include!(concat!(env!(\"OUT_DIR\"), \"/client_generated.rs\"));",
+            "include!(concat!(\"../mcp/test\", \"ing.rs\"));",
+            "include!(\"../../outside.rs\");",
+            "#[path = concat!(env!(\"OUT_DIR\"), \"/client.rs\")] mod generated;",
+            "#[path = \"../../outside.rs\"] mod generated;",
+            "include!(\"missing.rs\");",
+            "include!(\"shared.txt\");",
+        ] {
+            fixture.write("generated.rs", text);
+            let problems = boundary_source_loading(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("BOUNDARY_SOURCE_LOADING") && problems.contains("generated.rs"),
+                "{text}: {problems}"
+            );
+        }
+        for text in [
+            "include!(\"shared.rs\");",
+            "#[path = \"shared.rs\"] mod shared;",
+            "include!(r#\"shared.rs\"#);",
+            "include_str!(concat!(env!(\"OUT_DIR\"), \"/asset\")); include_bytes!(\"asset\");",
+            "#[cfg(test)] mod tests { include!(concat!(env!(\"OUT_DIR\"), \"/test.rs\")); }",
+        ] {
+            fixture.write("generated.rs", text);
+            assert!(
+                boundary_source_loading(&fixture.0).unwrap().is_empty(),
+                "{text}"
+            );
+        }
+        for name in ["orch-client", "orch-proto", "orch-tui"] {
+            let src = fixture.0.join("crates").join(name).join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(
+                src.join("lib.rs"),
+                "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+            )
+            .unwrap();
+            assert!(
+                boundary_source_loading(&fixture.0)
+                    .unwrap()
+                    .join("\n")
+                    .contains(name)
+            );
+            std::fs::remove_dir_all(src).unwrap();
+        }
+    }
+
+    #[test]
+    fn boundary_custom_build_targets_require_an_exact_reviewed_entry() {
+        for name in ["orch-cli", "orch-client", "orch-proto", "orch-tui"] {
+            let metadata = serde_json::json!({"packages":[{"name":name, "targets":[{"kind":["custom-build"], "src_path":"/fixture/build.rs"}]}]});
+            let problems = boundary_build_targets(&metadata).join("\n");
+            assert!(
+                problems.contains(name) && problems.contains("BOUNDARY_BUILD_TARGETS"),
+                "{problems}"
+            );
+        }
+        assert!(
+            boundary_build_targets(
+                &serde_json::json!({"packages":[{"name":"orch-cli", "targets":[{"kind":["lib"]}]}]})
+            )
+            .is_empty()
+        );
+    }
     #[test]
     fn client_process_features_include_build_target_alias_and_feature_forwarding() {
         let fixture = SourceFixture::new();
