@@ -1,4 +1,4 @@
-//! A capability opt-in may appear only at reviewed definitions/forwarders or
+//! A capability opt-in may appear only at exact reviewed sites or
 //! in the explicitly non-forking test fixtures. No production file wildcard.
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -8,6 +8,7 @@ const SELECTORS: &[&str] = &[
     "with_spawn_domain",
     "isolated_fake_spawns",
     "build_registry_with_clock_and_spawn_domain",
+    "build_registry_with_clock_spawn_domain_and_prompt_directory",
     "build_full_with_children_and_spawn_domain",
     "bring_up_with_spawn_domain",
     "run_with_spawn_domain",
@@ -21,7 +22,7 @@ const TEST_FILES: &[&str] = &[
     "crates/orch-infra/src/process/gate/synthetic_tests.rs",
 ];
 
-// Exact approved production lines, including definitions, imports and default
+// Exact approved lines, including definitions, imports, refusal probes and default
 // forwarding. A duplicate on another line, even in these files, is rejected.
 const PRODUCTION: &[(&str, &[&str])] = &[
     (
@@ -44,13 +45,26 @@ const PRODUCTION: &[(&str, &[&str])] = &[
             "let mut running = Running::bring_up_with_spawn_domain(",
         ],
     ),
+    // This test file is pinned line by line, not a non-forking fixture.
+    // Two sites probe refusals: opting in without a supplied manager, and
+    // offering a synthetic reservation to the default process manager, which
+    // the spawn gate must reject before any child exists. The remaining site
+    // uses an injected non-forking manager.
+    (
+        "crates/orch-daemon/tests/daemon_harness_hermetic.rs",
+        &[
+            ".isolated_fake_spawns()",
+            "let domain = orch_infra::process::gate::SpawnDomain::for_synthetic_processes();",
+            ".isolated_fake_spawns()",
+        ],
+    ),
     (
         "crates/orch-engine/src/container.rs",
         &[
-            "use orch_infra::adapters::registry::build_registry_with_clock_and_spawn_domain;",
+            "use orch_infra::adapters::registry::build_registry_with_clock_spawn_domain_and_prompt_directory;",
             "build_full_with_children_and_spawn_domain(",
             "pub async fn build_full_with_children_and_spawn_domain(",
-            "let adapters = Arc::new(build_registry_with_clock_and_spawn_domain(",
+            "let adapters = Arc::new(build_registry_with_clock_spawn_domain_and_prompt_directory(",
             ".with_spawn_domain(spawn_domain.clone()),",
         ],
     ),
@@ -63,6 +77,8 @@ const PRODUCTION: &[(&str, &[&str])] = &[
         &[
             "build_registry_with_clock_and_spawn_domain(process_manager, clock, Default::default())",
             "pub fn build_registry_with_clock_and_spawn_domain(",
+            "build_registry_with_clock_spawn_domain_and_prompt_directory(",
+            "pub fn build_registry_with_clock_spawn_domain_and_prompt_directory(",
             ".with_spawn_domain(domain),",
         ],
     ),
