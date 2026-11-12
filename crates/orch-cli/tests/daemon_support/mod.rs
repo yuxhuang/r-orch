@@ -51,6 +51,14 @@ impl Sandbox {
         Sandbox { project, short }
     }
 
+    /// Keep the default in-project socket short regardless of the ambient TMPDIR.
+    pub fn with_short_project_root(mut self) -> Self {
+        let project = tempfile::tempdir_in(self.short_dir()).unwrap();
+        fs::create_dir(project.path().join("home")).unwrap();
+        self.project = project;
+        self
+    }
+
     /// An uninitialised project root (no `.orchestry`).
     pub fn raw_root(&self) -> PathBuf {
         self.project.path().canonicalize().unwrap()
