@@ -56,8 +56,8 @@ pub struct OpPermit {
 impl OpPermit {
     /// Call before a potentially partial write. The coarse subscriber seam
     /// invalidates all views; the push hub may refine this by domain events.
-    pub fn invalidate(&mut self, _store: Store) {
-        self.boundary.mark_changed();
+    pub fn invalidate(&mut self, store: Store) {
+        self.boundary.note_store(crate::hub::engine_store(store));
     }
 }
 

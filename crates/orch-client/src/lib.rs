@@ -16,6 +16,21 @@
 //! };
 //! let task = client.task_get(args::TaskGetArgs { id: Id::new("tsk_1")? }).await?;
 //! ```
+//!
+//! Subscription API (one dedicated observation connection):
+//! `Client::into_subscription(self, SubscribeArgs) -> Result<Subscription, ClientError>`.
+//! Its accessors are `subscription(&self) -> u64`, `instance(&self) -> &Id`, and
+//! `baseline_commit_seq(&self) -> u64`. `next(&mut self) ->
+//! Result<SubscriptionEvent, SubscriptionError>` is cancellation-safe; consuming
+//! `unsubscribe(self) -> Result<(), SubscriptionError>` waits for a correlated ack.
+//! All operations are async except the accessors. Register before fetching views
+//! through a separate ordinary client. The baseline is the subscribe terminal's
+//! commit ordinal, while the first event cursor is 1. A `ResyncRequired` item ends
+//! the handle: invalidate all caches, resubscribe, then refetch. Transport loss is
+//! `SubscriptionError::TransportClosed` and also
+//! requires refetch after reconnect. Dropping a handle closes only observation.
+//! See the `testing` module in debug builds for a compiling scripted-peer example and
+//! exact fake-transport signatures. The fake seam is excluded from release builds.
 #![deny(
     unreachable_pub,
     clippy::unwrap_used,
@@ -26,9 +41,15 @@
 mod api;
 mod call;
 mod discovery;
+mod subscription;
+#[cfg(any(test, debug_assertions))]
+pub mod testing;
 pub use call::{Call, MAX_STREAMED_RESULT_BYTES, Progress};
 pub use discovery::Project;
 pub use orch_proto::error::ConnectFailure as NoDaemon;
+pub use subscription::{
+    Subscription, SubscriptionError, SubscriptionEvent, SubscriptionResyncReason,
+};
 
 use orch_proto::error::{ErrorBody, NoDaemonDetail};
 use orch_proto::frame::limits;

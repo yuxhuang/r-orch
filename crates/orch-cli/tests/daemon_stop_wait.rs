@@ -1,6 +1,8 @@
 //! A successful stop must let the owner start its successor immediately.
 mod daemon_support;
 use daemon_support::{READY, Sandbox, start_ready, text};
+use orch_proto::ops::results::{DaemonStatus, OwnershipStatus};
+use std::process::Output;
 
 #[test]
 fn stop_then_immediate_start_succeeds_five_rounds() {
@@ -45,9 +47,11 @@ fn plain_status_names_ownership_socket_instance_and_running_count() {
     }
     // Removing this owner's PID lock makes the live RPC report LOST.
     std::fs::remove_file(sandbox.state_dir().join("orchestry.lock")).unwrap();
+    // A request already accepted when ownership is lost can be refused once with
+    // `request cancelled before execution`; the next reply must say lost.
+    let mut tolerated_cancellation = false;
     daemon_support::wait_for(READY, "ownership loss", || {
-        (sandbox.status().unwrap().ownership == orch_proto::ops::results::OwnershipStatus::Lost)
-            .then_some(())
+        ownership_loss_probe(&mut tolerated_cancellation, sandbox.status())
     });
     let output = sandbox.run(&["daemon", "status"]);
     assert!(output.status.success(), "{}", text(&output.stderr));
@@ -144,4 +148,161 @@ fn committed_context_set_with_discarded_reply_is_reported_as_unknown() {
     });
     assert!(sandbox.run(&["daemon", "stop"]).status.success());
     assert!(daemon.wait_exit(READY).success());
+}
+
+fn ownership_loss_probe(
+    tolerated_cancellation: &mut bool,
+    result: Result<DaemonStatus, Output>,
+) -> Option<()> {
+    match result {
+        Ok(status) if status.ownership == OwnershipStatus::Lost => Some(()),
+        Ok(status) => {
+            assert!(
+                !*tolerated_cancellation,
+                "expected lost after transition-time cancellation: {status:?}"
+            );
+            None
+        }
+        Err(output)
+            if !*tolerated_cancellation
+                && output.status.code() == Some(1)
+                && output.stdout.is_empty()
+                && output.stderr == "  ✕ request cancelled before execution\n".as_bytes() =>
+        {
+            *tolerated_cancellation = true;
+            eprintln!("tolerated transition-time cancellation while polling ownership loss");
+            None
+        }
+        Err(output) => panic!("unexpected ownership-loss probe: {output:?}"),
+    }
+}
+
+mod ownership_loss_poll_tests {
+    use super::*;
+    use orch_proto::ops::results::DispatchState;
+    use orch_proto::path::WirePath;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    fn status(ownership: OwnershipStatus) -> Result<DaemonStatus, Output> {
+        Ok(DaemonStatus {
+            pid: 1,
+            project_root: WirePath::new("project").unwrap(),
+            socket: WirePath::new("socket").unwrap(),
+            protocol: 1,
+            binary: "test".into(),
+            instance: "instance".into(),
+            executable: WirePath::new("orch").unwrap(),
+            started_at: "2026-01-01T00:00:00Z".into(),
+            dispatch: DispatchState {
+                dispatch_on: false,
+                batch_active: false,
+            },
+            running_tasks: Vec::new(),
+            sessions: 1,
+            session_cap: 1,
+            busy_rejections: 0,
+            ownership,
+            removed_env: Vec::new(),
+        })
+    }
+
+    fn refusal() -> Output {
+        Output {
+            status: ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: "  ✕ request cancelled before execution\n"
+                .as_bytes()
+                .to_vec(),
+        }
+    }
+
+    #[test]
+    fn refusal_then_lost_completes() {
+        let mut tolerated = false;
+        let replies = [Err(refusal()), status(OwnershipStatus::Lost)];
+        let decisions: Vec<_> = replies
+            .into_iter()
+            .map(|reply| ownership_loss_probe(&mut tolerated, reply))
+            .collect();
+        assert_eq!((decisions, tolerated), (vec![None, Some(())], true));
+    }
+
+    #[test]
+    fn held_then_refusal_then_lost_completes() {
+        let mut tolerated = false;
+        let replies = [
+            status(OwnershipStatus::Held),
+            Err(refusal()),
+            status(OwnershipStatus::Lost),
+        ];
+        let decisions: Vec<_> = replies
+            .into_iter()
+            .map(|reply| ownership_loss_probe(&mut tolerated, reply))
+            .collect();
+        assert_eq!((decisions, tolerated), (vec![None, None, Some(())], true));
+    }
+
+    #[test]
+    fn held_then_held_then_lost_completes_without_tolerance() {
+        let mut tolerated = false;
+        let replies = [
+            status(OwnershipStatus::Held),
+            status(OwnershipStatus::Held),
+            status(OwnershipStatus::Lost),
+        ];
+        let decisions: Vec<_> = replies
+            .into_iter()
+            .map(|reply| ownership_loss_probe(&mut tolerated, reply))
+            .collect();
+        assert_eq!((decisions, tolerated), (vec![None, None, Some(())], false));
+    }
+
+    #[test]
+    #[should_panic(expected = "expected lost after transition-time cancellation:")]
+    fn refusal_then_held_fails_immediately() {
+        let mut tolerated = false;
+        ownership_loss_probe(&mut tolerated, Err(refusal()));
+        ownership_loss_probe(&mut tolerated, status(OwnershipStatus::Held));
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected ownership-loss probe: Output")]
+    fn refusal_then_refusal_fails_immediately() {
+        let mut tolerated = false;
+        ownership_loss_probe(&mut tolerated, Err(refusal()));
+        ownership_loss_probe(&mut tolerated, Err(refusal()));
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected ownership-loss probe: Output")]
+    fn exit_seven_fails_immediately() {
+        let mut output = refusal();
+        output.status = ExitStatus::from_raw(7 << 8);
+        ownership_loss_probe(&mut false, Err(output));
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected ownership-loss probe: Output")]
+    fn exit_one_with_other_stderr_fails_immediately() {
+        let mut output = refusal();
+        output.stderr = b"another error\n".to_vec();
+        ownership_loss_probe(&mut false, Err(output));
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected ownership-loss probe: Output")]
+    fn refusal_with_nonempty_stdout_fails_immediately() {
+        let mut output = refusal();
+        output.stdout = b"unexpected output".to_vec();
+        ownership_loss_probe(&mut false, Err(output));
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected ownership-loss probe: Output")]
+    fn signal_status_fails_immediately() {
+        let mut output = refusal();
+        output.status = ExitStatus::from_raw(15);
+        ownership_loss_probe(&mut false, Err(output));
+    }
 }

@@ -13,8 +13,24 @@ use orch_domain::{
 
 use super::{
     AgentFields, AgentOpts, BackendResult, ClipboardPaste, CreateTaskOpts, GoalFields,
-    HistoryEntry, LaunchContext, MessageTarget, ModelCatalog, TaskFields, TuiBackend,
+    HistoryEntry, LaunchContext, MessageTarget, ModelCatalog, Observation, TaskFields, TuiBackend,
 };
+
+/// A recorded state read. Kept apart from [`Call`] so the existing call
+/// assertions are unchanged, and so a test can prove that time alone reads
+/// nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Read {
+    Tasks,
+    Agents,
+    Goals,
+    State,
+    Teams,
+    Timings,
+    PromptMode,
+    PeerStatus,
+    Dispatch,
+}
 
 /// A recorded facade call. Tests assert on this log rather than on side effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,6 +137,25 @@ pub struct FakeBackend {
     pub agent_diagnostics: Vec<String>,
     /// Queued events handed out by the next [`TuiBackend::poll_events`].
     pub pending_events: Vec<OrchestratorEvent>,
+    /// Queued pushes handed out by the next [`TuiBackend::poll_observations`].
+    pub pending_observations: Vec<Observation>,
+    /// Every state read, in order.
+    pub reads: Vec<Read>,
+    /// The commit ordinal a read observes now, as
+    /// [`TuiBackend::last_read_seq`] reports it after the read. `None`
+    /// models a backend that cannot tell.
+    pub commit_seq: Option<u64>,
+    last_read_seq: Option<u64>,
+    /// Pushes queued the moment a given read runs: a change that commits
+    /// while the dashboard is in the middle of a refresh.
+    pub on_read: Vec<(Read, Observation)>,
+    /// The daemon's dispatch switch as [`TuiBackend::refresh_dispatch`]
+    /// reads it; `None` falls back to the launch value. `start_watch` /
+    /// `stop_watch` move it, as `dispatch.set` moves the daemon's.
+    pub dispatch_on: Option<bool>,
+    /// When set, the next read of that kind fails with this message (and is
+    /// still recorded). Separate from `fail_next`, which reads never consume.
+    pub fail_read: Option<(Read, String)>,
     pub pending_history: Vec<Vec<HistoryEntry>>,
     pub pending_catalog: Option<ModelCatalog>,
     pub pending_update: Option<String>,
@@ -198,6 +233,13 @@ impl FakeBackend {
             calls: Vec::new(),
             agent_diagnostics: Vec::new(),
             pending_events: Vec::new(),
+            pending_observations: Vec::new(),
+            reads: Vec::new(),
+            commit_seq: None,
+            last_read_seq: None,
+            on_read: Vec::new(),
+            dispatch_on: None,
+            fail_read: None,
             pending_history: Vec::new(),
             pending_catalog: None,
             pending_update: None,
@@ -270,6 +312,32 @@ impl FakeBackend {
         let id = format!("{prefix}_{:03}", self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// How many reads of `kind` were made.
+    pub fn read_count(&self, kind: Read) -> usize {
+        self.reads.iter().filter(|r| **r == kind).count()
+    }
+
+    /// Record a read: its ordinal, and any push scripted to land meanwhile.
+    /// A failed read observes nothing.
+    fn record_read(&mut self, kind: Read) -> BackendResult<()> {
+        self.reads.push(kind);
+        if self.fail_read.as_ref().is_some_and(|(k, _)| *k == kind) {
+            let (_, error) = self.fail_read.take().expect("checked above");
+            return Err(error);
+        }
+        self.last_read_seq = self.commit_seq;
+        let mut index = 0;
+        while index < self.on_read.len() {
+            if self.on_read[index].0 == kind {
+                let (_, observation) = self.on_read.remove(index);
+                self.pending_observations.push(observation);
+            } else {
+                index += 1;
+            }
+        }
+        Ok(())
     }
 
     fn check_failure(&mut self) -> BackendResult<()> {
@@ -424,22 +492,27 @@ impl TuiBackend for FakeBackend {
     }
 
     fn refresh_tasks(&mut self) -> BackendResult<Vec<Task>> {
+        self.record_read(Read::Tasks)?;
         Ok(self.tasks.clone())
     }
 
     fn refresh_agents(&mut self) -> BackendResult<Vec<Agent>> {
+        self.record_read(Read::Agents)?;
         Ok(self.agents.clone())
     }
 
     fn refresh_goals(&mut self) -> BackendResult<Vec<Goal>> {
+        self.record_read(Read::Goals)?;
         Ok(self.goals.clone())
     }
 
     fn refresh_state(&mut self) -> BackendResult<OrchestratorState> {
+        self.record_read(Read::State)?;
         Ok(self.state.clone())
     }
 
     fn list_teams(&mut self) -> BackendResult<Vec<Team>> {
+        self.record_read(Read::Teams)?;
         Ok(self.teams.clone())
     }
 
@@ -450,6 +523,7 @@ impl TuiBackend for FakeBackend {
         orch_state: Option<&OrchestratorState>,
         now_ms: i64,
     ) -> BackendResult<super::TimingSnapshot> {
+        self.record_read(Read::Timings)?;
         if let Some(error) = &self.timings_error {
             return Err(error.clone());
         }
@@ -784,6 +858,7 @@ impl TuiBackend for FakeBackend {
     }
 
     fn peer_status(&mut self) -> BackendResult<String> {
+        self.record_read(Read::PeerStatus)?;
         Ok(self
             .peer_status
             .clone()
@@ -824,12 +899,16 @@ impl TuiBackend for FakeBackend {
 
     fn start_watch(&mut self) -> BackendResult<()> {
         self.calls.push(Call::StartWatch);
-        self.check_failure()
+        self.check_failure()?;
+        self.dispatch_on = Some(true);
+        Ok(())
     }
 
     fn stop_watch(&mut self) -> BackendResult<()> {
         self.calls.push(Call::StopWatch);
-        self.check_failure()
+        self.check_failure()?;
+        self.dispatch_on = Some(false);
+        Ok(())
     }
 
     fn save_palette(&mut self, palette: TuiPaletteName) -> BackendResult<()> {
@@ -853,7 +932,19 @@ impl TuiBackend for FakeBackend {
     }
 
     fn project_prompt_mode(&mut self) -> BackendResult<orch_domain::PromptMode> {
+        self.record_read(Read::PromptMode)?;
         Ok(self.prompt_mode)
+    }
+
+    fn last_read_seq(&self) -> Option<u64> {
+        self.last_read_seq
+    }
+
+    fn refresh_dispatch(&mut self) -> BackendResult<bool> {
+        self.record_read(Read::Dispatch)?;
+        Ok(self
+            .dispatch_on
+            .unwrap_or(self.context.initial_watch_active))
     }
 
     /// Records the request and holds it pending until the test calls
@@ -887,6 +978,10 @@ impl TuiBackend for FakeBackend {
 
     fn poll_events(&mut self) -> Vec<OrchestratorEvent> {
         std::mem::take(&mut self.pending_events)
+    }
+
+    fn poll_observations(&mut self) -> Vec<Observation> {
+        std::mem::take(&mut self.pending_observations)
     }
 
     fn poll_history(&mut self) -> Vec<Vec<HistoryEntry>> {

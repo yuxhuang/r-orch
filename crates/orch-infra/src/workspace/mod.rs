@@ -66,8 +66,19 @@ pub(crate) async fn run(
     command: &str,
     args: &[String],
 ) -> Result<Captured, String> {
-    let reservation =
-        crate::process::gate::reserve_spawn(crate::process::gate::SpawnSite::Workspace).await;
+    run_with_spawn_domain(pm, cwd, command, args, &Default::default()).await
+}
+
+pub(crate) async fn run_with_spawn_domain(
+    pm: &dyn ProcessManager,
+    cwd: &Path,
+    command: &str,
+    args: &[String],
+    domain: &crate::process::gate::SpawnDomain,
+) -> Result<Captured, String> {
+    let reservation = domain
+        .reserve(crate::process::gate::SpawnSite::Workspace)
+        .await;
     let child = reservation.run(|| {
         pm.spawn(
             command,
@@ -102,8 +113,18 @@ pub(crate) async fn run_for_code(
     command: &str,
     args: &[&str],
 ) -> i32 {
+    run_for_code_with_spawn_domain(pm, cwd, command, args, &Default::default()).await
+}
+
+pub(crate) async fn run_for_code_with_spawn_domain(
+    pm: &dyn ProcessManager,
+    cwd: &Path,
+    command: &str,
+    args: &[&str],
+    domain: &crate::process::gate::SpawnDomain,
+) -> i32 {
     let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
-    match run(pm, cwd, command, &args).await {
+    match run_with_spawn_domain(pm, cwd, command, &args, domain).await {
         Ok(captured) => captured.code,
         Err(error) => {
             tracing::debug!(command, %error, "spawn failed");

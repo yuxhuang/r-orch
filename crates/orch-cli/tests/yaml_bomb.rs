@@ -158,8 +158,8 @@ fn run_sampling_daemon_rss(
                     let _ = child.wait();
                     panic!(
                         "the client never got a response within {budget:?} — daemon peak RSS \
-                         {} MiB. This is the C0 failure: the daemon keeps allocating and the \
-                         request that hit the bomb never completes.",
+                         {} MiB. A bomb read must finish and leave the daemon responsive \
+                         to later requests.",
                         peak_kib / 1024
                     );
                 }
@@ -288,37 +288,41 @@ fn task_show_prints_markdown_in_a_literal_block_scalar() {
     }
 }
 
-/// S2a-cli: `orchestry.lock` is now the daemon's own single-instance marker
-/// (`crates/orch-daemon/src/guard.rs`), held for the daemon's whole
-/// lifetime — not a transient per-command lock a *client* could strand by
-/// hitting the bomb mid-read. With an explicit test daemon running (required
-/// for `status` to work at all under S2a-cli), the file exists throughout for
-/// reasons unrelated to this test, so the original "a refused read leaves no
-/// lock behind" assertion is now unconditionally false and proves nothing.
-///
-/// The regression this guarded — a rejected read wedging the thing that was
-/// holding the lock — plausibly still matters, but now as "the daemon stays
-/// responsive after refusing a bomb", which needs a decision on how to probe
-/// a specific RPC connection's health (a follow-up request on the same
-/// daemon, once its config is restored to something readable?) rather than a
-/// file-existence check.
+/// The daemon owns `orchestry.lock` for its lifetime. A refused read must
+/// release the operation lane, so the same daemon can read and write again.
 #[test]
-#[ignore = "S2a-cli: orchestry.lock is now the daemon's permanent single-instance \
-            marker, not a transient per-command lock; the file existing while a test \
-            daemon runs is expected and no longer signals a stranded lock. Needs a \
-            decision on what \"the daemon stays healthy after refusing a bomb\" should \
-            assert instead."]
-fn refusing_a_bomb_leaves_no_lock_behind() {
+fn refusing_a_bomb_leaves_the_same_daemon_responsive_to_reads_and_writes() {
     let project = project();
-    std::fs::write(project.path().join(".orchestry/config.yml"), shape_d()).unwrap();
+    let config_path = project.path().join(".orchestry/config.yml");
+    let config = std::fs::read(&config_path).unwrap();
+    let daemon_pid = project.daemon.pid();
+    std::fs::write(&config_path, shape_d()).unwrap();
 
     let mut command = orch(project.path());
     command.arg("status");
-    let (code, _, _) =
-        run_sampling_daemon_rss(&mut command, project.daemon.pid(), Duration::from_secs(20));
-    assert_eq!(code, Some(1));
-    assert!(
-        !project.path().join(".orchestry/orchestry.lock").exists(),
-        "a refused read must not strand the lock"
-    );
+    let (code, _, _) = run_sampling_daemon_rss(&mut command, daemon_pid, Duration::from_secs(20));
+    assert_eq!(code, Some(1), "the planted bomb must be refused");
+    std::fs::write(&config_path, config).unwrap();
+
+    let mut command = orch(project.path());
+    command.arg("status");
+    let (code, _, _) = run_sampling_daemon_rss(&mut command, daemon_pid, Duration::from_secs(5));
+    assert_eq!(code, Some(0), "a valid read after refusal must succeed");
+
+    let added =
+        project
+            .daemon
+            .control(&["task", "add", "created after refusing a bomb", "--quiet"]);
+    assert!(added.status.success(), "{added:?}");
+    let id = String::from_utf8(added.stdout).unwrap().trim().to_owned();
+    assert!(id.starts_with("tsk_"), "expected task id, got {id:?}");
+    let shown = project.daemon.control(&["--json", "task", "show", &id]);
+    assert!(shown.status.success(), "{shown:?}");
+    let task: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(task["title"], "created after refusing a bomb");
+
+    let status = project.daemon.control(&["--json", "daemon", "status"]);
+    assert!(status.status.success(), "{status:?}");
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["pid"], daemon_pid, "the daemon must not restart");
 }

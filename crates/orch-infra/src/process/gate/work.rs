@@ -53,6 +53,9 @@ impl SpawnWork {
             _slot: None,
         })
     }
+    pub fn is_sealed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).sealed
+    }
     pub fn seal(&self) {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).sealed = true;
         self.slots.close();
@@ -72,6 +75,11 @@ impl SpawnWork {
 pub(crate) struct WorkLease {
     owner: Arc<SpawnWork>,
     _slot: Option<OwnedSemaphorePermit>,
+}
+impl WorkLease {
+    pub(crate) fn belongs_to(&self, work: &Arc<SpawnWork>) -> bool {
+        Arc::ptr_eq(&self.owner, work)
+    }
 }
 impl Drop for WorkLease {
     fn drop(&mut self) {

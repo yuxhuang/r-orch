@@ -12,14 +12,16 @@
 //!    a *request*: implementations must not block on long-running work
 //!    (dispatching an agent run, for example) — they kick it off and let the
 //!    outcome arrive through [`TuiBackend::poll_events`].
-//! 2. **Polled streams.** Events, history, the model catalog and the update
-//!    check are `poll_*` methods drained once per frame, which is what makes
-//!    the TUI tests synchronous (ARCHITECTURE §8.4).
+//! 2. **Polled streams.** Events, pushed store changes, history, the model
+//!    catalog and the update check are `poll_*` methods drained once per
+//!    frame from memory, which is what makes the TUI tests synchronous
+//!    (ARCHITECTURE §8.4). Draining never reaches the daemon; state is read
+//!    only for a view a pushed [`Observation`] made stale.
 
 pub mod copy;
 pub mod fake;
 
-pub use fake::{Call, FakeBackend, make_agent, make_goal, make_task, make_team};
+pub use fake::{Call, FakeBackend, Read, make_agent, make_goal, make_task, make_team};
 
 use std::collections::HashMap;
 
@@ -160,6 +162,42 @@ pub fn derive_timings(
     }
 }
 
+/// A project store the daemon reports changes for. The ten names of the
+/// daemon's subscription protocol, mirrored here because `orch-tui` depends
+/// on the domain only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ObservedStore {
+    Tasks,
+    Goals,
+    Agents,
+    Messages,
+    Context,
+    Teams,
+    Runs,
+    Config,
+    State,
+    Remote,
+}
+
+/// What the daemon's push told the dashboard since the last poll: a
+/// refetch hint, never entity contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Observation {
+    /// `store` changed in the commit numbered `commit_seq`. `id` is the
+    /// entity when the daemon knows it; `None` is a store-wide change. Every
+    /// view built from `store` is stale unless its last read already
+    /// observed `commit_seq` (see [`TuiBackend::last_read_seq`]).
+    Changed {
+        store: ObservedStore,
+        id: Option<String>,
+        commit_seq: u64,
+    },
+    /// The backend lost continuity on the push (a gap, a lag, an uncertain
+    /// commit) and has already subscribed again. Every view is stale and is
+    /// read again before the dashboard shows it as current.
+    Resynced,
+}
+
 /// Options for creating a task.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CreateTaskOpts {
@@ -281,9 +319,11 @@ pub struct LaunchContext {
     pub initial_max_concurrent: u32,
     /// Watch mode started successfully on launch.
     pub initial_watch_active: bool,
-    /// Watch mode was refused and a disk observer took over.
+    /// Legacy: the pre-daemon dashboard's disk-observer mode. No backend
+    /// sets it any more (every dashboard is a daemon client fed by push);
+    /// it only still selects the `OBSERVING` chip. PR 4 removes it.
     pub observer_mode: bool,
-    /// Watch-mode failure message, suppressed in observer mode.
+    /// Watch-mode failure message.
     pub watch_error: Option<String>,
     /// The project prompt mode (`defaults.agent.prompt_mode`) at launch.
     pub initial_prompt_mode: PromptMode,
@@ -369,10 +409,11 @@ pub trait TuiBackend {
     fn refresh_goals(&mut self) -> BackendResult<Vec<Goal>>;
     fn refresh_state(&mut self) -> BackendResult<OrchestratorState>;
     fn list_teams(&mut self) -> BackendResult<Vec<Team>>;
-    /// Started/Elapsed for the entities this refresh just returned (D3).
-    /// `orch_state` is this refresh's state, or `None` when it could not be
-    /// read — never an older snapshot. Called once per refresh, never per
-    /// frame. A backend without run history reports nothing.
+    /// Started/Elapsed for the entities the dashboard holds now (D3).
+    /// `orch_state` is the current state view, or `None` when its last read
+    /// failed — never a snapshot a newer change has invalidated. Called when
+    /// a task, goal, run or state change is pushed, never per frame. A
+    /// backend without run history reports nothing.
     fn refresh_timings(
         &mut self,
         _tasks: &[Task],
@@ -384,6 +425,21 @@ pub trait TuiBackend {
             sampled_at_ms: now_ms,
             ..TimingSnapshot::default()
         })
+    }
+
+    /// The commit ordinal the last successful read observed: every commit
+    /// numbered at or below it is already reflected in what that read
+    /// returned. `None` when the backend cannot tell, in which case every
+    /// change invalidates.
+    fn last_read_seq(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether the daemon's automatic dispatch is on now, for the header's
+    /// WATCHING / IDLE chip. `Err` when the backend cannot read it; the
+    /// header then keeps the value it has.
+    fn refresh_dispatch(&mut self) -> BackendResult<bool> {
+        Err("Reading the dispatch switch is not available".into())
     }
 
     // ── Tasks ──────────────────────────────────────────────────────────────
@@ -472,8 +528,9 @@ pub trait TuiBackend {
 
     // ── Project prompt mode ────────────────────────────────────────────────
 
-    /// The project prompt mode as stored now. Read on every refresh, so a
-    /// change made by `orch config set` in another process reaches the header.
+    /// The project prompt mode as stored now. Read again when a config
+    /// change is pushed, so `orch config set` in another process reaches the
+    /// header.
     fn project_prompt_mode(&mut self) -> BackendResult<PromptMode> {
         Ok(self.context().initial_prompt_mode)
     }
@@ -502,6 +559,12 @@ pub trait TuiBackend {
 
     /// Orchestrator events since the last poll, oldest first.
     fn poll_events(&mut self) -> Vec<OrchestratorEvent>;
+
+    /// Store changes the daemon pushed since the last poll, oldest first.
+    /// Memory only: draining it never reaches the daemon.
+    fn poll_observations(&mut self) -> Vec<Observation> {
+        Vec::new()
+    }
 
     /// Run-history batches since the last poll.
     fn poll_history(&mut self) -> Vec<Vec<HistoryEntry>> {

@@ -10,8 +10,18 @@
 //! in Rust there are no dynamic imports to avoid, so each tier simply
 //! constructs what it needs (ARCHITECTURE §7).
 
+pub mod commit;
 pub mod operation;
+mod tracked;
 pub use operation::{OperationBoundary, OperationOutcome};
+
+#[cfg(test)]
+pub(crate) fn tracked_test_runs(
+    store: std::sync::Arc<dyn orch_core::storage::RunStore>,
+    boundary: std::sync::Arc<OperationBoundary>,
+) -> std::sync::Arc<dyn orch_core::storage::RunStore> {
+    tracked::Tracked::wrap(store, boundary)
+}
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,7 +39,8 @@ use orch_core::storage::{
 use orch_core::template::TemplateEngine;
 use orch_core::workspace::WorkspaceManager;
 use orch_domain::{GlobalConfig, OrchestratorConfig, OrchestratorEvent};
-use orch_infra::adapters::build_registry_with_clock;
+use orch_infra::adapters::registry::build_registry_with_clock_and_spawn_domain;
+use orch_infra::process::gate::SpawnDomain;
 use orch_infra::storage::{
     FileAgentStore, FileConfigStore, FileContextStore, FileGlobalConfigStore, FileGoalStore,
     FileMessageStore, FileRunStore, FileStateStore, FileTaskStore, FileTeamStore, Paths,
@@ -54,6 +65,7 @@ use crate::team_service::TeamService;
 /// Keeping the concrete handle here leaves the existing core store trait intact.
 pub struct ContextService {
     store: Arc<FileContextStore>,
+    boundary: Arc<OperationBoundary>,
 }
 
 impl ContextService {
@@ -63,7 +75,30 @@ impl ContextService {
 
     /// Remove expired entries. Reads only filter them; daemon maintenance calls this.
     pub async fn expire_now(&self) -> Result<Vec<String>> {
-        self.store.expire_now().await
+        self.boundary
+            .with_source(
+                commit::CommitSource::Expiry,
+                self.boundary.store_write(async {
+                    let added = self.boundary.note_store(commit::CommitStore::Context);
+                    let keys = self.store.expire_now().await?;
+                    if added && keys.is_empty() {
+                        self.boundary
+                            .discard_noop_store(commit::CommitStore::Context);
+                    }
+                    for key in &keys {
+                        self.boundary.record_change(commit::CommitChange {
+                            store: commit::CommitStore::Context,
+                            id: Some(key.clone()),
+                            action: commit::CommitAction::Deleted,
+                            old: Some(commit::Membership::default()),
+                            new: None,
+                        });
+                    }
+                    Ok(keys)
+                }),
+            )
+            .await
+            .value
     }
 }
 
@@ -124,6 +159,7 @@ impl FullEngine {
     /// before the listener admits a session. Invalid context entities are reported
     /// without blocking recovery (R11).
     pub async fn daemon_initialize(&self) -> Result<()> {
+        self.operation_boundary().enable_store_operations();
         self.orchestrator.daemon_initialize().await?;
         self.operation_boundary()
             .run(false, async {
@@ -229,6 +265,8 @@ pub async fn build_light_with(
     seams: EngineSeams,
 ) -> Result<Engine> {
     let paths = Paths::new(project_root);
+    let events = Arc::new(EventBus::new());
+    let boundary = events.operation_boundary();
     paths.require_init().await?;
 
     let config_store: Arc<dyn ConfigStore> = Arc::new(FileConfigStore::new(paths.clone()));
@@ -259,6 +297,7 @@ pub async fn build_light_with(
     ));
     let context_service = Arc::new(ContextService {
         store: Arc::clone(&context_store),
+        boundary: Arc::clone(&boundary),
     });
     let context: Arc<dyn ContextStore> = context_store;
     let messages: Arc<dyn MessageStore> = Arc::new(FileMessageStore::new(
@@ -267,7 +306,17 @@ pub async fn build_light_with(
     ));
     let goals: Arc<dyn GoalStore> = Arc::new(FileGoalStore::new(paths.clone()));
     let teams: Arc<dyn TeamStore> = Arc::new(FileTeamStore::new(paths.clone()));
-    let events = Arc::new(EventBus::new());
+    let tasks: Arc<dyn TaskStore> = tracked::Tracked::wrap(tasks, boundary.clone());
+    let agents: Arc<dyn AgentStore> = tracked::Tracked::wrap(agents, boundary.clone());
+    let runs: Arc<dyn RunStore> = tracked::Tracked::wrap(runs, boundary.clone());
+    let state: Arc<dyn StateStore> = tracked::Tracked::wrap(state, boundary.clone());
+    let context: Arc<dyn ContextStore> = tracked::Tracked::wrap(context, boundary.clone());
+    let messages: Arc<dyn MessageStore> = tracked::Tracked::wrap(messages, boundary.clone());
+    let goals: Arc<dyn GoalStore> = tracked::Tracked::wrap(goals, boundary.clone());
+    let teams: Arc<dyn TeamStore> = tracked::Tracked::wrap(teams, boundary.clone());
+    let config_store: Arc<dyn ConfigStore> = tracked::Tracked::wrap(config_store, boundary.clone());
+    let global_config_store: Arc<dyn GlobalConfigStore> =
+        tracked::Tracked::wrap(global_config_store, boundary);
 
     let task_service = Arc::new(
         TaskService::new(
@@ -370,6 +419,7 @@ pub async fn build_full_with(
         orch_domain::PeerConfig::default(),
         None,
         None,
+        SpawnDomain::default(),
     )
     .await
 }
@@ -384,6 +434,7 @@ pub async fn build_full_with_peer(
         peer,
         None,
         None,
+        SpawnDomain::default(),
     )
     .await
 }
@@ -398,7 +449,15 @@ pub async fn build_full_with_processes(
     peer: orch_domain::PeerConfig,
     processes: Arc<dyn ProcessManager>,
 ) -> Result<FullEngine> {
-    build_full_internal(project_root.into(), seams, peer, Some(processes), None).await
+    build_full_internal(
+        project_root.into(),
+        seams,
+        peer,
+        Some(processes),
+        None,
+        SpawnDomain::default(),
+    )
+    .await
 }
 
 /// The daemon also supplies its command runner for doctor and automatic
@@ -410,12 +469,36 @@ pub async fn build_full_with_children(
     processes: Arc<dyn ProcessManager>,
     command_runner: Arc<dyn CommandRunner>,
 ) -> Result<FullEngine> {
+    build_full_with_children_and_spawn_domain(
+        project_root,
+        seams,
+        peer,
+        processes,
+        command_runner,
+        SpawnDomain::default(),
+    )
+    .await
+}
+
+/// Assemble synthetic admission only with a ProcessManager that never forks.
+/// Crate-internal real builders fail closed; external direct Command builders must never opt in.
+/// Launch, GitWorkspaceManager git/rsync (preparation, cleanup, changed-files listing)
+/// and OpenCode effort-wire probes share this domain; other real builders, including merge, stay global.
+pub async fn build_full_with_children_and_spawn_domain(
+    project_root: impl Into<PathBuf>,
+    seams: EngineSeams,
+    peer: orch_domain::PeerConfig,
+    processes: Arc<dyn ProcessManager>,
+    command_runner: Arc<dyn CommandRunner>,
+    spawn_domain: SpawnDomain,
+) -> Result<FullEngine> {
     build_full_internal(
         project_root.into(),
         seams,
         peer,
         Some(processes),
         Some(command_runner),
+        spawn_domain,
     )
     .await
 }
@@ -426,6 +509,7 @@ async fn build_full_internal(
     peer: orch_domain::PeerConfig,
     processes: Option<Arc<dyn ProcessManager>>,
     command_runner: Option<Arc<dyn CommandRunner>>,
+    spawn_domain: SpawnDomain,
 ) -> Result<FullEngine> {
     let mut engine = build_light_with(project_root.clone(), seams).await?;
     if peer.name.is_some() {
@@ -441,15 +525,19 @@ async fn build_full_internal(
     // Adapters stamp the events they parse out of a child's stdout, so they
     // get the injected clock too — otherwise the seam would reach every
     // timestamp except the ones the adapters actually read.
-    let adapters = Arc::new(build_registry_with_clock(
+    let adapters = Arc::new(build_registry_with_clock_and_spawn_domain(
         Arc::clone(&processes),
         Arc::clone(&engine.clock),
+        spawn_domain.clone(),
     ));
-    let workspace: Arc<dyn WorkspaceManager> = Arc::new(GitWorkspaceManager::new(
-        project_root.clone(),
-        engine.paths.root(),
-        Arc::clone(&processes),
-    ));
+    let workspace: Arc<dyn WorkspaceManager> = Arc::new(
+        GitWorkspaceManager::new(
+            project_root.clone(),
+            engine.paths.root(),
+            Arc::clone(&processes),
+        )
+        .with_spawn_domain(spawn_domain.clone()),
+    );
     let templates: Arc<dyn TemplateEngine> = Arc::new(LiquidTemplateEngine::new());
     let skills: Arc<dyn SkillLoader> = Arc::new(orch_infra::skills::FileSkillLoader::new());
     let lock: Arc<dyn ProjectLock> = Arc::new(FileLock::new(engine.paths.lock_path()));
@@ -484,7 +572,12 @@ async fn build_full_internal(
         goal_store: Some(Arc::clone(&engine.goals)),
         skill_loader: Some(Arc::clone(&skills)),
     }));
-    orchestrator.set_spawn_admission(Arc::new(orch_infra::process::gate::ProcessSpawnAdmission));
+    if spawn_domain.is_process() {
+        orchestrator
+            .set_spawn_admission(Arc::new(orch_infra::process::gate::ProcessSpawnAdmission));
+    } else {
+        orchestrator.set_spawn_admission(Arc::new(spawn_domain));
+    }
     orchestrator.set_config_store(Arc::clone(&engine.config_store));
     orchestrator.set_context_service(Arc::clone(&engine.context_service));
 
@@ -976,5 +1069,644 @@ mod tests {
             removed,
             "initial tick should run explicit context maintenance"
         );
+    }
+}
+
+#[cfg(test)]
+mod commit_store_tests {
+    use super::commit::*;
+    use super::*;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn store_writers_capture_create_reassign_delete_and_singleton() {
+        let temp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(temp.path().join(".orchestry"))
+            .await
+            .unwrap();
+        let engine = build_light_with(
+            temp.path(),
+            EngineSeams {
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = records.clone();
+        engine
+            .events
+            .operation_boundary()
+            .set_publisher(Some(Arc::new(move |p| {
+                if let Publication::Commit(record) = p {
+                    sink.lock().unwrap().push(record.clone());
+                }
+            })));
+        let mut task = engine
+            .task_service
+            .create(orch_domain::CreateTaskInput {
+                title: "metadata".into(),
+                goal_id: Some("goal_old".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        task.goal_id = Some("goal_new".into());
+        task.assignee = Some("agent_new".into());
+        engine.tasks.save(&task).await.unwrap();
+        engine.tasks.delete(&task.id).await.unwrap();
+        engine
+            .state
+            .write(&orch_domain::OrchestratorState::default())
+            .await
+            .unwrap();
+        let records = records.lock().unwrap();
+        assert_eq!(
+            records.len(),
+            4,
+            "every store write must be observable without an RPC"
+        );
+        let change = &records[0].changes[0];
+        assert_eq!(change.id.as_deref(), Some(task.id.as_str()));
+        assert_eq!(change.action, CommitAction::Created);
+        assert_eq!(records[1].changes[0].action, CommitAction::Updated);
+        assert_eq!(
+            records[1].changes[0]
+                .old
+                .as_ref()
+                .unwrap()
+                .goal_id
+                .as_deref(),
+            Some("goal_old")
+        );
+        assert_eq!(
+            records[1].changes[0]
+                .new
+                .as_ref()
+                .unwrap()
+                .goal_id
+                .as_deref(),
+            Some("goal_new")
+        );
+        assert_eq!(records[2].changes[0].action, CommitAction::Deleted);
+        assert_eq!(
+            records[2].changes[0]
+                .old
+                .as_ref()
+                .unwrap()
+                .agent_id
+                .as_deref(),
+            Some("agent_new")
+        );
+        assert_eq!(
+            records[3].changes,
+            vec![CommitChange::store_wide(CommitStore::State)]
+        );
+    }
+    /// Exercise every mutation offered by the core store traits. Runs have
+    /// no delete method; config/state/global are singleton updates.
+    #[tokio::test]
+    async fn all_core_store_mutations_publish_identity_only_changes() {
+        use orch_domain::*;
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".orchestry")).unwrap();
+        let engine = build_light_with(
+            temp.path(),
+            EngineSeams {
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut task = engine
+            .task_service
+            .create(CreateTaskInput {
+                title: "matrix".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut agent = engine
+            .agent_service
+            .create(CreateAgentInput {
+                name: "matrix".into(),
+                adapter: "shell".into(),
+                command: Some("exit 0".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut goal = engine
+            .goal_service
+            .create(CreateGoalInput {
+                title: "matrix".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut team = engine
+            .team_service
+            .create(CreateTeamInput {
+                name: "matrix".into(),
+                lead_agent_id: agent.id.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        task.id = "task_matrix".into();
+        agent.id = "agent_matrix".into();
+        goal.id = "goal_matrix".into();
+        team.id = "team_matrix".into();
+        engine
+            .messages
+            .save(&orch_domain::Message {
+                id: "message_expired".into(),
+                channel: MessageChannel::Direct,
+                from_agent_id: "sender".into(),
+                to_agent_id: Some("recipient".into()),
+                subject: String::new(),
+                body: String::new(),
+                reply_to: None,
+                created_at: engine.clock.now_iso(),
+                expires_at: Some("2000-01-01T00:00:00.000Z".into()),
+                status: MessageStatus::Pending,
+                delivered_at: None,
+                team_id: None,
+            })
+            .await
+            .unwrap();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = records.clone();
+        engine
+            .events
+            .operation_boundary()
+            .set_publisher(Some(Arc::new(move |p| {
+                if let Publication::Commit(record) = p {
+                    sink.lock().unwrap().push(record.clone());
+                }
+            })));
+        let mut expected = Vec::new();
+        macro_rules! mutation {
+            ($write:expr, $store:ident, $id:expr, $action:ident) => {{
+                $write.await.unwrap();
+                expected.push((CommitStore::$store, $id, CommitAction::$action));
+            }};
+        }
+        mutation!(
+            engine.tasks.save(&task),
+            Tasks,
+            Some("task_matrix"),
+            Created
+        );
+        task.title = "updated".into();
+        mutation!(
+            engine.tasks.save(&task),
+            Tasks,
+            Some("task_matrix"),
+            Updated
+        );
+        mutation!(
+            engine.tasks.delete(&task.id),
+            Tasks,
+            Some("task_matrix"),
+            Deleted
+        );
+        mutation!(
+            engine.agents.save(&agent),
+            Agents,
+            Some("agent_matrix"),
+            Created
+        );
+        agent.name = "updated".into();
+        mutation!(
+            engine.agents.save(&agent),
+            Agents,
+            Some("agent_matrix"),
+            Updated
+        );
+        mutation!(
+            engine.agents.delete(&agent.id),
+            Agents,
+            Some("agent_matrix"),
+            Deleted
+        );
+        mutation!(
+            engine.goals.save(&goal),
+            Goals,
+            Some("goal_matrix"),
+            Created
+        );
+        goal.title = "updated".into();
+        mutation!(
+            engine.goals.save(&goal),
+            Goals,
+            Some("goal_matrix"),
+            Updated
+        );
+        mutation!(
+            engine.goals.delete(&goal.id),
+            Goals,
+            Some("goal_matrix"),
+            Deleted
+        );
+        mutation!(
+            engine.teams.save(&team),
+            Teams,
+            Some("team_matrix"),
+            Created
+        );
+        team.name = "updated".into();
+        mutation!(
+            engine.teams.save(&team),
+            Teams,
+            Some("team_matrix"),
+            Updated
+        );
+        mutation!(
+            engine.teams.delete(&team.id),
+            Teams,
+            Some("team_matrix"),
+            Deleted
+        );
+        let mut message = Message {
+            id: "message_matrix".into(),
+            channel: MessageChannel::Direct,
+            from_agent_id: "sender_old".into(),
+            to_agent_id: Some("recipient_old".into()),
+            subject: "private-canary".into(),
+            body: "private-canary".into(),
+            created_at: engine.clock.now_iso(),
+            expires_at: None,
+            status: MessageStatus::Pending,
+            delivered_at: None,
+            team_id: None,
+            reply_to: None,
+        };
+        mutation!(
+            engine.messages.save(&message),
+            Messages,
+            Some("message_matrix"),
+            Created
+        );
+        message.to_agent_id = Some("recipient_new".into());
+        mutation!(
+            engine.messages.save(&message),
+            Messages,
+            Some("message_matrix"),
+            Updated
+        );
+        mutation!(
+            engine.messages.mark_delivered(&message.id),
+            Messages,
+            Some("message_matrix"),
+            Updated
+        );
+        mutation!(
+            engine.messages.delete(&message.id),
+            Messages,
+            Some("message_matrix"),
+            Deleted
+        );
+        mutation!(engine.messages.purge_expired(), Messages, None, Updated);
+        assert!(
+            engine
+                .messages
+                .get("message_expired")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        mutation!(
+            engine.context.set("matrix", "private-canary", None),
+            Context,
+            Some("matrix"),
+            Created
+        );
+        mutation!(
+            engine.context.set("matrix", "changed", None),
+            Context,
+            Some("matrix"),
+            Updated
+        );
+        mutation!(
+            engine.context.delete("matrix"),
+            Context,
+            Some("matrix"),
+            Deleted
+        );
+        let mut run = Run {
+            id: "run_matrix".into(),
+            task_id: "task_matrix".into(),
+            agent_id: "agent_old".into(),
+            attempt: 1,
+            status: RunStatus::Running,
+            started_at: engine.clock.now_iso(),
+            workspace_path: String::new(),
+            prompt: "private-canary".into(),
+            finished_at: None,
+            pid: None,
+            error: None,
+            error_kind: None,
+            tokens: None,
+        };
+        mutation!(engine.runs.save(&run), Runs, Some("run_matrix"), Created);
+        run.agent_id = "agent_new".into();
+        mutation!(engine.runs.save(&run), Runs, Some("run_matrix"), Updated);
+        mutation!(
+            engine.runs.append_event(
+                &run.id,
+                &RunEvent {
+                    timestamp: engine.clock.now_iso(),
+                    event_type: RunEventType::Done,
+                    data: serde_json::json!({}),
+                }
+            ),
+            Runs,
+            None,
+            Updated
+        );
+        mutation!(
+            engine.state.write(&OrchestratorState::default()),
+            State,
+            None,
+            Updated
+        );
+        mutation!(
+            engine.state.write(&OrchestratorState::default()),
+            State,
+            None,
+            Updated
+        );
+        mutation!(
+            engine.config_store.write(&OrchestratorConfig::default()),
+            Config,
+            None,
+            Updated
+        );
+        mutation!(
+            engine.config_store.set("concurrency", serde_json::json!(2)),
+            Config,
+            None,
+            Updated
+        );
+        mutation!(
+            engine.global_config_store.write(&GlobalConfig::default()),
+            Config,
+            None,
+            Updated
+        );
+        let records = records.lock().unwrap();
+        assert_eq!(
+            records.len(),
+            expected.len(),
+            "one commit per actual store mutation"
+        );
+        for (index, (record, (store, id, action))) in records.iter().zip(expected).enumerate() {
+            assert_eq!(record.commit_seq, records[0].commit_seq + index as u64);
+            assert!(!record.store_set_uncertain);
+            assert_eq!(record.source, CommitSource::Internal);
+            assert_eq!(record.changes.len(), 1);
+            let change = &record.changes[0];
+            assert_eq!(
+                (change.store, change.id.as_deref(), change.action),
+                (store, id, action)
+            );
+        }
+        assert_eq!(
+            records[13].changes[0]
+                .old
+                .as_ref()
+                .unwrap()
+                .recipient_id
+                .as_deref(),
+            Some("recipient_old")
+        );
+        assert_eq!(
+            records[13].changes[0]
+                .new
+                .as_ref()
+                .unwrap()
+                .recipient_id
+                .as_deref(),
+            Some("recipient_new")
+        );
+        assert_eq!(
+            records[21].changes[0]
+                .old
+                .as_ref()
+                .unwrap()
+                .agent_id
+                .as_deref(),
+            Some("agent_old")
+        );
+        assert_eq!(
+            records[21].changes[0]
+                .new
+                .as_ref()
+                .unwrap()
+                .agent_id
+                .as_deref(),
+            Some("agent_new")
+        );
+        assert!(!format!("{records:?}").contains("private-canary"));
+    }
+
+    #[tokio::test]
+    async fn partial_entity_write_still_publishes_its_known_store() {
+        let temp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(temp.path().join(".orchestry"))
+            .await
+            .unwrap();
+        let engine = build_light_with(
+            temp.path(),
+            EngineSeams {
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut task = engine
+            .task_service
+            .create(orch_domain::CreateTaskInput {
+                title: "before".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let index = temp.path().join(".orchestry/tasks/_index.json");
+        tokio::fs::remove_file(&index).await.unwrap();
+        tokio::fs::create_dir(&index).await.unwrap();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = records.clone();
+        engine
+            .events
+            .operation_boundary()
+            .set_publisher(Some(Arc::new(move |p| {
+                if let Publication::Commit(record) = p {
+                    sink.lock().unwrap().push(record.clone());
+                }
+            })));
+        task.title = "partially committed".into();
+        assert!(engine.tasks.save(&task).await.is_err());
+        assert_eq!(
+            engine.tasks.get(&task.id).await.unwrap().unwrap().title,
+            "partially committed"
+        );
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(
+            !records[0].store_set_uncertain,
+            "the failed index write has a known store"
+        );
+        assert_eq!(records[0].changes[0].store, CommitStore::Tasks);
+    }
+
+    #[tokio::test]
+    async fn context_expiry_is_a_typed_internal_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(temp.path().join(".orchestry"))
+            .await
+            .unwrap();
+        let clock = Arc::new(orch_core::test_support::FixedClock::new());
+        let engine = build_light_with(
+            temp.path(),
+            EngineSeams {
+                clock: clock.clone(),
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine
+            .context
+            .set("expires", "secret-canary", Some(1))
+            .await
+            .unwrap();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = records.clone();
+        engine
+            .events
+            .operation_boundary()
+            .set_publisher(Some(Arc::new(move |p| {
+                if let Publication::Commit(record) = p {
+                    sink.lock().unwrap().push(record.clone());
+                }
+            })));
+        clock.advance_ms(2);
+        assert_eq!(
+            engine.context_service.expire_now().await.unwrap(),
+            vec!["expires"]
+        );
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source, CommitSource::Expiry);
+        assert_eq!(records[0].changes[0].id.as_deref(), Some("expires"));
+        assert_eq!(records[0].changes[0].action, CommitAction::Deleted);
+        assert!(!format!("{:?}", records[0]).contains("secret-canary"));
+    }
+    #[tokio::test]
+    async fn idle_expiry_does_not_publish_a_periodic_invalidation() {
+        let temp = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(temp.path().join(".orchestry"))
+            .await
+            .unwrap();
+        let engine = build_light_with(
+            temp.path(),
+            EngineSeams {
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = records.clone();
+        engine
+            .events
+            .operation_boundary()
+            .set_publisher(Some(Arc::new(move |p| {
+                if let Publication::Commit(record) = p {
+                    sink.lock().unwrap().push(record.clone());
+                }
+            })));
+        assert!(
+            engine
+                .context_service
+                .expire_now()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            records.lock().unwrap().is_empty(),
+            "idle maintenance must not make subscribers poll"
+        );
+    }
+    #[tokio::test]
+    async fn zero_maintenance_retracts_only_its_own_declaration() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".orchestry")).unwrap();
+        let engine = build_light_with(
+            temp.path(),
+            EngineSeams {
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let boundary = engine.events.operation_boundary();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = records.clone();
+        boundary.set_publisher(Some(Arc::new(move |p| {
+            if let Publication::Commit(record) = p {
+                sink.lock().unwrap().push(record.clone());
+            }
+        })));
+        let before = boundary.current_commit_seq();
+        assert_eq!(engine.messages.purge_expired().await.unwrap(), 0);
+        assert_eq!(
+            boundary.current_commit_seq(),
+            before,
+            "zero purge is not a write"
+        );
+        for store in [CommitStore::Messages, CommitStore::Context] {
+            for recorded in [false, true] {
+                boundary
+                    .run(false, async {
+                        if recorded {
+                            boundary.record_change(CommitChange::store_wide(store));
+                        } else {
+                            boundary.note_store(store);
+                        }
+                        if store == CommitStore::Messages {
+                            assert_eq!(engine.messages.purge_expired().await.unwrap(), 0);
+                        } else {
+                            assert!(
+                                engine
+                                    .context_service
+                                    .expire_now()
+                                    .await
+                                    .unwrap()
+                                    .is_empty()
+                            );
+                        }
+                    })
+                    .await;
+                let record = records
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .cloned()
+                    .expect("earlier declaration survives");
+                assert_eq!(record.changes, vec![CommitChange::store_wide(store)]);
+                assert!(!record.store_set_uncertain);
+            }
+        }
+        assert_eq!(records.lock().unwrap().len(), 4);
     }
 }

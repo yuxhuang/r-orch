@@ -20,7 +20,18 @@ use super::dispatch::{
 };
 use super::{CANCEL_KILL_GRACE, Orchestrator};
 
+/// Only preparation failures may be cancelled by an overlapping stop. Final
+/// execute errors always retain their existing failure accounting.
+enum PreparationFailureOutcome {
+    Failed,
+    Cancelled,
+}
+
 impl Orchestrator {
+    fn daemon_preparation_stopping(&self) -> bool {
+        self.is_shutting_down() || self.spawn_admission().is_closed()
+    }
+
     async fn daemon_launch_cancelled(
         &self,
         token: &tokio_util::sync::CancellationToken,
@@ -54,7 +65,7 @@ impl Orchestrator {
         self.deps()
             .events
             .operation_boundary()
-            .run(true, async {
+            .run(false, async {
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
@@ -77,11 +88,26 @@ impl Orchestrator {
         skip_autonomous_seeding: bool,
         cancelled: Arc<AtomicBool>,
     ) -> Result<()> {
+        self.deps()
+            .events
+            .operation_boundary()
+            .with_source(
+                crate::container::commit::CommitSource::Tick,
+                Box::pin(self.daemon_tick_with_guard_inner(skip_autonomous_seeding, cancelled)),
+            )
+            .await
+    }
+
+    async fn daemon_tick_with_guard_inner(
+        &self,
+        skip_autonomous_seeding: bool,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<()> {
         let candidates =
             self.deps()
                 .events
                 .operation_boundary()
-                .run(true, async {
+                .run(false, async {
                     if cancelled.load(Ordering::SeqCst) || self.is_shutting_down() {
                         return Ok(Vec::new());
                     }
@@ -162,7 +188,7 @@ impl Orchestrator {
 
     pub(super) async fn daemon_cancel_task(&self, task_id: &str, strict: bool) -> Result<()> {
         let boundary = self.deps().events.operation_boundary();
-        let (entry, preparing_runs) = boundary.run(true, async {
+        let (entry, preparing_runs) = boundary.run(false, async {
             let mut slot = self.inner.state.lock().await;
             self.load_state(&mut slot).await?;
             let state = slot.as_mut().expect("state loaded");
@@ -209,7 +235,7 @@ impl Orchestrator {
             }
         }
         boundary
-            .run(true, async {
+            .run(false, async {
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
@@ -266,8 +292,10 @@ impl Orchestrator {
         override_retry_wait: bool,
     ) -> Result<()> {
         let boundary = self.deps().events.operation_boundary();
+        // Selection can reject every candidate without touching a store.
+        // Tracked writers declare changes before I/O, including failed writes.
         let selected = boundary
-            .run(true, async {
+            .run(false, async {
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
@@ -339,10 +367,8 @@ impl Orchestrator {
                 };
                 drop(preparing);
                 state.claimed.insert(task_id.to_owned());
-                // Starting consumes the due retry, as in v0.13: `enqueue_retry`
-                // deduplicates by task id, so a leftover entry would swallow
-                // the back-off of a failure before spawn.
-                state.retry_queue.retain(|retry| retry.task_id != task_id);
+                // Only the final launch phase consumes the due retry. A stop
+                // during preparation must leave its back-off intact.
                 let generation = self.inner.preparation_seq.fetch_add(1, Ordering::SeqCst) + 1;
                 self.inner
                     .preparing_agents
@@ -395,8 +421,11 @@ impl Orchestrator {
                     // copy a plain one. None of them means the preparation was
                     // invalidated; the recorder checks that itself (generation,
                     // and a terminal task under the dispatch gate).
-                    self.daemon_record_workspace_failure(task_id, generation, &error)
-                        .await?;
+                    if let PreparationFailureOutcome::Cancelled = self.daemon_record_workspace_failure(task_id, generation, &error)
+                        .await? {
+                        self.daemon_release_preparation(task_id, generation).await?;
+                        return Ok(());
+                    }
                     return Err(error);
                 }
             };
@@ -441,7 +470,7 @@ impl Orchestrator {
                 }
             };
             let run = boundary
-                .run(true, async {
+                .run(false, async {
                     if cancelled.load(Ordering::SeqCst)
                         || self.config() != launch_config
                         || cancel.is_cancelled()
@@ -528,10 +557,13 @@ impl Orchestrator {
                 let preparation = match preparation {
                     Ok(preparation) => preparation,
                     Err(error) => {
-                        self.daemon_fail_preparation(
+                        if let PreparationFailureOutcome::Cancelled = self.daemon_fail_preparation(
                             &task, &agent, generation, &run.id, &error, &workspace,
                         )
-                        .await?;
+                        .await? {
+                            self.daemon_release_preparation(task_id, generation).await?;
+                            return Ok(());
+                        }
                         return Err(error.into());
                     }
                 };
@@ -541,10 +573,13 @@ impl Orchestrator {
                     match self.dispatch_effort_diagnostics(adapter.kind(), &params.config) {
                         Ok(planned) => diagnostics.extend(planned),
                         Err(error) => {
-                            self.daemon_fail_preparation(
+                            if let PreparationFailureOutcome::Cancelled = self.daemon_fail_preparation(
                                 &task, &agent, generation, &run.id, &error, &workspace,
                             )
-                            .await?;
+                            .await? {
+                                self.daemon_release_preparation(task_id, generation).await?;
+                                return Ok(());
+                            }
                             return Err(error.into());
                         }
                     }
@@ -555,7 +590,7 @@ impl Orchestrator {
             // Admission precedes the project boundary and state mutex. A queued
             // launch owns no blocking worker and cannot outlive cancellation.
             let admission = self.spawn_admission();
-            let reservation = if agent.remote.is_none() {
+            let mut reservation = if agent.remote.is_none() {
                 tokio::select! {
                     biased;
                     () = self.daemon_launch_cancelled(&cancel, &cancelled) => {
@@ -567,14 +602,16 @@ impl Orchestrator {
             } else { None };
 
             let launched = boundary
-                .run(true, async {
+                .run(false, async {
                     if self.is_shutting_down() {
                         return Ok(false);
                     }
                     let mut slot = self.inner.state.lock().await;
                     self.load_state(&mut slot).await?;
                     let state = slot.as_mut().expect("state loaded");
-                    if cancelled.load(Ordering::SeqCst)
+                    let admitted = reservation.as_mut().is_none_or(|permit| permit.try_admit());
+                    if !admitted
+                        || cancelled.load(Ordering::SeqCst)
                         || self.config() != launch_config
                         || cancel.is_cancelled()
                         || !self
@@ -911,7 +948,7 @@ impl Orchestrator {
         self.deps()
             .events
             .operation_boundary()
-            .run(true, async {
+            .run(false, async {
                 if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
                     return Ok(());
                 }
@@ -953,13 +990,16 @@ impl Orchestrator {
         task_id: &str,
         generation: u64,
         error: &Error,
-    ) -> Result<()> {
+    ) -> Result<PreparationFailureOutcome> {
         self.deps()
             .events
             .operation_boundary()
-            .run(true, async {
-                if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
-                    return Ok(());
+            .run(false, async {
+                if self.daemon_preparation_stopping() {
+                    return Ok(PreparationFailureOutcome::Cancelled);
+                }
+                if !self.owns_preparation(task_id, generation).await {
+                    return Ok(PreparationFailureOutcome::Failed);
                 }
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
@@ -976,7 +1016,8 @@ impl Orchestrator {
                     self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
                 }
                 self.release_preparation_locked(state, task_id).await?;
-                self.save_state(state).await
+                self.save_state(state).await?;
+                Ok(PreparationFailureOutcome::Failed)
             })
             .await
             .value
@@ -990,14 +1031,16 @@ impl Orchestrator {
         run_id: &str,
         error: &orch_core::adapter::AdapterError,
         workspace: &orch_core::workspace::PrepareResult,
-    ) -> Result<()> {
+    ) -> Result<PreparationFailureOutcome> {
         let mut owns_preparation = false;
+        let mut stopped = false;
         let result = self
             .deps()
             .events
             .operation_boundary()
-            .run(true, async {
-                if self.is_shutting_down() {
+            .run(false, async {
+                if self.daemon_preparation_stopping() {
+                    stopped = true;
                     return Ok(());
                 }
 
@@ -1018,6 +1061,7 @@ impl Orchestrator {
                         .finish(run_id, RunStatus::Cancelled, None, None)
                         .await?;
                 } else {
+                    state.retry_queue.retain(|retry| retry.task_id != task.id);
                     self.deps()
                         .task_service
                         .update_status(&task.id, TaskStatus::InProgress)
@@ -1062,6 +1106,12 @@ impl Orchestrator {
             self.daemon_release_preparation(&task.id, generation)
                 .await?;
         }
-        result
+        result.map(|()| {
+            if stopped {
+                PreparationFailureOutcome::Cancelled
+            } else {
+                PreparationFailureOutcome::Failed
+            }
+        })
     }
 }

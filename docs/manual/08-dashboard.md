@@ -45,6 +45,14 @@ The dashboard is a client of the project's [daemon](18-daemon.md): it shows and 
 
 Press `r` to try to connect again once you have started the daemon, or `q` to quit (exit code 7). The dashboard never starts a daemon. If the daemon is a different orch version, the message names both versions and says `Start it with: orch daemon stop, then orch daemon start`. If the daemon goes away while the dashboard is open, it shows the same screen.
 
+**How it stays current.** The dashboard subscribes to the daemon's change notices before it reads the project,
+and reads a view again only when the daemon reports a change that concerns it: a task created from the CLI, an
+agent's message or a run that ends shows up without a key press. It does not watch the project's files and does not
+re-read the project on a timer; only the clock-driven columns, such as Elapsed*, move by themselves. If the daemon
+tells it that it fell behind, it reads every view again and keeps your selection where it can. After the daemon
+goes away and you start it again, `r` connects to the new daemon and reads everything afresh. See
+[How clients follow changes](18-daemon.md#how-clients-follow-changes).
+
 `orch tui --observe`, `--listen` and `--peer-name` were removed: the dashboard never dispatches by itself, so there is nothing to observe instead, and only the daemon listens for other machines and names this one to them. Start the daemon with `--listen` and `--peer-name` ([Remote agents](11-remote-agents.md)).
 
 ![The dashboard's Tasks view: nine tasks in review, to-do, done and failed states, sorted by STATUS with an up arrow, in columns for status, priority, title, goal, assignee, Started and Elapsed*, with the activity feed below](images/dashboard-overview.png)
@@ -52,11 +60,11 @@ Press `r` to try to connect again once you have started the daemon, or `q` to qu
 *The Tasks view, which the dashboard opens on. Under the header, chips count tasks by status and count the teams. The `↑` after STATUS marks the sort column.*
 
 The screenshots in this chapter were taken with orch 0.13.0 in observe mode, so the header shows `OBSERVING` and the second header line reads `listen off · controller none`. With the daemon the header shows the daemon's dispatch state instead.
-<!-- W2: screenshots predate PR 2; re-take after S2c (PR 3/4 QA). --> The second line tells you about peer connections: whether this machine listens for other orch machines (`listen off` or an address), which machine controls it (`controller none`), and the state of each remote you registered. See [Remote agents](11-remote-agents.md).
+The second line tells you about peer connections: whether this machine listens for other orch machines (`listen off` or an address), which machine controls it (`controller none`), and the state of each remote you registered. See [Remote agents](11-remote-agents.md).
 
 ## Read the screen
 
-From top to bottom the screen has these parts. This is the real layout of a small project in a 120-column terminal, started with `orch tui --observe`. No orchestrator had started for the project, so the header shows no uptime. Runs of empty rows are shortened to `…`:
+From top to bottom the screen has these parts. This is the real layout of a small project in a 120-column terminal, started with `orch tui --observe`. No orchestrator had started for the project, so the header shows no uptime. Runs of empty rows are shortened to `…`. The last activity line, about disk polling, belongs to that removed mode; today's dashboard never polls:
 
 ```text
 ◆ ORCH 0.10.2 · proj  G GOALS  T TASKS  A AGENTS L ACTIONS                     0 running │ 2 todo · normal · ● OBSERVING

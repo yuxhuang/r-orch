@@ -1,10 +1,5 @@
 # The orch daemon
 
-<!-- W1 (PR 1) wrote this chapter from the approved spec; W2 (PR 2, tsk_M9AsDfP) removed the developmental
-gate and made the PR 2 cutover current, written to wave-c-brief.md "PR 2 contract" items 1-4 and design.md
-D5/D8/D13; the board-2 fact-check (tsk_eVo3agZ) checked it at run time at f70fc707. Examples without a
-"$" prompt are contract text, not captures. -->
-
 The **daemon** is the one orch process that owns a project. It reads and writes everything under `.orchestry/`,
 starts and stops the agents, and runs the orchestrator when dispatch is on. Every other orch command, the
 dashboard, `orch web` and `orch mcp` is a **client**: it asks the daemon to do the work over a private Unix socket
@@ -25,6 +20,7 @@ is the operator's view of it.
 - [Version skew](#version-skew)
 - [Recovery](#recovery)
 - [How `serve`, `run` and the dashboard map to the daemon](#how-serve-run-and-the-dashboard-map-to-the-daemon)
+- [How clients follow changes](#how-clients-follow-changes)
 - [Upgrading from orch 0.13.0](#upgrading-from-orch-0130)
 
 ## Why a daemon
@@ -71,13 +67,6 @@ What the daemon does **not** promise:
   158/228 ms and `status` 129/209 ms. Afterwards, with the daemon restarted, at load 15.84–18.83 and 201 reads per
   command, `task list` p95 was 27.61 ms against 30.84 ms for an idle project measured at the same time, and
   `status` 21.00 ms against 20.05 ms. These are observations on one machine, not promised bounds.
-<!-- A6 (tsk_I57BLvA), decision-tsk_DKbRFg5-f1b-acceptance.md. Queue: crates/orch-engine/src/container/operation.rs:130
-(tokio Mutex, FIFO acquisition) and crates/orch-daemon/src/coordinator.rs:153 (non-external requests, reads included);
-10 s refusal coordinator.rs:163-164, exit 7 crates/orch-proto/src/error.rs:64; durable write
-crates/orch-infra/src/storage/fs_utils.rs:97 (awaited file sync),128-135 (best-effort directory sync);
-all at b97fc59a, unchanged at 8a4c9eb4. External operations: crates/orch-daemon/src/ops/mod.rs:234-256.
-Numbers only from the "Paragraph approved for
-documentation" of perf-eng-pr2b-f1b-reverdict-a08fad1b.md (tsk_KwZ1rOH). -->
 
 ## Command reference
 
@@ -112,7 +101,6 @@ orchestrator left (the same reconciliation `orch serve` does at start, and a reb
 [runtime entries](#runtime-files-and-gitignore) to `.orchestry/.gitignore` and writes `.orchestry/daemon.json`.
 A failed context expiry does not stop the start. Only then does it print its readiness line, exactly
 `listening <socket>`, followed by its dispatch state. From then on every client of the project can use it.
-<!-- PR 2 contract item 4: the developmental gate and its banner are removed. -->
 
 If recovery cannot save a change to a task, run or agent, for example because a store directory is not
 writable, the start fails with exit 1 and names the write that failed. Nothing listens, so `orch daemon status`
@@ -142,8 +130,6 @@ check, and covers everything written to the detached daemon's output:
 
 With `RUST_LOG` or `ORCHESTRY_DEBUG` set, the log fills faster and rotates more often, within the same limit. To
 reclaim the space, stop the daemon and delete `daemon.log.1`.
-<!-- At f70fc707 a detached daemon's log stayed at 0 bytes at the default level over several starts and stops
-(tsk_J8tJF2x); PR 1's 175 bytes were the developmental banner that PR 2 removed. -->
 
 **One daemon per project.** Ownership is decided by a lock that the daemon holds from start until the last
 step of its shutdown (`.orchestry/.daemon-owner.lock`, never deleted) and by the project's existing orchestrator
@@ -319,7 +305,6 @@ Every command that reads or changes project state exits 7 the same way: `orch ta
 `orch task add` or `orch daemon status`. `orch mcp` does not exit; it returns the message with `exit_code` 7 as an
 MCP error (see [When no daemon answers](#when-no-daemon-answers)). The
 [MCP chapter](17-mcp-server.md#exit-codes-and-startup-errors) lists `orch mcp`'s own startup exit codes.
-<!-- PR 2 contract items 1 and 3; spec "Uniform failure contract"; design D5. -->
 
 ## When no daemon answers
 
@@ -365,8 +350,9 @@ Three cases are not "no daemon" and say so:
   In an agent's environment the second line ends with ` Report this to the owner and stop.` Look at what the
   request would have changed before you send it again; orch never sends it again for you.
 - **Busy.** The daemon is running but has no room for another client: all sessions are in use, or too many
-  clients are connecting at the same moment. A client waits up to 10 s for room before it gives up (no request has
-  been sent by then, so waiting cannot run anything twice), then exits 7, with no start hint:
+  clients are connecting at the same moment. A client waits up to about 13 s for room (10 s of waiting plus one
+  last connection attempt) before it gives up (no request has been sent by then, so waiting cannot run anything
+  twice), then exits 7, with no start hint:
 
   ```text
     ✕ daemon_busy for <project root> (orch daemon PID <pid or unavailable> is running; <n>/<cap> sessions)
@@ -385,10 +371,6 @@ Three cases are not "no daemon" and say so:
 
   orch does not tell you to delete or kill anything.
 
-<!-- Texts: crates/orch-proto/src/error.rs ConnectFailure::render at the PR 1 frozen SHA 6a7a6481 (frozen by
-R5/R6; PR 2 contract item 3). -->
-
-<!-- PR 2 contract items 1 and 3; design D5; spec R18. -->
 **Each kind of client** shows the same text in its own way:
 
 | Client | With no usable daemon |
@@ -460,7 +442,7 @@ socket to an environment you would not trust as yourself.
 
 A client and a daemon talk only when they are the same orch version **and** the same local protocol version
 (`LOCAL_PROTOCOL`).
-<!-- LOCAL_PROTOCOL is still 1 at the PR 2 head (crates/orch-proto/src/lib.rs:46 at f70fc707). --> When they differ, in either direction, the client stops before any request
+When they differ, in either direction, the client stops before any request
 is decoded, so nothing in your project changes. The message names the daemon's and this orch's versions and
 protocols in `<detail>` and changes the hint:
 
@@ -520,7 +502,6 @@ orch serve --once || { rc=$?; echo "orch batch failed (exit $rc); owner action r
 
 Dispatch is a mode of the daemon, not a separate process. `orch serve` and `orch run --watch` start a daemon; every
 other way of running work asks the running daemon:
-<!-- design D8 and its batch policy (RT5/G3); spec R5, R13, R38; PR 2 contract item 1. -->
 
 | Command | What it does now |
 |---|---|
@@ -535,17 +516,19 @@ other way of running work asks the running daemon:
 | `orch doctor` | A client: with no daemon it runs its local checks, then prints the no-daemon message and exits 7; outside a project it exits 0. |
 | `orch init`, `--help`, `--version` | Need no daemon. `orch init` prints how to start one and never starts it; running it again changes nothing in an existing project. |
 
-**Dispatch waits for the next check.** With dispatch on, the daemon starts waiting work only at its scheduling
-checks, every `scheduling.poll_interval_ms` (10 s by default). A new task, or a task unblocked by a finished run, can
-wait up to that long before its agent starts, and a task queued behind another task of the same agent waits for the
-first check after that run ends. orch 0.13.0 dispatched within about half a second. To shorten the wait, lower the
-interval, for example `orch config set scheduling.poll_interval_ms 2000` (values under 100 ms count as 100 ms); the
-daemon uses the new value from its next check. A later release restores immediate dispatch.
-<!-- Dissent 10.9 (dissent-log-cp5.md). crates/orch-engine/src/orchestrator/tick.rs:595 (no reactive dispatch in
-daemon mode), crates/orch-daemon/src/dispatch/mod.rs:24-67 (plain sleep, DEFAULT_POLL 10 s, MIN_POLL 100 ms) at
-f70fc707; 0.13.0 debounce 500 ms (orchestrator.rs:83, TaskCreated at :618-620 at 8bab8d1c). Measured at f70fc707,
-default interval, one shell agent: created->done 0.6/8.9/10.0 s (fact-check), 3.6/8.0/23.2 s (tsk_J8tJF2x; the
-23.2 s task waited behind another task of the same agent). -->
+**Dispatch follows changes.** With dispatch on, a change to the project wakes the daemon's scheduler: a new or
+edited task, a run that ends and unblocks another task, a message, from any client or from the daemon's own work.
+The daemon checks for work about half a second after the first such change; changes that arrive in the meantime
+join that check, so a burst of changes leads to one check, not one per change. A change that arrives while a check
+is running leads to at most one more check, about half a second after it ends. The checks the scheduler makes do
+not wake it again. Half a second is when the check is due, not a promise of when the agent starts: a long check or
+a busy machine can delay it.
+
+The periodic check every `scheduling.poll_interval_ms` (10 s by default) still runs, for work that becomes due
+with time, such as a retry whose delay has passed. Change the interval with
+`orch config set scheduling.poll_interval_ms <ms>` (values under 100 ms count as 100 ms); the daemon uses the new
+value from its next check. A wake never turns dispatch on, never starts a task of a paused goal and never skips a
+task's retry delay or the back-off after a failed preparation.
 
 **Options a daemon start refuses.** A foreground `orch serve` or `orch run --watch` *is* the daemon, so the
 options orch 0.13.0 used to shape that process's log or interval have nothing left to apply to. The command refuses
@@ -570,10 +553,6 @@ The messages, after `✕`:
 `orch serve --once` keeps `--log-format json|text`, `--log-file` and `--verbose`: it is a client, and it renders
 the batch's events itself ([Logs of `serve --once`](07-running-and-monitoring.md#logs-of-serve---once)).
 `orch run <task-id>`, `--all` and `--once` accept `--verbose` and ignore it.
-<!-- W2b (tsk_s5fpInN): crates/orch-cli/src/tree.rs REJECT_* constants, RunCmd/ServeCmd::rejected_flag and
-lib.rs dispatch_parsed (refusal before the foreground daemon path) at feature/daemon-clients-cli 6acc62db;
-s2a-cli-decisions.md §2. Captured at f70fc707 by the board-2 fact-check (fact-checker-pr2-review-f70fc70-evidence/
-flags.txt): every row and message matches. -->
 
 **`orch serve --once` is a batch.** While global dispatch is on it refuses with
 `dispatch is ON; serve --once needs dispatch OFF` (exit 2). With dispatch off it runs one batch at a time (a second
@@ -590,6 +569,44 @@ blocked dependency therefore keeps the batch going, as before. The batch never c
 `orch daemon start`, `orch daemon status`, the dashboard header and `orch web` show whether dispatch is on or off,
 and a daemon starts with it off unless you start it with `orch serve`, `orch run --watch` or `--dispatch on`, also
 after a restart.
+
+## How clients follow changes
+
+The daemon tells its clients when something changes; no client watches the project's files or re-reads the
+project on a timer.
+
+- **What a client gets.** A client that wants live updates subscribes to the stores it shows (tasks, goals,
+  agents, messages, context, and optionally teams, runs, configuration, daemon state and remotes) and, if it
+  wants, to the orchestrator's events. Each change notice names the store, the kind of change (`created`,
+  `updated`, `deleted`) and the entity's ID, never its contents. A notice without an ID means "something in this
+  store changed": the daemon sends it for its own state and the configuration, and when it knows which store a
+  change touched but not which entries. The client then reads what it needs again, through ordinary requests.
+- **Who subscribes.** The dashboard, so every `orch web` tab too, since each tab runs a dashboard; and
+  `orch mcp`, for the `orch://` resources its client subscribed to
+  ([Subscribe to resources](17-mcp-server.md#subscribe-to-resources)). The CLI's one-shot commands do not
+  subscribe; `orch logs --follow` streams events as before.
+- **When a client falls behind.** Each subscription holds at most 256 waiting notices, and one connection at most
+  4 MiB of waiting output. A client that falls further behind gets one "start over" notice instead (resync): it
+  then reads every view it shows again. If even that notice does not fit, the daemon closes the connection, and
+  the client treats it as a lost connection. The daemon also sends a resync to every subscriber when a change
+  failed part-way and it cannot tell which stores were touched. Both are rare; a client never misses a change
+  silently. A connection holds at most 8 subscriptions.
+- **When the daemon goes away.** The dashboard shows the [no-daemon screen](#when-no-daemon-answers) (`r` to
+  retry, `q` to quit). `orch web` answers new pages with HTTP 503, and an open tab shows its dashboard's
+  no-daemon screen. `orch mcp` tells its client that every subscribed resource changed, then answers each call with
+  the no-daemon error. **Nothing restarts the daemon**, and no client starts one: you do. After you start it again,
+  the dashboard (`r`) and `orch mcp` (on a resource read, tool call or new resource subscription) subscribe to the new daemon and read
+  everything again; no mutation is replayed. Notifications remain hints and may repeat.
+
+**Limits and a known limitation.** Commit identity metadata holds at most 256 entries / 64 KiB; the
+subscription and session limits above bound staged output, including frames handed to the writer. The engine's
+per-operation domain-event buffer is not capped: it holds one operation's events until the operation releases
+the permit and grows with the number of events that operation emits. An overflow design for in-process
+listeners remains deferred.
+
+An idle worker linked to a controller emits no change notices or dispatch wakes for heartbeat frames. An idle
+controller with a linked peer still invalidates the Remote store about once per second for peer status; those
+commits can wake dispatch.
 
 ## Upgrading from orch 0.13.0
 

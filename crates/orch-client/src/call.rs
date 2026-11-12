@@ -72,7 +72,8 @@ impl Client {
     }
 
     /// The next frame addressed to a request. Subscription pushes carry no
-    /// request id and have no consumer before PR 3, so they are skipped.
+    /// request id and belong to a dedicated observation session. Ordinary
+    /// request lanes skip them rather than buffering unrelated observations.
     async fn read_frame(&mut self) -> Result<ServerFrame, ClientError> {
         loop {
             let bytes = self

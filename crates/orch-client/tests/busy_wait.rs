@@ -78,7 +78,9 @@ impl FakeDaemon {
                         }
                         Answer::Busy => reject(RejectCode::Busy),
                         Answer::HandshakeFailed => reject(RejectCode::HandshakeFailed),
-                        Answer::Welcome => HandshakeReply::welcome(welcome(&hello, 1)),
+                        Answer::Welcome => {
+                            HandshakeReply::welcome(welcome(&hello, orch_proto::LOCAL_PROTOCOL))
+                        }
                         Answer::Skew => HandshakeReply::welcome(Welcome {
                             compatible: false,
                             ..welcome(&hello, orch_proto::LOCAL_PROTOCOL + 1)

@@ -43,18 +43,18 @@ pub use orch_domain;
 /// semver plus equal `LOCAL_PROTOCOL` is the only compatibility signal, and two
 /// builds that differ in neither are deliberately indistinguishable.
 #[cfg(not(feature = "skew-seam"))]
-pub const LOCAL_PROTOCOL: u32 = 1;
+pub const LOCAL_PROTOCOL: u32 = 2;
 
 /// Test seam (T2a, spec R32 vector 8.20): a build with `--features skew-seam`
 /// takes its protocol revision from `ORCH_SEAM_LOCAL_PROTOCOL` at BUILD time,
 /// so two binaries of one tree can disagree. Never enabled by default; without
-/// the feature the constant above is 1 and the variable is ignored.
+/// the feature the constant above is 2 and the variable is ignored.
 #[cfg(feature = "skew-seam")]
 pub const LOCAL_PROTOCOL: u32 = seam_protocol(option_env!("ORCH_SEAM_LOCAL_PROTOCOL"));
 
 #[cfg(feature = "skew-seam")]
 const fn seam_protocol(raw: Option<&str>) -> u32 {
-    let Some(raw) = raw else { return 1 };
+    let Some(raw) = raw else { return 2 };
     let bytes = raw.as_bytes();
     assert!(!bytes.is_empty(), "ORCH_SEAM_LOCAL_PROTOCOL is empty");
     let mut value = 0_u32;
@@ -79,12 +79,12 @@ pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 mod local_protocol_tests {
     use super::LOCAL_PROTOCOL;
 
-    // Without the seam the constant is 1 whatever ORCH_SEAM_LOCAL_PROTOCOL says at
+    // Without the seam the constant is 2 whatever ORCH_SEAM_LOCAL_PROTOCOL says at
     // build time (run with `ORCH_SEAM_LOCAL_PROTOCOL=2 cargo test -p orch-proto`).
     #[cfg(not(feature = "skew-seam"))]
     #[test]
-    fn feature_off_local_protocol_is_one_regardless_of_env() {
-        assert_eq!(LOCAL_PROTOCOL, 1);
+    fn feature_off_local_protocol_is_two_regardless_of_env() {
+        assert_eq!(LOCAL_PROTOCOL, 2);
     }
 
     #[cfg(feature = "skew-seam")]
@@ -93,8 +93,8 @@ mod local_protocol_tests {
         use crate::seam_protocol;
 
         #[test]
-        fn feature_on_env_unset_parses_to_one() {
-            assert_eq!(seam_protocol(None), 1);
+        fn feature_on_env_unset_parses_to_two() {
+            assert_eq!(seam_protocol(None), 2);
         }
 
         #[test]
@@ -113,7 +113,7 @@ mod local_protocol_tests {
         #[test]
         fn feature_on_constant_follows_the_build_time_env() {
             let expected = match option_env!("ORCH_SEAM_LOCAL_PROTOCOL") {
-                None => 1,
+                None => 2,
                 Some(raw) => raw.parse::<u32>().unwrap(),
             };
             assert_eq!(LOCAL_PROTOCOL, expected);

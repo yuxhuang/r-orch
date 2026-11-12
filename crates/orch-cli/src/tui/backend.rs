@@ -27,6 +27,14 @@
 //! 4. **Bounded waits.** Every request carries a deadline, so a daemon that
 //!    stops answering cannot freeze the draw thread; an expired deadline is a
 //!    lost session with an unknown outcome, never a silent success.
+//! 5. **Push, then read.** One observation session (every store plus the
+//!    bus) is subscribed *before* the first read, so nothing committed in
+//!    between is missed (brief D3). Its pump only fills memory: store
+//!    changes into a coalescing [`ObservationQueue`], bus events into the
+//!    activity queue. A gap or a daemon resync opens a new subscription
+//!    first and only then tells the dashboard to read every view again; a
+//!    different daemon instance, or the observation ending, is a lost
+//!    session. Nothing on that path replays a request or starts a daemon.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -36,7 +44,9 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use orch_client::{Client, ClientError, NoDaemon, Progress};
+use orch_client::{
+    Client, ClientError, NoDaemon, Progress, Subscription, SubscriptionError, SubscriptionEvent,
+};
 use orch_domain::{
     Agent, CreateGoalInput, CreateTeamInput, Goal, GoalStatus, NotificationPreferences,
     OrchestratorEvent, OrchestratorState, PromptMode, ReasoningEffort, Task, Team, TuiPaletteName,
@@ -46,6 +56,7 @@ use orch_infra::clipboard::{
 };
 use orch_proto::bounded::{BoundedString, BoundedVec, Id};
 use orch_proto::error::NoDaemonDetail;
+use orch_proto::frame::Store;
 use orch_proto::ops::Op;
 use orch_proto::ops::args::{self, DispatchSwitch, FieldPatch, ImageFormat, TransferPurpose};
 use orch_proto::ops::results;
@@ -53,7 +64,8 @@ use orch_proto::path::WirePath;
 use orch_tui::backend::{
     AgentFields, AgentOpts, BackendResult, ClipboardPaste, CopyOutcome, CopyResult, CopyTarget,
     CopyTicket, CreateTaskOpts, EntityTiming, GoalFields, HistoryEntry, LaunchContext,
-    MessageTarget, ModelCatalog, ModelOption, TaskFields, TimingSnapshot, TuiBackend, copy,
+    MessageTarget, ModelCatalog, ModelOption, Observation, ObservedStore, TaskFields,
+    TimingSnapshot, TuiBackend, copy,
 };
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
@@ -92,7 +104,7 @@ enum CatalogState {
     Delivered,
 }
 
-/// Events waiting for the next frame, fed by the `logs.follow` session.
+/// Bus events waiting for the next frame, fed by the observation session.
 #[derive(Debug, Default)]
 struct EventQueue(Mutex<VecDeque<OrchestratorEvent>>);
 
@@ -116,6 +128,63 @@ impl EventQueue {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, VecDeque<OrchestratorEvent>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Store changes waiting for the next frame, coalesced per store: the
+/// highest commit ordinal each store has been pushed, plus whether a resync
+/// is pending. Bounded by construction (ten stores and a flag), so a
+/// dashboard that stops drawing loses no invalidation, it only merges them.
+#[derive(Debug, Default)]
+struct ObservationQueue(Mutex<PendingObservations>);
+
+#[derive(Debug, Default)]
+struct PendingObservations {
+    resynced: bool,
+    /// Per store, in first-seen order: the newest ordinal, and the entity id
+    /// when exactly one change is merged.
+    changed: Vec<(ObservedStore, u64, Option<String>)>,
+}
+
+impl ObservationQueue {
+    fn changed(&self, store: ObservedStore, id: Option<String>, commit_seq: u64) {
+        let mut pending = self.lock();
+        match pending.changed.iter_mut().find(|(s, _, _)| *s == store) {
+            Some(entry) => {
+                entry.1 = entry.1.max(commit_seq);
+                entry.2 = None;
+            }
+            None => pending.changed.push((store, commit_seq, id)),
+        }
+    }
+
+    /// Every view is stale. Changes merged before it are covered by the
+    /// refetch; they are kept anyway, since over-reading is harmless.
+    fn resynced(&self) {
+        self.lock().resynced = true;
+    }
+
+    /// A resync first (it makes every view stale), then the changes.
+    fn drain(&self) -> Vec<Observation> {
+        let pending = std::mem::take(&mut *self.lock());
+        let mut out = Vec::with_capacity(pending.changed.len() + 1);
+        if pending.resynced {
+            out.push(Observation::Resynced);
+        }
+        out.extend(pending.changed.into_iter().map(|(store, commit_seq, id)| {
+            Observation::Changed {
+                store,
+                id,
+                commit_seq,
+            }
+        }));
+        out
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, PendingObservations> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -177,6 +246,7 @@ pub struct DaemonBackend {
     cwd: PathBuf,
     context: LaunchContext,
     queue: Arc<EventQueue>,
+    observations: Arc<ObservationQueue>,
     history: Arc<Mutex<VecDeque<Vec<HistoryEntry>>>>,
     catalog: Arc<Mutex<CatalogState>>,
     copy: CopyTransport,
@@ -188,7 +258,7 @@ pub struct DaemonBackend {
     /// `update_agent` wrote, handed out once by `take_agent_diagnostics`.
     authored_diagnostics: Vec<String>,
     loss: Arc<SessionLoss>,
-    /// The `logs.follow` pump and any observed launches; aborted on drop so
+    /// The observation pump and any observed launches; aborted on drop so
     /// no session outlives the dashboard.
     tasks: Vec<JoinHandle<()>>,
 }
@@ -220,9 +290,14 @@ impl Drop for DaemonBackend {
 }
 
 impl DaemonBackend {
-    /// Connect, read the launch context in one coordinated `ui.bootstrap`,
-    /// and start the event stream. Opening the dashboard **does not change
-    /// dispatch**: the header shows the daemon's switch as it is.
+    /// Subscribe, then connect, read the launch context in one coordinated
+    /// `ui.bootstrap`, and hand the observation to its pump. Opening the
+    /// dashboard **does not change dispatch**: the header shows the daemon's
+    /// switch as it is.
+    ///
+    /// The subscription comes first so a change committed between it and
+    /// the first read is still pushed (brief D3); the pump runs before the
+    /// bootstrap so a slow bootstrap cannot overflow the observation buffer.
     ///
     /// Must be called from the runtime. `version` is the CLI's own version,
     /// which the dashboard shows in its header. `stop` is the draw loop's
@@ -233,23 +308,38 @@ impl DaemonBackend {
         cwd: PathBuf,
         stop: Arc<AtomicBool>,
     ) -> Result<DaemonBackend, ClientError> {
+        let subscription = subscribe(&connector).await?;
+        let instance = subscription.instance().clone();
+        let loss = SessionLoss::new(stop);
+        let queue = Arc::new(EventQueue::default());
+        let observations = Arc::new(ObservationQueue::default());
+        let handle = Handle::current();
+        // Aborted unless the launch completes: a failed bootstrap must not
+        // leave an observation running, and the pump reports a loss only
+        // once there is a dashboard to stop (`ready`), never into the
+        // no-daemon screen a failed launch is about to show.
+        let (ready, launched) = tokio::sync::oneshot::channel();
+        let pump = AbortOnDrop(Some(handle.spawn(pump_observations(
+            subscription,
+            connector.clone(),
+            Arc::clone(&queue),
+            Arc::clone(&observations),
+            Arc::clone(&loss),
+            launched,
+        ))));
+
         let mut client = connector.connect().await?;
+        if client.welcome.instance != instance {
+            // The daemon restarted between the two connects: this launch
+            // would mix two lifetimes. Report it like any lost session.
+            return Err(lost(connector.project_root()));
+        }
         let boot = within_owned(REQUEST_TIMEOUT, &mut client, |c| {
             c.ui_bootstrap(args::UiBootstrapArgs {})
         })
         .await?;
-        // A second session for the live feed: `logs.follow` holds its lane
-        // until cancelled, so it cannot share the request lane.
-        let follow = connector.connect().await?;
-        let loss = SessionLoss::new(stop);
-        let queue = Arc::new(EventQueue::default());
-        let handle = Handle::current();
-        let pump = handle.spawn(pump_events(
-            follow,
-            Arc::clone(&queue),
-            Arc::clone(&loss),
-            connector.agent_context(),
-        ));
+        let pump = pump.release();
+        let _ = ready.send(());
 
         let context = LaunchContext {
             project_name: boot.project_name,
@@ -276,6 +366,7 @@ impl DaemonBackend {
             cwd,
             context,
             queue,
+            observations,
             history: Arc::new(Mutex::new(VecDeque::new())),
             catalog: Arc::new(Mutex::new(CatalogState::NotStarted)),
             // Opens nothing and starts no thread: the native worker waits for
@@ -443,7 +534,7 @@ impl DaemonBackend {
     /// Both stream until their runs are terminal, which a frame cannot wait
     /// for, so the call returns as soon as the daemon confirms the launch —
     /// its first streamed event — or refuses it; the rest of the stream is
-    /// drained in the background and discarded (the `logs.follow` feed
+    /// drained in the background and discarded (the observation's bus
     /// already carries every event). Ending the dashboard closes that session,
     /// which ends the daemon's *observation* only: runs continue (design D8).
     fn launch_observed(&mut self, request: LaunchRequest) -> BackendResult<()> {
@@ -567,42 +658,136 @@ async fn drain_launch(
     }
 }
 
-/// Feed the queue from `logs.follow` until the session ends; an end that was
-/// not asked for is a lost session.
-async fn pump_events(
-    mut client: Client,
-    queue: Arc<EventQueue>,
-    loss: Arc<SessionLoss>,
-    agent_context: bool,
-) {
-    let root = client.project().root.to_string_lossy().into_owned();
-    let result: Result<(), ClientError> = async {
-        let mut call = client
-            .follow_logs(args::LogsFollowArgs {
-                run_id: None,
-                task_id: None,
-                agent_id: None,
-            })
-            .await?;
-        loop {
-            match call.next().await? {
-                Progress::Event(event) => queue.push(*event),
-                // The daemon ends a follow only when it is stopping.
-                Progress::Done(()) => {
-                    return Err(ClientError::Connection(NoDaemon::no_daemon(
-                        &root,
-                        NoDaemonDetail::Stopping,
-                    )));
-                }
-            }
-        }
+/// Every store the dashboard shows something of, plus the ones it does not
+/// (messages, context) so the subscription matches the brief's list and a
+/// later view needs no protocol change.
+const OBSERVED: [Store; 10] = [
+    Store::Tasks,
+    Store::Goals,
+    Store::Agents,
+    Store::Messages,
+    Store::Context,
+    Store::Teams,
+    Store::Runs,
+    Store::Config,
+    Store::State,
+    Store::Remote,
+];
+
+/// Open a fresh session and turn it into the dashboard's observation: every
+/// store, unfiltered, with the bus.
+async fn subscribe(connector: &Connector) -> Result<Subscription, ClientError> {
+    let client = connector.connect().await?;
+    let stores = BoundedVec::new(OBSERVED.to_vec())
+        .map_err(|_| ClientError::InvalidArguments("too many observed stores".into()))?;
+    client
+        .into_subscription(args::SubscribeArgs {
+            stores,
+            filter: None,
+            bus: true,
+        })
+        .await
+}
+
+fn observed_store(store: Store) -> ObservedStore {
+    match store {
+        Store::Tasks => ObservedStore::Tasks,
+        Store::Goals => ObservedStore::Goals,
+        Store::Agents => ObservedStore::Agents,
+        Store::Messages => ObservedStore::Messages,
+        Store::Context => ObservedStore::Context,
+        Store::Teams => ObservedStore::Teams,
+        Store::Runs => ObservedStore::Runs,
+        Store::Config => ObservedStore::Config,
+        Store::State => ObservedStore::State,
+        Store::Remote => ObservedStore::Remote,
     }
-    .await;
-    if let Err(error) = result {
-        let error = normalize(error, Path::new(&root));
-        // A refused follow is not survivable either: without it the
-        // dashboard would show a frozen activity pane as if all were quiet.
-        loss.record(error.render(agent_context));
+}
+
+/// Fill the queues from the observation until it ends. A resync (gap, lag,
+/// uncertain commit, client overflow) subscribes again on a new session and
+/// only then queues [`Observation::Resynced`], so every read the dashboard
+/// makes for it is covered by the new subscription. Anything else that ends
+/// the observation — EOF, a malformed frame, a refusal, or a resubscription
+/// that reaches a different daemon instance — is a lost session.
+async fn pump_observations(
+    mut subscription: Subscription,
+    connector: Connector,
+    events: Arc<EventQueue>,
+    observations: Arc<ObservationQueue>,
+    loss: Arc<SessionLoss>,
+    launched: tokio::sync::oneshot::Receiver<()>,
+) {
+    let root = connector.project_root().to_path_buf();
+    let instance = subscription.instance().clone();
+    let error = loop {
+        match subscription.next().await {
+            Ok(SubscriptionEvent::Change {
+                store,
+                id,
+                commit_seq,
+                ..
+            }) => observations.changed(
+                observed_store(store),
+                id.map(|id| id.as_str().to_owned()),
+                commit_seq,
+            ),
+            Ok(SubscriptionEvent::Bus { event, .. }) => events.push(*event),
+            Ok(SubscriptionEvent::ResyncRequired { reason }) => {
+                tracing::debug!(?reason, "TUI observation resync; subscribing again");
+                subscription = match subscribe(&connector).await {
+                    Ok(next) if *next.instance() == instance => next,
+                    // A new daemon lifetime: the request lane and every
+                    // cached view belong to the old one (brief D7).
+                    Ok(_) => break lost(&root),
+                    Err(error) => break normalize(error, &root),
+                };
+                observations.resynced();
+            }
+            Err(error) => break observation_error(error, &root),
+        }
+    };
+    if launched.await.is_ok() {
+        loss.record(error.render(connector.agent_context()));
+    }
+}
+
+/// An ended observation, in the uniform session-loss text.
+fn observation_error(error: SubscriptionError, root: &Path) -> ClientError {
+    match error {
+        SubscriptionError::Remote(body) => normalize(ClientError::Remote(*body), root),
+        SubscriptionError::TransportClosed
+        | SubscriptionError::InvalidFrame
+        | SubscriptionError::InvalidAck
+        | SubscriptionError::CompletionTimeout
+        | SubscriptionError::BufferOverflow
+        | SubscriptionError::Ended => lost(root),
+    }
+}
+
+/// "The daemon this session talked to is gone", as the no-daemon screen
+/// shows it.
+fn lost(root: &Path) -> ClientError {
+    ClientError::Connection(NoDaemon::no_daemon(
+        &root.to_string_lossy(),
+        NoDaemonDetail::ConnectionLost,
+    ))
+}
+
+/// Aborts the task unless [`AbortOnDrop::release`]d.
+struct AbortOnDrop(Option<JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn release(mut self) -> JoinHandle<()> {
+        self.0.take().expect("released once")
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
     }
 }
 
@@ -719,7 +904,7 @@ impl TuiBackend for DaemonBackend {
         Ok(status)
     }
 
-    // ── Refresh (RPC on the existing tick; push is PR 3) ─────────────────
+    // ── Refresh: one read per view a pushed change made stale ────────────
 
     fn refresh_tasks(&mut self) -> BackendResult<Vec<Task>> {
         self.request(args::TaskListArgs {
@@ -739,6 +924,18 @@ impl TuiBackend for DaemonBackend {
 
     fn refresh_state(&mut self) -> BackendResult<OrchestratorState> {
         self.request(args::StateGetArgs {})
+    }
+
+    /// The request lane's last terminal `commit_seq`: what the read just
+    /// made observed (the daemon holds the operation boundary across it).
+    fn last_read_seq(&self) -> Option<u64> {
+        self.client.last_commit_seq()
+    }
+
+    /// `daemon.status`: the switch lives in daemon memory, not a store.
+    fn refresh_dispatch(&mut self) -> BackendResult<bool> {
+        self.request(args::DaemonStatusArgs {})
+            .map(|status| status.dispatch.dispatch_on)
     }
 
     fn list_teams(&mut self) -> BackendResult<Vec<Team>> {
@@ -1273,13 +1470,18 @@ impl TuiBackend for DaemonBackend {
 
     // ── Polled streams ───────────────────────────────────────────────────
 
-    /// Everything the `logs.follow` session delivered since the last frame,
+    /// Every bus event the observation delivered since the last frame,
     /// oldest first.
     fn poll_events(&mut self) -> Vec<OrchestratorEvent> {
         self.queue.drain()
     }
 
     /// History batches that have arrived since the last frame.
+    /// Store changes pushed since the last frame, coalesced per store.
+    fn poll_observations(&mut self) -> Vec<Observation> {
+        self.observations.drain()
+    }
+
     fn poll_history(&mut self) -> Vec<Vec<HistoryEntry>> {
         self.history
             .lock()

@@ -120,6 +120,20 @@ calls; sockets accepted/created elsewhere on macOS retain their separate
 close-on-exec window. No immunity to crash transactionality or external writers
 is implied. See [process start diagnosis](RUNBOOK.md#a-process-is-waiting-to-start).
 
+Test-only assembly may explicitly opt a wholly non-forking fake process manager
+into one synthetic admission domain per harness, shared by launch, the
+`GitWorkspaceManager` git and rsync commands (workspace preparation, cleanup,
+changed-files listing) and OpenCode effort-wire probes. Merge remains
+process-wide. Default harnesses and real-process tests retain production
+admission. Covered crate-internal real builders reject a synthetic token before
+invoking their spawn closure; external direct-fork managers must never opt in.
+In an opted-in harness that rejection is a panic: it stops that harness's
+dispatch loop and can leave a task `in_progress` in the harness's temporary
+project. It is a test-configuration error, and no real child is started.
+Doctor/version probes, merge, real discovery and hostname remain process-global.
+Linux creates no synthetic semaphore. This capability is library assembly data,
+never selected by environment, config, CLI or RPC.
+
 ---
 
 ## 3. Crate layout
@@ -178,7 +192,7 @@ crates also have; the exact edge set is the table in `xtask crate-graph` (below)
 stores once `orch init` has created them, and every stateful frontend is its client. `orch daemon` runs without
 any environment gate. Each CLI command connects one daemon session through `orch-client` and sends typed
 operations (`commands/rpc.rs`, `Rpc::connect`). `orch mcp` is a stdio-to-socket bridge, the dashboard backend
-reads over the socket on its existing tick, and `orch web` checks for a daemon before it listens and again before
+reads over the socket on its existing tick at PR 2 (push replaces that tick in PR 3), and `orch web` checks for a daemon before it listens and again before
 every page and websocket, answering HTTP 503 if the daemon has gone away (`web/mod.rs`, `daemon_guard`). With no
 daemon, every client reports the uniform no-daemon message, and none of them starts one: a CLI command and
 `orch web` exit 7; the dashboard shows the message with `r retry · q quit`, and `q` exits 7; `orch mcp` keeps
@@ -312,27 +326,43 @@ All three names are the same program:
 
 ### 3.3.1 `orch mcp` (`orch-cli::mcp`)
 
-The stdio MCP server ([ADR 0011](decisions/0011-mcp-server.md), [manual](manual/17-mcp-server.md)). It lives
-entirely in `orch-cli`, above the engine, so the crate graph (§3.1) is unchanged. It calls the same `Engine`
-services as the CLI commands, never their printing wrappers.
+The stdio MCP bridge ([ADR 0012](decisions/0012-daemon-owned-state.md), [manual](manual/17-mcp-server.md))
+lives in `orch-cli`. Tools and resource reads open authenticated `orch-client` sessions; the daemon owns the
+stores, ordering and execution. The bridge builds no Engine and never starts a daemon.
 
 | Module | Owns |
 |---|---|
-| `mcp` (`mcp.rs`) | `orch mcp` entry: identity, mode and project root resolved before anything reaches stdout; a first light-Engine build so a broken config is a startup error; its own Tokio runtime with a 250 ms bounded shutdown (Tokio's stdin read cannot be cancelled) |
-| `mcp::server` | `rmcp::ServerHandler`; per-call admission (store lane: 16 permits, FIFO `tokio::sync::Mutex`, 10 s wait; diagnostic lane for `doctor`: 2 permits, 120 s whole-call deadline); a fresh light `Engine` per admitted call; lifecycle: stdin EOF and SIGINT/SIGTERM/SIGHUP are clean exits (signal handlers installed before `initialize`), and the first failed stdout write admits no further call, leaves calls that already ran done, and exits 1 with a `cannot write to stdout` reason on stderr; `initialize` instructions |
-| `mcp::registry` | `Registry::add` over rmcp's `ToolRouter`: one name, schema (`schemars`), annotations and class per tool; strict decode (unknown fields refused) and `ToolArgs::validate` before any Engine; mode filtering at registration and again at call |
+| `mcp` (`mcp.rs`) | Entry: identity, mode and project root resolved before protocol output; discovery only at launch; its own Tokio runtime with a 250 ms shutdown bound after the service finishes (not a total-stop deadline) |
+| `mcp::server` | `rmcp::ServerHandler`; immediate admission bounds: 16 project calls, 2 diagnostic calls with a 120 s whole-call deadline; no bridge FIFO. Healthy EOF drains responses. Failed or stalled stdout write/flush/shutdown stops new admission and returns `cannot write to stdout` (exit 1). One frame's writes and flush share a 5 s output budget; partial writes do not reset it. |
+| `mcp::server::subscriptions` | One observation session, at most one scheduled recovery including mutex waiters, and owned reader/writer/recovery tasks. Stop or stdin EOF cancels recovery; shutdown joins tasks and drop aborts them. At most 256 distinct canonical URIs, at most 527 bytes per URI and 256 bytes per identifier/alias component, checked before retention; updates coalesce per URI. |
+| `mcp::registry` | `Registry::add` over rmcp's `ToolRouter`: one name, schema (`schemars`), annotations and class per tool; strict decode (unknown fields refused) and `ToolArgs::validate` before RPC; mode filtering at registration and again at call |
 | `mcp::mode`, `mcp::identity` | Pure policy: `Default`/`ReadOnly`/`AllowDestructive` and the `Read`/`Mutate`/`Destructive` classes; `--agent` over `ORCH_AGENT_ID` |
 | `mcp::projections`, `mcp::resources` | Print-free read projections shared by tools and the `orch://` resources; strict URI grammar |
 | `mcp::system`, `mcp::tools::*` | `status`/`doctor`, and one leaf module per tool group, each exporting only `register` |
 
 Rules that keep it correct:
-- **Never the full tier.** No `FullEngine`, orchestrator, PID lock, scheduler or listener is built; `task_cancel` is
-  store-only. Short data-integrity locks (`.index.lock`, `.definition.lock`) are still taken.
-- **Shared validation, not copies.** Definition mutations and `config set` go through print-free helpers extracted
-  in `commands::{task, agent, config}`, which the CLI wrappers also call.
+- **No client stores.** The bridge builds no orchestrator, scheduler or listener; `task_cancel` reaches the
+  daemon's live process registry. Reads do not expire context; daemon maintenance does.
+- **Shared authority.** Typed operations and daemon-side validation preserve the tool modes and identity rules.
 - **stdout is the protocol.** Diagnostics go through the existing stderr `tracing` subscriber; no command wrapper
   runs after the transport starts; `file: "-"` is refused so nothing reads stdin but the transport.
-- **Reads can write**, as everywhere (§2.1): read-only mode removes authored-mutation tools, not maintenance writes.
+- **Observation recovery is explicit.** A later tool call, resource read or subscribe can request recovery of a
+  lost observation session. There is no autonomous retry or mutation replay, and no daemon start or repair.
+
+### 3.3.2 PR 3 push ordering and deferred refresh
+
+The daemon registers a subscription before the initial reads and buffers its events while inactive. Its sole
+session writer activates it only after the correlated acknowledgement has been written and flushed successfully;
+reply-queue priority alone cannot establish that order. Inactive events still consume the existing count/byte
+budgets. Unsubscribe drops buffered events; an event already selected by the writer precedes its acknowledgement.
+Session cleanup stops observations and preserves healthy terminal replies, but ordered state cleanup can delay
+the later drain timers: those timers are not a total-stop guarantee.
+
+The dashboard, including each web PTY dashboard, refreshes from invalidations rather than periodic state reads.
+An asynchronous prompt-mode write defers that view's refresh. When its answer arrives, success or refusal,
+the dashboard rearms the existing debounce if the view is still dirty, so a newer external mode is read without
+another event or key press. A clean view causes no extra read. See the spec's
+[push contract](specs/2026-11-09-daemon-owned-state.md#push-gaps-and-snapshot-ordering).
 
 ### 3.4 Organization templates
 

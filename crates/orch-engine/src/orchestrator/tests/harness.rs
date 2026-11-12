@@ -27,6 +27,94 @@ use crate::orchestrator::{Orchestrator, OrchestratorDeps, WatchOptions};
 use crate::run_service::RunService;
 use crate::task_service::TaskService;
 
+/// Real process assembly for launch/stop regressions. Tests drive the
+/// lifecycle and adapter ports while this fixture owns the shared tracker.
+#[derive(Default)]
+pub(crate) struct LaunchProcesses {
+    work: Arc<orch_infra::process::gate::SpawnWork>,
+}
+
+impl LaunchProcesses {
+    pub(crate) fn shell_adapter(
+        &self,
+        root: &std::path::Path,
+    ) -> Arc<dyn orch_core::adapter::Adapter> {
+        let processes =
+            orch_infra::process::SnapshotEnvProcessManager::new(orch_infra::process::EnvSnapshot {
+                base: vec![
+                    ("HOME".into(), root.as_os_str().to_owned()),
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                ],
+                forced: vec![],
+            })
+            .with_spawn_work(self.work.clone());
+        Arc::new(orch_infra::adapters::shell::ShellAdapter::new(Arc::new(
+            processes,
+        )))
+    }
+
+    pub(crate) fn shell_adapter_and_processes(
+        &self,
+        root: &std::path::Path,
+    ) -> (
+        Arc<dyn orch_core::adapter::Adapter>,
+        Arc<dyn orch_core::process::ProcessManager>,
+    ) {
+        let processes: Arc<dyn orch_core::process::ProcessManager> = Arc::new(
+            orch_infra::process::SnapshotEnvProcessManager::new(orch_infra::process::EnvSnapshot {
+                base: vec![
+                    ("HOME".into(), root.as_os_str().to_owned()),
+                    ("PATH".into(), "/usr/bin:/bin".into()),
+                ],
+                forced: vec![],
+            })
+            .with_spawn_work(self.work.clone()),
+        );
+        (
+            Arc::new(orch_infra::adapters::shell::ShellAdapter::new(
+                processes.clone(),
+            )),
+            processes,
+        )
+    }
+
+    pub(crate) fn workspace(
+        &self,
+        root: &std::path::Path,
+    ) -> Arc<dyn orch_core::workspace::WorkspaceManager> {
+        let (_, processes) = self.shell_adapter_and_processes(root);
+        Arc::new(orch_infra::workspace::GitWorkspaceManager::new(
+            root.to_owned(),
+            root.join(".orchestry"),
+            processes,
+        ))
+    }
+
+    pub(crate) fn admission(&self) -> Arc<dyn orch_core::process::SpawnAdmission> {
+        Arc::new(orch_infra::process::gate::TrackedSpawnAdmission::new(
+            orch_infra::process::gate::SpawnDomain::default(),
+            self.work.clone(),
+        ))
+    }
+
+    pub(crate) fn is_idle(&self) -> bool {
+        self.work.is_idle()
+    }
+
+    pub(crate) fn seal(&self) {
+        self.work.seal();
+    }
+
+    pub(crate) async fn wait_idle(&self) {
+        self.work.wait_idle().await;
+    }
+}
+
+pub(crate) async fn reserve_process_launch() -> Box<dyn orch_core::process::SpawnReservation> {
+    orch_core::process::SpawnAdmission::reserve(&orch_infra::process::gate::ProcessSpawnAdmission)
+        .await
+}
+
 /// A command runner that answers every review criterion from one scripted
 /// outcome, so no unit test shells out to `npm`.
 pub(crate) struct ScriptedCommandRunner {
@@ -145,6 +233,7 @@ pub(crate) struct HarnessBuilder {
         reason = "test-only store wrappers; each signature is spelled out where it is used"
     )]
     wrap_runs: Option<Box<dyn FnOnce(Arc<FakeRunStore>) -> Arc<dyn RunStore>>>,
+    workspace_impl: Option<Arc<dyn orch_core::workspace::WorkspaceManager>>,
 }
 
 impl Default for HarnessBuilder {
@@ -175,6 +264,7 @@ impl HarnessBuilder {
             wrap_tasks: None,
             wrap_agents: None,
             wrap_runs: None,
+            workspace_impl: None,
         }
     }
 
@@ -256,6 +346,14 @@ impl HarnessBuilder {
         self
     }
 
+    pub(crate) fn workspace_impl(
+        mut self,
+        workspace: Arc<dyn orch_core::workspace::WorkspaceManager>,
+    ) -> Self {
+        self.workspace_impl = Some(workspace);
+        self
+    }
+
     /// Leave the registry empty, so `require()` fails.
     pub(crate) fn without_adapter(mut self) -> Self {
         self.register_adapter = false;
@@ -321,6 +419,9 @@ impl HarnessBuilder {
             Some(wrap) => wrap(Arc::clone(&runs)),
             None => Arc::clone(&runs) as Arc<dyn RunStore>,
         };
+        // Exercise the same write accounting as the container, including
+        // collector tests that observe ordinals with otherwise fake stores.
+        let run_store = crate::container::tracked_test_runs(run_store, bus.operation_boundary());
 
         let mut registry = AdapterRegistry::new();
         match self.adapter_impl {
@@ -384,7 +485,9 @@ impl HarnessBuilder {
             run_store,
             state_store: Arc::clone(&state) as Arc<dyn StateStore>,
             adapters: Arc::new(registry),
-            workspace: Arc::clone(&workspace) as Arc<dyn orch_core::workspace::WorkspaceManager>,
+            workspace: self.workspace_impl.unwrap_or_else(|| {
+                Arc::clone(&workspace) as Arc<dyn orch_core::workspace::WorkspaceManager>
+            }),
             templates: Arc::clone(&templates) as Arc<dyn orch_core::template::TemplateEngine>,
             processes: Arc::clone(&processes) as Arc<dyn orch_core::process::ProcessManager>,
             events: Arc::clone(&bus),

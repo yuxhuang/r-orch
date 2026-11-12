@@ -158,6 +158,38 @@ pub struct EnvSnapshot {
     pub forced: Vec<(String, String)>,
 }
 
+#[cfg(test)]
+mod sealed_launch_tests {
+    use super::*;
+    use crate::process::gate::{SpawnObservation, SpawnObserver, SpawnSite, SpawnStage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Entered(AtomicUsize);
+    impl SpawnObserver for Entered {
+        fn observe(&self, event: SpawnObservation) {
+            if event.stage == SpawnStage::Entered {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_sealed_launch_never_enters_the_spawn_observer() {
+        let work = Arc::new(super::super::gate::SpawnWork::default());
+        let manager =
+            SnapshotEnvProcessManager::new(EnvSnapshot::default()).with_spawn_work(work.clone());
+        let observer = Arc::new(Entered::default());
+        let reservation =
+            crate::process::gate::reserve_observed(SpawnSite::Launch, Some(observer.clone())).await;
+        work.seal();
+        let result = reservation.run(|| manager.spawn("/bin/true", &[], SpawnOptions::default()));
+        assert!(result.is_err());
+        assert_eq!(observer.0.load(Ordering::SeqCst), 0);
+        assert!(work.is_idle());
+    }
+}
+
 impl SnapshotEnvProcessManager {
     pub fn new(snapshot: EnvSnapshot) -> Self {
         SnapshotEnvProcessManager {
@@ -206,7 +238,8 @@ fn spawn_with(
 ) -> Result<SpawnedChild> {
     let lease = work
         .map(|work| {
-            work.track()
+            super::gate::take_admitted_work(work)
+                .or_else(|| work.track())
                 .ok_or_else(|| Error::other("spawn admission closed"))
         })
         .transpose()?;

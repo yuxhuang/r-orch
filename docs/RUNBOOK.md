@@ -18,6 +18,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | `daemon is orch … protocol …, this client is orch …`, or upgrading orch | [Version skew and upgrading](#version-skew-and-upgrading-orch) |
 | Commands time out, or `orch daemon stop` says the PID is still running | [A hung daemon](#a-hung-daemon) |
 | `orch` commands, the dashboard or MCP tools are slow while many tasks fail to start | [Commands are slow while many tasks fail to start](#orch-commands-are-slow-while-many-tasks-fail-to-start) |
+| The dashboard or an MCP client re-reads everything at once, `resources/subscribe` is refused, or a new task does not start within a second | [Live updates and dispatch wake](#live-updates-and-dispatch-wake) |
 | `Orchestrator already running (PID: undefined)` and nothing is running | [Corrupt lock file](#corrupt-lock-file) |
 | `serve --once` never exits | [`serve --once` hangs on review](#serve---once-hangs-on-a-task-in-review) |
 | `task show <id>` works but `task list` omits the task | [Rebuilding an index](#rebuilding-an-index-after-a-lost-update) (legacy procedure) |
@@ -49,11 +50,6 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 ---
 
 ## The orch daemon
-
-<!-- W2 (PR 2, tsk_M9AsDfP): written to wave-c-brief.md "PR 2 contract" items 1-4 and 7, spec "Normative recovery
-table" and "Uniform failure contract" (R5, R6, R14, R18, R35), design D3/D5/D13 and ADR 0012. Refusal texts are
-from crates/orch-daemon/src/lifecycle.rs and crates/orch-proto/src/error.rs at the PR 1 frozen SHA 6a7a6481.
-The board-2 fact-check (tsk_eVo3agZ) checked the rest at run time at the PR 2 head f70fc707. -->
 
 Every orch command that reads or changes a project, the dashboard, `orch web` and `orch mcp` talk to the project's
 daemon. **Nothing starts the daemon but you.** The operator's reference is [manual chapter 18](manual/18-daemon.md);
@@ -108,7 +104,8 @@ retry it. A restart does not resume the agent's conversation. `orch daemon start
 `orch run --watch` refuse to start from such an environment (exit 2); each accepts `--from-agent` to override
 that on purpose.
 
-**Not this entry:** `daemon_busy` (the daemon runs but found no room for the client within 10 s, for a session
+**Not this entry:** `daemon_busy` (the daemon runs but found no room for the client within about 13 s, that is 10 s
+of waiting plus one last connection attempt, for a session
 or for the connection itself, so the count can read `1/64 sessions`: close clients and retry), `wrong_project` (the socket
 belongs to another project: fix `ORCH_SOCKET`/`ORCH_PROJECT_ROOT`), `Cannot confirm the orch request outcome`
 (the reply was lost: read the state before you retry; see
@@ -133,8 +130,6 @@ through them, and it cannot republish them.
 **Give each project its own socket.** A project is identified by the device and inode of its `.orchestry/`
 directory. On a file system that reuses inodes, two projects pointed at one `ORCH_SOCKET` path can, in a narrow
 window, have one daemon remove the other's socket. Set `ORCH_SOCKET` per project, or leave it unset.
-<!-- ADR 0012 decision 9 note (ruling 8.15, architect message): (dev,ino) weaker on inode-reusing filesystems;
-remove_if_same safe under the project guard; residual ABA = two projects sharing a misconfigured ORCH_SOCKET. -->
 
 ### After a daemon crash or `kill -9`
 
@@ -211,9 +206,6 @@ the project until that call returns. Its shutdown is already under way, so **`ki
 3. `kill -KILL <pid>`. Its children are not killed with it.
 4. Check each child with `ps -p <child-pid> -o command=` and stop it too, or wait until it has exited.
 5. `orch daemon start`. The new daemon reconciles the killed one's work as after a crash.
-<!-- Symptom B: N1 06a4ae1e (manual 18 "After a timeout the daemon can still own the project" and the Recovery
-row); stop-timeout text crates/orch-proto/src/error.rs:278 at f70fc707; release-eng measured the extra SIGTERM
-at cd0fd4c0 (tech-writer-stop-timeout-n1-ba1c717.md). Not reproduced at f70fc707 (needs a hung git worktree add). -->
 
 ### A process is waiting to start
 
@@ -269,8 +261,8 @@ depending on writes are a stated non-guarantee: see
    `retrying · attempt 1/3`.
 3. Why they fail: `orch --json status` shows each waiting retry's error in `state.retry_queue[].error`, for
    example `"error": "workspace_mode \"worktree\" requires a git repository"`. Once terminal `failed` is recorded,
-   the failed task and status retry queue no longer retain its workspace failure reason (pending PR-4 fix,
-   task tsk_R3FGvVF, continuing tsk_ajCzJGN). An exhausted `retrying · attempt 3/3` can still carry the reason
+   the failed task and status retry queue no longer retain its workspace failure reason (pending fix).
+   An exhausted `retrying · attempt 3/3` can still carry the reason
    while final-failure recording is pending, so read it while the task is still `retrying`.
 
 **Fix.** For a finite burst with working storage, preparations stop at each task's attempt limit (`max_attempts`,
@@ -292,16 +284,27 @@ request was not run and can be retried. An ordinary request still waiting to acq
 is refused this way; this is not a completion deadline for work already started. If the error instead says
 `request outcome unknown`, inspect state before retrying: the request may have applied. Exit 7 or elapsed time
 alone does not establish that nothing ran.
-<!-- A6 (tsk_I57BLvA). Queue and durable writes: see the comment under manual 18 "What the daemon does not promise".
-Steps 1-3 and the dispatch-off line run on a throwaway project with release a08fad1b (worktree agent in a non-git
-project); retry_queue error from orch --json status; reason gone once terminal failed is recorded:
-tsk_ajCzJGN (PR-4 continuation tsk_R3FGvVF). Corrections at 8a4c9eb4: dispatch.rs:313-346 and daemon.rs:278-283
-keep exhausted retrying/back-off after a cascade-list read error, retrying only recording. Reservation:
-daemon.rs:167-169,889-905; daemon/shutdown.rs:98-114; recovery.rs:368-371. Safe retry:
-coordinator.rs:150-190; orch-client/src/call.rs:62-65; orch-proto/src/error.rs:250-254,292-307.
-Fact-check tsk_FUuRgp8 reused isolated runtime evidence; restart recovery is code-audited only. -->
 
 ---
+
+### Live updates and dispatch wake
+
+The daemon pushes change notices to the dashboard (every `orch web` tab runs one) and to `orch mcp` for subscribed
+resources, and wakes its own scheduler about half a second after a change
+([How clients follow changes](manual/18-daemon.md#how-clients-follow-changes)). No client polls.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The dashboard re-reads every view at once, or an MCP client gets `notifications/resources/updated` for every subscribed resource | The client fell behind (more than 256 waiting notices on a subscription, or 4 MiB on its connection), a change failed part-way with the affected stores unknown, or the daemon stopped or restarted | Nothing, if reads work: the client is catching up. If they fail with the no-daemon message, start the daemon yourself; nothing restarts it. Frequent resyncs mean a client reads too slowly: close clients you do not need. |
+| `resources/subscribe` is refused | That `orch mcp` process follows 256 distinct URIs, or the URI exceeds 527 bytes or an identifier/alias exceeds 256 bytes | Unsubscribe to free a slot; for `-32602`, correct the URI. Oversized strings are refused before retention. |
+| The prompt-mode header temporarily shows the old value during an F3 change | Its own asynchronous write is still pending | Wait for its answer. A pushed invalidation received meanwhile is refreshed after the usual debounce on success or refusal, without another key press or event. |
+| With dispatch on, a new or unblocked task does not start within about a second | The task is not eligible: dispatch is off, its goal is paused, its agent is busy, disabled or at capacity, it waits out a retry delay, or a failed preparation is backing off. A long scheduling check can also delay the next one. | `orch daemon status` (dispatch ON?), `orch task show <id>`, `orch logs --task <id>`. The periodic check still runs every `scheduling.poll_interval_ms`; a wake never overrides these checks. |
+
+The engine's per-operation domain-event buffer is not capped: it holds the events of one operation until
+the operation releases the permit and grows with the number of events the operation emits. Commit metadata
+(256 entries / 64 KiB), subscription counts and staged output have separate limits; see
+[How clients follow changes](manual/18-daemon.md#how-clients-follow-changes). An overflow design for in-process
+listeners remains deferred.
 
 ## Corrupt lock file
 
@@ -392,8 +395,6 @@ fail it, which is the worse failure mode.
 > one that is stale and still valid. The procedure with a daemon: `orch daemon stop`, remove the affected
 > `_index.json`, `orch daemon start`; never remove an index while the daemon runs. The 0.13.0 text below is
 > removed in a later release.
-<!-- W2: spec recovery table row "Crash between entity/index writes"; dissent-log W0 Q3; PR 2 contract item 7
-(mark legacy; deletion is PR 4). -->
 
 **Symptom.** `orch task show <id>` returns the task, but `orch task list` and `orch status` do not show it,
 and the orchestrator never dispatches it. The entity's `.yml` file exists on disk.
@@ -979,7 +980,8 @@ correction for a resize received together with a keypress; heading state-machine
 - `logs --follow` prints a text banner and then live events; `serve --once` writes JSON Lines
   (`--log-format json`, the default) or text. `--yaml` changes neither, and it never changes the on-disk `.jsonl`
   logs. A foreground `serve` is the daemon: it prints `listening <socket>` and `dispatch on`, no event lines, and
-  its diagnostics go to stderr only with `RUST_LOG` (to `.orchestry/daemon.log` when detached).
+  its operator diagnostics go to stderr regardless of `RUST_LOG` (to `.orchestry/daemon.log` when detached).
+  Arbitrary error details are omitted there; use `orch logs --follow` for the live error text and context.
 - A failing command prints its error as text on stderr under every output flag; stdout is empty.
 
 **Fix.** For `doctor`, drop the leading header lines before parsing: `orch --json doctor | sed '1,2d'`. For
@@ -1012,9 +1014,13 @@ failures take one of three paths:
 
 - **Configuration errors** (`configuration preflight` and the eco/custom-template message) stop the dispatch
   before any run exists. No run is recorded, the task stays `todo` with its attempts unchanged, and the agent
-  stays idle. `orch run <id>` prints the error and exits without running the task. `orch serve` logs it as
-  `orchestrator:error` with `context=dispatch task <id>` and `fatal=false`, then tries again on every tick
-  (`scheduling.poll_interval_ms`, 10 s by default) until the file is fixed. `orch serve --once` does not finish
+  stays idle. `orch run <id>` prints the error and exits without running the task. Foreground `orch serve`
+  writes only `⚠ orchestrator:error (details omitted from daemon stderr; use orch logs --follow)` to stderr.
+  In another terminal, start `orch logs --follow` to see the task context and full error text from subsequent
+  scheduling checks. The underlying live `orchestrator:error` event carries `context=dispatch task <id>` and
+  `fatal=false`; the daemon's stderr omits those fields. Dispatch tries again at each periodic or change-triggered scheduling
+  check (the periodic interval is `scheduling.poll_interval_ms`, 10 s by default) until the file is fixed.
+  These configuration failures do not consume an attempt or enter the workspace-preparation retry back-off. `orch serve --once` does not finish
   while this repeats. There is nothing to retry by hand: once the file is fixed, the next tick dispatches the
   task.
 - **`effort preparation failed`** fails one run before the tool starts, through the normal failed-run path (the
@@ -1023,11 +1029,11 @@ failures take one of three paths:
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `orch serve` logs `orchestrator:error error=configuration preflight: cannot read defaults.agent.prompt_mode: …` every tick; the task stays `todo` | `.orchestry/config.yml` became unreadable or invalid while `serve` was running. orch reads only the prompt mode again before each dispatch; other settings come from start-up. Commands that load the config, such as `orch run` and `orch task show`, refuse to start with the parse error itself. | Repair `.orchestry/config.yml`. The next tick reads it again and dispatches the task. |
-| `eco prompt mode is incompatible with custom templates (…)` from `orch run` (exit code 2), or as an `orchestrator:error` in the `serve` log every tick; the task stays `todo` | A hand-edited file combines eco with a custom prompt template. | `orch agent update <id> --prompt-mode normal` for each listed agent, or `orch config set defaults.agent.prompt_mode normal`. A running `serve` picks either up on the next tick. Removing the template instead needs a `serve` restart, because `serve` reads the `prompt` settings only at start-up. |
+| `orch logs --follow` shows `configuration preflight: cannot read defaults.agent.prompt_mode: …` on scheduling checks; foreground `orch serve` prints the redacted diagnostic above; the task stays `todo` | `.orchestry/config.yml` became unreadable or invalid while `serve` was running. orch reads only the prompt mode again before each dispatch; other settings come from start-up. Commands that load the config, such as `orch run` and `orch task show`, refuse to start with the parse error itself. | Repair `.orchestry/config.yml`. The next tick reads it again and dispatches the task. |
+| `eco prompt mode is incompatible with custom templates (…)` from `orch run` (exit code 2), or in `orch logs --follow` on scheduling checks; foreground `orch serve` prints the redacted diagnostic above; the task stays `todo` | A hand-edited file combines eco with a custom prompt template. | `orch agent update <id> --prompt-mode normal` for each listed agent, or `orch config set defaults.agent.prompt_mode normal`. A running `serve` picks either up on the next tick. Removing the template instead needs a `serve` restart, because `serve` reads the `prompt` settings only at start-up. |
 | Run fails: `effort preparation failed: … the installed opencode did not prove provider/model#variant support …` | OpenCode agent with an effort newer than 0.9.4's, and the `opencode` on `PATH` is not version 2 (or the check timed out after 2 s or produced more than 64 KiB). | Install OpenCode 2, or `orch agent update <id> --effort default`. A stored `low`/`medium`/`high` never fails this way: it is dropped with a `legacy-ignored` warning. |
-| `legacy-ignored`, `capability-unknown` and other effort warnings at `orch run` start, or `serve:diagnostic` records in the `serve` log | Stored efforts that this adapter or model cannot take, or that orch cannot check. Not an error. | Review with `orch agent list`; clear with `--effort default` or set a model. |
-| `orchestrator:error` warnings with context `effort preparation for run … (agent …)` and `fatal: false` in the `serve` log, or `⚠ effort preparation for run …` lines in `orch run --watch` | Each effort warning for that run, once: the same statuses as the start-up warnings, after the OpenCode version check where there is one. An agent with no warning logs none. Not an error; the run goes ahead. | Treat it as in the row above. |
+| `legacy-ignored`, `capability-unknown` and other effort warnings at `orch run` start, or `serve:diagnostic` records in `orch serve --once` output | Stored efforts that this adapter or model cannot take, or that orch cannot check. Not an error. | Review with `orch agent list`; clear with `--effort default` or set a model. |
+| `⚠ effort preparation: …` on foreground `orch serve` or `orch run --watch` stderr; `orch logs --follow` shows the full warning and `effort preparation for run … (agent …)` context | Each effort warning for that run, once: the same statuses as the start-up warnings, after the OpenCode version check where there is one. An agent with no warning logs none. Not an error; the run goes ahead. | Treat it as in the row above. |
 | v0.9.4 fails every agent command with `parse …/agents/agt_….yml` | A newer effort value in that file. | Clear it with the newer binary, or restore the file from a backup. Do not hand-map `max`/`ultra` to `high`. |
 
 The OpenCode check runs `opencode --version` and `opencode run --help` in the agent's workspace with the agent's
@@ -1118,7 +1124,6 @@ work to continue.
 > writer, so this hazard no longer arises between orch processes of this release
 > ([One writer: the daemon](manual/17-mcp-server.md#one-writer-the-daemon)). Use this entry only to repair a
 > project that orch 0.13.0 processes shared. The entry is removed in a later release.
-<!-- W2: goal row 9; ADR 0012 supersedes ADR 0011 decision 7 / D10; PR 2 contract item 7 (deletion is PR 4). -->
 
 Applies to projects that `orch mcp` clients share with other writers: `orch run --watch`, `orch serve`, the
 dashboard, other `orch mcp` processes and one-off `orch` commands of orch 0.13.0 (the 0.13.0 manual's "Concurrent
@@ -1201,10 +1206,6 @@ with `<file>: config.<key>: invalid field type`, and the file is left unchanged.
 
 **Prevention.** Change configuration with `orch config set` (or `config_set`) rather than by hand, and back up
 `.orchestry/config.yml` before a hand edit.
-<!-- Captured at f70fc707 (fact-check tsk_eVo3agZ evidence/mcp-badcfg.txt, mcp-handcfg.txt; tsk_J8tJF2x): CLI and MCP
-config_set "hello" rejected, file byte-identical; config_patch {scheduling: {poll_interval_ms: hello}} rejected
-`invalid field type`; hand-broken file: status/task list exit 1, agent/context/goal list and config get exit 0;
-config set of the broken key repairs it, of max_concurrent_agents exit 2; invalid YAML: status and config set exit 1. -->
 
 ## Capturing `orch mcp` diagnostics
 
@@ -1274,7 +1275,25 @@ exists.
 
 ## A stuck or leftover `orch mcp` process
 
-**Symptom.** A client shows the orch server as not responding; every call is refused with
+**Current daemon bridge.** Check `orch daemon status` first. The bridge admits up to 16 project calls and
+two diagnostic calls; excess calls are refused immediately, while daemon admission and storage can delay
+admitted work. A lost observation is recovered on a later explicit call, with at most one recovery pending.
+There is no background daemon start or mutation replay.
+
+On stdin EOF the bridge stops its observation/recovery tasks and drains healthy responses. A stdout frame's
+writes and flush share a 5 s budget, even with partial progress; pending output shutdown is also bounded.
+Output failure returns `cannot write to stdout` and exit 1, including when the client has already closed stdin
+but keeps output unread. This is not a total-stop deadline or a limit on an already-started daemon operation.
+Inspect state before repeating a call whose answer was lost. Restarting the MCP client does not stop the daemon
+or undo its writes. See [MCP lifecycle](manual/17-mcp-server.md#exit-codes-and-startup-errors).
+
+### Legacy direct-writer MCP recovery (0.12–0.13)
+
+The observations and procedure below describe the old direct-writer server, which ran its own probes and FIFO.
+They are retained for older installations; the exit times are historical observations, not deadlines for the
+daemon bridge. Its probes now run in the daemon: do not apply the legacy probe-cleanup procedure to them.
+
+**Legacy symptom.** A client shows the orch server as not responding; every call is refused with
 `Not executed: timed out after 10 s waiting for the store queue; retry later`; or an `orch mcp` process is still
 running after its client quit.
 

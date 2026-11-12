@@ -315,6 +315,17 @@ impl Running {
         spec: BringUp,
         maintenance_timer: bool,
     ) -> Result<Running, DaemonError> {
+        Self::bring_up_with_spawn_domain(spec, maintenance_timer, None).await
+    }
+
+    /// Synthetic domains require a ProcessManager that never forks. The
+    /// fail-closed check covers crate-internal real builders only; external
+    /// direct Command builders must never opt in.
+    pub(crate) async fn bring_up_with_spawn_domain(
+        spec: BringUp,
+        maintenance_timer: bool,
+        spawn_domain: Option<orch_infra::process::gate::SpawnDomain>,
+    ) -> Result<Running, DaemonError> {
         let root = spec.project_root.clone();
         let state_dir = root.join(".orchestry");
         let (project_id, meta) = discovery::project_identity(&root)?;
@@ -333,6 +344,7 @@ impl Running {
             spec,
             Arc::clone(&pid_lock),
             maintenance_timer,
+            spawn_domain,
         )
         .await
         {
@@ -355,6 +367,7 @@ impl Running {
         spec: BringUp,
         pid_lock: Arc<PidLock>,
         maintenance_timer: bool,
+        spawn_domain: Option<orch_infra::process::gate::SpawnDomain>,
     ) -> Result<Running, DaemonError> {
         let child_env = orch_infra::process::EnvSnapshot {
             base: spec.snapshot.base.clone(),
@@ -374,17 +387,26 @@ impl Running {
             name: spec.peer_name,
             listen: spec.listen,
         };
+        let spawn_domain = spawn_domain.unwrap_or_default();
         let engine = Arc::new(
-            orch_engine::container::build_full_with_children(
+            orch_engine::container::build_full_with_children_and_spawn_domain(
                 root.clone(),
                 spec.seams,
                 peer,
                 processes,
                 command_runner,
+                spawn_domain.clone(),
             )
             .await?,
         );
+        engine.orchestrator.set_spawn_admission(Arc::new(
+            orch_infra::process::gate::TrackedSpawnAdmission::new(
+                spawn_domain,
+                Arc::clone(diagnostics.spawn_work()),
+            ),
+        ));
         let coordinator = Arc::new(ProjectCoordinator::new(engine.operation_boundary()));
+        crate::diagnostics::attach(&engine.events);
         // Startup recovery (claims, running entries, orphan runs) and the
         // index read/rebuild, before anything is served. Fatal on error.
         engine.daemon_initialize().await?;
@@ -706,7 +728,7 @@ impl Running {
         self.runtime.spawn(async move {
             #[cfg(feature = "testing")]
             let _directories = directories;
-            let _ = handler.engine.orchestrator.daemon_stop().await;
+            let _ = handler.stop_execution().await;
             for task in loops {
                 let _ = task.await;
             }

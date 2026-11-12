@@ -182,6 +182,16 @@ authorize client recovery side effects, release or merge.
     redundant per-server store serialization lane while keeping bounded admission/mode checks. PR 2
     initially refreshes TUI through RPC on the existing tick, without a disk observer; PR 3 replaces RPC
     polling with push.
+    *PR 3 clarifications, 2026-11-10; the decision above is unchanged.* Two wire refinements inside the
+    approved contract, with `LOCAL_PROTOCOL` raised for them: (1) the subscribe result's `seq` is the
+    subscription cursor's origin, always 0, the first event has `seq` 1, and the baseline commit ordinal is
+    the subscribe call's terminal `commit_seq`; (2) a change event's entity `id` is optional, and an event
+    without one is an ordinary ordered store-wide change (`kind` updated) for singleton stores and for a known
+    store whose changed entities are not known, while resync stays rare: `lagged`, plus one reason for a
+    failure that leaves the affected store set unknown. These bounds cover commit metadata and session
+    queues; the engine's per-operation domain-event buffer is not capped and holds one operation's events
+    until release, growing with the number emitted (follow-up R-evbuf). Wording:
+    [spec, Protocol and service reference](../specs/2026-11-09-daemon-owned-state.md#protocol-and-service-reference-approved).
 
 12. **Security and tests are part of the boundary.** Validate every frame and operation before mutation;
     bound admission by count and bytes, frame/depth, transfers and queues. Typed DTOs contain no untyped

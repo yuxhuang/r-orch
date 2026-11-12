@@ -22,6 +22,7 @@ use super::util::{
     build_full_prompt, copy_present, error_event, number_field, probe_version, streaming_events,
     stringify, system_clock, version_probe_failure,
 };
+use crate::process::gate::SpawnDomain;
 use crate::process::spawn::{StderrPolicy, spawn_child};
 
 const INSTALL_HINT: &str = "OpenCode CLI not found. Install: npm i -g opencode";
@@ -29,6 +30,7 @@ const INSTALL_HINT: &str = "OpenCode CLI not found. Install: npm i -g opencode";
 pub struct OpenCodeAdapter {
     process_manager: Arc<dyn ProcessManager>,
     clock: Arc<dyn Clock>,
+    spawn_domain: SpawnDomain,
 }
 
 impl OpenCodeAdapter {
@@ -36,7 +38,16 @@ impl OpenCodeAdapter {
         OpenCodeAdapter {
             process_manager,
             clock: system_clock(),
+            spawn_domain: SpawnDomain::default(),
         }
+    }
+
+    /// Use synthetic admission only with a ProcessManager that never forks.
+    /// The fail-closed check covers crate-internal real builders only; external
+    /// direct Command builders must never opt in. Only effort probes are scoped.
+    pub fn with_spawn_domain(mut self, domain: SpawnDomain) -> Self {
+        self.spawn_domain = domain;
+        self
     }
 
     pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
@@ -96,7 +107,7 @@ impl OpenCodeAdapter {
         let reservation = tokio::select! {
             biased;
             () = params.cancel.cancelled() => return Err("OpenCode syntax probe cancelled"),
-            reservation = crate::process::gate::reserve_spawn(crate::process::gate::SpawnSite::Version) => reservation,
+            reservation = self.spawn_domain.reserve(crate::process::gate::SpawnSite::Version) => reservation,
         };
         let mut child = reservation.run(|| {
             self.process_manager

@@ -77,7 +77,7 @@ async fn every_frame_kind_round_trips_through_the_line_codec() {
     let events: Vec<EventFrame> = [
         EventBody::Change {
             store: Store::Tasks,
-            id: Id::new("tsk_1").unwrap(),
+            id: Some(Id::new("tsk_1").unwrap()),
             kind: ChangeKind::Updated,
             commit_seq: 5,
         },

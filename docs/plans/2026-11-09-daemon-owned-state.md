@@ -56,13 +56,28 @@ rejected alternatives. This section is the summary a builder needs to find the r
   `.orchestry/run/orch.sock` within the 100-byte budget, else `$TMPDIR/orch-<hash16>/orch.sock`;
   `.orchestry/daemon.json` schema 1; project identity is the dev/ino of `.orchestry`.
 - **Protocol (R6, R7, R20, R32, R36).** Frozen hello/welcome/reject envelope; strict equality of package semver
-  and `LOCAL_PROTOCOL` (1) for every operation; only `hello.intent: "stop"` crosses skew. 1 MiB NDJSON frames,
+  and `LOCAL_PROTOCOL` (1; 2 from PR 3, for the subscription semantics) for every operation; only `hello.intent: "stop"` crosses skew. 1 MiB NDJSON frames,
   typed closed DTOs, separate pre-handshake and session budgets.
 - **Engine guarantees (R9–R12).** One coordinator orders complete read/modify/write transitions; a pause decision
   is ordered with spawn; task cancel reaches the live run registry; context expiry is daemon maintenance, reads
   never purge.
 - **Dispatch mapping (R13, D8).** Dispatch is a daemon mode, not a process. The `serve` / `run --watch` /
-  `run --once` / `serve --once` remap is PR 2; at PR 1 head they keep their v0.13.0 behaviour.
+  `run --once` / `serve --once` remap landed in PR 2.
+- **Push and dispatch wake (R16–R18; PR 3).** Clients subscribe before they read; a subscription has a cursor
+  (origin 0, first event 1) and a baseline (the subscribe call's `commit_seq`). A change without an entity id
+  invalidates its whole store; resync (`lagged`, or an uncertain store set) is rare. The dashboard and the web
+  dashboard's sessions refresh only from push; `orch mcp` maps store events to at most 256 subscribed `orch://`
+  URIs over one observation session. A commit schedules a dispatch wake within a 500 ms scheduling bound,
+  and a tick never wakes itself. This is not an execution or task-start guarantee: a slow tick, the operation
+  permit or the OS can delay execution. See the spec's
+  [Push, gaps and snapshot ordering](../specs/2026-11-09-daemon-owned-state.md#push-gaps-and-snapshot-ordering) and
+  [Commit-triggered dispatch wake](../specs/2026-11-09-daemon-owned-state.md#commit-triggered-dispatch-wake).
+- **PR 3 known limitations.** Commit metadata (256 entries / 64 KiB), 8 subscriptions/session,
+  256 events/subscription and 4 MiB staged output/session are bounded. The engine's per-operation domain-event
+  buffer is not capped: it holds one operation's events until release and grows with the number emitted.
+  PR 4 must supply a bounded lossless overflow design for in-process listeners or an explicit owner-approved
+  supported envelope; this obligation is not deferred beyond the goal. An idle worker's heartbeats emit no changes
+  or wakes; an idle controller still publishes Remote status about once per second and may wake dispatch.
 - **Rejected** (details in ADR 0012): a direct-store fallback; auto-start; a separate `orchd` binary; gRPC or
   tarpc; a second framing next to `orch-peer`'s; protocol-number-only skew checks; an RPC-only FIFO or a lock per
   save in place of the coordinator.
@@ -72,13 +87,13 @@ rejected alternatives. This section is the summary a builder needs to find the r
 Four stacked PRs against `main` (spec R29, regrouped at CP1 after red-team finding RT1), each green and leaving
 `main` working; the owner merges each, no version bump. PR *n*+1 is built once PR *n* is frozen for review and
 rebases on its merge. Builders work in separate worktrees with disjoint scopes and integrate by merge, never by
-rebase of a shared branch. Owners are roles; the orch task ids are in [Status](#status).
+rebase of a shared branch. Owners are roles; task ids live in the tracker, not in this plan.
 
 | PR | Branch | Scope | Board (gate) |
 |---|---|---|---|
 | 1 | `feature/daemon-core` | `orch-proto`, `orch-daemon`, `orch-client` control plane, `orch daemon start\|status\|stop\|dispatch`, engine guarantees (B0 + B0d), in-process harness, spec, plan, ADR 0012, ARCHITECTURE §3.1, manual 18, CHANGELOG. **Developmental**: `ORCH_DAEMON_DEVELOPMENTAL=1` plus a banner that legacy writers are not excluded; no client is converted. | code, security, resilience, facts, cold gate + Linux |
 | 2 | `feature/daemon-clients` | The single production cutover: every D7 operation in `orch-client`; CLI, MCP bridge, TUI backend over RPC (refresh tick, no disk observer), `orch web` preflight and PTY env; developmental gate removed; D8 command remap; binary-test migration; no-daemon matrix for all five frontends; real-TUI + 4 CLI + 2 MCP stress; README upgrade, CHANGELOG, changed command chapters. Over the 3,000-line guideline by design: splitting it would ship a head with a daemon client and a direct writer side by side (RT1). | code, security, resilience, performance (CLI round trip vs v0.13.0), cold gate + Linux |
-| 3 | `feature/daemon-push` | Subscriptions; TUI and web stop RPC polling; MCP `resources/updated`; delete the unused `disk_observer`. | code, security, resilience, cold gate; QA pass 1 on the owner's Mac |
+| 3 | `feature/daemon-push` | Subscriptions (cursor, baseline, store-wide change, resync); TUI and web stop RPC polling; MCP `resources/subscribe` and `resources/updated`; commit-triggered dispatch wake (restores prompt dispatch); foreground start-up diagnostics; delete the unused `disk_observer`. | code, security, resilience, facts, performance (wake latency, slow subscribers), cold gate + Linux; QA pass 1 on the owner's Mac after the board |
 | 4 | `feature/daemon-enforce` | Crate and source-site allowlist, client infra/engine dependencies removed, MCP FIFO and dead code removed; ARCHITECTURE §2, RUNBOOK, manual 17/18 sweep; spec Verification table; plan and spec `done`. | code, security, resilience, facts, cold gate; QA pass 2 |
 
 ### PR 1 (wave B)
@@ -115,39 +130,90 @@ rebase of a shared branch. Owners are roles; the orch task ids are in [Status](#
 | T2b | Move binary tests to an explicit test daemon on an isolated `ORCH_SOCKET` (test-eng-2) | R25 | `crates/orch-cli/tests/common/**`, `crates/orch-cli/tests/mcp_common/**` | S2a | `cargo test -p orch-cli --tests` | 2 |
 | W2 | README "Upgrading from v0.13.0"; CHANGELOG; every changed command chapter; command reference; remove manual 18's developmental notice (tech-writer) | R22, R35 | `README.md`, `CHANGELOG.md`, `docs/manual/**` | S2a | links resolve; `docs/manual/tools/gen-command-reference.sh` output committed | 2 |
 | I2, G2, CP4 | Integrate, board 2 with CLI round-trip latency, adjudicate, PR 2 | R24 | per finding | S2b, S2c, T2a, T2b, W2 | the CI set; cold gate; latency report | 2 |
-| S3a, S3b | TUI push; web push (senior-eng; frontend-eng) | R16 | `crates/orch-cli/src/{tui,web}/**` | PR 2 frozen | `tui_daemon::push_updates_without_disk_observer` | 3 |
-| S3c | Subscription hub; MCP `resources/updated`; delete `disk_observer` (senior-eng-2) | R16, R17 | `crates/orch-daemon/**`, `crates/orch-cli/src/mcp/resources.rs`, `crates/orch-cli/src/serve/disk_observer.rs` | PR 2 frozen | `daemon_push::subscribe_snapshot_gap_resync`; `daemon_push::mcp_resource_updates` | 3 |
-| T3 | Push tests; TUI/web rows of the matrix (test-eng-2) | R16, R18 | `crates/orch-cli/tests/**` | S3a, S3b, S3c | `cargo test -p orch-cli --tests` | 3 |
-| I3, G3, QA1 | Integrate, board 3, QA pass 1 on the owner's Mac (qa-engineer) | R24, R28 | per finding | T3 | reviewer verdicts; QA transcript | 3 |
+| S3-api | Freeze the subscription API in `orch-proto` and `orch-client` (cursor origin 0, baseline from `commit_seq`, optional change id, second resync reason, `LOCAL_PROTOCOL` 2); one buildable API-first SHA that every PR 3 consumer merges (senior-eng) | R16, R20, R32 | `crates/orch-proto/{src,tests}/**`, `crates/orch-client/{src,tests}/**` | PR 2 frozen | `cargo test -p orch-proto -p orch-client`; `cargo xtask crate-graph` | 3 |
+| IGN1 | Print start-up orchestrator errors once on the foreground daemon's stderr; un-ignore the two opencode legacy-ignore tests (senior-eng-2) | R20 | `crates/orch-daemon/src/**`, `crates/orch-cli/src/commands/daemon.rs`, `crates/orch-cli/tests/token_eco_opencode_wire_gate.rs` | PR 2 frozen | `cargo test -p orch-cli --test token_eco_opencode_wire_gate` | 3 |
+| S3c-1 | Subscription hub and typed commit metadata: register before read, ack before events, filters, store-wide changes, bounded queues, resync or close (senior-eng) | R16, R20 | `crates/orch-daemon/src/**`, `crates/orch-engine/src/**` | S3-api, IGN1 | `cargo test -p orch-daemon --features testing`; `cargo test -p orch-engine` | 3 |
+| S3c-2 | Commit-triggered dispatch wake: 500 ms scheduling bound, coalescing, no self-wake, OFF/pause/back-off rechecked (senior-eng) | R9, R13 | as S3c-1 | S3c-1 | `cargo test -p orch-daemon --features testing dispatch` | 3 |
+| S3a | Dashboard consumes push: subscribe before bootstrap, no periodic state read; delete `disk_observer` (frontend-eng) | R16, R18 | `crates/orch-cli/src/tui/**`, `crates/orch-tui/{src,tests}/**`, `crates/orch-cli/src/serve/{mod,disk_observer}.rs` | S3-api | `cargo test -p orch-tui`; `cargo test -p orch-cli --lib tui::` | 3 |
+| S3b | `orch web` parent holds an observation and liveness connection; sessions keep the PTY dashboard (frontend-eng-2) | R16, R18 | `crates/orch-cli/src/web/**` | S3-api | `cargo test -p orch-cli --lib web::`; `cargo test -p orch-cli --test web_bridge` | 3 |
+| S3m | `orch mcp` resource subscriptions: 256 URIs, one observation session, local URI mapping, coalesced `resources/updated` (senior-eng-2) | R17, R18 | `crates/orch-cli/src/mcp/**` | S3-api | `cargo test -p orch-cli --lib mcp::`; `cargo test -p orch-cli --test mcp_contract --test mcp_tools --test mcp_stdio` | 3 |
+| PR 3 scoped repairs | Writer activates after acknowledgement flush; dirty prompt-mode view rearms on asynchronous success/refusal; MCP owns one scheduled recovery, bounds retained URI strings, cancels/joins tasks and bounds output even at EOF | R16–R18, R20 | `crates/orch-daemon/src/{session,hub}.rs`, `crates/orch-tui/{src/app.rs,tests/push_refresh.rs}`, `crates/orch-cli/src/mcp/server{.rs,/subscriptions.rs}` | existing push API | Scoped exact-SHA reviews are qualified; integration must retain the causal controls and obtain independent code/security/resilience delta reviews at the new full SHA | 3 |
+| T3 | Independent push and wake acceptance tests, authored against the API and finished on the integrated candidate (test-engineer) | R16–R18, R9, R13 | `crates/orch-daemon/tests/{daemon_push,daemon_dispatch_wake}.rs`, `crates/orch-cli/tests/{daemon_push,tui_daemon,web_daemon}.rs`, `crates/orch-cli/tests/push_support/**` | S3-api | the spec's [PR 3 acceptance targets](../specs/2026-11-09-daemon-owned-state.md#pr-3-acceptance-targets) | 3 |
+| T3-port | Replace the ignored PR 2 cases (`yaml_bomb` health assertion, three registry tests) with active daemon-owned equivalents (test-eng-2) | R15, R19, R20 | `crates/orch-cli/tests/{yaml_bomb,remote_peers}.rs`, `crates/orch-daemon/tests/registry_store.rs` | PR 2 frozen | `cargo test -p orch-cli --test yaml_bomb --test remote_peers`; `cargo test -p orch-daemon --features testing --test registry_store` | 3 |
+| W3 | Spec wording, this plan, ADR 0012 clarification note, manual 02/07/08/09/12/15/17/18, RUNBOOK, CHANGELOG; drafted ahead of the code, verified on the integrated candidate (tech-writer) | R16–R18, R22, R23, R29 | `README.md`, `CHANGELOG.md`, `docs/**` | PR 2 frozen | `git diff --check`; examples re-run on an isolated integrated binary | 3 |
+| I3a, I3b | Assemble the candidate on `feature/daemon-push` by merge; then merge final tests and docs, gate and freeze (senior-eng-2) | R24, R29 | per merge | all PR 3 slices | the CI set; cold `./xtask/gate.sh`; Linux | 3 |
+| G3, QA1 | Board 3 at the frozen SHA: gate (release-eng), code (code-reviewer), security (sec-reviewer-codex), resilience (sre), facts (fact-checker), performance (perf-eng); then QA pass 1 on the owner's Mac (qa-engineer) | R24, R28 | per finding | I3b | reviewer verdicts; QA transcript | 3 |
 | S4 | Crate and source-site allowlist; remove client infra/engine dependencies, the MCP FIFO lane and dead cross-process code (senior-eng-2; release-eng co-signs the manifest); R39 pgid-derived stop/off acknowledgement and its test vectors (CP6 ruling 12.8) | R3, R39 | `xtask/**`, `crates/orch-cli/src/{serve,mcp}/**`, `crates/orch-cli/Cargo.toml`, `crates/orch-daemon/src/session.rs`, `crates/orch-daemon/src/ops/control.rs`, `crates/orch-daemon/tests/daemon_security.rs` | PR 3 frozen | `cargo xtask crate-graph` passes, and fails on a planted `orch_infra` import in a client file; planned `cargo test -p orch-daemon --features testing --test daemon_security agent_control_requires_explicit_override -- --exact` (R39) | 4 |
+| PR 4 retained hardening | Resolve uncapped per-operation events; adjudicate no-op peer commit/fan-out work; make the daemon harness hermetic by default; trace and independently measure no-op and collector `record_event` held-permit p50/p95 | R20, R21, R25 | scopes fixed at the qualified PR 4 base | PR 3 integration and explicit PR 4 handoff | Bounded lossless event-buffer design or owner-approved envelope; unchanged peer interoperability and causal controls; exact-base reviews and both held-permit distributions | 4 |
 | W4 | ARCHITECTURE §2; RUNBOOK; manual 17/18 sweep with captured output; spec Verification table; spec and plan `done`; Pensieve mirror (tech-writer) | R22, R35, R38 | `docs/**`, `README.md`, `CHANGELOG.md` | S4 | every example re-run at the frozen commit; fact-check | 4 |
 | I4, G4, QA2 | Integrate, board 4, QA pass 2 | R22, R24, R28 | per finding | S4, W4 | reviewer verdicts; QA transcript | 4 |
 
+### Bounded synthetic spawn-admission repair
+
+Build a new repair branch from `e5b46febad614baa645e2bdeee297d7cd306e464`;
+first merge final PR 2 head `c49d47830091a812613dd86764343a58d1dad7bb`,
+which includes the required ETXTBSY base
+`33ebc8839fbb6ff439b214b8af74f6ce9c0b038b`. Preserve all existing public
+signatures, Process defaults and real macOS complete-spawn exclusion. No new
+features, dependencies, protocol, config or on-disk changes.
+
+| Step | Work | Prerequisite | Result / evidence |
+|---|---|---|---|
+| T1 | Demonstrate the deterministic foreign pre-body reservation regression at exact baseline, with Collector/Retry/Pause cause records and post-release controls | adopted design and Linux falsifier | Done. Red at the baseline (`7eb7933f`, the regression on top of the pre-repair candidate): `daemon_spawn_gate_isolation` fails with "fake daemon completed its wake while the foreign pre-spawn reservation remained held". Landed as `b83dc12`. |
+| B | Explicit per-harness synthetic domain, provenance rejection, additive plumbing through launch/workspace/OpenCode; document before code | required baseline red; final PR 2 merge | Done: spec and plan `9e3f9cf`, code `6cf17f0`. |
+| T2 | Bind the two fake fixtures; add domain lifecycle/route controls, fail-closed negatives and exact opt-in source allow-list | B interfaces | Done: `fbe9e75`, `3dd0831`. The record-ID controls were then made independent of the 128-record observation registry: `a46b015`. |
+| Q | Freeze SHA/tree and lineage; regression green/revert red/restored green; original ten-vector wake target N=30, default threading, first red stands; exclusion negative and standard checks | T2 | Passed at `3dd0831e`, macOS: regression green at the repair, red with the repair reverted, green again once restored; real-spawn exclusion negative red when bypassed; `daemon_dispatch_wake` 30 of 30 consecutive default-threaded invocations `10 passed; 0 failed`; `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` (6427 passed / 0 failed / 7 ignored), `cargo xtask crate-graph` and `cargo deny check` green. N=30 is acceptance at the stated N, **not a reliability rate**. |
+| QL | Native Linux regression companion, original wake and infra controls, one invocation each | Q; quiet host | Passed at `3dd0831e`: companion 1/0, contract 1/0, `daemon_dispatch_wake` 10/0, `cargo test -p orch-infra` 953 passed / 0 failed / 4 ignored. One local Docker sequence (aarch64), **not Linux CI**. |
+| Reviews / checkpoint | Independent exact-SHA code, resilience and security review, then lead integration decision | QL | Done at `3dd0831e`: security pass, resilience pass, code pass with conditions. Test-only condition fixed at `a46b015f` and re-reviewed pass (20 of 20 runs of `cargo test -p orch-infra --lib process::gate::`, 27 tests each). The repair is accepted at `a46b015f`; the Q and QL results carry to it because it changes only a test module that is empty on Linux. The second condition, the harness route list, is documentation only and is recorded in the spec (R25) and ARCHITECTURE. |
+
+The unchanged-candidate Linux falsifier is done: one invocation, green 10/0,
+platform support only. It is not repair acceptance. Only Q and QL ran the original
+wake oracle against the repair; no serialization, deadline change, drain change or
+rerun to green was allowed.
+
+Still pending, and not claimed: the integration candidate's macOS cold gate, Linux
+CI and owner QA. The existing integration, CI, owner QA and reserved-consumer
+holds remain.
+
 ## Status
 
-Snapshot of goal `goal_zX0WXev` at 2026-11-09, taken by W1; wave-B rows updated by I1. Not updated automatically; I1 and later writers edit
-it.
+Status at 2026-11-10, including scoped PR 3 repairs. This table does not certify a new integrated freeze.
 
-| Item | Task | State |
-|---|---|---|
-| Gate 1 (plan and design questions) | — | approved by the owner, 2026-11-09 |
-| A1, SE, RT, A1b | `tsk_7bvf0xQ`, `tsk_1u_dvll`, `tsk_YVAjJFo`, `tsk_3BJ8YPF` | done; spec v2 `e1ef3b60` |
-| B0, B0c, B0d, B0 review, B0d re-review | `tsk_5j4sVEl`, `tsk_I7nHT_o`, `tsk_aDaGYFl`, `tsk_ph7n2g7`, `tsk_J3ae0CX` | implemented on `feature/daemon-engine` at `f44d60b7`; review passed |
-| T0 | `tsk_YXbg6QP` | implemented, failing-first (`d0da296d`) |
-| W0 | `tsk_hcfxtAc` | drafted (`a2dab502`, `50409748`) |
-| CP1, CP2, gate 2 (spec) | `tsk_Yvrqc9i`, `tsk_W2m3n_b` | spec approved, ADR 0012 accepted (`c14698fb`) |
-| S1a-api | `tsk_K8xOIZl` | done (`f91ff25f`); integrated by I1 |
-| S1a-impl | `tsk_sStUSpy` | done (`d0b657e5`, startup seams `fab0fa1a` via `tsk_x8pp05Z`); integrated by I1 |
-| S1b | `tsk_8wgBbdh` | done (`2d2f5f05`); integrated by I1 |
-| S1c | `tsk_fiC9flm` | done (`ba0c7037`, continuations `tsk_fssJiFW`, `tsk_MqrS4Yx`); integrated by I1 |
-| S1d | `tsk__4ahant` | done (`959001ad`); integrated by I1 |
-| T1 | `tsk_UtDGaCh` | done (`ca5492d9`; maintenance-timer seam `14ecefbb` via `tsk_HnLcpiw`, observation fix `2d097798` via `tsk_cVJbOAK`); integrated by I1 |
-| T1b | `tsk_AWRlxx9` | done (`e5216b2f`); integrated by I1 |
-| W1 | `tsk_ArQCbkH` | done (`05d55220`); written ahead of the code, so the facts board checks it at the I1 SHA |
-| I1 | `tsk_vNn_rPy` | integrated on `feature/daemon-core`; the frozen SHA is the commit that changes this row (recorded in the I1 report) |
-| G1: code, security, resilience, facts, cold gate | `tsk_Gc_B8Ya`, `tsk_mQszv9B`, `tsk_jeSSHfY`, `tsk_Zt3JSh7`, `tsk_JpO4CUF` | pending |
-| CP3 | `tsk__g95cwZ` | pending |
-| PR 2–4 | — | pending |
+| Item | State |
+|---|---|
+| Gate 1 (plan and design questions) | approved by the owner, 2026-11-09 |
+| Gate 2 (spec) | spec approved, ADR 0012 accepted, 2026-11-09 |
+| PR 1, `feature/daemon-core` | frozen at `051742bd`; draft PR [#74](https://github.com/yuxhuang/r-orch/pull/74) opened against `main`; the test-only CI fixture fix is included |
+| PR 2, `feature/daemon-clients` | integration frozen at `7fd1fa02`; board 2c and PR handoff are pending; this row does not certify Linux CI |
+| PR 3, `feature/daemon-push` | original freeze `9277f832`; acknowledgement repair `17fe365d`, deferred-refresh repair `c1b7194d` and MCP lifecycle repair `28fbfddd` have scoped qualified reviews. Actual PR 2 production/test integration, separate containment lineage, I3 re-freeze and exact-SHA delta reviews remain required before gate release and QA pass 1. |
+| PR 4, `feature/daemon-enforce` | pending; starts when PR 3 is frozen |
+
+### Owner-amended performance acceptance and storage follow-up (2026-11-10)
+
+PR 3 performance is accepted **7/7 under the amended no-regression burst criterion** at
+`9277f832281d1c9734ce9ef03e8096389ae4ddc9`, comparator
+`b97fc59a5b1f32ec3f8d3fb1685a5cccb9bf9533`. Raw results remain 38/100 acknowledgements within 500 ms,
+100 eventually, last at 1318.192250 ms; comparator diagnostics reached 39–40/100. The owner accepts the spread
+as run-to-run noise. The original fixed-throughput failure remains unchanged: no remeasurement, statistical
+equivalence, faster storage or successful 100-in-500-ms/coalescing test is claimed. See the
+[spec's full acceptance qualification](../specs/2026-11-09-daemon-owned-state.md#pr-3-performance-acceptance-owner-amended-2026-11-10).
+
+Keep the other six contracts: launch 30 per side, continuous 60-second traffic, paired fan-out intervals
+containing zero, qualified RSS occupancy, live peer heartbeat and collector delivery/reconstruction (including
+its original failure and qualified offline reconstruction). Only no-op and `record_event` held-permit p50/p95
+are deferred to PR 4. The qualified containment source `67ee5017eee36af8dc665ecb9c00c92a51b7a51a` is a
+separate lineage; measurement and scoped repair acceptance do not certify integration or shipping.
+
+Defer the 100-successful-commits-in-500-ms storage objective to separate work **after this goal**. It is not
+a PR 3, PR 4 or push gate. That work must first design amortized/batched persistence and specify durability,
+error visibility, ordering, publication and crash recovery; attribution supports inherited sequential
+persistence latency but does not establish a safe minimal repair. No early acknowledgements, dropped syncs,
+changed formats or widened measurement window are authorized. The PR 4 hardening row remains required.
+
+The integration lead must preserve the PR 2 board/draft handoff, qualify the actual production and test deltas,
+integrate and re-freeze PR 3, and obtain independent exact-SHA delta reviews before releasing its direct gate.
+QA follows that qualified candidate. Draft shipping requires three complete green GitHub CI executions on the
+identified head/tree and the other applicable gates; the lead reports readiness and the owner merges.
 
 ## Test plan
 - The spec's [requirements table](../specs/2026-11-09-daemon-owned-state.md#requirements) names the acceptance
@@ -171,12 +237,18 @@ it.
   different `LOCAL_PROTOCOL` constants under T2a (R6/R32). The pgid-derived acknowledgement (R39) moved to
   PR 4 under S4 (CP6 ruling 12.8).
   The stress test is the evidence that D10 is closed and replaces the runbook hazard.
-- PR 3 planned: `daemon_push::*`, `tui_daemon::*`, `web_daemon::*`; QA pass 1 on the owner's Mac (R28).
+- PR 3 planned: the spec's [PR 3 acceptance targets](../specs/2026-11-09-daemon-owned-state.md#pr-3-acceptance-targets)
+  (`daemon_push::*`, `daemon_dispatch_wake::*`, `tui_daemon::*`, `web_daemon::*`, `daemon_push::mcp_resource_updates`),
+  each shown failing once against a deliberate break; QA pass 1 on the owner's Mac (R28) after board 3.
 - Hermeticity: no test touches a real project's daemon or `~/.orchestry`; sockets live under a per-test temp
   directory on a path of at most 100 bytes; fake shell agents only.
-- CI set on every PR: `cargo fmt --all --check`; `cargo clippy --workspace --all-targets -- -D warnings`;
-  `cargo test --workspace`; `cargo xtask crate-graph`; `cargo deny check`; Linux CI. Cold `./xtask/gate.sh` on
-  macOS for each PR (process lifecycle, layering and security change in every one).
+- Owner-amended macOS gate: run `cargo fmt --all --check`,
+  `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask crate-graph` and
+  `cargo test --workspace --no-fail-fast` directly, with tmux on PATH and plain command timeouts.
+  Process snapshots are observations, not vetoes; custom test runners are retired from these gates.
+  Linux coverage comes from GitHub CI after a qualified draft push; no local Linux/Docker prerequisite.
+  CI retains its lockfile and cargo-deny checks. Each identified head/tree needs three complete green CI
+  executions; this supersedes the older cold-gate wording in the historical task tables above.
 
 ## Rollback / compatibility
 No on-disk format changes (R23): entity, index, `config.yml`, org-template and run-event files keep their format.

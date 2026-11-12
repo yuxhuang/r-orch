@@ -421,7 +421,10 @@ impl Server {
             queue,
             budget: Arc::new(Semaphore::new(limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION)),
         };
-        let writer = tokio::spawn(write_loop(write, queued));
+        let events = crate::hub::EventOutput::new(Arc::clone(&outbox.budget));
+        base.event_output = Some(Arc::clone(&events));
+        let mut event_closed = events.closed();
+        let writer = tokio::spawn(write_loop(write, queued, Arc::clone(&events)));
         // The reader task owns partial-line state, so cancelling a select
         // never loses half a frame.
         let (lines, mut incoming) = mpsc::channel(1);
@@ -435,6 +438,7 @@ impl Server {
                 biased;
                 () = crate::session::until_set(&mut drain) => break,
                 () = outbox.queue.closed() => break,
+                () = until_set(&mut event_closed) => break,
                 next = incoming.recv() => next,
             };
             while inflight.try_join_next().is_some() {}
@@ -503,6 +507,20 @@ impl Server {
             ));
         }
         reading.abort();
+        let _ = reading.await;
+        self.finish_requests(session_id, events, inflight, outbox, writer)
+            .await;
+    }
+
+    async fn finish_requests(
+        &self,
+        session_id: u64,
+        events: Arc<crate::hub::EventOutput>,
+        mut inflight: tokio::task::JoinSet<()>,
+        outbox: Outbox,
+        writer: tokio::task::JoinHandle<()>,
+    ) {
+        events.begin_drain();
         // Cancel observations first so streams end; started writes finish and
         // their cleanup is ordered behind them by the handler.
         if let Err(error) = self.handler.disconnect(session_id).await {
@@ -515,7 +533,15 @@ impl Server {
         // Requests still running are daemon-owned; detach them.
         inflight.detach_all();
         drop(outbox);
-        let _ = tokio::time::timeout(DRAIN_TIMEOUT, writer).await;
+        let mut writer = writer;
+        if tokio::time::timeout(DRAIN_TIMEOUT, &mut writer)
+            .await
+            .is_err()
+        {
+            writer.abort();
+            let _ = writer.await;
+        }
+        events.close();
     }
 }
 
@@ -610,6 +636,7 @@ fn invalid_request(line: &[u8], error: &CodecError) -> ErrorBody {
 struct Queued {
     bytes: Vec<u8>,
     _budget: OwnedSemaphorePermit,
+    activate: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -620,6 +647,10 @@ struct Outbox {
 
 impl Outbox {
     async fn send(&self, bytes: Vec<u8>) -> bool {
+        self.send_with_activation(bytes, None).await
+    }
+
+    async fn send_with_activation(&self, bytes: Vec<u8>, activate: Option<u64>) -> bool {
         let Ok(count) = u32::try_from(bytes.len().min(limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION))
         else {
             return false;
@@ -631,6 +662,7 @@ impl Outbox {
             .send(Queued {
                 bytes,
                 _budget: budget,
+                activate,
             })
             .await
             .is_ok()
@@ -657,16 +689,107 @@ async fn read_loop<R: AsyncRead + Unpin>(
     }
 }
 
-async fn write_loop<W: AsyncWrite + Unpin>(mut write: W, mut queued: mpsc::Receiver<Queued>) {
-    while let Some(frame) = queued.recv().await {
+enum Outbound {
+    Reply(Queued),
+    Event(crate::hub::QueuedEvent),
+}
+impl Outbound {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Reply(frame) => &frame.bytes,
+            Self::Event(frame) => &frame.bytes,
+        }
+    }
+}
+
+async fn write_loop<W: AsyncWrite + Unpin>(
+    write: W,
+    queued: mpsc::Receiver<Queued>,
+    events: Arc<crate::hub::EventOutput>,
+) {
+    write_loop_inner(
+        write,
+        queued,
+        events,
+        #[cfg(test)]
+        WriterHooks::default(),
+    )
+    .await;
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct WriterHooks {
+    after_empty_reply: Option<WriterPause>,
+    after_event_selection: Option<WriterPause>,
+}
+
+#[cfg(test)]
+struct WriterPause {
+    reached: tokio::sync::oneshot::Sender<()>,
+    resume: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+impl WriterPause {
+    async fn wait(pause: &mut Option<Self>) {
+        if let Some(pause) = pause.take() {
+            let _ = pause.reached.send(());
+            let _ = pause.resume.await;
+        }
+    }
+}
+
+async fn write_loop_inner<W: AsyncWrite + Unpin>(
+    mut write: W,
+    mut queued: mpsc::Receiver<Queued>,
+    events: Arc<crate::hub::EventOutput>,
+    #[cfg(test)] mut hooks: WriterHooks,
+) {
+    let mut closed = events.closed();
+    loop {
+        if *closed.borrow() {
+            return;
+        }
+        // Register before inspecting queues: a concurrent publication cannot
+        // fall between the empty check and arming the wake.
+        let notified = events.ready.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let frame = if let Ok(frame) = queued.try_recv() {
+            Outbound::Reply(frame)
+        } else {
+            #[cfg(test)]
+            WriterPause::wait(&mut hooks.after_empty_reply).await;
+            if let Some(frame) = events.pop() {
+                #[cfg(test)]
+                WriterPause::wait(&mut hooks.after_event_selection).await;
+                Outbound::Event(frame)
+            } else {
+                tokio::select! {
+                    biased;
+                    () = until_set(&mut closed) => return,
+                    frame = queued.recv() => match frame { Some(frame) => Outbound::Reply(frame), None => break },
+                    () = &mut notified => continue,
+                }
+            }
+        };
         let written = tokio::time::timeout(WRITE_TIMEOUT, async {
-            write.write_all(&frame.bytes).await?;
+            write.write_all(frame.bytes()).await?;
             write.flush().await
         })
         .await;
         if !matches!(written, Ok(Ok(()))) {
             tracing::debug!("session write failed or timed out; closing");
             return;
+        }
+        // Only this writer can expose events, and only after the correlated
+        // acknowledgement has reached the socket. Queue priority alone cannot
+        // order a producer racing the empty-reply check and event selection.
+        if let Outbound::Reply(frame) = &frame
+            && let Some(subscription) = frame.activate
+        {
+            events.activate(subscription);
         }
     }
     let _ = write.shutdown().await;
@@ -709,12 +832,22 @@ fn run_request(
         match result {
             Ok(committed) => {
                 tracing::debug!(op = name, id = id.0.get(), elapsed_ms, "ok");
+                let subscription = if name == "subscribe" {
+                    serde_json::from_str::<orch_proto::ops::results::SubscribeAck>(
+                        committed.value.get(),
+                    )
+                    .ok()
+                    .map(|ack| ack.subscription)
+                } else {
+                    None
+                };
                 send_ok(
                     &outbox,
                     id,
                     committed.value,
                     committed.commit_seq,
                     next_part,
+                    subscription,
                 )
                 .await;
             }
@@ -742,6 +875,7 @@ async fn send_ok(
     value: Box<serde_json::value::RawValue>,
     commit_seq: u64,
     first_part: u64,
+    activate: Option<u64>,
 ) {
     let frame = OkFrame {
         id,
@@ -750,7 +884,7 @@ async fn send_ok(
     };
     match ndjson::encode(&frame, MAX_FRAME_BYTES) {
         Ok(bytes) => {
-            outbox.send(bytes).await;
+            outbox.send_with_activation(bytes, activate).await;
             return;
         }
         Err(CodecError::Oversize { .. }) => {}
@@ -804,7 +938,9 @@ async fn send_ok(
     let Ok(ok) = serde_json::value::to_raw_value(&summary) else {
         return;
     };
-    outbox.frame(&OkFrame { id, ok, commit_seq }).await;
+    if let Ok(bytes) = ndjson::encode(&OkFrame { id, ok, commit_seq }, MAX_FRAME_BYTES) {
+        outbox.send_with_activation(bytes, activate).await;
+    }
 }
 
 #[cfg(test)]
@@ -900,6 +1036,578 @@ mod tests {
         }
     }
 
+    struct WriterTask(tokio::task::JoinHandle<()>);
+
+    impl Drop for WriterTask {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    impl WriterTask {
+        async fn finish(&mut self) {
+            tokio::time::timeout(Duration::from_secs(10), &mut self.0)
+                .await
+                .expect("writer finishes within its bounded fixture")
+                .unwrap();
+        }
+    }
+
+    fn writer_pause() -> (
+        WriterPause,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached, waiting) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        (
+            WriterPause {
+                reached,
+                resume: resumed,
+            },
+            waiting,
+            resume,
+        )
+    }
+
+    async fn reached(waiting: tokio::sync::oneshot::Receiver<()>) {
+        tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("writer reaches the deterministic pause")
+            .unwrap();
+    }
+
+    fn output_fixture(daemon: &TestDaemon) -> (Outbox, mpsc::Receiver<Queued>, OpContext) {
+        let (queue, queued) = mpsc::channel(64);
+        let budget = Arc::new(Semaphore::new(limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION));
+        let mut base = OpContext::new(hello(daemon).session_identity().unwrap());
+        base.event_output = Some(crate::hub::EventOutput::new(Arc::clone(&budget)));
+        (Outbox { queue, budget }, queued, base)
+    }
+
+    async fn output_request(daemon: &TestDaemon, base: &OpContext, outbox: &Outbox, raw: &str) {
+        let frame: RequestFrame = serde_json::from_str(raw).unwrap();
+        let outstanding = Arc::new(Mutex::new(HashSet::from([frame.id])));
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            run_request(
+                daemon.running.handler.clone(),
+                base.clone(),
+                frame,
+                outbox.clone(),
+                outstanding,
+            ),
+        )
+        .await
+        .expect("request queues its terminal response");
+    }
+
+    fn publish_context(daemon: &TestDaemon) {
+        use orch_engine::container::commit::{CommitRecord, CommitSource, Publication};
+        daemon
+            .running
+            .handler
+            .hub
+            .publish(&Publication::Commit(CommitRecord {
+                commit_seq: u64::MAX,
+                source: CommitSource::Rpc,
+                changes: vec![],
+                store_set_uncertain: true,
+            }));
+    }
+
+    async fn json_line(client: &mut BufReader<DuplexStream>) -> serde_json::Value {
+        serde_json::from_str(&line(client).await.expect("writer frame")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn real_writer_subscribe_ack_precedes_buffered_event_at_empty_reply_race() {
+        let daemon = start(false, None).await;
+        let (outbox, queued, base) = output_fixture(&daemon);
+        let budget = outbox.budget.clone();
+        let events = base.event_output.as_ref().unwrap();
+        let (pause, waiting, resume) = writer_pause();
+        let (client, write) = tokio::io::duplex(4096);
+        let mut client = BufReader::new(client);
+        let mut writer = WriterTask(tokio::spawn(write_loop_inner(
+            write,
+            queued,
+            events.clone(),
+            WriterHooks {
+                after_empty_reply: Some(pause),
+                ..Default::default()
+            },
+        )));
+        reached(waiting).await;
+        // The real producer finishes after the writer saw an empty reply
+        // queue, but before it selects an event. This was F-C3-1's legal race.
+        output_request(
+            &daemon,
+            &base,
+            &outbox,
+            r#"{"id":1,"req":{"op":"subscribe","args":{"stores":["context"]}}}"#,
+        )
+        .await;
+        publish_context(&daemon);
+        resume.send(()).unwrap();
+        let ack = json_line(&mut client).await;
+        assert_eq!(
+            ack["id"], 1,
+            "subscribe ack must precede the buffered event: {ack}"
+        );
+        let event = json_line(&mut client).await;
+        assert_eq!(event["ev"]["subscription"], ack["ok"]["subscription"]);
+        assert_eq!(event["ev"]["seq"], 1);
+        daemon.running.handler.hub.disconnect(base.session_id);
+        drop(outbox);
+        writer.finish().await;
+        assert_eq!(
+            budget.available_permits(),
+            limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION
+        );
+        assert!(daemon.running.shutdown().await.clean);
+    }
+
+    struct FlushGate {
+        write: DuplexStream,
+        reached: Option<tokio::sync::oneshot::Sender<()>>,
+        outcome: tokio::sync::oneshot::Receiver<std::io::Result<()>>,
+        released: bool,
+    }
+
+    impl AsyncWrite for FlushGate {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.write).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if !self.released {
+                if let Some(reached) = self.reached.take() {
+                    let _ = reached.send(());
+                }
+                let result = std::task::ready!(std::pin::Pin::new(&mut self.outcome).poll(cx));
+                self.released = true;
+                result.map_err(std::io::Error::other)??;
+            }
+            std::pin::Pin::new(&mut self.write).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.write).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn real_writer_activates_only_after_successful_ack_flush() {
+        for succeeds in [true, false] {
+            let daemon = start(false, None).await;
+            let (outbox, queued, base) = output_fixture(&daemon);
+            let budget = outbox.budget.clone();
+            let events = base.event_output.as_ref().unwrap();
+            output_request(
+                &daemon,
+                &base,
+                &outbox,
+                r#"{"id":1,"req":{"op":"subscribe","args":{"stores":["context"]}}}"#,
+            )
+            .await;
+            publish_context(&daemon);
+            let (reached_flush, flushing) = tokio::sync::oneshot::channel();
+            let (finish_flush, outcome) = tokio::sync::oneshot::channel();
+            let (client, write) = tokio::io::duplex(4096);
+            let mut client = BufReader::new(client);
+            let mut writer = WriterTask(tokio::spawn(write_loop(
+                FlushGate {
+                    write,
+                    reached: Some(reached_flush),
+                    outcome,
+                    released: false,
+                },
+                queued,
+                events.clone(),
+            )));
+            reached(flushing).await;
+            assert!(
+                events.pop().is_none(),
+                "a written but unflushed ack cannot activate events"
+            );
+            if succeeds {
+                finish_flush.send(Ok(())).unwrap();
+                assert_eq!(json_line(&mut client).await["id"], 1);
+                assert_eq!(json_line(&mut client).await["ev"]["seq"], 1);
+            } else {
+                finish_flush
+                    .send(Err(std::io::Error::other("fixture flush failure")))
+                    .unwrap();
+                writer.finish().await;
+                assert!(
+                    events.pop().is_none(),
+                    "a failed ack cannot activate events"
+                );
+            }
+            daemon.running.handler.hub.disconnect(base.session_id);
+            drop(outbox);
+            if succeeds {
+                writer.finish().await;
+            }
+            assert_eq!(
+                budget.available_permits(),
+                limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION
+            );
+            assert!(daemon.running.shutdown().await.clean);
+        }
+    }
+
+    #[tokio::test]
+    async fn real_writer_activation_needs_no_extra_output_budget() {
+        use orch_engine::container::commit::Publication;
+        let daemon = start(false, None).await;
+        let (outbox, queued, base) = output_fixture(&daemon);
+        let budget = outbox.budget.clone();
+        let events = base.event_output.as_ref().unwrap();
+        output_request(
+            &daemon,
+            &base,
+            &outbox,
+            r#"{"id":1,"req":{"op":"subscribe","args":{"stores":[],"bus":true}}}"#,
+        )
+        .await;
+        let bus = Publication::Bus(Arc::new(
+            orch_domain::OrchestratorEvent::OrchestratorError {
+                error: "x".repeat(600 * 1024),
+                context: "fixture".into(),
+                fatal: false,
+            },
+        ));
+        for _ in 0..6 {
+            daemon.running.handler.hub.publish(&bus);
+        }
+        let held = budget
+            .clone()
+            .try_acquire_many_owned(budget.available_permits() as u32)
+            .unwrap();
+        assert_eq!(budget.available_permits(), 0);
+        let (client, write) = tokio::io::duplex(4096);
+        let mut client = BufReader::new(client);
+        let mut writer = WriterTask(tokio::spawn(write_loop(write, queued, events.clone())));
+        assert_eq!(json_line(&mut client).await["id"], 1);
+        for seq in 1..=6 {
+            assert_eq!(json_line(&mut client).await["ev"]["seq"], seq);
+        }
+        daemon.running.handler.hub.disconnect(base.session_id);
+        drop(outbox);
+        writer.finish().await;
+        drop(held);
+        assert_eq!(
+            budget.available_permits(),
+            limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION
+        );
+        assert!(daemon.running.shutdown().await.clean);
+    }
+
+    #[tokio::test]
+    async fn real_writer_selected_event_stays_before_unsubscribe_ack() {
+        let daemon = start(false, None).await;
+        let (outbox, queued, base) = output_fixture(&daemon);
+        let budget = outbox.budget.clone();
+        let events = base.event_output.as_ref().unwrap();
+        output_request(
+            &daemon,
+            &base,
+            &outbox,
+            r#"{"id":1,"req":{"op":"subscribe","args":{"stores":["context"]}}}"#,
+        )
+        .await;
+        let (pause, waiting, resume) = writer_pause();
+        let (client, write) = tokio::io::duplex(4096);
+        let mut client = BufReader::new(client);
+        let mut writer = WriterTask(tokio::spawn(write_loop_inner(
+            write,
+            queued,
+            events.clone(),
+            WriterHooks {
+                after_event_selection: Some(pause),
+                ..Default::default()
+            },
+        )));
+        let ack = json_line(&mut client).await;
+        publish_context(&daemon);
+        publish_context(&daemon);
+        reached(waiting).await;
+        let unsubscribe = serde_json::json!({"id":2,"req":{"op":"unsubscribe","args":{
+            "subscription":ack["ok"]["subscription"]
+        }}});
+        output_request(&daemon, &base, &outbox, &unsubscribe.to_string()).await;
+        assert!(
+            events.pop().is_none(),
+            "unsubscribe discards the remaining buffered event"
+        );
+        resume.send(()).unwrap();
+        assert_eq!(json_line(&mut client).await["ev"]["seq"], 1);
+        assert_eq!(json_line(&mut client).await["id"], 2);
+        publish_context(&daemon);
+        drop(outbox);
+        writer.finish().await;
+        assert!(
+            eof(&mut client).await,
+            "no event after unsubscribe acknowledgement"
+        );
+        assert_eq!(
+            budget.available_permits(),
+            limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION
+        );
+        daemon.running.handler.hub.disconnect(base.session_id);
+        assert!(daemon.running.shutdown().await.clean);
+    }
+
+    #[tokio::test]
+    async fn real_writer_disconnected_ack_releases_inactive_event_budget() {
+        let daemon = start(false, None).await;
+        let (outbox, queued, base) = output_fixture(&daemon);
+        let budget = outbox.budget.clone();
+        let events = base.event_output.as_ref().unwrap();
+        output_request(
+            &daemon,
+            &base,
+            &outbox,
+            r#"{"id":1,"req":{"op":"subscribe","args":{"stores":["context"]}}}"#,
+        )
+        .await;
+        publish_context(&daemon);
+        let (client, write) = tokio::io::duplex(4096);
+        drop(client);
+        let mut writer = WriterTask(tokio::spawn(write_loop(write, queued, events.clone())));
+        writer.finish().await;
+        assert!(
+            events.pop().is_none(),
+            "a disconnected ack cannot activate events"
+        );
+        daemon.running.handler.hub.disconnect(base.session_id);
+        drop(outbox);
+        assert_eq!(
+            budget.available_permits(),
+            limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION
+        );
+        assert!(daemon.running.shutdown().await.clean);
+    }
+
+    #[tokio::test]
+    async fn real_writer_drain_preserves_ack_without_reactivating_removed_subscription() {
+        let daemon = start(false, None).await;
+        let (outbox, queued, base) = output_fixture(&daemon);
+        let budget = outbox.budget.clone();
+        let events = base.event_output.as_ref().unwrap();
+        output_request(
+            &daemon,
+            &base,
+            &outbox,
+            r#"{"id":1,"req":{"op":"subscribe","args":{"stores":["context"]}}}"#,
+        )
+        .await;
+        publish_context(&daemon);
+        // Quiesce event output with the activation acknowledgement still in
+        // the response queue. Flushing it must not resurrect a subscription.
+        events.begin_drain();
+        let (client, write) = tokio::io::duplex(4096);
+        let mut client = BufReader::new(client);
+        let mut writer = WriterTask(tokio::spawn(write_loop(write, queued, events.clone())));
+        drop(outbox);
+        assert_eq!(json_line(&mut client).await["id"], 1);
+        writer.finish().await;
+        assert!(eof(&mut client).await);
+        assert!(events.pop().is_none());
+        assert_eq!(
+            budget.available_permits(),
+            limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION
+        );
+        daemon.running.handler.hub.disconnect(base.session_id);
+        assert!(daemon.running.shutdown().await.clean);
+    }
+
+    async fn pending_reply_survives_drain(subscribed: bool) {
+        let daemon = start(false, None).await;
+        let (queue, queued) = mpsc::channel(64);
+        let outbox = Outbox {
+            queue,
+            budget: Arc::new(Semaphore::new(limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION)),
+        };
+        let events = crate::hub::EventOutput::new(Arc::clone(&outbox.budget));
+        let session_id = OpContext::new(hello(&daemon).session_identity().unwrap()).session_id;
+        if subscribed {
+            assert!(daemon.running.handler.hub.register(
+                session_id,
+                Some(Arc::clone(&events)),
+                1,
+                orch_proto::bounded::Id::new("drain_test").unwrap(),
+                0,
+                serde_json::from_str(r#"{"stores":["context"]}"#).unwrap(),
+            ));
+            events.activate(1);
+            events.ready.notified().await;
+        }
+        let (client, write) = tokio::io::duplex(4096);
+        let mut client = BufReader::new(client);
+        let writer = tokio::spawn(write_loop(write, queued, Arc::clone(&events)));
+        let (release, pending) = tokio::sync::oneshot::channel();
+        let mut inflight = tokio::task::JoinSet::new();
+        let response = outbox.clone();
+        inflight.spawn(async move {
+            pending.await.unwrap();
+            assert!(
+                response
+                    .send(b"{\"id\":1,\"ok\":null,\"commit_seq\":0}\n".to_vec())
+                    .await
+            );
+        });
+
+        // Force teardown to quiesce events BEFORE the accepted request can
+        // enqueue its terminal reply. This is the stop-watch interleaving,
+        // without depending on which Tokio task happens to win a race.
+        let drain_events = Arc::clone(&events);
+        let draining = drain_events.ready.notified();
+        tokio::pin!(draining);
+        draining.as_mut().enable();
+        let server = Arc::clone(&daemon.running.server);
+        let finishing = tokio::spawn(async move {
+            server
+                .finish_requests(session_id, events, inflight, outbox, writer)
+                .await;
+        });
+        draining.await;
+        release.send(()).unwrap();
+        let raw = line(&mut client)
+            .await
+            .expect("accepted request gets its terminal reply before EOF");
+        let reply: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(reply["id"], 1);
+        assert!(reply.get("ok").is_some(), "{reply}");
+        assert!(eof(&mut client).await);
+        finishing.await.unwrap();
+        assert_eq!(daemon.running.shutdown().await.code, 0);
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_preserves_pending_reply_without_subscriptions() {
+        pending_reply_survives_drain(false).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_preserves_pending_reply_with_subscription() {
+        pending_reply_survives_drain(true).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_socket_stop_replies_before_eof_with_and_without_subscription() {
+        for subscribed in [false, true] {
+            let daemon = start(true, None).await;
+            let socket = daemon.scratch.path().join("s");
+            let mut stream =
+                BufReader::new(tokio::net::UnixStream::connect(&socket).await.unwrap());
+            let hello = serde_json::to_vec(&HelloFrame {
+                hello: hello(&daemon),
+            })
+            .unwrap();
+            stream.get_mut().write_all(&hello).await.unwrap();
+            stream.get_mut().write_all(b"\n").await.unwrap();
+            let shutdown = tokio::spawn(async move {
+                daemon.running.wait_for_stop(None).await;
+                let exit = daemon.running.shutdown().await;
+                // Keep the project's temp directory alive through shutdown.
+                drop(daemon.project);
+                exit
+            });
+            let mut raw = String::new();
+            stream.read_line(&mut raw).await.unwrap();
+            assert!(
+                serde_json::from_str::<HandshakeReply>(&raw)
+                    .unwrap()
+                    .welcome
+                    .unwrap()
+                    .compatible
+            );
+            if subscribed {
+                stream.get_mut().write_all(b"{\"id\":1,\"req\":{\"op\":\"subscribe\",\"args\":{\"stores\":[\"context\"]}}}\n").await.unwrap();
+                raw.clear();
+                stream.read_line(&mut raw).await.unwrap();
+                let ack: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(ack["id"], 1);
+                assert!(ack.get("ok").is_some(), "{ack}");
+            }
+            stream
+                .get_mut()
+                .write_all(b"{\"id\":2,\"req\":{\"op\":\"daemon.stop\",\"args\":{}}}\n")
+                .await
+                .unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    raw.clear();
+                    assert!(
+                        stream.read_line(&mut raw).await.unwrap() > 0,
+                        "ordinary stop terminal reply before EOF"
+                    );
+                    let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    if frame.get("ev").is_some() {
+                        assert!(subscribed, "unexpected event: {frame}");
+                        continue;
+                    }
+                    break frame;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(reply["id"], 2, "{reply}");
+            assert_eq!(reply["ok"]["clean"], true, "{reply}");
+            raw.clear();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(10), stream.read_line(&mut raw))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            assert_eq!(shutdown.await.unwrap(), crate::lifecycle::DaemonExit::CLEAN);
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_drain_bounds_a_stalled_reply_writer() {
+        let daemon = start(false, None).await;
+        let (queue, queued) = mpsc::channel(64);
+        let outbox = Outbox {
+            queue,
+            budget: Arc::new(Semaphore::new(limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION)),
+        };
+        let events = crate::hub::EventOutput::new(Arc::clone(&outbox.budget));
+        let (_unread, write) = tokio::io::duplex(1);
+        assert!(outbox.send(vec![b'x'; 4096]).await);
+        let writer = tokio::spawn(write_loop(write, queued, Arc::clone(&events)));
+        let budget = Arc::clone(&outbox.budget);
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        daemon
+            .running
+            .server
+            .finish_requests(0, events, tokio::task::JoinSet::new(), outbox, writer)
+            .await;
+        assert!(started.elapsed() <= DRAIN_TIMEOUT + WRITE_TIMEOUT);
+        assert_eq!(
+            budget.available_permits(),
+            limits::MAX_QUEUED_OUTPUT_BYTES_PER_SESSION
+        );
+        tokio::time::resume();
+        assert_eq!(daemon.running.shutdown().await.code, 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn foreign_or_unavailable_peer_uid_is_closed_before_any_byte() {
         let daemon = start(false, None).await;
@@ -917,6 +1625,105 @@ mod tests {
             send_hello(&mut stream, &hello(&daemon)).await;
             assert!(eof(&mut stream).await, "no byte may reach {peer:?}");
         }
+        assert_eq!(daemon.running.shutdown().await.code, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn push_ack_then_snapshot_then_matching_change() {
+        let daemon = start(false, None).await;
+        let mut stream = session(&daemon).await;
+        send(
+            &mut stream,
+            r#"{"id":1,"req":{"op":"context.set","args":{"key":"before","value":"v"}}}"#,
+        )
+        .await;
+        assert!(line(&mut stream).await.unwrap().contains("commit_seq"));
+        send(
+            &mut stream,
+            r#"{"id":2,"req":{"op":"subscribe","args":{"stores":["context"]}}}"#,
+        )
+        .await;
+        let ack: serde_json::Value =
+            serde_json::from_str(&line(&mut stream).await.unwrap()).unwrap();
+        assert_eq!(
+            ack["ok"]["seq"], 0,
+            "ack is cursor origin, not the baseline"
+        );
+        let baseline = ack["commit_seq"].as_u64().unwrap();
+        assert!(baseline > 0);
+        send(
+            &mut stream,
+            r#"{"id":3,"req":{"op":"context.list","args":{}}}"#,
+        )
+        .await;
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&line(&mut stream).await.unwrap()).unwrap();
+        assert_eq!(snapshot["id"], 3);
+        assert!(snapshot["commit_seq"].as_u64().unwrap() >= baseline);
+        send(
+            &mut stream,
+            r#"{"id":4,"req":{"op":"context.set","args":{"key":"after","value":"secret-canary"}}}"#,
+        )
+        .await;
+        let mut pushed = None;
+        for _ in 0..2 {
+            let raw = line(&mut stream).await.unwrap();
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame.get("ev").is_some() {
+                assert!(
+                    !raw.contains("secret-canary"),
+                    "invalidations never carry entity contents"
+                );
+                pushed = Some(frame);
+            }
+        }
+        let pushed = pushed.expect("write delivered an invalidation");
+        assert_eq!(pushed["ev"]["seq"], 1);
+        assert_eq!(pushed["ev"]["store"], "context");
+        assert!(pushed["ev"]["commit_seq"].as_u64().unwrap() > baseline);
+        drop(stream);
+        assert_eq!(daemon.running.shutdown().await.code, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_push_consumer_does_not_block_control() {
+        let daemon = start(false, None).await;
+        let (client, server_stream) = tokio::io::duplex(64);
+        daemon.running.server.admit(server_stream, me());
+        let mut stalled = BufReader::new(client);
+        send_hello(&mut stalled, &hello(&daemon)).await;
+        assert!(matches!(reply(&mut stalled).await, Reply::Welcome(_)));
+        send(
+            &mut stalled,
+            r#"{"id":1,"req":{"op":"subscribe","args":{"stores":["state"]}}}"#,
+        )
+        .await;
+        let ack: serde_json::Value =
+            serde_json::from_str(&line(&mut stalled).await.unwrap()).unwrap();
+        assert_eq!(ack["ok"]["seq"], 0);
+        let boundary = daemon.running.handler.engine.operation_boundary();
+        for _ in 0..600 {
+            boundary
+                .run(false, async {
+                    boundary.note_store(orch_engine::container::commit::CommitStore::State);
+                })
+                .await;
+        }
+        let mut control = session(&daemon).await;
+        send(
+            &mut control,
+            r#"{"id":2,"req":{"op":"dispatch.set","args":{"dispatch":"off"}}}"#,
+        )
+        .await;
+        let response = tokio::time::timeout(Duration::from_secs(2), line(&mut control))
+            .await
+            .expect("control remains responsive")
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], 2);
+        assert!(response.get("ok").is_some(), "{response}");
+        drop(stalled);
+        drop(control);
         assert_eq!(daemon.running.shutdown().await.code, 0);
     }
 
@@ -1243,7 +2050,7 @@ mod tests {
         let big = serde_json::to_string(&"x".repeat(3 * 1024 * 1024)).unwrap();
         let value = serde_json::value::RawValue::from_string(big.clone()).unwrap();
         let id = RequestId(std::num::NonZeroU64::new(5).unwrap());
-        let sender = tokio::spawn(async move { send_ok(&outbox, id, value, 42, 3).await });
+        let sender = tokio::spawn(async move { send_ok(&outbox, id, value, 42, 3, None).await });
         let mut frames = Vec::new();
         while let Some(frame) = queued.recv().await {
             assert!(frame.bytes.len() <= MAX_FRAME_BYTES + 1);

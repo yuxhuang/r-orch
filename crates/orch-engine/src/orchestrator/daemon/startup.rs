@@ -10,7 +10,7 @@ impl Orchestrator {
         self.enable_daemon_mode();
         let boundary = self.deps().events.operation_boundary();
         let orphaned = boundary
-            .run(true, async {
+            .run(false, async {
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 self.invalidate_caches().await;
@@ -46,7 +46,7 @@ impl Orchestrator {
             }
         }
         boundary
-            .run(true, async {
+            .run(false, async {
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");

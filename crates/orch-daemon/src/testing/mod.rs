@@ -58,7 +58,9 @@ pub struct HarnessBuilder {
     maintenance_timer: Option<bool>,
     ids: Option<Arc<dyn IdGenerator>>,
     processes: Option<Arc<dyn ProcessManager>>,
+    isolated_fake_spawns: bool,
     global_config_path: Option<PathBuf>,
+    environment: Option<crate::env::Snapshot>,
     dispatch: DispatchMode,
     versions: Option<(u32, String)>,
     on_socket: bool,
@@ -97,9 +99,32 @@ impl HarnessBuilder {
         self
     }
 
+    /// Isolate launch, GitWorkspaceManager git/rsync (preparation, cleanup,
+    /// changed-files listing) and OpenCode effort-wire probes within this harness.
+    /// Requires a non-forking `.processes(...)` manager. Crate-internal real builders
+    /// fail closed; external direct Command builders must never opt in. Doctor,
+    /// merge, discovery and hostname stay process-wide. Linux admission is unchanged.
+    pub fn isolated_fake_spawns(mut self) -> Self {
+        self.isolated_fake_spawns = true;
+        self
+    }
+
     /// Where `global.yml` lives; tests must never use the real one.
     pub fn global_config_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.global_config_path = Some(path.into());
+        self
+    }
+
+    /// Replace the inherited environment for this daemon's child processes
+    /// and diagnostics. The normal daemon sanitizer is still applied; no
+    /// ambient variables are merged in. Supply private HOME/CODEX_HOME and a
+    /// PATH containing test-owned adapters when driving model discovery.
+    /// Without this seam the harness keeps its existing inherited environment.
+    pub fn environment(
+        mut self,
+        vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    ) -> Self {
+        self.environment = Some(crate::env::capture(vars));
         self
     }
 
@@ -170,6 +195,14 @@ impl HarnessBuilder {
         root: PathBuf,
         project: Option<tempfile::TempDir>,
     ) -> Result<DaemonHarness, DaemonError> {
+        if self.isolated_fake_spawns && self.processes.is_none() {
+            return Err(DaemonError::InvalidArguments(
+                "isolated fake spawns require a supplied process manager".into(),
+            ));
+        }
+        let spawn_domain = self
+            .isolated_fake_spawns
+            .then(orch_infra::process::gate::SpawnDomain::for_synthetic_processes);
         // Short, private and harness-owned: the socket (when bound) and the
         // default global.yml.
         let scratch = tempfile::Builder::new()
@@ -189,7 +222,7 @@ impl HarnessBuilder {
                     .unwrap_or_else(|| scratch.path().join("global.yml")),
             ),
         };
-        let mut running = Running::bring_up_with_maintenance_timer(
+        let mut running = Running::bring_up_with_spawn_domain(
             BringUp {
                 project_root: root.clone(),
                 socket: socket.clone(),
@@ -199,9 +232,12 @@ impl HarnessBuilder {
                 seams,
                 processes: self.processes,
                 versions: self.versions,
-                snapshot: crate::env::capture(std::env::vars_os()),
+                snapshot: self
+                    .environment
+                    .unwrap_or_else(|| crate::env::capture(std::env::vars_os())),
             },
             self.maintenance_timer.unwrap_or(true),
+            spawn_domain,
         )
         .await?;
         let scratch = Arc::new(scratch);
