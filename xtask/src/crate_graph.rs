@@ -834,7 +834,9 @@ fn source_path_literal<'a>(token: &Token<'a>) -> Option<&'a str> {
 
 fn boundary_source_loading(repo_root: &Path) -> Result<Vec<String>> {
     let mut problems = Vec::new();
-    for name in BOUNDARY_CRATES {
+    // Bootstrap aliases/impls must also stay inside the enumerated daemon
+    // root; otherwise an ordinary include/path could hide their declarations.
+    for name in BOUNDARY_CRATES.iter().chain([&"orch-daemon"]) {
         let src = repo_root.join("crates").join(name).join("src");
         if !src.is_dir() {
             continue;
@@ -1575,6 +1577,38 @@ fn declaration_separator(tokens: &[Token<'_>], start: usize, separators: &[&str]
     tokens.len()
 }
 
+// The one existing blanket impl has no members and lives in the test API.
+// Any other type-parameter impl could apply to a bootstrap type without ever
+// spelling its name. Lifetime-only impls on fixed receivers are not blanket.
+const BOOTSTRAP_BLANKET_IMPLS: &[(&str, &str)] = &[(
+    "testing/mod.rs",
+    "impl<T: AsyncRead + AsyncWrite + Send + Unpin> ClientStream for T",
+)];
+
+fn impl_has_type_parameters(header: &[Token<'_>]) -> bool {
+    if header.get(1).is_none_or(|t| t.text != "<") {
+        return false;
+    }
+    let mut angle = 1usize;
+    let mut start = true;
+    let mut i = 2;
+    while i < header.len() && angle > 0 {
+        let text = header[i].text;
+        if start && !matches!(text, "'" | "const" | ">") {
+            return true;
+        }
+        start = false;
+        match text {
+            "<" => angle += 1,
+            ">" if header[i - 1].text != "-" => angle -= 1,
+            "," if angle == 1 => start = true,
+            _ => {}
+        }
+        i = group_end(header, i);
+    }
+    false
+}
+
 /// Follow names globally and conservatively, including nested/cfg-gated code.
 /// A wrapper/projection is tainted too: it is rejected below, never mistaken
 /// for a successfully resolved identity alias. Names are not scope-resolved;
@@ -1793,6 +1827,20 @@ fn bootstrap_declarations(
                     problems.push(format!("crates/orch-daemon/src/{file}:{}: reviewed value macro names cannot be imported/rebound (BOOTSTRAP_IMPLS)", token.line));
                 }
             }
+            if token.text == "macro_rules"
+                && tokens
+                    .get(i + 3)
+                    .is_some_and(|t| matches!(t.text, "(" | "[" | "{"))
+            {
+                let end = group_end(&tokens, i + 3);
+                if let Some(target) = tokens[i + 4..end.saturating_sub(1)]
+                    .iter()
+                    .filter(|t| !t.literal)
+                    .find_map(|t| aliases.get(t.text))
+                {
+                    problems.push(format!("crates/orch-daemon/src/{file}:{}: local macro definition carries bootstrap type {target}; expansion requires review (BOOTSTRAP_IMPLS)", token.line));
+                }
+            }
             if (token.text == "macro_rules"
                 && tokens
                     .get(i + 2)
@@ -1846,6 +1894,7 @@ fn bootstrap_impls(repo_root: &Path) -> Result<Vec<String>> {
         .collect::<Result<_>>()?;
     let aliases = bootstrap_type_aliases(&sources);
     let mut seen = BTreeSet::new();
+    let mut seen_blankets = BTreeSet::new();
     let mut problems = bootstrap_declarations(&sources, &aliases);
     for (relative, text) in &sources {
         let tokens = rust_tokens(text);
@@ -1879,6 +1928,23 @@ fn bootstrap_impls(repo_root: &Path) -> Result<Vec<String>> {
                 .filter_map(|t| aliases.get(t.text))
                 .collect();
             if types.is_empty() {
+                if impl_has_type_parameters(header) {
+                    let entry =
+                        BOOTSTRAP_BLANKET_IMPLS
+                            .iter()
+                            .enumerate()
+                            .find(|(_, (file, expected))| {
+                                file == relative && same_tokens(header, &rust_tokens(expected))
+                            });
+                    if let Some((index, _)) = entry
+                        && tokens[body].text == "{"
+                        && group_end(&tokens, body) == body + 2
+                        && seen_blankets.insert(index)
+                    {
+                        continue;
+                    }
+                    problems.push(format!("crates/orch-daemon/src/{relative}:{}: unreviewed type-parameter impl could apply to a bootstrap type (BOOTSTRAP_IMPLS)", token.line));
+                }
                 if header.iter().any(|t| t.text == "$") {
                     problems.push(format!("crates/orch-daemon/src/{relative}:{}: unresolved macro impl receiver; it could name a bootstrap type (BOOTSTRAP_IMPLS)", token.line));
                 }
@@ -1932,6 +1998,13 @@ fn bootstrap_impls(repo_root: &Path) -> Result<Vec<String>> {
                 continue;
             }
             problems.push(format!("crates/orch-daemon/src/{relative}:{}: unreviewed impl/method on bootstrap type(s) {}: [{}] (BOOTSTRAP_IMPLS)", token.line, types.into_iter().map(String::as_str).collect::<Vec<_>>().join(", "), members.join(", ")));
+        }
+    }
+    for (i, (file, header)) in BOOTSTRAP_BLANKET_IMPLS.iter().enumerate() {
+        if !seen_blankets.contains(&i) {
+            problems.push(format!(
+                "crates/orch-daemon/src/{file}: stale BOOTSTRAP_BLANKET_IMPLS entry `{header}`"
+            ));
         }
     }
     for (i, (file, header, _)) in BOOTSTRAP_IMPLS.iter().enumerate() {
@@ -2365,16 +2438,8 @@ mod tests {
 
     #[test]
     fn bootstrap_facade_cannot_return_a_store_or_accept_an_execution_closure() {
-        let fixture = SourceFixture::new();
-        let src = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("crates/orch-daemon/src");
+        let fixture = daemon_fixture();
         let dest = fixture.0.join("crates/orch-daemon/src");
-        std::fs::create_dir_all(&dest).unwrap();
-        for file in ["bootstrap.rs", "lifecycle.rs", "discovery.rs", "error.rs"] {
-            std::fs::copy(src.join(file), dest.join(file)).unwrap();
-        }
         assert!(bootstrap_contracts(&fixture.0).unwrap().is_empty());
         for (file, old, new) in [
             (
@@ -2485,6 +2550,8 @@ mod tests {
         for file in ["bootstrap.rs", "lifecycle.rs", "discovery.rs", "error.rs"] {
             std::fs::copy(src.join(file), dest.join(file)).unwrap();
         }
+        std::fs::create_dir_all(dest.join("testing")).unwrap();
+        std::fs::copy(src.join("testing/mod.rs"), dest.join("testing/mod.rs")).unwrap();
         fixture
     }
 
@@ -2612,6 +2679,16 @@ mod tests {
                 "mod aliases { pub type Outcome = crate::InitOutcome; }",
                 "impl crate::aliases::Outcome { fn local_tasks() {} }",
             ),
+            (
+                "blanket trait",
+                "",
+                "impl<T> Local for T { fn local_tasks() {} }",
+            ),
+            (
+                "lifetime and type blanket",
+                "",
+                "impl<'a, T: 'a> Local for T { fn local_tasks() {} }",
+            ),
             ("direct", "", "impl InitOutcome { fn local_tasks() {} }"),
             (
                 "crate path",
@@ -2689,6 +2766,11 @@ mod tests {
                 "impl OutcomeΩ { fn local_tasks() {} }",
             ),
             (
+                "trait projection",
+                "trait Identity { type Out; } impl Identity for () { type Out = InitOutcome; }",
+                "impl Local for <() as Identity>::Out { fn local_tasks() {} }",
+            ),
+            (
                 "projection",
                 "trait Identity { type Out; } impl Identity for () { type Out = InitOutcome; }",
                 "impl <() as Identity>::Out { fn local_tasks() {} }",
@@ -2702,6 +2784,11 @@ mod tests {
                 "macro receiver",
                 "",
                 "macro_rules! add { ($t:ty) => { impl $t { fn local_tasks() {} } } }",
+            ),
+            (
+                "macro alias RHS",
+                "",
+                "macro_rules! base { () => { InitOutcome } } type Outcome = base!(); impl Outcome { fn local_tasks() {} }",
             ),
             ("macro argument", "", "add!(InitOutcome);"),
             ("macro keyword argument", "", "add!(impl, InitOutcome);"),
@@ -2740,6 +2827,28 @@ mod tests {
     }
 
     #[test]
+    fn the_reviewed_blanket_impl_cannot_grow_or_go_stale() {
+        let fixture = daemon_fixture();
+        let path = fixture.0.join("crates/orch-daemon/src/testing/mod.rs");
+        let original = std::fs::read_to_string(&path).unwrap();
+        let old = "impl<T: AsyncRead + AsyncWrite + Send + Unpin> ClientStream for T {}";
+        assert!(original.contains(old));
+        for replacement in [
+            "impl<T: AsyncRead + AsyncWrite + Send + Unpin> ClientStream for T { fn local_tasks() {} }",
+            "impl<T> ClientStream for T {}",
+            "",
+        ] {
+            std::fs::write(&path, original.replacen(old, replacement, 1)).unwrap();
+            let problems = bootstrap_impls(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("BOOTSTRAP_IMPLS")
+                    || problems.contains("BOOTSTRAP_BLANKET_IMPLS"),
+                "{problems}"
+            );
+        }
+    }
+
+    #[test]
     fn bootstrap_alias_resolution_and_unresolved_forms_are_explicit() {
         let fixture = daemon_fixture();
         let file = fixture.0.join("crates/orch-daemon/src/alias.rs");
@@ -2765,6 +2874,7 @@ mod tests {
             "type Outcome<T = InitOutcome> = T;",
             "type Outcome where InitOutcome: Identity = Unknown;",
             "type Outcome: Identity<InitOutcome>;",
+            "type Outcome<const N: usize> = InitOutcome where [(); N]: Sized;",
             "type Outcome<const N: usize = { 0 }> = [InitOutcome; N];",
         ] {
             std::fs::write(&file, declaration).unwrap();
@@ -2831,6 +2941,42 @@ mod tests {
             "pub struct StartOptions { pub hook: fn(),",
             "#[cfg(test)] pub struct StartOptions { pub project_root: PathBuf, pub socket: Option<PathBuf>, pub detach: bool, pub dispatch: DispatchMode, pub from_agent: bool, pub listen: Option<String>, pub peer_name: Option<String>, }",
         );
+    }
+
+    #[test]
+    fn bootstrap_aliases_cannot_be_loaded_from_unenumerated_sources() {
+        let fixture = daemon_fixture();
+        let src = fixture.0.join("crates/orch-daemon/src");
+        std::fs::write(
+            fixture.0.join("outside.rs"),
+            "type Outcome = crate::InitOutcome;",
+        )
+        .unwrap();
+        std::fs::write(src.join("aliases.rs"), "type Outcome = crate::InitOutcome;").unwrap();
+        for text in [
+            r#"include!(concat!("../", "outside.rs"));"#,
+            r#"include!("../../../outside.rs");"#,
+            r#"#[path = "../../../outside.rs"] mod aliases;"#,
+            r#"use std::include as load; load!("../../../outside.rs");"#,
+        ] {
+            std::fs::write(src.join("lib.rs"), text).unwrap();
+            let problems = boundary_source_loading(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("orch-daemon/src/lib.rs:1")
+                    && problems.contains("BOUNDARY_SOURCE_LOADING"),
+                "{text}: {problems}"
+            );
+        }
+        for text in [
+            r#"include!("aliases.rs");"#,
+            r#"#[path = "aliases.rs"] mod aliases;"#,
+        ] {
+            std::fs::write(src.join("lib.rs"), text).unwrap();
+            assert!(
+                boundary_source_loading(&fixture.0).unwrap().is_empty(),
+                "{text}"
+            );
+        }
     }
 
     #[test]
