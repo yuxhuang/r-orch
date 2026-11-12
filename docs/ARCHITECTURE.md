@@ -179,7 +179,7 @@ r-orch/
                  │  daemon.rs, init.rs    │
                  │                   orch-client     (domain + proto only; no store, no process API)
                  │                        ▲
-             orch-cli ────────────────────┘          (top of the stack; may name anything below)
+             orch-cli ────────────────────┘          (client facade; owner access only at daemon/init)
                  │
                  ▼  implements TuiBackend
              orch-tui                       (depends on orch-domain ONLY)
@@ -201,10 +201,13 @@ message for a request that presented the credential and `orch daemon unavailable
 without `--once` and `orch run --watch` are a foreground `orch daemon start` with dispatch on that forwards
 `--from-agent` and the peer flags (`commands/daemon.rs`, `foreground`); `orch serve --once`, `orch run --once` and
 `orch run <id>` are requests to a running daemon. The commands that do not need a daemon are `init`, `update`,
-`daemon` and the local checks of `doctor` (`tree.rs`, `CONTAINER_LESS_COMMANDS`). Three things wait for PR 4:
-`orch-cli` keeps its production dependencies on `orch-core`, `orch-engine`, `orch-infra` and `orch-peer`; `serve/`
-still holds the old container-building `serve::run`, which nothing calls, and its unit tests; and §2.1 still
-describes the v0.13.0 multi-writer story. Until then "a client never names a store" is a convention, not a gate.
+`daemon` and the local checks of `doctor` (`tree.rs`, `CONTAINER_LESS_COMMANDS`).
+
+The CLI's normal workspace dependencies are client, core, daemon, domain, proto and TUI. Engine and infra
+are dev dependencies only, and peer is absent. The gate checks declared dependency kinds, aliases,
+target conditions and optional edges, so an inactive dependency cannot bypass that boundary. The daemon
+facade is restricted to the explicit daemon/init wrappers; the four dedicated CLI fixture modules must
+retain their own test guards. Inline tests exempt only their guarded items, never a whole source file.
 Where each edge and rule lands, per the [plan](plans/2026-11-09-daemon-owned-state.md#tasks) (PR 1 and PR 2 are in
 place at this head):
 
@@ -214,7 +217,7 @@ place at this head):
 | `orch-daemon → orch-engine, orch-infra, orch-peer, orch-proto, orch-core, orch-domain` | PR 1 | The one owner of a project's stores and agent processes. The stores and their file formats stay behind this crate; it exposes `start`, `initialize` and a test harness, never a store implementation or an arbitrary execute closure. |
 | `orch-peer → orch-proto` | PR 1 | The generic bounded NDJSON framing moves out of `orch-peer` so both protocols share one reader. The peer `Frame` schema, `PROTOCOL` constant and 0.5.x tolerance are unchanged. |
 | `orch-client → orch-domain, orch-proto` | PR 1 (control plane), PR 2 (every operation) | Discovery, connect, kernel peer-uid check, handshake and the uniform NoDaemon error. PR 1 carries only what `orch daemon status`, `stop` and `dispatch` need; PR 2 adds every operation and converts the CLI, dashboard backend, `orch web` and `orch mcp` to it. The crate has no process API: it never spawns, forks or execs. |
-| `orch-cli → orch-daemon` only from `commands/daemon.rs` and `commands/init.rs` | PR 1 (the edge), PR 4 (the allowlist) | Only the explicit start and `init` may name `orch_daemon`. PR 4 adds a bidirectional source-site allowlist, like `ENGINE_INFRA_SITES` below, and removes `orch-cli`'s production edges to `orch-core`, `orch-engine`, `orch-infra` and `orch-peer`, so a client file that names a store fails the gate. Until then this rule is a convention. |
+| `orch-cli → orch-daemon` only from `commands/daemon.rs` and `commands/init.rs` | PR 1 (the edge), PR 4 (the allowlist) | Only the explicit start and `init` wrappers may name the reviewed `orch_daemon` bootstrap API. The bidirectional `CLI_DAEMON_SITES` table rejects any other production site and stale exceptions. Normal/build engine, infra and peer edges are forbidden; engine and infra remain dev-only for fixtures. Core stays normal for state-free helpers and port types. Bootstrap signatures return lifecycle results, never stores, engines or arbitrary execution closures. |
 
 Every writer, remote peer callbacks included, is then owned by the daemon's coordination, not by a UI handle.
 [ADR 0012](decisions/0012-daemon-owned-state.md) records the decision.

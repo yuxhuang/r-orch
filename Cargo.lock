@@ -1699,7 +1699,6 @@ dependencies = [
  "orch-domain",
  "orch-engine",
  "orch-infra",
- "orch-peer",
  "orch-proto",
  "orch-tui",
  "png",
@@ -1812,7 +1811,6 @@ dependencies = [
 name = "orch-infra"
 version = "0.13.0"
 dependencies = [
- "arboard",
  "async-stream",
  "async-trait",
  "dirs",
@@ -1826,7 +1824,6 @@ dependencies = [
  "nix 0.31.3",
  "orch-core",
  "orch-domain",
- "png",
  "regex",
  "saphyr-parser",
  "serde",
