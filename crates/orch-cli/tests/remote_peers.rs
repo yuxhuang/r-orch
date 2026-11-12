@@ -2834,7 +2834,8 @@ from pathlib import Path
 
 binary = str(Path(sys.argv[1]).resolve())
 mode = sys.argv[2]
-result = {'scenario': mode, 'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
+owner_command = sys.argv[3]
+result = {'scenario': mode, 'owner_command': owner_command, 'binary_sha256': hashlib.sha256(Path(binary).read_bytes()).hexdigest(),
           'checks': [], 'violations': [], 'limits': {'wall_s': 45, 'owner_rss_kib': 262144, 'cpu_s': 20, 'nofile': 128}}
 owners, seeds, sockets, streams, logs = [], [], [], [], []
 stop = threading.Event()
@@ -2883,7 +2884,13 @@ def receive(sock, stream, kind, predicate=lambda f:True):
         assert line and len(line)<=1024*1024+1, 'EOF/oversize waiting for '+kind
         value=json.loads(line)
         if value['t']=='ping': send(sock,{'t':'pong'})
-        if value['t']==kind and predicate(value): return value
+        if value['t']==kind and predicate(value):
+            if kind=='hello':
+                result['hello_name']=value.get('name')
+                assert value.get('name')=='controller', ('fixture Hello owner mismatch: received '+repr(value.get('name'))+
+                    ', expected controller; queue length before owner='+str(result['queue_length_before_owner'])+
+                    ', seed connections drained='+str(result['seed_connections_drained']))
+            return value
     raise AssertionError('timed out waiting for '+kind)
 
 def connection(sock):
@@ -2937,7 +2944,7 @@ class Project:
         finally:
             try: os.killpg(seed.pid,signal.SIGTERM)
             except ProcessLookupError: pass
-            seed.wait(timeout=7)
+            result.setdefault('seed_exit_statuses',[]).append(seed.wait(timeout=7))
     def path(self, rel): return self.root/'.orchestry'/rel
     def cli(self,*args):
         proc=subprocess.run([binary,*args],cwd=self.root,env=self.env,capture_output=True,text=True,timeout=7,preexec_fn=limits)
@@ -2958,7 +2965,7 @@ class Project:
         self.agents=[copy.deepcopy(a) for a in rows if a['id'] in self.ids]
     def start(self,listen):
         log=(self.root/'owner.log').open('w');logs.append(log)
-        args=[binary,'serve','--peer-name',self.root.name]
+        args=[binary,*owner_command.split(),'--peer-name','controller']
         if listen: args+=['--listen','127.0.0.1:0']
         owner=subprocess.Popen(args,cwd=self.root,env=self.env,stdout=log,stderr=log,start_new_session=True,preexec_fn=limits);owners.append(owner)
         if listen:
@@ -2991,6 +2998,17 @@ try:
     elif mode=='controller':
         sink=socket.socket();sockets.append(sink);sink.bind(('127.0.0.1',0));sink.listen();sink.settimeout(7)
         addr='127.0.0.1:'+str(sink.getsockname()[1]);peer.seeded(lambda: peer.cli('remote','add','sink',addr))
+        # seeded() has waited for the seed's exit. Close every connection it
+        # queued before the owner exists; the final nonblocking accept proves
+        # the queue empty, and the reaped seed can never add another one.
+        sink.setblocking(False);drained=0
+        while True:
+            try: old,_=sink.accept()
+            except BlockingIOError: break
+            old.close();drained+=1
+        result['seed_connections_drained']=drained
+        result['queue_length_before_owner']=0
+        sink.settimeout(7)
         path=peer.path('remotes/sink.json')
         path.write_text(json.dumps({'alias':'sink','addr':addr,'online':True,'last_seen':None,'last_error':None,'peer_name':'old','instance_id':'old','os':'linux','agents':peer.agents}))
         peer.start(False);sock,_=sink.accept();stream=connection(sock)
@@ -3025,24 +3043,27 @@ sys.exit(bool(result['violations']))
 "####;
 
 fn s1_discovery_probe(direction: &str) {
-    let sandbox = Peer::new("s1-discovery-supervisor");
-    let mut command = sandbox.command("python3");
-    command.args([
-        "-c",
-        S1_DISCOVERY_PROBE,
-        env!("CARGO_BIN_EXE_orch"),
-        direction,
-    ]);
-    let output = sandbox
-        .spawn(command, "s1-probe")
-        .output(Duration::from_secs(55));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    eprintln!("{stdout}");
-    assert!(
-        output.status.success(),
-        "S1 {direction}: {stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for owner_command in ["serve", "daemon start"] {
+        let sandbox = Peer::new("s1-discovery-supervisor");
+        let mut command = sandbox.command("python3");
+        command.args([
+            "-c",
+            S1_DISCOVERY_PROBE,
+            env!("CARGO_BIN_EXE_orch"),
+            direction,
+            owner_command,
+        ]);
+        let output = sandbox
+            .spawn(command, "s1-probe")
+            .output(Duration::from_secs(55));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!("{stdout}");
+        assert!(
+            output.status.success(),
+            "S1 {direction}: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
