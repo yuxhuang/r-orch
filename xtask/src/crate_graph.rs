@@ -80,7 +80,7 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "orch-proto",
         ],
     ),
-    // Only the explicit daemon/init wrappers may use the owner facade.
+    // Reviewed production owner-facade sites are the explicit daemon/init wrappers.
     (
         "orch-cli",
         &[
@@ -854,10 +854,10 @@ fn boundary_source_loading(repo_root: &Path) -> Result<Vec<String>> {
                 .to_string_lossy()
                 .replace('\\', "/");
             let text = std::fs::read_to_string(&file)?;
-            // Check raw source, including test-only tokens and macro/attribute
-            // arguments. ASCII has one spelling, so aliases cannot disagree
-            // through rustc's Unicode identifier normalization. Comments and
-            // opaque literals cannot declare names and remain unrestricted.
+            // Check raw non-literal tokens, including test-only tokens and
+            // macro/attribute arguments. This catches non-ASCII spellings only
+            // when the tokenizer emits them outside a literal; the literal-
+            // boundary residual in ARCHITECTURE §3.1 can conceal source here.
             let raw = rust_tokens(&text);
             for token in raw.iter().filter(|t| !t.literal && !t.text.is_ascii()) {
                 problems.push(format!("crates/{name}/src/{relative}:{}: non-ASCII source token outside a comment or literal (SOURCE_SPELLING)", token.line));
@@ -985,8 +985,9 @@ struct Token<'a> {
     raw_identifier: bool,
 }
 
-/// A small lexical tripwire: comments/literals cannot authorize an import.
-/// Keep literals as opaque tokens so cfg/path attributes can still be checked.
+/// A lexical review tripwire: literal suffixes are not modeled, so adjacent
+/// suffixed literals can conceal subsequent source (ARCHITECTURE §3.1).
+/// Keep recognized literals opaque so cfg/path attributes can be checked.
 fn rust_tokens(text: &str) -> Vec<Token<'_>> {
     let b = text.as_bytes();
     let mut out = Vec::new();
@@ -1198,9 +1199,9 @@ fn production_tokens<'a>(tokens: &[Token<'a>]) -> Vec<Token<'a>> {
                         prefix = group_end(tokens, prefix);
                     }
                 }
-                // Rust let statements always require a semicolon, including
-                // block initializers and let-else. Generic commas and blocks
-                // cannot end the attributed statement or begin its successor.
+                // Rust let statements require a semicolon, including block
+                // initializers and let-else. This text test also classifies a
+                // raw let-keyword macro as a statement and can omit its successor.
                 let let_statement = tokens.get(prefix).is_some_and(|t| t.text == "let");
                 let item = tokens.get(prefix).is_some_and(|t| {
                     matches!(
@@ -1265,8 +1266,9 @@ fn production_tokens<'a>(tokens: &[Token<'a>]) -> Vec<Token<'a>> {
                 .get(i + 1)
                 .is_some_and(|t| matches!(t.text, "(" | "[" | "{"))
         {
-            // A macro decides what an attribute in its input means; do not
-            // treat a cfg-looking token sequence there as a test guard.
+            // Preserve cfg-looking input for calls recognized as invocations.
+            // Raw declaration-keyword macro names are not distinguished from
+            // definitions here and can instead receive a cfg exemption.
             let end = group_end(tokens, i + 1);
             out.extend_from_slice(&tokens[i..end]);
             i = end;
@@ -1569,7 +1571,8 @@ fn bootstrap_enums(repo_root: &Path) -> Result<Vec<String>> {
 }
 
 /// Every daemon type named by CLI_DAEMON_SITES, plus PreparedStart returned
-/// by prepare_start. No source module may add an unreviewed implementation.
+/// by prepare_start. Recognized impls must match the reviewed table; foreign
+/// same-named re-exports are not resolved to their outside definitions.
 const BOOTSTRAP_TYPES: &[&str] = &[
     "InitOutcome",
     "InitOptions",
@@ -1658,10 +1661,10 @@ fn impl_has_type_parameters(header: &[Token<'_>]) -> bool {
     false
 }
 
-/// Follow names globally and conservatively, including nested/cfg-gated code.
-/// A wrapper/projection is tainted too: it is rejected below, never mistaken
-/// for a successfully resolved identity alias. Names are not scope-resolved;
-/// shadowing can cause a rejection, not grant an unreviewed implementation.
+/// Follow names in emitted non-literal tokens, including nested/cfg-gated code.
+/// A visible wrapper/projection is tainted too and rejected below rather than
+/// resolved as an identity alias. Names are not scope-resolved; foreign
+/// same-named re-exports can leave implementations outside the scanned root.
 fn bootstrap_type_aliases(sources: &[(String, String)]) -> BTreeMap<String, String> {
     let mut aliases: BTreeMap<_, _> = BOOTSTRAP_TYPES
         .iter()
@@ -2004,9 +2007,9 @@ fn bootstrap_impls(repo_root: &Path) -> Result<Vec<String>> {
             if token.text != "impl" {
                 continue;
             }
-            // Do not skip unfamiliar positions (including macro arguments).
-            // A bootstrap-bearing impl Trait/header we cannot classify fails
-            // closed. Skip const-generic groups while locating the body.
+            // Inspect unfamiliar positions in emitted tokens, including macro
+            // arguments. A visible bootstrap-bearing impl Trait/header we cannot
+            // classify fails closed. Skip const-generic groups to find the body.
             let body = declaration_separator(&tokens, i + 1, &["{", ";", ",", ")", "]", "="]);
             if body == tokens.len() {
                 continue;
