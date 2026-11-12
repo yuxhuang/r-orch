@@ -2736,6 +2736,36 @@ mod tests {
                 "impl (InitOutcome) { fn local_tasks() {} }",
             ),
             (
+                "tuple trait",
+                "",
+                "impl Local for (InitOutcome,) { fn local_tasks() {} }",
+            ),
+            (
+                "option trait",
+                "",
+                "impl Local for Option<InitOutcome> { fn local_tasks() {} }",
+            ),
+            (
+                "pointer trait",
+                "",
+                "impl Local for *const InitOutcome { fn local_tasks() {} }",
+            ),
+            (
+                "slice trait",
+                "",
+                "impl Local for [InitOutcome] { fn local_tasks() {} }",
+            ),
+            (
+                "parenthesized alias",
+                "type Outcome = (InitOutcome);",
+                "impl Outcome { fn local_tasks() {} }",
+            ),
+            (
+                "turbofish alias",
+                "type Outcome<const N: usize> = InitOutcome;",
+                "impl Outcome::<0> { fn local_tasks() {} }",
+            ),
+            (
                 "trait reference",
                 "",
                 "impl Local for &InitOutcome { fn local_tasks() {} }",
