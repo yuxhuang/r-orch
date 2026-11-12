@@ -1852,11 +1852,13 @@ fn bootstrap_declarations(
             {
                 problems.push(format!("crates/orch-daemon/src/{file}:{}: reviewed value macro names cannot be rebound (BOOTSTRAP_IMPLS)", token.line));
             }
+            let reviewed_value_call = BOOTSTRAP_VALUE_MACROS.contains(&token.text)
+                && (i == 0 || tokens[i - 1].text != ":");
             if tokens.get(i + 1).is_some_and(|t| t.text == "!")
                 && tokens
                     .get(i + 2)
                     .is_some_and(|t| matches!(t.text, "(" | "[" | "{"))
-                && !BOOTSTRAP_VALUE_MACROS.contains(&token.text)
+                && !reviewed_value_call
             {
                 let end = group_end(&tokens, i + 2);
                 if let Some(target) = tokens[i + 3..end.saturating_sub(1)]
@@ -2819,6 +2821,11 @@ mod tests {
                 "macro alias RHS",
                 "",
                 "macro_rules! base { () => { InitOutcome } } type Outcome = base!(); impl Outcome { fn local_tasks() {} }",
+            ),
+            (
+                "qualified value macro name",
+                "",
+                "external::matches!(InitOutcome);",
             ),
             ("macro argument", "", "add!(InitOutcome);"),
             ("macro keyword argument", "", "add!(impl, InitOutcome);"),
