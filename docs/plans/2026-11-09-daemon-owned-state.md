@@ -123,10 +123,10 @@ rebase of a shared branch. Owners are roles; task ids live in the tracker, not i
 
 | Id | Task (owner) | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|
-| S2a | Every D7 operation in `orch-client`; convert every CLI command; `init`; D8 command remap; remove the developmental gate (senior-eng); R39 moved to S4 by CP6 ruling 12.8 | R3–R5, R13, R29, R31, R38 | `crates/orch-client/**`, `crates/orch-cli/src/commands/**`, `context.rs`, `lib.rs`, `crates/orch-daemon/src/session.rs`, `crates/orch-daemon/src/ops/control.rs` | PR 1 frozen | `cargo test -p orch-client -p orch-cli` | 2 |
+| S2a | Every D7 operation in `orch-client`; convert every CLI command; `init`; D8 command remap; remove the developmental gate (senior-eng); R39 is deferred by the owner and not built | R3–R5, R13, R29, R31, R38 | `crates/orch-client/**`, `crates/orch-cli/src/commands/**`, `context.rs`, `lib.rs`, `crates/orch-daemon/src/session.rs`, `crates/orch-daemon/src/ops/control.rs` | PR 1 frozen | `cargo test -p orch-client -p orch-cli` | 2 |
 | S2b | `orch mcp` as a stdio-to-socket bridge; NoDaemon as `initialize` and tool error (senior-eng-2) | R17, R18 | `crates/orch-cli/src/mcp/**` | S2a client API | `cargo test -p orch-cli --test mcp_stdio --test mcp_contract --test mcp_tools` | 2 |
 | S2c | TUI backend over RPC (refresh tick, no disk observer); `orch web` preflight, 503 and PTY env (frontend-eng) | R16, R18, R26 | `crates/orch-cli/src/{tui,web}/**` | S2a client API | `cargo test -p orch-cli`; tmux end-to-end tests | 2 |
-| T2a | No-daemon matrix, lifecycle, two-executable skew (replace ignored T1b placeholder), stress with the real `orch tui` in tmux + 4 CLI + 2 MCP clients (test-engineer); R39 vectors moved to S4 by CP6 ruling 12.8 | R4, R6, R12, R26, R27, R32, R35 | `crates/orch-cli/tests/daemon_*.rs` | S2a | `cargo test -p orch-cli --test daemon_no_daemon --test daemon_lifecycle --test daemon_stress`; build two binaries with different LOCAL_PROTOCOL constants, same package semver, then run the non-ignored `daemon_lifecycle::two_executable_stale_dev_instance` in both directions (old executable removed in one case); build/run fixture must be committed by T2a | 2 |
+| T2a | No-daemon matrix, lifecycle, two-executable skew (replace ignored T1b placeholder), stress with the real `orch tui` in tmux + 4 CLI + 2 MCP clients (test-engineer); no R39 vectors, R39 being deferred by the owner | R4, R6, R12, R26, R27, R32, R35 | `crates/orch-cli/tests/daemon_*.rs` | S2a | `cargo test -p orch-cli --test daemon_no_daemon --test daemon_lifecycle --test daemon_stress`; build two binaries with different LOCAL_PROTOCOL constants, same package semver, then run the non-ignored `daemon_lifecycle::two_executable_stale_dev_instance` in both directions (old executable removed in one case); build/run fixture must be committed by T2a | 2 |
 | T2b | Move binary tests to an explicit test daemon on an isolated `ORCH_SOCKET` (test-eng-2) | R25 | `crates/orch-cli/tests/common/**`, `crates/orch-cli/tests/mcp_common/**` | S2a | `cargo test -p orch-cli --tests` | 2 |
 | W2 | README "Upgrading from v0.13.0"; CHANGELOG; every changed command chapter; command reference; remove manual 18's developmental notice (tech-writer) | R22, R35 | `README.md`, `CHANGELOG.md`, `docs/manual/**` | S2a | links resolve; `docs/manual/tools/gen-command-reference.sh` output committed | 2 |
 | I2, G2, CP4 | Integrate, board 2 with CLI round-trip latency, adjudicate, PR 2 | R24 | per finding | S2b, S2c, T2a, T2b, W2 | the CI set; cold gate; latency report | 2 |
@@ -143,7 +143,7 @@ rebase of a shared branch. Owners are roles; task ids live in the tracker, not i
 | W3 | Spec wording, this plan, ADR 0012 clarification note, manual 02/07/08/09/12/15/17/18, RUNBOOK, CHANGELOG; drafted ahead of the code, verified on the integrated candidate (tech-writer) | R16–R18, R22, R23, R29 | `README.md`, `CHANGELOG.md`, `docs/**` | PR 2 frozen | `git diff --check`; examples re-run on an isolated integrated binary | 3 |
 | I3a, I3b | Assemble the candidate on `feature/daemon-push` by merge; then merge final tests and docs, gate and freeze (senior-eng-2) | R24, R29 | per merge | all PR 3 slices | the CI set; cold `./xtask/gate.sh`; Linux | 3 |
 | G3, QA1 | Board 3 at the frozen SHA: gate (release-eng), code (code-reviewer), security (sec-reviewer-codex), resilience (sre), facts (fact-checker), performance (perf-eng); then QA pass 1 on the owner's Mac (qa-engineer) | R24, R28 | per finding | I3b | reviewer verdicts; QA transcript | 3 |
-| S4 | Crate and source-site allowlist; remove client infra/engine dependencies, the MCP FIFO lane and dead cross-process code (senior-eng-2; release-eng co-signs the manifest); R39 pgid-derived stop/off acknowledgement and its test vectors (CP6 ruling 12.8) | R3, R39 | `xtask/**`, `crates/orch-cli/src/{serve,mcp}/**`, `crates/orch-cli/Cargo.toml`, `crates/orch-daemon/src/session.rs`, `crates/orch-daemon/src/ops/control.rs`, `crates/orch-daemon/tests/daemon_security.rs` | PR 3 frozen | `cargo xtask crate-graph` passes, and fails on a planted `orch_infra` import in a client file; planned `cargo test -p orch-daemon --features testing --test daemon_security agent_control_requires_explicit_override -- --exact` (R39) | 4 |
+| S4 | Crate and source-site allowlist; remove client infra/engine dependencies, the MCP FIFO lane and dead cross-process code (senior-eng-2; release-eng co-signs the manifest) | R3 | `xtask/**`, `crates/orch-cli/src/{serve,mcp}/**`, `crates/orch-cli/Cargo.toml`, `crates/orch-daemon/src/session.rs`, `crates/orch-daemon/src/ops/control.rs`, `crates/orch-daemon/tests/daemon_security.rs` | PR 3 frozen | `cargo xtask crate-graph` passes, and fails on a planted `orch_infra` import in a client file | 4 |
 | PR 4 retained hardening | Resolve uncapped per-operation events; adjudicate no-op peer commit/fan-out work; make the daemon harness hermetic by default; trace and independently measure no-op and collector `record_event` held-permit p50/p95 | R20, R21, R25 | scopes fixed at the qualified PR 4 base | PR 3 integration and explicit PR 4 handoff | Bounded lossless event-buffer design or owner-approved envelope; unchanged peer interoperability and causal controls; exact-base reviews and both held-permit distributions | 4 |
 | W4 | ARCHITECTURE §2; RUNBOOK; manual 17/18 sweep with captured output; spec Verification table; spec and plan `done`; Pensieve mirror (tech-writer) | R22, R35, R38 | `docs/**`, `README.md`, `CHANGELOG.md` | S4 | every example re-run at the frozen commit; fact-check | 4 |
 | I4, G4, QA2 | Integrate, board 4, QA pass 2 | R22, R24, R28 | per finding | S4, W4 | reviewer verdicts; QA transcript | 4 |
@@ -234,8 +234,8 @@ identified head/tree and the other applicable gates; the lead reports readiness 
   the peer suites 3×. These fixes are not claimed present or passing at `b1216ce4`.
 - PR 2 planned: `daemon_no_daemon::all_frontends_matrix` with process-table and spawn assertions;
   `daemon_stress::real_tui_cli_mcp_share_state_order` (60 s acceptance run); two compiled executables with
-  different `LOCAL_PROTOCOL` constants under T2a (R6/R32). The pgid-derived acknowledgement (R39) moved to
-  PR 4 under S4 (CP6 ruling 12.8).
+  different `LOCAL_PROTOCOL` constants under T2a (R6/R32). The pgid-derived acknowledgement (R39) is deferred
+  by the owner and not built.
   The stress test is the evidence that D10 is closed and replaces the runbook hazard.
 - PR 3 planned: the spec's [PR 3 acceptance targets](../specs/2026-11-09-daemon-owned-state.md#pr-3-acceptance-targets)
   (`daemon_push::*`, `daemon_dispatch_wake::*`, `tui_daemon::*`, `web_daemon::*`, `daemon_push::mcp_resource_updates`),
@@ -276,16 +276,13 @@ mirrored to Pensieve's `specs/` directory.
 ## Open questions
 Gate 2's Q2 stop intent and Q5 regrouping were approved on 2026-11-09. CP3 rulings 8.17/8.20 record:
 
-1. **R39 deferred to PR 4 (enforcement and hardening), S4 implementation and tests, by CP6 ruling 12.8.**
-   CP3 rulings 8.17/8.20 first deferred it from PR 1 to PR 2. Kernel-pgid-derived acknowledgement for
-   agent-originated stop/dispatch off is absent at PR 1, PR 2 and PR 3: at the PR 2 and PR 3 heads an
-   agent-context `orch daemon stop` or `orch daemon dispatch off` succeeds without `--from-agent`. It
-   prevents same-UID accidents rather than providing authorization; existing kernel-UID/project checks
-   remain mandatory, and the board-2 security verdict at `f70fc707` was pass. PR 2 was the all-frontends
-   cutover; the attribution is implemented with PR 4, when the control paths are final. PR 4 must test
-   matching live-run pgids, unrelated owner pgids, explicit `--from-agent`, and spoofed caller-pid rejection
-   (planned test unchanged: `crates/orch-daemon/tests/daemon_security.rs::agent_control_requires_explicit_override`).
-   This is a reasoned should-row deferral, not a pass.
+1. **R39 is deferred by the owner (2026-11-11) and not built in this goal.** The kernel-pgid-derived
+   acknowledgement for agent-originated stop/dispatch off does not exist: an agent-context `orch daemon stop` or
+   `orch daemon dispatch off` succeeds without `--from-agent`. Reasons: an agent with a shell can always run the
+   command, and no design satisfies both R39 and the unconditional stop of an old-version daemon (R6, R14). The
+   accepted consequence is that the environment-based refusal of an agent-context start is the only protection:
+   accident prevention, not a barrier against a same-uid process. Existing kernel-UID/project checks remain
+   mandatory. R39 is a should row, recorded as deferred, not as a pass. The decision is ADR 0012, decision 15.
 2. **R6/R32 two-executable skew acceptance is UNMET at PR 1.** T1b's
    `orch-cli/daemon_lifecycle::two_executable_stale_dev_instance` is ignored and has an empty body; it does
    not supply acceptance even if run with `--ignored`. Harness-advertised versions cover wire behavior only.

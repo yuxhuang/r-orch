@@ -283,6 +283,23 @@ authorize client recovery side effects, release or merge.
     `serve::ONCE_POLL_INTERVAL`, the `serve::once` module (with `run_once`), `logs::run`, `logs::LogsDeps`,
     `doctor::run`, `doctor::container_less_registry` or `tui::first_run`.
 
+15. **R39, the stop acknowledgement for agent-originated `daemon stop` and `daemon dispatch off`, is deferred
+    by the owner and is not built in this goal.** The owner decided this on 2026-11-11. The spec's R39 asked the
+    daemon to recognise such a request from the kernel-reported process group of the caller and to require
+    `--from-agent`.
+
+    Reasons. An agent with a shell can always run the command, so an acknowledgement cannot stop it. And no
+    design satisfies both R39 and the unconditional stop of an old-version daemon (R6 and R14): the stop
+    request is a frozen envelope that works across versions, and the check would have to run in the daemon
+    being stopped.
+
+    Consequence the owner accepted. `orch daemon stop`, `orch daemon dispatch on` and `orch daemon dispatch
+    off` run in an agent's environment (`ORCH_TASK_ID` or `ORCH_AGENT_ID` set) succeed without
+    `--from-agent`. The only agent-context protection is the environment-based refusal of `orch daemon start`,
+    `orch serve` and `orch run --watch` (exit 2 without `--from-agent`). It prevents an accidental start by an
+    agent; it is not a barrier against a process of the same user, which can unset the variables. The
+    same-user peer-credential check and the project check on every connection are unchanged.
+
 ## Alternatives considered
 
 - **Keep multiple writers and patch locks individually:** does not provide one ownership boundary across
