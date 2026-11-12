@@ -76,6 +76,25 @@ impl Orchestrator {
             .value
     }
 
+    /// Owner maintenance independent of scheduling. The operation boundary
+    /// serializes this with cancellation, startup and collector completion.
+    pub async fn daemon_reconcile_dead_local_runs(&self) -> Result<()> {
+        self.deps()
+            .events
+            .operation_boundary()
+            .run(false, async {
+                if self.is_shutting_down() {
+                    return Ok(());
+                }
+                let mut slot = self.inner.state.lock().await;
+                self.load_state(&mut slot).await?;
+                self.reconcile_dead_local_runs(slot.as_mut().expect("state loaded"))
+                    .await
+            })
+            .await
+            .value
+    }
+
     /// Reconcile and select under the boundary, then prepare each candidate
     /// outside it. The caller owns persistent dispatch/batch policy.
     pub async fn daemon_tick(&self, skip_autonomous_seeding: bool) -> Result<()> {

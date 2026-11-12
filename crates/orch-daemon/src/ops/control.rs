@@ -284,6 +284,28 @@ impl ServiceHandler {
             if self.coordinator.is_stopping() {
                 break;
             }
+            let engine = Arc::clone(&self.engine);
+            if let Err(error) = self
+                .coordinator
+                .run_op(Lane::Internal, move |_| {
+                    Box::pin(async move {
+                        engine
+                            .orchestrator
+                            .daemon_reconcile_dead_local_runs()
+                            .await
+                            .map_err(service_error)
+                    })
+                })
+                .await
+            {
+                self.engine
+                    .events
+                    .emit(orch_domain::OrchestratorEvent::OrchestratorError {
+                        error: error.message.to_string(),
+                        context: "local run maintenance".into(),
+                        fatal: false,
+                    });
+            }
             if let Err(error) = self.expire_context().await {
                 self.engine
                     .events
