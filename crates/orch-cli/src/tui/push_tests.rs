@@ -48,6 +48,8 @@ struct FakeDaemon {
     scripts: Mutex<Vec<mpsc::UnboundedSender<Script>>>,
     connects: AtomicUsize,
     tasks: Mutex<Vec<Task>>,
+    goals: Mutex<Vec<orch_domain::Goal>>,
+    agents: Mutex<Vec<orch_domain::Agent>>,
     /// When set, the `ui.bootstrap` reply waits for this many pushes to be
     /// scripted first (a change committed between subscribe and the read).
     push_before_bootstrap: Mutex<Option<EventBody>>,
@@ -66,6 +68,8 @@ impl FakeDaemon {
             scripts: Mutex::new(Vec::new()),
             connects: AtomicUsize::new(0),
             tasks: Mutex::new(vec![task("tsk_1")]),
+            goals: Mutex::new(Vec::new()),
+            agents: Mutex::new(Vec::new()),
             push_before_bootstrap: Mutex::new(None),
             dispatch_on: AtomicBool::new(false),
             down: AtomicBool::new(false),
@@ -236,7 +240,23 @@ async fn serve(mut peer: FakeServer, daemon: Arc<FakeDaemon>) {
                 let seq = daemon.commit_seq.fetch_add(1, Ordering::SeqCst) + 1;
                 ok(&mut peer, frame.id, seq, task("tsk_new")).await;
             }
-            Request::AgentList(_) | Request::GoalList(_) | Request::TeamList(_) => {
+            Request::AgentList(_) => {
+                let agents = daemon
+                    .agents
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                ok(&mut peer, frame.id, seq, agents).await;
+            }
+            Request::GoalList(_) => {
+                let goals = daemon
+                    .goals
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                ok(&mut peer, frame.id, seq, goals).await;
+            }
+            Request::TeamList(_) => {
                 ok(&mut peer, frame.id, seq, Vec::<()>::new()).await;
             }
             Request::StateGet(_) => {
@@ -679,6 +699,113 @@ fn tui_eof_on_the_observation_is_a_lost_session_and_nothing_reconnects() {
         fixture.daemon.connects.load(Ordering::SeqCst),
         connects,
         "a lost observation is not retried behind the user's back"
+    );
+}
+
+#[test]
+fn tui_keyword_retry_refetches_after_repeated_outages_and_failed_connects() {
+    use orch_domain::{AgentStatus, GoalStatus};
+    use orch_tui::{App, TestClock, ViewId};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let daemon = FakeDaemon::new();
+    *daemon.goals.lock().unwrap() = vec![orch_tui::backend::make_goal(
+        "g_old",
+        "東京",
+        GoalStatus::Active,
+    )];
+    *daemon.agents.lock().unwrap() = vec![orch_tui::backend::make_agent(
+        "a_old",
+        "مرحبا",
+        AgentStatus::Idle,
+    )];
+    let mut fixture = Fixture::launch_with(daemon);
+    let root = fixture._dir.path().to_path_buf();
+    let mut app = App::new(fixture.backend.take().unwrap(), TestClock::new(0));
+    let keywords = [
+        (ViewId::Tasks, "Task"),
+        (ViewId::Goals, "東京"),
+        (ViewId::Agents, "مرحبا"),
+    ];
+    for (view, keyword) in keywords {
+        app.state.view = view;
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        app.handle_paste(keyword);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.state.keyword_counts(view), (1, 1));
+    }
+    for outage in 0..2 {
+        let loss = app.backend.session_loss();
+        fixture.wait_subscriptions(outage + 1);
+        fixture.daemon.down.store(true, Ordering::SeqCst);
+        fixture.daemon.script(outage, Script::Close);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while loss.failure().is_none() {
+            assert!(Instant::now() < deadline, "outage ends the observation");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(fixture.stop.load(Ordering::SeqCst));
+        let filters = app.state.keyword_filters();
+        drop(app);
+        for _ in 0..2 {
+            assert!(
+                fixture
+                    .rt
+                    .block_on(DaemonBackend::launch(
+                        connector(&fixture.daemon, &root),
+                        "test",
+                        root.clone(),
+                        Arc::clone(&fixture.stop),
+                    ))
+                    .is_err(),
+                "an explicit retry while down fails"
+            );
+        }
+        let mut fresh = task("tsk_fresh");
+        fresh.title = "Replacement".into();
+        *fixture.daemon.tasks.lock().unwrap() = vec![fresh];
+        fixture.daemon.goals.lock().unwrap().clear();
+        fixture.daemon.agents.lock().unwrap().clear();
+        fixture.daemon.down.store(false, Ordering::SeqCst);
+        fixture.stop.store(false, Ordering::SeqCst);
+        let backend = fixture
+            .rt
+            .block_on(DaemonBackend::launch(
+                connector(&fixture.daemon, &root),
+                "test",
+                root.clone(),
+                Arc::clone(&fixture.stop),
+            ))
+            .unwrap();
+        app = App::new_with_filters(backend, TestClock::new(0), &filters);
+        for (view, keyword) in keywords {
+            assert_eq!(app.state.keyword(view), keyword, "keyword after reconnect");
+            assert_eq!(
+                app.state.keyword_counts(view),
+                (0, usize::from(view == ViewId::Tasks))
+            );
+        }
+        assert_eq!(app.state.tasks[0].id, "tsk_fresh");
+        assert_eq!(
+            (
+                app.state.task_selected,
+                app.state.goal_selected,
+                app.state.agent_selected
+            ),
+            (0, 0, 0)
+        );
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+    assert!(app.state.should_exit);
+    let reads = fixture
+        .daemon
+        .log()
+        .iter()
+        .filter(|op| op.as_str() == "task.list")
+        .count();
+    assert_eq!(
+        reads, 3,
+        "each successful connection bootstraps fresh entities"
     );
 }
 

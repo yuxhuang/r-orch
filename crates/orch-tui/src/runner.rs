@@ -25,6 +25,7 @@ use crate::app::App;
 use crate::backend::TuiBackend;
 use crate::clock::SystemClock;
 use crate::messages::ANIM_TICK_MS;
+use crate::state::KeywordFilters;
 use crate::tty::{Ready, TtyInput};
 use crate::views;
 
@@ -147,20 +148,52 @@ pub fn run<B: TuiBackend>(backend: B) -> io::Result<Exit> {
 /// event: a closed pty master sets no flag of ours, and a SIGHUP that does is
 /// useless if the loop never reaches this check again. See `src/tty.rs`.
 pub fn run_until<B: TuiBackend>(backend: B, stop: &AtomicBool) -> io::Result<Exit> {
+    run_until_with_filters(backend, stop, &mut KeywordFilters::default())
+}
+
+/// [`run_until`] with list keywords carried across explicit retries within one
+/// dashboard lifetime. Each call bootstraps a fresh app from `backend`; only
+/// keywords are restored, and selection is clamped to its filtered live rows.
+/// The caller discards `filters` on quit and starts a new dashboard with default.
+pub fn run_until_with_filters<B: TuiBackend>(
+    backend: B,
+    stop: &AtomicBool,
+    filters: &mut KeywordFilters,
+) -> io::Result<Exit> {
     let mut guard = TerminalGuard::enter()?;
     let mut input = TtyInput::open();
-    let mut app = App::new(backend, SystemClock);
-    // The env var is the startup switch; `F2` and `/mouse` move the same flag
-    // from here on, and the guard follows it.
-    app.state.mouse.enabled = guard.mouse;
+    with_keyword_filters(backend, filters, |app| {
+        // The env var is the startup switch; `F2` and `/mouse` move the same flag
+        // from here on, and the guard follows it.
+        app.state.mouse.enabled = guard.mouse;
+        run_loop(&mut guard, &mut input, app, stop)
+    })
+}
 
+fn with_keyword_filters<B: TuiBackend, T>(
+    backend: B,
+    filters: &mut KeywordFilters,
+    draw: impl FnOnce(&mut App<B>) -> T,
+) -> T {
+    let mut app = App::new_with_filters(backend, SystemClock, filters);
+    let outcome = draw(&mut app);
+    *filters = app.state.keyword_filters();
+    outcome
+}
+
+fn run_loop<B: TuiBackend>(
+    guard: &mut TerminalGuard,
+    input: &mut TtyInput,
+    app: &mut App<B>,
+    stop: &AtomicBool,
+) -> io::Result<Exit> {
     loop {
         // A terminal that goes away mid-frame fails the ioctl or the write
         // instead of the wait, so both of those ask whether it is still there
         // before reporting an error nobody is left to read.
         let size = match guard.terminal().size() {
             Ok(size) => size,
-            Err(err) => return hung_up_or(&mut input, err),
+            Err(err) => return hung_up_or(input, err),
         };
         app.state.width = size.width;
         app.state.height = size.height;
@@ -171,9 +204,9 @@ pub fn run_until<B: TuiBackend>(backend: B, stop: &AtomicBool) -> io::Result<Exi
         let mut hits = None;
         if let Err(err) = guard
             .terminal()
-            .draw(|frame| hits = Some(views::draw(frame, &app)))
+            .draw(|frame| hits = Some(views::draw(frame, app)))
         {
-            return hung_up_or(&mut input, err);
+            return hung_up_or(input, err);
         }
         if let Some(hits) = hits {
             app.set_hits(hits);
@@ -440,6 +473,155 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::backend::{FakeBackend, Read, make_agent, make_goal, make_task};
+    use crate::state::{InputMode, ViewId};
+    use orch_domain::{AgentStatus, GoalStatus, TaskStatus};
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn keyword(app: &mut App<FakeBackend>, view: ViewId, text: &str) {
+        app.state.view = view;
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        app.handle_paste(text);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    fn filtered_backend(count: usize) -> FakeBackend {
+        let mut backend = FakeBackend::new()
+            .with_tasks(
+                (0..count)
+                    .map(|i| make_task(&format!("t_{i}"), "Élan 🚀", TaskStatus::Todo))
+                    .collect(),
+            )
+            .with_goals(
+                (0..count)
+                    .map(|i| make_goal(&format!("g_{i}"), "東京", GoalStatus::Active))
+                    .collect(),
+            )
+            .with_agents(
+                (0..count)
+                    .map(|i| make_agent(&format!("a_{i}"), "مرحبا", AgentStatus::Idle))
+                    .collect(),
+            );
+        backend.can_create_task = false;
+        backend
+    }
+
+    #[test]
+    fn retry_handoff_retains_keywords_and_clamps_to_fresh_filtered_rows() {
+        let mut filters = KeywordFilters::default();
+        with_keyword_filters(filtered_backend(3), &mut filters, |app| {
+            keyword(app, ViewId::Tasks, "Élan 🚀");
+            keyword(app, ViewId::Goals, "東京");
+            keyword(app, ViewId::Agents, "مرحبا");
+            app.state.task_selected = 2;
+            app.state.goal_selected = 2;
+            app.state.agent_selected = 2;
+            app.state.command_bar.input.reset("/task pending draft");
+            app.request_exit(crate::keys::ExitCause::Signal);
+        });
+        for count in [1, 0, 2] {
+            let mut backend = filtered_backend(count);
+            // Live data no longer includes the former matching rows. Unrelated
+            // rows stay in the total but must not enter the filtered selection.
+            backend
+                .tasks
+                .push(make_task("other", "Other", TaskStatus::Todo));
+            backend
+                .goals
+                .push(make_goal("other", "Other", GoalStatus::Active));
+            backend
+                .agents
+                .push(make_agent("other", "Other", AgentStatus::Idle));
+            with_keyword_filters(backend, &mut filters, |app| {
+                for (view, text) in [
+                    (ViewId::Tasks, "Élan 🚀"),
+                    (ViewId::Goals, "東京"),
+                    (ViewId::Agents, "مرحبا"),
+                ] {
+                    assert_eq!(
+                        app.state.keyword(view),
+                        text,
+                        "retained keyword after retry"
+                    );
+                    assert_eq!(app.state.keyword_counts(view), (count, count + 1));
+                }
+                assert_eq!(app.state.task_selected, 0);
+                assert_eq!(app.state.goal_selected, 0);
+                assert_eq!(app.state.agent_selected, 0);
+                assert!(!app.state.should_exit);
+                assert_eq!(app.state.input_mode, InputMode::None);
+                assert!(app.state.command_bar.input.value().is_empty());
+                assert!(app.armed_broadcast.is_none());
+                for read in [Read::Tasks, Read::Goals, Read::Agents] {
+                    assert!(app.backend.reads.contains(&read), "fresh {read:?} read");
+                }
+                for (width, height) in [(80, 24), (40, 14)] {
+                    app.resize(width, height);
+                    app.state.view = ViewId::Tasks;
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            views::draw(frame, app);
+                        })
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    let rendered: String = buffer.content.iter().map(|c| c.symbol()).collect();
+                    assert!(rendered.contains("filter:"), "{rendered}");
+                    assert!(
+                        rendered.contains(&format!("{count}/{}", count + 1)),
+                        "{rendered}"
+                    );
+                    assert_eq!(app.state.task_selected, 0);
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn retry_handoff_keeps_empty_and_no_match_keywords() {
+        for texts in [["", "", ""], ["missing 🚀", "不存在", "لا تطابق"]] {
+            let views = [ViewId::Tasks, ViewId::Goals, ViewId::Agents];
+            let mut filters = KeywordFilters::default();
+            with_keyword_filters(filtered_backend(1), &mut filters, |app| {
+                for (view, text) in views.into_iter().zip(texts) {
+                    keyword(app, view, text);
+                }
+            });
+            for _ in 0..3 {
+                with_keyword_filters(filtered_backend(1), &mut filters, |app| {
+                    for (view, text) in views.into_iter().zip(texts) {
+                        assert_eq!(app.state.keyword(view), text);
+                        assert_eq!(
+                            app.state.keyword_counts(view),
+                            (usize::from(text.is_empty()), 1)
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn quit_and_a_new_dashboard_reset_keywords() {
+        let mut filters = KeywordFilters::default();
+        with_keyword_filters(filtered_backend(1), &mut filters, |app| {
+            keyword(app, ViewId::Tasks, "Élan 🚀");
+            keyword(app, ViewId::Goals, "東京");
+            keyword(app, ViewId::Agents, "مرحبا");
+            app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+            assert!(app.state.should_exit);
+        });
+        assert_ne!(filters, KeywordFilters::default());
+        // The legacy runner/new dashboard owns a new default value.
+        with_keyword_filters(filtered_backend(1), &mut KeywordFilters::default(), |app| {
+            for view in [ViewId::Tasks, ViewId::Goals, ViewId::Agents] {
+                assert_eq!(app.state.keyword(view), "");
+                assert_eq!(app.state.keyword_counts(view), (1, 1));
+            }
+        });
+    }
 
     /// The mode set is the whole of §3.5's capture policy, and it is the one
     /// part of this module that can be tested without a terminal — which also
