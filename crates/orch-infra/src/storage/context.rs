@@ -124,6 +124,7 @@ impl ContextStore for FileContextStore {
         let path = self.paths.context_path(key)?;
         let now = self.clock.now_iso();
         let existing = read_json::<ContextEntry>(&path).await?;
+        let stored_key = existing.as_ref().map(|entry| entry.key.clone());
 
         let entry = ContextEntry {
             key: key.to_owned(),
@@ -139,17 +140,73 @@ impl ContextStore for FileContextStore {
         };
 
         write_json(&path, &entry).await?;
+        // A different spelling can replace the same file. A separate real
+        // record with the old key must remain listed, including beside an alias.
+        let retired_key = if let Some(stored_key) = stored_key
+            && stored_key != key
+            && let Ok(stored_path) = self.paths.context_path(&stored_key)
+            && !tokio::fs::metadata(&stored_path)
+                .await
+                .is_ok_and(|metadata| !metadata.is_file())
+            && read_json::<ContextEntry>(&stored_path)
+                .await
+                .is_ok_and(|record| record.is_none_or(|record| record.key != stored_key))
+        {
+            Some(stored_key)
+        } else {
+            None
+        };
         self.index
-            .update_index(move |items| replace_at_end(items, entry, |e| &e.key))
+            .update_index(move |mut items| {
+                items.retain(|e| retired_key.as_ref().is_none_or(|retired| e.key != *retired));
+                replace_at_end(items, entry, |e| &e.key)
+            })
             .await
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
         let _mutation = self.mutation.lock().await;
+        let path = self.paths.context_path(key)?;
+        // Do not open a device or FIFO that can otherwise simply be unlinked.
+        // Best-effort identity read: malformed or unreadable files still delete.
+        let stored_key = if tokio::fs::metadata(&path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+        {
+            read_json::<ContextEntry>(&path)
+                .await
+                .ok()
+                .flatten()
+                .map(|entry| entry.key)
+        } else {
+            None
+        };
         self.delete_file(key).await?;
+        // Keep the stored identity if a separate real record still uses it.
+        let retired_key = if let Some(stored_key) = stored_key
+            && stored_key != key
+            && let Ok(stored_path) = self.paths.context_path(&stored_key)
+            && !tokio::fs::metadata(&stored_path)
+                .await
+                .is_ok_and(|metadata| !metadata.is_file())
+            && read_json::<ContextEntry>(&stored_path)
+                .await
+                .is_ok_and(|record| record.is_none_or(|record| record.key != stored_key))
+        {
+            Some(stored_key)
+        } else {
+            None
+        };
         let key = key.to_owned();
         self.index
-            .update_index(move |items| items.into_iter().filter(|e| e.key != key).collect())
+            .update_index(move |items| {
+                items
+                    .into_iter()
+                    .filter(|e| {
+                        e.key != key && retired_key.as_ref().is_none_or(|retired| e.key != *retired)
+                    })
+                    .collect()
+            })
             .await
     }
 
