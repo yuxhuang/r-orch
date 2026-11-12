@@ -386,8 +386,10 @@ impl Harness {
             skill_loader: None,
         };
 
+        let orchestrator = Arc::new(Orchestrator::new(deps));
+        orchestrator.enable_daemon_mode();
         Harness {
-            orchestrator: Arc::new(Orchestrator::new(deps)),
+            orchestrator,
             tasks: task_store,
             agents: agent_store,
             runs: run_store,
@@ -454,7 +456,7 @@ async fn pause_during_tick(at: GateAt) -> Harness {
 
     let tick = {
         let orchestrator = Arc::clone(&harness.orchestrator);
-        async move { orchestrator.run_all().await }
+        async move { orchestrator.daemon_tick(true).await }
     };
     let pause_while_in_flight = async {
         gate.wait_until_entered().await;
@@ -557,7 +559,7 @@ async fn a_paused_goals_task_is_not_dispatched_by_a_later_tick() {
         .await
         .unwrap();
 
-    harness.orchestrator.run_all().await.unwrap();
+    harness.orchestrator.daemon_tick(true).await.unwrap();
 
     assert_eq!(harness.spawn_count(), 0);
     assert_eq!(
@@ -577,7 +579,7 @@ async fn an_unpaused_goals_task_is_dispatched_so_the_gate_harness_can_fail() {
     );
     let tick = {
         let orchestrator = Arc::clone(&harness.orchestrator);
-        async move { orchestrator.run_all().await }
+        async move { orchestrator.daemon_tick(true).await }
     };
     let release = async {
         gate.wait_until_entered().await;
@@ -599,7 +601,7 @@ async fn an_unpaused_goals_task_is_dispatched_so_the_gate_harness_can_fail() {
 /// A plain task dispatched and running under the scripted Pi child.
 async fn running_task() -> Harness {
     let harness = Harness::new(vec![task("tsk_live")], None);
-    harness.orchestrator.run_all().await.unwrap();
+    harness.orchestrator.daemon_tick(true).await.unwrap();
     assert_eq!(harness.spawn_count(), 1, "precondition: the agent is live");
     assert_eq!(
         harness.tasks.peek("tsk_live").unwrap().status,
@@ -676,7 +678,7 @@ async fn cancelling_a_task_that_is_not_running_kills_nothing() {
 #[tokio::test(flavor = "current_thread")]
 async fn cancelling_one_running_task_does_not_kill_another_tasks_process() {
     let harness = Harness::new(vec![task("tsk_one")], None);
-    harness.orchestrator.run_all().await.unwrap();
+    harness.orchestrator.daemon_tick(true).await.unwrap();
     // A second, unrelated task that never started.
     harness.tasks.seed(task("tsk_two"));
 

@@ -1,7 +1,7 @@
 //! Shared support for the engine's integration tests.
 //!
-//! These tests drive the **public** orchestrator API (`run_all`,
-//! `start_watch`, `stop`) against real adapters and, where it matters, real
+//! These tests drive the **public** daemon orchestrator API against real
+//! adapters and, where it matters, real
 //! file stores. The only thing faked is the child process, because the point
 //! is to exercise the adapter's own parser and the orchestrator's collection
 //! path, not to require a live AI CLI.
@@ -272,7 +272,7 @@ pub struct Rig {
 
 impl Rig {
     /// `config.scheduling.poll_interval_ms` is left long: every integration
-    /// test drives dispatch explicitly through `run_all`.
+    /// test drives dispatch explicitly through `daemon_tick`.
     pub fn new(
         tasks: Vec<Task>,
         agents: Vec<Agent>,
@@ -354,8 +354,10 @@ impl Rig {
             skill_loader: None,
         };
 
+        let orchestrator = Orchestrator::new(deps);
+        orchestrator.enable_daemon_mode();
         Rig {
-            orchestrator: Orchestrator::new(deps),
+            orchestrator,
             tasks: task_store,
             agents: agent_store,
             runs: run_store,

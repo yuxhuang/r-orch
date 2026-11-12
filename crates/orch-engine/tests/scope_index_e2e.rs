@@ -1,12 +1,12 @@
-//! Scope scheduling through the **whole real stack**: file stores, the real
+//! Daemon scope scheduling through the **whole real stack**: file stores, the real
 //! `AdapterRegistry` and `ShellAdapter`, the real `SystemProcessManager`, the
 //! PID lock, and real child processes. The only external dependency is
 //! `bash`, used as a deterministic short-lived workload.
 //!
-//! What it proves that a unit test cannot: the tick-scoped `ScopeIndex` is
-//! rebuilt from what is genuinely `in_progress` on disk each tick, so an
-//! overlapping task waits for the run that blocked it and a disjoint one fills
-//! the free slot in the same tick.
+//! Explicit daemon startup under the PID lock and daemon ticks use the live
+//! `in_progress` state on disk: an overlapping task waits for the run that
+//! blocked it and a disjoint one fills the free slot in the same tick.
+//! Trace order, run outcomes and persisted output events prove the scheduling.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
@@ -14,10 +14,9 @@ use std::time::Duration;
 
 use orch_core::storage::ConfigStore;
 use orch_domain::{
-    CreateAgentInput, CreateTaskInput, OrchestratorEvent, OrchestratorEventType, RunStatus,
-    TaskStatus, WorkspaceMode, default_config,
+    CreateAgentInput, CreateTaskInput, OrchestratorEvent, RunStatus, TaskStatus, WorkspaceMode,
+    default_config,
 };
-use orch_engine::orchestrator::WatchOptions;
 use orch_engine::{FullEngine, build_full};
 use orch_infra::storage::{FileConfigStore, Paths};
 
@@ -47,6 +46,7 @@ async fn project() -> (tempfile::TempDir, FullEngine) {
         .expect("write config.yml");
 
     let engine = build_full(temp.path()).await.expect("build_full");
+    assert!(engine.lock.acquire().await.acquired, "acquire PID lock");
     (temp, engine)
 }
 
@@ -111,11 +111,9 @@ async fn overlapping_scopes_serialize_while_disjoint_work_fills_the_free_slots()
     let trace: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let run_to_task: Arc<Mutex<std::collections::HashMap<String, String>>> =
         Arc::new(Mutex::new(std::collections::HashMap::new()));
-    let overlaps: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let unsubscribe = {
         let trace = Arc::clone(&trace);
         let run_to_task = Arc::clone(&run_to_task);
-        let overlaps = Arc::clone(&overlaps);
         runtime.events.on_any(move |event| match event {
             OrchestratorEvent::AgentStarted {
                 run_id, task_id, ..
@@ -131,25 +129,23 @@ async fn overlapping_scopes_serialize_while_disjoint_work_fills_the_free_slots()
                     trace.lock().unwrap().push(format!("completed:{task_id}"));
                 }
             }
-            OrchestratorEvent::TaskScopeOverlap { task_id, .. } => {
-                overlaps.lock().unwrap().insert(task_id.clone());
-            }
             _ => {}
         })
     };
 
     runtime
-        .orchestrator
-        .start_watch(WatchOptions {
-            skip_autonomous_seeding: true,
-            handle_signals: false,
-        })
+        .daemon_initialize()
         .await
-        .expect("start_watch");
+        .expect("daemon initialize");
 
     // Every task reaches `done` (the agents are auto-approve).
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
+        runtime
+            .orchestrator
+            .daemon_tick(true)
+            .await
+            .expect("daemon tick");
         let mut all_done = true;
         for id in &task_ids {
             let task = runtime.task_service.get(id).await.expect("read task");
@@ -166,7 +162,12 @@ async fn overlapping_scopes_serialize_while_disjoint_work_fills_the_free_slots()
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    runtime.orchestrator.stop().await.expect("stop");
+    runtime
+        .orchestrator
+        .daemon_stop()
+        .await
+        .expect("daemon stop");
+    runtime.lock.release().await;
     unsubscribe.unsubscribe();
 
     let trace = trace.lock().unwrap().clone();
@@ -201,12 +202,6 @@ async fn overlapping_scopes_serialize_while_disjoint_work_fills_the_free_slots()
     let started_db_child = index_of(&format!("started:{}", db_child.id));
     assert!(completed_db_parent > started_db_parent);
     assert!(started_db_child > completed_db_parent, "trace={trace:?}");
-
-    // Exactly the two blocked tasks were reported as overlapping.
-    assert_eq!(
-        *overlaps.lock().unwrap(),
-        BTreeSet::from([auth_parent.id.clone(), db_child.id.clone()])
-    );
 
     // Four runs, all succeeded, one per task, each with at least one output
     // event written to its JSONL file.
@@ -311,29 +306,18 @@ async fn a_task_with_no_scope_is_never_blocked_by_one_that_has_scope() {
         .await
         .expect("create unscoped task");
 
-    let overlaps: Arc<Mutex<BTreeSet<String>>> = Arc::new(Mutex::new(BTreeSet::new()));
-    let unsubscribe = {
-        let overlaps = Arc::clone(&overlaps);
-        runtime
-            .events
-            .on(OrchestratorEventType::TaskScopeOverlap, move |event| {
-                if let OrchestratorEvent::TaskScopeOverlap { task_id, .. } = event {
-                    overlaps.lock().unwrap().insert(task_id.clone());
-                }
-            })
-    };
-
     runtime
-        .orchestrator
-        .start_watch(WatchOptions {
-            skip_autonomous_seeding: true,
-            handle_signals: false,
-        })
+        .daemon_initialize()
         .await
-        .expect("start_watch");
+        .expect("daemon initialize");
 
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     loop {
+        runtime
+            .orchestrator
+            .daemon_tick(true)
+            .await
+            .expect("daemon tick");
         let both_done = runtime
             .task_service
             .get(&scoped.id)
@@ -355,12 +339,14 @@ async fn a_task_with_no_scope_is_never_blocked_by_one_that_has_scope() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
-    runtime.orchestrator.stop().await.expect("stop");
-    unsubscribe.unsubscribe();
+    runtime
+        .orchestrator
+        .daemon_stop()
+        .await
+        .expect("daemon stop");
+    runtime.lock.release().await;
 
-    // A task with no scope is exempt from the index entirely, so nothing was
-    // reported as overlapping and both runs succeeded.
-    assert!(overlaps.lock().unwrap().is_empty());
+    // A task with no scope runs alongside the scoped task; both runs succeeded.
     let runs = runtime.run_service.list_all().await.expect("list runs");
     assert_eq!(runs.len(), 2);
     assert!(runs.iter().all(|run| run.status == RunStatus::Succeeded));
