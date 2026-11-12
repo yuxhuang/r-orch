@@ -27,6 +27,11 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
         "explicit starter re-executes before serving; lifecycle never calls it",
     ),
     (
+        "orch-daemon/src/discovery.rs",
+        1,
+        "cfg(test) reaped stale-socket fixture; listener never enters the test runner",
+    ),
+    (
         "orch-engine/src/review_runner.rs",
         1,
         "fallback runner; daemon injects SnapshotCommandRunner in lifecycle::Running::build",
