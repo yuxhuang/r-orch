@@ -5,6 +5,93 @@
 //! `orch-core` port traits, which is what lets the whole layer be unit-tested
 //! against in-memory fakes.
 
+//! The legacy unit-test scheduler is excluded from normal library builds.
+//! Shipped owners use the daemon API instead.
+//!
+//! ```compile_fail,E0599
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::run_task;
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::run_all;
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::start_watch;
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::start_watch_with::<fn() -> std::future::Ready<orch_core::error::Result<()>>, std::future::Ready<orch_core::error::Result<()>>>;
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::stop;
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::wait_for_stop;
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::handle_signal;
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::interrupt;
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::is_interrupted;
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::stop_interrupted_runs;
+//! ```
+//!
+//! ```compile_fail,E0432
+//! use orch_engine::WatchOptions;
+//! ```
+//!
+//! ```compile_fail,E0432
+//! use orch_engine::orchestrator::WatchOptions;
+//! ```
+//!
+//! Method-item and import controls use the same library and example forms:
+//!
+//! ```
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::daemon_tick;
+//! ```
+//!
+//! ```
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::daemon_launch_task;
+//! ```
+//!
+//! ```
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::daemon_stop;
+//! ```
+//!
+//! ```
+//! use orch_engine::Orchestrator;
+//! let _ = Orchestrator::wait_for_collectors;
+//! ```
+//!
+//! ```
+//! use orch_engine::OrchestratorDeps;
+//! ```
+
 // Stricter than the workspace lints, for library code only (integration tests are separate crates and
 // `clippy.toml` allows unwrap and print inside `#[cfg(test)]`). See AGENTS.md, "Rust coding standards".
 #![deny(
@@ -41,7 +128,9 @@ pub use events::{EventBus, EventHandler, EventSubscription, Unsubscribe};
 pub use goal_service::{GoalService, UpdateGoalFields};
 pub use lock::{FileLock, InMemoryLock, LockResult, ProjectLock};
 pub use message_service::MessageService;
-pub use orchestrator::{Orchestrator, OrchestratorDeps, WatchOptions};
+#[cfg(test)]
+pub use orchestrator::WatchOptions;
+pub use orchestrator::{Orchestrator, OrchestratorDeps};
 pub use review_runner::{
     CommandOutcome, CommandRunner, ProcessCommandRunner, ReviewRunner, ReviewRunnerOptions,
     all_passed, format_report,

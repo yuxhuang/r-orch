@@ -1,16 +1,23 @@
-//! Dispatch: candidate selection, scope gating, and the claim → assign →
-//! execute sequence.
+//! Shared prompt, execution and retry accounting, with the legacy unit-test
+//! scheduler's candidate selection and claim → assign → execute sequence.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::{HashMap, HashSet};
 
 use orch_core::adapter::ExecuteParams;
 use orch_core::error::{Error, Result};
-use orch_core::storage::{AgentStore, GoalStore, TaskStore};
+#[cfg(test)]
+use orch_core::storage::AgentStore;
+use orch_core::storage::{GoalStore, TaskStore};
 use orch_core::template::{GoalContext, GoalTaskRow, RetryContext};
 use orch_domain::{
-    AgentConfig, AgentStatus, DomainError, OrchestratorEvent, OrchestratorState, PromptMode,
-    RetryEntry, RunningEntry, ScopeIndex, Task, TaskProof, TaskStatus, calculate_retry_delay,
-    is_blocked, is_dispatchable, is_terminal, resolve_failure_status, scopes_overlap,
+    AgentConfig, AgentStatus, OrchestratorEvent, OrchestratorState, PromptMode, RetryEntry,
+    RunningEntry, Task, TaskStatus, calculate_retry_delay, is_terminal, resolve_failure_status,
+};
+#[cfg(test)]
+use orch_domain::{
+    DomainError, ScopeIndex, TaskProof, is_blocked, is_dispatchable, scopes_overlap,
 };
 use orch_infra::template::{
     BuildPromptOptions, RenderedPrompt, build_eco_prompt_context, build_prompt_context,
@@ -22,6 +29,7 @@ use super::{MAX_RETRY_QUEUE_SIZE, Orchestrator};
 
 #[derive(Clone, Copy)]
 pub(super) enum MailboxMode {
+    #[cfg(test)]
     Drain,
     Snapshot,
 }
@@ -52,6 +60,7 @@ impl Orchestrator {
 
     /// Invalidate → load → dispatch → save, under the state lock. Shared by
     /// `run_task`, `run_all` and the reactive dispatch.
+    #[cfg(test)]
     pub(super) async fn fresh_dispatch_all(&self) -> Result<()> {
         let mut slot = self.inner.state.lock().await;
         self.invalidate_caches().await;
@@ -63,6 +72,7 @@ impl Orchestrator {
         self.save_state(state).await
     }
 
+    #[cfg(test)]
     pub(super) async fn fresh_dispatch_only(&self, task_id: &str) -> Result<()> {
         let mut slot = self.inner.state.lock().await;
         self.invalidate_caches().await;
@@ -82,6 +92,7 @@ impl Orchestrator {
     /// remote agents. Once the local slots are full, the pass keeps going only
     /// while an online remote agent is idle, and offers candidates to remote
     /// agents alone.
+    #[cfg(test)]
     pub(super) async fn dispatch_all(&self, state: &mut OrchestratorState) -> Result<()> {
         let max_local = self.config().scheduling.max_concurrent_agents;
         // Loaded at most once per pass, and only when the local slots are full.
@@ -185,6 +196,7 @@ impl Orchestrator {
     /// Whether an online remote agent has no running entry. The directory is
     /// read once per pass into `cache`; a read error is reported and treated
     /// as "none", which is the old full-slots behaviour: stop dispatching.
+    #[cfg(test)]
     async fn has_idle_remote_agent(
         &self,
         state: &OrchestratorState,
@@ -396,6 +408,7 @@ impl Orchestrator {
     /// dispatch path cannot opportunistically start it, then the original
     /// claimed set is restored. Without this a one-shot command would behave
     /// like `run --all` whenever more work happened to be ready.
+    #[cfg(test)]
     async fn dispatch_only_task(&self, state: &mut OrchestratorState, task_id: &str) -> Result<()> {
         let original_claimed = state.claimed.clone();
         let all_tasks = self.inner.cached_tasks.list(&Default::default()).await?;
@@ -426,6 +439,7 @@ impl Orchestrator {
     ///
     /// The claim is **persisted before the spawn** so a crash between the two
     /// leaves a recoverable claim rather than an invisible run.
+    #[cfg(test)]
     pub(super) async fn dispatch_task(
         &self,
         state: &mut OrchestratorState,
@@ -436,6 +450,7 @@ impl Orchestrator {
 
     /// [`Self::dispatch_task`], optionally limited to remote agents: the
     /// scheduler's pass uses that once the local slots are full.
+    #[cfg(test)]
     async fn dispatch_task_to(
         &self,
         state: &mut OrchestratorState,
@@ -516,6 +531,7 @@ impl Orchestrator {
         }
     }
 
+    #[cfg(test)]
     async fn dispatch_claimed(
         &self,
         state: &mut OrchestratorState,
@@ -944,6 +960,7 @@ impl Orchestrator {
                     return Ok(Vec::new());
                 }
                 match (self.deps().message_service.as_ref(), mailbox) {
+                    #[cfg(test)]
                     (Some(messages), MailboxMode::Drain) => Ok(messages
                         .drain_mailbox(&agent.id, &task_id)
                         .await
@@ -1382,6 +1399,7 @@ pub(super) fn retry_pending(state: &OrchestratorState, task_id: &str, now_ms: i6
     })
 }
 
+#[cfg(test)]
 fn local_running(state: &OrchestratorState) -> usize {
     state
         .running

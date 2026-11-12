@@ -1,19 +1,25 @@
-//! The tick loop: reconcile, autonomous seeding, and the reactive dispatch
-//! debounce.
+//! Shared reconciliation and autonomous seeding, with the legacy unit-test
+//! tick loop and reactive dispatch debounce.
 //!
 //! Phase order is contract and the whole tick runs under the
 //! state lock.
 
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 
 use orch_core::error::Result;
 use orch_core::storage::{AgentStore, GoalStore, TaskStore};
 use orch_domain::{
     AgentStatus, OrchestratorEvent, OrchestratorState, RunStatus, RunningEntry, TaskStatus,
-    is_dispatchable, is_terminal,
+    is_terminal,
 };
 
-use super::{AUTO_SEED_COOLDOWN_MS, DEBOUNCE, MAX_IMMEDIATE_DISPATCH_RETRIES, Orchestrator};
+#[cfg(test)]
+use orch_domain::is_dispatchable;
+
+use super::{AUTO_SEED_COOLDOWN_MS, Orchestrator};
+#[cfg(test)]
+use super::{DEBOUNCE, MAX_IMMEDIATE_DISPATCH_RETRIES};
 
 /// `new Date(value).getTime()`. Now lives beside the formatter it inverts,
 /// in `orch-core`, so both share one node-verified test vector.
@@ -24,6 +30,7 @@ impl Orchestrator {
     /// tick-scoped caches, load state, reconcile, seed autonomous work,
     /// dispatch, emit `orchestrator:tick`. Then, **outside** the lock, touch
     /// the lock file so a slow tick is not mistaken for a dead holder.
+    #[cfg(test)]
     pub(super) async fn tick_once(&self) -> Result<()> {
         if self.is_shutting_down() {
             return Ok(());
@@ -39,6 +46,7 @@ impl Orchestrator {
         result
     }
 
+    #[cfg(test)]
     async fn tick_body(&self) -> Result<()> {
         let mut slot = self.inner.state.lock().await;
         if self.is_shutting_down() {
@@ -270,6 +278,7 @@ impl Orchestrator {
 
         self.reconcile_stale_agents(state).await?;
         self.reconcile_orphaned_tasks(state).await?;
+        #[cfg(test)]
         if !self.is_daemon_mode() {
             self.process_retry_queue(state).await?;
         }
@@ -489,6 +498,7 @@ impl Orchestrator {
 
     /// Dispatch everything whose `due_at` has passed, re-reading each task
     /// first: it may have succeeded through another path while it waited.
+    #[cfg(test)]
     async fn process_retry_queue(&self, state: &mut OrchestratorState) -> Result<()> {
         let now = self.deps().clock.now_ms();
         let mut due = Vec::new();
@@ -645,6 +655,7 @@ impl Orchestrator {
     /// The debounce is observable — tests wait past it — so
     /// it stays even though the `select!` arms already reduce the contention
     /// the retry loop was written for.
+    #[cfg(test)]
     pub(super) fn schedule_immediate_dispatch(&self, retries: u32) {
         if self.is_daemon_mode() || self.is_shutting_down() {
             return;
@@ -680,6 +691,7 @@ impl Orchestrator {
     /// A mini-tick: invalidate, load, dispatch, save. **No reconcile.**
     /// Skipped entirely while a `run <id>` single-task run is in flight, so a
     /// one-shot command cannot opportunistically start other work.
+    #[cfg(test)]
     async fn immediate_dispatch(&self) -> Result<()> {
         if self.is_shutting_down() {
             return Ok(());
