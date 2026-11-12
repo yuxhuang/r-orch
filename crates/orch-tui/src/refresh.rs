@@ -14,10 +14,10 @@
 
 use crate::backend::ObservedStore;
 
-/// Minimum interval between timing re-reads driven by run changes. Event
+/// Minimum interval between timing re-reads driven by Runs/State changes. Event
 /// appends can arrive continuously, but each timing read decodes the whole
 /// run history. Five seconds bounds that work while keeping live timings
-/// current; task, goal and state changes still use the ordinary debounce.
+/// current; task and goal changes still use the ordinary debounce.
 pub(crate) const TIMINGS_REFRESH_INTERVAL_SECS: i64 = 5;
 
 /// One cached read the dashboard can repeat.

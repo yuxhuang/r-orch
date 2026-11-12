@@ -6,7 +6,7 @@
 //! State is read when the daemon says it changed, never on a timer: the
 //! backend's pushed [`Observation`]s mark the views they touch dirty
 //! ([`crate::refresh`]), a 150 ms debounce collapses a burst into one read
-//! per view. Run-only timing re-reads have a minimum interval with a trailing
+//! per view. Runs/State timing re-reads have a minimum interval with a trailing
 //! read; a resync reads every view before the next frame is drawn.
 //! A frame otherwise drains memory only. Key dispatch lives in
 //! [`crate::keys`] and command execution in [`crate::commands`], both as
@@ -73,8 +73,11 @@ pub struct App<B: TuiBackend, C: Clock = SystemClock> {
     freshness: Freshness,
     /// A resync arrived: every view is read before the next frame.
     resync_pending: bool,
-    /// A Runs invalidation waiting for its bounded, trailing timing read.
+    /// A Runs/State invalidation waiting for its bounded, trailing timing read.
     run_timings_refresh_at: Option<i64>,
+    /// Tasks/Goals made timings dirty: later output invalidations must not
+    /// defer the read already owed at the ordinary debounce.
+    timings_debounce_pending: bool,
     /// Last timing re-read attempt. Bootstrap is not a re-read; the first
     /// pushed change retains the ordinary debounce.
     last_timing_refresh_at: Option<i64>,
@@ -178,6 +181,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             freshness,
             resync_pending: false,
             run_timings_refresh_at: None,
+            timings_debounce_pending: false,
             last_timing_refresh_at: None,
             read_errors: Vec::new(),
         };
@@ -355,19 +359,28 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
                 store, commit_seq, ..
             } => {
                 if self.freshness.changed(store, commit_seq) {
-                    if store == ObservedStore::Runs {
+                    if matches!(store, ObservedStore::Tasks | ObservedStore::Goals)
+                        && self.freshness.dirty().contains(View::Timings)
+                    {
+                        self.timings_debounce_pending = true;
+                        self.run_timings_refresh_at = None;
+                    } else if matches!(store, ObservedStore::Runs | ObservedStore::State)
+                        && self.freshness.dirty().contains(View::Timings)
+                        && !self.timings_debounce_pending
+                        && self.run_timings_refresh_at.is_none()
+                    {
+                        // Keep the first deadline: repeated State writes
+                        // during output must neither bypass nor postpone it.
                         let debounced = self.now().saturating_add(REFRESH_DEBOUNCE_MS);
                         let deadline = self.last_timing_refresh_at.map_or(debounced, |last| {
                             debounced
                                 .max(last.saturating_add(TIMINGS_REFRESH_INTERVAL_SECS * 1_000))
                         });
                         self.run_timings_refresh_at = Some(deadline);
-                    } else {
-                        // A semantic change must still update timings with
-                        // its tasks/goals/state, even during a Runs burst.
-                        if crate::refresh::views_of(store).contains(View::Timings) {
-                            self.run_timings_refresh_at = None;
-                        }
+                    }
+                    if store != ObservedStore::Runs {
+                        // State and Dispatch still refresh at the debounce;
+                        // only their timing invalidation is rate limited.
                         self.schedule_refresh();
                     }
                 }
@@ -685,6 +698,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         // output notifications. A failure still waits for a new change.
         self.last_timing_refresh_at = Some(now);
         self.run_timings_refresh_at = None;
+        self.timings_debounce_pending = false;
         let orch_state = state_read.then_some(&self.state.orch_state);
         match self
             .backend
