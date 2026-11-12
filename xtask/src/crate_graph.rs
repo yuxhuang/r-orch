@@ -853,11 +853,19 @@ fn boundary_source_loading(repo_root: &Path) -> Result<Vec<String>> {
                 .strip_prefix(&src)?
                 .to_string_lossy()
                 .replace('\\', "/");
+            let text = std::fs::read_to_string(&file)?;
+            // Check raw source, including test-only tokens and macro/attribute
+            // arguments. ASCII has one spelling, so aliases cannot disagree
+            // through rustc's Unicode identifier normalization. Comments and
+            // opaque literals cannot declare names and remain unrestricted.
+            let raw = rust_tokens(&text);
+            for token in raw.iter().filter(|t| !t.literal && !t.text.is_ascii()) {
+                problems.push(format!("crates/{name}/src/{relative}:{}: non-ASCII source token outside a comment or literal (SOURCE_SPELLING)", token.line));
+            }
             if *name == "orch-cli" && CLI_TEST_ROOTS.iter().any(|(root, _, _)| *root == relative) {
                 continue;
             }
-            let text = std::fs::read_to_string(&file)?;
-            let tokens = production_tokens(&rust_tokens(&text));
+            let tokens = production_tokens(&raw);
             let mut attribute_end = 0;
             for (i, token) in tokens.iter().enumerate().filter(|(_, t)| !t.literal) {
                 if token.text == "use" {
@@ -1039,7 +1047,12 @@ fn rust_tokens(text: &str) -> Vec<Token<'_>> {
                     i += 1;
                 }
             } else if b[i] == b'"'
-                || (b[i] == b'\'' && (b.get(i + 2) == Some(&b'\'') || b.get(i + 1) == Some(&b'\\')))
+                || (b[i] == b'\''
+                    && (text[i + 1..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| b.get(i + 1 + c.len_utf8()) == Some(&b'\''))
+                        || b.get(i + 1) == Some(&b'\\')))
             {
                 literal = true;
                 let quote = b[i];
@@ -1062,7 +1075,8 @@ fn rust_tokens(text: &str) -> Vec<Token<'_>> {
                 // A raw identifier is the same crate name, not a string.
                 if &text[start..i] == "r"
                     && b.get(i) == Some(&b'#')
-                    && b.get(i + 1).is_some_and(u8::is_ascii_alphabetic)
+                    && b.get(i + 1)
+                        .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
                 {
                     i += 1;
                     let ident = i;
@@ -1108,6 +1122,16 @@ fn group_end(tokens: &[Token<'_>], start: usize) -> usize {
         i = group_end(tokens, i);
     }
     tokens.len()
+}
+
+fn group_is_closed(tokens: &[Token<'_>], start: usize, end: usize) -> bool {
+    let close = match tokens[start].text {
+        "(" => ")",
+        "[" => "]",
+        "{" => "}",
+        _ => return false,
+    };
+    end > start + 1 && tokens.get(end - 1).is_some_and(|t| t.text == close)
 }
 
 /// Conservative cfg proof: with test=false, can this expression still be true?
@@ -1221,6 +1245,23 @@ fn production_tokens<'a>(tokens: &[Token<'a>]) -> Vec<Token<'a>> {
             } else {
                 out.extend_from_slice(&tokens[begin..i]);
             }
+        } else if tokens[i].text == "!"
+            && i > 0
+            && tokens[i - 1].text != "macro_rules"
+            && tokens[i - 1]
+                .text
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            && tokens
+                .get(i + 1)
+                .is_some_and(|t| matches!(t.text, "(" | "[" | "{"))
+        {
+            // A macro decides what an attribute in its input means; do not
+            // treat a cfg-looking token sequence there as a test guard.
+            let end = group_end(tokens, i + 1);
+            out.extend_from_slice(&tokens[i..end]);
+            i = end;
         } else {
             out.push(tokens[i].clone());
             i += 1;
@@ -1717,16 +1758,7 @@ fn bootstrap_alias_target<'a>(
 // These are expression/data macros used with bootstrap values today. Their
 // arguments are still scanned; this is not an exemption for nested impls.
 // Macro name binding and procedural expansion remain source-review limits.
-const BOOTSTRAP_VALUE_MACROS: &[&str] = &[
-    "matches",
-    "assert",
-    "assert_eq",
-    "assert_ne",
-    "format",
-    "write",
-    "writeln",
-    "vec",
-];
+const BOOTSTRAP_VALUE_MACROS: &[&str] = &["matches", "assert", "assert_eq", "vec"];
 
 fn bootstrap_declarations(
     sources: &[(String, String)],
@@ -1740,12 +1772,47 @@ fn bootstrap_declarations(
     for (file, text) in sources {
         let tokens = rust_tokens(text);
         let production = production_tokens(&tokens);
+        let mut depth = Vec::with_capacity(tokens.len());
+        let mut level = 0usize;
+        for t in &tokens {
+            if !t.literal && t.text == "}" {
+                level = level.saturating_sub(1);
+            }
+            depth.push(level);
+            if !t.literal && t.text == "{" {
+                level += 1;
+            }
+        }
         for (i, token) in tokens.iter().enumerate().filter(|(_, t)| !t.literal) {
             if matches!(token.text, "struct" | "enum")
                 && let Some(name) = tokens.get(i + 1)
                 && let Some(sites) = declarations.get_mut(name.text)
             {
                 sites.push(format!("{file}:{}", token.line));
+            }
+            if matches!(token.text, "struct" | "enum")
+                && let Some(name) = tokens.get(i + 1)
+                && BOOTSTRAP_TYPES.contains(&name.text)
+            {
+                let home = match name.text {
+                    "InitOutcome" | "InitOptions" => "bootstrap.rs",
+                    "DaemonError" => "error.rs",
+                    _ => "lifecycle.rs",
+                };
+                if file != home
+                    || depth[i] != 0
+                    || !production
+                        .iter()
+                        .any(|t| t.text.as_ptr() == token.text.as_ptr())
+                {
+                    problems.push(format!("crates/orch-daemon/src/{file}:{}: bootstrap type {} must be declared once at the top level of {home} in production (BOOTSTRAP_TYPES)", token.line, name.text));
+                }
+            }
+            if matches!(token.text, "type" | "as" | "union" | "trait" | "mod")
+                && let Some(name) = tokens.get(i + 1)
+                && BOOTSTRAP_TYPES.contains(&name.text)
+            {
+                problems.push(format!("crates/orch-daemon/src/{file}:{}: bootstrap type name {} cannot be rebound (BOOTSTRAP_TYPES)", token.line, name.text));
             }
             if token.text == "type"
                 && let Some(name) = tokens.get(i + 1)
@@ -1773,8 +1840,11 @@ fn bootstrap_declarations(
                     "orch_domain",
                     "PromptMode",
                     "bool",
+                    "Path",
+                    "std",
                 ],
-                "lifecycle.rs" => &["PathBuf", "Option", "String", "bool", "i32"],
+                "lifecycle.rs" => &["PathBuf", "Option", "String", "bool", "i32", "Result"],
+                "discovery.rs" => &["Option", "Path", "Result", "PathBuf"],
                 "error.rs" => &[
                     "Option",
                     "u32",
@@ -1807,7 +1877,9 @@ fn bootstrap_declarations(
                                 && imports.get(j + 1).is_none_or(|next| next.text != ":"))
                     });
                 let reviewed = match file.as_str() {
-                    "bootstrap.rs" | "lifecycle.rs" => "use std::path::{Path, PathBuf}",
+                    "bootstrap.rs" | "lifecycle.rs" | "discovery.rs" => {
+                        "use std::path::{Path, PathBuf}"
+                    }
                     "error.rs" => "use orch_proto::error::{ErrorBody, exit}",
                     _ => "",
                 };
@@ -1833,7 +1905,11 @@ fn bootstrap_declarations(
                     .is_some_and(|t| matches!(t.text, "(" | "[" | "{"))
             {
                 let end = group_end(&tokens, i + 3);
-                if let Some(target) = tokens[i + 4..end.saturating_sub(1)]
+                if !group_is_closed(&tokens, i + 3, end) {
+                    problems.push(format!("crates/orch-daemon/src/{file}:{}: unclosed macro definition group (BOOTSTRAP_IMPLS)", token.line));
+                    continue;
+                }
+                if let Some(target) = tokens[i + 4..end - 1]
                     .iter()
                     .filter(|t| !t.literal)
                     .find_map(|t| aliases.get(t.text))
@@ -1861,7 +1937,11 @@ fn bootstrap_declarations(
                 && !reviewed_value_call
             {
                 let end = group_end(&tokens, i + 2);
-                if let Some(target) = tokens[i + 3..end.saturating_sub(1)]
+                if !group_is_closed(&tokens, i + 2, end) {
+                    problems.push(format!("crates/orch-daemon/src/{file}:{}: unclosed macro invocation group (BOOTSTRAP_IMPLS)", token.line));
+                    continue;
+                }
+                if let Some(target) = tokens[i + 3..end - 1]
                     .iter()
                     .filter(|t| !t.literal)
                     .find_map(|t| aliases.get(t.text))
@@ -2558,6 +2638,181 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_source_spellings_fail_before_alias_resolution() {
+        let fixture = SourceFixture::new();
+        let src = fixture.0.join("crates/orch-daemon/src");
+        std::fs::create_dir_all(&src).unwrap();
+        for text in [
+            "type Café = InitOutcome; impl Cafe\u{301} { fn local_tasks() {} }",
+            "type Café<const N: usize> = InitOutcome; impl Cafe\u{301}<0> { fn local_tasks() {} }",
+            "use crate::InitOutcome as Café; impl Cafe\u{301} { fn local_tasks() {} }",
+            "type OutcomeΩ = InitOutcome; impl OutcomeΩ {}",
+        ] {
+            std::fs::write(src.join("alias.rs"), format!("// header\n{text}")).unwrap();
+            let problems = boundary_source_loading(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("alias.rs:2") && problems.contains("SOURCE_SPELLING"),
+                "{problems}"
+            );
+        }
+    }
+
+    #[test]
+    fn spelling_scan_distinguishes_literals_comments_and_lifetimes() {
+        let fixture = SourceFixture::new();
+        for name in BOUNDARY_CRATES.iter().chain([&"orch-daemon"]) {
+            let src = fixture.0.join("crates").join(name).join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            let file = src.join("lib.rs");
+            for text in [
+                "// café\n/// café\n//! café\n/* café /* Ω */ é */ fn ascii() {}",
+                r####"const S: &str = "é"; const R: &str = r###"Ω"###; const B: &[u8] = b"\xFF"; const C: char = 'é'; const Q: char = '\u{e9}'; const X: u8 = b'\xFF';"####,
+                "fn f<'a>(x: &'a str) {} type r#_Outcome = r#InitOutcome;",
+                "#[doc = \"é\"] fn f() {} m!(\"Ω\", 'é');",
+            ] {
+                std::fs::write(&file, text).unwrap();
+                assert!(
+                    boundary_source_loading(&fixture.0).unwrap().is_empty(),
+                    "{name}: {text}"
+                );
+            }
+            for text in [
+                "fn f<'é>(x: &'é str) {}",
+                "#[é] fn f() {}",
+                "m!(Ω);",
+                "#[cfg(test)] fn café() {}",
+                "fn f() { let r#café = 0; }",
+                "fn f() {\u{a0}}",
+            ] {
+                std::fs::write(&file, text).unwrap();
+                assert!(
+                    boundary_source_loading(&fixture.0)
+                        .unwrap()
+                        .join("\n")
+                        .contains("SOURCE_SPELLING"),
+                    "{name}: {text}"
+                );
+            }
+            std::fs::remove_file(file).unwrap();
+        }
+    }
+
+    #[test]
+    fn bootstrap_names_cannot_be_rebound_or_moved_out_of_production_root() {
+        let fixture = daemon_fixture();
+        let src = fixture.0.join("crates/orch-daemon/src");
+        for (file, name, declaration, replacement) in [
+            (
+                "bootstrap.rs",
+                "InitOutcome",
+                "pub struct InitOutcome",
+                "mod reviewed { pub struct InitOutcome",
+            ),
+            (
+                "lifecycle.rs",
+                "DispatchMode",
+                "pub enum DispatchMode",
+                "#[cfg(test)] pub enum DispatchMode",
+            ),
+            (
+                "bootstrap.rs",
+                "InitOutcome",
+                "pub struct InitOutcome",
+                "#[cfg(test)] pub struct InitOutcome",
+            ),
+        ] {
+            let path = src.join(file);
+            let original = std::fs::read_to_string(&path).unwrap();
+            let mut modified = original.replacen(declaration, replacement, 1);
+            if replacement.starts_with("mod") {
+                let start = modified.find(replacement).unwrap();
+                let close = modified[start..].find("\n}").unwrap() + start + 2;
+                modified.insert_str(close, " }");
+                modified.push_str("\npub use shadow::Live as InitOutcome;\n");
+            } else {
+                modified.push_str(&format!(
+                    "\n#[cfg(not(test))] pub use shadow::Live as {name};\n"
+                ));
+            }
+            std::fs::write(&path, modified).unwrap();
+            let problems = bootstrap_impls(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("top level") && problems.contains(name),
+                "{problems}"
+            );
+            std::fs::write(path, original).unwrap();
+        }
+        for declaration in [
+            "type InitOutcome = shadow::Live;",
+            "use shadow::Live as InitOutcome;",
+            "union InitOutcome { n: u8 }",
+            "trait InitOutcome {}",
+            "mod InitOutcome {}",
+            "type r#InitOutcome = shadow::Live;",
+        ] {
+            std::fs::write(src.join("rebind.rs"), declaration).unwrap();
+            let problems = bootstrap_impls(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("bootstrap type name InitOutcome cannot be rebound"),
+                "{declaration}: {problems}"
+            );
+        }
+    }
+
+    #[test]
+    fn cfg_inside_macro_arguments_cannot_hide_production_references() {
+        for text in [
+            "strip!(#[cfg(test)] orch_daemon::prepare_start(o));",
+            "strip![#[cfg(test)] orch_daemon::prepare_start(o)];",
+            "strip!{#[cfg(test)] orch_daemon::prepare_start(o)}",
+            "strip!(#[cfg(test)] {} ? orch_daemon::prepare_start(o));",
+        ] {
+            assert!(
+                !cli_file_problems("mcp/tools/task.rs", text).is_empty(),
+                "{text}"
+            );
+        }
+        assert!(
+            cli_file_problems(
+                "lib.rs",
+                "#[cfg(test)] strip! { orch_daemon::prepare_start(o) }"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_macro_groups_report_diagnostics() {
+        let fixture = daemon_fixture();
+        let path = fixture.0.join("crates/orch-daemon/src/broken.rs");
+        for text in ["x!(", "macro_rules! m {"] {
+            std::fs::write(&path, text).unwrap();
+            assert!(
+                bootstrap_impls(&fixture.0)
+                    .unwrap()
+                    .join("\n")
+                    .contains("unclosed macro")
+            );
+        }
+    }
+
+    #[test]
+    fn unfamiliar_impl_position_has_an_independent_negative() {
+        let fixture = daemon_fixture();
+        std::fs::write(
+            fixture.0.join("crates/orch-daemon/src/receiver.rs"),
+            "matches!(impl InitOutcome { fn local_tasks() {} });",
+        )
+        .unwrap();
+        assert!(
+            bootstrap_impls(&fixture.0)
+                .unwrap()
+                .join("\n")
+                .contains("receiver.rs")
+        );
+    }
+
+    #[test]
     fn bootstrap_impls_are_checked_across_the_entire_daemon_source_tree() {
         let fixture = daemon_fixture();
         assert!(bootstrap_contracts(&fixture.0).unwrap().is_empty());
@@ -3020,6 +3275,16 @@ mod tests {
     fn bootstrap_payload_tokens_cannot_be_rebound_in_pinned_files() {
         let fixture = daemon_fixture();
         for (file, declaration) in [
+            ("discovery.rs", "use orch_engine::Container as PathBuf;"),
+            (
+                "lifecycle.rs",
+                "type Result<T, E> = std::result::Result<T, E>;",
+            ),
+            ("bootstrap.rs", "type Path = std::path::Path;"),
+            (
+                "discovery.rs",
+                "type Result<T, E> = std::result::Result<T, E>;",
+            ),
             ("lifecycle.rs", "use orch_engine::Container as PathBuf;"),
             ("lifecycle.rs", "type PathBuf = orch_engine::Container;"),
             ("bootstrap.rs", "use orch_engine::Container as String;"),
