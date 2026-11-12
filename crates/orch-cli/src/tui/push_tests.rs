@@ -864,14 +864,8 @@ fn tui_production_retry_handoff_keeps_keywords_and_modes_and_resets_on_quit() {
             self.discarded = true;
             Ok(())
         }
-        fn draw<B: TuiBackend>(
-            self,
-            app: &mut App<B>,
-            stop: &AtomicBool,
-            discard_pending: bool,
-        ) -> std::io::Result<Exit> {
+        fn draw<B: TuiBackend>(self, app: &mut App<B>, stop: &AtomicBool) -> std::io::Result<Exit> {
             let draw = self.draws.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(discard_pending, draw > 0, "only retries discard input");
             assert_eq!(
                 self.discarded,
                 draw > 0,
@@ -904,6 +898,16 @@ fn tui_production_retry_handoff_keeps_keywords_and_modes_and_resets_on_quit() {
                     "new dashboard resets all view intent"
                 );
                 if self.fresh_only {
+                    app.state.input_mode = InputMode::Keyword;
+                    app.handle_terminal_event(ratatui::crossterm::event::Event::Key(
+                        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+                    ));
+                    assert_eq!(
+                        app.state.task_keyword.value(),
+                        "r",
+                        "first start has no retry gesture"
+                    );
+                    app.state.input_mode = InputMode::None;
                     key(app, 'q');
                     return Ok(Exit::Requested);
                 }
@@ -968,6 +972,28 @@ fn tui_production_retry_handoff_keeps_keywords_and_modes_and_resets_on_quit() {
                     "fresh entities after outage"
                 );
             }
+            // Probe the runner's actual arming through the terminal boundary,
+            // without issuing a backend mutation: r edits a keyword prompt.
+            let previous_view = app.state.view;
+            app.state.view = ViewId::Tasks;
+            let before = app.state.task_keyword.value().to_owned();
+            app.state.input_mode = InputMode::Keyword;
+            app.handle_terminal_event(ratatui::crossterm::event::Event::Key(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+            )));
+            assert_eq!(
+                app.state.task_keyword.value(),
+                if draw == 0 {
+                    format!("{before}r")
+                } else {
+                    before.clone()
+                },
+                "runner arms the retry gesture only after an explicit retry"
+            );
+            app.state.task_keyword.reset(&before);
+            app.state.input_mode = InputMode::None;
+            app.state.view = previous_view;
             if draw == 2 {
                 key(app, 'q');
                 assert!(app.state.should_exit);

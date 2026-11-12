@@ -13,6 +13,7 @@
 //! `impl` blocks on this type.
 
 use orch_domain::{Agent, Goal, GoalStatus, OrchestratorEvent, Task, TaskStatus, TuiPaletteName};
+use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind};
 
 use crate::backend::{
     ClipboardPaste, HistoryEntry, ModelCatalog, Observation, ObservedStore, TuiBackend,
@@ -49,6 +50,10 @@ pub struct BroadcastArm {
     pub generation: u64,
 }
 
+/// A retry press belongs to the reconnect gesture until this much silence.
+/// At exactly the boundary it acts normally; held presses restart the window.
+const RETRY_GESTURE_SILENCE_MS: i64 = 1_000;
+
 pub struct App<B: TuiBackend, C: Clock = SystemClock> {
     pub state: AppState,
     pub backend: B,
@@ -68,6 +73,8 @@ pub struct App<B: TuiBackend, C: Clock = SystemClock> {
     /// which no interactive path uses).
     pub(crate) submitted_generation: u64,
     last_anim_at: i64,
+    /// Transient input ownership, never part of retained view intent.
+    last_retry_press_ms: Option<i64>,
     /// Which cached views a pushed change has made stale, and the commit
     /// ordinal each was last read at.
     freshness: Freshness,
@@ -178,6 +185,7 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             armed_broadcast: None,
             submitted_generation: 0,
             last_anim_at: now,
+            last_retry_press_ms: None,
             freshness,
             resync_pending: false,
             run_timings_refresh_at: None,
@@ -232,6 +240,55 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         app.state.restore_view_intent(intent);
         app.state.clamp_all(app.backend.can_create_task());
         app
+    }
+
+    /// Deliver terminal input, retiring repeated retry presses after reconnect.
+    /// Other input reaches the existing dispatcher immediately. Release/repeat
+    /// event kinds retain its ignore semantics and cannot extend the gesture.
+    pub fn handle_terminal_event(&mut self, event: Event) {
+        if self.continues_retry_gesture(&event) {
+            return;
+        }
+        self.dispatch_ui_event(&crate::keys::UiEvent::Terminal(event));
+    }
+
+    pub(crate) fn begin_retry_gesture(&mut self) {
+        self.last_retry_press_ms = Some(self.now());
+    }
+
+    fn continues_retry_gesture(&mut self, event: &Event) -> bool {
+        let Some(last) = self.last_retry_press_ms else {
+            return false;
+        };
+        let now = self.now();
+        // Wall time can step backwards. Overflow or a negative delta ends the
+        // gesture too, rather than trapping a deliberate run key indefinitely.
+        if !now
+            .checked_sub(last)
+            .is_some_and(|elapsed| (0..RETRY_GESTURE_SILENCE_MS).contains(&elapsed))
+        {
+            self.last_retry_press_ms = None;
+            return false;
+        }
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if matches!(key.code, KeyCode::Char('r' | 'R'))
+                    && !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
+                    self.last_retry_press_ms = Some(now);
+                    return true;
+                }
+                self.last_retry_press_ms = None;
+            }
+            Event::Mouse(mouse) if matches!(mouse.kind, MouseEventKind::Down(_)) => {
+                self.last_retry_press_ms = None;
+            }
+            Event::Paste(_) => self.last_retry_press_ms = None,
+            _ => {}
+        }
+        false
     }
 
     pub fn now(&self) -> i64 {
@@ -2493,5 +2550,257 @@ mod tests {
         app.resolve_wizard_leave(crate::wizard::LeaveChoice::Discard);
         assert!(app.state.pending_attachments.is_empty());
         assert!(app.state.wizard.is_none());
+    }
+}
+
+#[cfg(test)]
+mod retry_gesture_tests {
+    use super::*;
+    use crate::backend::{Call, FakeBackend, make_task};
+    use crate::clock::TestClock;
+    use crate::hit::ZoneKind;
+    use crate::state::{InputMode, ViewId};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
+
+    fn app(retried: bool) -> App<FakeBackend, TestClock> {
+        let backend = FakeBackend::new().with_tasks(vec![
+            make_task("one", "Task one", TaskStatus::Todo),
+            make_task("two", "Task two", TaskStatus::Todo),
+        ]);
+        let mut app = App::new(backend, TestClock::new(10_000));
+        app.batch_ms = 0;
+        if retried {
+            app.begin_retry_gesture();
+        }
+        app
+    }
+
+    fn key(app: &mut App<FakeBackend, TestClock>, ch: char) {
+        app.handle_terminal_event(Event::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::NONE,
+        )));
+    }
+
+    fn assert_no_action(app: &App<FakeBackend, TestClock>, at: i64) {
+        assert!(
+            app.backend.calls.is_empty(),
+            "retry press at +{at} ms acted"
+        );
+        assert!(
+            !app.state
+                .messages
+                .iter()
+                .any(|m| m.text.contains("Running ")
+                    || m.text.contains("Dispatched")
+                    || m.text.contains("Failed:")),
+            "retry press at +{at} ms emitted a task action or error"
+        );
+    }
+
+    fn assert_run_selected(app: &mut App<FakeBackend, TestClock>) {
+        let id = app.state.selected_task().unwrap().id.clone();
+        let before = app.backend.calls.len();
+        key(app, 'r');
+        assert_eq!(
+            &app.backend.calls[before..],
+            &[Call::RunTask(id)],
+            "a deliberate run key must act after the retry gesture ends"
+        );
+    }
+
+    #[test]
+    fn retry_gesture_drops_double_presses_at_50_150_and_400_ms() {
+        let mut app = app(true);
+        for at in [50, 150, 400] {
+            app.clock.set_ms(10_000 + at);
+            key(&mut app, 'r');
+            assert_no_action(&app, at);
+        }
+    }
+
+    #[test]
+    fn retry_gesture_drops_a_key_held_for_three_seconds() {
+        let mut app = app(true);
+        for at in (33..=3_003).step_by(33) {
+            app.clock.set_ms(10_000 + at);
+            key(&mut app, 'r');
+            assert_no_action(&app, at);
+        }
+        app.clock.advance_ms(1_000);
+        assert_run_selected(&mut app);
+    }
+
+    #[test]
+    fn retry_gesture_runs_after_one_second_of_silence_at_the_inclusive_boundary() {
+        let mut app = app(true);
+        app.clock.advance_ms(1_000);
+        assert_run_selected(&mut app);
+    }
+
+    #[test]
+    fn retry_gesture_restarts_silence_on_each_dropped_press() {
+        let mut app = app(true);
+        app.clock.advance_ms(999);
+        key(&mut app, 'r');
+        assert_no_action(&app, 999);
+        app.clock.advance_ms(999);
+        key(&mut app, 'r');
+        assert_no_action(&app, 1_998);
+        app.clock.advance_ms(1_000);
+        assert_run_selected(&mut app);
+    }
+
+    #[test]
+    fn retry_gesture_another_key_acts_and_ends_the_gesture() {
+        let mut app = app(true);
+        key(&mut app, 'j');
+        assert_eq!(app.state.task_selected, 1, "the other key acts immediately");
+        assert_run_selected(&mut app);
+    }
+
+    #[test]
+    fn retry_gesture_a_mouse_press_acts_and_ends_the_gesture() {
+        for complete_click in [false, true] {
+            let mut app = app(true);
+            app.state.mouse.enabled = true;
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            let mut hits = None;
+            terminal
+                .draw(|frame| hits = Some(crate::views::draw(frame, &mut app)))
+                .unwrap();
+            app.set_hits(hits.unwrap());
+            let rect = app
+                .state
+                .mouse
+                .hits
+                .zones()
+                .iter()
+                .find(|zone| zone.kind == ZoneKind::TaskRow { selection: 1 })
+                .unwrap()
+                .rect;
+            let mut event = MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            };
+            app.handle_terminal_event(Event::Mouse(event));
+            assert_eq!(
+                app.state.mouse.press_cell,
+                Some((rect.x, rect.y)),
+                "the mouse press acts normally"
+            );
+            if complete_click {
+                event.kind = MouseEventKind::Up(MouseButton::Left);
+                app.handle_terminal_event(Event::Mouse(event));
+                assert_eq!(
+                    app.state.task_selected, 1,
+                    "the click keeps its usual release action"
+                );
+            }
+            // A run immediately after Down must work too, before any Up.
+            assert_run_selected(&mut app);
+        }
+    }
+
+    #[test]
+    fn retry_gesture_a_paste_acts_and_ends_the_gesture() {
+        let mut app = app(false);
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+        assert_eq!(app.state.input_mode, InputMode::Keyword);
+        app.begin_retry_gesture();
+        app.handle_terminal_event(Event::Paste("Task".into()));
+        assert_eq!(
+            app.state.keyword(ViewId::Tasks),
+            "Task",
+            "paste acts normally"
+        );
+        key(&mut app, 'r');
+        assert_eq!(
+            app.state.keyword(ViewId::Tasks),
+            "Taskr",
+            "immediate r acts after paste"
+        );
+        // Paste in normal mode has no action, but still ends the gesture.
+        let mut app = self::app(true);
+        app.handle_terminal_event(Event::Paste(String::new()));
+        assert_run_selected(&mut app);
+    }
+
+    #[test]
+    fn retry_gesture_uppercase_r_is_the_same_retry_key() {
+        let mut app = app(true);
+        app.clock.advance_ms(400);
+        key(&mut app, 'R');
+        assert_no_action(&app, 400);
+        app.clock.advance_ms(999);
+        key(&mut app, 'r');
+        assert_no_action(&app, 1_399);
+    }
+
+    #[test]
+    fn retry_gesture_control_and_alt_keys_are_untouched_and_end_the_gesture() {
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::ALT] {
+            let event = Event::Key(KeyEvent::new(KeyCode::Char('r'), modifiers));
+            let mut baseline = app(false);
+            baseline.handle_terminal_event(event.clone());
+            let mut app = app(true);
+            app.handle_terminal_event(event);
+            assert_eq!(
+                app.backend.calls, baseline.backend.calls,
+                "{modifiers:?} r acts normally"
+            );
+            assert_eq!(app.state.messages, baseline.state.messages);
+            assert_run_selected(&mut app);
+        }
+    }
+
+    #[test]
+    fn retry_gesture_first_start_runs_an_immediate_r() {
+        assert_run_selected(&mut app(false));
+    }
+
+    #[test]
+    fn retry_gesture_a_backward_clock_step_ends_the_gesture() {
+        let mut app = app(true);
+        app.clock.set_ms(9_999);
+        assert_run_selected(&mut app);
+    }
+
+    #[test]
+    fn retry_gesture_resize_and_focus_neither_end_nor_extend_it() {
+        for event in [Event::Resize(40, 14), Event::FocusGained, Event::FocusLost] {
+            let mut app = app(true);
+            app.clock.advance_ms(900);
+            app.handle_terminal_event(event.clone());
+            key(&mut app, 'r');
+            assert_no_action(&app, 900);
+            // In a separate gesture the same event cannot extend the deadline.
+            let mut app = self::app(true);
+            app.clock.advance_ms(900);
+            app.handle_terminal_event(event);
+            app.clock.advance_ms(100);
+            assert_run_selected(&mut app);
+        }
+    }
+
+    #[test]
+    fn retry_gesture_release_and_repeat_keep_the_existing_ignore_semantics() {
+        for kind in [KeyEventKind::Release, KeyEventKind::Repeat] {
+            let mut app = app(true);
+            app.clock.advance_ms(900);
+            let mut event = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE);
+            event.kind = kind;
+            app.handle_terminal_event(Event::Key(event));
+            assert_no_action(&app, 900);
+            app.clock.advance_ms(100);
+            assert_run_selected(&mut app);
+        }
     }
 }

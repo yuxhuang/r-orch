@@ -248,8 +248,8 @@ async fn run_draw_loop<D: orch_tui::DashboardDriver + Send + 'static>(
         .await
         .map_err(|err| Error::other(format!("the dashboard thread was cancelled: {err}")))?;
     match outcome {
-        // The guard in `orch_tui::run` restored the terminal before unwinding
-        // past it, so it is safe to print.
+        // TerminalDashboard's TerminalGuard restored the terminal before
+        // unwinding past it, so it is safe to print.
         Err(panic) => Err(Error::other(format!(
             "the dashboard panicked: {}",
             panic_message(&panic)
