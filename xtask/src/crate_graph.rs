@@ -856,7 +856,26 @@ fn boundary_source_loading(repo_root: &Path) -> Result<Vec<String>> {
             }
             let text = std::fs::read_to_string(&file)?;
             let tokens = production_tokens(&rust_tokens(&text));
+            let mut attribute_end = 0;
             for (i, token) in tokens.iter().enumerate().filter(|(_, t)| !t.literal) {
+                if token.text == "use" {
+                    let end = (i + 1..tokens.len())
+                        .find(|&j| tokens[j].text == ";")
+                        .unwrap_or(tokens.len());
+                    if tokens[i + 1..end]
+                        .iter()
+                        .any(|t| !t.literal && t.text == "include")
+                    {
+                        problems.push(format!("crates/{name}/src/{relative}:{}: importing or renaming the include macro is forbidden (BOUNDARY_SOURCE_LOADING)", token.line));
+                    }
+                }
+                if token.text == "#" {
+                    let start =
+                        i + 1 + usize::from(tokens.get(i + 1).is_some_and(|t| t.text == "!"));
+                    if tokens.get(start).is_some_and(|t| t.text == "[") {
+                        attribute_end = group_end(&tokens, start);
+                    }
+                }
                 let arg = if token.text == "include"
                     && tokens.get(i + 1).is_some_and(|t| t.text == "!")
                     && tokens
@@ -864,12 +883,19 @@ fn boundary_source_loading(repo_root: &Path) -> Result<Vec<String>> {
                         .is_some_and(|t| matches!(t.text, "(" | "[" | "{"))
                 {
                     Some(&tokens[i + 3..group_end(&tokens, i + 2).saturating_sub(1)])
-                } else if token.text == "#"
-                    && tokens.get(i + 1).is_some_and(|t| t.text == "[")
-                    && tokens.get(i + 2).is_some_and(|t| t.text == "path")
-                    && tokens.get(i + 3).is_some_and(|t| t.text == "=")
+                } else if i < attribute_end
+                    && token.text == "path"
+                    && tokens.get(i + 1).is_some_and(|t| t.text == "=")
                 {
-                    Some(&tokens[i + 4..group_end(&tokens, i + 1).saturating_sub(1)])
+                    // cfg_attr (including nested cfg_attr) can set the same
+                    // module path as a direct attribute. Stop at its value's
+                    // delimiter, not the end of the enclosing attribute.
+                    let mut end = i + 2;
+                    while end < attribute_end && !matches!(tokens[end].text, "," | ")" | "]" | "}")
+                    {
+                        end = group_end(&tokens, end);
+                    }
+                    Some(&tokens[i + 2..end])
                 } else {
                     None
                 };
@@ -1133,8 +1159,9 @@ fn production_tokens<'a>(tokens: &[Token<'a>]) -> Vec<Token<'a>> {
                 i = end;
             }
             if test_only {
-                // Fields/arms end at a comma or their enclosing closer. Items
-                // can contain generic commas (Result<(), E>) before the body.
+                // Fields/arms end at a comma or their enclosing closer. A
+                // block-ended arm/statement/macro needs no comma. Items can
+                // contain generic commas (Result<(), E>) before the body.
                 let mut prefix = i;
                 if tokens.get(prefix).is_some_and(|t| t.text == "pub") {
                     prefix += 1;
@@ -1167,6 +1194,16 @@ fn production_tokens<'a>(tokens: &[Token<'a>]) -> Vec<Token<'a>> {
                     }
                     i = group_end(tokens, i);
                     if text == ";" || (item && text == "{") || (!item && text == ",") {
+                        break;
+                    }
+                    // Keep an else branch or postfix continuation with its
+                    // block. An early stop otherwise only exposes tokens.
+                    if !item
+                        && text == "{"
+                        && !tokens
+                            .get(i)
+                            .is_some_and(|t| matches!(t.text, "else" | "." | "?"))
+                    {
                         break;
                     }
                 }
@@ -1418,7 +1455,56 @@ fn bootstrap_contracts(repo_root: &Path) -> Result<Vec<String>> {
             }
         }
     }
+    problems.extend(bootstrap_enums(repo_root)?);
     problems.extend(bootstrap_impls(repo_root)?);
+    Ok(problems)
+}
+
+/// Pin variants and payloads, while leaving derive/error/default attributes
+/// free to change. A new payload is just as much an API change as a field.
+fn bootstrap_enums(repo_root: &Path) -> Result<Vec<String>> {
+    let mut problems = Vec::new();
+    for (file, name, contract) in [
+        (
+            "error.rs",
+            "DaemonError",
+            "pub enum DaemonError {
+                AlreadyRunning(Option<u32>), LegacyLockHeld(u32),
+                RefusedInAgentContext, InvalidArguments(String), NotInitialized,
+                Core(orch_core::error::Error),
+                Io { context: String, source: std::io::Error, },
+                Operation(Box<ErrorBody>), StopIncomplete,
+                Unimplemented { what: &'static str, owner: &'static str, },
+            }",
+        ),
+        (
+            "lifecycle.rs",
+            "DispatchMode",
+            "pub enum DispatchMode { Off, On, }",
+        ),
+    ] {
+        let text = std::fs::read_to_string(repo_root.join("crates/orch-daemon/src").join(file))?;
+        let tokens = rust_tokens(&text);
+        // Drop attributes only, including those on tuple payload fields.
+        // Do not grant cfg(test) an exemption from the exact variant list.
+        let mut plain = Vec::new();
+        let mut i = 0;
+        while i < tokens.len() {
+            if tokens[i].text == "#" && tokens.get(i + 1).is_some_and(|t| t.text == "[") {
+                i = group_end(&tokens, i + 1);
+            } else {
+                plain.push(tokens[i].clone());
+                i += 1;
+            }
+        }
+        let expected = rust_tokens(contract);
+        if !plain
+            .windows(expected.len())
+            .any(|w| same_tokens(w, &expected))
+        {
+            problems.push(format!("crates/orch-daemon/src/{file}: bootstrap enum boundary changed: {name} variants and payloads must match the reviewed list (BOOTSTRAP_TYPES)"));
+        }
+    }
     Ok(problems)
 }
 
@@ -2092,23 +2178,33 @@ mod tests {
     // Reverting the element bound must expose each following production use.
     #[test]
     fn cfg_test_fields_and_match_arms_do_not_hide_production_references() {
-        for text in [
+        let missed: Vec<_> = [
             "struct S { #[cfg(test)] hidden: u8, value: u8 } fn f() { orch_daemon::initialize(o); }",
             "struct S { #[cfg(test)] pub hidden: u8, value: u8 } fn f() { orch_daemon::initialize(o); }",
             "fn f() { S { #[cfg(test)] hidden: 1, value: { orch_infra::Paths; 2 } }; }",
             "fn f() { match n { #[cfg(test)] 0 => 0, _ => { orch_infra::Paths; 1 } } }",
             "struct S { #[cfg(test)] hidden: u8 } fn f() { orch_daemon::initialize(o); }",
-        ] {
+            "fn f() { match n { #[cfg(test)] 0 => { 0 } _ => { orch_daemon::initialize(o); 1 } } }",
+            "fn f() { match n { #[cfg(test)] 0 => if n > 1 { 0 } else { 2 } _ => { orch_infra::Paths; 1 } } }",
+            "fn f() { #[cfg(test)] { let _ = 1; } orch_daemon::initialize(o); }",
+            "#[cfg(test)] thread_local! { static N: u8 = 0; } fn f() { orch_infra::Paths; }",
+        ]
+        .into_iter()
+        .filter(|text| {
             let problems = cli_file_problems("commands/task.rs", text).join("\n");
-            assert!(
-                problems.contains("production owner import")
-                    || problems.contains("CLI_DAEMON_SITES"),
-                "{text}: {problems}"
-            );
-        }
+            !problems.contains("production owner import") && !problems.contains("CLI_DAEMON_SITES")
+        })
+        .collect();
+        assert!(
+            missed.is_empty(),
+            "hidden production references: {missed:#?}"
+        );
         for text in [
             "#[cfg(test)] pub async fn f() -> Result<(), E> { orch_infra::Paths; }",
             "#[cfg(test)] impl<T, E> Trait<T, E> for S { fn f() { orch_infra::Paths; } }",
+            "fn f() { match n { #[cfg(test)] 0 => if n > 1 { orch_infra::Paths; 0 } else { orch_infra::Paths; 2 } _ => 1 } }",
+            "fn f() { #[cfg(test)] { orch_infra::Paths }.method(orch_infra::Paths); }",
+            "fn f() { #[cfg(test)] { orch_infra::Paths }?; }",
         ] {
             assert!(cli_file_problems("lib.rs", text).is_empty(), "{text}");
         }
@@ -2225,6 +2321,49 @@ mod tests {
             let problems = bootstrap_contracts(&fixture.0).unwrap().join("\n");
             assert!(
                 problems.contains("bootstrap type boundary changed"),
+                "{new}: {problems}"
+            );
+            std::fs::write(&path, original).unwrap();
+        }
+    }
+
+    #[test]
+    fn bootstrap_enum_variants_and_payloads_are_exact() {
+        let fixture = daemon_fixture();
+        assert!(bootstrap_enums(&fixture.0).unwrap().is_empty());
+        for (file, old, new, name) in [
+            (
+                "error.rs",
+                "pub enum DaemonError {",
+                "pub enum DaemonError { Leak(Arc<orch_engine::Container>),",
+                "DaemonError",
+            ),
+            (
+                "lifecycle.rs",
+                "pub enum DispatchMode {",
+                "pub enum DispatchMode { Hook(fn(&Path)),",
+                "DispatchMode",
+            ),
+            (
+                "error.rs",
+                "InvalidArguments(String)",
+                "InvalidArguments(orch_engine::Container)",
+                "DaemonError",
+            ),
+            (
+                "lifecycle.rs",
+                "    On,",
+                "    On(fn(&Path)),",
+                "DispatchMode",
+            ),
+        ] {
+            let path = fixture.0.join("crates/orch-daemon/src").join(file);
+            let original = std::fs::read_to_string(&path).unwrap();
+            assert!(original.contains(old), "fixture must apply: {old}");
+            std::fs::write(&path, original.replacen(old, new, 1)).unwrap();
+            let problems = bootstrap_contracts(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("BOOTSTRAP_TYPES") && problems.contains(name),
                 "{new}: {problems}"
             );
             std::fs::write(&path, original).unwrap();
@@ -2411,6 +2550,68 @@ mod tests {
                     .contains(name)
             );
             std::fs::remove_dir_all(src).unwrap();
+        }
+    }
+
+    #[test]
+    fn boundary_include_macro_imports_are_rejected() {
+        let fixture = SourceFixture::new();
+        for text in [
+            "use std::include as load_source; load_source!(concat!(env!(\"OUT_DIR\"), \"/client.rs\"));",
+            "pub use core::{include as load_source, include_str};",
+            "use ::std::include;",
+        ] {
+            fixture.write("generated.rs", &format!("\n{text}"));
+            let problems = boundary_source_loading(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("BOUNDARY_SOURCE_LOADING")
+                    && problems.contains("generated.rs:2:")
+                    && problems.contains("include macro"),
+                "{text}: {problems}"
+            );
+        }
+        for text in [
+            "use std::{include_str as text, include_bytes as bytes};",
+            "#[cfg(test)] use std::include as load_test_source;",
+            "let label = \"use std::include as load_source;\";",
+        ] {
+            fixture.write("generated.rs", text);
+            assert!(
+                boundary_source_loading(&fixture.0).unwrap().is_empty(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn boundary_nested_path_attributes_stay_inside_the_scanned_source_root() {
+        let fixture = SourceFixture::new();
+        fixture.write("shared.rs", "fn shared() {}");
+        for text in [
+            "#[cfg_attr(all(), path = \"../../outside.rs\")] mod generated;",
+            "#[cfg_attr(all(), cfg_attr(unix, path = \"../../outside.rs\"))] mod generated;",
+            "#[cfg_attr(all(), path = concat!(\"shared\", \".rs\"))] mod generated;",
+            "#[other(path = \"../../outside.rs\")] mod generated;",
+        ] {
+            fixture.write("generated.rs", &format!("\n{text}"));
+            let problems = boundary_source_loading(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("BOUNDARY_SOURCE_LOADING")
+                    && problems.contains("generated.rs:2:"),
+                "{text}: {problems}"
+            );
+        }
+        for text in [
+            "#[cfg_attr(all(), path = \"shared.rs\")] mod shared;",
+            "#[cfg_attr(all(), cfg_attr(unix, path = \"shared.rs\"), allow(dead_code))] mod shared;",
+            "#[other(path = r#\"shared.rs\"#)] mod shared;",
+            "#[doc = \"path = unscanned\"] mod shared;",
+        ] {
+            fixture.write("generated.rs", text);
+            assert!(
+                boundary_source_loading(&fixture.0).unwrap().is_empty(),
+                "{text}"
+            );
         }
     }
 
