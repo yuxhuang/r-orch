@@ -396,7 +396,20 @@ impl Orchestrator {
                     .insert(task_id.to_owned(), (generation, agent.id.clone()));
                 let launch_config = self.config();
                 let cancel = self.register_cancel(task_id).await;
-                self.save_state(state).await?;
+                if let Err(error) = self.save_state(state).await {
+                    // No launch began. The next reload discards the claim;
+                    // release only this selection's in-memory reservation.
+                    let mut preparing = self.inner.preparing_agents.lock().await;
+                    if preparing
+                        .get(task_id)
+                        .is_some_and(|(current, _)| *current == generation)
+                    {
+                        preparing.remove(task_id);
+                        drop(preparing);
+                        self.drop_cancel(task_id).await;
+                    }
+                    return Err(error);
+                }
                 Ok::<_, Error>(Some((
                     task,
                     agent,
