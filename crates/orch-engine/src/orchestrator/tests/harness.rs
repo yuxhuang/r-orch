@@ -239,6 +239,7 @@ pub(crate) struct HarnessBuilder {
     )]
     wrap_state: Option<Box<dyn FnOnce(Arc<FakeStateStore>) -> Arc<dyn StateStore>>>,
     workspace_impl: Option<Arc<dyn orch_core::workspace::WorkspaceManager>>,
+    processes_impl: Option<Arc<dyn orch_core::process::ProcessManager>>,
 }
 
 impl Default for HarnessBuilder {
@@ -271,6 +272,7 @@ impl HarnessBuilder {
             wrap_runs: None,
             wrap_state: None,
             workspace_impl: None,
+            processes_impl: None,
         }
     }
 
@@ -401,6 +403,14 @@ impl HarnessBuilder {
         self
     }
 
+    pub(crate) fn processes(
+        mut self,
+        processes: Arc<dyn orch_core::process::ProcessManager>,
+    ) -> Self {
+        self.processes_impl = Some(processes);
+        self
+    }
+
     pub(crate) fn build(self) -> Harness {
         let tasks = Arc::new(FakeTaskStore::with_tasks(self.tasks));
         let agents = Arc::new(FakeAgentStore::with_agents(self.agents));
@@ -507,7 +517,7 @@ impl HarnessBuilder {
                 Arc::clone(&workspace) as Arc<dyn orch_core::workspace::WorkspaceManager>
             }),
             templates: Arc::clone(&templates) as Arc<dyn orch_core::template::TemplateEngine>,
-            processes: Arc::clone(&processes) as Arc<dyn orch_core::process::ProcessManager>,
+            processes: self.processes_impl.unwrap_or_else(|| processes.clone()),
             events: Arc::clone(&bus),
             task_service,
             agent_service,

@@ -22,6 +22,7 @@ mod force_review;
 pub(crate) mod harness;
 mod mutex;
 mod noop_publication;
+mod orphan_confirmation;
 mod parallel_race;
 mod pause_prelaunch;
 mod perf_opts;

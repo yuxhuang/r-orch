@@ -93,6 +93,8 @@ const MAX_IMMEDIATE_DISPATCH_RETRIES: u32 = 10;
 const CANCEL_KILL_GRACE: Duration = Duration::from_millis(3_000);
 /// Grace period for the kill that follows stall detection.
 const STALL_KILL_GRACE: Duration = Duration::from_millis(5_000);
+/// Post-kill confirmation shared by daemon recovery and shutdown.
+const DAEMON_KILL_CONFIRMATION: Duration = Duration::from_secs(1);
 /// `proof.agent_summary` cap.
 const MAX_AGENT_SUMMARY_LEN: usize = 2000;
 /// `last_error.message` cap.
