@@ -1078,6 +1078,51 @@ pub fn plan_after_wire_check_failure(
     }
 }
 
+/// One read-only diagnostic for one agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDiagnostic {
+    pub agent_id: String,
+    pub agent_name: String,
+    pub message: String,
+}
+
+/// What dispatch will do with each agent's stored effort, without spawning
+/// anything: warnings for legacy-ignored, clamp/override/unknown statuses and
+/// the Codex managed-model coupling, and the configuration error a new
+/// invalid value will raise. The plain request-only note is not reported.
+///
+/// OpenCode's bounded wire check is **not** run here; its outcome is reported
+/// at dispatch, where the probe runs immediately before the spawn.
+pub fn agent_effort_diagnostics(agents: &[Agent]) -> Vec<AgentDiagnostic> {
+    let mut out = Vec::new();
+    for agent in agents.iter().filter(|agent| agent.remote.is_none()) {
+        let push = |out: &mut Vec<AgentDiagnostic>, message: String| {
+            out.push(AgentDiagnostic {
+                agent_id: agent.id.clone(),
+                agent_name: agent.name.clone(),
+                message,
+            });
+        };
+        match plan_effort_dispatch(
+            &agent.adapter,
+            agent.config.model.as_deref(),
+            agent.config.effort,
+        ) {
+            EffortDispatch::Unset => {}
+            EffortDispatch::Reject(error) => {
+                push(&mut out, format!("configuration error: {error}"))
+            }
+            EffortDispatch::IgnoreLegacy { diagnostics }
+            | EffortDispatch::Forward { diagnostics, .. } => {
+                for diagnostic in diagnostics.into_iter().filter(|d| d.is_warning()) {
+                    push(&mut out, diagnostic.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1899,51 +1944,6 @@ mod tests {
             format!("request-only: {EFFORT_REQUEST_ONLY_NOTE}")
         );
     }
-}
-
-/// One read-only diagnostic for one agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentDiagnostic {
-    pub agent_id: String,
-    pub agent_name: String,
-    pub message: String,
-}
-
-/// What dispatch will do with each agent's stored effort, without spawning
-/// anything: warnings for legacy-ignored, clamp/override/unknown statuses and
-/// the Codex managed-model coupling, and the configuration error a new
-/// invalid value will raise. The plain request-only note is not reported.
-///
-/// OpenCode's bounded wire check is **not** run here; its outcome is reported
-/// at dispatch, where the probe runs immediately before the spawn.
-pub fn agent_effort_diagnostics(agents: &[Agent]) -> Vec<AgentDiagnostic> {
-    let mut out = Vec::new();
-    for agent in agents.iter().filter(|agent| agent.remote.is_none()) {
-        let push = |out: &mut Vec<AgentDiagnostic>, message: String| {
-            out.push(AgentDiagnostic {
-                agent_id: agent.id.clone(),
-                agent_name: agent.name.clone(),
-                message,
-            });
-        };
-        match plan_effort_dispatch(
-            &agent.adapter,
-            agent.config.model.as_deref(),
-            agent.config.effort,
-        ) {
-            EffortDispatch::Unset => {}
-            EffortDispatch::Reject(error) => {
-                push(&mut out, format!("configuration error: {error}"))
-            }
-            EffortDispatch::IgnoreLegacy { diagnostics }
-            | EffortDispatch::Forward { diagnostics, .. } => {
-                for diagnostic in diagnostics.into_iter().filter(|d| d.is_warning()) {
-                    push(&mut out, diagnostic.to_string());
-                }
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]

@@ -465,7 +465,7 @@ mod tests {
         // An invalid tail must also remain unseen: this proves early stopping
         // without relying solely on the timing assertion above.
         doc.push_str("invalid: [\n");
-        let err = expanded_node_count(&path, &doc).expect_err("stop at alias 65");
+        let err = expanded_node_count(path, &doc).expect_err("stop at alias 65");
         assert!(
             err.to_string()
                 .contains("YAML aliases, over the limit of 64")
