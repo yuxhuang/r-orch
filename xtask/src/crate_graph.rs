@@ -972,6 +972,7 @@ struct Token<'a> {
     text: &'a str,
     line: usize,
     literal: bool,
+    raw_identifier: bool,
 }
 
 /// A small lexical tripwire: comments/literals cannot authorize an import.
@@ -1070,6 +1071,7 @@ fn rust_tokens(text: &str) -> Vec<Token<'_>> {
                         text: &text[ident..i],
                         line,
                         literal: false,
+                        raw_identifier: true,
                     });
                     continue;
                 }
@@ -1081,6 +1083,7 @@ fn rust_tokens(text: &str) -> Vec<Token<'_>> {
                 text: &text[start..i],
                 line: start_line,
                 literal,
+                raw_identifier: false,
             });
         }
         line += b[start..i].iter().filter(|c| **c == b'\n').count();
@@ -1196,13 +1199,19 @@ fn production_tokens<'a>(tokens: &[Token<'a>]) -> Vec<Token<'a>> {
                     if text == ";" || (item && text == "{") || (!item && text == ",") {
                         break;
                     }
-                    // Keep an else branch or postfix continuation with its
-                    // block. An early stop otherwise only exposes tokens.
+                    // Neither `else`, postfix `?`, nor a single postfix `.`
+                    // can begin a new arm/statement (`r#else!` is an identifier,
+                    // not the else keyword). A range CAN begin with
+                    // `..`, so keep only a dot not followed by another dot.
+                    // An early stop otherwise only exposes tokens.
                     if !item
                         && text == "{"
-                        && !tokens
-                            .get(i)
-                            .is_some_and(|t| matches!(t.text, "else" | "." | "?"))
+                        && !tokens.get(i).is_some_and(|t| {
+                            (t.text == "else" && !t.raw_identifier)
+                                || t.text == "?"
+                                || (t.text == "."
+                                    && tokens.get(i + 1).is_none_or(|t| t.text != "."))
+                        })
                     {
                         break;
                     }
@@ -1545,8 +1554,31 @@ const BOOTSTRAP_IMPLS: &[(&str, &str, &[&str])] = &[
     ),
 ];
 
-/// Follow explicit type/import aliases before inspecting impl headers. Rust
-/// permits inherent impls through aliases; a spelling change grants no API.
+/// Locate a top-level separator without mistaking generic defaults, const
+/// blocks or function arrows for the end of a declaration/header. This is a
+/// lexical tripwire (no parser dependency is permitted for this gate).
+fn declaration_separator(tokens: &[Token<'_>], start: usize, separators: &[&str]) -> usize {
+    let mut angle = 0usize;
+    let mut i = start;
+    while i < tokens.len() {
+        let text = tokens[i].text;
+        if angle == 0 && separators.contains(&text) {
+            return i;
+        }
+        match text {
+            "<" => angle += 1,
+            ">" if i == 0 || tokens[i - 1].text != "-" => angle = angle.saturating_sub(1),
+            _ => {}
+        }
+        i = group_end(tokens, i);
+    }
+    tokens.len()
+}
+
+/// Follow names globally and conservatively, including nested/cfg-gated code.
+/// A wrapper/projection is tainted too: it is rejected below, never mistaken
+/// for a successfully resolved identity alias. Names are not scope-resolved;
+/// shadowing can cause a rejection, not grant an unreviewed implementation.
 fn bootstrap_type_aliases(sources: &[(String, String)]) -> BTreeMap<String, String> {
     let mut aliases: BTreeMap<_, _> = BOOTSTRAP_TYPES
         .iter()
@@ -1557,14 +1589,17 @@ fn bootstrap_type_aliases(sources: &[(String, String)]) -> BTreeMap<String, Stri
         for (_, text) in sources {
             let tokens = rust_tokens(text);
             for (i, token) in tokens.iter().enumerate().filter(|(_, t)| !t.literal) {
-                if token.text == "type" && tokens.get(i + 2).is_some_and(|t| t.text == "=") {
-                    let end = (i + 3..tokens.len())
-                        .find(|&j| tokens[j].text == ";")
-                        .unwrap_or(tokens.len());
-                    if let Some(target) = tokens[i + 3..end].iter().find_map(|t| before.get(t.text))
+                if token.text == "type"
+                    && let Some(name) = tokens.get(i + 1)
+                {
+                    let end = declaration_separator(&tokens, i + 2, &[";"]);
+                    if let Some(target) = tokens[i + 2..end]
+                        .iter()
+                        .filter(|t| !t.literal)
+                        .find_map(|t| before.get(t.text))
                     {
                         aliases
-                            .entry(tokens[i + 1].text.to_owned())
+                            .entry(name.text.to_owned())
                             .or_insert_with(|| target.clone());
                     }
                 }
@@ -1585,6 +1620,215 @@ fn bootstrap_type_aliases(sources: &[(String, String)]) -> BTreeMap<String, Stri
     }
 }
 
+/// An identity alias is a path ending in a tracked name, with optional generic
+/// arguments. `Option<T>`, `(T,)`, `&T` and associated projections are not T.
+fn bootstrap_alias_target<'a>(
+    tokens: &'a [Token<'a>],
+    aliases: &BTreeMap<String, String>,
+) -> Option<&'a str> {
+    let mut i = 0;
+    if tokens.first().is_some_and(|t| t.text == ":") {
+        if tokens.get(1).is_none_or(|t| t.text != ":") {
+            return None;
+        }
+        i = 2;
+    }
+    loop {
+        let name = tokens.get(i)?;
+        if name.literal
+            || !name
+                .text
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_')
+        {
+            return None;
+        }
+        i += 1;
+        if tokens.get(i).is_some_and(|t| t.text == ":")
+            && tokens.get(i + 1).is_some_and(|t| t.text == ":")
+        {
+            i += 2;
+            continue;
+        }
+        if !aliases.contains_key(name.text) {
+            return None;
+        }
+        if i == tokens.len() {
+            return Some(name.text);
+        }
+        if tokens[i].text == "<" {
+            // Balanced generic arguments must occupy the entire suffix.
+            // Count them separately to reject `Alias<T>::Associated`.
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < tokens.len() {
+                match tokens[j].text {
+                    "<" => depth += 1,
+                    ">" if j == 0 || tokens[j - 1].text != "-" => {
+                        depth = depth.checked_sub(1)?;
+                        if depth == 0 {
+                            return (j + 1 == tokens.len()).then_some(name.text);
+                        }
+                    }
+                    _ => {}
+                }
+                j = group_end(tokens, j);
+            }
+        }
+        return None;
+    }
+}
+
+// These are expression/data macros used with bootstrap values today. Their
+// arguments are still scanned; this is not an exemption for nested impls.
+// Macro name binding and procedural expansion remain source-review limits.
+const BOOTSTRAP_VALUE_MACROS: &[&str] = &[
+    "matches",
+    "assert",
+    "assert_eq",
+    "assert_ne",
+    "format",
+    "write",
+    "writeln",
+    "vec",
+];
+
+fn bootstrap_declarations(
+    sources: &[(String, String)],
+    aliases: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut declarations: BTreeMap<&str, Vec<String>> = BOOTSTRAP_TYPES
+        .iter()
+        .map(|&name| (name, Vec::new()))
+        .collect();
+    for (file, text) in sources {
+        let tokens = rust_tokens(text);
+        let production = production_tokens(&tokens);
+        for (i, token) in tokens.iter().enumerate().filter(|(_, t)| !t.literal) {
+            if matches!(token.text, "struct" | "enum")
+                && let Some(name) = tokens.get(i + 1)
+                && let Some(sites) = declarations.get_mut(name.text)
+            {
+                sites.push(format!("{file}:{}", token.line));
+            }
+            if token.text == "type"
+                && let Some(name) = tokens.get(i + 1)
+            {
+                let end = declaration_separator(&tokens, i + 2, &[";"]);
+                let eq = declaration_separator(&tokens, i + 2, &["=", ";"]);
+                let mentioned = tokens[i + 2..end]
+                    .iter()
+                    .filter(|t| !t.literal)
+                    .find_map(|t| aliases.get(t.text));
+                if let Some(target) = mentioned {
+                    let rhs = if eq < end { &tokens[eq + 1..end] } else { &[] };
+                    if bootstrap_alias_target(rhs, aliases).is_none() || name.text == "$" {
+                        problems.push(format!("crates/orch-daemon/src/{file}:{}: unresolved bootstrap alias {} mentioning {target} (BOOTSTRAP_IMPLS)", token.line, name.text));
+                    }
+                }
+            }
+            // Prevent a payload token in an exact contract being re-bound to
+            // an unrelated type/module in the same pinned source file.
+            let payloads: &[&str] = match file.as_str() {
+                "bootstrap.rs" => &[
+                    "PathBuf",
+                    "Option",
+                    "String",
+                    "orch_domain",
+                    "PromptMode",
+                    "bool",
+                ],
+                "lifecycle.rs" => &["PathBuf", "Option", "String", "bool", "i32"],
+                "error.rs" => &[
+                    "Option",
+                    "u32",
+                    "String",
+                    "orch_core",
+                    "Error",
+                    "std",
+                    "io",
+                    "Box",
+                    "ErrorBody",
+                    "str",
+                ],
+                _ => &[],
+            };
+            if matches!(
+                token.text,
+                "type" | "as" | "struct" | "enum" | "union" | "trait" | "mod"
+            ) && let Some(name) = tokens.get(i + 1)
+                && payloads.contains(&name.text)
+            {
+                problems.push(format!("crates/orch-daemon/src/{file}:{}: pinned payload name {} cannot be rebound by a declaration/rename (BOOTSTRAP_TYPES)", token.line, name.text));
+            }
+            if token.text == "use" && tokens.get(i + 1).is_none_or(|t| t.text != "<") {
+                let end = declaration_separator(&tokens, i + 1, &[";"]);
+                let imports = &tokens[i..end];
+                let pinned = !payloads.is_empty()
+                    && imports.iter().enumerate().any(|(j, t)| {
+                        t.text == "*"
+                            || (payloads.contains(&t.text)
+                                && imports.get(j + 1).is_none_or(|next| next.text != ":"))
+                    });
+                let reviewed = match file.as_str() {
+                    "bootstrap.rs" | "lifecycle.rs" => "use std::path::{Path, PathBuf}",
+                    "error.rs" => "use orch_proto::error::{ErrorBody, exit}",
+                    _ => "",
+                };
+                if pinned
+                    && !same_tokens(imports, &rust_tokens(reviewed))
+                    && !(same_tokens(imports, &rust_tokens("use super::*"))
+                        && !production
+                            .iter()
+                            .any(|t| t.text.as_ptr() == token.text.as_ptr()))
+                {
+                    problems.push(format!("crates/orch-daemon/src/{file}:{}: unreviewed import binding of a pinned payload name (BOOTSTRAP_TYPES)", token.line));
+                }
+                if imports
+                    .iter()
+                    .any(|t| BOOTSTRAP_VALUE_MACROS.contains(&t.text))
+                {
+                    problems.push(format!("crates/orch-daemon/src/{file}:{}: reviewed value macro names cannot be imported/rebound (BOOTSTRAP_IMPLS)", token.line));
+                }
+            }
+            if (token.text == "macro_rules"
+                && tokens
+                    .get(i + 2)
+                    .is_some_and(|t| BOOTSTRAP_VALUE_MACROS.contains(&t.text)))
+                || (token.text == "as"
+                    && tokens
+                        .get(i + 1)
+                        .is_some_and(|t| BOOTSTRAP_VALUE_MACROS.contains(&t.text)))
+            {
+                problems.push(format!("crates/orch-daemon/src/{file}:{}: reviewed value macro names cannot be rebound (BOOTSTRAP_IMPLS)", token.line));
+            }
+            if tokens.get(i + 1).is_some_and(|t| t.text == "!")
+                && tokens
+                    .get(i + 2)
+                    .is_some_and(|t| matches!(t.text, "(" | "[" | "{"))
+                && !BOOTSTRAP_VALUE_MACROS.contains(&token.text)
+            {
+                let end = group_end(&tokens, i + 2);
+                if let Some(target) = tokens[i + 3..end.saturating_sub(1)]
+                    .iter()
+                    .filter(|t| !t.literal)
+                    .find_map(|t| aliases.get(t.text))
+                {
+                    problems.push(format!("crates/orch-daemon/src/{file}:{}: macro {} carries bootstrap type {target}; expansion requires review (BOOTSTRAP_IMPLS)", token.line, token.text));
+                }
+            }
+        }
+    }
+    for (name, sites) in declarations {
+        if sites.len() != 1 {
+            problems.push(format!("crates/orch-daemon/src: bootstrap type {name} requires exactly one raw struct/enum declaration, found {} [{}] (BOOTSTRAP_TYPES)", sites.len(), sites.join(", ")));
+        }
+    }
+    problems
+}
+
 fn bootstrap_impls(repo_root: &Path) -> Result<Vec<String>> {
     let src = repo_root.join("crates/orch-daemon/src");
     let mut files = Vec::new();
@@ -1602,7 +1846,7 @@ fn bootstrap_impls(repo_root: &Path) -> Result<Vec<String>> {
         .collect::<Result<_>>()?;
     let aliases = bootstrap_type_aliases(&sources);
     let mut seen = BTreeSet::new();
-    let mut problems = Vec::new();
+    let mut problems = bootstrap_declarations(&sources, &aliases);
     for (relative, text) in &sources {
         let tokens = rust_tokens(text);
         for (i, token) in tokens.iter().enumerate().filter(|(_, t)| !t.literal) {
@@ -1621,18 +1865,13 @@ fn bootstrap_impls(repo_root: &Path) -> Result<Vec<String>> {
             if token.text != "impl" {
                 continue;
             }
-            // An impl Trait argument/return is not an implementation block.
-            if i > 0
-                && !matches!(
-                    tokens[i - 1].text,
-                    ";" | "{" | "}" | "]" | "unsafe" | "default"
-                )
-            {
+            // Do not skip unfamiliar positions (including macro arguments).
+            // A bootstrap-bearing impl Trait/header we cannot classify fails
+            // closed. Skip const-generic groups while locating the body.
+            let body = declaration_separator(&tokens, i + 1, &["{", ";", ",", ")", "]", "="]);
+            if body == tokens.len() {
                 continue;
             }
-            let Some(body) = (i + 1..tokens.len()).find(|&j| tokens[j].text == "{") else {
-                continue;
-            };
             let header = &tokens[i..body];
             let types: BTreeSet<_> = header
                 .iter()
@@ -1640,6 +1879,9 @@ fn bootstrap_impls(repo_root: &Path) -> Result<Vec<String>> {
                 .filter_map(|t| aliases.get(t.text))
                 .collect();
             if types.is_empty() {
+                if header.iter().any(|t| t.text == "$") {
+                    problems.push(format!("crates/orch-daemon/src/{relative}:{}: unresolved macro impl receiver; it could name a bootstrap type (BOOTSTRAP_IMPLS)", token.line));
+                }
                 continue;
             }
             let end = group_end(&tokens, body).saturating_sub(1);
@@ -2188,6 +2430,9 @@ mod tests {
             "fn f() { match n { #[cfg(test)] 0 => if n > 1 { 0 } else { 2 } _ => { orch_infra::Paths; 1 } } }",
             "fn f() { #[cfg(test)] { let _ = 1; } orch_daemon::initialize(o); }",
             "#[cfg(test)] thread_local! { static N: u8 = 0; } fn f() { orch_infra::Paths; }",
+            "fn f() { match n { #[cfg(test)] 9 => { 0 } ..=5 => { orch_daemon::prepare_start(o); 1 } _ => 2 } }",
+            "fn f() { #[cfg(test)] { let _ = 1; } ..orch_infra::Paths::new(p); }",
+            "fn f() { #[cfg(test)] {} r#else! { orch_daemon::prepare_start(o); } }",
         ]
         .into_iter()
         .filter(|text| {
@@ -2292,6 +2537,319 @@ mod tests {
                 .join("\n")
                 .contains("local_tasks")
         );
+    }
+
+    #[test]
+    fn bootstrap_receiver_spellings_fail_closed() {
+        let fixture = daemon_fixture();
+        let src = fixture.0.join("crates/orch-daemon/src");
+        let mut missed = Vec::new();
+        // First case is the const-parameter identity alias. Keep each spelling
+        // independent: a rejection of one alias must not mask another case.
+        for (label, declarations, implementation) in [
+            (
+                "const generic",
+                "type Outcome<const N: usize> = InitOutcome;",
+                "impl Outcome<0> { fn local_tasks() {} }",
+            ),
+            (
+                "type generic identity",
+                "type Outcome<T> = T;",
+                "impl Outcome<InitOutcome> { fn local_tasks() {} }",
+            ),
+            (
+                "type generic",
+                "trait Identity { type Out; } impl<T> Identity for T { type Out = InitOutcome; } type Outcome<T> = <T as Identity>::Out;",
+                "impl Outcome<()> { fn local_tasks() {} }",
+            ),
+            (
+                "lifetime generic",
+                "type Outcome<'a> = InitOutcome;",
+                "impl Outcome<'static> { fn local_tasks() {} }",
+            ),
+            (
+                "where clause",
+                "type Outcome<const N: usize> where [(); N]: Sized = InitOutcome;",
+                "impl Outcome<0> { fn local_tasks() {} }",
+            ),
+            (
+                "generic default",
+                "type Outcome<T = InitOutcome> = T;",
+                "impl Outcome { fn local_tasks() {} }",
+            ),
+            (
+                "const expression",
+                "type Outcome<const N: usize = { let n = 0; n }> = InitOutcome;",
+                "impl Outcome { fn local_tasks() {} }",
+            ),
+            (
+                "function arrow",
+                "type Outcome<T = fn() -> InitOutcome> = T;",
+                "impl Outcome { fn local_tasks() {} }",
+            ),
+            (
+                "plain alias",
+                "type Outcome = InitOutcome;",
+                "impl Outcome { fn local_tasks() {} }",
+            ),
+            (
+                "alias chain",
+                "type Outcome = Middle; type Middle = InitOutcome;",
+                "impl Outcome { fn local_tasks() {} }",
+            ),
+            (
+                "renamed import",
+                "use crate::InitOutcome as Outcome;",
+                "impl Outcome { fn local_tasks() {} }",
+            ),
+            (
+                "grouped raw rename",
+                "use crate::{InitOutcome as r#Outcome};",
+                "impl Outcome { fn local_tasks() {} }",
+            ),
+            (
+                "cross module",
+                "mod aliases { pub type Outcome = crate::InitOutcome; }",
+                "impl crate::aliases::Outcome { fn local_tasks() {} }",
+            ),
+            ("direct", "", "impl InitOutcome { fn local_tasks() {} }"),
+            (
+                "crate path",
+                "",
+                "impl crate::bootstrap::InitOutcome { fn local_tasks() {} }",
+            ),
+            (
+                "self path",
+                "",
+                "impl self::InitOutcome { fn local_tasks() {} }",
+            ),
+            (
+                "super path",
+                "",
+                "mod inner { impl super::InitOutcome { fn local_tasks() {} } }",
+            ),
+            (
+                "absolute path",
+                "",
+                "impl ::owner::InitOutcome { fn local_tasks() {} }",
+            ),
+            (
+                "function",
+                "",
+                "fn scoped() { type Outcome = InitOutcome; impl Outcome { fn local_tasks() {} } }",
+            ),
+            (
+                "block",
+                "",
+                "fn scoped() { { type Outcome = InitOutcome; impl Outcome { fn local_tasks() {} } } }",
+            ),
+            (
+                "const scope",
+                "",
+                "const _: () = { type Outcome = InitOutcome; impl Outcome { fn local_tasks() {} } };",
+            ),
+            (
+                "nested module",
+                "",
+                "mod nested { type Outcome = InitOutcome; impl Outcome { fn local_tasks() {} } }",
+            ),
+            (
+                "parenthesized",
+                "",
+                "impl (InitOutcome) { fn local_tasks() {} }",
+            ),
+            (
+                "trait reference",
+                "",
+                "impl Local for &InitOutcome { fn local_tasks() {} }",
+            ),
+            (
+                "trait generic",
+                "",
+                "impl<const N: usize> Local<N> for InitOutcome { fn local_tasks() {} }",
+            ),
+            (
+                "const generic header",
+                "",
+                "impl Local<{ 0 }> for InitOutcome { fn local_tasks() {} }",
+            ),
+            (
+                "unsafe trait",
+                "",
+                "unsafe impl Local for InitOutcome { fn local_tasks() {} }",
+            ),
+            (
+                "raw identifier",
+                "type r#Outcome = r#InitOutcome;",
+                "impl r#Outcome { fn local_tasks() {} }",
+            ),
+            (
+                "unicode identifier",
+                "type OutcomeΩ = InitOutcome;",
+                "impl OutcomeΩ { fn local_tasks() {} }",
+            ),
+            (
+                "projection",
+                "trait Identity { type Out; } impl Identity for () { type Out = InitOutcome; }",
+                "impl <() as Identity>::Out { fn local_tasks() {} }",
+            ),
+            (
+                "macro literal",
+                "",
+                "macro_rules! add { () => { impl InitOutcome { fn local_tasks() {} } } }",
+            ),
+            (
+                "macro receiver",
+                "",
+                "macro_rules! add { ($t:ty) => { impl $t { fn local_tasks() {} } } }",
+            ),
+            ("macro argument", "", "add!(InitOutcome);"),
+            ("macro keyword argument", "", "add!(impl, InitOutcome);"),
+            (
+                "macro alias argument",
+                "type Outcome = InitOutcome;",
+                "add!(Outcome);",
+            ),
+            (
+                "macro shadow",
+                "",
+                "macro_rules! matches { ($t:ty) => { add!($t); } } matches!(InitOutcome);",
+            ),
+            (
+                "macro import shadow",
+                "",
+                "use producer::add as matches; matches!(InitOutcome);",
+            ),
+            (
+                "unfamiliar impl position",
+                "",
+                "add!(impl InitOutcome { fn local_tasks() {} });",
+            ),
+        ] {
+            std::fs::write(src.join("aliases.rs"), declarations).unwrap();
+            std::fs::write(src.join("receiver.rs"), implementation).unwrap();
+            let problems = bootstrap_impls(&fixture.0).unwrap().join("\n");
+            if !problems.contains("BOOTSTRAP_IMPLS") || !problems.contains("receiver.rs") {
+                missed.push(format!("{label}: {problems}"));
+            }
+        }
+        assert!(
+            missed.is_empty(),
+            "unreviewed receivers accepted: {missed:#?}"
+        );
+    }
+
+    #[test]
+    fn bootstrap_alias_resolution_and_unresolved_forms_are_explicit() {
+        let fixture = daemon_fixture();
+        let file = fixture.0.join("crates/orch-daemon/src/alias.rs");
+        for declaration in [
+            "type Outcome<const N: usize> = crate::InitOutcome;",
+            "type Outcome<'a> = self::InitOutcome;",
+            "type Outcome<const N: usize> where [(); N]: Sized = InitOutcome;",
+            "type Middle<const N: usize> = InitOutcome; type Outcome = Middle<0>;",
+        ] {
+            let sources = vec![("alias.rs".to_owned(), declaration.to_owned())];
+            assert_eq!(bootstrap_type_aliases(&sources)["Outcome"], "InitOutcome");
+            std::fs::write(&file, declaration).unwrap();
+            assert!(
+                bootstrap_impls(&fixture.0).unwrap().is_empty(),
+                "{declaration}"
+            );
+        }
+        for declaration in [
+            "type Outcome<T> = Option<InitOutcome>;",
+            "type Outcome = (InitOutcome,);",
+            "type Outcome<'a> = &'a InitOutcome;",
+            "type Outcome = <InitOutcome as Identity>::Out;",
+            "type Outcome<T = InitOutcome> = T;",
+            "type Outcome where InitOutcome: Identity = Unknown;",
+            "type Outcome: Identity<InitOutcome>;",
+            "type Outcome<const N: usize = { 0 }> = [InitOutcome; N];",
+        ] {
+            std::fs::write(&file, declaration).unwrap();
+            let problems = bootstrap_impls(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("alias.rs:1")
+                    && problems.contains("Outcome")
+                    && problems.contains("InitOutcome")
+                    && problems.contains("BOOTSTRAP_IMPLS"),
+                "{declaration}: {problems}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_pins_require_one_raw_declaration_per_type() {
+        let fixture = daemon_fixture();
+        let file = fixture.0.join("crates/orch-daemon/src/duplicate.rs");
+        for name in BOOTSTRAP_TYPES {
+            std::fs::write(&file, format!("#[cfg(test)] pub struct {name} {{}}")).unwrap();
+            let problems = bootstrap_contracts(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains(name)
+                    && problems.contains("exactly one raw")
+                    && problems.contains("duplicate.rs:1")
+                    && problems.contains("BOOTSTRAP_TYPES"),
+                "{name}: {problems}"
+            );
+        }
+        std::fs::remove_file(&file).unwrap();
+        // The exact reviewed copy cannot authorize a changed live definition.
+        for (file, old, live, reviewed) in [
+            (
+                "lifecycle.rs",
+                "pub enum DispatchMode {",
+                "pub enum DispatchMode { Hook(fn(&Path)),",
+                "#[cfg(test)] pub enum DispatchMode { Off, On, }",
+            ),
+            (
+                "lifecycle.rs",
+                "pub struct StartOptions {",
+                "pub struct StartOptions { pub hook: fn(),",
+                "#[cfg(test)] pub struct StartOptions { pub project_root: PathBuf, pub socket: Option<PathBuf>, pub detach: bool, pub dispatch: DispatchMode, pub from_agent: bool, pub listen: Option<String>, pub peer_name: Option<String>, }",
+            ),
+        ] {
+            let path = fixture.0.join("crates/orch-daemon/src").join(file);
+            let original = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(
+                &path,
+                format!("{}\n{reviewed}", original.replacen(old, live, 1)),
+            )
+            .unwrap();
+            let problems = bootstrap_contracts(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("exactly one raw") && problems.contains("BOOTSTRAP_TYPES"),
+                "{problems}"
+            );
+            std::fs::write(&path, original).unwrap();
+        }
+    }
+
+    #[test]
+    fn bootstrap_payload_tokens_cannot_be_rebound_in_pinned_files() {
+        let fixture = daemon_fixture();
+        for (file, declaration) in [
+            ("lifecycle.rs", "use orch_engine::Container as PathBuf;"),
+            ("lifecycle.rs", "type PathBuf = orch_engine::Container;"),
+            ("bootstrap.rs", "use orch_engine::Container as String;"),
+            ("error.rs", "type ErrorBody = orch_engine::Container;"),
+            ("error.rs", "use owner as orch_core;"),
+            ("lifecycle.rs", "struct String;"),
+            ("lifecycle.rs", "use owner::String;"),
+            ("lifecycle.rs", "use owner::*;"),
+            ("lifecycle.rs", "use super::*;"),
+        ] {
+            let path = fixture.0.join("crates/orch-daemon/src").join(file);
+            let original = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, format!("{original}\n{declaration}")).unwrap();
+            let problems = bootstrap_impls(&fixture.0).unwrap().join("\n");
+            assert!(
+                problems.contains("pinned payload name") && problems.contains("BOOTSTRAP_TYPES"),
+                "{declaration}: {problems}"
+            );
+            std::fs::write(&path, original).unwrap();
+        }
     }
 
     #[test]
@@ -2603,6 +3161,7 @@ mod tests {
         }
         for text in [
             "#[cfg_attr(all(), path = \"shared.rs\")] mod shared;",
+            "#[cfg_attr(all(), path = \"shared.rs\", allow(dead_code))] mod shared;",
             "#[cfg_attr(all(), cfg_attr(unix, path = \"shared.rs\"), allow(dead_code))] mod shared;",
             "#[other(path = r#\"shared.rs\"#)] mod shared;",
             "#[doc = \"path = unscanned\"] mod shared;",
