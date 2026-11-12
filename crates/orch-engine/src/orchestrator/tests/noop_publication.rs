@@ -388,9 +388,21 @@ async fn ordered_state_collections_are_not_treated_as_equal_serialized_state() {
 }
 
 #[tokio::test]
-async fn failed_state_save_is_announced_and_retried_before_reload() {
+async fn failed_state_save_is_announced_then_reloaded_and_recomputed() {
     let f = Fixture::new().await;
+    use super::harness::{NOW_ISO, state_running};
+    f.full
+        .tasks
+        .save(&orch_domain::Task {
+            status: TaskStatus::Done,
+            ..make_task()
+        })
+        .await
+        .unwrap();
+    let stale = state_running("tsk_test1", "agt_test1", "run_stale", 42, NOW_ISO);
     let path = f.full.paths.state_path();
+    f.full.state.write(&stale).await.unwrap();
+    f.records.lock().unwrap().clear();
     tokio::fs::remove_file(&path).await.unwrap();
     tokio::fs::create_dir(&path).await.unwrap();
     let boundary = f.full.operation_boundary();
@@ -414,12 +426,22 @@ async fn failed_state_save_is_announced_and_retried_before_reload() {
         assert!(!records[0].store_set_uncertain);
     }
     tokio::fs::remove_dir(&path).await.unwrap();
+    f.full.state.write(&stale).await.unwrap();
+    f.records.lock().unwrap().truncate(1);
     f.full.orchestrator.daemon_tick(true).await.unwrap();
-    assert_eq!(f.full.state.read().await.unwrap().stats.total_runs, 7);
+    let stored = f.full.state.read().await.unwrap();
+    assert_eq!(
+        stored.stats.total_runs, 0,
+        "failed mutation must be rolled back"
+    );
+    assert!(
+        stored.running.is_empty(),
+        "reconciliation must recompute the removal"
+    );
     assert_eq!(
         f.records.lock().unwrap().len(),
         2,
-        "one retry, no redundant tail"
+        "one recomputed tail write"
     );
     f.full.orchestrator.daemon_tick(true).await.unwrap();
     assert_eq!(f.records.lock().unwrap().len(), 2);
@@ -445,12 +467,23 @@ impl orch_core::storage::StateStore for PausedStateWrite {
 }
 
 #[tokio::test]
-async fn cancelled_state_save_keeps_the_unsaved_state_for_the_next_tick() {
+async fn cancelled_state_save_reloads_before_recomputing_the_next_tick() {
     use super::harness::Harness;
     use std::sync::atomic::Ordering;
     let entered = Arc::new(tokio::sync::Notify::new());
     let pause = Arc::new(AtomicBool::new(false));
     let h = Harness::builder()
+        .tasks([orch_domain::Task {
+            status: TaskStatus::Done,
+            ..make_task()
+        }])
+        .state(super::harness::state_running(
+            "tsk_test1",
+            "agt_test1",
+            "run_stale",
+            42,
+            super::harness::NOW_ISO,
+        ))
         .wrap_state_store({
             let entered = entered.clone();
             let pause = pause.clone();
@@ -481,8 +514,84 @@ async fn cancelled_state_save_keeps_the_unsaved_state_for_the_next_tick() {
     assert!(save.await.unwrap_err().is_cancelled());
     pause.store(false, Ordering::SeqCst);
     h.reconcile().await.unwrap();
-    assert_eq!(h.state.peek().stats.total_runs, 9);
+    assert_eq!(
+        h.state.peek().stats.total_runs,
+        0,
+        "cancelled mutation must be rolled back"
+    );
+    assert!(
+        h.state.peek().running.is_empty(),
+        "tail must persist the recomputed removal"
+    );
     assert_eq!(h.state.written().len(), 1);
     h.reconcile().await.unwrap();
     assert_eq!(h.state.written().len(), 1);
+}
+
+// A failed write invalidates the equality proof even if memory subsequently
+// returns to the old bytes within the same reconciliation operation.
+#[tokio::test]
+async fn failed_write_cannot_skip_an_equal_reconciliation_tail() {
+    use super::harness::Harness;
+    let h = Harness::builder().build();
+    h.load_state().await.unwrap();
+    let mut slot = h.orchestrator.inner.state.lock().await;
+    let state = slot.as_mut().unwrap();
+    state.stats.total_runs = 1;
+    h.state.faults.fail_once("state write failed");
+    assert!(h.orchestrator.save_state(state).await.is_err());
+    state.stats.total_runs = 0;
+    h.orchestrator.reconcile(state).await.unwrap();
+    assert_eq!(
+        h.state.written().len(),
+        2,
+        "failed attempt plus mandatory tail"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_write_cannot_skip_an_equal_reconciliation_tail() {
+    use super::harness::Harness;
+    use std::sync::atomic::Ordering;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let pause = Arc::new(AtomicBool::new(false));
+    let h = Harness::builder()
+        .wrap_state_store({
+            let entered = entered.clone();
+            let pause = pause.clone();
+            move |inner| {
+                Arc::new(PausedStateWrite {
+                    inner,
+                    entered,
+                    pause,
+                })
+            }
+        })
+        .build();
+    h.load_state().await.unwrap();
+    pause.store(true, Ordering::SeqCst);
+    let save = {
+        let orchestrator = h.orchestrator.clone();
+        tokio::spawn(async move {
+            let mut slot = orchestrator.inner.state.lock().await;
+            let state = slot.as_mut().unwrap();
+            state.stats.total_runs = 1;
+            orchestrator.save_state(state).await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), entered.notified())
+        .await
+        .unwrap();
+    save.abort();
+    assert!(save.await.unwrap_err().is_cancelled());
+    pause.store(false, Ordering::SeqCst);
+    let mut slot = h.orchestrator.inner.state.lock().await;
+    let state = slot.as_mut().unwrap();
+    state.stats.total_runs = 0;
+    h.orchestrator.reconcile(state).await.unwrap();
+    assert_eq!(
+        h.state.written().len(),
+        1,
+        "mandatory tail after cancelled attempt"
+    );
 }

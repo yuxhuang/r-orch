@@ -510,8 +510,7 @@ impl Orchestrator {
 
     async fn save_state(&self, state: &OrchestratorState) -> Result<()> {
         // Invalidate before tracked I/O: failure or cancellation may have
-        // partially written, and must retain the in-memory state for retry.
-        self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
+        // partially written, so equality cannot prove that a save is redundant.
         *self
             .inner
             .persisted_state_bytes
@@ -529,6 +528,8 @@ impl Orchestrator {
 
     /// Only reconciliation's redundant checkpoint may be skipped. Transition
     /// saves still always reach the tracked store, even for identical bytes.
+    /// The lazy-dirty check is defence in depth: callers flush the debounce
+    /// before reconciliation, but pending collector updates must never skip.
     async fn save_reconciled_state(&self, state: &OrchestratorState) -> Result<()> {
         if !self.inner.remote_state_dirty.load(Ordering::SeqCst)
             && !self.inner.lazy_save.lock().await.dirty
