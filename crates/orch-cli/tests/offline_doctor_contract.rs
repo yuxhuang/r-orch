@@ -249,3 +249,19 @@ fn logging_shims_block_and_record_every_adapter_and_git_probe() {
             .collect::<String>()
     );
 }
+
+#[test]
+fn init_in_an_empty_project_reaches_the_git_logging_shim() {
+    let sandbox = Sandbox::new(false);
+    let output = sandbox
+        .orch()
+        .args(["init", "--adapter", "shell", "--name", "control"])
+        .output()
+        .unwrap();
+    let calls = fs::read_to_string(&sandbox.calls).unwrap();
+    assert!(
+        calls.lines().any(|name| name == "git"),
+        "orch init did not reach the git logging shim: calls={calls:?}, output={output:?}"
+    );
+    sandbox.assert_no_runtime();
+}
