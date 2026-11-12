@@ -279,13 +279,14 @@ impl ServiceHandler {
     pub async fn run_maintenance(&self) {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_error = None;
         while !self.coordinator.is_stopping() {
             interval.tick().await;
             if self.coordinator.is_stopping() {
                 break;
             }
             let engine = Arc::clone(&self.engine);
-            if let Err(error) = self
+            let result = self
                 .coordinator
                 .run_op(Lane::Internal, move |_| {
                     Box::pin(async move {
@@ -296,15 +297,22 @@ impl ServiceHandler {
                             .map_err(service_error)
                     })
                 })
-                .await
-            {
-                self.engine
-                    .events
-                    .emit(orch_domain::OrchestratorEvent::OrchestratorError {
-                        error: error.message.to_string(),
-                        context: "local run maintenance".into(),
-                        fatal: false,
-                    });
+                .await;
+            match result {
+                Ok(_) => last_error = None,
+                Err(error) => {
+                    let error = error.message.to_string();
+                    if last_error.as_ref() != Some(&error) {
+                        self.engine.events.emit(
+                            orch_domain::OrchestratorEvent::OrchestratorError {
+                                error: error.clone(),
+                                context: "local run maintenance".into(),
+                                fatal: false,
+                            },
+                        );
+                        last_error = Some(error);
+                    }
+                }
             }
             if let Err(error) = self.expire_context().await {
                 self.engine

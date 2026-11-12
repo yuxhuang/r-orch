@@ -23,11 +23,11 @@ struct FailCreate {
 #[async_trait]
 impl RunStore for FailCreate {
     async fn save(&self, run: &Run) -> Result<()> {
-        if run.status == RunStatus::Preparing {
-            if let Some(arm) = self.arm.lock().unwrap().take() {
-                arm();
-                return Err(Error::other("run create failed"));
-            }
+        if run.status == RunStatus::Preparing
+            && let Some(arm) = self.arm.lock().unwrap().take()
+        {
+            arm();
+            return Err(Error::other("run create failed"));
         }
         self.inner.save(run).await
     }

@@ -808,3 +808,73 @@ async fn maintenance_reconciles_adopted_death_without_dispatch_or_idle_publicati
     assert!(processes.spawned().is_empty());
     daemon.shutdown().await.unwrap();
 }
+
+/// Expiry follows local-run reconciliation in each maintenance iteration, so
+/// removing an expired marker proves a complete owner pass has happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_errors_are_deduplicated_until_a_successful_pass() {
+    async fn pass(daemon: &DaemonHarness, clock: &TestClock) {
+        daemon
+            .engine()
+            .context
+            .set("pass-marker", "v", Some(1))
+            .await
+            .unwrap();
+        let marker = daemon.engine().paths.context_path("pass-marker").unwrap();
+        assert!(marker.exists());
+        clock.advance_ms(2);
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                if !tokio::fs::try_exists(&marker).await.unwrap() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("maintenance did not reach expiry after local reconciliation");
+    }
+    let clock = TestClock::new();
+    let daemon = DaemonHarness::builder()
+        .clock(clock.clone())
+        .start()
+        .await
+        .unwrap();
+    let path = daemon.project_root().join(".orchestry/state.json");
+    let stored = std::fs::read(&path).unwrap();
+    let mut events = daemon.engine().events.subscribe();
+    std::fs::write(&path, b"invalid state json").unwrap();
+    for _ in 0..3 {
+        pass(&daemon, &clock).await;
+    }
+    let failures = |events: Vec<Arc<orch_domain::OrchestratorEvent>>| {
+        events
+            .into_iter()
+            .filter(|event| {
+                matches!(event.as_ref(),
+            orch_domain::OrchestratorEvent::OrchestratorError {context, fatal: false, ..}
+            if context == "local run maintenance")
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = failures(events.try_drain());
+    std::fs::write(&path, &stored).unwrap();
+    pass(&daemon, &clock).await;
+    let recovery = failures(events.try_drain());
+    std::fs::write(&path, b"invalid state json").unwrap();
+    pass(&daemon, &clock).await;
+    let second = failures(events.try_drain());
+    std::fs::write(&path, &stored).unwrap();
+    daemon.shutdown().await.unwrap();
+    assert_eq!(
+        first.len(),
+        1,
+        "one error for repeated failing passes: {first:?}"
+    );
+    assert!(recovery.is_empty(), "a successful pass is not an error");
+    assert_eq!(second.len(), 1, "recovery must reset error suppression");
+    assert_eq!(
+        first[0], second[0],
+        "same failure must be reported again after recovery"
+    );
+}
