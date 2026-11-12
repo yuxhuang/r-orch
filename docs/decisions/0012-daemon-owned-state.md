@@ -258,14 +258,19 @@ authorize client recovery side effects, release or merge.
     initializer (`tui::first_run`). No command reached any of them. PR 4 deletes them with their unit tests.
     What stays is the structured logger and its sink options, the event formatting functions, offline `orch
     init` behind the daemon's bootstrap facade, and the socket-backed `serve`, `run` and `logs` commands. The
-    contracts the old tests pinned (the terminal-batch rule, start-up diagnostics, ordered and complete log
-    delivery, peer lifecycle, and a finished client batch leaving the daemon up) are now pinned by daemon
-    tests instead.
+    contracts the old tests pinned (start-up diagnostics, ordered and complete log delivery, peer lifecycle,
+    a finished client batch leaving the daemon up, and the terminal-batch rule except for one case) are now
+    pinned by daemon tests instead. The one case is dropped: the old `--once` code reported all tasks done
+    (or a failure) when a stop arrived after every task was already terminal; the daemon checks a pending
+    stop first and reports the batch as interrupted, and no test pins either order. That precedence is not a
+    daemon contract.
 
-    Reasons: R38 and goal row 2 say no client links the stores. Decision 4's crate-graph and source gates
-    cannot be tightened while `orch-cli` still contains code that builds a store container, starts the
-    orchestrator or spawns a probe, even uncalled. Deleting it also removes any code a later change could
-    reach for as a "fallback" when no daemon answers, which the owner ruled out in decision 1.
+    Reasons: R3 and source item 2 of the spec say no client links the stores. Decision 4's crate-graph and
+    source gates cannot be tightened while `orch-cli` still contains code that builds a store container,
+    starts the orchestrator or spawns a doctor probe, even uncalled. (`orch init`'s adapter detection is a
+    probe that stays and is called: see the exception in the Consequences.) Deleting the code also removes
+    any code a later change could reach for as a "fallback" when no daemon answers, which the owner ruled
+    out in decision 1.
 
     Consequences for the owner: to learn which agent CLIs are installed, start the daemon first (it starts
     with dispatch off), then run `orch doctor`; before that, doctor only says where the project is and
@@ -274,7 +279,9 @@ authorize client recovery side effects, release or merge.
     summary. With `--json`, the offline output is the same plain-text note, not JSON; the JSON report needs the daemon. No other command
     changes: the deleted frontends had no caller, so `orch serve`, `orch run`, `orch logs` and bare `orch`
     behave as decisions 2, 3 and 7 describe. The unpublished `orch_cli` library no longer exports
-    `serve::run`, `serve::run_with`, `ServeOrchestrator`, `OnceResult`, `logs::run` or `tui::first_run`.
+    `serve::run`, `serve::run_with`, `serve::ServeArgs`, `serve::ServeOrchestrator`, `serve::OnceResult`,
+    `serve::ONCE_POLL_INTERVAL`, the `serve::once` module (with `run_once`), `logs::run`, `logs::LogsDeps`,
+    `doctor::run`, `doctor::container_less_registry` or `tui::first_run`.
 
 ## Alternatives considered
 
@@ -323,8 +330,10 @@ authorize client recovery side effects, release or merge.
   increases upgrade cost, but the approved frozen stop defines recovery with either binary; two-executable acceptance remains unmet at
   PR 1 and is assigned to PR 2 T2a (harness skew is not that evidence).
 - With no daemon, `orch doctor` tells the owner where the project is and whether a discovery record exists,
-  and nothing about installed agent CLIs; those checks need a running daemon (decision 14). The CLI no longer
-  contains any code that builds stores, runs the orchestrator or probes adapters in its own process.
+  and nothing about installed agent CLIs; those checks need a running daemon (decision 14). Apart from the
+  adapter detection of `orch init`, which stays because init runs without a daemon (it runs `--version` on
+  each agent CLI when `--adapter` is not given), the CLI no longer contains any code that builds stores,
+  runs the orchestrator or probes adapters in its own process; `orch doctor` has none.
 - Tests mostly retain their in-process model. Binary tests explicitly start an isolated test daemon and never
   connect to a real project or real global configuration. Mac QA and Linux CI cover different OS boundaries.
 - Four stacked PRs deliver the transition under decision 13. PR 1 is explicitly developmental; PR 2 has no
