@@ -535,6 +535,14 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn stale_socket_helper_binds_without_descendants() {
+        let Some(path) = std::env::var_os("ORCH_TEST_DISCOVERY_STALE_SOCKET") else {
+            return;
+        };
+        let (_listener, _, _) = bind_private(Path::new(&path)).unwrap();
+    }
+
     #[tokio::test]
     async fn stale_socket_classification_never_targets_files_links_or_live_listeners() {
         let dir = short_dir();
@@ -542,11 +550,36 @@ mod tests {
         assert_eq!(classify_socket(&path).await.unwrap(), SocketState::Absent);
 
         // Live: a bound, listening socket.
-        let (listener, _, _) = bind_private(&path).unwrap();
-        let listener = tokio::net::UnixListener::from_std(listener).unwrap();
-        assert_eq!(classify_socket(&path).await.unwrap(), SocketState::Live);
-        // Stale: the listener is gone but the file remains.
-        drop(listener);
+        let live_path = dir.path().join("live");
+        let (listener, _, _) = bind_private(&live_path).unwrap();
+        let _listener = tokio::net::UnixListener::from_std(listener).unwrap();
+        assert_eq!(
+            classify_socket(&live_path).await.unwrap(),
+            SocketState::Live
+        );
+        // The stale descriptor never enters this runner, where a sibling's
+        // fork could retain it. The child binds without spawning descendants;
+        // waiting for its exit proves the socket has no remaining listener.
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "discovery::tests::stale_socket_helper_binds_without_descendants",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("HOME", dir.path())
+            .env("TMPDIR", dir.path())
+            .env(
+                "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                dir.path().join("global.yml"),
+            )
+            .env("ORCH_TEST_DISCOVERY_STALE_SOCKET", &path)
+            .current_dir(dir.path())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "stale socket helper: {output:?}");
         let state = classify_socket(&path).await.unwrap();
         let SocketState::Stale { dev, ino } = state else {
             panic!("expected stale, got {state:?}");
