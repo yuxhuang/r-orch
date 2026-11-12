@@ -693,8 +693,55 @@ impl Orchestrator {
                             },
                         );
                         state.claimed.shift_remove(task_id);
+                        if let Err(error) = self.save_state(state).await {
+                            use orch_core::storage::TaskStore;
+
+                            // Nothing was submitted. Restore the slot while we
+                            // still hold its lock, before any debounce can write
+                            // it. The preparing owner stays for error-path release.
+                            state.running.shift_remove(task_id);
+                            state.claimed.insert(task_id.to_owned());
+                            // The InProgress save already spent this attempt.
+                            // Use the same retry policy as fail_before_spawn,
+                            // without treating a remote agent as a local one or
+                            // inserting an unsubmitted run for its failure handler.
+                            let recorded = async {
+                                self.deps().run_service.finish(
+                                    &run.id, RunStatus::Failed, None, Some(error.to_string()),
+                                ).await?;
+                                let fresh = self.deps().task_service.get(task_id).await?;
+                                let status = orch_domain::resolve_failure_status(&fresh);
+                                self.deps().task_service.update_status(task_id, status).await?;
+                                if status == TaskStatus::Retrying {
+                                    let delay = orch_domain::calculate_retry_delay(
+                                        fresh.attempts.saturating_sub(1),
+                                        self.config().scheduling.retry_base_delay_ms,
+                                        self.config().scheduling.retry_max_delay_ms,
+                                    );
+                                    self.enqueue_retry(state, task_id, fresh.attempts + 1, delay, &error.to_string());
+                                    self.emit(OrchestratorEvent::RunRetry {
+                                        run_id: run.id.clone(), attempt: fresh.attempts + 1, delay_ms: delay,
+                                    });
+                                } else {
+                                    self.inner.cached_tasks.invalidate_async().await;
+                                    let tasks = self.inner.cached_tasks.list(&Default::default()).await?;
+                                    self.cascade_fail_dependents(task_id, &tasks,
+                                        &format!("dependency {task_id} failed: {error}")).await;
+                                    state.stats.total_tasks_failed += 1;
+                                }
+                                state.stats.total_runs += 1;
+                                self.emit(OrchestratorEvent::AgentError {
+                                    run_id: run.id.clone(), agent_id: agent.id.clone(),
+                                    error: error.to_string(), error_kind: None,
+                                });
+                                self.save_remote_state(state).await
+                            }.await;
+                            if let Err(record_error) = recorded {
+                                self.emit_error(record_error, format!("record remote pre-submit failure for {task_id}"));
+                            }
+                            return Err(error);
+                        }
                         self.inner.preparing_agents.lock().await.remove(task_id);
-                        self.save_state(state).await?;
                         let request = orch_core::remote::RemoteSubmit {
                             alias: remote.alias.clone(),
                             exec_key: run.id.clone(),
