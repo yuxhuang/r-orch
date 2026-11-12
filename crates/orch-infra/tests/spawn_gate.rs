@@ -12,8 +12,13 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
     ),
     (
         "orch-cli/src/commands/init.rs",
-        2,
-        "explicit initialization client; never serves a daemon",
+        1,
+        "adapter version probe in the explicit initialization client",
+    ),
+    (
+        "orch-daemon/src/bootstrap.rs",
+        1,
+        "offline init git helper; serving lifecycle never calls initialize",
     ),
     ("orch-cli/src/editor.rs", 1, "editor runs in the CLI client"),
     (
