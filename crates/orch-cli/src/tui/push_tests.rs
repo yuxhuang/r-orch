@@ -815,7 +815,7 @@ fn tui_keyword_retry_refetches_after_repeated_outages_and_failed_connects() {
 fn tui_production_retry_handoff_keeps_keywords_and_modes_and_resets_on_quit() {
     use super::command::{DashboardUi, run_dashboard_with_ui};
     use super::no_daemon::Choice;
-    use orch_tui::state::{AgentGroupBy, AgentSortField, InputMode};
+    use orch_tui::state::{AgentGroupBy, AgentSortField, GoalSort, InputMode, TaskSort};
     use orch_tui::{App, DashboardDriver, Exit, ViewId, ViewIntent};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -918,6 +918,12 @@ fn tui_production_retry_handoff_keeps_keywords_and_modes_and_resets_on_quit() {
                 key(app, 'b');
                 app.state.view = ViewId::Tasks;
                 key(app, 'g');
+                key(app, 'o');
+                key(app, 'O');
+                app.state.view = ViewId::Goals;
+                key(app, 'o');
+                key(app, 'o');
+                key(app, 'O');
                 *self.retained.lock().unwrap() = Some(app.state.view_intent());
             } else {
                 for (view, text) in keywords {
@@ -927,6 +933,16 @@ fn tui_production_retry_handoff_keeps_keywords_and_modes_and_resets_on_quit() {
                         "keyword through production handoff"
                     );
                 }
+                assert_eq!(
+                    app.state.task_sort,
+                    TaskSort::default().cycled().reversed(),
+                    "Tasks sort through production handoff"
+                );
+                assert_eq!(
+                    app.state.goal_sort,
+                    GoalSort::default().cycled().cycled().reversed(),
+                    "Goals sort through production handoff"
+                );
                 assert_eq!(
                     app.state.agent_sort.field,
                     AgentSortField::Name,
@@ -958,7 +974,7 @@ fn tui_production_retry_handoff_keeps_keywords_and_modes_and_resets_on_quit() {
                 return Ok(Exit::Requested);
             }
             // Deliberately leave transient state behind. It must not cross the
-            // reconnect even though the six pieces of list intent do.
+            // reconnect even though the eight pieces of list intent do.
             app.state.view = ViewId::Agents;
             app.state.task_selected = 2;
             app.state.agent_selected = 2;
