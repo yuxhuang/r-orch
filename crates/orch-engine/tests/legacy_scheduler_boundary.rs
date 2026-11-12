@@ -137,18 +137,20 @@ fn no_features(source: &str, manifest: &str) -> bool {
 
 fn unused_allow_count(source: &str) -> usize {
     let source = compact(source);
-    source
-        .split(concat!("allow", "("))
-        .skip(1)
-        .filter(|attribute| {
-            attribute
-                .split(')')
-                .next()
-                .unwrap()
-                .split(',')
-                .any(|lint| lint == "dead_code" || lint.starts_with("unused"))
+    ["allow", "expect"]
+        .into_iter()
+        .map(|kind| {
+            source
+                .split(&format!("{kind}("))
+                .skip(1)
+                .filter(|attribute| {
+                    attribute.split(')').next().unwrap().split(',').any(|lint| {
+                        lint == "dead_code" || lint.starts_with("unused") || lint == "warnings"
+                    })
+                })
+                .count()
         })
-        .count()
+        .sum()
 }
 
 #[test]
@@ -232,13 +234,19 @@ fn boundary_checks_reject_missing_misplaced_and_unconditional_gates() {
 #[test]
 fn normal_library_has_no_feature_escape_or_unused_allowance() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let manifest = read(&root.join("Cargo.toml"));
+    let manifest_path = root.join("Cargo.toml");
+    let manifest = read(&manifest_path);
+    assert!(
+        no_features("", &manifest),
+        "feature table in {}",
+        manifest_path.display()
+    );
     let mut files = Vec::new();
     rust_files(&root.join("src"), &mut files);
     assert!(files.len() > 50, "empty or incomplete source scan");
     for path in files {
         assert!(
-            no_features(&read(&path), &manifest),
+            no_features(&read(&path), ""),
             "feature gate in {}",
             path.display()
         );
@@ -269,12 +277,23 @@ fn policy_checks_have_positive_controls() {
     ));
     assert!(!no_features("", "[features]\nlegacy = []"));
     assert_eq!(unused_allow_count("#[cfg(test)] fn legacy() {}"), 0);
-    assert_eq!(
-        unused_allow_count(&format!("#[{}(dead_code)] fn legacy() {{}}", "allow")),
-        1
-    );
-    assert_eq!(
-        unused_allow_count(&format!("#[{}( unused_imports )] use legacy;", "allow")),
-        1
-    );
+    for kind in ["allow", "expect"] {
+        assert_eq!(
+            unused_allow_count(&format!("#[{kind}(clippy::all, reason = \"fixture\")]")),
+            0
+        );
+        for lint in ["dead_code", "unused", "unused_imports", "warnings"] {
+            let attribute = format!("{kind}( {lint}, reason = \"fixture\" )");
+            assert_eq!(
+                unused_allow_count(&format!("#[{attribute}] fn legacy() {{}}")),
+                1
+            );
+            assert_eq!(
+                unused_allow_count(&format!(
+                    "#[cfg_attr(not(test), {attribute})] fn legacy() {{}}"
+                )),
+                1
+            );
+        }
+    }
 }
