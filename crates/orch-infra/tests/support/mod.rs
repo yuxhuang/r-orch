@@ -291,18 +291,33 @@ impl ScriptedProcessManager {
         self.graceful_kills.lock().expect("graceful kills").clone()
     }
 
-    /// What the adapter wrote to the child's stdin, once the capture has seen
-    /// it and stopped growing. `None` if nothing arrived within the timeout.
+    /// What the adapter wrote to the child's stdin, including the EOF marker.
+    /// `None` if the capture did not complete within the timeout.
     pub async fn stdin_capture(&self) -> Option<String> {
         let path = self.dir.path().join("stdin");
-        let mut previous = String::new();
         for _ in 0..200 {
             tokio::time::sleep(Duration::from_millis(10)).await;
             let contents = std::fs::read_to_string(&path).unwrap_or_default();
-            if !contents.is_empty() && contents == previous {
+            if contents.ends_with(STDIN_EOF_MARKER) {
                 return Some(contents);
             }
-            previous = contents;
+        }
+        None
+    }
+
+    /// Observe a newline-terminated stdin frame without waiting for EOF.
+    /// Return the whole file after one settle interval, including any EOF marker.
+    /// `None` if the frame and settle read do not fit within 200 ten-millisecond polls.
+    pub async fn stdin_open_frame(&self) -> Option<String> {
+        let path = self.dir.path().join("stdin");
+        let mut settle = false;
+        for _ in 0..200 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let contents = std::fs::read_to_string(&path).unwrap_or_default();
+            if settle {
+                return Some(contents);
+            }
+            settle = contents.contains('\n');
         }
         None
     }
@@ -650,5 +665,148 @@ pub fn exited(code: i32) -> ExitOutcome {
     ExitOutcome {
         code: Some(code),
         signal: None,
+    }
+}
+
+#[cfg(test)]
+mod stdin_capture_tests {
+    use super::{Duration, STDIN_EOF_MARKER, ScriptedProcessManager};
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn unchanged_prefix_waits_for_the_rest_and_returns_the_complete_capture() {
+        let pm = ScriptedProcessManager::silent();
+        let path = pm.dir.path().join("stdin");
+        std::fs::write(&path, "prefix").expect("write prefix");
+        let complete = format!("prefix\nrest{STDIN_EOF_MARKER}");
+
+        let writer = async {
+            // The prefix is unchanged at the 10, 20 and 30 ms polls.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            std::fs::write(&path, &complete).expect("complete capture");
+        };
+        let (captured, ()) = tokio::join!(pm.stdin_capture(), writer);
+
+        assert_eq!(captured.as_deref(), Some(complete.as_str()));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn missing_capture_returns_none_at_the_existing_bound() {
+        let pm = ScriptedProcessManager::silent();
+        let started = tokio::time::Instant::now();
+
+        let captured = pm.stdin_capture().await;
+
+        assert_eq!(
+            (captured, started.elapsed()),
+            (None, Duration::from_secs(2))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn capture_without_a_marker_returns_none_within_the_existing_bound() {
+        let pm = ScriptedProcessManager::silent();
+        std::fs::write(pm.dir.path().join("stdin"), "unfinished").expect("write prefix");
+        let started = tokio::time::Instant::now();
+
+        let captured = pm.stdin_capture().await;
+
+        assert_eq!(
+            (captured, started.elapsed() <= Duration::from_secs(2)),
+            (None, true)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn completed_empty_input_returns_the_marker_unchanged() {
+        let pm = ScriptedProcessManager::silent();
+        std::fs::write(pm.dir.path().join("stdin"), STDIN_EOF_MARKER)
+            .expect("write completed empty capture");
+
+        assert_eq!(pm.stdin_capture().await.as_deref(), Some(STDIN_EOF_MARKER));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn unchanged_partial_frame_waits_for_the_newline_and_returns_the_whole_frame() {
+        let pm = ScriptedProcessManager::silent();
+        let path = pm.dir.path().join("stdin");
+        std::fs::write(&path, "partial").expect("write partial frame");
+        let writer = async {
+            // No terminator at the 10, 20 and 30 ms polls.
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            std::fs::write(&path, "partial frame\n").expect("complete frame");
+        };
+        let (observed, ()) = tokio::join!(pm.stdin_open_frame(), writer);
+
+        assert_eq!(observed.as_deref(), Some("partial frame\n"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn missing_open_frame_returns_none_at_the_existing_bound() {
+        let pm = ScriptedProcessManager::silent();
+        let started = tokio::time::Instant::now();
+
+        let observed = pm.stdin_open_frame().await;
+
+        assert_eq!(
+            (observed, started.elapsed()),
+            (None, Duration::from_secs(2))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn frame_without_a_newline_returns_none_within_the_existing_bound() {
+        let pm = ScriptedProcessManager::silent();
+        std::fs::write(pm.dir.path().join("stdin"), "unfinished").expect("write partial frame");
+        let started = tokio::time::Instant::now();
+
+        let observed = pm.stdin_open_frame().await;
+
+        assert_eq!(
+            (observed, started.elapsed() <= Duration::from_secs(2)),
+            (None, true)
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn closed_stdin_frame_returns_the_eof_marker_unchanged() {
+        let pm = ScriptedProcessManager::silent();
+        let contents = format!("frame\n{STDIN_EOF_MARKER}");
+        std::fs::write(pm.dir.path().join("stdin"), &contents).expect("write closed stdin");
+
+        assert_eq!(
+            pm.stdin_open_frame().await.as_deref(),
+            Some(contents.as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn bytes_arriving_during_the_settle_interval_are_returned() {
+        let pm = ScriptedProcessManager::silent();
+        let path = pm.dir.path().join("stdin");
+        std::fs::write(&path, "first\n").expect("write complete line");
+        let writer = async {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            std::fs::write(&path, "first\nsecond\n").expect("write during settle interval");
+        };
+        let (observed, ()) = tokio::join!(pm.stdin_open_frame(), writer);
+
+        assert_eq!(observed.as_deref(), Some("first\nsecond\n"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn frame_first_seen_on_the_last_poll_returns_none_without_exceeding_the_bound() {
+        let pm = ScriptedProcessManager::silent();
+        let path = pm.dir.path().join("stdin");
+        let started = tokio::time::Instant::now();
+        let writer = async {
+            tokio::time::sleep(Duration::from_millis(1995)).await;
+            std::fs::write(&path, "last\n").expect("write before last poll");
+        };
+        let (observed, ()) = tokio::join!(pm.stdin_open_frame(), writer);
+
+        assert_eq!(
+            (observed, started.elapsed()),
+            (None, Duration::from_secs(2))
+        );
     }
 }

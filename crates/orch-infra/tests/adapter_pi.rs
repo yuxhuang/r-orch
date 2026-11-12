@@ -98,7 +98,7 @@ async fn writes_one_jsonl_prompt_frame_and_keeps_stdin_open() {
         .execute(params("do work", "/tmp/pi-ws"))
         .expect("execute");
 
-    let captured = pm.stdin_capture().await.expect("stdin was written");
+    let captured = pm.stdin_open_frame().await.expect("stdin was written");
     assert!(captured.ends_with('\n'), "the frame is newline-terminated");
     assert!(
         !captured.contains(STDIN_EOF_MARKER),
