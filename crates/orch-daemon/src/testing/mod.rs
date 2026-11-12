@@ -10,9 +10,11 @@
 //! tests that need one. Seams map to existing engine injections.
 //!
 //! Hermetic by construction: the project is a fresh temp dir (or the
-//! caller's), `global.yml` lives in a harness-owned temp dir unless the test
-//! names one, and a bound socket sits at a short path under `/tmp`. Nothing
-//! here reads `~/.orchestry` or dials a daemon the harness did not start.
+//! caller's). Children and discovery get an immutable private HOME, TMPDIR,
+//! global config path and empty executable directory on PATH. Tests may replace
+//! that environment explicitly. The scratch directory, including a bound socket
+//! at a short path under `/tmp`, is retained until accepted work drains. Nothing
+//! here dials a daemon the harness did not start.
 
 use crate::DaemonError;
 use crate::lifecycle::{BringUp, DaemonExit, DispatchMode, Running, internal_context};
@@ -115,11 +117,11 @@ impl HarnessBuilder {
         self
     }
 
-    /// Replace the inherited environment for this daemon's child processes
-    /// and diagnostics. The normal daemon sanitizer is still applied; no
-    /// ambient variables are merged in. Supply private HOME/CODEX_HOME and a
-    /// PATH containing test-owned adapters when driving model discovery.
-    /// Without this seam the harness keeps its existing inherited environment.
+    /// Replace the private default environment for this daemon's child processes
+    /// and diagnostics. The normal daemon sanitizer is still applied; neither
+    /// ambient variables nor harness defaults are merged in. Supply private
+    /// HOME/TMPDIR/global config paths and a PATH containing test-owned adapters
+    /// when driving model discovery or launch.
     pub fn environment(
         mut self,
         vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
@@ -203,8 +205,8 @@ impl HarnessBuilder {
         let spawn_domain = self
             .isolated_fake_spawns
             .then(orch_infra::process::gate::SpawnDomain::for_synthetic_processes);
-        // Short, private and harness-owned: the socket (when bound) and the
-        // default global.yml.
+        // Short, private and retained through the drain: the socket (when
+        // bound), default global.yml and the child environment directories.
         let scratch = tempfile::Builder::new()
             .prefix("od-")
             .permissions(std::os::unix::fs::PermissionsExt::from_mode(0o700))
@@ -213,14 +215,39 @@ impl HarnessBuilder {
                 crate::discovery::io_error("create the harness scratch dir", source)
             })?;
         let socket = self.on_socket.then(|| scratch.path().join("s"));
+        let global_config_path = self
+            .global_config_path
+            .unwrap_or_else(|| scratch.path().join("global.yml"));
+        let snapshot = match self.environment {
+            Some(environment) => environment,
+            None => {
+                let home = scratch.path().join("home");
+                let tmp = scratch.path().join("tmp");
+                let bin = scratch.path().join("bin");
+                for directory in [&home, &tmp, &bin] {
+                    std::fs::create_dir(directory).map_err(|source| {
+                        crate::discovery::io_error("create a harness environment directory", source)
+                    })?;
+                }
+                crate::env::capture([
+                    ("HOME".into(), home.into_os_string()),
+                    ("TMPDIR".into(), tmp.into_os_string()),
+                    // An existing empty directory prevents both ambient lookup
+                    // and the OS fallback search used when PATH is absent.
+                    ("PATH".into(), bin.into_os_string()),
+                    (
+                        "ORCHESTRY_GLOBAL_CONFIG_PATH".into(),
+                        global_config_path.clone().into_os_string(),
+                    ),
+                ])
+            }
+        };
         let defaults = orch_engine::container::EngineSeams::default();
         let seams = orch_engine::container::EngineSeams {
             clock: self.clock.unwrap_or(defaults.clock),
             ids: self.ids.unwrap_or(defaults.ids),
-            global_config_path: Some(
-                self.global_config_path
-                    .unwrap_or_else(|| scratch.path().join("global.yml")),
-            ),
+            global_config_path: Some(global_config_path),
+            claude_prompt_directory: Some(scratch.path().join("claude-prompts")),
         };
         let mut running = Running::bring_up_with_spawn_domain(
             BringUp {
@@ -232,9 +259,7 @@ impl HarnessBuilder {
                 seams,
                 processes: self.processes,
                 versions: self.versions,
-                snapshot: self
-                    .environment
-                    .unwrap_or_else(|| crate::env::capture(std::env::vars_os())),
+                snapshot,
             },
             self.maintenance_timer.unwrap_or(true),
             spawn_domain,

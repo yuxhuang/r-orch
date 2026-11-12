@@ -1,5 +1,6 @@
 //! Registry construction and the registration order.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use orch_core::adapter::AdapterRegistry;
@@ -57,11 +58,31 @@ pub fn build_registry_with_clock_and_spawn_domain(
     clock: Arc<dyn Clock>,
     domain: crate::process::gate::SpawnDomain,
 ) -> AdapterRegistry {
+    build_registry_with_clock_spawn_domain_and_prompt_directory(
+        process_manager,
+        clock,
+        domain,
+        None,
+    )
+}
+
+/// Assemble the same adapters with an optional private Claude prompt directory.
+/// `None` preserves the runtime/temp directory resolution of the default registry.
+pub fn build_registry_with_clock_spawn_domain_and_prompt_directory(
+    process_manager: Arc<dyn ProcessManager>,
+    clock: Arc<dyn Clock>,
+    domain: crate::process::gate::SpawnDomain,
+    claude_prompt_directory: Option<PathBuf>,
+) -> AdapterRegistry {
     let pm = || Arc::clone(&process_manager);
     let tick = || Arc::clone(&clock);
 
     let mut registry = AdapterRegistry::new();
-    registry.register(Arc::new(ClaudeAdapter::new(pm()).with_clock(tick())));
+    registry.register(Arc::new(
+        ClaudeAdapter::new(pm())
+            .with_clock(tick())
+            .with_system_prompt_directory(claude_prompt_directory),
+    ));
     registry.register(Arc::new(CodexAdapter::new(pm()).with_clock(tick())));
     registry.register(Arc::new(CursorAdapter::new(pm()).with_clock(tick())));
     registry.register(Arc::new(ShellAdapter::new(pm()).with_clock(tick())));

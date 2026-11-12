@@ -33,8 +33,8 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
     ),
     (
         "orch-infra/src/adapters/claude.rs",
-        2,
-        "cfg(test) child cleanup fixtures",
+        3,
+        "cfg(test) two child cleanup fixtures and the fresh-process child of the default-prompt-directory equivalence test",
     ),
     (
         "orch-infra/src/adapters/util.rs",
