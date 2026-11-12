@@ -486,6 +486,13 @@ fn workspace_edges(metadata: &Value) -> Result<Edges> {
 
 fn graph_problems(actual: &Edges) -> Vec<String> {
     let mut problems = Vec::new();
+    for (owner, _) in DEV_ALLOWED {
+        if !actual.contains_key(*owner) {
+            problems.push(format!(
+                "stale dev allowance owner `{owner}` is not a workspace crate"
+            ));
+        }
+    }
     for name in actual.keys() {
         if !ALLOWED.iter().any(|(n, _)| n == name) {
             problems.push(format!(
@@ -956,14 +963,36 @@ fn cli_file_problems(file: &str, text: &str) -> Vec<String> {
             }
         }
     }
-    for token in tokens.iter().filter(|t| t.literal) {
+    // Inspect only module-loading literals: a diagnostic string is not an
+    // import, but a relative/raw path or concat! inside include! can load a fixture.
+    let mut module_paths = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        if token.text == "#" && tokens.get(i + 1).is_some_and(|t| t.text == "[") {
+            let end = group_end(&tokens, i + 1);
+            for attribute in tokens[i + 2..end - 1].windows(3) {
+                if attribute[0].text == "path" && attribute[1].text == "=" && attribute[2].literal {
+                    module_paths.push(&attribute[2]);
+                }
+            }
+        }
+        if token.text == "include"
+            && tokens.get(i + 1).is_some_and(|t| t.text == "!")
+            && tokens.get(i + 2).is_some_and(|t| t.text == "(")
+        {
+            module_paths.extend(
+                tokens[i + 3..group_end(&tokens, i + 2) - 1]
+                    .iter()
+                    .filter(|t| t.literal),
+            );
+        }
+    }
+    for token in module_paths {
         for (root, _, _) in CLI_TEST_ROOTS {
-            if token.text.trim_matches('"')
-                == Path::new(root)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-            {
+            let basename = Path::new(root)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if token.text.contains(basename) {
                 problems.push(format!(
                     "crates/orch-cli/src/{file}:{}: cfg-test path `{root}` loaded in production",
                     token.line
@@ -1310,6 +1339,13 @@ mod tests {
 
     #[test]
     fn stale_kind_allowances_and_promoted_test_features_fail() {
+        let mut missing_owner = edge_fixture();
+        missing_owner.remove("orch-infra");
+        assert!(
+            graph_problems(&missing_owner)
+                .iter()
+                .any(|p| p.contains("stale dev allowance owner `orch-infra`"))
+        );
         let mut actual = edge_fixture();
         actual
             .get_mut("orch-cli")
@@ -1586,5 +1622,30 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    #[test]
+    fn relative_fixture_paths_must_not_promote_test_code() {
+        for text in [
+            "#[path = \"../mcp/tools/remote_tests.rs\"] mod innocent;",
+            "#[path = r\"../commands/org_testing.rs\"] mod innocent;",
+            "include!(\"../mcp/testing.rs\");",
+            "include!(concat!(\"..\", \"/mcp/testing.rs\"));",
+        ] {
+            let problems = cli_file_problems("web/escape.rs", text).join("\n");
+            assert!(
+                problems.contains("web/escape.rs") && problems.contains("loaded in production"),
+                "{text}: {problems}"
+            );
+        }
+        for text in [
+            "let diagnosis = \"remote_tests.rs\";",
+            "let path = \"../mcp/testing.rs\";",
+            "#[cfg(test)] include!(\"../mcp/testing.rs\");",
+        ] {
+            assert!(
+                cli_file_problems("web/escape.rs", text).is_empty(),
+                "{text}"
+            );
+        }
     }
 }
