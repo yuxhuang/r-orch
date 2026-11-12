@@ -280,6 +280,15 @@ async fn reconcile_detects_a_stall_while_the_collector_is_still_reading() {
 
 #[tokio::test]
 async fn reconcile_skips_the_stall_check_once_the_collectors_stream_has_ended() {
+    finishing_collector_keeps_its_outcome(false).await;
+}
+
+#[tokio::test]
+async fn maintenance_preserves_a_finishing_collectors_clean_outcome() {
+    finishing_collector_keeps_its_outcome(true).await;
+}
+
+async fn finishing_collector_keeps_its_outcome(maintenance: bool) {
     // The child went quiet past the stall timeout, then exited cleanly. Its
     // stream has ended and the success handler is queued behind reconcile's
     // state lock: neither the dead PID nor the old stall clock is a failure.
@@ -335,10 +344,17 @@ async fn reconcile_skips_the_stall_check_once_the_collectors_stream_has_ended() 
     }
     assert!(finishing, "the collector never reported its stream ended");
 
-    h.orchestrator
-        .reconcile(slot.as_mut().expect("state loaded"))
-        .await
-        .unwrap();
+    if maintenance {
+        h.orchestrator
+            .reconcile_dead_local_runs(slot.as_mut().expect("state loaded"))
+            .await
+            .unwrap();
+    } else {
+        h.orchestrator
+            .reconcile(slot.as_mut().expect("state loaded"))
+            .await
+            .unwrap();
+    }
     drop(slot);
 
     assert!(

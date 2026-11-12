@@ -11,6 +11,7 @@
 mod auto_review_approve;
 mod autonomous;
 mod bugfixes_2026_03;
+mod cascade_dedup;
 mod collector_publication;
 mod core;
 mod defensive_validation;
@@ -21,6 +22,7 @@ mod force_review;
 pub(crate) mod harness;
 mod mutex;
 mod noop_publication;
+mod orphan_confirmation;
 mod parallel_race;
 mod pause_prelaunch;
 mod perf_opts;
@@ -37,3 +39,7 @@ mod remote;
 mod watch_restart;
 
 mod preparation_stop;
+
+mod failed_state_writes;
+
+mod early_release_cleanup;

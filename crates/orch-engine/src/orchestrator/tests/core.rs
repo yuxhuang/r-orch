@@ -10,7 +10,9 @@ use orch_domain::{
     RunStatus, Task, TaskStatus,
 };
 
-use super::harness::{Harness, NOW_ISO, config_with_concurrency, iso_before, state_running};
+use super::harness::{
+    Harness, NOW_ISO, config_with_concurrency, iso_before, running_entry, state_running,
+};
 
 fn task_at(id: &str, status: TaskStatus) -> Task {
     Task {
@@ -1560,4 +1562,122 @@ async fn a_goal_pause_waits_for_the_dispatch_critical_section() {
     );
     drop(guard);
     assert_eq!(pause.await.unwrap().status, GoalStatus::Paused);
+}
+
+#[tokio::test]
+async fn maintenance_reaps_only_dead_collectorless_local_entries() {
+    let mut state = OrchestratorState::default();
+    let mut tasks = Vec::new();
+    let mut agents = Vec::new();
+    for (name, pid) in [
+        ("dead", 101),
+        ("live", 102),
+        ("active", 103),
+        ("finishing", 104),
+        ("remote", 0),
+        ("cancelled", 105),
+    ] {
+        let task_id = format!("tsk_{name}");
+        let agent_id = format!("agt_{name}");
+        tasks.push(Task {
+            id: task_id.clone(),
+            assignee: Some(agent_id.clone()),
+            attempts: 1,
+            status: if name == "cancelled" {
+                TaskStatus::Cancelled
+            } else {
+                TaskStatus::InProgress
+            },
+            ..make_task()
+        });
+        agents.push(orch_domain::Agent {
+            id: agent_id.clone(),
+            status: AgentStatus::Running,
+            ..make_agent()
+        });
+        let mut entry = running_entry(
+            &task_id,
+            &agent_id,
+            &format!("run_{name}"),
+            pid,
+            &iso_before(700_000),
+        );
+        if name == "remote" {
+            entry.remote = Some(orch_domain::RemoteRunRef::new("worker", "execution"));
+        }
+        state.running.insert(task_id, entry);
+    }
+    let remote = state.running["tsk_remote"].clone();
+    let h = Harness::builder()
+        .tasks(tasks)
+        .agents(agents)
+        .state(state)
+        .build();
+    for name in ["dead", "live", "active", "finishing", "remote", "cancelled"] {
+        h.runs.seed(Run {
+            id: format!("run_{name}"),
+            task_id: format!("tsk_{name}"),
+            agent_id: format!("agt_{name}"),
+            status: RunStatus::Running,
+            ..make_run()
+        });
+    }
+    for pid in [101, 103, 104, 105, 0] {
+        h.processes.set_dead(pid);
+    }
+    h.orchestrator
+        .inner
+        .active_collectors
+        .lock()
+        .await
+        .insert("tsk_active".into());
+    h.orchestrator
+        .inner
+        .finishing_collectors
+        .lock()
+        .await
+        .insert("tsk_finishing".into());
+    h.orchestrator.enable_daemon_mode();
+    h.own_lock();
+    h.orchestrator
+        .daemon_reconcile_dead_local_runs()
+        .await
+        .unwrap();
+    let after = h.persisted_state();
+    assert!(!after.running.contains_key("tsk_dead"));
+    assert_eq!(h.task("tsk_dead").status, TaskStatus::Retrying);
+    assert_eq!(h.runs.peek("run_dead").unwrap().status, RunStatus::Failed);
+    assert!(
+        after
+            .retry_queue
+            .iter()
+            .any(|retry| retry.task_id == "tsk_dead")
+    );
+    assert!(!after.running.contains_key("tsk_cancelled"));
+    assert_eq!(h.task("tsk_cancelled").status, TaskStatus::Cancelled);
+    assert_eq!(
+        h.runs.peek("run_cancelled").unwrap().status,
+        RunStatus::Cancelled
+    );
+    for name in ["live", "active", "finishing", "remote"] {
+        assert!(after.running.contains_key(&format!("tsk_{name}")));
+        assert_eq!(
+            h.task(&format!("tsk_{name}")).status,
+            TaskStatus::InProgress
+        );
+        assert_eq!(
+            h.runs.peek(&format!("run_{name}")).unwrap().status,
+            RunStatus::Running
+        );
+    }
+    assert_eq!(after.running["tsk_remote"], remote);
+    assert!(
+        h.processes.killed_with_grace().is_empty(),
+        "no stall or remote signalling"
+    );
+    assert!(
+        h.events_of(OrchestratorEventType::OrchestratorStallDetected)
+            .is_empty()
+    );
+    assert!(h.processes.spawned().is_empty());
 }

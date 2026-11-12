@@ -39,6 +39,7 @@
 mod collect;
 mod daemon;
 mod dispatch;
+mod preparation_cleanup;
 mod recovery;
 mod remote;
 mod tick;
@@ -92,6 +93,8 @@ const MAX_IMMEDIATE_DISPATCH_RETRIES: u32 = 10;
 const CANCEL_KILL_GRACE: Duration = Duration::from_millis(3_000);
 /// Grace period for the kill that follows stall detection.
 const STALL_KILL_GRACE: Duration = Duration::from_millis(5_000);
+/// Post-kill confirmation shared by daemon recovery and shutdown.
+const DAEMON_KILL_CONFIRMATION: Duration = Duration::from_secs(1);
 /// `proof.agent_summary` cap.
 const MAX_AGENT_SUMMARY_LEN: usize = 2000;
 /// `last_error.message` cap.
@@ -219,6 +222,10 @@ struct Inner {
     last_auto_seed_at: Mutex<HashMap<String, i64>>,
 
     remote_state_dirty: AtomicBool,
+    /// Exact serialized state from the latest successful read or write, never
+    /// a previous tick. Unknown before an attempted write until it succeeds.
+    /// Access is serialized by `state`; this leaf lock never spans I/O.
+    persisted_state_bytes: std::sync::Mutex<Option<Vec<u8>>>,
     remote_bridge: std::sync::RwLock<Arc<dyn orch_core::remote::RemoteBridge>>,
     /// Where dispatch re-reads the project prompt mode; see
     /// [`Orchestrator::set_config_store`].
@@ -242,6 +249,10 @@ struct Inner {
     daemon_mode: AtomicBool,
     daemon_batch_active: AtomicBool,
     preparing_agents: Mutex<HashMap<String, (u64, String)>>,
+    /// Failed releases retain their generation and reservation until both run
+    /// finalization and the claim removal are durable. Restart uses the
+    /// existing claimed/preparing-run sweep instead of a persisted ledger.
+    pending_preparation_cleanup: Mutex<HashMap<String, u64>>,
     preparation_seq: std::sync::atomic::AtomicU64,
     spawn_admission: std::sync::RwLock<Arc<dyn orch_core::process::SpawnAdmission>>,
     deferred_kills: Mutex<Vec<(String, orch_domain::RunningEntry, String)>>,
@@ -309,6 +320,7 @@ impl Orchestrator {
         let orchestrator = Orchestrator {
             inner: Arc::new(Inner {
                 remote_state_dirty: AtomicBool::new(false),
+                persisted_state_bytes: std::sync::Mutex::new(None),
                 remote_bridge: std::sync::RwLock::new(Arc::new(
                     orch_core::remote::NoopRemoteBridge,
                 )),
@@ -333,6 +345,7 @@ impl Orchestrator {
                 daemon_mode: AtomicBool::new(false),
                 daemon_batch_active: AtomicBool::new(false),
                 preparing_agents: Mutex::new(HashMap::new()),
+                pending_preparation_cleanup: Mutex::new(HashMap::new()),
                 preparation_seq: std::sync::atomic::AtomicU64::new(0),
                 spawn_admission: std::sync::RwLock::new(Arc::new(
                     orch_core::process::NoopSpawnAdmission,
@@ -485,14 +498,53 @@ impl Orchestrator {
         {
             self.save_state(state).await?;
         }
-        *slot = Some(self.deps().state_store.read().await?);
+        let state = self.deps().state_store.read().await?;
+        *self
+            .inner
+            .persisted_state_bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = serde_json::to_vec(&state).ok();
+        *slot = Some(state);
         Ok(())
     }
 
     async fn save_state(&self, state: &OrchestratorState) -> Result<()> {
+        // Invalidate before tracked I/O: failure or cancellation may have
+        // partially written, so equality cannot prove that a save is redundant.
+        *self
+            .inner
+            .persisted_state_bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         self.deps().state_store.write(state).await?;
+        *self
+            .inner
+            .persisted_state_bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = serde_json::to_vec(state).ok();
         self.inner.remote_state_dirty.store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Only reconciliation's redundant checkpoint may be skipped. Transition
+    /// saves still always reach the tracked store, even for identical bytes.
+    /// The lazy-dirty check is defence in depth: callers flush the debounce
+    /// before reconciliation, but pending collector updates must never skip.
+    async fn save_reconciled_state(&self, state: &OrchestratorState) -> Result<()> {
+        if !self.inner.remote_state_dirty.load(Ordering::SeqCst)
+            && !self.inner.lazy_save.lock().await.dirty
+            && let Some(bytes) = serde_json::to_vec(state).ok()
+            && self
+                .inner
+                .persisted_state_bytes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                == Some(&bytes)
+        {
+            return Ok(());
+        }
+        self.save_state(state).await
     }
 
     async fn save_remote_state(&self, state: &OrchestratorState) -> Result<()> {

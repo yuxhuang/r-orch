@@ -4,6 +4,43 @@ use orch_domain::RunStatus;
 use super::super::Orchestrator;
 
 impl Orchestrator {
+    /// The process port can return immediately after SIGKILL. Confirm only
+    /// liveness of the already-selected PID; this grants no signal authority.
+    pub(super) async fn daemon_confirm_child_stopped(&self, pid: u32) -> bool {
+        if !self.deps().processes.is_alive(pid) {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + super::super::DAEMON_KILL_CONFIRMATION;
+        loop {
+            let next = tokio::time::Instant::now() + std::time::Duration::from_millis(10);
+            tokio::time::sleep_until(next.min(deadline)).await;
+            // Also probe after the final sleep, at the deadline.
+            if !self.deps().processes.is_alive(pid) {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
+    pub(super) fn daemon_survivor_identity(run_id: &str, pid: u32) -> String {
+        // Saved metadata can be hand-edited: bound each identifier and keep
+        // control characters from adding diagnostic lines.
+        let run_id: String = run_id
+            .chars()
+            .take(64)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        format!("run {run_id}, PID {pid}")
+    }
+
     /// Recover under lifecycle ownership acquired by orch-daemon. No PID lock
     /// is acquired or released here, and orphan children are reaped externally.
     pub async fn daemon_initialize(&self) -> Result<()> {
@@ -29,6 +66,7 @@ impl Orchestrator {
             })
             .await
             .value?;
+        let mut failures = Vec::new();
         for run in &orphaned {
             if !run.agent_id.contains('@')
                 && let Some(pid) = run.pid
@@ -38,12 +76,16 @@ impl Orchestrator {
                     .processes
                     .kill_with_grace(pid, orch_core::process::DEFAULT_KILL_GRACE)
                     .await;
-                if self.deps().processes.is_alive(pid) {
-                    return Err(Error::other(
-                        "Daemon recovery could not stop an orphaned local child",
-                    ));
+                if !self.daemon_confirm_child_stopped(pid).await {
+                    failures.push(Self::daemon_survivor_identity(&run.id, pid));
                 }
             }
+        }
+        if !failures.is_empty() {
+            return Err(Error::other(format!(
+                "Daemon recovery could not stop an orphaned local child: {}",
+                failures.join("; ")
+            )));
         }
         boundary
             .run(false, async {

@@ -41,6 +41,7 @@ tracing.workspace = true
 orch-core = { workspace = true, features = ["test-support"] }
 insta.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

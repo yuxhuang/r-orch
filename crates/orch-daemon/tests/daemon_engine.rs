@@ -555,3 +555,326 @@ async fn mode_enforced_daemon_side_with_raw_client() {
     assert!(!reaper.alive(pid));
     daemon.shutdown().await.unwrap();
 }
+
+/// Recovery adopts live local PIDs without creating collectors. Their later
+/// death is owner maintenance, even while all scheduling stays switched off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_reconciles_adopted_death_without_dispatch_or_idle_publication() {
+    #[derive(Default)]
+    struct AdoptedProcesses {
+        dead: std::sync::Mutex<Vec<u32>>,
+        starts: std::sync::atomic::AtomicUsize,
+    }
+    impl AdoptedProcesses {
+        fn set_dead(&self, pid: u32) {
+            self.dead.lock().unwrap().push(pid);
+        }
+        fn spawned(&self) -> Vec<()> {
+            vec![(); self.starts.load(Ordering::SeqCst)]
+        }
+    }
+    #[async_trait::async_trait]
+    impl orch_core::ProcessManager for AdoptedProcesses {
+        fn is_alive(&self, pid: u32) -> bool {
+            !self.dead.lock().unwrap().contains(&pid)
+        }
+        fn kill(&self, pid: u32, _: orch_core::Signal) {
+            self.set_dead(pid);
+        }
+        async fn kill_with_grace(&self, pid: u32, _: std::time::Duration) {
+            self.set_dead(pid);
+        }
+        fn spawn(
+            &self,
+            _: &str,
+            _: &[String],
+            _: orch_core::process::SpawnOptions,
+        ) -> orch_core::Result<orch_core::process::SpawnedChild> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            Err(orch_core::Error::other("maintenance must not spawn"))
+        }
+    }
+    fn make_agent() -> orch_domain::Agent {
+        serde_json::from_value(
+            json!({"id":"agt_fixture", "name":"fixture", "adapter":"shell",
+            "config":{}, "status":"idle", "stats":{"tasks_completed":0, "tasks_failed":0,
+            "total_runs":0, "total_runtime_ms":0}}),
+        )
+        .unwrap()
+    }
+    fn make_task() -> orch_domain::Task {
+        serde_json::from_value(
+            json!({"id":"tsk_fixture", "title":"fixture", "description":"",
+            "status":"todo", "priority":3, "labels":[], "depends_on":[],
+            "created_at":"2025-01-01T00:00:00Z", "updated_at":"2025-01-01T00:00:00Z",
+            "attempts":0, "max_attempts":3}),
+        )
+        .unwrap()
+    }
+    fn make_run() -> orch_domain::Run {
+        serde_json::from_value(json!({"id":"run_fixture", "task_id":"tsk_fixture",
+            "agent_id":"agt_fixture", "attempt":1, "status":"running",
+            "started_at":"2025-01-01T00:00:00Z", "workspace_path":"", "prompt":""}))
+        .unwrap()
+    }
+    use orch_domain::{
+        AgentStatus, OrchestratorState, RetryEntry, RunStatus, RunningEntry, TaskStatus,
+    };
+    use orch_engine::container::{EngineSeams, build_full_with_processes};
+    use std::os::unix::fs::MetadataExt;
+
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project.path().join(".orchestry")).unwrap();
+    let processes = Arc::new(AdoptedProcesses::default());
+    let seed = build_full_with_processes(
+        project.path(),
+        EngineSeams {
+            global_config_path: Some(project.path().join("global.yml")),
+            ..Default::default()
+        },
+        Default::default(),
+        processes.clone(),
+    )
+    .await
+    .unwrap();
+    let mut state = OrchestratorState::default();
+    for (name, pid) in [("dead", 701), ("live", 702)] {
+        let agent = format!("agt_{name}");
+        let task = format!("tsk_{name}");
+        let run = format!("run_{name}");
+        seed.agents
+            .save(&orch_domain::Agent {
+                id: agent.clone(),
+                status: AgentStatus::Running,
+                current_task: Some(task.clone()),
+                ..make_agent()
+            })
+            .await
+            .unwrap();
+        seed.tasks
+            .save(&orch_domain::Task {
+                id: task.clone(),
+                assignee: Some(agent.clone()),
+                status: TaskStatus::InProgress,
+                attempts: 1,
+                max_attempts: 1,
+                ..make_task()
+            })
+            .await
+            .unwrap();
+        seed.runs
+            .save(&orch_domain::Run {
+                id: run.clone(),
+                task_id: task.clone(),
+                agent_id: agent.clone(),
+                status: RunStatus::Running,
+                pid: Some(pid),
+                ..make_run()
+            })
+            .await
+            .unwrap();
+        state.running.insert(
+            task.clone(),
+            RunningEntry {
+                task_id: task,
+                agent_id: agent,
+                run_id: run,
+                pid,
+                started_at: "2025-01-01T00:00:00Z".into(),
+                last_event_at: "2025-01-01T00:00:00Z".into(),
+                remote: None,
+            },
+        );
+    }
+    seed.agents
+        .save(&orch_domain::Agent {
+            id: "agt_queue".into(),
+            ..make_agent()
+        })
+        .await
+        .unwrap();
+    seed.agents
+        .save(&orch_domain::Agent {
+            id: "agt_auto".into(),
+            autonomous: Some(true),
+            ..make_agent()
+        })
+        .await
+        .unwrap();
+    for (id, status) in [
+        ("tsk_queue", TaskStatus::Todo),
+        ("tsk_retry", TaskStatus::Retrying),
+    ] {
+        seed.tasks
+            .save(&orch_domain::Task {
+                id: id.into(),
+                assignee: Some("agt_queue".into()),
+                status,
+                ..make_task()
+            })
+            .await
+            .unwrap();
+    }
+    state.retry_queue.push(RetryEntry {
+        task_id: "tsk_retry".into(),
+        attempt: 2,
+        due_at: "2025-01-01T00:00:00Z".into(),
+        error: "earlier".into(),
+    });
+    seed.state.write(&state).await.unwrap();
+    drop(seed);
+
+    let daemon = DaemonHarness::builder()
+        .processes(processes.clone())
+        .start_in(project.path())
+        .await
+        .unwrap();
+    let mut owner = Raw::session(&daemon, "cli", "normal").await;
+    assert_eq!(
+        ok(&owner.request(1, "daemon.status", json!({})).await)["dispatch"]["dispatch_on"],
+        false
+    );
+    // Startup retained both PIDs; neither is being watched by a collector.
+    assert_eq!(daemon.engine().state.read().await.unwrap().running.len(), 2);
+    let mut observer = Raw::session(&daemon, "tui", "normal").await;
+    ok(&observer
+        .request(2, "subscribe", json!({"stores": ["tasks", "state"]}))
+        .await);
+    processes.set_dead(701);
+    let mut task_pushed = false;
+    let mut state_pushed = false;
+    tokio::time::timeout(std::time::Duration::from_secs(4), async {
+        while !task_pushed || !state_pushed {
+            let frame = observer.recv().await.unwrap();
+            let ev = &frame["ev"];
+            task_pushed |= ev["store"] == "tasks";
+            state_pushed |= ev["store"] == "state";
+        }
+    })
+    .await
+    .expect("adopted death must push its task and state outcome with dispatch off");
+    assert_eq!(task_status(&mut owner, "tsk_dead").await, "failed");
+    assert_eq!(
+        daemon
+            .engine()
+            .runs
+            .get("run_dead")
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        RunStatus::Failed
+    );
+    let after = daemon.engine().state.read().await.unwrap();
+    assert!(!after.running.contains_key("tsk_dead"));
+    assert!(
+        after.running.contains_key("tsk_live"),
+        "maintenance must not apply stall policy"
+    );
+    assert_eq!(after.retry_queue, state.retry_queue);
+    assert_eq!(task_status(&mut owner, "tsk_queue").await, "todo");
+    assert_eq!(task_status(&mut owner, "tsk_retry").await, "retrying");
+    assert_eq!(
+        daemon
+            .engine()
+            .tasks
+            .list(&Default::default())
+            .await
+            .unwrap()
+            .len(),
+        4,
+        "no autonomous task seeded"
+    );
+    assert!(
+        processes.spawned().is_empty(),
+        "maintenance started an agent"
+    );
+
+    let path = project.path().join(".orchestry/state.json");
+    let before = std::fs::metadata(&path).unwrap();
+    let seq = owner.request(3, "daemon.status", json!({})).await["commit_seq"].clone();
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    let status = owner.request(4, "daemon.status", json!({})).await;
+    assert_eq!(
+        status["commit_seq"], seq,
+        "unchanged maintenance announces nothing"
+    );
+    assert_eq!(ok(&status)["dispatch"]["dispatch_on"], false);
+    let after = std::fs::metadata(path).unwrap();
+    assert_eq!(
+        (after.ino(), after.modified().unwrap()),
+        (before.ino(), before.modified().unwrap())
+    );
+    assert!(processes.spawned().is_empty());
+    daemon.shutdown().await.unwrap();
+}
+
+/// Expiry follows local-run reconciliation in each maintenance iteration, so
+/// removing an expired marker proves a complete owner pass has happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maintenance_errors_are_deduplicated_until_a_successful_pass() {
+    async fn pass(daemon: &DaemonHarness, clock: &TestClock) {
+        daemon
+            .engine()
+            .context
+            .set("pass-marker", "v", Some(1))
+            .await
+            .unwrap();
+        let marker = daemon.engine().paths.context_path("pass-marker").unwrap();
+        assert!(marker.exists());
+        clock.advance_ms(2);
+        tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            loop {
+                if !tokio::fs::try_exists(&marker).await.unwrap() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("maintenance did not reach expiry after local reconciliation");
+    }
+    let clock = TestClock::new();
+    let daemon = DaemonHarness::builder()
+        .clock(clock.clone())
+        .start()
+        .await
+        .unwrap();
+    let path = daemon.project_root().join(".orchestry/state.json");
+    let stored = std::fs::read(&path).unwrap();
+    let mut events = daemon.engine().events.subscribe();
+    std::fs::write(&path, b"invalid state json").unwrap();
+    for _ in 0..3 {
+        pass(&daemon, &clock).await;
+    }
+    let failures = |events: Vec<Arc<orch_domain::OrchestratorEvent>>| {
+        events
+            .into_iter()
+            .filter(|event| {
+                matches!(event.as_ref(),
+            orch_domain::OrchestratorEvent::OrchestratorError {context, fatal: false, ..}
+            if context == "local run maintenance")
+            })
+            .collect::<Vec<_>>()
+    };
+    let first = failures(events.try_drain());
+    std::fs::write(&path, &stored).unwrap();
+    pass(&daemon, &clock).await;
+    let recovery = failures(events.try_drain());
+    std::fs::write(&path, b"invalid state json").unwrap();
+    pass(&daemon, &clock).await;
+    let second = failures(events.try_drain());
+    std::fs::write(&path, &stored).unwrap();
+    daemon.shutdown().await.unwrap();
+    assert_eq!(
+        first.len(),
+        1,
+        "one error for repeated failing passes: {first:?}"
+    );
+    assert!(recovery.is_empty(), "a successful pass is not an error");
+    assert_eq!(second.len(), 1, "recovery must reset error suppression");
+    assert_eq!(
+        first[0], second[0],
+        "same failure must be reported again after recovery"
+    );
+}
