@@ -2710,11 +2710,12 @@ async fn a_mirror_is_dispatched_only_while_its_own_controller_is_connected() {
     assert_eq!(h.adapter.execute_calls.len(), 1);
 }
 
-/// Pause exactly the second launch write: the claim is already durable, but
-/// the remote running entry must not become durable before submission.
+/// Fail the first write containing this task's remote running entry: its claim
+/// is already durable, but the entry must not become durable before submission.
 struct RemoteLaunchSaveFailure {
     inner: Arc<FakeStateStore>,
-    writes: std::sync::atomic::AtomicUsize,
+    task_id: &'static str,
+    failed_once: std::sync::atomic::AtomicBool,
     failed: tokio::sync::Semaphore,
     resume: tokio::sync::Semaphore,
 }
@@ -2726,10 +2727,13 @@ impl StateStore for RemoteLaunchSaveFailure {
     }
 
     async fn write(&self, state: &OrchestratorState) -> Result<()> {
-        if self
-            .writes
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            == 1
+        if state
+            .running
+            .get(self.task_id)
+            .is_some_and(|entry| entry.remote.is_some())
+            && !self
+                .failed_once
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             assert!(state.claimed.is_empty());
             assert_eq!(state.running.len(), 1);
@@ -2763,7 +2767,8 @@ async fn failed_remote_launch(
             move |inner| {
                 let store = Arc::new(RemoteLaunchSaveFailure {
                     inner,
-                    writes: std::sync::atomic::AtomicUsize::new(0),
+                    task_id: "tsk_one",
+                    failed_once: std::sync::atomic::AtomicBool::new(false),
                     failed: tokio::sync::Semaphore::new(0),
                     resume: tokio::sync::Semaphore::new(0),
                 });
@@ -2780,7 +2785,7 @@ async fn failed_remote_launch(
     let launch = tokio::spawn(async move { launcher.daemon_launch_task("tsk_one").await });
     tokio::time::timeout(std::time::Duration::from_secs(2), store.failed.acquire())
         .await
-        .expect("launch must reach its second state write")
+        .expect("launch must write the remote running entry for tsk_one")
         .unwrap()
         .forget();
     assert!(h.persisted_state().claimed.contains("tsk_one"));
@@ -2994,4 +2999,140 @@ async fn remote_launch_save_failure_collector_timer_cannot_persist_unsubmitted_r
     );
     assert_remote_launch_released(&h, &bridge).await;
     remote_launch_retries_once(&h, &bridge).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn remote_launch_save_failure_on_last_attempt_cascades_and_releases() {
+    let fixture = PeerFixture::new(true).await;
+    let store_slot = Arc::new(Mutex::new(None));
+    let h = fixture
+        .builder()
+        .tasks([
+            Task {
+                id: "tsk_one".into(),
+                max_attempts: 1,
+                ..make_task()
+            },
+            Task {
+                id: "tsk_dep".into(),
+                depends_on: vec!["tsk_one".into()],
+                ..make_task()
+            },
+        ])
+        .wrap_state_store({
+            let store_slot = store_slot.clone();
+            move |inner| {
+                let store = Arc::new(RemoteLaunchSaveFailure {
+                    inner,
+                    task_id: "tsk_one",
+                    failed_once: std::sync::atomic::AtomicBool::new(false),
+                    failed: tokio::sync::Semaphore::new(0),
+                    resume: tokio::sync::Semaphore::new(0),
+                });
+                *store_slot.lock().unwrap() = Some(store.clone());
+                store as Arc<dyn StateStore>
+            }
+        })
+        .build();
+    let store = store_slot.lock().unwrap().take().unwrap();
+    let bridge = Arc::new(FakeBridge::for_harness(&h));
+    h.orchestrator.set_remote_bridge(bridge.clone());
+    h.orchestrator.enable_daemon_mode();
+    let launcher = h.orchestrator.clone();
+    let launch = tokio::spawn(async move { launcher.daemon_launch_task("tsk_one").await });
+    tokio::time::timeout(std::time::Duration::from_secs(2), store.failed.acquire())
+        .await
+        .expect("launch must write the remote running entry for tsk_one")
+        .unwrap()
+        .forget();
+    store.resume.add_permits(1);
+    let error = launch.await.unwrap().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("remote launch state write failed")
+    );
+    assert_eq!(h.task("tsk_one").status, TaskStatus::Failed);
+    assert_eq!(h.task("tsk_one").attempts, 1);
+    assert_eq!(
+        h.task("tsk_dep").status,
+        TaskStatus::Failed,
+        "exhausted remote attempt must cascade to its dependent"
+    );
+    for state in [h.in_memory_state().await, h.persisted_state()] {
+        assert!(
+            state.running.is_empty(),
+            "failed remote attempt retained a running entry"
+        );
+        assert!(
+            state.claimed.is_empty(),
+            "failed remote attempt retained a claim"
+        );
+        assert!(
+            state.retry_queue.is_empty(),
+            "exhausted remote attempt must not retry"
+        );
+        assert_eq!(
+            state.stats.total_tasks_failed, 1,
+            "exhausted task must count once"
+        );
+        assert_eq!(
+            state.stats.total_runs, 1,
+            "failed remote run must count once"
+        );
+    }
+    assert!(
+        h.orchestrator
+            .inner
+            .preparing_agents
+            .lock()
+            .await
+            .is_empty()
+    );
+    assert!(h.orchestrator.inner.cancels.lock().await.is_empty());
+    assert!(
+        h.orchestrator
+            .inner
+            .pending_preparation_cleanup
+            .lock()
+            .await
+            .is_empty()
+    );
+    let runs = h.runs.snapshot();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, RunStatus::Failed);
+    assert!(
+        runs[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("remote launch state write failed")
+    );
+    assert_eq!(
+        h.events_of(OrchestratorEventType::AgentError).len(),
+        1,
+        "failure must be reported once"
+    );
+    for _ in 0..3 {
+        h.orchestrator.daemon_tick(true).await.unwrap();
+        assert!(
+            bridge.submitted.lock().unwrap().is_empty(),
+            "exhausted attempt must never be submitted"
+        );
+    }
+    assert_eq!(
+        h.runs.snapshot().len(),
+        1,
+        "later ticks must not create another run"
+    );
+    assert_eq!(
+        h.events_of(OrchestratorEventType::AgentError).len(),
+        1,
+        "later ticks must not repeat the error"
+    );
+    assert!(
+        h.events_of(OrchestratorEventType::OrchestratorError)
+            .is_empty()
+    );
+    no_process_calls(&h);
 }
