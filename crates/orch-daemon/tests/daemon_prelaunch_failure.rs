@@ -595,9 +595,9 @@ async fn a_read_queued_during_a_failure_batch_is_served_before_the_batch_ends() 
         "commits: start {start}, park {at_park}, witness {witness}, read {served}, \
          next park {at_next_park}, end {end}"
     );
-    // The tick's selection commit, then two per failed candidate.
-    assert_eq!(at_park - start, 2 * PARK as u64, "{commits}");
-    assert_eq!(end - start, 1 + 2 * CANDIDATES as u64, "{commits}");
+    // A clean tick start commits nothing; each failed candidate commits selection and record.
+    assert_eq!(at_park - start, 2 * PARK as u64 - 1, "{commits}");
+    assert_eq!(end - start, 2 * CANDIDATES as u64, "{commits}");
     assert_eq!(
         at_next_park - at_park,
         2,
