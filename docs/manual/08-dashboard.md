@@ -45,6 +45,22 @@ The dashboard is a client of the project's [daemon](18-daemon.md): it shows and 
 
 Press `r` to try to connect again once you have started the daemon, or `q` to quit (exit code 7). The dashboard never starts a daemon. If the daemon is a different orch version, the message names both versions and says `Start it with: orch daemon stop, then orch daemon start`. If the daemon goes away while the dashboard is open, it shows the same screen.
 
+**After `r` brings the dashboard back.** The dashboard opens afresh on the Tasks view with the first row selected;
+selections, prompts, wizards and an unsent command are not carried over, and keys you pressed while it was
+reconnecting are discarded. Each list keeps its keyword filter and its sort (see
+[Sort the lists](#sort-the-lists), [Sort and group agents](#sort-and-group-agents) and
+[Filter a list by keyword](#filter-a-list-by-keyword)), and the Agents and Tasks groupings stay as they were.
+Quitting the dashboard resets all of it.
+
+Further presses of `r` are then ignored until you press another key, press a mouse button or paste, or until one
+second passes without an `r`. Otherwise a double press, or a key you hold down, would also run the first task in the
+list, because `R` runs the selected task on the Tasks view. The rule applies only after a reconnect; on a first
+start `r` acts at once. Its limits:
+
+- Every ignored `r` restarts the second, so pause for a second or press any other key first.
+- Scrolling the mouse wheel does not end it.
+- If your terminal waits longer than one second before it repeats a held key, a held `r` can still run a task.
+
 **How it stays current.** The dashboard subscribes to the daemon's change notices before it reads the project,
 and reads a view again only when the daemon reports a change that concerns it: a task created from the CLI, an
 agent's message or a run that ends shows up without a key press. It does not watch the project's files and does not
@@ -175,7 +191,7 @@ A goal with no tasks still has a Tasks section. It shows the header and `No entr
 
 ## Sort the lists
 
-The Goals, Tasks and Agents lists have a column header row. Each list keeps its own sort for this session, and none of these controls change grouping. A goal's [Tasks section](#a-goals-tasks-section) has no sort of its own: it uses the Tasks list's sort, and these controls change that sort while the section has focus.
+The Goals, Tasks and Agents lists have a column header row. Each list keeps its own sort until you close the dashboard, including across a reconnect with `r` on the no-daemon screen, and none of these controls change grouping. A goal's [Tasks section](#a-goals-tasks-section) has no sort of its own: it uses the Tasks list's sort, and these controls change that sort while the section has focus.
 
 | Key | What it does |
 |---|---|
@@ -197,7 +213,7 @@ A task's Started is its earliest retained run record, which is written while the
 
 ## Sort and group agents
 
-The Agents list is a table with one header row, like Goals and Tasks. You sort it with the keys in [Sort the lists](#sort-the-lists) and cut it into sections with `b`. The sort and the grouping are separate: the sort orders the agents inside each section, and neither one resets the other. Both keep the selected agent selected, and both last only until you close the dashboard.
+The Agents list is a table with one header row, like Goals and Tasks. You sort it with the keys in [Sort the lists](#sort-the-lists) and cut it into sections with `b`. The sort and the grouping are separate: the sort orders the agents inside each section, and neither one resets the other. Both keep the selected agent selected, and both last only until you close the dashboard; a reconnect with `r` on the no-daemon screen keeps them.
 
 This is the Agents view of a small project in a 120-column terminal, grouped by team and in the default order:
 
@@ -310,7 +326,7 @@ On the Goals, Tasks or Agents list, press `Ctrl+K` (or click `^K filter` in the 
 
 Matching ignores case and looks at each field on its own: the ID, the title or name, the status (both `in_progress` and the `RUN` the row shows), the assignee's or agent's name and ID, a task's goal, and an agent's team, adapter, model, node (`local` or the remote alias) and every capability. Descriptions and the Started and Elapsed times are not searched.
 
-A keyword shows as a chip on the list's title rule, for example `filter: docs · 1/2 ^U ✕`; click the chip to clear it. The filter applies before sorting, grouping and the ten-task limit, so the ten tasks listed are all matches and a match past the first ten unfiltered tasks is not lost; with more than ten matches, `show all` lists the rest (`▼ Show all (2 more) — press S`). Empty sections disappear, and a goal section counts its listed tasks as `1/2 tasks`. The selected row stays selected while it still matches. Each list has its own keyword, up to 256 characters, kept until you close the dashboard. The Tasks keyword does not narrow a goal's [Tasks section](#a-goals-tasks-section). `/` still opens the command bar.
+A keyword shows as a chip on the list's title rule, for example `filter: docs · 1/2 ^U ✕`; click the chip to clear it. The filter applies before sorting, grouping and the ten-task limit, so the ten tasks listed are all matches and a match past the first ten unfiltered tasks is not lost; with more than ten matches, `show all` lists the rest (`▼ Show all (2 more) — press S`). Empty sections disappear, and a goal section counts its listed tasks as `1/2 tasks`. The selected row stays selected while it still matches. Each list has its own keyword, up to 256 characters, kept until you close the dashboard, including across a reconnect with `r` on the no-daemon screen. The Tasks keyword does not narrow a goal's [Tasks section](#a-goals-tasks-section). `/` still opens the command bar.
 
 ## Follow activity feeds
 

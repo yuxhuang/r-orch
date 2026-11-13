@@ -202,6 +202,8 @@ Setting a key that exists replaces its value.
 
 Use a short, specific key such as `build-status` or `api-base-url`. Entries are stored in `.orchestry/context/`.
 
+On a disk that ignores case (the macOS default), two keys that differ only in case are one entry: after `orch context set Foo one` and `orch context set foo two`, `orch context list` shows a single entry, and the spelling written last, `foo`, is the one listed.
+
 ### Read, list and delete entries
 
 ```sh

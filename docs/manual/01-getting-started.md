@@ -191,6 +191,9 @@ A **project** is a directory with a `.orchestry/` folder. Make a new directory a
    If orch finds an AI CLI on your `PATH`, one line before `✓ initialized` names it, for example
    `Detected: claude (<version>)`; with none it prints `No AI adapters detected — defaulting to claude`.
 
+   In a new project, `orch init` creates `.orchestry/` with mode 0700. For existing projects and what that does and does not protect,
+   see [Permissions of `.orchestry/`](18-daemon.md#permissions-of-orchestry).
+
 3. Start the project's daemon. Every orch command after `orch init` asks this one process to do its work, and
    nothing starts it but you ([The orch daemon](18-daemon.md)).
 

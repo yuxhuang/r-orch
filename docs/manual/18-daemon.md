@@ -420,7 +420,8 @@ project on a network file system (NFS, SMB) is unverified.
 
 The daemon creates `run/` (or the temporary directory) with mode 0700 and binds the socket with mode 0600. A
 pre-existing directory must be owned by you with no group or other access; the daemon refuses it otherwise and
-never changes its mode. `.orchestry/` itself must be owned by you and not writable by group or others. Both ends
+never changes its mode. `.orchestry/` itself must be owned by you and not writable by group or others
+(see [Permissions of `.orchestry/`](#permissions-of-orchestry)). Both ends
 check the other's user with the kernel before any byte is trusted: a client never sends a byte to a daemon of
 another user, and the daemon refuses a client of another user.
 
@@ -446,6 +447,37 @@ Anything that runs as your user can use the socket with your full authority, inc
 that can see `.orchestry/` or the socket, and remote principals that `orch web` or a peer link admit. An agent
 identity (`--agent`, `ORCH_AGENT_ID`) is attribution, not authorization. Do not expose `.orchestry/` or the
 socket to an environment you would not trust as yourself.
+
+### Permissions of `.orchestry/`
+
+New `orch init` projects create `.orchestry` with mode 0700; existing projects keep their modes, and opening the
+directory later requires protecting all daemon-consumed files and directories yourself. `orch init` and
+`orch daemon start` never change the mode of an existing `.orchestry`.
+
+The daemon protects its socket and [runtime files](#runtime-files-and-gitignore), but ordinary state and store
+directories follow the process umask, and startup checks only the owner and write bits of `.orchestry` itself.
+Untrusted local users must not be able to modify state files or replace their directories—umask 002 can permit group
+members to forge messages/context and alter runtime state despite the private socket, so use an owner-only
+`.orchestry` (`chmod 700 <state-directory>`) in an owner-controlled parent, without ACL grants to untrusted users, or
+treat every filesystem writer as the project owner.
+
+**Existing projects are not migrated.** A daemon started under umask 002 on a project whose `.orchestry` is 0755
+still writes group-writable state. In a check on macOS the daemon wrote `state.json` and the `_index.json` files with
+mode 0664 and `messages/`, `context/` and `teams/` with mode 0775, and `.orchestry` stayed 0755. To protect such a
+project, run `chmod 700 '<absolute path of .orchestry>'` as its owner, the command the refusal below prints.
+
+**When orch refuses.** If `.orchestry` is writable by group or others, or owned by another user, commands such as
+`orch task list`, `orch daemon status` and `orch daemon start` exit 2 and change nothing. The message names the
+project and the directory, says `No permissions were changed.` and prints the owner's commands with the paths
+shell-quoted. For a group-writable directory, with your own paths:
+
+```text
+  ✕ Refusing project `<project root>`: `<project root>/.orchestry` is group/world-writable (mode 0775). No permissions were changed. For an owner-only project, run `chmod 700 '<project root>/.orchestry'` as its owner, keep its parent directories and ACLs under trusted control, then start explicitly with `(cd '<project root>' && orch daemon start)`. If other accounts could already write state, verify or restore it from trusted data before starting.
+```
+
+The commands that talk to the daemon add `A refused project does not prove a daemon is absent.` at the end. For a
+directory owned by another user, the message says it `is owned by uid <n>, but this process runs as uid <m>` and
+tells you to run as the project owner or select your project.
 
 ## Version skew
 
