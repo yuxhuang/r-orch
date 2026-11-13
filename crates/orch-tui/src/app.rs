@@ -6,14 +6,17 @@
 //! State is read when the daemon says it changed, never on a timer: the
 //! backend's pushed [`Observation`]s mark the views they touch dirty
 //! ([`crate::refresh`]), a 150 ms debounce collapses a burst into one read
-//! per view, and a resync reads every view before the next frame is drawn.
+//! per view. Runs/State timing re-reads have a minimum interval with a trailing
+//! read; a resync reads every view before the next frame is drawn.
 //! A frame otherwise drains memory only. Key dispatch lives in
 //! [`crate::keys`] and command execution in [`crate::commands`], both as
 //! `impl` blocks on this type.
 
 use orch_domain::{Agent, Goal, GoalStatus, OrchestratorEvent, Task, TaskStatus, TuiPaletteName};
 
-use crate::backend::{ClipboardPaste, HistoryEntry, ModelCatalog, Observation, TuiBackend};
+use crate::backend::{
+    ClipboardPaste, HistoryEntry, ModelCatalog, Observation, ObservedStore, TuiBackend,
+};
 use crate::clock::{Clock, SystemClock};
 use crate::format::parse_timestamp_ms;
 use crate::messages::{
@@ -21,7 +24,7 @@ use crate::messages::{
     format_event,
 };
 use crate::onboarding::{COMPLETED_DISMISS_MS, OnboardingStep};
-use crate::refresh::{Freshness, View, ViewSet};
+use crate::refresh::{Freshness, TIMINGS_REFRESH_INTERVAL_SECS, View, ViewSet};
 use crate::state::{
     AppState, DetailPanel, EntityType, InputMode, PendingDeletion, TabFlash, ToastKind, ViewId,
 };
@@ -70,6 +73,14 @@ pub struct App<B: TuiBackend, C: Clock = SystemClock> {
     freshness: Freshness,
     /// A resync arrived: every view is read before the next frame.
     resync_pending: bool,
+    /// A Runs/State invalidation waiting for its bounded, trailing timing read.
+    run_timings_refresh_at: Option<i64>,
+    /// Tasks/Goals made timings dirty: later output invalidations must not
+    /// defer the read already owed at the ordinary debounce.
+    timings_debounce_pending: bool,
+    /// Last timing re-read attempt. Bootstrap is not a re-read; the first
+    /// pushed change retains the ordinary debounce.
+    last_timing_refresh_at: Option<i64>,
     /// The last failure shown per view, so a repeated one is not repeated.
     read_errors: Vec<(View, String)>,
 }
@@ -169,6 +180,9 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             last_anim_at: now,
             freshness,
             resync_pending: false,
+            run_timings_refresh_at: None,
+            timings_debounce_pending: false,
+            last_timing_refresh_at: None,
             read_errors: Vec::new(),
         };
 
@@ -282,7 +296,16 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             && now >= deadline
         {
             self.state.refresh_at = None;
-            self.refresh_views(self.freshness.dirty());
+            let mut views = self.freshness.dirty();
+            if self.run_timings_refresh_at.is_some_and(|at| now < at) {
+                views.remove(View::Timings);
+            }
+            self.refresh_views(views);
+        }
+        if let Some(deadline) = self.run_timings_refresh_at
+            && now >= deadline
+        {
+            self.refresh_views(ViewSet::of(&[View::Timings]));
         }
 
         for deletion in self.state.take_expired_deletions(now) {
@@ -335,8 +358,33 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
             Observation::Changed {
                 store, commit_seq, ..
             } => {
-                if self.freshness.changed(store, commit_seq) {
-                    self.schedule_refresh();
+                // A newer Tasks/Goals commit still owes a timing read when
+                // an earlier notification already dirtied every affected view.
+                let semantic_timings = matches!(store, ObservedStore::Tasks | ObservedStore::Goals)
+                    && self.freshness.is_new_for(View::Timings, commit_seq);
+                if self.freshness.changed(store, commit_seq) || semantic_timings {
+                    if semantic_timings && self.freshness.dirty().contains(View::Timings) {
+                        self.timings_debounce_pending = true;
+                        self.run_timings_refresh_at = None;
+                    } else if matches!(store, ObservedStore::Runs | ObservedStore::State)
+                        && self.freshness.dirty().contains(View::Timings)
+                        && !self.timings_debounce_pending
+                        && self.run_timings_refresh_at.is_none()
+                    {
+                        // Keep the first deadline: repeated State writes
+                        // during output must neither bypass nor postpone it.
+                        let debounced = self.now().saturating_add(REFRESH_DEBOUNCE_MS);
+                        let deadline = self.last_timing_refresh_at.map_or(debounced, |last| {
+                            debounced
+                                .max(last.saturating_add(TIMINGS_REFRESH_INTERVAL_SECS * 1_000))
+                        });
+                        self.run_timings_refresh_at = Some(deadline);
+                    }
+                    if store != ObservedStore::Runs {
+                        // State and Dispatch still refresh at the debounce;
+                        // only their timing invalidation is rate limited.
+                        self.schedule_refresh();
+                    }
                 }
             }
             Observation::Resynced => {
@@ -648,6 +696,11 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
     /// once per distinct error and leaves every timing unknown rather than
     /// claiming nothing started.
     fn refresh_timings(&mut self, state_read: bool, now: i64) {
+        // Count attempts too: a failing backend must not be hammered by
+        // output notifications. A failure still waits for a new change.
+        self.last_timing_refresh_at = Some(now);
+        self.run_timings_refresh_at = None;
+        self.timings_debounce_pending = false;
         let orch_state = state_read.then_some(&self.state.orch_state);
         match self
             .backend
@@ -1984,6 +2037,10 @@ fn agent_field_label(step_id: &str) -> &'static str {
 pub fn agents_changed(prev: &[Agent], next: &[Agent]) -> bool {
     prev.len() != next.len() || prev != next
 }
+
+#[cfg(test)]
+#[path = "timings_refresh_tests.rs"]
+mod timings_refresh_tests;
 
 #[cfg(test)]
 mod tests {
