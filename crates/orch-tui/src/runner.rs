@@ -1,9 +1,8 @@
 //! The terminal event loop.
 //!
 //! Lives here rather than in the CLI so `orch tui` is one call: build a
-//! [`TuiBackend`] and hand it to [`run`]. Nothing in this module is reachable
-//! from `TestBackend`, so it stays as thin as possible — all behaviour worth
-//! testing is in [`crate::app`], [`crate::keys`] and [`crate::views`].
+//! [`TuiBackend`] and hand it to [`run`]. The driver boundary also lets tests
+//! exercise the production bootstrap and view-intent hand-off without a tty.
 
 use std::io::{self, Stdout, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +24,7 @@ use crate::app::App;
 use crate::backend::TuiBackend;
 use crate::clock::SystemClock;
 use crate::messages::ANIM_TICK_MS;
-use crate::state::KeywordFilters;
+use crate::state::{KeywordFilters, ViewIntent};
 use crate::tty::{Ready, TtyInput};
 use crate::views;
 
@@ -160,14 +159,9 @@ pub fn run_until_with_filters<B: TuiBackend>(
     stop: &AtomicBool,
     filters: &mut KeywordFilters,
 ) -> io::Result<Exit> {
-    let mut guard = TerminalGuard::enter()?;
-    let mut input = TtyInput::open();
-    with_keyword_filters(backend, filters, |app| {
-        // The env var is the startup switch; `F2` and `/mouse` move the same flag
-        // from here on, and the guard follows it.
-        app.state.mouse.enabled = guard.mouse;
-        run_loop(&mut guard, &mut input, app, stop)
-    })
+    let mut driver = TerminalDashboard::default();
+    driver.enter()?;
+    with_keyword_filters(backend, filters, |app| driver.draw(app, stop, false))
 }
 
 fn with_keyword_filters<B: TuiBackend, T>(
@@ -179,6 +173,103 @@ fn with_keyword_filters<B: TuiBackend, T>(
     let outcome = draw(&mut app);
     *filters = app.state.keyword_filters();
     outcome
+}
+
+/// The presentation half of a dashboard session. Embedders can drive the same
+/// runner entry with deterministic input instead of opening a terminal.
+pub trait DashboardDriver {
+    /// Enter terminal mode before bootstrap. Non-terminal drivers need no setup.
+    fn enter(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Retire input belonging to the previous screen before the new frame.
+    fn discard_pending(&mut self) -> io::Result<()>;
+
+    fn draw<B: TuiBackend>(
+        self,
+        app: &mut App<B>,
+        stop: &AtomicBool,
+        discard_pending: bool,
+    ) -> io::Result<Exit>;
+}
+
+/// The interactive terminal driver used by the CLI and the legacy runners.
+#[derive(Default)]
+pub struct TerminalDashboard {
+    session: Option<(TerminalGuard, TtyInput)>,
+}
+
+impl DashboardDriver for TerminalDashboard {
+    fn enter(&mut self) -> io::Result<()> {
+        self.session = Some((TerminalGuard::enter()?, TtyInput::open()));
+        Ok(())
+    }
+
+    fn discard_pending(&mut self) -> io::Result<()> {
+        let Some((_, input)) = self.session.as_mut() else {
+            return Err(io::Error::other("dashboard terminal was not entered"));
+        };
+        let result = discard_pending_events(|| {
+            if input.wait(Duration::ZERO)? == Ready::HungUp {
+                // The draw loop handles hangup without re-entering crossterm.
+                return Ok(None);
+            }
+            if has_parsed_event()? {
+                event::read().map(Some)
+            } else {
+                Ok(None)
+            }
+        });
+        match result {
+            Err(_) if input.wait(Duration::ZERO)? == Ready::HungUp => Ok(()),
+            other => other,
+        }
+    }
+
+    fn draw<B: TuiBackend>(
+        self,
+        app: &mut App<B>,
+        stop: &AtomicBool,
+        _discard_pending: bool,
+    ) -> io::Result<Exit> {
+        let Some((mut guard, mut input)) = self.session else {
+            return Err(io::Error::other("dashboard terminal was not entered"));
+        };
+        app.state.mouse.enabled = guard.mouse;
+        run_loop(&mut guard, &mut input, app, stop)
+    }
+}
+
+/// Bootstrap a fresh dashboard, restore its plain list intent, and return the
+/// updated intent on exit. `discard_pending` is true only after an explicit
+/// retry: the driver retires input queued before the first new frame. It must
+/// handle input arriving after that frame normally. First starts pass false.
+/// The caller drops `intent` on quit; an independent dashboard uses defaults.
+pub fn run_until_with_view_intent<B: TuiBackend>(
+    backend: B,
+    stop: &AtomicBool,
+    intent: &mut ViewIntent,
+    discard_pending: bool,
+    mut driver: impl DashboardDriver,
+) -> io::Result<Exit> {
+    driver.enter()?;
+    let mut app = App::new_with_view_intent(backend, SystemClock, intent);
+    if discard_pending {
+        driver.discard_pending()?;
+    }
+    let outcome = driver.draw(&mut app, stop, discard_pending);
+    *intent = app.state.view_intent();
+    outcome
+}
+
+/// Consume the currently pending batch once, before publishing the new frame.
+/// No frame/time quota: even a batch larger than MAX_EVENTS_PER_FRAME belongs
+/// to the previous screen. `next` is a readiness probe, not a quiet-period
+/// timer; the terminal uses the same nonzero crossterm probe as the draw loop.
+fn discard_pending_events(mut next: impl FnMut() -> io::Result<Option<Event>>) -> io::Result<()> {
+    while next()?.is_some() {}
+    Ok(())
 }
 
 fn run_loop<B: TuiBackend>(
@@ -509,7 +600,88 @@ mod tests {
     }
 
     #[test]
-    fn retry_handoff_retains_keywords_and_clamps_to_fresh_filtered_rows() {
+    fn reconnected_dashboard_discards_keys_queued_before_it_is_ready() {
+        struct QueuedInput(std::collections::VecDeque<Event>);
+        impl DashboardDriver for QueuedInput {
+            fn discard_pending(&mut self) -> io::Result<()> {
+                discard_pending_events(|| Ok(self.0.pop_front()))
+            }
+            fn draw<B: TuiBackend>(
+                mut self,
+                app: &mut App<B>,
+                _: &AtomicBool,
+                _: bool,
+            ) -> io::Result<Exit> {
+                while let Some(Event::Key(key)) = self.0.pop_front() {
+                    app.handle_key(key);
+                }
+                app.state.flush_messages(app.now());
+                // A run key emits Running/Dispatched on success or Failed on
+                // refusal; none belongs to a reconnect.
+                assert!(
+                    !app.state
+                        .messages
+                        .iter()
+                        .any(|m| m.text.contains("Running ")
+                            || m.text.contains("Dispatched")
+                            || m.text.contains("Failed:")),
+                    "queued retry keys emitted a task action or error"
+                );
+                app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+                assert_eq!(app.state.task_selected, 1, "input after readiness acts");
+                Ok(Exit::Requested)
+            }
+        }
+        for count in [1, 2, 10, 130] {
+            let pending = std::collections::VecDeque::from(vec![
+                Event::Key(KeyEvent::new(
+                    KeyCode::Char('r'),
+                    KeyModifiers::NONE
+                ));
+                count
+            ]);
+            run_until_with_view_intent(
+                filtered_backend(2),
+                &AtomicBool::new(false),
+                &mut ViewIntent::default(),
+                true,
+                QueuedInput(pending),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn first_start_keeps_pending_input() {
+        struct InitialInput;
+        impl DashboardDriver for InitialInput {
+            fn discard_pending(&mut self) -> io::Result<()> {
+                panic!("a first dashboard start must not discard input");
+            }
+            fn draw<B: TuiBackend>(
+                self,
+                app: &mut App<B>,
+                _: &AtomicBool,
+                retried: bool,
+            ) -> io::Result<Exit> {
+                assert!(!retried);
+                app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+                assert_eq!(app.state.task_selected, 1);
+                Ok(Exit::Requested)
+            }
+        }
+        run_until_with_view_intent(
+            filtered_backend(2),
+            &AtomicBool::new(false),
+            &mut ViewIntent::default(),
+            false,
+            InitialInput,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn retry_handoff_retains_keywords_and_resets_selection_on_fresh_rows() {
         let mut filters = KeywordFilters::default();
         with_keyword_filters(filtered_backend(3), &mut filters, |app| {
             keyword(app, ViewId::Tasks, "Élan 🚀");

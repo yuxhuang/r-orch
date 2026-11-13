@@ -809,6 +809,231 @@ fn tui_keyword_retry_refetches_after_repeated_outages_and_failed_connects() {
     );
 }
 
+/// Drives the real reconnect loop and draw thread. Only terminal I/O and the
+/// no-daemon key choice are scripted; bootstrap and the runner are production.
+#[test]
+fn tui_production_retry_handoff_keeps_keywords_and_modes_and_resets_on_quit() {
+    use super::command::{DashboardUi, run_dashboard_with_ui};
+    use super::no_daemon::Choice;
+    use orch_tui::state::{AgentGroupBy, AgentSortField, InputMode};
+    use orch_tui::{App, DashboardDriver, Exit, ViewId, ViewIntent};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    struct Ui {
+        daemon: Arc<FakeDaemon>,
+        draws: Arc<AtomicUsize>,
+        choices: Arc<AtomicUsize>,
+        retained: Arc<Mutex<Option<ViewIntent>>>,
+        fresh_only: bool,
+    }
+    struct Driver {
+        daemon: Arc<FakeDaemon>,
+        draws: Arc<AtomicUsize>,
+        retained: Arc<Mutex<Option<ViewIntent>>>,
+        fresh_only: bool,
+        discarded: bool,
+    }
+    impl DashboardUi for Ui {
+        type Driver = Driver;
+        fn driver(&mut self) -> Driver {
+            Driver {
+                daemon: Arc::clone(&self.daemon),
+                draws: Arc::clone(&self.draws),
+                retained: Arc::clone(&self.retained),
+                fresh_only: self.fresh_only,
+                discarded: false,
+            }
+        }
+        fn leave_screen(&mut self) {}
+        async fn ask(
+            &mut self,
+            failure: &str,
+            _: Arc<AtomicBool>,
+        ) -> orch_core::Result<Option<Choice>> {
+            assert!(failure.contains("No orch daemon"), "{failure}");
+            let choice = self.choices.fetch_add(1, Ordering::SeqCst);
+            // The first outage has two failed explicit retries, then success.
+            // The second outage succeeds on its first explicit retry.
+            self.daemon.down.store(choice < 2, Ordering::SeqCst);
+            Ok(Some(Choice::Retry))
+        }
+    }
+    impl DashboardDriver for Driver {
+        fn discard_pending(&mut self) -> std::io::Result<()> {
+            assert!(!self.discarded, "discard only once per retry entry");
+            self.discarded = true;
+            Ok(())
+        }
+        fn draw<B: TuiBackend>(
+            self,
+            app: &mut App<B>,
+            stop: &AtomicBool,
+            discard_pending: bool,
+        ) -> std::io::Result<Exit> {
+            let draw = self.draws.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(discard_pending, draw > 0, "only retries discard input");
+            assert_eq!(
+                self.discarded,
+                draw > 0,
+                "runner invokes the input boundary"
+            );
+            assert_eq!(app.state.view, ViewId::Tasks, "active view is not carried");
+            assert_eq!(
+                (
+                    app.state.task_selected,
+                    app.state.goal_selected,
+                    app.state.agent_selected
+                ),
+                (0, 0, 0)
+            );
+            assert_eq!(app.state.input_mode, InputMode::None);
+            assert!(app.state.command_bar.input.value().is_empty());
+            assert!(app.armed_broadcast.is_none());
+            let key = |app: &mut App<B>, ch| {
+                app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+            };
+            let keywords = [
+                (ViewId::Tasks, "Task"),
+                (ViewId::Goals, "東京"),
+                (ViewId::Agents, "مرحبا"),
+            ];
+            if draw == 0 {
+                assert_eq!(
+                    app.state.view_intent(),
+                    ViewIntent::default(),
+                    "new dashboard resets all view intent"
+                );
+                if self.fresh_only {
+                    key(app, 'q');
+                    return Ok(Exit::Requested);
+                }
+                for (view, text) in keywords {
+                    app.state.view = view;
+                    app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL));
+                    app.handle_paste(text);
+                    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+                key(app, 'o');
+                key(app, 'O');
+                key(app, 'b');
+                app.state.view = ViewId::Tasks;
+                key(app, 'g');
+                *self.retained.lock().unwrap() = Some(app.state.view_intent());
+            } else {
+                for (view, text) in keywords {
+                    assert_eq!(
+                        app.state.keyword(view),
+                        text,
+                        "keyword through production handoff"
+                    );
+                }
+                assert_eq!(
+                    app.state.agent_sort.field,
+                    AgentSortField::Name,
+                    "Agents sort through production handoff"
+                );
+                assert!(app.state.agent_sort.descending);
+                assert_eq!(
+                    app.state.agent_group_by,
+                    AgentGroupBy::Node,
+                    "Agents grouping through production handoff"
+                );
+                assert!(
+                    app.state.group_by_goal,
+                    "Tasks grouping through production handoff"
+                );
+                assert_eq!(
+                    app.state.view_intent(),
+                    *self.retained.lock().unwrap().as_ref().unwrap()
+                );
+                assert_eq!(
+                    app.state.tasks[0].id,
+                    format!("fresh_{draw}"),
+                    "fresh entities after outage"
+                );
+            }
+            if draw == 2 {
+                key(app, 'q');
+                assert!(app.state.should_exit);
+                return Ok(Exit::Requested);
+            }
+            // Deliberately leave transient state behind. It must not cross the
+            // reconnect even though the six pieces of list intent do.
+            app.state.view = ViewId::Agents;
+            app.state.task_selected = 2;
+            app.state.agent_selected = 2;
+            app.state.goal_selected = 2;
+            app.state.command_bar.input.reset("/task unsent draft");
+            self.daemon.down.store(true, Ordering::SeqCst);
+            *self.daemon.tasks.lock().unwrap() = vec![task(&format!("fresh_{}", draw + 1))];
+            self.daemon
+                .script(self.daemon.subscriptions() - 1, Script::Close);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !stop.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < deadline,
+                    "observation EOF stops the draw loop"
+                );
+                std::thread::yield_now();
+            }
+            Ok(Exit::Requested)
+        }
+    }
+    let daemon = FakeDaemon::new();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".orchestry")).unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let draws = Arc::new(AtomicUsize::new(0));
+    let choices = Arc::new(AtomicUsize::new(0));
+    let retained = Arc::new(Mutex::new(None));
+    let ui = |fresh_only, draws| Ui {
+        daemon: Arc::clone(&daemon),
+        draws,
+        choices: Arc::clone(&choices),
+        retained: Arc::clone(&retained),
+        fresh_only,
+    };
+    let exit = rt
+        .block_on(run_dashboard_with_ui(
+            connector(&daemon, root.path()),
+            root.path().into(),
+            "test",
+            ui(false, Arc::clone(&draws)),
+        ))
+        .unwrap();
+    assert_eq!(exit, std::process::ExitCode::SUCCESS);
+    assert_eq!(draws.load(Ordering::SeqCst), 3);
+    assert_eq!(choices.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        daemon
+            .log()
+            .iter()
+            .filter(|op| op.as_str() == "task.list")
+            .count(),
+        3
+    );
+    assert!(
+        !daemon
+            .log()
+            .iter()
+            .any(|op| op == "task.run" || op == "dispatch.set")
+    );
+    // A separate dashboard after quit owns new defaults, through the same path.
+    let fresh_draws = Arc::new(AtomicUsize::new(0));
+    rt.block_on(run_dashboard_with_ui(
+        connector(&daemon, root.path()),
+        root.path().into(),
+        "test",
+        ui(true, Arc::clone(&fresh_draws)),
+    ))
+    .unwrap();
+    assert_eq!(fresh_draws.load(Ordering::SeqCst), 1);
+}
+
 /// A manual driver, not an assertion: with `ORCH_TUI_FAKE_DRIVE=<dir>` set it
 /// runs the real `orch tui` loop (dashboard, no-daemon screen, `r`, `q`) on
 /// this terminal against the fake daemon, so it can be driven in tmux. Files
