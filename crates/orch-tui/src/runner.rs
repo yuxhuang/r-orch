@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -161,7 +161,7 @@ pub fn run_until_with_filters<B: TuiBackend>(
 ) -> io::Result<Exit> {
     let mut driver = TerminalDashboard::default();
     driver.enter()?;
-    with_keyword_filters(backend, filters, |app| driver.draw(app, stop, false))
+    with_keyword_filters(backend, filters, |app| driver.draw(app, stop))
 }
 
 fn with_keyword_filters<B: TuiBackend, T>(
@@ -186,12 +186,7 @@ pub trait DashboardDriver {
     /// Retire input belonging to the previous screen before the new frame.
     fn discard_pending(&mut self) -> io::Result<()>;
 
-    fn draw<B: TuiBackend>(
-        self,
-        app: &mut App<B>,
-        stop: &AtomicBool,
-        discard_pending: bool,
-    ) -> io::Result<Exit>;
+    fn draw<B: TuiBackend>(self, app: &mut App<B>, stop: &AtomicBool) -> io::Result<Exit>;
 }
 
 /// The interactive terminal driver used by the CLI and the legacy runners.
@@ -227,12 +222,7 @@ impl DashboardDriver for TerminalDashboard {
         }
     }
 
-    fn draw<B: TuiBackend>(
-        self,
-        app: &mut App<B>,
-        stop: &AtomicBool,
-        _discard_pending: bool,
-    ) -> io::Result<Exit> {
+    fn draw<B: TuiBackend>(self, app: &mut App<B>, stop: &AtomicBool) -> io::Result<Exit> {
         let Some((mut guard, mut input)) = self.session else {
             return Err(io::Error::other("dashboard terminal was not entered"));
         };
@@ -244,7 +234,8 @@ impl DashboardDriver for TerminalDashboard {
 /// Bootstrap a fresh dashboard, restore its plain list intent, and return the
 /// updated intent on exit. `discard_pending` is true only after an explicit
 /// retry: the driver retires input queued before the first new frame. It must
-/// handle input arriving after that frame normally. First starts pass false.
+/// handle input arriving after that frame through the retry-gesture boundary.
+/// First starts pass false and have no gesture.
 /// The caller drops `intent` on quit; an independent dashboard uses defaults.
 pub fn run_until_with_view_intent<B: TuiBackend>(
     backend: B,
@@ -257,8 +248,9 @@ pub fn run_until_with_view_intent<B: TuiBackend>(
     let mut app = App::new_with_view_intent(backend, SystemClock, intent);
     if discard_pending {
         driver.discard_pending()?;
+        app.begin_retry_gesture();
     }
-    let outcome = driver.draw(&mut app, stop, discard_pending);
+    let outcome = driver.draw(&mut app, stop);
     *intent = app.state.view_intent();
     outcome
 }
@@ -348,28 +340,13 @@ fn run_loop<B: TuiBackend>(
             // bytes on the wire to be a truncated sequence, and every other
             // path is checked, so this is narrower than the bug it replaces
             // rather than a gap left open by accident.
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
-                // Only reaches us with bracketed paste on. Without it the
-                // paste arrives as keys, where its first newline submits and
-                // the rest lands in normal mode — see `TerminalGuard::enter`.
-                Event::Paste(text) => app.handle_paste(&text),
-                Event::Mouse(mouse) => {
-                    app.handle_mouse(mouse);
-                    // An action that changed the layout retires the geometry,
-                    // so stop draining and redraw: the rest of this batch is
-                    // still queued in crossterm and gets handled against the
-                    // new frame instead of being dropped against the old one.
-                    // This is what design §3.2.3 means by "the drain loop then
-                    // breaks to redraw".
-                    if !app.state.mouse.hits.is_valid() {
-                        break;
-                    }
-                }
-                // Retires the map only if the frame we drew is not already
-                // this size; see `App::resize`.
-                Event::Resize(width, height) => app.resize(width, height),
-                _ => {}
+            let event = event::read()?;
+            let mouse = matches!(event, Event::Mouse(_));
+            app.handle_terminal_event(event);
+            // An action that changes the layout retires its geometry. Redraw
+            // before handling the remaining mouse input against a new frame.
+            if mouse && !app.state.mouse.hits.is_valid() {
+                break;
             }
             if app.state.should_exit
                 || stop.load(Ordering::Relaxed)
@@ -606,15 +583,12 @@ mod tests {
             fn discard_pending(&mut self) -> io::Result<()> {
                 discard_pending_events(|| Ok(self.0.pop_front()))
             }
-            fn draw<B: TuiBackend>(
-                mut self,
-                app: &mut App<B>,
-                _: &AtomicBool,
-                _: bool,
-            ) -> io::Result<Exit> {
-                while let Some(Event::Key(key)) = self.0.pop_front() {
-                    app.handle_key(key);
+            fn draw<B: TuiBackend>(mut self, app: &mut App<B>, _: &AtomicBool) -> io::Result<Exit> {
+                while let Some(event) = self.0.pop_front() {
+                    app.handle_terminal_event(event);
                 }
+                assert_eq!(app.state.view, ViewId::Tasks, "queued view key was drained");
+                assert_eq!(app.state.task_selected, 0, "queued move key was drained");
                 app.state.flush_messages(app.now());
                 // A run key emits Running/Dispatched on success or Failed on
                 // refusal; none belongs to a reconnect.
@@ -627,19 +601,31 @@ mod tests {
                             || m.text.contains("Failed:")),
                     "queued retry keys emitted a task action or error"
                 );
-                app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+                app.handle_terminal_event(Event::Key(KeyEvent::new(
+                    KeyCode::Char('j'),
+                    KeyModifiers::NONE,
+                )));
                 assert_eq!(app.state.task_selected, 1, "input after readiness acts");
                 Ok(Exit::Requested)
             }
         }
         for count in [1, 2, 10, 130] {
-            let pending = std::collections::VecDeque::from(vec![
+            let mut pending = std::collections::VecDeque::from(vec![
                 Event::Key(KeyEvent::new(
                     KeyCode::Char('r'),
                     KeyModifiers::NONE
                 ));
                 count
             ]);
+            // The retry guard can retire r independently; these prove the drain.
+            pending.push_back(Event::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            )));
+            pending.push_back(Event::Key(KeyEvent::new(
+                KeyCode::Char('j'),
+                KeyModifiers::NONE,
+            )));
             run_until_with_view_intent(
                 filtered_backend(2),
                 &AtomicBool::new(false),
@@ -658,13 +644,7 @@ mod tests {
             fn discard_pending(&mut self) -> io::Result<()> {
                 panic!("a first dashboard start must not discard input");
             }
-            fn draw<B: TuiBackend>(
-                self,
-                app: &mut App<B>,
-                _: &AtomicBool,
-                retried: bool,
-            ) -> io::Result<Exit> {
-                assert!(!retried);
+            fn draw<B: TuiBackend>(self, app: &mut App<B>, _: &AtomicBool) -> io::Result<Exit> {
                 app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
                 assert_eq!(app.state.task_selected, 1);
                 Ok(Exit::Requested)

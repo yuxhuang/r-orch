@@ -315,6 +315,103 @@ fn tui_retry_reaches_the_daemon_after_the_owner_starts_it() {
     );
 }
 
+/// Retire non-retry type-ahead through the real tty driver. Stopping the
+/// waiting client and checking the tty queue makes this independent of how
+/// quickly the reconnect or the terminal's event reader runs.
+#[test]
+fn tui_retry_discards_queued_view_and_move_keys() {
+    use nix::sys::signal::Signal;
+
+    let _serial = serial();
+    let scene = Scene::new(Cond::NoSocket);
+    let (agent, _) = scene
+        .sandbox()
+        .seed_agent_task("drain-stub", "exit 0", "Drain older");
+    let pane = TuiPane::launch(&scene, "tui", &[]);
+    pane.wait_screen("the no-daemon screen", |s| {
+        s.contains("No orch daemon is running for")
+    });
+    let clients = pane.client_pids();
+    assert_eq!(clients.len(), 1);
+    let client = clients[0];
+    let _daemon = start_ready(scene.sandbox(), &[], "owner");
+    let added = scene
+        .sandbox()
+        .run(&["task", "add", "Drain newer", "--assignee", &agent]);
+    assert!(added.status.success(), "{}", text(&added.stderr));
+
+    // Resume on an assertion failure too, so the fixture can shut down.
+    struct Resume(u32);
+    impl Drop for Resume {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(i32::try_from(self.0).unwrap()),
+                Signal::SIGCONT,
+            );
+        }
+    }
+    signal(client, Signal::SIGSTOP);
+    let resume = Resume(client);
+    wait_for(READY, "the client to stop before queuing input", || {
+        let out = std::process::Command::new("/bin/ps")
+            .args(["-o", "state=", "-p", &client.to_string()])
+            .output()
+            .unwrap();
+        text(&out.stdout).contains('T').then_some(())
+    });
+    let tmux = |args: &[&str]| {
+        let mut cmd = pane.cmd();
+        cmd.args(args);
+        let out = output_with_deadline(cmd, CALL);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        text(&out.stdout)
+    };
+    let tty = tmux(&["display-message", "-p", "-t", "t", "#{pane_tty}"]);
+    tmux(&["set-buffer", "-b", "retry-input", "raj"]);
+    // One raw pane write, not three send-keys calls or bracketed paste.
+    tmux(&["paste-buffer", "-r", "-b", "retry-input", "-t", "t"]);
+    wait_for(READY, "all three bytes on the stopped client's tty", || {
+        // Python's safe ioctl wrapper avoids unsafe Rust for this readiness
+        // check. FIONREAD is available on both supported Unix platforms.
+        let mut cmd = std::process::Command::new("/usr/bin/python3");
+        cmd.env_clear()
+            .env("HOME", scene.test_root.join("home"))
+            .args([
+                "-c",
+                "import array,fcntl,os,sys,termios; fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NONBLOCK); n=array.array('i',[0]); fcntl.ioctl(fd,termios.FIONREAD,n,True); print(n[0]); os.close(fd)",
+                tty.trim(),
+            ]);
+        let out = output_with_deadline(cmd, CALL);
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        (text(&out.stdout).trim().parse::<usize>().unwrap() >= 3).then_some(())
+    });
+    drop(resume);
+    pane.wait_screen("the first reconnected frame", |s| {
+        s.contains("ORCH") && !s.contains("No orch daemon is running for")
+    });
+    // A visible FIFO barrier: the queued a/j must have been processed (or
+    // discarded) before help opens. Closing it reveals the resulting view.
+    pane.keys(&["?"]);
+    pane.wait_screen("help after the queued input", |s| {
+        s.contains("KEYBOARD SHORTCUTS")
+    });
+    pane.keys(&["Escape"]);
+    let screen = pane.wait_screen("the dashboard after closing help", |s| {
+        s.contains("ORCH") && !s.contains("KEYBOARD SHORTCUTS")
+    });
+    let rows: Vec<_> = screen
+        .lines()
+        .filter(|line| line.contains("Drain older") || line.contains("Drain newer"))
+        .collect();
+    assert!(
+        screen.contains("> TASKS")
+            && rows.len() == 2
+            && rows[0].trim_start().starts_with('▸')
+            && !rows[1].trim_start().starts_with('▸'),
+        "queued view/move keys acted on the reconnected dashboard:\n{screen}"
+    );
+}
+
 /// Web has no way to retry a closed tab's page, so an outage while serving is
 /// an HTTP 503 with the generic text, not a silent hang and not a restart.
 #[test]

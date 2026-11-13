@@ -276,6 +276,8 @@ pub struct KeywordFilters {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ViewIntent {
     pub(crate) keywords: KeywordFilters,
+    task_sort: TaskSort,
+    goal_sort: GoalSort,
     agent_sort: AgentSort,
     agent_group_by: AgentGroupBy,
     group_by_goal: bool,
@@ -2314,10 +2316,12 @@ impl AppState {
         self.agent_keyword.reset(&filters.agents);
     }
 
-    /// Capture only the list keywords and the three retained list modes.
+    /// Capture only the list keywords, sorts and grouping modes.
     pub fn view_intent(&self) -> ViewIntent {
         ViewIntent {
             keywords: self.keyword_filters(),
+            task_sort: self.task_sort,
+            goal_sort: self.goal_sort,
             agent_sort: self.agent_sort,
             agent_group_by: self.agent_group_by,
             group_by_goal: self.group_by_goal,
@@ -2326,6 +2330,8 @@ impl AppState {
 
     pub(crate) fn restore_view_intent(&mut self, intent: &ViewIntent) {
         self.restore_keyword_filters(&intent.keywords);
+        self.task_sort = intent.task_sort;
+        self.goal_sort = intent.goal_sort;
         self.agent_sort = intent.agent_sort;
         self.agent_group_by = intent.agent_group_by;
         self.group_by_goal = intent.group_by_goal;
