@@ -784,12 +784,22 @@ async fn heartbeat(lock: Arc<PidLock>, handler: ServiceHandler, mut quit: watch:
             tracing::error!(
                 "ownership_lost: the project PID lock is missing or names another process"
             );
-            if let Err(error) = handler.set_ownership_lost().await {
-                tracing::error!(code = ?error.code, "could not record ownership loss");
-            }
+            let recorded = handler.set_ownership_lost().await;
+            // The state operation has released its permit before stderr I/O.
+            report_ownership_loss(recorded, std::io::stderr().lock());
             return;
         }
     }
+}
+
+fn report_ownership_loss(recorded: crate::coordinator::OpResult<()>, mut stderr: impl Write) {
+    if let Err(error) = recorded {
+        tracing::error!(code = ?error.code, "could not record ownership loss");
+    }
+    let _ = writeln!(
+        stderr,
+        "  ⚠ ownership lost: the project PID lock is missing or names another process; dispatch is off and this daemon is still running"
+    );
 }
 
 pub use crate::bootstrap::{InitOptions, InitOutcome, initialize};
@@ -871,6 +881,25 @@ mod tests {
     use super::test_support::{project, scratch, spec};
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn failed_ownership_recording_still_writes_the_constant_notice() {
+        use orch_proto::error::{ErrorBody, ErrorCode, Execution};
+
+        let mut stderr = Vec::new();
+        report_ownership_loss(
+            Err(ErrorBody::new(
+                ErrorCode::General,
+                "untrusted error\nforged line",
+                Execution::Unknown,
+            )),
+            &mut stderr,
+        );
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "  ⚠ ownership lost: the project PID lock is missing or names another process; dispatch is off and this daemon is still running\n"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bring_up_publishes_private_files_and_shutdown_releases_ownership_last() {
