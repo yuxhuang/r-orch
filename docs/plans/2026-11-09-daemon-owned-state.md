@@ -84,16 +84,16 @@ rejected alternatives. This section is the summary a builder needs to find the r
 
 ## Tasks
 
-Four stacked PRs against `main` (spec R29, regrouped at CP1 after red-team finding RT1), each green and leaving
-`main` working; the owner merges each, no version bump. PR *n*+1 is built once PR *n* is frozen for review and
+Four stacked PRs against `main` (spec R29, regrouped after a red-team review found that a split cutover would
+ship a daemon client and a direct writer side by side), each green and leaving `main` working; the owner merges each, no version bump. PR *n*+1 is built once PR *n* is frozen for review and
 rebases on its merge. Builders work in separate worktrees with disjoint scopes and integrate by merge, never by
 rebase of a shared branch. Owners are roles; task ids live in the tracker, not in this plan.
 
-| PR | Branch | Scope | Board (gate) |
+| PR | Branch | Scope | Reviews and gate |
 |---|---|---|---|
 | 1 | `feature/daemon-core` | `orch-proto`, `orch-daemon`, `orch-client` control plane, `orch daemon start\|status\|stop\|dispatch`, engine guarantees (B0 + B0d), in-process harness, spec, plan, ADR 0012, ARCHITECTURE §3.1, manual 18, CHANGELOG. **Developmental**: `ORCH_DAEMON_DEVELOPMENTAL=1` plus a banner that legacy writers are not excluded; no client is converted. | code, security, resilience, facts, cold gate + Linux |
-| 2 | `feature/daemon-clients` | The single production cutover: every D7 operation in `orch-client`; CLI, MCP bridge, TUI backend over RPC (refresh tick, no disk observer), `orch web` preflight and PTY env; developmental gate removed; D8 command remap; binary-test migration; no-daemon matrix for all five frontends; real-TUI + 4 CLI + 2 MCP stress; README upgrade, CHANGELOG, changed command chapters. Over the 3,000-line guideline by design: splitting it would ship a head with a daemon client and a direct writer side by side (RT1). | code, security, resilience, performance (CLI round trip vs v0.13.0), cold gate + Linux |
-| 3 | `feature/daemon-push` | Subscriptions (cursor, baseline, store-wide change, resync); TUI and web stop RPC polling; MCP `resources/subscribe` and `resources/updated`; commit-triggered dispatch wake (restores prompt dispatch); foreground start-up diagnostics; delete the unused `disk_observer`. | code, security, resilience, facts, performance (wake latency, slow subscribers), cold gate + Linux; QA pass 1 on the owner's Mac after the board |
+| 2 | `feature/daemon-clients` | The single production cutover: every D7 operation in `orch-client`; CLI, MCP bridge, TUI backend over RPC (refresh tick, no disk observer), `orch web` preflight and PTY env; developmental gate removed; D8 command remap; binary-test migration; no-daemon matrix for all five frontends; real-TUI + 4 CLI + 2 MCP stress; README upgrade, CHANGELOG, changed command chapters. Over the 3,000-line guideline by design: splitting it would ship a head with a daemon client and a direct writer side by side. | code, security, resilience, performance (CLI round trip vs v0.13.0), cold gate + Linux |
+| 3 | `feature/daemon-push` | Subscriptions (cursor, baseline, store-wide change, resync); TUI and web stop RPC polling; MCP `resources/subscribe` and `resources/updated`; commit-triggered dispatch wake (restores prompt dispatch); foreground start-up diagnostics; delete the unused `disk_observer`. | code, security, resilience, facts, performance (wake latency, slow subscribers), cold gate + Linux; QA pass 1 on the owner's Mac after those reviews |
 | 4 | `feature/daemon-enforce` | Crate and source-site allowlist, client infra/engine dependencies removed, MCP FIFO and dead code removed; ARCHITECTURE §2, RUNBOOK, manual 17/18 sweep; spec Verification table; plan and spec `done`. | code, security, resilience, facts, cold gate; QA pass 2 |
 
 ### PR 1 (wave B)
@@ -226,12 +226,13 @@ identified head/tree and the other applicable gates; the lead reports readiness 
   + `ops_daemon`, `orch-daemon/daemon_engine` + `ops_control` + `ops_coordinator`.
   **Every standalone orch-daemon run uses `--features testing`** (including `--tests` and `--lib`).
   `cargo test -p orch-peer` remains required. The ignored empty two-executable placeholder does not count.
-- Fix round 1, verify at I1b: `crates/orch-daemon/tests/daemon_peer_boundary.rs`,
+- First fix round, verified when the fix branches are integrated:
+  `crates/orch-daemon/tests/daemon_peer_boundary.rs`,
   `daemon_endpoint_safety.rs`, `staging_cleanup.rs`; `crates/orch-cli/tests/daemon_stop_wait.rs`;
   `crates/orch-engine/tests/daemon_startup_index.rs`, `daemon_recovery_errors.rs`. The spec has one
-  runnable command per target. I1b verifies the integrated function names/counts, the extensions to existing
-  security/lifecycle/path targets, diagnostic env/stderr and client unknown-outcome regressions, and repeats
-  the peer suites 3×. These fixes are not claimed present or passing at `b1216ce4`.
+  runnable command per target. That integration verifies the integrated function names/counts, the extensions
+  to existing security/lifecycle/path targets, diagnostic env/stderr and client unknown-outcome regressions,
+  and repeats the peer suites 3×. These fixes are not claimed present or passing at `b1216ce4`.
 - PR 2 planned: `daemon_no_daemon::all_frontends_matrix` with process-table and spawn assertions;
   `daemon_stress::real_tui_cli_mcp_share_state_order` (60 s acceptance run); two compiled executables with
   different `LOCAL_PROTOCOL` constants under T2a (R6/R32). The pgid-derived acknowledgement (R39) is deferred
@@ -239,7 +240,7 @@ identified head/tree and the other applicable gates; the lead reports readiness 
   The stress test is the evidence that D10 is closed and replaces the runbook hazard.
 - PR 3 planned: the spec's [PR 3 acceptance targets](../specs/2026-11-09-daemon-owned-state.md#pr-3-acceptance-targets)
   (`daemon_push::*`, `daemon_dispatch_wake::*`, `tui_daemon::*`, `web_daemon::*`, `daemon_push::mcp_resource_updates`),
-  each shown failing once against a deliberate break; QA pass 1 on the owner's Mac (R28) after board 3.
+  each shown failing once against a deliberate break; QA pass 1 on the owner's Mac (R28) after the PR 3 reviews.
 - Hermeticity: no test touches a real project's daemon or `~/.orchestry`; sockets live under a per-test temp
   directory on a path of at most 100 bytes; fake shell agents only.
 - Owner-amended macOS gate: run `cargo fmt --all --check`,
@@ -279,12 +280,12 @@ Gate 2's Q2 stop intent and Q5 regrouping were approved on 2026-11-09. Recorded 
 1. **R39 is deferred by the owner (2026-11-11) and not built in this goal.** The kernel-pgid-derived acknowledgement
    for agent-originated stop/dispatch off does not exist: an agent-context `orch daemon stop` or `orch daemon
    dispatch off` succeeds without `--from-agent`. Reasons: the owner's, that an agent with a shell can always run
-   the command, so an acknowledgement cannot stop it; and the design review's finding that, with the only evidence
-   the daemon can get about a caller (sampled process-group ids), no design refuses an agent's accidental stop
-   without sometimes refusing the owner's own: when a run's process group ends and its number is reused for the
-   owner's shell, a stop sent by an older `orch`, whose frozen stop hello cannot carry an acknowledgement, would be
-   refused, and R6 and R14 require that stop to work. The finding is limited to that evidence; it is not a claim
-   about every possible design. The accepted consequence is that the environment-based refusal of an agent-context
+   the command, so an acknowledgement cannot stop it; and the design review's finding that, with the
+   evidence the design was permitted to use about a caller (sampled process-group ids), no design refuses an
+   agent's accidental stop without sometimes refusing the owner's own: when a run's process group ends and its
+   number is reused for the owner's shell, a stop sent by an older `orch`, whose frozen stop hello cannot carry
+   an acknowledgement, would be refused, and R6 and R14 require that stop to work. The finding is limited to
+   that evidence; it is not a claim about every possible design. The accepted consequence is that the environment-based refusal of an agent-context
    start is the only protection: accident prevention, not a barrier against a same-uid process. Existing
    kernel-UID/project checks remain mandatory. R39 is a should row, recorded as deferred, not as a pass. The
    decision is ADR 0012, decision 15.
@@ -297,4 +298,4 @@ Gate 2's Q2 stop intent and Q5 regrouping were approved on 2026-11-09. Recorded 
    this unmet acceptance explicitly; no owner waiver is implied. Same semver/protocol with a different build
    remains an intentional detection limit.
 
-I1b/board 1b must still verify the fix round before PR 1 can advance; these dispositions do not certify it.
+The integration of the fix branches and the review that follows it must still verify the first fix round before PR 1 can advance; these dispositions do not certify it.

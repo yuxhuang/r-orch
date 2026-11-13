@@ -1,6 +1,6 @@
 # 0011. A stdio MCP server in `orch-cli`, built on rmcp
 
-- Status: accepted
+- Status: accepted; decision 7 and the concurrent-sessions consequence are superseded by [0012](0012-daemon-owned-state.md); the rest stands
 - Date: 2026-11-07; accepted 2026-11-08, after decision 5 was amended the same day
 
 ## Context
@@ -54,6 +54,9 @@ Facts that forced the shape:
 7. **Concurrency is documented, not repaired here.** The server is one more non-transactional mutator, with the
    same hazards as two `orch` processes; recovery is in the RUNBOOK. Storage repair is separate work.
 
+   > Superseded by [ADR 0012](0012-daemon-owned-state.md): one explicit project daemon owns all state, and
+   > `orch mcp` is a bridge to it, so the server is no longer a separate mutator.
+
 Design assumptions. Each is accepted as designed, with no code change and no new flag (goal `goal_h-gIBCW`
 item 11, 2026-11-08):
 - **Asserted identity.** `--agent`, `ORCH_AGENT_ID` and a call's `from` are asserted by the client, not
@@ -102,5 +105,7 @@ Rejected:
   fine at the documented scale (ARCHITECTURE A1), unmeasured beyond it.
 - Concurrent MCP sessions widen how often the existing store races can be hit; they are not fixed. A broken config
   written through `config_set` breaks every call until the file is restored by hand.
+  *The first sentence is superseded by [ADR 0012](0012-daemon-owned-state.md): the daemon is the one process
+  that writes the stores, and MCP sessions are its clients. The second sentence stands.*
 - `rmcp` pulls in a second `sha2` major alongside `orch web`'s, until axum moves.
 - Rollback is removing the client registration; state formats do not change, and completed mutations stay.

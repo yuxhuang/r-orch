@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-11-09
 - Revision: 2, after round-1 challenge; accepted by the owner at gate 2, 2026-11-09. Decision 14 added in PR 4, 2026-11-11
-- Supersedes: ADR [0011](0011-mcp-server.md) decision 7 and the D10 concurrent-writer acceptance, when the client conversion is complete. Other MCP decisions remain except where the implementation is explicitly replaced below.
+- Supersedes: ADR [0011](0011-mcp-server.md) decision 7 and the D10 concurrent-writer acceptance. The client conversion is complete: the CLI, the dashboard, `orch web` and `orch mcp` are clients of the daemon through `orch-client`. Apart from `orch daemon start` and `orch init`, which enter `orch-daemon`, none of them uses the store implementations in its production code ([ARCHITECTURE §3.1](../ARCHITECTURE.md#31-dependency-direction)). Other MCP decisions remain except where the implementation is explicitly replaced below.
 
 ## Context
 
@@ -289,9 +289,9 @@ authorize client recovery side effects, release or merge.
     `--from-agent`.
 
     Reasons. The owner's reason: an agent with a shell can always run the command, so an acknowledgement cannot
-    stop it. The design review's finding, which the owner had before deciding: with the only evidence the
-    daemon can get about a caller (sampled process-group ids), no design refuses an agent's accidental stop
-    without sometimes refusing the owner's own stop. When a run's process group ends and its number is reused
+    stop it. The design review's finding, which the owner had before deciding: with the evidence the design
+    was permitted to use about a caller (sampled process-group ids), no design refuses an agent's accidental
+    stop without sometimes refusing the owner's own stop. When a run's process group ends and its number is reused
     for the owner's shell, that evidence matches the owner; a stop sent by an older `orch`, whose frozen stop
     request cannot carry an acknowledgement, would then be refused, and R6 and R14 require that stop to work.
     The finding is limited to that evidence and to the unchanged requirement that the owner's stop always
