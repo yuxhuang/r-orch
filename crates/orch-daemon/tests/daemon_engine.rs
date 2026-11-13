@@ -621,10 +621,13 @@ async fn maintenance_reconciles_adopted_death_without_dispatch_or_idle_publicati
         AgentStatus, OrchestratorState, RetryEntry, RunStatus, RunningEntry, TaskStatus,
     };
     use orch_engine::container::{EngineSeams, build_full_with_processes};
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
     let project = tempfile::tempdir().unwrap();
-    std::fs::create_dir(project.path().join(".orchestry")).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(project.path().join(".orchestry"))
+        .unwrap();
     let processes = Arc::new(AdoptedProcesses::default());
     let seed = build_full_with_processes(
         project.path(),

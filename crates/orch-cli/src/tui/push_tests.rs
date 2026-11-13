@@ -1027,7 +1027,10 @@ fn tui_production_retry_handoff_keeps_keywords_and_modes_and_resets_on_quit() {
     }
     let daemon = FakeDaemon::new();
     let root = tempfile::tempdir().unwrap();
-    std::fs::create_dir(root.path().join(".orchestry")).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.path().join(".orchestry"))
+        .unwrap();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
