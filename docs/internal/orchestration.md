@@ -44,7 +44,7 @@ CLI). Temporary paths are shown as `<tmp>`.
 | **Q2.** How does one agent connect to another agent? | Never directly. An agent writes a **message** file (`orch msg send`) or a **shared context** entry (`orch context set`). The message is injected into the recipient's prompt the next time the recipient is dispatched; nothing wakes the recipient. | [§3](#3-q2-how-does-one-agent-connect-to-another-agent) |
 | **Q3.** How does one agent connect to another task? | Through the `orch` CLI, from inside its run: it creates tasks (`--assignee`, `--depends-on`, `--goal-id`), inspects them (`orch task show`), and approves or rejects them. The orchestrator gives each run `ORCH_AGENT_ID` and `ORCH_TASK_ID`. A finished task's result sits in its `proof`; nobody pushes it to the creator. | [§4](#4-q3-how-does-one-agent-connect-to-another-task) |
 | **Q4.** How does a goal-driven system work? | A goal with an assignee makes that agent **autonomous**. While a goal is `active`, every tick gives each idle autonomous agent with no open task an `[auto]` task carrying the goal text (30-second cooldown per agent). The prompt tells the agent to decompose the goal into tasks and to mark the goal `achieved` when they are finished. That part is **[convention]**: nothing closes a goal automatically. | [§5](#5-q4-how-does-a-goal-driven-system-work) |
-| **Q5.** How, when and why does a pause happen, and what makes it continue? | There is no single pause. **Goal pause** stops new `[auto]` work for that goal and cancels its queued autonomous tasks; running work normally finishes, but the pause is not an atomic barrier ([§5.5](#55-what-pausing-a-goal-does-to-its-tasks)). **Abandoning** (or achieving) a goal stops `[auto]` work too, but cancels nothing: queued tasks still run. **Agent disable** holds an idle agent, but a run that ends sets the agent back to `idle`. **Watch stop** (`/pause`, `Ctrl+C`, `SIGTERM`) kills running agents and sends their tasks back to `retrying`. Individual tasks also **wait** in `review`, on dependencies, on scope, or for an agent. Each resumes on a specific command or state change; no message or inbox entry resumes anything by itself. | [§6](#6-q5-how-does-a-pause-happen) |
+| **Q5.** How, when and why does a pause happen, and what makes it continue? | There is no single pause. **Goal pause** stops new `[auto]` work for that goal and cancels its queued autonomous tasks; running work normally finishes, but the pause is not an atomic barrier ([§5.5](#55-what-pausing-a-goal-does-to-its-tasks)). **Abandoning** (or achieving) a goal stops `[auto]` work too, but cancels nothing: queued tasks still run. **Agent disable** holds an idle agent, but a run that ends sets the agent back to `idle`. **Dispatch off** (`/pause`, `orch daemon dispatch off`) stops only future automatic dispatch; running agents continue. **Daemon stop** (`orch daemon stop`, or SIGTERM/SIGINT/SIGHUP to the daemon) attempts to stop local runs with grace, moves their tasks to `retrying` (or `failed`) and reconciles them. `Ctrl+C` on `orch run <task-id>`, `orch run --all` or `orch run --once` ends only that client's observation; the runs continue in the daemon. `orch run --watch` is a foreground daemon, so there `Ctrl+C` is a daemon stop. Individual tasks also **wait** in `review`, on dependencies, on scope, or for an agent. Each resumes on a specific command or state change; no message or inbox entry resumes anything by itself. | [§6](#6-q5-how-does-a-pause-happen) |
 
 ---
 
@@ -97,28 +97,35 @@ flowchart LR
 
 Ids are a prefix plus a nanoid (`infra/ids.rs:18-20`). Path builders are in `infra/storage/paths.rs:32-154`.
 
-**The event bus is in-process.** `task:created`, `task:status_changed` and the rest go to subscribers in the
-same process only. A task created by another process (an agent's `orch task add`, your terminal) is not
-seen until the orchestrator's next tick reloads its caches and the files (`orchestrator/tick.rs:48-49`). A task
-created inside the orchestrator's own process triggers a reactive dispatch instead (`orchestrator.rs:607-615`). That is why
-cross-process changes take effect within `scheduling.poll_interval_ms` (default 10 s, `domain/config.rs:239`)
-and in-process ones within about 0.5 s.
+**The event bus is in-process; frontend changes reach it through the daemon.** Frontend project-state
+changes, including an agent's `orch task add`, arrive as daemon requests. A non-tick commit schedules a
+coalesced dispatch wake about 0.5 s later; tick-sourced commits do not wake another tick, and the
+poll interval is the fallback (`crates/orch-daemon/src/dispatch/{mod,wake}.rs`). Automatic dispatch
+still requires the daemon's dispatch switch to be on.
 
 ### Who runs the orchestrator
 
-| Command | Owner lock | Reconcile | Creates `[auto]` tasks | Starts | Ends |
-|---|---|---|---|---|---|
-| `orch run <task-id>` | temporary (`orchestrator.rs:379-393`, `484-490`) | no | no | that task only; every other ready task is claimed so it cannot start (`orchestrator/dispatch.rs:264-293`), which also means it starts nothing and exits 0 when the assignee has another `todo`/`retrying` task ([§8](#8-known-gaps-pending-fixes) row 9) | when its collectors finish (`orchestrator.rs:681-688`) |
-| `orch run --all` | temporary (`orchestrator.rs:493-498`) | no | no | one pass over everything ready (`orchestrator/dispatch.rs:25-34`) | when its collectors finish |
-| `orch run --watch`, `orch serve`, the dashboard (`orch`, `orch tui`, `orch web`) | held while running (`orchestrator.rs:563-567`) | every tick | yes | every tick, plus reactive dispatch | on a signal, `/pause`, or the tick circuit breaker |
-| `orch serve --once` | held | every tick | **no** (`orchestrator.rs:165-172`) | every tick | when every task is terminal |
-| `orch tui --observe` | none | — | — | nothing on its own (one-shot actions from the dashboard still work) | — |
+The daemon owns the engine, project stores and agent processes. Frontend commands request work
+through its socket; opening or closing a dashboard does not change dispatch. Sources:
+`crates/orch-cli/src/commands/{daemon,run}.rs`, `crates/orch-cli/src/tui/{backend,command}.rs`,
+`crates/orch-daemon/src/{lifecycle,dispatch/mod,ops/control}.rs`.
 
-Only one process can hold the lock. Another watch-mode start fails with `LockConflict`
-(`orchestrator.rs:563-566`). The lock file holds a PID; it is stale when that PID is dead or the file has not
-been touched for 60 s (`infra/storage/lock.rs:27`, `41-60`), and every tick touches it
-(`orchestrator/tick.rs:36-38`). One-shot commands such as `orch task add` never take the lock; the
-consequences are in [ARCHITECTURE §2.1](../ARCHITECTURE.md#21-a2-in-detail--the-concurrency-story-is-weaker-than-single-writer).
+| Command | Ownership | Scheduling behavior | Lifetime |
+|---|---|---|---|
+| `orch daemon start` | acquires owner guard and PID lock; performs startup recovery before serving | dispatch off by default; `--dispatch on` enables automatic scheduling | until explicit stop or termination |
+| `orch run --watch`, `orch serve` without `--once` | explicit foreground daemon start | dispatch on | until daemon shutdown |
+| `orch run <task-id>` | client of the running daemon | requests the named task and observes its outcome | client observation ends; disconnect does not kill the run |
+| `orch run --all` | client | tries tasks dispatchable when the request arrives, retrying pending ones as runs finish; observes launched runs until they finish and no pending task remains eligible | client observation ends |
+| `orch run --once` | client | one scheduling tick | returns after the tick |
+| `orch serve --once` | client | dispatch-until-terminal batch, without autonomous seeding; requires dispatch off (refused when on); one batch at a time (exit 4) | batch result or observation cancellation; daemon stays running |
+| `orch`, `orch tui`, `orch web` | clients | show the daemon's switch; `/watch` and `/pause` set it on/off | dashboard closes independently of daemon/agents |
+
+`OwnerGuard` holds the stable `.daemon-owner.lock` advisory lock; `PidLock` maintains the decimal
+PID file. A live holder is not evicted because its PID file is old. The independent heartbeat
+checks it every 10 seconds. `--observe` is removed: every dashboard is a client. State commands,
+including commands issued by agents, use the daemon's operation boundary rather than writing
+alongside it. Guarantees and the crash/external-writer limits are in
+[ARCHITECTURE §2.1](../ARCHITECTURE.md#21-daemon-ownership-guarantees-and-limits).
 
 ---
 
@@ -179,8 +186,8 @@ flowchart TD
 - Startup and the loop: `orchestrator.rs:504-666`, `1084-1143`. The loop is a `tokio::select!` over the
   shutdown token, the interval timer and the signal handlers (`orchestrator.rs:1117-1137`). The interval
   does not burst to catch up after a slow tick (`MissedTickBehavior::Delay`, `orchestrator.rs:1104-1108`).
-  [ARCHITECTURE §6.2](../ARCHITECTURE.md#62-tick-loop) shows an earlier design sketch of this loop; the code
-  above is what ships.
+  This diagram and these `orchestrator.rs` references describe the legacy in-process watch loop.
+  [ARCHITECTURE §6.2](../ARCHITECTURE.md#62-tick-loop) describes the current daemon-hosted loop.
 - One tick: `orchestrator/tick.rs:27-67`. The whole tick holds the state mutex, so ticks, completions and
   cancels never interleave ([ARCHITECTURE §6.1](../ARCHITECTURE.md#61-state-mutex)).
 - Circuit breaker: five consecutive failed ticks call `stop()` (`orchestrator.rs:76`, `1148-1168`).
@@ -430,8 +437,10 @@ Two worktree tasks that touch the same file will conflict at merge time unless t
 
 ### 2.8 Shutdown and restart recovery
 
-**Graceful stop** — `stop()` (`orchestrator.rs:751-831`, `orchestrator/recovery.rs:580-660`). Called by the
-signal handlers, the circuit breaker and the dashboard's `/pause`.
+**Graceful stop (legacy in-process watch loop)** — `stop()` (`orchestrator.rs`, test builds only),
+called by that loop's signal handlers and circuit breaker. In the daemon, `/pause` only turns dispatch
+off; a daemon stop runs `daemon_stop_with_spawn_seal` (`crates/orch-engine/src/orchestrator/daemon/shutdown.rs`),
+which refuses unverified worker PIDs and reports survivors instead of claiming a clean stop.
 
 1. Stop future ticks (the in-flight tick finishes), cancel the reactive-dispatch timer and the debounced save.
 2. For each **local** running entry: kill the process group with a 10 s grace
@@ -550,9 +559,10 @@ point it.
 To read it: `orch task show <id>`, `orch logs <run-id>`, `orch logs --task <id>`, `orch goal show <id>`,
 `orch status` ([manual: View logs](../manual/07-running-and-monitoring.md#view-logs)).
 
-Concurrent writers can lose an index entry (a task file exists but `_index.json` does not list it, so dispatch
-does not see it). This is a known hazard with a recovery procedure:
-[ARCHITECTURE §2.1](../ARCHITECTURE.md#21-a2-in-detail--the-concurrency-story-is-weaker-than-single-writer).
+Frontend mutations share the daemon's operation boundary. An entity and its index are still separate
+writes, so a crash or I/O failure between them can leave a valid index missing an entity; a direct
+filesystem writer can also bypass the boundary (`crates/orch-infra/src/storage/task.rs`, `index.rs`).
+See [ARCHITECTURE §2.1](../ARCHITECTURE.md#21-daemon-ownership-guarantees-and-limits).
 
 ### 2.12 Checklist: will this task be handled?
 
@@ -899,14 +909,19 @@ Achieving a goal (with `achieved`, no `--force`) left its queued `[ateam] checkp
 
 - a **goal** stops generating work (pause, abandon);
 - an **agent** stops taking work (disable);
-- the **orchestrator** stops running work (watch stop, standalone interrupt, circuit breaker, crash).
+- the daemon's **dispatch switch** stops future automatic scheduling; a **daemon stop** attempts to
+  stop and reconcile local runs; a client interrupt ends only its observation.
 
 Separately, one **task** can wait on its own conditions ("Waits that look like pauses", below). A goal pause
-cancels queued autonomous work, and the orchestrator-level stops kill running work. Abandoning the goal and
-disabling the agent, the two levers an operator is likely to try first, do neither: queued work still runs.
+cancels queued autonomous work; a daemon stop attempts to stop running agents, while dispatch off and
+client interrupts leave them alive. Abandoning the goal and disabling the agent, the two levers an
+operator is likely to try first, stop neither: abandoning cancels no queued task,
+a disabled agent is held only while it is idle (the end of its current run sets it back to `idle`
+and it takes its next queued task), and running agents continue.
 None of them is resumed by a message: the inbox is read only when a task is dispatched, so a message cannot restart anything. What
-resumes each one is a command or a change of state, picked up at the next tick (within
-`poll_interval_ms`) because the orchestrator re-reads the files each tick (`orchestrator/tick.rs:48-50`).
+resumes each one is a command or a change of state. With automatic dispatch on, non-tick commits
+schedule a coalesced wake about 0.5 s later; the poll interval is the fallback
+(`crates/orch-daemon/src/dispatch/{mod,wake}.rs`).
 
 ### 6.1 Pause and resume table
 
@@ -915,15 +930,19 @@ resumes each one is a command or a change of state, picked up at the next tick (
 | **Goal pause**: `orch goal status <id> paused`, dashboard `P`, `/goal status <id> paused` | A human or an agent decides. The `a-team` lead pauses its goal at the approval gate [convention] (`domain/org_templates/a-team/agents/orchestrator.yml:78`). | Seeding for that goal; the assignee's autonomous flag; the assignee's queued autonomous tasks of that goal (cancelled) | Running tasks, normally (not an atomic barrier: a listed task that starts before its cancel is stopped, [§5.5](#55-what-pausing-a-goal-does-to-its-tasks)); non-autonomous linked tasks | `goals/<id>.yml` `status: paused`; agent `autonomous: false`; cancelled tasks | `orch goal status <id> active` (or `P`). The a-team convention: the owner sends `orch msg send <lead> …` **and** runs `goal status active`; the message alone does nothing. |
 | **Goal abandon** (or achieve): `orch goal status <id> abandoned`, dashboard `X` | A human or an agent gives up on (or closes) the goal | Seeding for that goal; the assignee's autonomous flag | **Every queued task**, autonomous-labelled ones included; running tasks ([§5.6](#56-what-abandoning-or-achieving-a-goal-does-to-its-tasks)) | `goals/<id>.yml` `status: abandoned`; agent `autonomous: false` | Nothing: the status is final. To stop the queued work, `orch task cancel` each task. |
 | **Agent disable**: `orch agent disable <id>` | A human wants one agent to stop taking work | New dispatch to the agent and `[auto]` seeding for it, **only while it is idle** | Its current run. When that run ends (success, failure or merge), the agent is written back to `idle` and takes its next queued task ([§8](#8-known-gaps-pending-fixes) row 6, pending fix) | `agents/<id>.yml` `status: disabled`, until a run ends | `orch agent enable <id>`, **or the end of any run it was executing** |
-| **Watch stop**: dashboard `/pause`, `Ctrl+C` or `SIGTERM` to `run --watch` / `serve` / the dashboard | An operator stops the daemon or the dashboard pauses | All ticks; **every local run is killed** (10 s grace). The dashboard's `/pause` also drops this node's peer listener, so controllers that use this node as a remote lose it until `/watch` (`cli/tui/backend.rs:868-877`; test at `cli/serve/peer.rs:228-246`) | Remote runs this node submitted (detached) | runs `cancelled`; tasks `retrying` (or `failed`); `state.json` `pid: null`, `running` emptied; lock released | Start a watch process again (`orch serve`, `orch run --watch`, dashboard `/watch`). `retrying` tasks start on the first tick. |
-| **Standalone interrupt**: `Ctrl+C`/`SIGTERM` to `orch run <id>` or `run --all` | An operator interrupts a one-shot run | New dispatches; the runs this command started | Runs started by other processes | Same as watch stop, for its own runs; exit code 130 or 143 | Run the command again |
-| **Circuit breaker** | Five consecutive failing ticks, for example an unreadable store | Same as watch stop | — | Same as watch stop; each failure is an `orchestrator:error` with context `tick`, and the fifth has `fatal: true` | Fix the cause, start again |
+| **Dispatch off**: dashboard `/pause`, `orch daemon dispatch off` | An operator stops automatic scheduling | Future automatic dispatch only | Running agents, collectors, peer listener, maintenance | Nothing beyond the daemon's in-memory switch | `/watch` or `orch daemon dispatch on` |
+| **Daemon stop**: `orch daemon stop`, SIGTERM/SIGINT/SIGHUP to the daemon | An operator stops the daemon | All dispatch; attempts to stop local runs with grace and reconcile them | Remote runs are detached; unverified or surviving local PIDs can prevent clean cleanup (ARCHITECTURE §2.1 N7) | `state.json` reconciled for stopped runs; failure preserves unresolved evidence | Start the daemon again after shutdown |
+| **Client interrupt**: `Ctrl+C`/`SIGTERM` to `orch run <id>` or `run --all` | An operator interrupts the client | The client observation and further launches requested by that observation | Runs already started in the daemon | No run cancellation solely because the client was interrupted | Observe current state or issue a new command |
+| **Failed automatic dispatch tick** | A daemon tick returns an error | That tick ends; the failure is logged and the loop continues | Running agents, maintenance, peer runtime; subsequent automatic ticks | Whatever the failed operation committed; there is no five-tick circuit breaker in the daemon loop | The next wake or poll retries while dispatch is on |
 | **Crash or `kill -9`** | The orchestrator dies without `stop()` | The tick and all collectors; child processes **may keep running** | Orphaned children | `state.json` still lists the runs and the old PID; the lock goes stale | Start again. Dead entries: their tasks are **cancelled** (`orch task retry` to restart). Live children: adopted, retried when they exit ([§2.8](#28-shutdown-and-restart-recovery)). |
 
 Sources: goal `engine/goal_service.rs:133-176`; agent disable `engine/agent_service.rs:527-529`, `546-556`, and
-the run-end resets `orchestrator/collect.rs:508-511` (success), `589-593` (failure), `811-815` (merge); `/pause` `tui/commands.rs:174-187` → `cli/tui/backend.rs:868-877` →
-`orchestrator.rs:751-831`; signals `orchestrator.rs:583-600`, `725-734`, `1132-1135`; standalone interrupt
-`orchestrator.rs:833-922`, exit codes `cli/commands/run.rs:361-362`; breaker `orchestrator.rs:1148-1168`; crash recovery `orchestrator/recovery.rs:245-485`.
+the run-end resets `orchestrator/collect.rs:508-511` (success), `589-593` (failure), `811-815` (merge).
+Dispatch controls: `crates/orch-cli/src/tui/backend.rs`, `crates/orch-daemon/src/ops/control.rs`;
+daemon stop and signals: `crates/orch-daemon/src/lifecycle.rs`,
+`crates/orch-engine/src/orchestrator/daemon/shutdown.rs`; client interruption:
+`crates/orch-cli/src/commands/run.rs`; tick failure: `crates/orch-daemon/src/dispatch/mod.rs`;
+crash recovery: `crates/orch-engine/src/orchestrator/recovery.rs`.
 
 **Waits that look like pauses** — the task is fine, it is waiting for a condition [mechanism]:
 
@@ -938,23 +957,29 @@ the run-end resets `orchestrator/collect.rs:508-511` (success), `589-593` (failu
 
 ### 6.2 State diagrams
 
-The orchestrator process, as the dashboard sees it:
+The daemon's dispatch switch, as the dashboard sees it:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> idle : orch tui (no watch)
-    [*] --> watching : orch serve, run --watch, dashboard default
-    [*] --> observing : orch tui --observe
-    idle --> watching : /watch
-    watching --> stopping : /pause, SIGINT, SIGTERM, 5 failed ticks
-    stopping --> idle : runs killed, tasks retrying, lock released (dashboard)
-    stopping --> [*] : serve or run --watch exits
-    watching --> crashed : kill -9 or panic
-    crashed --> watching : next start runs recovery
+    [*] --> idle : daemon start (default dispatch off)
+    [*] --> watching : explicit start with dispatch on
+    idle --> watching : /watch or daemon dispatch on
+    watching --> idle : /pause or daemon dispatch off
+    watching --> ownership_lost : PID ownership loss detected
+    idle --> ownership_lost : PID ownership loss detected
+    idle --> stopping : daemon stop or termination signal
+    watching --> stopping : daemon stop or termination signal
+    ownership_lost --> stopping : daemon stop or termination signal
+    stopping --> [*] : clean stop: agents killed with grace and reconciled, requests drained, ownership released
 ```
 
-The dashboard's labels are `watching`, `observing` and `idle` (`tui/state.rs:3712-3720`). `stopping` and
-`crashed` are not shown states; they are drawn to show what happens.
+WATCHING / IDLE reflects the daemon's dispatch switch. `/pause` leaves running agents alive;
+closing the dashboard leaves both the switch and those agents alone. Ownership loss disables
+scheduling but is not a general write fence (ARCHITECTURE §2.1 N3). `ownership_lost` and `stopping`
+above describe lifecycle transitions, not extra dashboard chips. There is no production
+`observing` mode (`crates/orch-cli/src/tui/{backend,command}.rs`,
+`crates/orch-daemon/src/ops/control.rs`). A crashed daemon requires an explicit restart;
+its next start runs recovery before serving (`crates/orch-daemon/src/lifecycle.rs`).
 
 A goal and what each status does to its queued work (the goal's own state machine is in [§5.1](#51-goal-state-machine)):
 
