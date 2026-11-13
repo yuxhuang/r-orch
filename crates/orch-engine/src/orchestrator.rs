@@ -235,6 +235,7 @@ struct Inner {
     single_task_runs: Mutex<HashSet<String>>,
     /// Per-agent auto-seed cooldown. In-memory — a restart reseeds.
     last_auto_seed_at: Mutex<HashMap<String, i64>>,
+    scope_overlap_reports: std::sync::Mutex<HashMap<String, (String, i64)>>,
 
     remote_state_dirty: AtomicBool,
     /// Exact serialized state from the latest successful read or write, never
@@ -362,6 +363,7 @@ impl Orchestrator {
                 #[cfg(test)]
                 single_task_runs: Mutex::new(HashSet::new()),
                 last_auto_seed_at: Mutex::new(HashMap::new()),
+                scope_overlap_reports: std::sync::Mutex::new(HashMap::new()),
                 remote_clocks: Mutex::new(HashMap::new()),
                 lazy_save: Mutex::new(LazySave::default()),
                 #[cfg(test)]
