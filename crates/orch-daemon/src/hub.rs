@@ -453,6 +453,67 @@ mod tests {
             .ev
     }
 
+    /// Pins the listener's start on a project without a task index, driven
+    /// directly by the hub fixture rather than the daemon's startup recovery.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_listener_start_declares_task_index_repair_with_remote_status() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".orchestry")).unwrap();
+        let mut engine = orch_engine::build_full_with(
+            temp.path(),
+            orch_engine::EngineSeams {
+                global_config_path: Some(temp.path().join("global.yml")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        engine.engine.config.peer.listen = Some("127.0.0.1:0".into());
+        engine.orchestrator.enable_daemon_mode();
+        let engine = Arc::new(engine);
+        let mut runtime = orch_peer::PeerRuntime::prepare(engine.clone())
+            .await
+            .unwrap();
+        let index = engine.paths.tasks_dir().join("_index.json");
+        assert!(!tokio::fs::try_exists(&index).await.unwrap());
+        let boundary = engine.events.operation_boundary();
+        let baseline = boundary.current_commit_seq();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let captured = records.clone();
+        let published = Arc::new(tokio::sync::Notify::new());
+        let ready = published.clone();
+        boundary.set_publisher(Some(Arc::new(move |p| {
+            if let Publication::Commit(record) = p {
+                lock(&captured).push(record.clone());
+                ready.notify_one();
+            }
+        })));
+        runtime.start_listener();
+        tokio::time::timeout(std::time::Duration::from_secs(5), published.notified())
+            .await
+            .expect("listener start committed");
+        let start_records = lock(&records).clone();
+        runtime.shutdown().await;
+        assert_eq!(start_records.len(), 1, "one listener-start commit");
+        let record = &start_records[0];
+        assert_eq!(record.source, CommitSource::Peer);
+        assert!(record.commit_seq > baseline);
+        assert!(!record.store_set_uncertain);
+        let stores: Vec<_> = record.changes.iter().map(|change| change.store).collect();
+        assert!(
+            stores.contains(&CommitStore::Tasks),
+            "task-index repair declared"
+        );
+        assert!(
+            stores.contains(&CommitStore::Remote),
+            "listener status declared"
+        );
+        assert_eq!(stores.len(), 2, "only Tasks and Remote declared");
+        let rebuilt: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&index).await.unwrap()).unwrap();
+        assert_eq!(rebuilt, serde_json::json!([]));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn peer_status_publish_is_remote_store_wide_without_tasks_or_resync() {
         let temp = tempfile::tempdir().unwrap();
