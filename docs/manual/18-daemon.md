@@ -141,6 +141,10 @@ holder, however old its lock file is: the message gives a `ps -p <pid> -o comman
 process is and stop it yourself. Because the daemon holds that same lock, an `orch serve` or `orch run --watch`
 of orch 0.13.0 cannot become the orchestrator while it runs; [stop every old orch process](#upgrading-from-orch-0130)
 before the first start anyway, because old one-off commands and old `orch mcp` servers write without that lock.
+This holds as long as `.orchestry/` and its two lock files are not deleted or replaced under a running daemon, for
+example by a restore from a backup: a second daemon can then start on the same project. See
+[ARCHITECTURE.md](../ARCHITECTURE.md#21-daemon-ownership-guarantees-and-limits) and, for the `wrong_project` message
+that shows it, [the runbook](../RUNBOOK.md#no-orch-daemon-is-running-for-project-root).
 
 **Refusals.** A start refuses, and changes nothing, when:
 
@@ -260,7 +264,8 @@ A request that the daemon had accepted before it lost ownership, and had not sta
 already running at that moment, such as `orch doctor`, is stopped and ends with `diagnostic cancelled` (exit 1);
 run it again after the restart. A command that was following its runs stops following them, and the agents keep
 running: `orch run <task-id>` and `orch run --all` end with `observation interrupted; runs continue in the daemon`
-(exit 1), `orch serve --once` ends its batch as `interrupted` (exit 1), and `orch logs --follow` ends. The agents
+(exit 1), `orch serve --once` ends its batch as `interrupted` (exit 1), and `orch logs --follow` returns without a
+message (exit 0). The agents
 they started keep running until you stop the daemon. orch does not retry any of these requests and does not restart anything. Repeat a
 command that only reads. Before you repeat a command that changes state, stop the daemon and start it again, as
 described above. A request made after the change is answered, and `orch daemon status` then prints
@@ -269,8 +274,9 @@ described above. A request made after the change is answered, and `orch daemon s
 **What may have been written before you stop it.** The daemon checks for ownership loss on a 10-second timer;
 scheduling and waiting for the control operation can delay recording the loss further. Until the loss is recorded,
 dispatch, if it is on, can still start tasks. After it is recorded, the requests listed above are refused, but every
-other request, including writes, runs until you stop the daemon. So the daemon can have written to the project in
-that time. A second daemon cannot have, as long as `.orchestry/.daemon-owner.lock` was not deleted or replaced as
+other request, including writes, runs until you stop the daemon. Agents already running still commit their results,
+and the daemon's own maintenance (dead-run reconciliation, context expiry) and a hosted peer runtime keep writing too.
+So the daemon can have written to the project in that time. A second daemon cannot have, as long as `.orchestry/.daemon-owner.lock` was not deleted or replaced as
 well: the daemon holds the lock on that file until it exits. Whether a process that is not a daemon wrote to the
 project in that time is not excluded by the code, and no test covers it.
 
@@ -291,14 +297,16 @@ so `orch daemon stop` followed by `orch daemon start` works. A success does not 
 from the process table: it can still be exiting for a moment after it has released the lock. The wait is at most
 30 s in total; if the daemon has not confirmed its cleanup and released the project by then, the command says
 `daemon accepted stop but PID <pid> is still running after 30 s` and exits 7. Shutting down, the daemon
-stops taking requests and dispatching, stops its running agents (each gets the usual 10 s grace before it is
-killed), records their runs as cancelled and settles their tasks' retries, removes its own socket and
-`daemon.json`, and releases ownership last. SIGTERM, SIGINT and SIGHUP do the same.
+stops taking requests and dispatching, tries to stop its running local agents (each gets the usual 10 s grace before
+it is killed), records the runs it stopped as cancelled and settles their tasks' retries, removes its own socket and
+`daemon.json`, and releases ownership last. Remote runs are not cancelled. SIGTERM, SIGINT and SIGHUP do the same.
 
 - The stop works even when the daemon and this `orch` are different versions (see [Version skew](#version-skew)).
   It is checked against your user and the project, and does nothing else.
-- If cleanup fails, the command reports the failure instead of a clean stop, and the daemon keeps the evidence
-  needed for recovery.
+- If cleanup fails, the command reports the failure instead of a clean stop and exits 1 with
+  `daemon shutdown cleanup failed; recovery evidence was retained`, and the daemon keeps the evidence needed for
+  recovery. This happens when it cannot verify an agent's saved PID or cannot confirm that an agent stopped; the
+  descendants of an agent can also survive a stop. Check the result before you start the daemon again.
 - If the daemon accepted the stop but the connection closed before it confirmed that it finished, the outcome is
   unknown: the message says that the stop may have been applied and to inspect state before retrying, and the
   command exits 7 (see [Reply lost](#when-no-daemon-answers)). `orch daemon stop` never kills, restarts or

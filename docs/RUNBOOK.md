@@ -67,14 +67,15 @@ procedures.
 | Start it with dispatch on | `orch serve`, `orch run --watch` or `orch daemon start --dispatch on` | As above, dispatch on |
 | See it | `orch daemon status` | `orch daemon PID <pid> · dispatch ON\|OFF`, then its socket, instance, running tasks and ownership; exit 7 if none answers |
 | Turn dispatch on or off | `orch daemon dispatch on` / `off` | Off does not stop running agents |
-| Stop it | `orch daemon stop` | Returns once the daemon has confirmed its cleanup and released the project, by exiting or by releasing its ownership lock (at most 30 s); agents get the usual 10 s grace and their runs end `cancelled` |
+| Stop it | `orch daemon stop` | Returns once the daemon has confirmed its cleanup and released the project, by exiting or by releasing its ownership lock (at most 30 s); it stops the local agents (the usual 10 s grace) and records their runs `cancelled`; remote runs are not cancelled. If it cannot confirm that an agent stopped, it exits 1 with `daemon shutdown cleanup failed; recovery evidence was retained` |
 
 `Ctrl+C`, SIGTERM and SIGHUP (closing the terminal or tmux pane of a foreground daemon) stop it cleanly, like
 `orch daemon stop`. A detached daemon survives closing its terminal or pane; it does not survive a reboot, and orch
 supplies no launchd job, watchdog or restart.
 
 To see which orch processes run, `pgrep -fl orch` lists the daemon (`orch daemon start`, `orch serve` or
-`orch run --watch`) and its clients (`orch mcp`, `orch tui`, `orch web`) separately.
+`orch run --watch`) and its clients (`orch mcp`, `orch tui`, `orch web`) separately. On Linux use `pgrep -af orch`:
+there `-l` prints only the process name, not its arguments.
 
 ### `No orch daemon is running for <project root>`
 
@@ -108,7 +109,11 @@ that on purpose.
 **Not this entry:** `daemon_busy` (the daemon runs but found no room for the client within about 13 s, that is 10 s
 of waiting plus one last connection attempt, for a session
 or for the connection itself, so the count can read `1/64 sessions`: close clients and retry), `wrong_project` (the socket
-belongs to another project: fix `ORCH_SOCKET`/`ORCH_PROJECT_ROOT`), `Cannot confirm the orch request outcome`
+belongs to another project: fix `ORCH_SOCKET`/`ORCH_PROJECT_ROOT`. If both paths in the message are the same,
+`.orchestry/` was replaced under a running daemon, for example by a restore from a backup: `orch daemon stop` fails
+the same way, so find the daemon with `pgrep -fl orch` (Linux: `pgrep -af orch`), check it with
+`ps -p <pid> -o command=` and `lsof -a -p <pid> -d cwd`, stop it with `kill -TERM <pid>`, then start the daemon
+again), `Cannot confirm the orch request outcome`
 (the reply was lost: read the state before you retry; see
 [the manual](manual/18-daemon.md#when-no-daemon-answers)).
 
@@ -138,14 +143,21 @@ window, have one daemon remove the other's socket. Set `ORCH_SOCKET` per project
 
 **Fix.**
 
-1. Confirm no daemon of this project runs: `orch daemon status` exits 7, and `pgrep -fl orch` shows no
-   `orch daemon start`, `orch serve` or `orch run --watch` for it.
+1. Confirm no daemon of this project runs: `orch daemon status` exits 7 (a daemon whose `.orchestry/` was replaced
+   also exits 7, with `wrong_project`), and `pgrep -fl orch` (Linux: `pgrep -af orch`) shows no
+   `orch daemon start`, `orch serve` or `orch run --watch`. For one that is listed, `lsof -a -p <pid> -d cwd` shows
+   the project it serves.
 2. Start it: `orch daemon start`. It starts with dispatch **off**, whatever it ran with before.
 3. At start it reconciles what the dead daemon left: stale claims are cleared; a run whose local agent died is
    recorded `cancelled` and its agent `idle`; a run that was still preparing is cancelled; remote runs stay
    unknown until their peer syncs. It also rebuilds any missing or corrupt `_index.json`. It does not rebuild an index
    that is stale but still valid: if `orch task show <id>` finds a task that `orch task list` omits, see
-   [Rebuilding an index](#rebuilding-an-index-after-a-lost-update).
+   [Rebuilding an index](#rebuilding-an-index-after-a-lost-update). Agents can outlive the crash: a local run whose
+   PID is still alive stays running and keeps its agent reserved, and after a reboot that PID can belong to another
+   process (see [ARCHITECTURE.md](ARCHITECTURE.md#21-daemon-ownership-guarantees-and-limits)). If the start fails
+   with `Daemon recovery could not stop an orphaned local child: run <run-id>, PID <pid>`, the daemon did not start
+   and recovery could not confirm that process stopped: check that PID with `ps -p <pid> -o user=,command=` before
+   you do anything else.
 4. Inspect before you go on: `orch task list`, `orch logs --task <id>`, `orch daemon status`. Retry what needs it
    (`orch task retry <id>`), then `orch daemon dispatch on`.
 
@@ -163,8 +175,8 @@ show `"ownership": "lost"`). A command that switches dispatch or starts a run fa
 - the dashboard's `/watch`, `/run` and `/run-all`, which show `Failed: daemon ownership was lost` (`/pause` has
   nothing to stop: the header shows dispatch off, and it answers `Watch mode not active`).
 
-Nothing is written to `.orchestry/daemon.log` when this happens (without `RUST_LOG` the daemon logs only
-process-spawn warnings). Often the first sign is that tasks stop starting and `orch daemon status` shows
+Nothing is written to `.orchestry/daemon.log` when this happens (without `RUST_LOG` and without
+`ORCHESTRY_DEBUG` the daemon logs only process-spawn warnings). Often the first sign is that tasks stop starting and `orch daemon status` shows
 `dispatch OFF`.
 
 **Cause.** The daemon re-checks `.orchestry/orchestry.lock` every 10 seconds. The file was deleted, it names
@@ -175,8 +187,10 @@ that is not in the list above is still executed, reads and writes, for every cli
 
 **Fix.**
 
-1. Stop it: `orch daemon stop`. Like every stop, it stops the running agents (10 s grace) and records their runs
-   `cancelled`.
+1. Stop it: `orch daemon stop`. It attempts to stop the recorded local agents with a 10 s grace and records the runs
+   it stopped as `cancelled`. A PID it cannot verify, or an agent that survives, prevents complete cleanup: the
+   command then exits 1 with `daemon shutdown cleanup failed; recovery evidence was retained`. Remote runs are
+   not cancelled, and an agent's descendants may survive. Check the stop result before you restart.
 2. Start it: `orch daemon start`. It starts with dispatch **off**. If it exits 4 with
    `the project lock .orchestry/orchestry.lock is held by live PID <pid>`, run `ps -p <pid> -o command=`. If that
    is an orch process, stop it and start the daemon again. If it is not an orch process, the lock is stale:
@@ -189,8 +203,9 @@ that is not in the list above is still executed, reads and writes, for every cli
 **What may have been written between the loss and the stop.** The daemon checks for ownership loss on a 10-second
 timer; scheduling and waiting for the control operation can delay recording the loss further. Until the loss is
 recorded, dispatch, if it is on, can still start tasks. After it is recorded, the requests listed above are
-refused, but every other request, including writes, runs until you stop the daemon. So the daemon can have written
-to the project in that time. A second daemon cannot have, as long as `.orchestry/.daemon-owner.lock` was not deleted
+refused, but every other request, including writes, runs until you stop the daemon. Agents already running still
+commit their results, and the daemon's own maintenance (dead-run reconciliation, context expiry) and a hosted peer
+runtime keep writing too. So the daemon can have written to the project in that time. A second daemon cannot have, as long as `.orchestry/.daemon-owner.lock` was not deleted
 or replaced as well: the daemon holds the lock on that file until it exits. Whether a process that is not a daemon
 wrote to the project in that time is not excluded by the code, and no test covers it.
 
@@ -199,7 +214,7 @@ ends with `request cancelled before execution` (exit 1); nothing was executed. A
 running, such as `orch doctor`, ends with `diagnostic cancelled` (exit 1). A command that was following its runs
 stops following them, and the agents keep running: `orch run <task-id>` and `orch run --all` end with
 `observation interrupted; runs continue in the daemon` (exit 1), `orch serve --once` ends its batch as
-`interrupted` (exit 1), and `orch logs --follow` ends. The agents they started keep running until you stop the
+`interrupted` (exit 1), and `orch logs --follow` returns without a message (exit 0). The agents they started keep running until you stop the
 daemon. Nothing retries any of these: repeat the command after the restart.
 
 ### Version skew and upgrading orch
@@ -387,10 +402,12 @@ The remedy lives here rather than in the code.
 **Recovery.**
 
 1. **Confirm no daemon is running.** Do not skip this; deleting the lock under a live daemon makes it report
-   `ownership: LOST`. `orch daemon status` must exit 7, and `pgrep -fl orch` must show no `orch daemon start`,
-   `orch serve` or `orch run --watch` for this project; then inspect the lock.
+   `ownership: LOST`. `orch daemon status` must exit 7 (a daemon whose `.orchestry/` was replaced also exits 7, with
+   `wrong_project`), and `pgrep -fl orch` (Linux: `pgrep -af orch`) must show no `orch daemon start`, `orch serve`
+   or `orch run --watch`; for one that is listed, `lsof -a -p <pid> -d cwd` shows the project it serves. Then
+   inspect the lock.
    ```bash
-   orch daemon status ; pgrep -fl orch
+   orch daemon status ; pgrep -fl orch      # Linux: pgrep -af orch
    cat .orchestry/orchestry.lock        # inspect what is actually in there
    ```
 2. Delete the lock:
@@ -468,8 +485,9 @@ truth:
 ```bash
 orch daemon stop
 rm .orchestry/tasks/_index.json      # or agents/, goals/, context/, messages/
-orch daemon start
+orch daemon start --detach           # or `orch daemon start` in a pane you keep open
 orch task list                       # rebuilds
+orch daemon dispatch on              # only if dispatch was on before
 ```
 
 Safe with the daemon stopped. Never remove an index while a daemon runs. There is **no command that does this for you**, and nothing reports the divergence —
@@ -486,7 +504,7 @@ entity files — so the failure can run the other way too: a **corrupt or trunca
 your entity files are intact. If you suspect corruption, force the read:
 
 ```bash
-orch daemon stop && rm .orchestry/tasks/_index.json && orch daemon start && orch task list
+orch daemon stop && rm .orchestry/tasks/_index.json && orch daemon start --detach && orch task list
 ```
 
 A rebuild reads every file and **fails loudly, naming the offending one** — which is what you want when
@@ -572,9 +590,13 @@ For `orch mcp`, stderr belongs to the MCP client, which may discard it; see
 [Capturing `orch mcp` diagnostics](#capturing-orch-mcp-diagnostics). On that path the MCP SDK's `debug` and
 `trace` events, which carry tool arguments and results, are never recorded, whatever `RUST_LOG` says.
 
-Without `ORCHESTRY_DEBUG`, tracing output is suppressed entirely — including the one signal that
-distinguishes "another process holds the lock" from "I could not read the lock file", since both print
-`PID: undefined`. **If you are diagnosing a lock problem, set it.**
+Without `ORCHESTRY_DEBUG` (and without `RUST_LOG`), tracing output is suppressed, except the process-spawn warnings
+of a daemon start. You do not need it to tell the lock cases apart: `orch daemon start` exits 4 and names the case.
+`orch daemon already running (PID <pid>)` means another daemon owns the project;
+`the project lock .orchestry/orchestry.lock is held by live PID <pid>; …` means a live process holds the lock file;
+`orch daemon already running (PID unavailable)` means no PID could be read: if `orch daemon status` exits 7 as well,
+see [Corrupt lock file](#corrupt-lock-file). **For anything these messages do not explain, set
+`ORCHESTRY_DEBUG`.**
 
 Other useful reads:
 
