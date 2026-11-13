@@ -453,8 +453,8 @@ mod tests {
             .ev
     }
 
-    /// Pins the listener's start on a project without a task index, driven
-    /// directly by the hub fixture rather than the daemon's startup recovery.
+    /// Pins the first listener-start commit's task-index repair and declaration,
+    /// reading the index during publication before the startup sweep can run.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn peer_listener_start_declares_task_index_repair_with_remote_status() {
         let temp = tempfile::tempdir().unwrap();
@@ -478,24 +478,27 @@ mod tests {
         assert!(!tokio::fs::try_exists(&index).await.unwrap());
         let boundary = engine.events.operation_boundary();
         let baseline = boundary.current_commit_seq();
-        let records = Arc::new(Mutex::new(Vec::new()));
-        let captured = records.clone();
+        let first_commit = Arc::new(Mutex::new(None));
+        let captured = first_commit.clone();
         let published = Arc::new(tokio::sync::Notify::new());
         let ready = published.clone();
         boundary.set_publisher(Some(Arc::new(move |p| {
             if let Publication::Commit(record) = p {
-                lock(&captured).push(record.clone());
-                ready.notify_one();
+                let mut first = lock(&captured);
+                if first.is_none() {
+                    // Publication is synchronous, so the listener cannot reach
+                    // its startup sweep before this read completes.
+                    *first = Some((record.clone(), std::fs::read(&index)));
+                    ready.notify_one();
+                }
             }
         })));
         runtime.start_listener();
         tokio::time::timeout(std::time::Duration::from_secs(5), published.notified())
             .await
             .expect("listener start committed");
-        let start_records = lock(&records).clone();
+        let (record, index_bytes) = lock(&first_commit).take().expect("first commit captured");
         runtime.shutdown().await;
-        assert_eq!(start_records.len(), 1, "one listener-start commit");
-        let record = &start_records[0];
         assert_eq!(record.source, CommitSource::Peer);
         assert!(record.commit_seq > baseline);
         assert!(!record.store_set_uncertain);
@@ -510,7 +513,8 @@ mod tests {
         );
         assert_eq!(stores.len(), 2, "only Tasks and Remote declared");
         let rebuilt: serde_json::Value =
-            serde_json::from_slice(&tokio::fs::read(&index).await.unwrap()).unwrap();
+            serde_json::from_slice(&index_bytes.expect("index repaired at listener-start commit"))
+                .unwrap();
         assert_eq!(rebuilt, serde_json::json!([]));
     }
 
