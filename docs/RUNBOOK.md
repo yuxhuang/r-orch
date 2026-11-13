@@ -736,10 +736,12 @@ git status --short | grep orchestry             # should be empty
    un-ignore it deliberately to share agent definitions. Once a key is in a repository, **`0600` protects
    nothing** — git preserves no mode beyond the executable bit, and anyone who can read the repo can read
    the key.
-2. **Only those two files are owner-only.** `tasks/`, `goals/`, `teams/`, `messages/` and `context/` keep
-   umask modes, so in a project whose `.orchestry` is not itself owner-only (for example a project created
-   under the usual umask 022 before `orch init` made it 0700, and any whose directory was opened up) a credential pasted into a task description
-   or a context value **is** world-readable to other local users. For what a 0700 `.orchestry` does and does not
+2. **Not every file is owner-only.** `tasks/`, `goals/` and `teams/` keep their entity files owner-only, but their
+   `_index.json` files (`tasks/_index.json` holds every task's description) and everything in `messages/` and
+   `context/` keep umask modes. So in a project whose `.orchestry` other local users can enter (for example 0755, which
+   `orch init` created under the usual umask 022 before it made the directory 0700, or any directory opened up to
+   others), a credential pasted into a task description or a context value **is** readable by other local users. If the
+   directory is opened to its group only (0750, for example under umask 027), it is readable by that group. For what a 0700 `.orchestry` does and does not
    protect, see [Permissions of `.orchestry/`](manual/18-daemon.md#permissions-of-orchestry).
 3. **The child process still receives it.** `env:` is passed to every agent the entry spawns, so anything
    that agent logs, echoes or sends onward can leak it.

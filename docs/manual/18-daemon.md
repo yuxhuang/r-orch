@@ -466,10 +466,10 @@ still writes group-writable state. In a check on macOS the daemon wrote `state.j
 mode 0664 and `messages/`, `context/` and `teams/` with mode 0775, and `.orchestry` stayed 0755. To protect such a
 project, run `chmod 700 '<absolute path of .orchestry>'` as its owner, the command the refusal below prints.
 
-**When orch refuses.** If `.orchestry` is writable by group or others, or owned by another user, commands such as
-`orch task list`, `orch daemon status` and `orch daemon start` exit 2 and change nothing. The message names the
-project and the directory, says `No permissions were changed.` and prints the owner's commands with the paths
-shell-quoted. For a group-writable directory, with your own paths:
+**When orch refuses.** If `.orchestry` is writable by group or others, or owned by another user and readable by you,
+commands such as `orch task list`, `orch daemon status` and `orch daemon start` exit 2 and change nothing. The message
+names the project and the directory and says `No permissions were changed.`; for a group- or world-writable directory it
+also prints the owner's commands with the paths shell-quoted. For a group-writable directory, with your own paths:
 
 ```text
   ✕ Refusing project `<project root>`: `<project root>/.orchestry` is group/world-writable (mode 0775). No permissions were changed. For an owner-only project, run `chmod 700 '<project root>/.orchestry'` as its owner, keep its parent directories and ACLs under trusted control, then start explicitly with `(cd '<project root>' && orch daemon start)`. If other accounts could already write state, verify or restore it from trusted data before starting.
@@ -477,7 +477,9 @@ shell-quoted. For a group-writable directory, with your own paths:
 
 The commands that talk to the daemon add `A refused project does not prove a daemon is absent.` at the end. For a
 directory owned by another user, the message says it `is owned by uid <n>, but this process runs as uid <m>` and
-tells you to run as the project owner or select your project.
+tells you to run as the project owner or select your project. If another user's `.orchestry` cannot be read at all (for
+example the 0700 a new project gets), `orch task list` and `orch daemon status` report the project as not initialized
+(exit 3), and `orch daemon start` exits 2 saying it is not usable.
 
 ## Version skew
 

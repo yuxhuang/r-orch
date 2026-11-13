@@ -54,7 +54,7 @@ Quitting the dashboard resets all of it.
 
 Further presses of `r` are then ignored until you press another key, press a mouse button or paste, or until one
 second passes without an `r`. Otherwise a double press, or a key you hold down, would also run the first task in the
-list, because `R` runs the selected task on the Tasks view. The rule applies only after a reconnect; on a first
+list, because on the Tasks view `r`, like `R`, runs the selected task. The rule applies only after a reconnect; on a first
 start `r` acts at once. Its limits:
 
 - Every ignored `r` restarts the second, so pause for a second or press any other key first.
