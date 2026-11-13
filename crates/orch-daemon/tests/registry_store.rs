@@ -37,8 +37,24 @@ fn lock_file(paths: &Paths) -> File {
 
 fn assert_unlocked(paths: &Paths) {
     let lock = lock_file(paths);
-    lock.try_lock()
-        .expect("a failed mutation releases the registry lock");
+    // A concurrent process start can briefly retain the closed lock's file
+    // reference. Retry contention, but still fail promptly for a leaked guard.
+    let timeout = Duration::from_secs(1);
+    let started = Instant::now();
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let waited = started.elapsed();
+                assert!(
+                    waited < timeout,
+                    "a failed mutation releases the registry lock: still locked after {waited:?} (limit {timeout:?})"
+                );
+                std::thread::yield_now();
+            }
+            Err(error) => panic!("observe registry lock after failed mutation: {error}"),
+        }
+    }
     lock.unlock().unwrap();
 }
 
