@@ -374,6 +374,9 @@ async fn stalled_handshakes_use_their_own_budget_and_are_reclaimed() {
     use orch_proto::frame::limits::PRE_HANDSHAKE_SLOTS;
     let daemon = DaemonHarness::start().await.unwrap();
     let mut live = Raw::session(&daemon, "cli", "normal").await;
+    // A request is answered only after the pre-handshake slot is released;
+    // unlike the welcome, its reply proves that the slot is free.
+    ok(&live.request(1, "daemon.status", json!({})).await);
     let mut idlers = Vec::new();
     for _ in 0..PRE_HANDSHAKE_SLOTS {
         idlers.push(Raw::open(&daemon).await);
@@ -383,7 +386,7 @@ async fn stalled_handshakes_use_their_own_budget_and_are_reclaimed() {
     let reply = overflow.recv().await.expect("a busy reject");
     assert_eq!(reply["reject"]["code"], "busy", "{reply}");
     // The established session never needed a pre-handshake slot again.
-    ok(&live.request(1, "daemon.status", json!({})).await);
+    ok(&live.request(2, "daemon.status", json!({})).await);
 
     // The handshake deadline closes the idlers (we only wait on the daemon's
     // own close, bounded by the hang guard).
