@@ -247,8 +247,11 @@ recreate the lock. Plain `orch daemon status` then prints `ownership: LOST — s
 A request that the daemon had accepted before it lost ownership, and had not started to execute, is refused with
 `request cancelled before execution`: the command prints it on stderr and exits 1, and nothing was executed.
 `orch daemon status` is one of the commands this can happen to, at the moment of the change. orch does not retry
-the request and does not restart anything; repeat the command. A request made after the change is answered, and
-`orch daemon status` then prints `ownership: LOST`.
+the request and does not restart anything. Repeat a command that only reads. Before you repeat a command that
+changes state, stop the daemon and start it again, as described above: after it has lost ownership the daemon
+refuses only dispatch requests (`orch daemon dispatch on` and `off`, `orch run --once`, `orch run <task-id>`,
+`orch run --all` and `orch serve --once`) and still executes other commands. A request made after the change is
+answered, and `orch daemon status` then prints `ownership: LOST`.
 
 ### Dispatch on and off
 

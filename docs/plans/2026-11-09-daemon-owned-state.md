@@ -274,15 +274,20 @@ troubleshooting; README "Upgrading from v0.13.0" (PR 2); CHANGELOG `[Unreleased]
 mirrored to Pensieve's `specs/` directory.
 
 ## Open questions
-Gate 2's Q2 stop intent and Q5 regrouping were approved on 2026-11-09. CP3 rulings 8.17/8.20 record:
+Gate 2's Q2 stop intent and Q5 regrouping were approved on 2026-11-09. Recorded dispositions:
 
-1. **R39 is deferred by the owner (2026-11-11) and not built in this goal.** The kernel-pgid-derived
-   acknowledgement for agent-originated stop/dispatch off does not exist: an agent-context `orch daemon stop` or
-   `orch daemon dispatch off` succeeds without `--from-agent`. Reasons: an agent with a shell can always run the
-   command, and no design satisfies both R39 and the unconditional stop of an old-version daemon (R6, R14). The
-   accepted consequence is that the environment-based refusal of an agent-context start is the only protection:
-   accident prevention, not a barrier against a same-uid process. Existing kernel-UID/project checks remain
-   mandatory. R39 is a should row, recorded as deferred, not as a pass. The decision is ADR 0012, decision 15.
+1. **R39 is deferred by the owner (2026-11-11) and not built in this goal.** The kernel-pgid-derived acknowledgement
+   for agent-originated stop/dispatch off does not exist: an agent-context `orch daemon stop` or `orch daemon
+   dispatch off` succeeds without `--from-agent`. Reasons: the owner's, that an agent with a shell can always run
+   the command, so an acknowledgement cannot stop it; and the design review's finding that, with the only evidence
+   the daemon can get about a caller (sampled process-group ids), no design refuses an agent's accidental stop
+   without sometimes refusing the owner's own: when a run's process group ends and its number is reused for the
+   owner's shell, a stop sent by an older `orch`, whose frozen stop hello cannot carry an acknowledgement, would be
+   refused, and R6 and R14 require that stop to work. The finding is limited to that evidence; it is not a claim
+   about every possible design. The accepted consequence is that the environment-based refusal of an agent-context
+   start is the only protection: accident prevention, not a barrier against a same-uid process. Existing
+   kernel-UID/project checks remain mandatory. R39 is a should row, recorded as deferred, not as a pass. The
+   decision is ADR 0012, decision 15.
 2. **R6/R32 two-executable skew acceptance is UNMET at PR 1.** T1b's
    `orch-cli/daemon_lifecycle::two_executable_stale_dev_instance` is ignored and has an empty body; it does
    not supply acceptance even if run with `--ignored`. Harness-advertised versions cover wire behavior only.

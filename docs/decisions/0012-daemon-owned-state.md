@@ -288,10 +288,14 @@ authorize client recovery side effects, release or merge.
     daemon to recognise such a request from the kernel-reported process group of the caller and to require
     `--from-agent`.
 
-    Reasons. An agent with a shell can always run the command, so an acknowledgement cannot stop it. And no
-    design satisfies both R39 and the unconditional stop of an old-version daemon (R6 and R14): the stop
-    request is a frozen envelope that works across versions, and the check would have to run in the daemon
-    being stopped.
+    Reasons. The owner's reason: an agent with a shell can always run the command, so an acknowledgement cannot
+    stop it. The design review's finding, which the owner had before deciding: with the only evidence the
+    daemon can get about a caller (sampled process-group ids), no design refuses an agent's accidental stop
+    without sometimes refusing the owner's own stop. When a run's process group ends and its number is reused
+    for the owner's shell, that evidence matches the owner; a stop sent by an older `orch`, whose frozen stop
+    request cannot carry an acknowledgement, would then be refused, and R6 and R14 require that stop to work.
+    The finding is limited to that evidence and to the unchanged requirement that the owner's stop always
+    works; it does not say that no other way of identifying a caller could ever help.
 
     Consequence the owner accepted. `orch daemon stop`, `orch daemon dispatch on` and `orch daemon dispatch
     off` run in an agent's environment (`ORCH_TASK_ID` or `ORCH_AGENT_ID` set) succeed without
