@@ -194,7 +194,7 @@ pub(crate) fn describe_listen(active: Option<&str>, configured: Option<&str>) ->
 }
 
 /// The listener's own wording, shared with the daemon's start-up warning.
-pub use orch_peer::exposure_warning;
+pub use orch_domain::remote::exposure_warning;
 
 /// Prints [`exposure_warning`] on stderr, so it survives a redirected or
 /// machine-read stdout (`serve --log-format json`).

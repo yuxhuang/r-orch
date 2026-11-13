@@ -3,15 +3,12 @@
 //! Three properties here are contract and none of them is something clap does on its
 //! own:
 //!
-//! 1. **The container is built before argument parsing.** In an uninitialized
-//!    directory every command exits `3` — including `orch <sub> --help`, an
-//!    unknown command and an unknown global option — because
-//!    `NotInitializedError` is thrown while the container is constructed, which
-//!    happens before clap parses. Only `init`, `doctor` and `update` are
-//!    exempt — plus `mcp`, which needs a project but resolves it itself,
-//!    because `--project-root` may name one the working directory is not in.
-//! 2. **`--help`/`--version` with no real subcommand** never builds a
-//!    container, so `orch --help` works in an empty directory.
+//! 1. **Project discovery precedes argument parsing for guarded commands.** An
+//!    uninitialized directory exits `3` even for subcommand help and unknown
+//!    commands. `init`, `doctor`, `update` and the dashboard handle discovery
+//!    after parsing. MCP resolves its own root because `--project-root` may
+//!    select a project outside the working directory.
+//! 2. **Root help and version need no project**, so they work anywhere.
 //! 3. **Usage errors exit `1`**, not clap's `2`, and carry fixed wording.
 
 use std::ffi::OsStr;
@@ -30,7 +27,7 @@ pub struct ArgvShape {
     /// where clap prefixes it with the program name.
     pub wants_version: bool,
     /// `process.argv.length <= 2` — no arguments at all, which is the
-    /// first-run path rather than a guarded command.
+    /// dashboard path rather than a guarded command.
     pub is_bare: bool,
     /// Initialization policy delegated to the nested org command owner.
     org_requires_initialized_project: bool,
@@ -84,19 +81,14 @@ impl ArgvShape {
             .is_some_and(|sub| ALL_KNOWN_COMMANDS.contains(&sub))
     }
 
-    /// `--help`/`--version` that must be answered without a container.
+    /// Root `--help`/`--version`, answered without project discovery.
     pub fn is_help_fast_path(&self) -> bool {
         self.is_help_or_version && !self.has_real_sub()
     }
 
-    /// Whether an uninitialized project is fatal for this invocation.
-    ///
-    /// `init`, `doctor` and `update` are the exemptions. A **bare** `orch` is
-    /// also not fatal: it is the first-run experience
-    /// (init, then the TUI), which is WP-6's surface — until that lands the
-    /// root help is printed instead. `orch --nope`, though, is *not* bare:
-    /// it has no subcommand, so the full container is built and
-    /// reports `Not initialized` before the usage error.
+    /// Whether discovery must reject an uninitialized directory before parsing.
+    /// `init`, `doctor`, `update`, MCP and a bare dashboard invocation handle
+    /// discovery after parsing. A stray global flag is still guarded.
     pub fn requires_initialized_project(&self) -> bool {
         if self.is_bare {
             return false;
@@ -104,7 +96,7 @@ impl ArgvShape {
         match self.sub.as_deref() {
             None => true,
             Some("org") => self.org_requires_initialized_project,
-            // Not container-less: `orch mcp` always serves a project. It
+            // `orch mcp` always serves a project. It
             // checks the root it resolves (`--project-root` or the walk up)
             // after parsing, and exits 3 there.
             Some("mcp") => false,
@@ -207,7 +199,7 @@ mod tests {
     fn the_help_fast_path_applies_only_without_a_real_subcommand() {
         assert!(shape(&["orch", "--help"]).is_help_fast_path());
         assert!(shape(&["orch", "-V"]).is_help_fast_path());
-        // A real subcommand means the container is built first, which is why
+        // A guarded subcommand requires project discovery first, which is why
         // `orch logs --help` exits 3 in an uninitialized directory.
         assert!(!shape(&["orch", "logs", "--help"]).is_help_fast_path());
         assert!(!shape(&["orch", "task", "list"]).is_help_fast_path());
@@ -216,12 +208,12 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_orch_is_the_first_run_path_but_a_stray_flag_is_not() {
+    fn a_bare_orch_is_the_dashboard_path_but_a_stray_flag_is_not() {
         assert!(shape(&["orch"]).is_bare);
         assert!(!shape(&["orch"]).requires_initialized_project());
 
         // `orch --nope` has no subcommand but is not bare: the
-        // container is built and reports `Not initialized`.
+        // discovery reports `Not initialized`.
         assert!(!shape(&["orch", "--nope"]).is_bare);
         assert!(shape(&["orch", "--nope"]).requires_initialized_project());
         assert!(shape(&["orch", "--json"]).requires_initialized_project());
@@ -236,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn only_init_doctor_and_update_run_without_a_project() {
+    fn init_doctor_and_update_defer_the_project_guard_until_after_parsing() {
         for exempt in ["init", "doctor", "update"] {
             assert!(
                 !shape(&["orch", exempt]).requires_initialized_project(),
@@ -252,13 +244,13 @@ mod tests {
                 "{guarded}"
             );
         }
-        // An unknown command is guarded too: the container is built before
+        // An unknown command is guarded too: discovery happens before
         // parsing, so `orch frobnicate` reports `Not initialized`, not a usage
         // error.
         assert!(shape(&["orch", "frobnicate"]).requires_initialized_project());
         // `orch help task` likewise — `help` is not one of the seventeen.
         assert!(shape(&["orch", "help", "task"]).requires_initialized_project());
-        // A bare `orch` is the first-run path, not a guarded command.
+        // A bare `orch` defers discovery to the dashboard.
         assert!(!shape(&["orch"]).requires_initialized_project());
     }
 
@@ -268,7 +260,7 @@ mod tests {
         assert!(!shape(&["orch", "mcp", "--project-root", "/p"]).requires_initialized_project());
         assert!(!shape(&["orch", "--json", "mcp", "--help"]).requires_initialized_project());
         assert!(!shape(&["orch", "mcp", "--help"]).is_help_fast_path());
-        // Still a command that needs a project, so not container-less.
+        // Still a command that needs a project, resolved after parsing.
         assert!(!crate::tree::CONTAINER_LESS_COMMANDS.contains(&"mcp"));
     }
 

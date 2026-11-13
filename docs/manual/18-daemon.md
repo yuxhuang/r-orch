@@ -76,7 +76,7 @@ What the daemon does **not** promise:
 | Command | What it does | Exit codes |
 |---|---|---|
 | `orch daemon start [--detach] [--dispatch on\|off] [--from-agent]` | Starts the daemon for the project, in the foreground unless `--detach`. Dispatch is **off** unless `--dispatch on`. Peer-link listener options are start options too; `orch daemon start --help` lists them. | 0 after a clean stop (foreground) or after readiness (`--detach`); 2, 3, 4 on refusal |
-| `orch daemon status` | Asks the running daemon for its live status. | 0; 7 when no compatible daemon answers |
+| `orch daemon status` | Asks the running daemon for its live status. | 0; 1 with `request cancelled before execution` when the daemon lost ownership of the project while the request was waiting ([Lost ownership](#status)); 7 when no compatible daemon answers |
 | `orch daemon stop` | Asks the daemon to shut down cleanly and waits until it confirms its cleanup and has released the project (its process has exited or it has released its ownership lock), for at most 30 s. Works across a version mismatch. | 0 on a completed clean stop; 7 when no daemon answers, the outcome is unknown or the wait times out (with a message of its own) |
 | `orch daemon dispatch on\|off` | Turns dispatching of future work on or off in the running daemon. | 0; 7 when no compatible daemon answers |
 
@@ -244,6 +244,15 @@ turns dispatch off and refuses `orch daemon dispatch on` with `daemon ownership 
 recreate the lock. Plain `orch daemon status` then prints `ownership: LOST — stop and restart the daemon`;
 `--json` and `--yaml` show `ownership` as `lost`. To recover, stop the daemon and start it again.
 
+A request that the daemon had accepted before it lost ownership, and had not started to execute, is refused with
+`request cancelled before execution`: the command prints it on stderr and exits 1, and nothing was executed.
+`orch daemon status` is one of the commands this can happen to, at the moment of the change. orch does not retry
+the request and does not restart anything. Repeat a command that only reads. Before you repeat a command that
+changes state, stop the daemon and start it again, as described above: after it has lost ownership the daemon
+refuses only dispatch requests (`orch daemon dispatch on` and `off`, `orch run --once`, `orch run <task-id>`,
+`orch run --all` and `orch serve --once`) and still executes other commands. A request made after the change is
+answered, and `orch daemon status` then prints `ownership: LOST`.
+
 ### Dispatch on and off
 
 `orch daemon dispatch on` lets the daemon start waiting tasks, as `orch run --watch` does; `orch daemon dispatch
@@ -293,7 +302,7 @@ orch's exit codes, with the one this work adds:
 | Code | Meaning |
 |---|---|
 | 0 | Success |
-| 1 | General error |
+| 1 | General error; also a request that was accepted but had not started when the daemon lost ownership of the project (`request cancelled before execution`) |
 | 2 | Invalid arguments; for a daemon start (`orch daemon start`, `orch serve`, `orch run --watch`): agent context without `--from-agent`, a user who does not own the project, or a socket that the start cannot prove stale; a foreground `orch serve` or `orch run --watch` given `--tick-interval`, `--log-file`, `--verbose` or a non-`json` `--log-format`, and `--tick-interval` on any `serve` or `run`; also `orch serve --once` while dispatch is on |
 | 3 | Not initialized: no project found |
 | 4 | Lock conflict: another daemon or live orchestrator owns the project, including `orch serve` or `orch run --watch` while a daemon runs; a second `orch serve --once` batch |
@@ -379,7 +388,7 @@ Three cases are not "no daemon" and say so:
 | The dashboard (`orch`, `orch tui`) | Shows the message full-screen. `r` tries to connect again, `q` quits with exit 7. It never starts anything. |
 | `orch web` | At start: prints the message and exits 7. If the daemon goes away while it serves: a new page or tab gets HTTP 503 with the message as plain text, after the usual login; with `--no-auth` it gets only `orch daemon unavailable`, never the project or socket path. A tab whose dashboard is already open shows the dashboard's own no-daemon screen. |
 | `orch mcp` | Stays running. `initialize` and every tool call return the message as an MCP error with `exit_code` 7, so a new MCP session's first call fails until you start the daemon. It exits 0 when its client closes stdin. See [the MCP chapter](17-mcp-server.md#when-no-daemon-is-running). |
-| `orch doctor` | Runs its local checks (five adapters, git, the git repository, `.gitignore`, the toolchain) in the current directory, then prints the message and exits 7. It never reads the project's state. Outside a project it prints the checks and `.orchestry/ not found — run: orch init`, and exits 0. |
+| `orch doctor` | Runs no check and starts no process. Prints `orch doctor · discovery only (daemon unavailable)`, the project root and `daemon discovery: available` or `unavailable`, then the message, and exits 7. Outside a project it prints `project discovery: unavailable`, then `Not initialized` and `Run: orch init`, and exits 3. See [Check your setup](07-running-and-monitoring.md#check-your-setup). |
 
 `orch --help`, `orch --version` and `orch init` never need a daemon.
 
@@ -513,7 +522,7 @@ other way of running work asks the running daemon:
 | `orch serve --once` | Run in the running daemon until every tracked task is final (below). Needs dispatch off. |
 | Dashboard start and stop watch | `orch daemon dispatch on` and `off`; never starts or stops a process. |
 | `orch tui --observe`, `orch tui --listen` | Removed: the dashboard is always a client; peer listening is a start option of the daemon. |
-| `orch doctor` | A client: with no daemon it runs its local checks, then prints the no-daemon message and exits 7; outside a project it exits 0. |
+| `orch doctor` | A client: with no daemon it runs no check, prints a discovery note and the no-daemon message, and exits 7; outside a project it prints `Not initialized` and exits 3. |
 | `orch init`, `--help`, `--version` | Need no daemon. `orch init` prints how to start one and never starts it; running it again changes nothing in an existing project. |
 
 **Dispatch follows changes.** With dispatch on, a change to the project wakes the daemon's scheduler: a new or

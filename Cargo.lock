@@ -1470,6 +1470,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1548,6 +1557,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases 0.2.2",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -1679,6 +1689,7 @@ name = "orch-cli"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "assert_cmd",
  "async-trait",
  "axum",
@@ -1698,9 +1709,9 @@ dependencies = [
  "orch-domain",
  "orch-engine",
  "orch-infra",
- "orch-peer",
  "orch-proto",
  "orch-tui",
+ "png",
  "portable-pty",
  "ratatui",
  "rmcp",
@@ -1743,8 +1754,10 @@ dependencies = [
  "futures",
  "indexmap",
  "orch-domain",
+ "saphyr-parser",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1808,7 +1821,6 @@ dependencies = [
 name = "orch-infra"
 version = "0.13.0"
 dependencies = [
- "arboard",
  "async-stream",
  "async-trait",
  "dirs",
@@ -1822,7 +1834,6 @@ dependencies = [
  "nix 0.31.3",
  "orch-core",
  "orch-domain",
- "png",
  "regex",
  "saphyr-parser",
  "serde",

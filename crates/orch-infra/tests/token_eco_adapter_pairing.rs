@@ -98,11 +98,18 @@ async fn spawn(kind: &str, r: &Rendered, config: AgentConfig) -> (SpawnRecord, O
         args[at + 1] = "<system-prompt-file>".into();
     }
     let stdin = if format!("{:?}", record.stdin) == "Pipe" {
-        pm.stdin_capture().await.map(|s| {
-            s.strip_suffix(STDIN_EOF_MARKER)
+        let observed = if kind == "pi" {
+            pm.stdin_open_frame().await
+        } else {
+            pm.stdin_capture().await
+        };
+        let contents = observed.unwrap_or_else(|| panic!("{kind}: missing pipe stdin capture"));
+        Some(
+            contents
+                .strip_suffix(STDIN_EOF_MARKER)
                 .map(str::to_owned)
-                .unwrap_or(s)
-        })
+                .unwrap_or(contents),
+        )
     } else {
         None
     };

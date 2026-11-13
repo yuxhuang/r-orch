@@ -6,14 +6,19 @@ use std::path::{Path, PathBuf};
 // Counts are deliberate: adding a second construction to an allowed file fails.
 const EXCEPTIONS: &[(&str, usize, &str)] = &[
     (
-        "orch-cli/src/lib.rs",
+        "orch-cli/src/spawn_subscriber_tests.rs",
         1,
         "cfg(test) fresh-process production subscriber fixture",
     ),
     (
         "orch-cli/src/commands/init.rs",
-        2,
-        "explicit initialization client; never serves a daemon",
+        1,
+        "adapter version probe in the explicit initialization client",
+    ),
+    (
+        "orch-daemon/src/bootstrap.rs",
+        1,
+        "offline init git helper; serving lifecycle never calls initialize",
     ),
     ("orch-cli/src/editor.rs", 1, "editor runs in the CLI client"),
     (
@@ -22,14 +27,19 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
         "explicit starter re-executes before serving; lifecycle never calls it",
     ),
     (
+        "orch-daemon/src/discovery.rs",
+        1,
+        "cfg(test) reaped stale-socket fixture; listener never enters the test runner",
+    ),
+    (
         "orch-engine/src/review_runner.rs",
         1,
         "fallback runner; daemon injects SnapshotCommandRunner in lifecycle::Running::build",
     ),
     (
         "orch-infra/src/adapters/claude.rs",
-        2,
-        "cfg(test) child cleanup fixtures",
+        3,
+        "cfg(test) two child cleanup fixtures and the fresh-process child of the default-prompt-directory equivalence test",
     ),
     (
         "orch-infra/src/adapters/util.rs",

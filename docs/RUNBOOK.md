@@ -530,7 +530,8 @@ orch doctor                           # adapter availability — note it checks 
 ```
 
 `orch doctor` reports whether the AI CLIs are installed and whether you are in a git repository. It does
-**not** check the lock, the state file, index consistency, or disk space, and it **always exits 0**.
+**not** check the lock, the state file, index consistency, or disk space. With a daemon it exits 0 even when
+checks fail. Without one it runs no check and exits 7 (3 outside a project).
 
 ---
 
@@ -975,8 +976,8 @@ correction for a resize received together with a keypress; heading state-machine
 **Cause.**
 - `doctor` prints its human header (`  orch doctor · checking adapters and dependencies`) to **stdout** before the
   structured document, whichever of `--json` or `--yaml` is given. The header is older than `--yaml` (master
-  prints it under `--json` too), and `--yaml` does not change it. Outside a project, `doctor` ignores both flags
-  and prints the text report.
+  prints it under `--json` too), and `--yaml` does not change it. Without a daemon, `doctor` ignores both flags
+  and prints a plain-text discovery note; the exit code (7, or 3 outside a project) is the signal.
 - `logs --follow` prints a text banner and then live events; `serve --once` writes JSON Lines
   (`--log-format json`, the default) or text. `--yaml` changes neither, and it never changes the on-disk `.jsonl`
   logs. A foreground `serve` is the daemon: it prints `listening <socket>` and `dispatch on`, no event lines, and

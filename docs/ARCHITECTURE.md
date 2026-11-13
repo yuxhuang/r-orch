@@ -179,7 +179,7 @@ r-orch/
                  │  daemon.rs, init.rs    │
                  │                   orch-client     (domain + proto only; no store, no process API)
                  │                        ▲
-             orch-cli ────────────────────┘          (top of the stack; may name anything below)
+             orch-cli ────────────────────┘          (client facade; owner access only at daemon/init)
                  │
                  ▼  implements TuiBackend
              orch-tui                       (depends on orch-domain ONLY)
@@ -201,10 +201,20 @@ message for a request that presented the credential and `orch daemon unavailable
 without `--once` and `orch run --watch` are a foreground `orch daemon start` with dispatch on that forwards
 `--from-agent` and the peer flags (`commands/daemon.rs`, `foreground`); `orch serve --once`, `orch run --once` and
 `orch run <id>` are requests to a running daemon. The commands that do not need a daemon are `init`, `update`,
-`daemon` and the local checks of `doctor` (`tree.rs`, `CONTAINER_LESS_COMMANDS`). Three things wait for PR 4:
-`orch-cli` keeps its production dependencies on `orch-core`, `orch-engine`, `orch-infra` and `orch-peer`; `serve/`
-still holds the old container-building `serve::run`, which nothing calls, and its unit tests; and §2.1 still
-describes the v0.13.0 multi-writer story. Until then "a client never names a store" is a convention, not a gate.
+`daemon`, and `doctor`, which without a daemon prints only a discovery note and exits 7, or 3 outside a project
+(`tree.rs`, `CONTAINER_LESS_COMMANDS`).
+
+The CLI's normal workspace dependencies are client, core, daemon, domain, proto and TUI. Engine and infra
+are dev dependencies only, and peer is absent. The gate checks declared dependency kinds, aliases,
+target conditions and optional edges, so an inactive dependency cannot bypass that boundary. The
+source scan restricts daemon-facade references in its retained production tokens to the explicit
+daemon/init wrappers; the four dedicated CLI fixture modules must retain their own test guards. For
+the item and element forms it recognizes, the cfg scan exempts the attributed item or element,
+including block-ended arms, statements and macros; the raw let-keyword macro boundary is listed as
+not caught below. For macro calls recognized as invocations, the cfg scan retains argument tokens
+without interpreting cfg-looking sequences as test guards; the raw declaration-keyword macro case is
+listed as not caught below.
+Section 2.1 still describes the v0.13.0 multi-writer model until the documentation sweep rewrites it.
 Where each edge and rule lands, per the [plan](plans/2026-11-09-daemon-owned-state.md#tasks) (PR 1 and PR 2 are in
 place at this head):
 
@@ -214,7 +224,7 @@ place at this head):
 | `orch-daemon → orch-engine, orch-infra, orch-peer, orch-proto, orch-core, orch-domain` | PR 1 | The one owner of a project's stores and agent processes. The stores and their file formats stay behind this crate; it exposes `start`, `initialize` and a test harness, never a store implementation or an arbitrary execute closure. |
 | `orch-peer → orch-proto` | PR 1 | The generic bounded NDJSON framing moves out of `orch-peer` so both protocols share one reader. The peer `Frame` schema, `PROTOCOL` constant and 0.5.x tolerance are unchanged. |
 | `orch-client → orch-domain, orch-proto` | PR 1 (control plane), PR 2 (every operation) | Discovery, connect, kernel peer-uid check, handshake and the uniform NoDaemon error. PR 1 carries only what `orch daemon status`, `stop` and `dispatch` need; PR 2 adds every operation and converts the CLI, dashboard backend, `orch web` and `orch mcp` to it. The crate has no process API: it never spawns, forks or execs. |
-| `orch-cli → orch-daemon` only from `commands/daemon.rs` and `commands/init.rs` | PR 1 (the edge), PR 4 (the allowlist) | Only the explicit start and `init` may name `orch_daemon`. PR 4 adds a bidirectional source-site allowlist, like `ENGINE_INFRA_SITES` below, and removes `orch-cli`'s production edges to `orch-core`, `orch-engine`, `orch-infra` and `orch-peer`, so a client file that names a store fails the gate. Until then this rule is a convention. |
+| `orch-cli → orch-daemon` only from `commands/daemon.rs` and `commands/init.rs` | PR 1 (the edge), PR 4 (the allowlist) | The bidirectional `CLI_DAEMON_SITES` table checks retained CLI production tokens against reviewed files and bootstrap symbols; an unlisted retained daemon reference or a listed file with no retained daemon reference fails. A `use` that itself names the daemon crate in those retained tokens fails if it is public or renamed, except for the listed InitOutcome re-export. Normal/build engine, infra and peer edges are forbidden; engine and infra remain dev-only for fixtures. Core stays normal for state-free helpers and port types. The source half tokenizes ASCII identifiers and the string/raw-string/character/byte literal forms it recognizes, skips line and nested block comments, then scans cfg attributes and macro invocation arguments. Literal suffixes are not modeled; the literal-boundary and raw-keyword cfg/macro omissions are listed as not caught below. SOURCE_SPELLING rejects non-ASCII characters emitted as non-literal tokens from all daemon and boundary source files, including test-only tokens and attribute/macro arguments; source misclassified as literal content is not checked. Raw identifiers and plain identifiers name the same tracked token. The bootstrap contracts pin function-signature tokens, option/result field tokens, and DaemonError and DispatchMode variant/payload tokens; the impl scan rejects public PreparedStart fields visible in its tokens. For each of the seven BOOTSTRAP_TYPES, the scan requires exactly one struct/enum declaration in its raw non-literal tokens, at brace depth zero of its pinned file and present in production tokens; type/as/union/trait/mod bindings of these names in the raw non-literal tokens fail. Pinned payload-token lists in bootstrap.rs, lifecycle.rs, discovery.rs and error.rs reject declarations, renames and imports visible as non-literal tokens, except their exact reviewed imports and test-only super globs; the literal-boundary residual can conceal bindings from these checks. For explicit inherent/trait impls visible as non-literal tokens across daemon source, the scan follows identity type aliases and import renames across files/scopes, with optional generic parameters and pre-equals where clauses; it does not inspect the outside definitions reached by the foreign re-export residual below. For impl headers containing a tracked bootstrap name or alias in those tokens, only exact BOOTSTRAP_IMPLS headers and member signatures pass. In those emitted tokens, unresolved bootstrap-bearing aliases/headers, variable macro receivers and unreviewed type-parameter impls fail; the single exact reviewed test-only blanket impl must remain memberless. Local macro definitions and calls carrying bootstrap names visible as non-literal tokens fail, except bare matches/assert/assert_eq/vec calls whose argument tokens remain scanned; explicit rebinding of these macro names visible in those tokens fails. Boundary crates reject unreviewed build scripts. For code-loading forms retained by the token and cfg scans, boundary and daemon source roots accept only plain literal paths to enumerated files inside that root (include calls and path values in attributes, including cfg_attr); imports/renames of include in those tokens fail. Data includes remain allowed. Normal/build feature closures cannot select test APIs. These source checks flag architectural changes for review; they do not hold against an author deliberately defeating the scan. **Not caught:** external fixed impl macros; procedural, attribute, derive and token-synthesizing expansion; semantic binding, including glob rebinding of bare value-macro names; and macro-generated include/path attributes (macro fragments are not expanded). A cfg-looking attribute in the arguments of a macro invocation whose raw name is the declaration keyword can hide an explicitly written CLI daemon reference. A test-only raw let-keyword macro invocation can make the text scan omit the following production statement. A daemon re-export can bind a bootstrap name to a same-named type declared outside the daemon source root, leaving additional methods outside the checked bootstrap surface. Adjacent suffixed literals in macro input can make the tokenizer treat subsequent source as literal content, concealing non-ASCII identifiers, explicit CLI daemon references, bootstrap impl headers and aliased receivers, pinned payload-name bindings, and source-loading attributes. External/provider source still needs review; existing derives, glob imports and proto meta/callback macros rule out blanket bans. The checks compare the recognized token forms above with explicit site, contract and loading tables; they do not resolve other source forms or establish that unreviewed source is absent. |
 
 Every writer, remote peer callbacks included, is then owned by the daemon's coordination, not by a UI handle.
 [ADR 0012](decisions/0012-daemon-owned-state.md) records the decision.
@@ -1208,9 +1218,10 @@ history; its regression tests are institutional memory, so add the test before c
 
 **Holds:** the clap command tree; `output` (glyphs, ASCII fallback, `print_table` with its exact padding,
 `print_key_value`, the formatters); every command module with human, `--json` and `--yaml` rendering; the error
-boundary and exit codes; `init`; `doctor`; `serve` with the structured logger, `--once` runner and disk
-observer; `update`/update-check; `editor` and `shop_picker`. It implements `TuiBackend` over the container
-(§3.1).
+boundary and exit codes; `init`; `doctor` (the daemon's report, or a discovery note when none answers); `serve`
+as the structured logger and its sink options (`serve/`), with `orch run`, `orch serve --once` and `orch logs` as
+requests to the daemon (`commands/run.rs`); `update`/update-check; `editor` and `shop_picker`. It implements
+`TuiBackend` over the daemon (`tui/backend.rs`, `DaemonBackend`) (§3.1).
 
 ### WP-6 — TUI
 

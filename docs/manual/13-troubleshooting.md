@@ -34,7 +34,7 @@ This chapter helps you when something does not work. Find your symptom, read the
 ```
 
 - **Cause.** The current directory, and every parent directory, has no `.orchestry/` folder. Almost every command needs a project. The exit code is 3.
-- **Do.** Run `orch init` in your project directory, then start its daemon (`orch daemon start`). `orch --help`, `orch --version`, `orch init` and `orch update` work anywhere; `orch doctor` runs its local checks anywhere. `orch org template` needs a project like every other command.
+- **Do.** Run `orch init` in your project directory, then start its daemon (`orch daemon start`). `orch --help`, `orch --version`, `orch init` and `orch update` work anywhere; `orch doctor` outside a project prints `project discovery: unavailable` and `Not initialized` and exits 3, like the other commands. `orch org template` needs a project like every other command.
 
 ### orch acts on the wrong project
 
@@ -50,7 +50,7 @@ This chapter helps you when something does not work. Find your symptom, read the
   ```
 
 - **Cause.** orch starts the agent's own command-line program (the adapter). It does not install it, and the program must be on your `PATH`.
-- **Do.** Run `orch doctor`. It lists each adapter, `git` and your project, and ends with a line such as `4 of 8 adapters ready`. Install the missing CLI and sign in to it, or use a different adapter. The `shell` adapter needs only `bash`. With a daemon, `orch doctor` exits with code 0 even when it reports problems, so do not use the exit code to test it; without a daemon it exits 7.
+- **Do.** Start the daemon (`orch daemon start`), then run `orch doctor`. It lists each adapter, `git` and your project, and ends with a line such as `4 of 8 adapters ready`. Without a daemon it checks nothing: it prints a discovery note and exits 7 (3 outside a project). Install the missing CLI and sign in to it, or use a different adapter. The `shell` adapter needs only `bash`. With a daemon, `orch doctor` exits with code 0 even when it reports problems, so do not use the exit code to test the adapters; 7 or 3 means the daemon or the project was not found.
 
 ### Every `claude` agent fails at once inside an agent session
 
@@ -125,8 +125,8 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 
 ### `--json` or `--yaml` output of `orch doctor` will not parse
 
-- **Cause.** `doctor` prints a text header before the structured document.
-- **Do.** Drop the first two lines: `orch --json doctor | sed '1,2d'`. See [Structured output](../RUNBOOK.md#structured-output-for-doctor-logs---follow-and-serve) and [Configuration and output](12-configuration-and-output.md).
+- **Cause.** `doctor` prints a text header before the structured document. Without a daemon, `orch --json doctor` prints the plain-text discovery note, not JSON; the exit code (7, or 3 with no project) is the signal.
+- **Do.** With a daemon, drop the first two lines: `orch --json doctor | sed '1,2d'`. See [Structured output](../RUNBOOK.md#structured-output-for-doctor-logs---follow-and-serve) and [Configuration and output](12-configuration-and-output.md).
 
 ## The dashboard
 

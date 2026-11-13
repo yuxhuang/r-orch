@@ -18,6 +18,7 @@
 
 pub mod agent;
 pub mod config;
+pub mod doctor;
 pub mod effort;
 pub mod error;
 pub mod events;
@@ -46,13 +47,14 @@ pub use config::{
     PromptMode, PromptModeSelection, PromptModeSource, SchedulingConfig, TaskDefaults, deep_merge,
     default_config, effective_prompt_mode, get_by_path, set_by_path,
 };
+pub use doctor::{CheckStatus, DoctorCheck, DoctorReport};
 pub use effort::{
-    CODEX_ULTRA_LABEL, EFFORT_CAPABILITIES, EFFORT_REQUEST_ONLY_NOTE, EFFORT_TABLE_CHECKED,
-    EffortCapability, EffortDiagnostic, EffortDispatch, EffortError, EffortEvidence, EffortReason,
-    EffortRejection, EffortSelection, EffortSelector, EffortStatus, EffortWire, EvidenceStatus,
-    GROK_EVIDENCE_GAP, ModelEffortRow, UnknownModelPolicy, allowed_efforts, effort_capability,
-    plan_after_wire_check_failure, plan_effort_dispatch, split_variant_suffix,
-    validate_effort_authoring,
+    AgentDiagnostic, CODEX_ULTRA_LABEL, EFFORT_CAPABILITIES, EFFORT_REQUEST_ONLY_NOTE,
+    EFFORT_TABLE_CHECKED, EffortCapability, EffortDiagnostic, EffortDispatch, EffortError,
+    EffortEvidence, EffortReason, EffortRejection, EffortSelection, EffortSelector, EffortStatus,
+    EffortWire, EvidenceStatus, GROK_EVIDENCE_GAP, ModelEffortRow, UnknownModelPolicy,
+    agent_effort_diagnostics, allowed_efforts, effort_capability, plan_after_wire_check_failure,
+    plan_effort_dispatch, split_variant_suffix, validate_effort_authoring,
 };
 pub use error::{
     AdapterErrorHint, AdapterErrorKind, DomainError, ERROR_HINTS, Result, classify_adapter_error,
@@ -64,7 +66,8 @@ pub use global_config::{
     TUI_PALETTE_NAMES, TuiPaletteName, TuiPreferences, default_global_config, is_tui_palette_name,
 };
 pub use goal::{
-    CreateGoalInput, GOAL_STATUSES, Goal, GoalStatus, goal_status_order, is_goal_terminal,
+    CreateGoalInput, GOAL_STATUSES, Goal, GoalStatus, UpdateGoalFields, goal_status_order,
+    is_goal_terminal,
 };
 pub use message::{
     CreateMessageInput, DEFAULT_MESSAGE_TTL_MS, MAX_MESSAGE_TTL_MS, Message, MessageChannel,

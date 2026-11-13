@@ -2,7 +2,7 @@
 
 - Status: accepted
 - Date: 2026-11-09
-- Revision: 2, after round-1 challenge; accepted by the owner at gate 2, 2026-11-09
+- Revision: 2, after round-1 challenge; accepted by the owner at gate 2, 2026-11-09. Decision 14 added in PR 4, 2026-11-11
 - Supersedes: ADR [0011](0011-mcp-server.md) decision 7 and the D10 concurrent-writer acceptance, when the client conversion is complete. Other MCP decisions remain except where the implementation is explicitly replaced below.
 
 ## Context
@@ -69,7 +69,7 @@ authorize client recovery side effects, release or merge.
    declared dev/build edges, while tests/ may use the daemon testing API and the source-site rule scans src/
    only. TUI remains domain-only. The CLI's desktop editor, clipboard and web PTY concerns remain frontend
    effects, while all agent execution belongs to the daemon. No daemon API re-exports stores or arbitrary
-   execution closures to clients.
+   execution closures to clients. The limits of the automatic check are in decision 16.
 
 5. **Reuse orch-peer's bounded NDJSON framing, not its protocol enum.** Lift generic reader/serializer code
    into orch-proto; retain the 1 MiB line bound. Local messages are typed hello/welcome/reject, req, ok/err,
@@ -113,7 +113,7 @@ authorize client recovery side effects, release or merge.
    until-terminal result semantics, distinct from one tick (G3/RT5). TUI watch controls toggle dispatch, not
    process lifecycle. Expiry and peer handling remain active with dispatch OFF. Start/status and TUI/web
    show dispatch state; restart defaults OFF. tui --observe/--listen are removed; peer listening is a daemon
-   start option. Doctor is a client, with discovery-only NoDaemon diagnosis; help/version remain offline.
+   start option. Doctor is a client, with discovery-only NoDaemon diagnosis (decision 14); help/version remain offline.
 
 8. **One shared state-operation boundary closes in-process races.** Services, dispatch/spawn decisions,
    collectors, peer persistence and expiry serialize entire read/validate/modify/save transitions. Long
@@ -224,8 +224,106 @@ authorize client recovery side effects, release or merge.
     README upgrade and CHANGELOG; PR 3 subscriptions/TUI+web push/MCP resources/delete disk observer/QA1; PR
     4 crate/source capability gates, remove obsolete dependencies/FIFO/dead code, architecture/runbook/
     manual sweep/QA2. PR 2's >3,000-line size is justified by the mixed-writer failure of splitting it. The
-    single-writer behavior must hold at PR 2 head; PR 4 enforces it structurally. The owner approved regrouping
+    single-writer behavior must hold at PR 2 head; PR 4 adds the structural check described, with its limits, in decision 16. The owner approved regrouping
     at gate 2 and merges each green PR. SE-20 developmental gating ends in PR 2, not the old PR 4 proposal.
+
+14. **With no daemon, `orch doctor` is discovery-only, and the CLI's local store and execution frontends are
+    removed.** Two PR 4 behaviour changes that make the code match decisions 4 and 7 and spec row R38.
+
+    *`orch doctor` without a daemon.* Until PR 4 a failed connection made doctor run its own checks first: it
+    version-probed five adapters (claude, shell, pi, grok, antigravity; codex, cursor and opencode were not
+    probed), ran `git`, the git-repository, `.gitignore` and toolchain checks in the current directory, looked
+    for `.orchestry/`, printed `N of 5 adapters ready`, and only then returned the no-daemon error. Now, when
+    the connection fails, doctor starts no child process (no adapter, git or shell probe) and opens no store.
+    It prints a header and two facts and returns the client error unchanged, with no exit-code mapping of its
+    own:
+
+    | Where doctor runs | Facts printed | Error and exit |
+    |---|---|---|
+    | Initialized project, no daemon | `project root: <root>` and `daemon discovery: available` or `unavailable` | the uniform no-daemon message and `Start it with: orch daemon start`, exit 7 |
+    | Directory with no project | `project discovery: unavailable` | the existing `Not initialized` diagnosis and `Run: orch init`, exit 3 |
+
+    `daemon discovery` says whether the client could read the project's `daemon.json` record with the same
+    bounded reader that connection setup uses; it does not say that a daemon answers, and nothing is probed to
+    find out. The adapter and dependency checks exist only inside the daemon, so a connected doctor is
+    unchanged (eight adapters, project line, exit 0 even when checks fail), and so is the MCP `doctor` tool.
+    The spec's R38 sentence names exit 7 and, for a directory with no project, exit 3. The no-project case exits 3 because that is what every other
+    client gives in a directory with no project, and a start hint there would name a command that itself
+    exits 3; this is the reading built.
+
+    *Legacy frontends under the CLI's `serve` path.* PR 2 moved every command onto the socket but left the
+    v0.13.0 in-process paths compiled and uncalled: `serve::run` and `run_with` over a `FullEngine` (stores,
+    orchestrator and peer runtime built inside the CLI process), the `--once` terminal-state rule, the CLI's
+    peer-runtime starter, the in-process log pump and the local `logs` reader, and the bare-`orch` first-run
+    initializer (`tui::first_run`). No command reached any of them. PR 4 deletes them with their unit tests.
+    What stays is the structured logger and its sink options, the event formatting functions, offline `orch
+    init` behind the daemon's bootstrap facade, and the socket-backed `serve`, `run` and `logs` commands. The
+    contracts the old tests pinned (start-up diagnostics, ordered and complete log delivery, peer lifecycle,
+    a finished client batch leaving the daemon up, and the terminal-batch rule except for one case) are now
+    pinned by daemon tests instead. The one case is dropped: the old `--once` code reported all tasks done
+    (or a failure) when a stop arrived after every task was already terminal; the daemon checks a pending
+    stop first and reports the batch as interrupted, and no test pins either order. That precedence is not a
+    daemon contract.
+
+    Reasons: R3 and source item 2 of the spec say no client links the stores. Decision 4's crate-graph and
+    source gates cannot be tightened while `orch-cli` still contains code that builds a store container,
+    starts the orchestrator or spawns a doctor probe, even uncalled. (`orch init`'s adapter detection is a
+    probe that stays and is called: see the exception in the Consequences.) Deleting the code also removes
+    any code a later change could reach for as a "fallback" when no daemon answers, which the owner ruled
+    out in decision 1.
+
+    Consequences for the owner: to learn which agent CLIs are installed, start the daemon first (it starts
+    with dispatch off), then run `orch doctor`; before that, doctor only says where the project is and
+    whether it left a discovery record. A script that expected exit 0 from `orch doctor` in a directory with
+    no project, or the `of 5 adapters ready` line, must change: it now gets exit 3 or exit 7 and no probe
+    summary. With `--json`, the offline output is the same plain-text note, not JSON; the JSON report needs the daemon. No other command
+    changes: the deleted frontends had no caller, so `orch serve`, `orch run`, `orch logs` and bare `orch`
+    behave as decisions 2, 3 and 7 describe. The unpublished `orch_cli` library no longer exports
+    `serve::run`, `serve::run_with`, `serve::ServeArgs`, `serve::ServeOrchestrator`, `serve::OnceResult`,
+    `serve::ONCE_POLL_INTERVAL`, the `serve::once` module (with `run_once`), `logs::run`, `logs::LogsDeps`,
+    `doctor::run`, `doctor::container_less_registry` or `tui::first_run`.
+
+15. **R39, the stop acknowledgement for agent-originated `daemon stop` and `daemon dispatch off`, is deferred
+    by the owner and is not built in this goal.** The owner decided this on 2026-11-11. The spec's R39 asked the
+    daemon to recognise such a request from the kernel-reported process group of the caller and to require
+    `--from-agent`.
+
+    Reasons. The owner's reason: an agent with a shell can always run the command, so an acknowledgement cannot
+    stop it. The design review's finding, which the owner had before deciding: with the only evidence the
+    daemon can get about a caller (sampled process-group ids), no design refuses an agent's accidental stop
+    without sometimes refusing the owner's own stop. When a run's process group ends and its number is reused
+    for the owner's shell, that evidence matches the owner; a stop sent by an older `orch`, whose frozen stop
+    request cannot carry an acknowledgement, would then be refused, and R6 and R14 require that stop to work.
+    The finding is limited to that evidence and to the unchanged requirement that the owner's stop always
+    works; it does not say that no other way of identifying a caller could ever help.
+
+    Consequence the owner accepted. `orch daemon stop`, `orch daemon dispatch on` and `orch daemon dispatch
+    off` run in an agent's environment (`ORCH_TASK_ID` or `ORCH_AGENT_ID` set) succeed without
+    `--from-agent`. The only agent-context protection is the environment-based refusal of `orch daemon start`,
+    `orch serve` and `orch run --watch` (exit 2 without `--from-agent`). It prevents an accidental start by an
+    agent; it is not a barrier against a process of the same user, which can unset the variables. The
+    same-user peer-credential check and the project check on every connection are unchanged.
+
+16. **The client boundary is checked by `cargo xtask crate-graph`, and the owner accepted that check with the
+    gaps its documentation lists.** Decision 4 sets the crate boundaries between the clients and the stores and
+    checks them with the crate graph and a source-site allowlist. This decision records how far that check
+    reaches and what was accepted.
+
+    What the check covers for the CLI. `cargo xtask crate-graph` checks the CLI crate's declared dependencies
+    and scans its production source against the rules in
+    [ARCHITECTURE.md section 3.1](../ARCHITECTURE.md#31-dependency-direction): the paragraph on the CLI's
+    dependencies and the `orch-cli → orch-daemon` row of its table. This entry does not restate that row.
+
+    Its limits. The source half is a text check. The same row lists the cases it does not catch, under **Not
+    caught**, and says of its checks that they "flag architectural changes for review; they do not hold against
+    an author deliberately defeating the scan". The cases are in that row; this entry adds nothing to them.
+
+    What the owner accepted. On 2026-11-12 the owner accepted the check with those documented gaps. The security
+    review rated them Medium (CWE-184), and its block on the check stands, as accepted by the owner. The owner
+    chose not to rewrite the check's parser. The block is not lifted: this entry records the owner's
+    acceptance, not a reviewer's clearance.
+
+    The check does not analyse what code in a crate the client may depend on does with the filesystem. No automatic check rejects project-state access placed in a helper of such a crate; that is covered by source review only.
 
 ## Alternatives considered
 
@@ -242,7 +340,7 @@ authorize client recovery side effects, release or merge.
 - **Hold a project mutex for an entire run:** agents issue orch calls and cancellation must reach them, so this
   can deadlock progress. Hold only state transitions and the final ordered spawn decision.
 - **A separate orchd executable:** packaging cost without a needed boundary; the existing orch binary has
-  explicit bootstrap wrappers, with crate/source gates enforcing capability separation.
+  explicit bootstrap wrappers, with crate/source gates checking capability separation (their limits are in decision 16).
 - **Strictly reject stop on skew:** advertised recovery fails after installed-binary replacement (RT2).
   A retained old binary is not reliable; automatic PID signalling is less safe than SE-8's authenticated
   same-project stop. Only that frozen intent crosses skew; no general compatibility negotiation is added.
@@ -252,6 +350,13 @@ authorize client recovery side effects, release or merge.
   discipline plus provenance covers the supported developer workflow, single-host topology is explicit.
 - **Socket-presence or PID age as sole authority:** stale metadata and a suspended live daemon invalidate that
   inference. Clients never decide ownership, and explicit start needs a sound exclusion primitive (G2).
+- **Keep the local probes in offline doctor:** useful on a machine with no project yet, but it makes a
+  client spawn adapter processes and look in the project directory, which decision 1 (no client reads `.orchestry`
+  beyond discovery metadata) and R38 exclude, and a second set of checks (five adapters) would drift from the
+  daemon's (eight). The daemon's report is the single source.
+- **Keep the uncalled in-process `serve` as a reference or emergency path:** kept compiled, it is the
+  direct-store fallback decision 1 excludes, one wiring mistake away, and it keeps the CLI's dependency on the
+  stores that decision 4 removes. Rejected.
 
 ## Consequences
 
@@ -266,11 +371,16 @@ authorize client recovery side effects, release or merge.
 - The owner must explicitly start a daemon before state commands or the first MCP call succeed. Strict ordinary skew
   increases upgrade cost, but the approved frozen stop defines recovery with either binary; two-executable acceptance remains unmet at
   PR 1 and is assigned to PR 2 T2a (harness skew is not that evidence).
+- With no daemon, `orch doctor` tells the owner where the project is and whether a discovery record exists,
+  and nothing about installed agent CLIs; those checks need a running daemon (decision 14). Apart from the
+  adapter detection of `orch init`, which stays because init runs without a daemon (it runs `--version` on
+  each agent CLI when `--adapter` is not given), the CLI no longer contains any code that builds stores,
+  runs the orchestrator or probes adapters in its own process; `orch doctor` has none.
 - Tests mostly retain their in-process model. Binary tests explicitly start an isolated test daemon and never
   connect to a real project or real global configuration. Mac QA and Linux CI cover different OS boundaries.
 - Four stacked PRs deliver the transition under decision 13. PR 1 is explicitly developmental; PR 2 has no
-  supported mixed-writer frontend, with real-path stress evidence at that head. PR 3/4 finish push and structural
-  enforcement. Owner merges; no release/tag/version bump here.
+  supported mixed-writer frontend, with real-path stress evidence at that head. PR 3/4 finish push and the structural
+  check (its limits are in decision 16). Owner merges; no release/tag/version bump here.
 - Rollback requires explicit owner stop and verification that agent children are reconciled, then selecting
   the previous binary. File formats remain readable; the old multiple-writer limitations return.
 - At stance 0.5, choose shared operation coordination and coarse push over a per-entity transactional framework:

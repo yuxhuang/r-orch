@@ -1032,3 +1032,336 @@ async fn oversized_outbox_message_is_rejected_locally_and_next_message_is_framed
     assert_eq!(huge.status, orch_domain::MessageStatus::Delivered);
     assert!(huge.body.contains("message too large for remote frame"));
 }
+
+fn frame_commits(worker: &Worker) -> Arc<Mutex<Vec<orch_engine::container::commit::CommitRecord>>> {
+    use orch_engine::container::commit::Publication;
+    let commits = Arc::new(Mutex::new(Vec::new()));
+    let captured = commits.clone();
+    worker
+        .ctx
+        .engine
+        .operation_boundary()
+        .set_publisher(Some(Arc::new(move |p| {
+            if let Publication::Commit(record) = p {
+                captured.lock().unwrap().push(record.clone());
+            }
+        })));
+    commits
+}
+
+async fn silent_frame(worker: &Worker, frame: Frame) {
+    let commits = frame_commits(worker);
+    let boundary = worker.ctx.engine.operation_boundary();
+    let seq = boundary.current_commit_seq();
+    let description = format!("{frame:?}");
+    let _ = worker.handle_ordered("controller", "C1", frame).await;
+    assert_eq!(
+        boundary.current_commit_seq(),
+        seq,
+        "write-free {description}"
+    );
+    assert!(
+        commits.lock().unwrap().is_empty(),
+        "write-free {description}"
+    );
+}
+
+#[tokio::test]
+async fn write_free_frame_categories_do_not_commit() {
+    let (_temp, worker, agent) = fixture().await;
+    worker
+        .handle_ordered("controller", "C1", submit("existing", &agent))
+        .await
+        .unwrap();
+    let frames = vec![
+        Frame::MsgAck {
+            id: "absent".into(),
+            reason: None,
+        },
+        Frame::MsgAck {
+            id: "absent".into(),
+            reason: Some("rejected".into()),
+        },
+        Frame::Attach {
+            exec_key: "absent".into(),
+            after_seq: 0,
+        },
+        Frame::Attach {
+            exec_key: "existing".into(),
+            after_seq: 0,
+        },
+        Frame::FinishedAck {
+            exec_key: "absent".into(),
+        },
+        Frame::FinishedAck {
+            exec_key: "existing".into(),
+        },
+        submit("invalid", "absent"),
+        submit("existing", &agent),
+        Frame::Agents { agents: vec![] }, // No inbound record in this fixture.
+        Frame::Msg {
+            id: "bad_recipient".into(),
+            from: "sender".into(),
+            to: "absent".into(),
+            subject: String::new(),
+            body: String::new(),
+            reply_to: None,
+        },
+        Frame::Sync {
+            active: vec!["existing".into()],
+        },
+        Frame::Cancel {
+            exec_key: "absent".into(),
+        },
+        Frame::Cancel {
+            exec_key: String::new(),
+        },
+        Frame::Ping,
+        Frame::Pong,
+        Frame::Gap {
+            exec_key: "unexpected".into(),
+        },
+    ];
+    for frame in frames {
+        silent_frame(&worker, frame).await;
+    }
+    terminal(&worker, "existing", TaskStatus::Done).await;
+    let commits = frame_commits(&worker);
+    worker
+        .handle_ordered(
+            "controller",
+            "C1",
+            Frame::FinishedAck {
+                exec_key: "existing".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(commits.lock().unwrap().len(), 1);
+    assert!(
+        commits.lock().unwrap()[0]
+            .changes
+            .iter()
+            .all(|c| c.store == orch_engine::container::commit::CommitStore::Tasks)
+    );
+    silent_frame(
+        &worker,
+        Frame::FinishedAck {
+            exec_key: "existing".into(),
+        },
+    )
+    .await;
+    silent_frame(
+        &worker,
+        Frame::Cancel {
+            exec_key: "existing".into(),
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn frame_writes_declare_only_the_written_stores() {
+    use orch_engine::container::commit::{CommitSource, CommitStore};
+    let (_temp, worker, agent) = fixture().await;
+    let commits = frame_commits(&worker);
+    worker
+        .handle_ordered("controller", "C1", submit("new", &agent))
+        .await
+        .unwrap();
+    let inbound = InboundStatus {
+        controller_name: "C1".into(),
+        instance_id: "controller".into(),
+        connected_since: worker.ctx.engine.clock.now_iso(),
+        agents: vec![],
+        controller_version: None,
+    };
+    worker.ctx.store.write_inbound(&inbound).await.unwrap();
+    worker
+        .handle_ordered("controller", "C1", Frame::Agents { agents: vec![] })
+        .await
+        .unwrap();
+    let msg = Frame::Msg {
+        id: "incoming".into(),
+        from: "sender".into(),
+        to: "cli".into(),
+        subject: String::new(),
+        body: String::new(),
+        reply_to: None,
+    };
+    worker
+        .handle_ordered("controller", "C1", msg.clone())
+        .await
+        .unwrap();
+    {
+        let commits = commits.lock().unwrap();
+        assert_eq!(commits.len(), 3);
+        for (record, store) in commits.iter().zip([
+            CommitStore::Tasks,
+            CommitStore::Remote,
+            CommitStore::Messages,
+        ]) {
+            assert_eq!(record.source, CommitSource::Peer);
+            assert!(!record.store_set_uncertain);
+            assert!(
+                record.changes.iter().all(|c| c.store == store),
+                "{record:?}"
+            );
+        }
+    }
+    silent_frame(&worker, msg).await;
+    // Both cancellation entrances must still persist feedback/status through
+    // their separate phases, without adding an unrelated Remote declaration.
+    for (key, frame) in [
+        (
+            "new",
+            Frame::Cancel {
+                exec_key: "new".into(),
+            },
+        ),
+        ("orphan", Frame::Sync { active: vec![] }),
+    ] {
+        if key == "orphan" {
+            worker
+                .handle_ordered("controller", "C1", submit(key, &agent))
+                .await
+                .unwrap();
+        }
+        let commits = frame_commits(&worker);
+        worker
+            .handle_ordered("controller", "C1", frame)
+            .await
+            .unwrap();
+        assert!(!commits.lock().unwrap().is_empty());
+        assert!(
+            commits
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|c| &c.changes)
+                .all(|c| c.store != CommitStore::Remote)
+        );
+    }
+}
+
+#[tokio::test]
+async fn attach_replays_events_without_a_commit() {
+    let (_temp, worker, agent) = fixture().await;
+    worker
+        .handle_ordered("controller", "C1", submit("replay", &agent))
+        .await
+        .unwrap();
+    let task = mirror(&worker, "replay").await;
+    worker.record(
+        &task.id,
+        "run",
+        &AgentEvent::new(AgentEventKind::Output, "now", serde_json::json!("event")),
+    );
+    let commits = frame_commits(&worker);
+    let boundary = worker.ctx.engine.operation_boundary();
+    let seq = boundary.current_commit_seq();
+    let replay = worker
+        .handle_ordered(
+            "controller",
+            "C1",
+            Frame::Attach {
+                exec_key: "replay".into(),
+                after_seq: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(replay.as_slice(), [Frame::Event { .. }, Frame::Gap { .. }]));
+    assert_eq!(boundary.current_commit_seq(), seq);
+    assert!(commits.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn failed_agents_write_still_declares_remote() {
+    use orch_engine::container::commit::{CommitChange, CommitSource, CommitStore};
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_temp, worker, _agent) = fixture().await;
+    let inbound = InboundStatus {
+        controller_name: "C1".into(),
+        instance_id: "controller".into(),
+        connected_since: worker.ctx.engine.clock.now_iso(),
+        agents: vec![],
+        controller_version: None,
+    };
+    worker.ctx.store.write_inbound(&inbound).await.unwrap();
+    let dir = worker.ctx.engine.paths.remotes_dir();
+    let permissions = std::fs::metadata(&dir).unwrap().permissions();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let commits = frame_commits(&worker);
+    let boundary = worker.ctx.engine.operation_boundary();
+    let seq = boundary.current_commit_seq();
+    let result = worker
+        .handle_ordered("controller", "C1", Frame::Agents { agents: vec![] })
+        .await;
+    // Restore before assertions so fixture cleanup also works on failure.
+    std::fs::set_permissions(&dir, permissions).unwrap();
+    result.unwrap(); // Storage faults are reported, not fatal to the session.
+    assert_eq!(
+        worker.ctx.store.read_inbound().await.unwrap(),
+        Some(inbound)
+    );
+    assert!(
+        worker
+            .faults()
+            .reported
+            .contains_key("record inbound agents")
+    );
+    assert_eq!(boundary.current_commit_seq(), seq + 1);
+    let commits = commits.lock().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].source, CommitSource::Peer);
+    assert!(!commits[0].store_set_uncertain);
+    assert_eq!(
+        commits[0].changes,
+        vec![CommitChange::store_wide(CommitStore::Remote)]
+    );
+}
+
+#[tokio::test]
+async fn failed_task_index_repair_is_declared() {
+    use orch_engine::container::commit::{CommitChange, CommitSource, CommitStore};
+    let (_temp, worker, agent) = fixture().await;
+    worker
+        .handle_ordered("controller", "C1", submit("existing", &agent))
+        .await
+        .unwrap();
+    let index = worker.ctx.engine.paths.tasks_dir().join("_index.json");
+    std::fs::remove_file(&index).unwrap();
+    std::fs::create_dir(&index).unwrap();
+    let commits = frame_commits(&worker);
+    let boundary = worker.ctx.engine.operation_boundary();
+    let seq = boundary.current_commit_seq();
+    worker
+        .handle_ordered(
+            "controller",
+            "C1",
+            Frame::Attach {
+                exec_key: "existing".into(),
+                after_seq: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(index.is_dir(), "repair really failed");
+    assert!(
+        worker
+            .faults()
+            .reported
+            .contains_key("read mirrors for attach")
+    );
+    assert_eq!(boundary.current_commit_seq(), seq + 1);
+    let commits = commits.lock().unwrap();
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].source, CommitSource::Peer);
+    assert!(!commits[0].store_set_uncertain);
+    assert_eq!(
+        commits[0].changes,
+        vec![CommitChange::store_wide(CommitStore::Tasks)]
+    );
+}

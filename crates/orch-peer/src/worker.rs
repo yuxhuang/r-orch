@@ -350,7 +350,7 @@ impl Worker {
         let path = self.controllers_path();
         let mut seen: BTreeMap<String, String> = read_json(&path).await?.unwrap_or_default();
         let now = self.ctx.engine.clock.now_ms();
-        let tasks = self.ctx.engine.tasks.list(&TaskFilter::default()).await?;
+        let tasks = self.list_tasks().await?;
         let mut orphans: Vec<(Task, String, String)> = Vec::new();
         let mut known: Vec<String> = Vec::new();
         if let Some(current) = &current {
@@ -436,7 +436,7 @@ impl Worker {
             .to_string();
         self.ctx
             .ordered(true, async {
-                for task in self.ctx.engine.tasks.list(&TaskFilter::default()).await? {
+                for task in self.list_tasks().await? {
                     self.register(&task);
                 }
                 self.listener_status(&addr, None).await
@@ -796,12 +796,27 @@ impl Worker {
             .map_err(|e| Error::other(format!("peer write: {e}")))
     }
 
+    async fn list_tasks(&self) -> Result<Vec<Task>> {
+        self.ctx
+            .ordered(false, async {
+                // TaskStore::list persists a rebuilt index on any failed index
+                // read. Match that trigger without repairing during the check;
+                // declare before the possible write, under the same permit.
+                let index = self.ctx.engine.paths.tasks_dir().join("_index.json");
+                if !matches!(read_json::<Vec<Task>>(&index).await, Ok(Some(_))) {
+                    self.ctx
+                        .engine
+                        .operation_boundary()
+                        .note_store(orch_engine::container::commit::CommitStore::Tasks);
+                }
+                self.ctx.engine.tasks.list(&TaskFilter::default()).await
+            })
+            .await
+    }
+
     async fn mirrors(&self, controller: &str) -> Result<Vec<Task>> {
         let ctl = format!("remote-ctl:{controller}");
-        let tasks = self
-            .ctx
-            .ordered(false, self.ctx.engine.tasks.list(&TaskFilter::default()))
-            .await?;
+        let tasks = self.list_tasks().await?;
         let mirrors: Vec<_> = tasks
             .into_iter()
             .filter(|task| task.labels.contains(&ctl))
@@ -930,9 +945,10 @@ impl Worker {
         if matches!(frame, Frame::Sync { .. } | Frame::Cancel { .. }) {
             return self.handle(controller, name, frame).await;
         }
-        let mutation = !matches!(frame, Frame::Ping | Frame::Pong);
+        // Each arm declares its writes at the write site, after read-only
+        // validation. In particular, admission to an arm is not a mutation.
         self.ctx
-            .ordered(mutation, Box::pin(self.handle(controller, name, frame)))
+            .ordered(false, Box::pin(self.handle(controller, name, frame)))
             .await
     }
 
@@ -1012,9 +1028,11 @@ impl Worker {
                 review_criteria,
                 goal_id,
             } => {
+                // Creates Tasks through the tracked save after validation.
+                // The initial list also declares a possible index repair.
                 // Rejected rather than skipped: without the duplicate check
                 // this request could create a second mirror for one key.
-                let tasks = match self.ctx.engine.tasks.list(&TaskFilter::default()).await {
+                let tasks = match self.list_tasks().await {
                     Ok(tasks) => tasks,
                     Err(error) => {
                         self.session_fault("read tasks for submit", &error);
@@ -1167,6 +1185,8 @@ impl Worker {
                 }
             }
             Frame::FinishedAck { exec_key } => {
+                // Besides a possible index repair, only the guarded tracked
+                // Tasks save below writes; healthy no-op reads stay silent.
                 // Not recording the ack costs one resend of the outcome on
                 // the next sync, so every fault here simply retries.
                 let mirrors = match self.mirrors(controller).await {
@@ -1197,6 +1217,8 @@ impl Worker {
                 exec_key,
                 after_seq,
             } => {
+                // Ring replay writes no store; mirrors declares an index
+                // repair only when the Tasks index cannot be read.
                 // A Gap alone is a valid answer: the controller re-attaches
                 // and the live event stream is unaffected.
                 let mirrors = self.mirrors(controller).await.unwrap_or_else(|error| {
@@ -1229,6 +1251,12 @@ impl Worker {
                 if let Err(error) = async {
                     if let Some(mut inbound) = self.ctx.store.read_inbound().await? {
                         inbound.agents = agents;
+                        // Raw Remote persistence: declare before the write,
+                        // retaining invalidation if it fails part way through.
+                        self.ctx
+                            .engine
+                            .operation_boundary()
+                            .note_store(orch_engine::container::commit::CommitStore::Remote);
                         self.ctx.store.write_inbound(&inbound).await?;
                     }
                     Ok::<(), Error>(())
@@ -1240,14 +1268,17 @@ impl Worker {
                 Ok(vec![])
             }
             frame @ Frame::Msg { .. } => {
+                // Ingest declares Messages at its tracked save; a duplicate
+                // or rejected message is write-free, including nested calls.
                 Ok(self.ctx.ingest(name, &frame).await?.into_iter().collect())
             }
             Frame::MsgAck { id, reason } => {
+                // msg_ack guards no-ops and predeclares only Messages writes.
                 self.ctx.msg_ack(name, &id, reason.as_deref()).await?;
                 Ok(vec![])
             }
-            // `handle_ordered` declares these two arms write-free. Adding a
-            // store write here requires changing that declaration as well.
+            // Heartbeats and unexpected frames write no stores. They still
+            // take the project permit; any future write needs a predeclaration.
             Frame::Ping => Ok(vec![Frame::Pong]),
             Frame::Pong => Ok(vec![]),
             _ => Err(Error::other("unexpected controller frame")),
@@ -1305,7 +1336,7 @@ impl Worker {
         // here survives the status change, and a failure below still leaves
         // the explanation behind.
         self.ctx
-            .ordered(true, async {
+            .ordered(false, async {
                 let mut fresh = self
                     .ctx
                     .engine
@@ -1716,7 +1747,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordered_submit_keeps_peer_remote_declaration_and_unexpected_frame_errors() {
+    async fn ordered_submit_declares_tasks_and_unexpected_frame_errors() {
         use orch_engine::container::commit::{CommitSource, CommitStore, Publication};
         let (_temp, worker, agent) = fixture().await;
         let boundary = worker.ctx.engine.operation_boundary();
@@ -1747,7 +1778,7 @@ mod tests {
                 commits[0]
                     .changes
                     .iter()
-                    .any(|c| c.store == CommitStore::Remote)
+                    .all(|c| c.store == CommitStore::Tasks)
             );
         }
         let error = worker

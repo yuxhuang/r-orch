@@ -12,8 +12,8 @@ orch task add --help
 > prints `Not initialized` and exits with code 3; without a daemon it prints `No orch daemon is running for
 > <project root>` and exits with code 7 ([The orch daemon](18-daemon.md)). This now includes commands that used to
 > work outside a project, such as `orch org template` and `orch config global`. `orch --help`, `orch --version`,
-> `orch init` and `orch update` need neither, and `orch doctor` runs its local checks anywhere
-> ([Check your setup](07-running-and-monitoring.md#check-your-setup)). `orch <command> --help` needs a project but no
+> `orch init` and `orch update` need neither. `orch doctor` runs anywhere, but without a daemon it only prints a
+> discovery note and exits 7, or 3 outside a project ([Check your setup](07-running-and-monitoring.md#check-your-setup)). `orch <command> --help` needs a project but no
 > daemon, except for `init`, `update`, `doctor`, `daemon` and `mcp`, whose help works anywhere. `orch mcp --project-root <path>` serves the project at `<path>` from
 > any directory, through that project's daemon.
 

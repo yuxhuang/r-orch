@@ -32,9 +32,6 @@ skew-seam = ["orch-proto/skew-seam"]
 [dependencies]
 orch-domain.workspace = true
 orch-core.workspace = true
-orch-engine.workspace = true
-orch-infra.workspace = true
-orch-peer.workspace = true
 orch-tui.workspace = true
 # `orch daemon start|stop|status|dispatch` (PR 1, S1c). Only
 # `commands/daemon.rs` and `commands/init.rs` may name `orch_daemon` (design D1).
@@ -44,6 +41,7 @@ orch-daemon.workspace = true
 
 # anyhow is allowed here and in xtask only — never in a library signature.
 anyhow.workspace = true
+arboard.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -59,6 +57,7 @@ json-patch.workspace = true
 jiff.workspace = true
 nanoid.workspace = true
 portable-pty.workspace = true
+png.workspace = true
 # `orch mcp`: the stdio MCP server and its tool input schemas.
 rmcp.workspace = true
 schemars.workspace = true
@@ -93,6 +92,9 @@ tracing-subscriber.workspace = true
 nix = { workspace = true, features = ["signal"] }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+orch-engine.workspace = true
+orch-infra.workspace = true
 orch-daemon = { workspace = true, features = ["testing"] }
 orch-core = { workspace = true, features = ["test-support"] }
 assert_cmd.workspace = true

@@ -120,14 +120,16 @@ async fn spawn(
     let handle = adapter.execute(p).expect("execute");
     let record = pm.spawn_record();
     let stdin = if format!("{:?}", record.stdin) == "Pipe" {
-        pm.stdin_capture()
-            .await
-            .map(|s| {
-                s.strip_suffix(STDIN_EOF_MARKER)
-                    .map(str::to_owned)
-                    .unwrap_or(s)
-            })
-            .unwrap_or_default()
+        let observed = if kind == "pi" {
+            pm.stdin_open_frame().await
+        } else {
+            pm.stdin_capture().await
+        };
+        let contents = observed.unwrap_or_else(|| panic!("{kind}: missing pipe stdin capture"));
+        contents
+            .strip_suffix(STDIN_EOF_MARKER)
+            .map(str::to_owned)
+            .unwrap_or(contents)
     } else {
         String::new()
     };

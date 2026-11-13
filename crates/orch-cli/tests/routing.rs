@@ -189,19 +189,14 @@ fn an_unknown_command_or_option_exits_three_before_the_usage_error() {
 }
 
 #[test]
-fn the_three_container_less_commands_run_in_an_uninitialized_directory() {
+fn doctor_and_update_report_their_offline_outcomes_without_a_project() {
     let dir = empty_project();
 
-    // `doctor` probes adapters and always exits 0.
+    // Offline doctor returns the same diagnosis as every uninitialized client.
     let output = orch(dir.path()).arg("doctor").output().expect("run");
-    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
-    assert!(stdout_of(&output).contains("orch doctor · checking adapters and dependencies"));
-    assert!(
-        stdout_of(&output).contains("of 5 adapters ready"),
-        "container-less doctor probes five adapters: {}",
-        stdout_of(&output)
-    );
-    assert!(stdout_of(&output).contains("not found — run: orch init"));
+    assert_eq!(output.status.code(), Some(3), "{}", stderr_of(&output));
+    assert!(stderr_of(&output).contains("Not initialized"));
+    assert!(!stdout_of(&output).contains("adapters ready"));
 
     // `update` reports the version and exits 0.
     let output = orch(dir.path()).arg("update").output().expect("run");
@@ -539,6 +534,17 @@ fn doctor_with_a_project_probes_eight_adapters_and_still_exits_zero() {
     let text = stdout_of(&output);
     assert!(text.contains("of 8 adapters ready"), "{text}");
     assert!(text.contains(".orchestry/   exists ·"), "{text}");
+}
+
+#[test]
+fn doctor_with_a_project_and_no_daemon_reports_discovery_only() {
+    let dir = initialized_project_unowned();
+    let output = orch(dir.path()).arg("doctor").output().expect("run");
+    assert_eq!(output.status.code(), Some(7), "{}", stderr_of(&output));
+    let error = stderr_of(&output);
+    assert!(error.contains("No orch daemon is running for"), "{error}");
+    assert!(error.contains("orch daemon start"), "{error}");
+    assert!(!stdout_of(&output).contains("adapters ready"));
 }
 
 #[test]

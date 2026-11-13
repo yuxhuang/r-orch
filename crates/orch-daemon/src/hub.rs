@@ -491,6 +491,13 @@ mod tests {
             }
             sink.publish(p);
         })));
+        // Keep task-index repair separate from the listener's status write.
+        tokio::fs::create_dir_all(engine.paths.tasks_dir())
+            .await
+            .unwrap();
+        tokio::fs::write(engine.paths.tasks_dir().join("_index.json"), b"[]")
+            .await
+            .unwrap();
         runtime.start_listener();
         let path = engine.paths.remotes_dir().join("_listener.json");
         let addr = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -658,6 +665,7 @@ mod tests {
         })
         .await
         .expect("pending outbox delivered on next tick");
+        let remote_before = remote_store_files(&engine.paths.remotes_dir()).await;
         write_frame(
             peer.get_mut(),
             &Frame::MsgAck {
@@ -668,16 +676,49 @@ mod tests {
         .await
         .unwrap();
         wait_for_rejection(&engine, &message.id).await;
-        assert_peer_message_change(&output, &records, true);
+        assert_peer_message_change(&output, &records, false);
+        assert_eq!(
+            remote_store_files(&engine.paths.remotes_dir()).await,
+            remote_before,
+            "message rejection writes no remote files"
+        );
 
+        let remote_before = remote_store_files(&engine.paths.remotes_dir()).await;
         message.id = "msg_local_oversize".into();
         message.body = "x".repeat(orch_peer::codec::MAX_FRAME_BYTES + 1);
         engine.messages.save(&message).await.unwrap();
         reset_peer_subscriptions(&output, boundary.current_commit_seq());
         wait_for_rejection(&engine, &message.id).await;
-        assert_peer_message_change(&output, &records, true);
+        assert_peer_message_change(&output, &records, false);
+        assert_eq!(
+            remote_store_files(&engine.paths.remotes_dir()).await,
+            remote_before,
+            "oversize rejection writes no remote files"
+        );
         drop(peer);
         runtime.shutdown().await;
+    }
+
+    async fn remote_store_files(
+        root: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        let mut files = std::collections::BTreeMap::new();
+        let mut directories = vec![root.to_owned()];
+        while let Some(directory) = directories.pop() {
+            let mut entries = tokio::fs::read_dir(directory).await.unwrap();
+            while let Some(entry) = entries.next_entry().await.unwrap() {
+                let path = entry.path();
+                if entry.file_type().await.unwrap().is_dir() {
+                    directories.push(path);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_owned(),
+                        tokio::fs::read(path).await.unwrap(),
+                    );
+                }
+            }
+        }
+        files
     }
 
     fn reset_peer_subscriptions(output: &EventOutput, baseline: u64) {

@@ -13,8 +13,8 @@
 use std::process::ExitCode;
 
 use orch_core::error::Result;
+use orch_domain::UpdateGoalFields;
 use orch_domain::{CreateGoalInput, GOAL_STATUSES, Goal, GoalStatus};
-use orch_engine::goal_service::UpdateGoalFields;
 use orch_proto::ops::args;
 use serde_json::{Value, json};
 

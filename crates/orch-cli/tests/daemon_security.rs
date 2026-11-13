@@ -42,7 +42,7 @@ fn under_umask(cmd: &Command, umask: &str) -> Command {
 #[test]
 fn files_are_private_under_any_umask_and_the_state_dir_is_not_chmodded() {
     for umask in ["077", "022", "000"] {
-        let sandbox = Sandbox::new();
+        let sandbox = Sandbox::new().with_short_project_root();
         sandbox.init_project();
         // Default endpoint (no ORCH_SOCKET): `<root>/.orchestry/run/orch.sock`.
         let state_mode = mode(&sandbox.state_dir());
