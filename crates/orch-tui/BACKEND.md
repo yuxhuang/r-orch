@@ -115,8 +115,9 @@ Grouped as in the trait.
   updates project config, and onboarding updates orchestrator state
   (`orch-daemon/src/ops/authored.rs`). The dashboard writes none of these files.
 * **Side channels** — `paste_image() -> ClipboardPaste` (the TUI writes nothing
-  itself; the implementation puts the image in a temp file and returns its path
-  plus its size) and `bell()`, a direct terminal write outside the draw loop.
+  itself; the implementation uploads the image to the daemon, which stages it under
+  `.orchestry/run/staged/` and returns its path; the backend returns that path plus the size)
+  and `bell()`, a direct terminal write outside the draw loop.
 
 ### Field semantics worth preserving
 
@@ -219,9 +220,10 @@ exercises facade operations through a daemon harness.
      agent_id: run.agent_id, task_id: run.task_id, event_type: event.type,
      data: event.data }`;
    * flatten each batch, sort **ascending** by timestamp, keep the **last 200**;
-   * deliver batch 1 as soon as it is ready and batch 2 afterwards (the host
-     loads it in the background). Failures go to stderr and must never bubble
-     into the UI.
+   * the daemon's `run.history` returns both batches in one background request
+     and the backend queues them in order. A failure that does not end the session
+     is logged at debug level and leaves history empty; session loss instead enters the
+     dashboard's connection-failure state (`orch-cli/src/tui/backend.rs`).
    The TUI prepends each batch and re-truncates to 500 messages, de-duplicates
    repeated nested provider errors per `run_id`, and skips entries whose
    formatter yields no summary.

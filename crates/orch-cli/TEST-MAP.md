@@ -8,11 +8,11 @@ Where `orch-cli` behaviour is tested. Keep this current.
 | Context | `NO_COLOR` presence, `TERM=dumb`, project-root walk | `src/context.rs` |
 | Output | icons, colours, table padding, formatters | `src/output.rs` |
 | `init` | validation, idempotency, files written, adapter detection, the multi-adapter prompt | `src/commands/init.rs` + `tests/routing.rs` |
-| `doctor` | daemon report rendering; discovery-only failure without a daemon | `src/doctor.rs`, `src/commands/run.rs`, `tests/routing.rs`, `tests/daemon_nodaemon_matrix.rs` |
+| `doctor` | daemon report rendering; discovery-only failure without a daemon | `src/doctor.rs`, `src/commands/run.rs`, `tests/routing.rs`, `tests/offline_doctor_contract.rs` |
 | `logs` | five routes, fetch sizes, display slices, four `--json` payloads, `--follow` shapes | `src/logs.rs` + `tests/routing.rs` |
 | `status` | human block, `{tasks, agents, state}`, `claimed` as an **array** | `src/commands/status.rs` + `tests/routing.rs` |
 | `logs --since` | the `--since`-only route, its run window and its 20-run cap | `src/logs.rs` |
-| `serve` options | `--log-format` validation, `--tick-interval` parsing, `--log-file` append, explicit foreground daemon start | `src/serve/mod.rs`, `src/commands/daemon.rs`, `tests/routing.rs` |
+| `serve` options | `--log-format` validation and `--log-file` append for `--once`; refusal (exit 2) of `--tick-interval`, plus `--log-file`, `--verbose` and non-default `--log-format` on a foreground start; explicit foreground daemon start | `src/serve/mod.rs`, `src/commands/daemon.rs`, `tests/routing.rs` |
 | `serve --once` | daemon batch request, terminal outcome, empty project and observer disconnect | `src/commands/run.rs`, `tests/serve_interrupted.rs`, `../orch-daemon/tests/daemon_dispatch.rs` |
 | Structured logger | record order, idle throttle, `agent:output` gating, the never-logged set, text format | `src/serve/logger.rs` |
 | Dashboard push | subscribe before read, store/bus delivery, commit ordinals, gap/resync, changed daemon instance, EOF and retry | `src/tui/push_tests.rs` |

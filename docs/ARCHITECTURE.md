@@ -27,7 +27,7 @@ Load-bearing, stated so they can be challenged:
 | # | Assumption | If wrong |
 |---|---|---|
 | A1 | **Scale is small.** Tens of agents, hundreds of tasks, thousands of run events per run. The caps (16 KB lines, 8 KB events, 1024-event buffer, 500-entry LRU) are generous. | Nothing in the design changes; the file-per-entity store would need an index rework only at ~10⁵ tasks. |
-| A2 | **One daemon owns each project.** Stateful frontends use its socket; all project-store operations and agent execution belong to that daemon. The filesystem must support advisory locking, and other programs must respect ownership. | A direct writer can bypass the daemon. See the guarantees and limits in §2.1. |
+| A2 | **One daemon owns each project.** Stateful frontends use its socket; all project-store operations and agent execution belong to that daemon. The filesystem must support advisory locking, and every process that can open the project must see the same lock. orch cannot detect a filesystem that accepts `flock` without sharing its exclusion across those processes; its PID check sees only the local PID namespace. Other programs must respect ownership. | A direct writer can bypass the daemon; replacing the owner-lock file can allow another daemon to start if the PID file no longer excludes it (§2.1 N3). |
 | A3 | **POSIX only.** r-orch uses process groups (`kill(-pid)`), `bash -lc`, `rsync`, and `O_APPEND` atomicity. Windows support is already partial at best. | Windows would need a separate process-group strategy (job objects) and no `bash`. Out of scope; keep platform code behind a `cfg` boundary so it can be added. |
 | A4 | **Latency is human-scale.** Automatic dispatch uses the configured poll interval and coalesced commit wakes; frontend requests also pay for socket and operation admission. | A slow operation can delay other state work; the single operation boundary favors consistency over parallel store throughput (§6). |
 | A5 | **Prompt text must be byte-exact** because agents are prompt-sensitive and the system prompt is a cache key. | If approximate were acceptable, the Liquid risk (§4.3) would mostly evaporate. It is not acceptable. |
@@ -35,7 +35,7 @@ Load-bearing, stated so they can be challenged:
 
 ### 2.1 Daemon ownership: guarantees and limits
 
-One daemon per project owns `.orchestry/`, every project store and every agent process. The CLI,
+One daemon per project owns `.orchestry/`, every project store and every agent process it launches. The CLI,
 dashboard, web dashboard, MCP bridge and agent-run CLI commands are clients for state reads and writes.
 `orch init` is the bootstrap exception; explicit daemon starts are the ownership entry points. The
 client-side clipboard, terminal and editor are frontend effects, not a second project-store owner.
@@ -78,7 +78,10 @@ crash transactionality or protection from a program bypassing the daemon.
    read-modify-write races; it does not turn multiple files into a transaction.
 3. **G3 — Pause and cancel reach the executing engine.** Goal pause and final launch checks share
    the project operation boundary, and launch re-reads eligibility. `task.cancel` reaches the daemon's
-   orchestrator and stops its local child before a successful reply
+   orchestrator. For a recorded local running entry, it signals the process group (falling back
+   to the recorded PID if group signalling fails) and replies successfully only after that PID
+   is no longer alive. Descendants are not tracked one by one, and after a restart the target
+   is a recorded PID rather than verified process identity (N7)
    (`crates/orch-engine/src/goal_service.rs`, `task_service.rs`,
    `orchestrator/daemon.rs`, `crates/orch-daemon/src/ops/core.rs`).
    `crates/orch-daemon/tests/daemon_engine.rs` covers no post-pause launch and live-process
@@ -130,14 +133,29 @@ crash transactionality or protection from a program bypassing the daemon.
    heartbeat rechecks the PID file every 10 seconds (`PID_REFRESH` in
    `crates/orch-daemon/src/guard.rs`, `heartbeat` in `lifecycle.rs`). Detection can lag by a
    recheck interval; scheduling or waiting for the control operation can delay the recorded
-   transition further. Work can run in that window. The retained owner guard excludes a second
-   cooperating daemon, but a non-daemon writer is possible; the tests do not establish safety
-   against such a writer in this window. Once loss is recorded, automatic dispatch stops and
-   `dispatch.set`, `dispatch.tick`, `dispatch.run_task`, `dispatch.run_all` and
-   `dispatch.until_terminal` refuse. Other requests remain available, including mutations;
-   existing observations are cancelled (`crates/orch-daemon/src/ops/control.rs`, `ops/mod.rs`).
-   `crates/orch-daemon/tests/daemon_lifecycle.rs` tests the loss transition and retained reads,
-   not concurrent external writes. The missing or foreign PID file is not recreated.
+   transition further. Work can run in that window. While the owner-lock file is intact,
+   the retained owner guard excludes a second cooperating daemon. Removing or replacing
+   `.orchestry/.daemon-owner.lock` leaves that guard attached to the old file. A second daemon
+   can start if the PID file also no longer excludes it; replacing only the guard does not
+   bypass the refusal of a live foreign PID (`guard.rs`). Restoring `.orchestry/` from a backup
+   without the live PID file can replace both locks and leave two daemons running on the same
+   project root until the first is stopped. Discovery points clients to the current
+   `daemon.json`. If the replacement directory has a different device/inode identity,
+   connections to the old daemon, including `orch daemon stop`, fail with `wrong_project`;
+   that daemon must be stopped by signal (`discovery.rs`, `session.rs`).
+   A non-daemon writer is possible as well; the tests do not establish safety against either
+   concurrent writer. Once loss is recorded, automatic dispatch stops and `dispatch.set`,
+   `dispatch.tick`, `dispatch.run_task`, `dispatch.run_all` and `dispatch.until_terminal` refuse.
+   Other requests remain available, including mutations. Agents that were already running
+   keep running and their outcomes are still committed. The one-second maintenance loop
+   (dead-run reconciliation and context expiry, `run_maintenance` in `ops/control.rs`) and
+   the hosted peer runtime also continue writing; loss does not bound these writes to the
+   detection window. Existing observations are cancelled (`crates/orch-daemon/src/ops/control.rs`,
+   `ops/mod.rs`, `peer/mod.rs`). `crates/orch-daemon/tests/daemon_lifecycle.rs` tests the loss
+   transition and retained reads, not concurrent external writes. A missing, foreign or
+   unparsable PID file counts as lost and is not recreated; the next start refuses a live
+   foreign PID and an unparsable file (both exit 4) until the owner stops that process or
+   removes the file.
 4. **N4 — The engine's per-operation event buffer is not capped.** It is a `Vec` in
    `OperationContext` (`crates/orch-engine/src/container/operation.rs`). Wire-frame, admission
    and subscriber limits do not bound this buffer or the total project size.
@@ -152,6 +170,24 @@ crash transactionality or protection from a program bypassing the daemon.
    A disconnected client can lack the outcome of a request the daemon completed. The client
    closes a failed lane and does not replay mutations (`crates/orch-client/src/lib.rs`,
    `crates/orch-daemon/src/hub.rs`). Consult current state before repeating an uncertain write.
+7. **N7 — Agent process identity is a recorded PID.** The daemon saves a local child's PID
+   after the spawn returns (`crates/orch-engine/src/orchestrator/daemon.rs`, `run_service.rs`).
+   Cancel and stall handling send SIGTERM to its process group, falling back to the PID if
+   group signalling fails. `kill_with_grace` polls only that PID and sends SIGKILL after the
+   grace period if it has not observed the PID exit (`crates/orch-infra/src/process/manager.rs`).
+   A descendant that left the group, or that survives SIGTERM after the leader exits, can
+   survive a successful cancel. Agents can outlive a daemon that crashes or is killed.
+   For ordinary local tasks, the next start keeps a running entry whose PID is alive,
+   cancels one whose PID is dead, and attempts to stop a running run with a live PID but
+   no running entry (`crates/orch-engine/src/orchestrator/recovery.rs`,
+   `orchestrator/daemon/startup.rs`). Liveness is `kill(pid, 0)`: it proves that some process
+   has the PID, not that it is the agent; a process of another user counts as alive.
+   After a reboot or PID reuse, a recorded PID can keep a task in progress and its agent
+   reserved, make `task.cancel` signal an unrelated same-user process group, or fail startup
+   with `Daemon recovery could not stop an orphaned local child`. A child started before
+   its PID was saved cannot be identified from those records and is not signalled by recovery.
+   Executions run for a peer have a separate quarantine path that avoids signalling an
+   unverified saved PID; that is not a general identity check for ordinary local tasks.
 
 **Definition locking remains inside the daemon.** Authored task, agent and config mutations use
 `.orchestry/.definition.lock` while reading, validating and applying their definitions
@@ -409,7 +445,7 @@ All three names are the same program:
 | `orch-core` | `storage` (9 traits), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
-| `orch-cli` | `commands::{task, agent, status, logs, config, context, msg, goal, team, org, run, doctor, tui, serve, init, update}`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
+| `orch-cli` | `commands::{agent, config, context, daemon, goal, init, msg, org, org_template, remote, rpc, run, status, task, team}`, `doctor`, `logs`, `tui` (`DaemonBackend`), `update`, `web`, `routing`, `tree`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
 | `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
 
 ### 3.3.1 `orch mcp` (`orch-cli::mcp`)
