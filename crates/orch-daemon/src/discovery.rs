@@ -201,23 +201,59 @@ pub(crate) fn check_state_dir_owner(
     meta: &std::fs::Metadata,
 ) -> Result<(), DaemonError> {
     let euid = nix::unistd::geteuid().as_raw();
-    if meta.uid() != euid {
-        return Err(DaemonError::InvalidArguments(format!(
-            "{} is owned by uid {}, but this process runs as uid {euid}; start the daemon as \
-             the project's owner",
-            root.join(STATE_DIR).display(),
-            meta.uid()
-        )));
-    }
-    if meta.mode() & 0o022 != 0 {
-        return Err(DaemonError::InvalidArguments(format!(
-            "{} is group- or world-writable (mode {:o}); remove those bits before starting \
-             the daemon",
-            root.join(STATE_DIR).display(),
-            meta.mode() & 0o777
+    if meta.uid() != euid || meta.mode() & 0o022 != 0 {
+        return Err(DaemonError::InvalidArguments(state_dir_refusal(
+            root,
+            meta.uid(),
+            euid,
+            meta.mode(),
         )));
     }
     Ok(())
+}
+
+fn state_dir_refusal(root: &Path, uid: u32, euid: u32, mode: u32) -> String {
+    let state = root.join(".orchestry");
+    let project_display = orch_proto::path::escape_controls(&root.to_string_lossy());
+    let state_display = orch_proto::path::escape_controls(&state.to_string_lossy());
+    if uid != euid {
+        return format!(
+            "Refusing project `{project_display}`: `{state_display}` is owned by uid {uid}, \
+             but this process runs as uid {euid}; run as the project owner/select your project. \
+             No permissions were changed."
+        );
+    }
+    format!(
+        "Refusing project `{project_display}`: `{state_display}` is group/world-writable \
+         (mode {:04o}). No permissions were changed. For an owner-only project, run \
+         `chmod 700 {}` as its owner, keep its parent directories and ACLs under trusted \
+         control, then start explicitly with `(cd {} && orch daemon start)`. If other \
+         accounts could already write state, verify or restore it from trusted data before starting.",
+        mode & 0o7777,
+        shell_quote_path(&state),
+        shell_quote_path(root),
+    )
+}
+
+// Both callers quote directories. Keep advice printable even when the CLI
+// escapes terminal controls; fixed octal operands also preserve non-UTF-8.
+fn shell_quote_path(path: &Path) -> String {
+    if let Some(path) = path.to_str()
+        && !path.chars().any(char::is_control)
+    {
+        return format!("'{}'", path.replace('\'', "'\\''"));
+    }
+    let bytes = path.as_os_str().as_encoded_bytes();
+    let mut encoded = String::new();
+    for byte in bytes {
+        encoded.push_str(&format!("\\{byte:03o}"));
+    }
+    // Shell substitution strips trailing newlines. A directory's `/.` alias
+    // preserves its identity and keeps that newline inside the quoted word.
+    if bytes.ends_with(b"\n") {
+        encoded.push_str("\\057\\056");
+    }
+    format!("\"$(printf '{encoded}')\"")
 }
 
 /// What occupies an endpoint path before bind.
@@ -511,6 +547,55 @@ mod tests {
             project_identity(temp.path()),
             Err(DaemonError::NotInitialized)
         ));
+    }
+
+    #[test]
+    fn permission_advice_quotes_path_bytes_and_escapes_prose_controls() {
+        for (path, expected) in [
+            ("/tmp/owner's project", "'/tmp/owner'\\''s project'"),
+            (
+                "/tmp/line\nnext",
+                r#""$(printf '\057\164\155\160\057\154\151\156\145\012\156\145\170\164')""#,
+            ),
+            ("-leading-dash", "'-leading-dash'"),
+            ("/tmp/$(echo bad);`id`", "'/tmp/$(echo bad);`id`'"),
+        ] {
+            assert_eq!(shell_quote_path(Path::new(path)), expected);
+        }
+        use std::os::unix::ffi::OsStrExt;
+        let raw = Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff'\n"));
+        assert_eq!(
+            shell_quote_path(raw),
+            r#""$(printf '\057\164\155\160\057\377\047\012\057\056')""#
+        );
+        let message = state_dir_refusal(Path::new("/tmp/owner's\nproject"), 42, 42, 0o775);
+        for part in [
+            "Refusing project `/tmp/owner's\\u{a}project`",
+            "`/tmp/owner's\\u{a}project/.orchestry`",
+            "is group/world-writable (mode 0775)",
+            "No permissions were changed.",
+            "`chmod 700 ",
+            " && orch daemon start)`",
+            "as its owner",
+            "keep its parent directories and ACLs under trusted control",
+            "verify or restore it from trusted data before starting",
+        ] {
+            assert!(message.contains(part), "missing {part:?}: {message}");
+        }
+        assert!(!message.contains('\n'), "{message}");
+        let owner = state_dir_refusal(Path::new("/tmp/project"), 41, 42, 0o775);
+        for part in [
+            "/tmp/project/.orchestry",
+            "owned by uid 41",
+            "runs as uid 42",
+            "run as the project owner/select your project",
+            "No permissions were changed.",
+        ] {
+            assert!(owner.contains(part), "{owner}");
+        }
+        assert!(!owner.contains("chmod"));
+        assert!(!owner.contains("sudo"));
+        assert!(!owner.contains("chown"));
     }
 
     #[test]
