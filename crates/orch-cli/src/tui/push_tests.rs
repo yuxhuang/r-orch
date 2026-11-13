@@ -3,6 +3,7 @@
 //! invalidations and the bus, and its gap / resync / new-instance / EOF paths
 //! end the way brief D7 says. No socket, no process, no real daemon.
 
+use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -373,7 +374,10 @@ impl Fixture {
 
     fn launch_with(daemon: Arc<FakeDaemon>) -> Fixture {
         let dir = tempfile::tempdir().expect("create isolated fake project");
-        std::fs::create_dir(dir.path().join(".orchestry")).expect("create fake project marker");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir.path().join(".orchestry"))
+            .expect("create fake project marker");
         let root = dir.path().to_path_buf();
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -1089,7 +1093,10 @@ fn drive_the_real_dashboard_loop_against_the_fake_daemon() {
     };
     let control = PathBuf::from(control);
     let dir = tempfile::tempdir().expect("create isolated fake project");
-    std::fs::create_dir(dir.path().join(".orchestry")).expect("create fake project marker");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.path().join(".orchestry"))
+        .expect("create fake project marker");
     let daemon = FakeDaemon::new();
     let connector = connector(&daemon, dir.path());
     let rt = tokio::runtime::Builder::new_multi_thread()

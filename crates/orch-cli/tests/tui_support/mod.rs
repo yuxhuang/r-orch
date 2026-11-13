@@ -12,6 +12,7 @@
 #![allow(dead_code, reason = "each test crate uses a subset of this module")]
 
 use std::ops::Deref;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -21,6 +22,14 @@ use orch_client::ClientConfig;
 use orch_daemon::testing::{DaemonHarness, HarnessBuilder};
 use orch_engine::FullEngine;
 use orch_proto::handshake::{Caller, CallerKind, SessionMode};
+
+/// Create private project state before any store can create it with the ambient umask.
+pub fn create_state_dir(root: &Path) {
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.join(".orchestry"))
+        .expect("create private test state directory");
+}
 
 /// A running test daemon over one project.
 pub struct TestDaemon {

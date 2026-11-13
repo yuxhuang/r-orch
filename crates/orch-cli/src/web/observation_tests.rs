@@ -7,13 +7,17 @@ use orch_proto::{
     handshake::{Caller, SessionMode},
     ops::{Request as DaemonRequest, results::SubscribeAck},
 };
+use std::os::unix::fs::DirBuilderExt;
 use tokio::sync::mpsc;
 
 type Peers = mpsc::UnboundedReceiver<FakeServer>;
 
 fn fixture() -> (tempfile::TempDir, Arc<WebState>, Peers, Arc<Mutex<String>>) {
     let root = tempfile::tempdir().expect("valid test fixture");
-    std::fs::create_dir(root.path().join(".orchestry")).expect("valid test fixture");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.path().join(".orchestry"))
+        .expect("valid test fixture");
     let path = root.path().to_path_buf();
     let (send, peers) = mpsc::unbounded_channel();
     let instance = Arc::new(Mutex::new(String::from("first-instance")));
@@ -66,6 +70,14 @@ fn fixture() -> (tempfile::TempDir, Arc<WebState>, Peers, Arc<Mutex<String>>) {
     (root, state, peers, instance)
 }
 
+// This is a safety bound for a missing/refused connector, never the success oracle.
+async fn next_peer(peers: &mut Peers) -> FakeServer {
+    tokio::time::timeout(Duration::from_secs(30), peers.recv())
+        .await
+        .expect("web observation peer did not connect within the safety deadline")
+        .expect("valid test fixture")
+}
+
 async fn acknowledge(peer: &mut FakeServer, instance: &str) {
     let request = tokio::time::timeout(Duration::from_secs(3), peer.recv())
         .await
@@ -103,7 +115,7 @@ async fn parent_holds_observation_without_http_request() {
         let state = state.clone();
         tokio::spawn(async move { state.daemon_check().await })
     };
-    let mut peer = peers.recv().await.expect("valid test fixture");
+    let mut peer = next_peer(&mut peers).await;
     acknowledge(&mut peer, "first-instance").await;
     check
         .await
@@ -123,7 +135,7 @@ async fn establish(state: &Arc<WebState>, peers: &mut Peers, instance: &str) -> 
         let state = state.clone();
         tokio::spawn(async move { state.daemon_check().await })
     };
-    let mut peer = peers.recv().await.expect("valid test fixture");
+    let mut peer = next_peer(peers).await;
     acknowledge(&mut peer, instance).await;
     check
         .await
@@ -287,7 +299,7 @@ async fn readiness_checks_share_one_observation_and_shutdown_releases_it() {
             .await
             .expect("valid test fixture")
             .expect("valid test fixture");
-        let mut preflight = peers.recv().await.expect("valid test fixture");
+        let mut preflight = next_peer(&mut peers).await;
         assert!(
             preflight
                 .recv()

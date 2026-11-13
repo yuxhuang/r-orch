@@ -63,7 +63,7 @@ async fn project() -> Project {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().canonicalize().expect("canonical root");
     let paths = Paths::new(&root);
-    tokio::fs::create_dir_all(paths.root()).await.expect("root");
+    tui_support::create_state_dir(&root);
     let mut config = default_config();
     config.defaults.agent.adapter = "shell".into();
     config.defaults.agent.workspace_mode = WorkspaceMode::Shared;
