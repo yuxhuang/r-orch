@@ -736,13 +736,12 @@ git status --short | grep orchestry             # should be empty
    un-ignore it deliberately to share agent definitions. Once a key is in a repository, **`0600` protects
    nothing** — git preserves no mode beyond the executable bit, and anyone who can read the repo can read
    the key.
-2. **Not every file is owner-only.** `tasks/`, `goals/` and `teams/` keep their entity files owner-only, but their
-   `_index.json` files (`tasks/_index.json` holds every task's description) and everything in `messages/` and
-   `context/` keep umask modes. So in a project whose `.orchestry` other local users can enter (for example 0755, which
-   `orch init` created under the usual umask 022 before it made the directory 0700, or any directory opened up to
-   others), a credential pasted into a task description or a context value **is** readable by other local users. If the
-   directory is opened to its group only (0750, for example under umask 027), it is readable by that group. For what a 0700 `.orchestry` does and does not
-   protect, see [Permissions of `.orchestry/`](manual/18-daemon.md#permissions-of-orchestry).
+2. **Not every file is owner-only.** Orch writes the entity YAML files in `tasks/`, `goals/` and `teams/` with an
+   owner-only mode, but their `_index.json` files (`tasks/_index.json` holds every task's description) and
+   message/context files follow the process umask. A credential pasted into a task description or context value may be
+   readable by other local accounts, including group members, when file permissions, directory permissions and ACLs
+   allow access. For what a 0700 `.orchestry` does and does not protect, see [Permissions of
+   `.orchestry/`](manual/18-daemon.md#permissions-of-orchestry).
 3. **The child process still receives it.** `env:` is passed to every agent the entry spawns, so anything
    that agent logs, echoes or sends onward can leak it.
 4. **Backups and sync tools do not read `.gitignore`.** Dropbox, Time Machine, `rsync` without

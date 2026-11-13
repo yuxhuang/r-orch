@@ -468,8 +468,9 @@ project, run `chmod 700 '<absolute path of .orchestry>'` as its owner, the comma
 
 **When orch refuses.** If `.orchestry` is writable by group or others, or owned by another user and readable by you,
 commands such as `orch task list`, `orch daemon status` and `orch daemon start` exit 2 and change nothing. The message
-names the project and the directory and says `No permissions were changed.`; for a group- or world-writable directory it
-also prints the owner's commands with the paths shell-quoted. For a group-writable directory, with your own paths:
+names the project and the directory and says `No permissions were changed.`; when the directory belongs to the caller
+and is group- or world-writable, it also prints the owner's commands with the paths shell-quoted. For a group-writable
+directory, with your own paths:
 
 ```text
   ✕ Refusing project `<project root>`: `<project root>/.orchestry` is group/world-writable (mode 0775). No permissions were changed. For an owner-only project, run `chmod 700 '<project root>/.orchestry'` as its owner, keep its parent directories and ACLs under trusted control, then start explicitly with `(cd '<project root>' && orch daemon start)`. If other accounts could already write state, verify or restore it from trusted data before starting.
