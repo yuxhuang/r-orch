@@ -737,8 +737,8 @@ git status --short | grep orchestry             # should be empty
    nothing** — git preserves no mode beyond the executable bit, and anyone who can read the repo can read
    the key.
 2. **Only those two files are owner-only.** `tasks/`, `goals/`, `teams/`, `messages/` and `context/` keep
-   umask modes, so in a project whose `.orchestry` is not itself owner-only (every project created before
-   `orch init` made it 0700, and any whose directory was opened up) a credential pasted into a task description
+   umask modes, so in a project whose `.orchestry` is not itself owner-only (for example a project created
+   under the usual umask 022 before `orch init` made it 0700, and any whose directory was opened up) a credential pasted into a task description
    or a context value **is** world-readable to other local users. For what a 0700 `.orchestry` does and does not
    protect, see [Permissions of `.orchestry/`](manual/18-daemon.md#permissions-of-orchestry).
 3. **The child process still receives it.** `env:` is passed to every agent the entry spawns, so anything
