@@ -44,7 +44,7 @@ CLI). Temporary paths are shown as `<tmp>`.
 | **Q2.** How does one agent connect to another agent? | Never directly. An agent writes a **message** file (`orch msg send`) or a **shared context** entry (`orch context set`). The message is injected into the recipient's prompt the next time the recipient is dispatched; nothing wakes the recipient. | [§3](#3-q2-how-does-one-agent-connect-to-another-agent) |
 | **Q3.** How does one agent connect to another task? | Through the `orch` CLI, from inside its run: it creates tasks (`--assignee`, `--depends-on`, `--goal-id`), inspects them (`orch task show`), and approves or rejects them. The orchestrator gives each run `ORCH_AGENT_ID` and `ORCH_TASK_ID`. A finished task's result sits in its `proof`; nobody pushes it to the creator. | [§4](#4-q3-how-does-one-agent-connect-to-another-task) |
 | **Q4.** How does a goal-driven system work? | A goal with an assignee makes that agent **autonomous**. While a goal is `active`, every tick gives each idle autonomous agent with no open task an `[auto]` task carrying the goal text (30-second cooldown per agent). The prompt tells the agent to decompose the goal into tasks and to mark the goal `achieved` when they are finished. That part is **[convention]**: nothing closes a goal automatically. | [§5](#5-q4-how-does-a-goal-driven-system-work) |
-| **Q5.** How, when and why does a pause happen, and what makes it continue? | There is no single pause. **Goal pause** stops new `[auto]` work for that goal and cancels its queued autonomous tasks; running work normally finishes, but the pause is not an atomic barrier ([§5.5](#55-what-pausing-a-goal-does-to-its-tasks)). **Abandoning** (or achieving) a goal stops `[auto]` work too, but cancels nothing: queued tasks still run. **Agent disable** holds an idle agent, but a run that ends sets the agent back to `idle`. **Watch stop** (`/pause`, `Ctrl+C`, `SIGTERM`) kills running agents and sends their tasks back to `retrying`. Individual tasks also **wait** in `review`, on dependencies, on scope, or for an agent. Each resumes on a specific command or state change; no message or inbox entry resumes anything by itself. | [§6](#6-q5-how-does-a-pause-happen) |
+| **Q5.** How, when and why does a pause happen, and what makes it continue? | There is no single pause. **Goal pause** stops new `[auto]` work for that goal and cancels its queued autonomous tasks; running work normally finishes, but the pause is not an atomic barrier ([§5.5](#55-what-pausing-a-goal-does-to-its-tasks)). **Abandoning** (or achieving) a goal stops `[auto]` work too, but cancels nothing: queued tasks still run. **Agent disable** holds an idle agent, but a run that ends sets the agent back to `idle`. **Dispatch off** (`/pause`, `orch daemon dispatch off`) stops only future automatic dispatch; running agents continue. **Daemon stop** (`orch daemon stop`, or SIGTERM/SIGINT/SIGHUP to the daemon) attempts to stop local runs with grace, moves their tasks to `retrying` (or `failed`) and reconciles them. `Ctrl+C` on `orch run` ends only that client's observation; the runs continue in the daemon. Individual tasks also **wait** in `review`, on dependencies, on scope, or for an agent. Each resumes on a specific command or state change; no message or inbox entry resumes anything by itself. | [§6](#6-q5-how-does-a-pause-happen) |
 
 ---
 
@@ -437,8 +437,10 @@ Two worktree tasks that touch the same file will conflict at merge time unless t
 
 ### 2.8 Shutdown and restart recovery
 
-**Graceful stop** — `stop()` (`orchestrator.rs:751-831`, `orchestrator/recovery.rs:580-660`). Called by the
-signal handlers, the circuit breaker and the dashboard's `/pause`.
+**Graceful stop (legacy in-process watch loop)** — `stop()` (`orchestrator.rs`, test builds only),
+called by that loop's signal handlers and circuit breaker. In the daemon, `/pause` only turns dispatch
+off; a daemon stop runs `daemon_stop` (`crates/orch-engine/src/orchestrator/daemon/shutdown.rs`),
+which refuses unverified worker PIDs and reports survivors instead of claiming a clean stop.
 
 1. Stop future ticks (the in-flight tick finishes), cancel the reactive-dispatch timer and the debounced save.
 2. For each **local** running entry: kill the process group with a 10 s grace
@@ -911,8 +913,9 @@ Achieving a goal (with `achieved`, no `--force`) left its queued `[ateam] checkp
   stop and reconcile local runs; a client interrupt ends only its observation.
 
 Separately, one **task** can wait on its own conditions ("Waits that look like pauses", below). A goal pause
-cancels queued autonomous work; dispatch off and client interrupts leave running agents alive. Abandoning the goal and
-disabling the agent, the two levers an operator is likely to try first, do neither: queued work still runs.
+cancels queued autonomous work; a daemon stop attempts to stop running agents, while dispatch off and
+client interrupts leave them alive. Abandoning the goal and disabling the agent, the two levers an
+operator is likely to try first, stop neither: queued work still runs and running agents continue.
 None of them is resumed by a message: the inbox is read only when a task is dispatched, so a message cannot restart anything. What
 resumes each one is a command or a change of state. With automatic dispatch on, non-tick commits
 schedule a coalesced wake about 0.5 s later; the poll interval is the fallback
