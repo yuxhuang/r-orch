@@ -3,7 +3,7 @@
 - Status: accepted
 - Date: 2026-11-09
 - Revision: 2, after round-1 challenge; accepted by the owner at gate 2, 2026-11-09. Decision 14 added in PR 4, 2026-11-11
-- Supersedes: ADR [0011](0011-mcp-server.md) decision 7 and the D10 concurrent-writer acceptance. The client conversion is complete: the CLI, the dashboard, `orch web` and `orch mcp` are clients of the daemon through `orch-client`. Apart from `orch daemon start` and `orch init`, which enter `orch-daemon`, none of them uses the store implementations in its production code ([ARCHITECTURE §3.1](../ARCHITECTURE.md#31-dependency-direction)). Other MCP decisions remain except where the implementation is explicitly replaced below.
+- Supersedes: ADR [0011](0011-mcp-server.md) decision 7 and the D10 concurrent-writer acceptance. The client conversion is complete: the CLI, the dashboard, `orch web` and `orch mcp` are clients of the daemon through `orch-client`. Apart from `orch daemon start` (also run in the foreground by `orch serve` and `orch run --watch`) and `orch init`, which enter `orch-daemon`, none of them uses the store implementations in its production code ([ARCHITECTURE §3.1](../ARCHITECTURE.md#31-dependency-direction)). Other MCP decisions remain except where the implementation is explicitly replaced below.
 
 ## Context
 

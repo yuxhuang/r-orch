@@ -106,6 +106,6 @@ Rejected:
 - Concurrent MCP sessions widen how often the existing store races can be hit; they are not fixed. A broken config
   written through `config_set` breaks every call until the file is restored by hand.
   *The first sentence is superseded by [ADR 0012](0012-daemon-owned-state.md): the daemon is the one process
-  that writes the stores, and MCP sessions are its clients. The second sentence stands.*
+  that writes the stores, and MCP sessions are its clients. The second sentence describes orch 0.13.0: the daemon's `config_set` refuses a value of the wrong type for a known field before writing it.*
 - `rmcp` pulls in a second `sha2` major alongside `orch web`'s, until axum moves.
 - Rollback is removing the client registration; state formats do not change, and completed mutations stay.

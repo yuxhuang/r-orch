@@ -239,7 +239,7 @@ $ orch --json daemon status
 | `removed_env` | Names, never values, removed from the agents' environment |
 
 **Lost ownership.** The daemon re-checks the orchestrator lock (`.orchestry/orchestry.lock`) every 10 seconds,
-whether dispatch is on or off. If the file is gone or names another PID, the daemon sets `ownership` to `lost` and
+whether dispatch is on or off. If the file is gone, names another PID or no longer holds a PID, the daemon sets `ownership` to `lost` and
 turns dispatch off. It does not recreate the lock. Plain `orch daemon status` then prints
 `ownership: LOST — stop and restart the daemon`; `--json` and `--yaml` show `ownership` as `lost`. To recover, stop
 the daemon and start it again.
@@ -249,7 +249,8 @@ with `daemon ownership was lost` (exit 1; nothing was executed):
 
 - `orch daemon dispatch on` and `orch daemon dispatch off`;
 - `orch run --once`, `orch run <task-id>`, `orch run --all` and `orch serve --once`;
-- the dashboard's `/watch`, `/pause`, `/run` and `/run-all`, which show the same message.
+- the dashboard's `/watch`, `/run` and `/run-all`, which show `Failed: daemon ownership was lost` (`/pause` has
+  nothing to stop: the header shows dispatch off, and it answers `Watch mode not active`).
 
 It still executes every other request, including the ones that change state.
 
@@ -257,15 +258,21 @@ A request that the daemon had accepted before it lost ownership, and had not sta
 `request cancelled before execution`: the command prints it on stderr and exits 1, and nothing was executed.
 `orch daemon status` is one of the commands this can happen to, at the moment of the change. A diagnostic that was
 already running at that moment, such as `orch doctor`, is stopped and ends with `diagnostic cancelled` (exit 1);
-run it again after the restart. orch does not retry any of these requests and does not restart anything. Repeat a
+run it again after the restart. A command that was following its runs stops following them, and the agents keep
+running: `orch run <task-id>` and `orch run --all` end with `observation interrupted; runs continue in the daemon`
+(exit 1), `orch serve --once` ends its batch as `interrupted` (exit 1), and `orch logs --follow` ends. The agents
+they started keep running until you stop the daemon. orch does not retry any of these requests and does not restart anything. Repeat a
 command that only reads. Before you repeat a command that changes state, stop the daemon and start it again, as
 described above. A request made after the change is answered, and `orch daemon status` then prints
 `ownership: LOST`.
 
-**What may have been written before you stop it.** The daemon notices the loss up to 10 seconds after it happens
-and, until you stop it, keeps executing every request except the refused ones, so it can have written to the project
-in that time. A second daemon cannot have: the daemon holds `.orchestry/.daemon-owner.lock` until it exits. Whether
-a process that is not a daemon wrote to the project in that time is not excluded by the code, and no test covers it.
+**What may have been written before you stop it.** The daemon checks for ownership loss on a 10-second timer;
+scheduling and waiting for the control operation can delay recording the loss further. Until the loss is recorded,
+dispatch, if it is on, can still start tasks. After it is recorded, the requests listed above are refused, but every
+other request, including writes, runs until you stop the daemon. So the daemon can have written to the project in
+that time. A second daemon cannot have, as long as `.orchestry/.daemon-owner.lock` was not deleted or replaced as
+well: the daemon holds the lock on that file until it exits. Whether a process that is not a daemon wrote to the
+project in that time is not excluded by the code, and no test covers it.
 
 ### Dispatch on and off
 
@@ -532,7 +539,7 @@ is something you do.
 | You upgraded orch and the old daemon still runs | Version skew message, exit 7. | `orch daemon stop` (either binary), then start the new one. Running agents are stopped and reconciled; this is not a transparent upgrade. |
 | The daemon hangs, or its socket was removed | Commands time out or report no daemon; status never claims liveness from files. | Read the PID in `daemon.json` as an untrusted hint. Only if `ps -p <pid> -o command=` shows an orch daemon for this project, send `kill -TERM <pid>`. If you cannot verify the process, do not signal it. If `orch daemon stop` already timed out, SIGTERM does nothing: see the next row. |
 | `orch daemon stop` timed out (exit 7) and `orch daemon start` says `already running (PID <pid>)` | The daemon is still finishing an operation it accepted, such as a hung `git worktree add`, and owns the project until it returns. `orch daemon status` reports no daemon (exit 7) and `kill -TERM` does nothing. | Wait: the daemon exits by itself when the call returns. To end it now, check that `ps -p <pid> -o command=` shows an orch daemon, list its child processes with `pgrep -P <pid>`, then `kill -KILL <pid>`. The children are not killed with it: a stuck `git worktree add` kept running under PID 1. Check each child with `ps -p <child-pid> -o command=` and stop it too, or wait until it has exited, before you start the daemon again; the crash row above then applies. |
-| orch crashed between writing an entity and its `_index.json` | One writer does not make two file writes one transaction. Start-up rebuilds a missing or corrupt index of tasks, agents, runs, goals, teams, messages or context, but cannot detect a stale index that is still valid. | Offline repair only: stop the daemon, remove the affected `_index.json`, start it. Never remove an index while a daemon runs. |
+| orch crashed between writing an entity and its `_index.json` | One writer does not make two file writes one transaction. Start-up rebuilds a missing or corrupt index of tasks, agents, goals, messages or context (runs and teams have no index), but cannot detect a stale index that is still valid. | Offline repair only: stop the daemon, remove the affected `_index.json`, start it. Never remove an index while a daemon runs. |
 | Re-running `orch init` | It does not overwrite the project and prints how to start the daemon. It never starts one. | Start the daemon yourself. |
 | An agent loses the daemon mid-task | Exit 7 with the agent-context message. The outcome of a change whose reply was lost is unknown. | The agent stops and reports to you. Start the daemon, inspect the task, run and state, then decide on a retry. A restart does not resume the agent's conversation. |
 | An MCP client's first call fails | The `initialize` error with the no-daemon message; the `orch mcp` process stays up. | Start the daemon, then reconnect, re-enable or restart the MCP session; not every MCP client retries by itself. |

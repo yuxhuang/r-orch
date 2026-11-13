@@ -63,7 +63,7 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 
 ## Running and tasks
 
-### `Orchestrator already running (PID: undefined)` and nothing is running
+### `orch daemon already running (PID unavailable)` and no daemon is running
 
 - **Cause.** The lock file `.orchestry/orchestry.lock` holds something that is not a process number, for example after an interrupted write. orch refuses it and never cleans it up, so a daemon cannot start (exit 4).
 - **Do.**

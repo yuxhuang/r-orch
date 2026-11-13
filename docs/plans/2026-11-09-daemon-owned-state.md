@@ -11,7 +11,7 @@ the dashboard, `orch web`, `orch mcp` and the `orch` commands agents run inside 
 a local Unix socket, for reads and writes alike. No client reads or writes `.orchestry/` state itself, no client
 ever starts a daemon, and with no daemon every client fails with one uniform message and exit code 7. This closes
 the cross-process store races of [ADR 0011](../decisions/0011-mcp-server.md) residual D10 and
-[ARCHITECTURE §2.1](../ARCHITECTURE.md#21-a2-in-detail--the-concurrency-story-is-weaker-than-single-writer) as a
+[ARCHITECTURE §2.1](../ARCHITECTURE.md#21-daemon-ownership-guarantees-and-limits) as a
 class: one writer instead of a patch per race.
 
 ## Non-goals

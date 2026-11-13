@@ -88,7 +88,7 @@ A failure changes nothing: parsing, merging and validation finish before anythin
 | `<file>: document exceeds 1 MiB` / `expected a regular input file` | 2 | Size limit; a directory |
 | `cannot mutate a running or remote agent definition` (task: `… remote-controlled task …`) | 2 | Running or remote target (checked in the service; covered by its unit tests) |
 | `Agent not found: <id>` | 1 | Unknown id; names are not accepted |
-| `mutation lock timed out after 5 s; retry` | 1 | The daemon was running another change that holds the lock, and it kept it for 5 s |
+| `<file>: mutation lock timed out after 5 s; retry` | 1 | The daemon was running another change that holds the lock, and it kept it for 5 s |
 | `read mutation input` | 1 | The file cannot be read. The message names the operation only, not the path or the OS reason |
 
 ## Concurrency and limits
@@ -97,7 +97,7 @@ A failure changes nothing: parsing, merging and validation finish before anythin
   waiting up to 5 seconds; the `orch` process you run takes no lock. The lock serializes these commands against each
   other, so two patches to different fields both survive. The daemon takes the same lock for `agent add`,
   `config set`, the prompt-mode change and `org deploy`.
-- `agent edit` and `config edit` fail with `authored definition changed; fetch it again before applying`, and write
+- `agent edit`, `task edit` and `config edit` fail with `authored definition changed; fetch it again before applying`, and write
   nothing, when the definition changed after the editor opened it. `update` and `patch` make no such check: they apply
   your document to the definition as the daemon reads it under the lock. An agent or task is saved through its normal
   store, which is not one transaction with its index.
