@@ -88,16 +88,19 @@ A failure changes nothing: parsing, merging and validation finish before anythin
 | `<file>: document exceeds 1 MiB` / `expected a regular input file` | 2 | Size limit; a directory |
 | `cannot mutate a running or remote agent definition` (task: `… remote-controlled task …`) | 2 | Running or remote target (checked in the service; covered by its unit tests) |
 | `Agent not found: <id>` | 1 | Unknown id; names are not accepted |
-| `<stdin>: mutation lock timed out after 5 s; retry` | 1 | Another mutation held the lock for 5 s |
+| `mutation lock timed out after 5 s; retry` | 1 | The daemon was running another change that holds the lock, and it kept it for 5 s |
 | `read mutation input` | 1 | The file cannot be read. The message names the operation only, not the path or the OS reason |
 
 ## Concurrency and limits
 
-- The three commands share one advisory lock, `.orchestry/.definition.lock`, taken for up to 5 seconds. It serializes
-  these commands against each other, so two patches to different fields both survive.
-- It does **not** cover `edit`, `agent add`, a running orchestrator or the dashboard. Those keep their existing
-  last-writer-wins behaviour, and an agent or task is saved through its normal store, which is not one transaction with
-  its index. To change many definitions reproducibly, stop the runner and use one writer.
+- The daemon carries these commands out. For each one it takes one advisory lock, `.orchestry/.definition.lock`,
+  waiting up to 5 seconds; the `orch` process you run takes no lock. The lock serializes these commands against each
+  other, so two patches to different fields both survive. The daemon takes the same lock for `agent add`,
+  `config set`, the prompt-mode change and `org deploy`.
+- `agent edit` and `config edit` fail with `authored definition changed; fetch it again before applying`, and write
+  nothing, when the definition changed after the editor opened it. `update` and `patch` make no such check: they apply
+  your document to the definition as the daemon reads it under the lock. An agent or task is saved through its normal
+  store, which is not one transaction with its index.
 - The write itself is atomic (a temporary file renamed over the target). A crash after the rename but before the
   output was printed has still saved the change: run `orch agent show`/`task show`/`config get` before retrying.
 - Rolling back is a second `update` with the previous definition. Save `orch --yaml agent show <id>` first.

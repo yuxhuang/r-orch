@@ -239,19 +239,33 @@ $ orch --json daemon status
 | `removed_env` | Names, never values, removed from the agents' environment |
 
 **Lost ownership.** The daemon re-checks the orchestrator lock (`.orchestry/orchestry.lock`) every 10 seconds,
-whether dispatch is on or off. If the file is gone or names another PID, the daemon sets `ownership` to `lost`,
-turns dispatch off and refuses `orch daemon dispatch on` with `daemon ownership was lost` (exit 1). It does not
-recreate the lock. Plain `orch daemon status` then prints `ownership: LOST — stop and restart the daemon`;
-`--json` and `--yaml` show `ownership` as `lost`. To recover, stop the daemon and start it again.
+whether dispatch is on or off. If the file is gone or names another PID, the daemon sets `ownership` to `lost` and
+turns dispatch off. It does not recreate the lock. Plain `orch daemon status` then prints
+`ownership: LOST — stop and restart the daemon`; `--json` and `--yaml` show `ownership` as `lost`. To recover, stop
+the daemon and start it again.
+
+From then until it stops, the daemon refuses the requests that switch dispatch or start a run, from every client,
+with `daemon ownership was lost` (exit 1; nothing was executed):
+
+- `orch daemon dispatch on` and `orch daemon dispatch off`;
+- `orch run --once`, `orch run <task-id>`, `orch run --all` and `orch serve --once`;
+- the dashboard's `/watch`, `/pause`, `/run` and `/run-all`, which show the same message.
+
+It still executes every other request, including the ones that change state.
 
 A request that the daemon had accepted before it lost ownership, and had not started to execute, is refused with
 `request cancelled before execution`: the command prints it on stderr and exits 1, and nothing was executed.
-`orch daemon status` is one of the commands this can happen to, at the moment of the change. orch does not retry
-the request and does not restart anything. Repeat a command that only reads. Before you repeat a command that
-changes state, stop the daemon and start it again, as described above: after it has lost ownership the daemon
-refuses only dispatch requests (`orch daemon dispatch on` and `off`, `orch run --once`, `orch run <task-id>`,
-`orch run --all` and `orch serve --once`) and still executes other commands. A request made after the change is
-answered, and `orch daemon status` then prints `ownership: LOST`.
+`orch daemon status` is one of the commands this can happen to, at the moment of the change. A diagnostic that was
+already running at that moment, such as `orch doctor`, is stopped and ends with `diagnostic cancelled` (exit 1);
+run it again after the restart. orch does not retry any of these requests and does not restart anything. Repeat a
+command that only reads. Before you repeat a command that changes state, stop the daemon and start it again, as
+described above. A request made after the change is answered, and `orch daemon status` then prints
+`ownership: LOST`.
+
+**What may have been written before you stop it.** The daemon notices the loss up to 10 seconds after it happens
+and, until you stop it, keeps executing every request except the refused ones, so it can have written to the project
+in that time. A second daemon cannot have: the daemon holds `.orchestry/.daemon-owner.lock` until it exits. Whether
+a process that is not a daemon wrote to the project in that time is not excluded by the code, and no test covers it.
 
 ### Dispatch on and off
 

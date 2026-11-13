@@ -15,6 +15,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | How do I start, see or stop the daemon? | [Start, check and stop the daemon](#start-check-and-stop-the-daemon) |
 | `orch daemon start` exits 2 naming the socket, or `connection refused` in the no-daemon detail | [A stale or stuck socket](#a-stale-or-stuck-socket) |
 | The daemon crashed or was killed | [After a daemon crash](#after-a-daemon-crash-or-kill--9) |
+| `ownership: LOST — stop and restart the daemon` in `orch daemon status`, or `daemon ownership was lost` from a dispatch command or the dashboard | [A daemon that reports `ownership: LOST`](#a-daemon-that-reports-ownership-lost) |
 | `daemon is orch … protocol …, this client is orch …`, or upgrading orch | [Version skew and upgrading](#version-skew-and-upgrading-orch) |
 | Commands time out, or `orch daemon stop` says the PID is still running | [A hung daemon](#a-hung-daemon) |
 | `orch` commands, the dashboard or MCP tools are slow while many tasks fail to start | [Commands are slow while many tasks fail to start](#orch-commands-are-slow-while-many-tasks-fail-to-start) |
@@ -148,6 +149,42 @@ window, have one daemon remove the other's socket. Set `ORCH_SOCKET` per project
 
 If the start fails with exit 1 naming a write, recovery could not save a change (permissions, disk full). Fix the
 cause and start again; the state it needs is kept.
+
+### A daemon that reports `ownership: LOST`
+
+**Symptom.** `orch daemon status` prints `ownership: LOST — stop and restart the daemon` (`--json` and `--yaml`
+show `"ownership": "lost"`). A command that switches dispatch or starts a run fails with `daemon ownership was lost`
+(exit 1):
+
+- `orch daemon dispatch on` and `orch daemon dispatch off`;
+- `orch run --once`, `orch run <task-id>`, `orch run --all` and `orch serve --once`;
+- the dashboard's `/watch`, `/pause`, `/run` and `/run-all`, which show the same message.
+
+**Cause.** The daemon re-checks `.orchestry/orchestry.lock` every 10 seconds. The file was deleted, or it names
+another PID. The daemon does not recreate it.
+
+**What the daemon still does.** Dispatch is off and stays off. Agents already running keep running. Every request
+that is not in the list above is still executed, reads and writes, for every client.
+
+**Fix.**
+
+1. Stop it: `orch daemon stop`.
+2. Start it: `orch daemon start`. It starts with dispatch **off**. If it exits 4 with
+   `the project lock .orchestry/orchestry.lock is held by live PID <pid>`, verify that PID with
+   `ps -p <pid> -o command=`, stop that orch process, and start the daemon again.
+3. `orch daemon status` shows `ownership: held`. Inspect (`orch task list`, `orch logs --task <id>`), then
+   `orch daemon dispatch on`.
+
+**What may have been written between the loss and the stop.** The daemon notices the loss up to 10 seconds after it
+happens and keeps executing every request except the refused ones until you stop it, so it can have written to the
+project in that time. A second daemon cannot have: the daemon holds `.orchestry/.daemon-owner.lock` until it exits.
+Whether a process that is not a daemon wrote to the project in that time is not excluded by the code, and no test
+covers it.
+
+**A command that was running at the moment of the loss.** A request the daemon had accepted and not yet started
+ends with `request cancelled before execution` (exit 1); nothing was executed. A diagnostic that was already
+running, such as `orch doctor`, ends with `diagnostic cancelled` (exit 1). Nothing retries either: repeat the
+command after the restart.
 
 ### Version skew and upgrading orch
 
@@ -407,7 +444,7 @@ serialises every index read-modify-write across processes with `<store>/.index.l
 two current writers creating different entities keep both entries. The entity file and its index entry are still
 written as two separate steps, not one transaction, and a writer that does not take the lock (an older orch
 binary, a hand edit) can still overwrite the index. A crash between the two writes, or such a writer, leaves the
-index behind the files. See [ARCHITECTURE.md §2.1](ARCHITECTURE.md#21-a2-in-detail--the-concurrency-story-is-weaker-than-single-writer).
+index behind the files. See [ARCHITECTURE.md §2.1](ARCHITECTURE.md#21-daemon-ownership-guarantees-and-limits).
 
 This is a documented hazard with a one-command recovery.
 
@@ -737,8 +774,8 @@ git status --short | grep orchestry             # should be empty
    nothing** — git preserves no mode beyond the executable bit, and anyone who can read the repo can read
    the key.
 2. **Not every file is owner-only.** Orch writes the entity YAML files in `tasks/`, `goals/` and `teams/` with an
-   owner-only mode, but their `_index.json` files (`tasks/_index.json` holds every task's description) and
-   message/context files follow the process umask. A credential pasted into a task description or context value may be
+   owner-only mode, but `tasks/_index.json` (which holds every task's description), `goals/_index.json` and the
+   message and context files follow the process umask. A credential pasted into a task description or context value may be
    readable by other local accounts, including group members, when file permissions, directory permissions and ACLs
    allow access. For what a 0700 `.orchestry` does and does not protect, see [Permissions of
    `.orchestry/`](manual/18-daemon.md#permissions-of-orchestry).
@@ -1002,7 +1039,7 @@ definition unchanged, because parsing, merging and validation finish before anyt
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `<source>: mutation lock timed out after 5 s; retry` (exit 1) | Another `update`/`patch` (or a hung one) holds `.orchestry/.definition.lock`. The lock is released when its process exits, however it exits. | Retry. If it persists, find the process (`lsof .orchestry/.definition.lock`) and stop it. Do not delete the file. |
+| `mutation lock timed out after 5 s; retry` (exit 1) | The daemon was running another change that holds `.orchestry/.definition.lock` (another `update`/`patch`, `agent add`, `config set`, a prompt-mode change or `org deploy`) and kept it for 5 s. It releases the lock when that operation ends. | Retry. If it persists, `lsof .orchestry/.definition.lock` names the process that holds it: normally the daemon, and if it is hung see [A hung daemon](#a-hung-daemon). Do not delete the file. |
 | `read mutation input` (exit 1) | The `-f` file cannot be read: missing, unreadable or a permission problem. The message does not name the path or the OS reason. | Check the path and permissions yourself (`ls -l FILE`). |
 | `<source>: <field>: read-only field` / `unknown field` / `required string` (exit 2) | The document names a field that cannot be written, does not exist or is missing. | Fix the document. `orch --yaml agent show <id>` shows the shape; read-only fields can be echoed back in `update` only when unchanged. |
 | `Agent not found: <name>` (exit 1) | `update`/`patch` take the id (`agt_…`), not the name. | `orch agent list` for the id. |
