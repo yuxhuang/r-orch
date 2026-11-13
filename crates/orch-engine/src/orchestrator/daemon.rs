@@ -12,8 +12,22 @@ use orch_core::adapter::ExecuteParams;
 use orch_core::error::{Error, Result};
 use orch_domain::{
     Agent, AgentStatus, GoalStatus, OrchestratorEvent, OrchestratorState, RunStatus, RunningEntry,
-    Task, TaskStatus, is_blocked, is_dispatchable, scopes_overlap,
+    Task, TaskStatus, is_blocked, is_dispatchable,
 };
+
+#[cfg(not(test))]
+use orch_domain::scopes_overlap;
+
+#[cfg(test)]
+thread_local! {
+    static SCOPE_MATCHER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn scopes_overlap(a: Option<&[String]>, b: Option<&[String]>) -> bool {
+    SCOPE_MATCHER_CALLS.with(|calls| calls.set(calls.get() + 1));
+    orch_domain::scopes_overlap(a, b)
+}
 
 use super::dispatch::{
     MailboxMode, PREPARATION_OWNS_EFFORT_DIAGNOSTICS, PreparedPrompt, check_preparation,
@@ -153,7 +167,7 @@ impl Orchestrator {
                         self.seed_autonomous_tasks().await;
                     }
                     let mut tasks = self.deps().task_store.list(&Default::default()).await?;
-                    self.daemon_prune_scope_overlap_reports(&tasks, state);
+                    self.daemon_prune_scope_overlap_reports(&tasks, state, None);
                     tasks.sort_by(|a, b| {
                         a.priority
                             .cmp(&b.priority)
@@ -961,7 +975,7 @@ impl Orchestrator {
             return Ok(true);
         }
         let tasks = self.deps().task_store.list(&Default::default()).await?;
-        self.daemon_prune_scope_overlap_reports(&tasks, state);
+        self.daemon_prune_scope_overlap_reports(&tasks, state, Some(&task.id));
         if is_blocked(task, tasks.as_slice()) {
             return Ok(false);
         }
@@ -1013,7 +1027,12 @@ impl Orchestrator {
             .remove(task_id);
     }
 
-    fn daemon_prune_scope_overlap_reports(&self, tasks: &[Task], state: &OrchestratorState) {
+    fn daemon_prune_scope_overlap_reports(
+        &self,
+        tasks: &[Task],
+        state: &OrchestratorState,
+        candidate: Option<&str>,
+    ) {
         let mut reports = self
             .inner
             .scope_overlap_reports
@@ -1025,10 +1044,8 @@ impl Orchestrator {
         let by_id: HashMap<&str, &Task> =
             tasks.iter().map(|task| (task.id.as_str(), task)).collect();
         let reserved = |id: &str| state.running.contains_key(id) || state.claimed.contains(id);
-        reports.retain(|id, (blocker_id, _)| {
-            let (Some(task), Some(blocker)) =
-                (by_id.get(id.as_str()), by_id.get(blocker_id.as_str()))
-            else {
+        let valid = |id: &str, blocker_id: &str| {
+            let (Some(task), Some(blocker)) = (by_id.get(id), by_id.get(blocker_id)) else {
                 return false;
             };
             is_dispatchable(task.status)
@@ -1036,7 +1053,20 @@ impl Orchestrator {
                 && id != blocker_id
                 && reserved(blocker_id)
                 && scopes_overlap(task.scope.as_deref(), blocker.scope.as_deref())
-        });
+        };
+        // A tick snapshot cleans all observations. A candidate needs only its
+        // own entry: rechecking unrelated scopes here multiplies the expensive
+        // Cartesian matcher by the entire held population for every candidate.
+        if let Some(id) = candidate {
+            if reports
+                .get(id)
+                .is_some_and(|(blocker, _)| !valid(id, blocker))
+            {
+                reports.remove(id);
+            }
+        } else {
+            reports.retain(|id, (blocker, _)| valid(id, blocker));
+        }
     }
 
     async fn daemon_preparation_valid(
@@ -1369,5 +1399,72 @@ mod scope_overlap_tests {
         assert!(!scope_overlap_repeat_due(i64::MAX, i64::MAX));
         assert!(!scope_overlap_repeat_due(i64::MAX, i64::MAX - 299_999));
         assert!(scope_overlap_repeat_due(i64::MIN + 300_000, i64::MIN));
+    }
+}
+
+#[cfg(test)]
+mod scope_overlap_work_tests {
+    use super::*;
+    use crate::orchestrator::tests::harness::Harness;
+    use orch_core::clock::Clock;
+    use orch_core::test_support::make_task;
+
+    #[tokio::test]
+    async fn warm_scope_prune_comparison_work_is_linear() {
+        let mut counts = Vec::new();
+        for n in [16, 32, 64] {
+            // Only the last pattern on each side overlaps: every matcher
+            // call performs all 64 * 64 pattern-pair comparisons.
+            let patterns = |prefix: &str| {
+                let mut scope: Vec<String> = (0..63).map(|i| format!("{prefix}/{i}/**")).collect();
+                scope.push("shared/**".into());
+                scope
+            };
+            let blocker = Task {
+                id: "A".into(),
+                scope: Some(patterns("blocker")),
+                ..make_task()
+            };
+            let mut state = OrchestratorState::default();
+            state.claimed.insert(blocker.id.clone());
+            let h = Harness::builder().tasks([blocker]).state(state).build();
+            h.orchestrator.enable_daemon_mode();
+            let ids: Vec<String> = (0..n).map(|i| format!("held-{i}")).collect();
+            for id in &ids {
+                h.tasks.seed(Task {
+                    id: id.clone(),
+                    scope: Some(patterns("held")),
+                    ..make_task()
+                });
+                h.orchestrator.daemon_launch_task(id).await.unwrap();
+            }
+            let now = h.clock.now_ms();
+            SCOPE_MATCHER_CALLS.with(|calls| calls.set(0));
+            for id in &ids {
+                h.orchestrator.daemon_launch_task(id).await.unwrap();
+            }
+            let calls = SCOPE_MATCHER_CALLS.with(|calls| calls.get());
+            assert_eq!(h.clock.now_ms(), now, "fixed clock inside repeat interval");
+            assert_eq!(
+                h.events()
+                    .iter()
+                    .filter(|e| matches!(e, OrchestratorEvent::TaskScopeOverlap { .. }))
+                    .count(),
+                n,
+                "warm evaluations must not add events"
+            );
+            println!(
+                "warm N={n} matcher_calls={calls} bound={} events={n}",
+                2 * n
+            );
+            counts.push((n, calls));
+        }
+        for (n, calls) in counts {
+            assert_eq!(
+                calls,
+                2 * n,
+                "one current-pair prune and revalidation per evaluation, N={n}"
+            );
+        }
     }
 }
