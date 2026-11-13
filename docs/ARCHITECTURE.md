@@ -14,7 +14,7 @@ every external effect, so the engine is testable deterministically without real 
 For the runtime flows (scheduling, handoffs, goals, pause, and how adapters drive each CLI), see
 [docs/internal/](internal/README.md).
 
-**No distributed system here.** (Optional peer links delegate work between installations; each project still has one engine.) One process per project, guarded by a PID lock file, with a filesystem as the
+**No distributed system here.** (Optional peer links delegate work between installations; each project still has one engine.) One daemon per project, guarded by an advisory owner lock and a PID file, with a filesystem as the
 database. The hard problems are (a) child-process lifecycle and cancellation, (b) exact, stable
 serialization of the on-disk and `--json` formats, and (c) not regressing a state machine that has had many bug fixes layered into it.
 
@@ -27,63 +27,139 @@ Load-bearing, stated so they can be challenged:
 | # | Assumption | If wrong |
 |---|---|---|
 | A1 | **Scale is small.** Tens of agents, hundreds of tasks, thousands of run events per run. The caps (16 KB lines, 8 KB events, 1024-event buffer, 500-entry LRU) are generous. | Nothing in the design changes; the file-per-entity store would need an index rework only at ~10⁵ tasks. |
-| A2 | **Single *orchestrator*, multiple concurrent mutators.** The PID lock serializes *orchestrators* only. One-shot commands and `orch mcp` never take it, and some "reads" write. See A2-detail below. | Not a hypothetical: it is true today, so it is documented rather than assumed away. |
+| A2 | **One daemon owns each project.** Stateful frontends use its socket; all project-store operations and agent execution belong to that daemon. The filesystem must support advisory locking, and other programs must respect ownership. | A direct writer can bypass the daemon. See the guarantees and limits in §2.1. |
 | A3 | **POSIX only.** r-orch uses process groups (`kill(-pid)`), `bash -lc`, `rsync`, and `O_APPEND` atomicity. Windows support is already partial at best. | Windows would need a separate process-group strategy (job objects) and no `bash`. Out of scope; keep platform code behind a `cfg` boundary so it can be added. |
-| A4 | **Latency budget is human-scale.** Tick interval 10 s; CLI commands should feel instant (<100 ms). The container tiering exists purely to keep read-only commands fast. | Rust startup is ~1 ms either way, so the tiering becomes an optional optimization rather than a requirement. |
+| A4 | **Latency is human-scale.** Automatic dispatch uses the configured poll interval and coalesced commit wakes; frontend requests also pay for socket and operation admission. | A slow operation can delay other state work; the single operation boundary favors consistency over parallel store throughput (§6). |
 | A5 | **Prompt text must be byte-exact** because agents are prompt-sensitive and the system prompt is a cache key. | If approximate were acceptable, the Liquid risk (§4.3) would mostly evaporate. It is not acceptable. |
 | A6 | **No external Rust consumer of the library crates yet.** | Public API stability is not a constraint; we are free to pick idiomatic signatures. |
 
-### 2.1 A2 in detail — the concurrency story is weaker than "single writer"
+### 2.1 Daemon ownership: guarantees and limits
 
-The PID lock serializes *orchestrators*, not every writer. Interchangeable use of several processes on one
-project directory is a normal workflow, which multiplies the exposure. Three facts:
+One daemon per project owns `.orchestry/`, every project store and every agent process. The CLI,
+dashboard, web dashboard, MCP bridge and agent-run CLI commands are clients for state reads and writes.
+`orch init` is the bootstrap exception; explicit daemon starts are the ownership entry points. The
+client-side clipboard, terminal and editor are frontend effects, not a second project-store owner.
+The assembly is in `crates/orch-daemon/src/lifecycle.rs`; request routing is in
+`crates/orch-daemon/src/ops/` and `crates/orch-cli/src/commands/rpc.rs`.
 
-1. **One-shot commands never take the lock.** Only one
-   `orch run --watch` can run at a time; one-shot commands do not acquire the lock. So `orch task add` while
-   the orchestrator runs is a second mutator — and that is the *normal* workflow, not an edge case. A running
-   `orch mcp` server is a long-lived mutator of the same kind.
-2. **Some reads write.** Reading an index that is missing or corrupt rebuilds it and **writes `_index.json`**.
-   `orch task list` on a fresh project therefore creates directories and writes
-   a file.
-3. **The mutex is in-process only.** It is invisible to a second r-orch process.
+```text
+CLI / dashboard / web / MCP / agent CLI
+                   | typed socket requests
+                   v
+        daemon sessions and coordinator
+                   | project operation boundary
+                   v
+    services / dispatch / collectors / peer callbacks / expiry
+                   | tracked stores
+                   v
+             entity files + indexes
+```
 
-**What is locked across processes, and what is not.** Every `_index.json` mutation (`IndexManager::update_index`,
-`write_index`, `rebuild_index` in `orch-infra/src/storage/index.rs`) takes `<store>/.index.lock`, an advisory file
-lock plus an in-process mutex, with a 5-second bounded wait, and holds it through read, modify and publish. Two
-current writers creating different entities therefore keep both entries. What remains:
+**Guarantees within this model.** These statements assume an intact owner-lock file and a filesystem
+that honors its advisory lock. The named tests exercise the mechanisms; they are not a claim of
+crash transactionality or protection from a program bypassing the daemon.
 
-- **Entity and index are two writes, not one transaction.** A crash between them, or a writer that ignores the
-  lock (an older binary, a hand edit), leaves `tasks/tsk_X.yml` on disk but absent from the index, so `task list`,
-  `status` and **dispatch** do not see the task while `task show tsk_X` does. It self-heals only when the index is
-  deleted or corrupted into a rebuild.
-- **Whole-record saves have no compare-and-swap.** Two processes that read the same task (say, the orchestrator
-  advancing its status and a CLI or MCP call assigning it) and save it in turn: the later save wins whole.
-- **Context expiry publishes a computed keep-list.** A `context list`/`get` that purges expired entries can drop
-  a key another process has just indexed, or delete an expired key another process is renewing.
+1. **G1 — Competing daemon starts have one owner.** `OwnerGuard` takes a nonblocking exclusive
+   advisory lock on the stable `.orchestry/.daemon-owner.lock` before `PidLock` acquires
+   `orchestry.lock`. The owner-lock file is kept, and its descriptor is close-on-exec. A live foreign
+   PID is refused regardless of the PID file's age (`crates/orch-daemon/src/guard.rs`).
+   `crates/orch-daemon/tests/daemon_lifecycle.rs` covers simultaneous contenders, an old live owner,
+   and the guard not being inherited by agent children.
+2. **G2 — Daemon state operations share one serialization boundary.** The coordinator uses the
+   engine's `OperationBoundary`; nested service/store calls reuse its task-local context. The
+   read/validate/modify/save phase holds the permit across file I/O. External preparation and
+   observation release it and revalidate before committing. Accepted requests run in daemon-owned
+   tasks, so dropping a socket observer does not abort an entered write
+   (`crates/orch-daemon/src/coordinator.rs`, `ops/mod.rs`,
+   `crates/orch-engine/src/container/operation.rs`). `crates/orch-daemon/tests/ops_coordinator.rs`
+   checks commit order and invalidation after partial failure;
+   `crates/orch-cli/tests/stress_single_writer.rs` checks simultaneous client mutations, field
+   updates, context renewal and entity/index agreement. This removes independent frontend
+   read-modify-write races; it does not turn multiple files into a transaction.
+3. **G3 — Pause and cancel reach the executing engine.** Goal pause and final launch checks share
+   the project operation boundary, and launch re-reads eligibility. `task.cancel` reaches the daemon's
+   orchestrator and stops its local child before a successful reply
+   (`crates/orch-engine/src/goal_service.rs`, `task_service.rs`,
+   `orchestrator/daemon.rs`, `crates/orch-daemon/src/ops/core.rs`).
+   `crates/orch-daemon/tests/daemon_engine.rs` covers no post-pause launch and live-process
+   cancellation through CLI, MCP and TUI sessions. Pausing automatic dispatch is different:
+   `dispatch.set off` leaves running agents alive (`crates/orch-daemon/src/ops/control.rs`,
+   `crates/orch-daemon/tests/daemon_dispatch.rs`).
+4. **G4 — Context reads do not perform expiry.** Reads filter expired entries; explicit daemon
+   maintenance removes them under the same operation boundary, including with dispatch off
+   (`crates/orch-infra/src/storage/context.rs`, `crates/orch-engine/src/container.rs`,
+   `crates/orch-daemon/src/ops/control.rs`). `reads_do_not_expire_and_renewal_survives` in
+   `crates/orch-daemon/tests/daemon_engine.rs` checks read-only behavior and renewal against expiry.
+5. **G5 — Client failure does not start a replacement owner.** `orch-client` connects and
+   handshakes; frontends report an unavailable daemon instead of opening stores or starting one.
+   `orch serve` without `--once` and `orch run --watch` are explicit foreground daemon starts,
+   not client recovery (`crates/orch-cli/src/commands/daemon.rs`).
+   `crates/orch-cli/tests/daemon_nodaemon_matrix.rs` checks client failure forms;
+   `daemon_lifecycle_nospawn.rs` checks that absent/stale/skewed endpoints cause no daemon spawn
+   and no endpoint repair.
+6. **G6 — The local socket checks the peer's uid and session versions.** The listener obtains
+   kernel credentials; the session rejects a foreign or unavailable uid before reading a byte.
+   Ordinary sessions require exact protocol and binary versions; stop uses a separate version-tolerant
+   control intent. Socket mode is `0600` in a private `0700` directory
+   (`crates/orch-daemon/src/listener.rs`, `session.rs`, `discovery.rs`).
+   `crates/orch-daemon/tests/daemon_security.rs` checks permissions and a real same-uid connection;
+   `session.rs` unit tests inject foreign/missing credentials and version skew. This is a uid
+   boundary, not authentication between programs running as the same user.
+7. **G7 — Changes are published after the operation releases its permit.** The engine buffers
+   operation events and publishes commit metadata in order; the daemon hub sends bounded
+   subscription streams. A lag or uncertain store set requires refetching, not replaying a write
+   (`crates/orch-engine/src/container/operation.rs`, `crates/orch-daemon/src/hub.rs`,
+   `session.rs`). `one_operation_delivers_one_thousand_events_in_order_after_release` in
+   `operation.rs` checks the release order; `crates/orch-daemon/tests/daemon_push.rs` covers
+   subscribe/snapshot gaps, acknowledgement ordering, overflow and a stalled subscriber.
 
-The per-process directory cache is no longer a residual. `ensure_dir` still remembers the directories it created,
-per process, but a write into a remembered directory that was removed underneath the process no longer fails until a
-restart: `fs_utils::atomic_write_with_mode` forgets the directory on `NotFound`, recreates it and retries the write
-once, so the daemon recovers on its own. The files that were in the removed directory are not brought back.
+**Non-guarantees and failure boundaries.**
 
-The honest response is to **document the behaviour and verify that it is what we documented**, not to claim a
-guarantee we cannot provide. Concurrent mutation while an orchestrator is running is a **known, documented
-hazard**, written up for operators, with recovery, in
-[docs/RUNBOOK.md](RUNBOOK.md#rebuilding-an-index-after-a-lost-update) and
-[Recovering after concurrent MCP writers](RUNBOOK.md#recovering-after-concurrent-mcp-writers).
+1. **N1 — Entity and index writes are not transactional.** For example, `FileTaskStore::save`
+   writes YAML, then updates `_index.json` (`crates/orch-infra/src/storage/task.rs`). A crash or
+   I/O failure between them can leave an entity absent from a valid index. `get` reads the entity;
+   `list` reads the index. `IndexManager::read_index` rebuilds a missing or corrupt index, not a
+   syntactically valid stale one (`storage/index.rs`). Startup recovery does not make this pair
+   atomic, and a failed multi-entity operation can leave partial work committed.
+2. **N2 — Same-uid direct writers are outside the boundary.** Advisory locks do not prevent a
+   program with filesystem access from editing `.orchestry/`, replacing a lock file or writing an
+   entity without updating its index. An old binary or hand edit can bypass the coordinator.
+   The retained index locks serialize cooperating index publishers only
+   (`crates/orch-infra/src/storage/index.rs`); they do not protect an entire entity operation.
+3. **N3 — Ownership loss is detected periodically, and is not a general write fence.** The
+   heartbeat rechecks the PID file every 10 seconds (`PID_REFRESH` in
+   `crates/orch-daemon/src/guard.rs`, `heartbeat` in `lifecycle.rs`). Detection can lag by a
+   recheck interval; scheduling or waiting for the control operation can delay the recorded
+   transition further. Work can run in that window. The retained owner guard excludes a second
+   cooperating daemon, but a non-daemon writer is possible; the tests do not establish safety
+   against such a writer in this window. Once loss is recorded, automatic dispatch stops and
+   `dispatch.set`, `dispatch.tick`, `dispatch.run_task`, `dispatch.run_all` and
+   `dispatch.until_terminal` refuse. Other requests remain available, including mutations;
+   existing observations are cancelled (`crates/orch-daemon/src/ops/control.rs`, `ops/mod.rs`).
+   `crates/orch-daemon/tests/daemon_lifecycle.rs` tests the loss transition and retained reads,
+   not concurrent external writes. The missing or foreign PID file is not recreated.
+4. **N4 — The engine's per-operation event buffer is not capped.** It is a `Vec` in
+   `OperationContext` (`crates/orch-engine/src/container/operation.rs`). Wire-frame, admission
+   and subscriber limits do not bound this buffer or the total project size.
+5. **N5 — There is no persisted entity revision.** `commit_seq` is an in-memory ordinal of one
+   daemon lifetime, not an entity version (`crates/orch-engine/src/container/operation.rs`).
+   Task, agent and goal records have no revision field (`crates/orch-domain/src/task.rs`,
+   `agent.rs`, `goal.rs`). Authored-definition edits can compare a supplied content digest
+   (`crates/orch-daemon/src/ops/authored.rs`); that is not general compare-and-swap for every
+   store write.
+6. **N6 — Notifications and disconnected requests are not durable delivery.** Subscription
+   overflow requires a new subscription and reads; the stream is not a persisted event log.
+   A disconnected client can lack the outcome of a request the daemon completed. The client
+   closes a failed lane and does not replay mutations (`crates/orch-client/src/lib.rs`,
+   `crates/orch-daemon/src/hub.rs`). Consult current state before repeating an uncertain write.
 
-**`orch mcp` is one more long-lived mutator, not a new class of hazard.** It never takes the orchestrator's PID
-lock. Its per-server FIFO queue (one store operation at a time, at most 16 admitted, 10 s wait) serializes the
-calls of *that* server only and is invisible to every other process; one server per client connection is the
-supported shape. Accepting this residual risk for the MCP server, rather than repairing the stores first, is lead
-decision-2 (E2) of the [MCP server spec](specs/2026-11-07-mcp-server.md); storage repair (compare-and-swap for
-whole-record saves, expiry under the index lock) is separate follow-up work. See [ADR 0011](decisions/0011-mcp-server.md).
-
-**`update` and `patch` add one narrow, new lock — not a fix for the above.** `orch agent|task|config update|patch`
-([guide](file-mutations.md)) take a stable advisory lock, `.orchestry/.definition.lock`, for at most 5 seconds
-(`fs_utils::mutation_lock`), so two of *those* commands cannot interleave their read-merge-write. `edit`, `agent add`,
-the orchestrator and the dashboard do not take it, and agent and task records are still saved through their stores
-and indexes, one write each, so the hazard in this section is unchanged for everything else.
+**Definition locking remains inside the daemon.** Authored task, agent and config mutations use
+`.orchestry/.definition.lock` while reading, validating and applying their definitions
+(`crates/orch-daemon/src/ops/authored.rs`, `crates/orch-engine/src/prompt_mode.rs`).
+`fs_utils::mutation_lock` waits at most 5 seconds for the advisory lock; it is additional to the
+project operation boundary, not the ownership mechanism. `crates/orch-cli/tests/update_patch.rs`
+covers lock timeout without changes and owner-only lock creation. The entity and index are still
+separate writes (N1).
 
 ### Daemon process admission
 
@@ -161,7 +237,7 @@ r-orch/
 ### 3.1 Dependency direction
 
 ```
-            orch-domain                     (no deps beyond serde/thiserror)
+            orch-domain                     (no workspace dependencies)
                  ▲
                  │
              orch-core                      (traits only; depends on orch-domain)
@@ -179,7 +255,7 @@ r-orch/
                  │  daemon.rs, init.rs    │
                  │                   orch-client     (domain + proto only; no store, no process API)
                  │                        ▲
-             orch-cli ────────────────────┘          (client facade; owner access only at daemon/init)
+             orch-cli ────────────────────┘          (also → orch-proto; owner access only at daemon/init)
                  │
                  ▼  implements TuiBackend
              orch-tui                       (depends on orch-domain ONLY)
@@ -188,21 +264,24 @@ r-orch/
 Arrows mean "depends on". The diagram leaves out the direct `orch-domain` and `orch-core` edges that most
 crates also have; the exact edge set is the table in `xtask crate-graph` (below).
 
-**State at the head of PR 2 of the daemon-owned state work.** The daemon is the one process that opens a project's
-stores once `orch init` has created them, and every stateful frontend is its client. `orch daemon` runs without
-any environment gate. Each CLI command connects one daemon session through `orch-client` and sends typed
-operations (`commands/rpc.rs`, `Rpc::connect`). `orch mcp` is a stdio-to-socket bridge, the dashboard backend
-reads over the socket on its existing tick at PR 2 (push replaces that tick in PR 3), and `orch web` checks for a daemon before it listens and again before
-every page and websocket, answering HTTP 503 if the daemon has gone away (`web/mod.rs`, `daemon_guard`). With no
-daemon, every client reports the uniform no-daemon message, and none of them starts one: a CLI command and
-`orch web` exit 7; the dashboard shows the message with `r retry · q quit`, and `q` exits 7; `orch mcp` keeps
-reading stdin and answers each request with a JSON-RPC error (`-32001`, `data.exit_code` 7); the 503 body is the
-message for a request that presented the credential and `orch daemon unavailable` under `--no-auth`. `orch serve`
-without `--once` and `orch run --watch` are a foreground `orch daemon start` with dispatch on that forwards
-`--from-agent` and the peer flags (`commands/daemon.rs`, `foreground`); `orch serve --once`, `orch run --once` and
-`orch run <id>` are requests to a running daemon. The commands that do not need a daemon are `init`, `update`,
-`daemon`, and `doctor`, which without a daemon prints only a discovery note and exits 7, or 3 outside a project
-(`tree.rs`, `CONTAINER_LESS_COMMANDS`).
+The daemon opens the project's stores after initialization, and every stateful frontend uses typed
+operations over `orch-client` (`crates/orch-cli/src/commands/rpc.rs`). `orch mcp` bridges stdio to
+the socket. `DaemonBackend` subscribes to every store and the event bus before its first read,
+then refreshes views made stale by push; there is no dashboard directory observer or periodic state
+poll (`crates/orch-cli/src/tui/backend.rs`). `orch web` checks for a daemon before listening and
+before serving a page or websocket; an unavailable daemon produces HTTP 503, with project details
+only for an authenticated request (`crates/orch-cli/src/web/mod.rs`).
+
+No client starts a daemon when connection fails. CLI state commands and web startup exit 7; the
+dashboard offers `r retry · q quit`, with quit on that screen exiting 7. MCP reports connection
+failure using JSON-RPC code `-32001` and `data.exit_code` 7 for initialize, pre-initialize requests
+and resource reads (`crates/orch-cli/src/mcp/server.rs`). `orch serve` without `--once` and
+`orch run --watch` explicitly start a foreground daemon with dispatch on; `orch serve --once`,
+`orch run --once` and `orch run <id>` request work from a running daemon
+(`crates/orch-cli/src/commands/daemon.rs`, `commands/run.rs`). `init` bootstraps the project and
+`update` prints upgrade information without a daemon. `doctor` attempts a daemon connection and,
+if unavailable, prints a discovery-only note before returning the connection error; this is not an
+offline store-reading engine (`commands/run.rs`, `doctor.rs`).
 
 The CLI's normal workspace dependencies are client, core, daemon, domain, proto and TUI. Engine and infra
 are dev dependencies only, and peer is absent. The gate checks declared dependency kinds, aliases,
@@ -214,9 +293,8 @@ including block-ended arms, statements and macros; the raw let-keyword macro bou
 not caught below. For macro calls recognized as invocations, the cfg scan retains argument tokens
 without interpreting cfg-looking sequences as test guards; the raw declaration-keyword macro case is
 listed as not caught below.
-Section 2.1 still describes the v0.13.0 multi-writer model until the documentation sweep rewrites it.
-Where each edge and rule lands, per the [plan](plans/2026-11-09-daemon-owned-state.md#tasks) (PR 1 and PR 2 are in
-place at this head):
+The following inventory retains the delivery-stage labels from the
+[plan](plans/2026-11-09-daemon-owned-state.md#tasks); the runtime wiring is described above:
 
 | Edge or rule | Lands in | What it means |
 |---|---|---|
@@ -226,7 +304,7 @@ place at this head):
 | `orch-client → orch-domain, orch-proto` | PR 1 (control plane), PR 2 (every operation) | Discovery, connect, kernel peer-uid check, handshake and the uniform NoDaemon error. PR 1 carries only what `orch daemon status`, `stop` and `dispatch` need; PR 2 adds every operation and converts the CLI, dashboard backend, `orch web` and `orch mcp` to it. The crate has no process API: it never spawns, forks or execs. |
 | `orch-cli → orch-daemon` only from `commands/daemon.rs` and `commands/init.rs` | PR 1 (the edge), PR 4 (the allowlist) | The bidirectional `CLI_DAEMON_SITES` table checks retained CLI production tokens against reviewed files and bootstrap symbols; an unlisted retained daemon reference or a listed file with no retained daemon reference fails. A `use` that itself names the daemon crate in those retained tokens fails if it is public or renamed, except for the listed InitOutcome re-export. Normal/build engine, infra and peer edges are forbidden; engine and infra remain dev-only for fixtures. Core stays normal for state-free helpers and port types. The source half tokenizes ASCII identifiers and the string/raw-string/character/byte literal forms it recognizes, skips line and nested block comments, then scans cfg attributes and macro invocation arguments. Literal suffixes are not modeled; the literal-boundary and raw-keyword cfg/macro omissions are listed as not caught below. SOURCE_SPELLING rejects non-ASCII characters emitted as non-literal tokens from all daemon and boundary source files, including test-only tokens and attribute/macro arguments; source misclassified as literal content is not checked. Raw identifiers and plain identifiers name the same tracked token. The bootstrap contracts pin function-signature tokens, option/result field tokens, and DaemonError and DispatchMode variant/payload tokens; the impl scan rejects public PreparedStart fields visible in its tokens. For each of the seven BOOTSTRAP_TYPES, the scan requires exactly one struct/enum declaration in its raw non-literal tokens, at brace depth zero of its pinned file and present in production tokens; type/as/union/trait/mod bindings of these names in the raw non-literal tokens fail. Pinned payload-token lists in bootstrap.rs, lifecycle.rs, discovery.rs and error.rs reject declarations, renames and imports visible as non-literal tokens, except their exact reviewed imports and test-only super globs; the literal-boundary residual can conceal bindings from these checks. For explicit inherent/trait impls visible as non-literal tokens across daemon source, the scan follows identity type aliases and import renames across files/scopes, with optional generic parameters and pre-equals where clauses; it does not inspect the outside definitions reached by the foreign re-export residual below. For impl headers containing a tracked bootstrap name or alias in those tokens, only exact BOOTSTRAP_IMPLS headers and member signatures pass. In those emitted tokens, unresolved bootstrap-bearing aliases/headers, variable macro receivers and unreviewed type-parameter impls fail; the single exact reviewed test-only blanket impl must remain memberless. Local macro definitions and calls carrying bootstrap names visible as non-literal tokens fail, except bare matches/assert/assert_eq/vec calls whose argument tokens remain scanned; explicit rebinding of these macro names visible in those tokens fails. Boundary crates reject unreviewed build scripts. For code-loading forms retained by the token and cfg scans, boundary and daemon source roots accept only plain literal paths to enumerated files inside that root (include calls and path values in attributes, including cfg_attr); imports/renames of include in those tokens fail. Data includes remain allowed. Normal/build feature closures cannot select test APIs. These source checks flag architectural changes for review; they do not hold against an author deliberately defeating the scan. **Not caught:** external fixed impl macros; procedural, attribute, derive and token-synthesizing expansion; semantic binding, including glob rebinding of bare value-macro names; and macro-generated include/path attributes (macro fragments are not expanded). A cfg-looking attribute in the arguments of a macro invocation whose raw name is the declaration keyword can hide an explicitly written CLI daemon reference. A test-only raw let-keyword macro invocation can make the text scan omit the following production statement. A daemon re-export can bind a bootstrap name to a same-named type declared outside the daemon source root, leaving additional methods outside the checked bootstrap surface. Adjacent suffixed literals in macro input can make the tokenizer treat subsequent source as literal content, concealing non-ASCII identifiers, explicit CLI daemon references, bootstrap impl headers and aliased receivers, pinned payload-name bindings, and source-loading attributes. External/provider source still needs review; existing derives, glob imports and proto meta/callback macros rule out blanket bans. The checks compare the recognized token forms above with explicit site, contract and loading tables; they do not resolve other source forms or establish that unreviewed source is absent. |
 
-Every writer, remote peer callbacks included, is then owned by the daemon's coordination, not by a UI handle.
+Every writer, remote peer callbacks included, is owned by the daemon's coordination, not by a UI handle.
 [ADR 0012](decisions/0012-daemon-owned-state.md) records the decision.
 
 Two things in this diagram were wrong in earlier revisions, and both are now enforced rather than described.
@@ -276,8 +354,8 @@ behavioural gain.
 **2. `orch-tui` depends on `orch-domain` alone — not on the engine.** An earlier revision of this diagram had
 the TUI depending on `orch-engine`. WP-6 **inverted** it: everything the dashboard needs crosses a single
 trait, `orch_tui::backend::TuiBackend` (`crates/orch-tui/BACKEND.md`), so the TUI names only
-the domain types that pass through it. `orch-cli` implements that trait over the DI container
-(`crates/orch-cli/src/tui/backend.rs`), and the TUI's own tests use an in-crate `FakeBackend`. **The real
+the domain types that pass through it. `orch-cli` implements that trait with `DaemonBackend` over
+the daemon socket (`crates/orch-cli/src/tui/backend.rs`), and the TUI's own tests use an in-crate `FakeBackend`. **The real
 layering is tighter than this document originally specified** — a genuine improvement, recorded rather than
 quietly absorbed.
 
@@ -331,7 +409,7 @@ All three names are the same program:
 | `orch-core` | `storage` (9 traits), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
-| `orch-cli` | `commands::{task, agent, status, logs, config, context, msg, goal, team, org, run, doctor, tui, serve, init, update}`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::{logger, once, observer}`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
+| `orch-cli` | `commands::{task, agent, status, logs, config, context, msg, goal, team, org, run, doctor, tui, serve, init, update}`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
 | `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
 
 ### 3.3.1 `orch mcp` (`orch-cli::mcp`)
@@ -359,7 +437,7 @@ Rules that keep it correct:
 - **Observation recovery is explicit.** A later tool call, resource read or subscribe can request recovery of a
   lost observation session. There is no autonomous retry or mutation replay, and no daemon start or repair.
 
-### 3.3.2 PR 3 push ordering and deferred refresh
+### 3.3.2 Push ordering and deferred refresh
 
 The daemon registers a subscription before the initial reads and buffers its events while inactive. Its sole
 session writer activates it only after the correlated acknowledgement has been written and flushed successfully;
@@ -555,8 +633,8 @@ comment in the workspace `Cargo.toml`).
   depends on their exact behaviour and exit codes, including `worktree prune` semantics libgit2 models
   differently. **Shelling out to `git` is the correct choice here** and it also removes a C dependency from
   the build. Decision recorded because it looks backwards at first glance.
-- **`notify`** (`9.0.0-rc.5`) — only a release candidate, and the serve-mode disk observer polls.
-  Keep polling.
+- **`notify`** — dashboard state changes arrive through daemon subscriptions
+  (`crates/orch-cli/src/tui/backend.rs`); that path needs no directory watcher.
 - **`sysinfo`** — overkill. PID liveness is `kill(pid, 0)` via `nix`.
 - **`libc` 1.0** — still alpha (`1.0.0-alpha.5`). `nix` 0.31 pulls a stable `libc` 0.2; let it.
 
@@ -866,7 +944,8 @@ Infrastructure errors (`std::io::Error`, YAML, JSON) get their own enums per mod
 
 ### 6.1 State mutex
 
-The orchestrator serializes state mutation with a `tokio::sync::Mutex`, and the index manager has its own:
+The daemon coordinator and engine share the outer project operation boundary (§2.1 G2). Inside it,
+the orchestrator protects execution state with a `tokio::sync::Mutex`, and each index manager has its own:
 
 ```rust
 pub struct Orchestrator {
@@ -888,8 +967,8 @@ pub struct Orchestrator {
    it does (file I/O), so use `tokio::sync::Mutex` there too.
 
 `Orchestrator` is `Clone`-able over `Arc`s so background tasks can hold it. One `Arc<Mutex<_>>` per concern
-rather than one giant lock, with a documented acquisition order (`state` → `active_collectors` →
-`finishing_collectors` → `cancels`) to make deadlock impossible by construction.
+rather than one giant lock. Daemon state phases acquire the project operation boundary before
+these internal locks (`crates/orch-engine/src/orchestrator/daemon.rs`).
 
 Reconcile and a run's collector meet at two guards. While a collector is registered in `active_collectors`,
 reconcile skips the PID check: the child may have exited cleanly with the success handler queued for the state
@@ -901,33 +980,26 @@ by task id, so a second run alongside a draining collector would be completed by
 
 ### 6.2 Tick loop
 
-```rust
-pub async fn start_watch(&self, opts: WatchOptions) -> Result<()> {
-    self.acquire_lock().await?;                 // LockConflict on failure
-    { let mut st = self.state.lock().await; /* load, cleanup stale, set pid/started_at, save */ }
-    let mut signals = signal_stream()?;         // SIGINT + SIGTERM
-    let mut ticker = tokio::time::interval(self.config.scheduling.poll_interval_ms);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);   // no burst catch-up
-    self.tick().await?;                                          // immediate first tick
-    loop {
-        tokio::select! {
-            _ = ticker.tick()              => self.on_tick_result(self.tick().await),
-            _ = self.immediate.notified()  => { let _ = self.immediate_dispatch().await; }
-            Some(sig) = signals.next()     => { self.emit_shutdown(sig); break; }
-            _ = self.shutdown.cancelled()  => break,
-        }
-    }
-    self.stop().await
-}
+Automatic dispatch lives in `crates/orch-daemon/src/dispatch/mod.rs`, not in a dashboard or a
+second watch process. The loop waits for the earlier of the next configured poll or a coalesced
+commit wake, then calls `ServiceHandler::automatic_tick`. That handler checks the dispatch
+switch, active batch and stopping state before entering the engine.
+
+```text
+non-tick commit --500 ms coalesced wake--+
+                                      +--> automatic_tick --> engine dispatch
+configured poll ----------------------+       | mode/generation checks
+                                              +--> no-op when disabled
 ```
 
-- **`MissedTickBehavior::Delay`** matters. The tick loop must not catch up on missed ticks; tokio's
-  default `Burst` would fire several ticks back-to-back after a slow one, changing dispatch timing.
-- The reactive-dispatch debounce (500 ms, max 10 retries while a tick is in flight) becomes a
-  `tokio::sync::Notify` plus a debounce task — the retry loop exists to avoid contending with a tick, which
-  `select!` arms already partly solve, but the **observable** 500 ms delay must be preserved because tests
-  depend on it.
-- Signal handling moves from process-global handlers to a `select!` arm, which keeps handler registration out of the global state.
+`dispatch/wake.rs` keeps one dirty generation and a fixed debounce deadline. A commit during a
+tick's external preparation retains a follow-up wake. After a tick the loop schedules the next
+poll from the current time, rather than catching up a burst of missed ticks. The configured
+interval is re-read each round, with a 100 ms floor and a 10 s fallback.
+
+PID refresh, context expiry, local-run maintenance, collectors and peer handling remain independent
+of the dispatch switch (`crates/orch-daemon/src/lifecycle.rs`, `ops/control.rs`). Turning dispatch
+off stops future automatic scheduling; stopping the daemon is a separate lifecycle operation.
 
 ### 6.3 Child process I/O
 
@@ -963,57 +1035,38 @@ A `Drop` guard on the orchestrator is **not** sufficient for process cleanup (as
 
 ### 6.5 Event bus
 
-The event bus is a broadcast channel:
+`crates/orch-engine/src/events.rs` provides synchronous handlers and a broadcast stream. Events
+emitted inside a project operation are buffered until its permit is released; outside an operation,
+handlers run inline. The broadcast channel has a 4096-event capacity and its receiver logs lag.
+This is in-process delivery inside the daemon, not a shared bus between frontend processes.
 
-```rust
-pub struct EventBus { tx: tokio::sync::broadcast::Sender<Arc<OrchestratorEvent>> }
-impl EventBus {
-    pub fn emit(&self, event: OrchestratorEvent);              // non-blocking, lossy-on-lag
-    pub fn subscribe(&self) -> broadcast::Receiver<Arc<OrchestratorEvent>>;
-}
-```
-
-`broadcast` with `Arc` payloads gives cheap fan-out to the TUI, the structured logger and the run store. One
-behaviour to be explicit about: `broadcast` **drops** messages for a lagging receiver instead of
-blocking. Mitigation: size the channel generously
-(4096), and have subscribers that must not miss events (the run-store writer) consume on a dedicated task
-that does nothing else. `RecvError::Lagged` is surfaced as a `tracing::warn`, never silently ignored. The TUI
-*may* lose high-frequency `agent:output` events under load — which the TUI's 80 ms batching
-and 2 KB caps already accept.
+The daemon hub publishes store invalidations and bus events over socket subscriptions. The dashboard
+has a dedicated observation session and bounded local activity queue
+(`crates/orch-daemon/src/hub.rs`, `crates/orch-cli/src/tui/backend.rs`). Slow consumers can lose activity
+or need a resync (§2.1 G7, N4, N6). Persisted run events take a different path: the collector calls
+`RunService::append_event` directly (`crates/orch-engine/src/orchestrator/collect.rs`); the run log is
+not written by a dashboard broadcast subscriber.
 
 ---
 
 ## 7. Container and wiring
 
-```rust
-pub struct Engine {                       // light tier: read-only commands
-    pub paths: Paths,
-    pub config: OrchestratorConfig,
-    pub global_config: GlobalConfig,
-    pub tasks: Arc<dyn TaskStore>,  /* … the other 8 stores … */
-    pub events: Arc<EventBus>,
-    pub clock: Arc<dyn Clock>,
-    pub ids: Arc<dyn IdGenerator>,
-    pub task_service: Arc<TaskService>,  /* … the other services … */
-}
+`crates/orch-engine/src/container.rs` retains two library assembly layers:
 
-pub struct FullEngine {                   // full tier: adds adapters, processes, orchestrator
-    pub engine: Engine,
-    pub processes: Arc<dyn ProcessManager>,
-    pub adapters: Arc<AdapterRegistry>,
-    pub workspace: Arc<dyn WorkspaceManager>,
-    pub templates: Arc<dyn TemplateEngine>,
-    pub skills: Arc<dyn SkillLoader>,
-    pub doctor: Arc<DoctorService>,
-    pub orchestrator: Arc<Orchestrator>,
-}
+- `Engine` holds paths, configuration, store traits, the event bus, clock, ids and services.
+- `FullEngine` adds process and adapter management, workspace/templates/skills, the orchestrator,
+  lock and doctor service. It embeds `Engine` and exposes the same operation boundary.
 
-pub async fn build_light(ctx: &CliContext) -> Result<Engine>;
-pub async fn build_full(ctx: &CliContext) -> Result<FullEngine>;
-```
+`build_light(project_root)` and `build_full(project_root)` remain library helpers, with injectable
+variants for tests and daemon assembly. They are not per-command CLI execution tiers. In production,
+`crates/orch-daemon/src/lifecycle.rs` acquires ownership, builds the full engine with its child
+process environment and spawn domain, creates the coordinator over that engine's boundary, and
+runs `daemon_initialize` before admitting socket sessions. Initialization recovers execution state
+and reads/rebuilds store indexes; context expiry is a separate startup operation.
 
-The two-tier split documents which commands may mutate state. It buys little startup time (there are no dynamic imports to avoid), so **do not** add lazy
-initialization machinery for it — just construct what each tier needs.
+The daemon's services, collectors and peer runtime share this engine. The CLI instead constructs
+`Rpc` or a frontend connector; its dashboard uses `DaemonBackend`. No frontend constructs a light
+engine as a read fallback. See §3.1 for the dependency boundary and its check's documented limits.
 
 ---
 
@@ -1030,7 +1083,7 @@ Unit tests are inline `#[cfg(test)]` modules; integration tests live in each cra
 | `orch-domain` | inline modules, `tests/` | Pure. |
 | `orch-engine` | `tests/` + inline | Uses the in-memory fake stores from `test_support`. |
 | `orch-infra` | `tests/` + inline | Mix of pure (fs-utils, index, scope) and process/IO (tempdirs, real `bash`). |
-| `orch-cli` | `tests/` | Output formatting, flag parsing, serve logger, disk observer; the real binary on temp projects. |
+| `orch-cli` | `tests/` | Output formatting, flag parsing, serve logger, daemon clients and push; the real binary on temp projects. |
 | `orch-tui` | `tests/` via `TestBackend` | See §8.4. |
 
 **No test requires a real AI CLI.** Every adapter test injects a fake `ProcessManager` whose `spawn()` returns
@@ -1209,7 +1262,7 @@ nils; `shared_context` as an ordered pair array); both default templates; `build
 **Holds:** `EventBus`; `TaskService`, `AgentService`, `RunService`, `GoalService`, `TeamService`,
 `MessageService`, `AgentFactory`, `ReviewRunner`, `DoctorService`; the `Orchestrator` (tick loop, reconcile,
 dispatch, collect, completion/failure handling, cascade failure, autonomous seeding, startup recovery,
-shutdown); `build_light` / `build_full`. It is the largest package by behaviour density, with a long bug-fix
+shutdown); library assembly through `build_light` / `build_full`, with the daemon owning production wiring (§7). It is the largest package by behaviour density, with a long bug-fix
 history; its regression tests are institutional memory, so add the test before changing the code it covers.
 
 ### WP-5 — CLI and serve mode
@@ -1257,8 +1310,8 @@ those two.
 - **Self-update, deliberately.** r-orch does not update itself at all; `orch update` reports the version and how
   to upgrade. A CLI overwriting its own executable as a side effect of `orch task list` is a supply-chain
   surface, not a feature. Users update r-orch the way they installed it.
-- **Concurrent operation is documented, not guaranteed.** §2.1 — the index read-modify-write can lose updates
-  across processes.
+- **Single-owner serialization rather than storage transactions.** Frontend operations share the daemon
+  boundary, but an entity and its index still need separate writes; external writers bypass it (§2.1 N1–N3).
 - **Shelling out to `git`** rather than linking libgit2 — slower per call, but it keeps exact command
   behaviour and exit codes, and it drops a C dependency.
 
@@ -1271,7 +1324,7 @@ those two.
 | R1 | **YAML divergence** — timestamp quoting, merge keys, or a schema construct — making a file written by r-orch read differently by another YAML reader | **High** | Mitigated by the quoting guard, the hand-measured YAML 1.1 date table with its `fs_utils` unit tests, and the byte-level check in `store_round_trip.rs` (§5.3, §8.2); there is no independent YAML 1.1 reader in the test suite. Merge keys are resolved with `apply_merge()` on every read. Escalation trigger for a hand-written emitter: any artifact where the byte-level check finds a timestamp-shaped scalar that quoting cannot fix. |
 | R2 | **`liquid` cannot reproduce prompt bytes** despite the mitigations | Medium-high | The golden prompts in `fixtures/prompts/` are the gate. Whitespace and truthiness already match, so the residual risk is a construct not enumerated. Fallback: a ~400-line renderer for 7 constructs. |
 | R3 | **Orchestrator behaviour regression** — a race that was already fixed and is reintroduced | **High** | The orchestrator regression tests (`bugfixes`, `resilience`, `retry-race`, `parallel-race`, `endurance`) are the encoded institutional memory; add the test before changing the code it covers. |
-| R4 | **`broadcast` event loss** under high adapter output | Medium | Dedicated consumer task for the run-store writer; 4096 capacity; `Lagged` logged as a warning, never swallowed. If a *correctness* consumer ever needs lossless delivery, give it an `mpsc` instead. |
+| R4 | **Activity event loss** under high adapter output | Medium | The event-bus receiver logs lag; socket subscriptions can require resync and the dashboard caps its activity queue. Run events are appended directly by the collector, independently of dashboard delivery (§6.5). |
 | R5 | **The trait surface is wrong**, forcing a cross-package rework | Medium | §5 is deliberately detailed so the freeze is informed. The trait crate is small, and `cargo` points at every break; changes go through an amendment (`docs/TRAITS-FROZEN.md`). |
 | R6 | **Live/streaming behaviour is under-tested** — `tui`, watch-mode `serve`, `run --watch` and `logs --follow` cannot be fully expressed as one-shot binary tests | Medium-high | `serve --once` tests cover stall past timeout, killed mid-run and concurrency saturation; PTY-based tests cover the watch-mode shutdown paths. |
 | R7 | **Adapter argv drift** — an external CLI changes its flags | Low | Snapshot tests pin our argv; real-CLI breakage is found by `orch doctor` and by users, not by the suite. |
@@ -1283,9 +1336,9 @@ those two.
 
 A release is rolled back by reinstalling the previous version (README, "Upgrading from v0.4.0 and rolling
 back"). The meaningful failure mode is shipping something that corrupts a project's `.orchestry/` data, which
-the YAML round-trip and format tests exist to prevent. What remains is documentation, not a flag: the
-concurrent-index hazard (§2.1) and the recovery for it are in [docs/RUNBOOK.md](RUNBOOK.md), which is where an
-operator will look.
+the YAML round-trip and format tests exist to prevent. The daemon does not make entity/index publication crash-atomic or fence direct filesystem writers
+(§2.1 N1–N3). [docs/RUNBOOK.md](RUNBOOK.md) covers daemon lifecycle and recovery; its concurrent-MCP
+procedure is marked as a legacy procedure.
 
 ---
 

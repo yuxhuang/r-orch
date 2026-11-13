@@ -1,9 +1,10 @@
-# `TuiBackend` — the engine facade the dashboard needs
+# `TuiBackend` — the daemon facade the dashboard needs
 
 `orch-tui` does **not** depend on `orch-engine`. Everything the dashboard needs
 from the rest of the system goes through one trait, `orch_tui::backend::TuiBackend`
-(`src/backend/mod.rs`). The CLI implements this trait over the DI container
+(`src/backend/mod.rs`). The CLI implements this trait as `DaemonBackend` over typed daemon requests
 (`crates/orch-cli/src/tui/backend.rs`); the tests use the in-crate `FakeBackend`.
+The backend opens no project store and starts no daemon.
 
 Everything below is the contract. If you need a shape changed, say so rather than
 widening it locally — the TUI's tests are written against this surface.
@@ -11,17 +12,17 @@ widening it locally — the TUI's tests are written against this surface.
 ## Shape of the facade
 
 1. **Synchronous.** Every method returns a value, not a future. A call is a
-   *request*: an implementation must not block on long-running work. `run_task`
-   asks the orchestrator to dispatch and returns; the outcome arrives through
-   `poll_events`. Use `tokio::runtime::Handle::block_on` for the short
-   store reads/writes (`refresh_*`, `create_task`, …) and `spawn` for anything
-   that waits on an agent.
+   request to the daemon and can hold the draw thread while awaiting its reply.
+   `run_task` asks for dispatch; later activity arrives through `poll_events`. `DaemonBackend` uses `tokio::runtime::Handle::block_on`
+   for bounded socket requests on the draw thread. Background work opens
+   separate sessions; the frame loop does not wait for an agent to finish.
 2. **Polled streams.** Events, history, the model catalog and update checks are
    `poll_*` methods that the TUI drains **once per frame**, not callback registrations:
 
    | Stream | Facade method | Contract |
    |---|---|---|
-   | Events | `poll_events() -> Vec<OrchestratorEvent>` | Events since the last poll, oldest first. Drain a `broadcast::Receiver` without blocking; drop nothing silently — the feed's caps are the TUI's job. |
+   | Events | `poll_events() -> Vec<OrchestratorEvent>` | Bus events since the last poll, oldest first. Drain the backend's in-memory queue without blocking; it drops the oldest event at its 4096-event cap and logs that drop. |
+   | Store changes | `poll_observations() -> Vec<Observation>` | Coalesced store invalidations and resync markers from the dedicated daemon subscription; no filesystem poll. |
    | History | `poll_history() -> Vec<Vec<HistoryEntry>>` | Zero or more batches since the last poll. The host delivers two (the 3 newest runs, then the next 7, 30 tail events each, sliced to the last 200). |
    | Model catalog | `poll_model_catalog() -> Option<ModelCatalog>` | The newest catalog, if one arrived. The TUI rebuilds an open agent wizard in place when it does. |
    | Update check | `poll_update() -> Option<String>` | A newer version, once known. The TUI starts `background_install` exactly once and then reads `installed_version()`. |
@@ -53,19 +54,23 @@ predicates are the `can_*` methods, all defaulting to `true`:
 
 `context() -> LaunchContext` carries the static launch facts:
 project name, version, default adapter, the persisted palette / activity filter
-/ notification preferences / max-concurrent value, and the watch-mode outcome
-(`initial_watch_active`, `observer_mode`, `watch_error`). The TUI emits the
-observer-mode banner or the watch-failure banner from these on launch.
+/ notification preferences / max-concurrent value, and the initial dispatch switch.
+`DaemonBackend` sets `initial_watch_active` from `ui.bootstrap`,
+`observer_mode` to `false` and `watch_error` to `None`. Opening the dashboard
+does not enable dispatch; pushed state changes refresh its WATCHING / IDLE chip.
 
 ## Operations
 
 Grouped as in the trait.
 
 * **Refresh** — `refresh_tasks`, `refresh_agents`, `refresh_goals`,
-  `refresh_state`, `list_teams`. Called on launch and after every mutation, plus
-  on the 150 ms debounced event refresh. The TUI commits a list only when
-  `entityListChanged` says so, so returning fresh-but-equal `Vec`s is cheap and
-  safe.
+  `refresh_state`, `list_teams`, and `refresh_dispatch`. Launch reads the views;
+  pushed invalidations mark dependent views dirty for a 150 ms debounced refresh.
+  A resync refreshes every view immediately. `last_read_seq` reports the daemon
+  commit ordinal observed by the last read, so already-observed changes need
+  no duplicate entity read (`orch-tui/src/app.rs`, `refresh.rs`). Dispatch is
+  re-read on every state invalidation; Runs/State-driven timing refreshes have
+  their own five-second throttle.
 * **Tasks** — `create_task(title, CreateTaskOpts)`, `update_task(id, TaskFields)`,
   `delete_task`, `run_task`, `run_all`, `cancel_task`, `retry_task`,
   `assign_task(task, agent)`, `approve_task`, `reject_task(id, feedback)`.
@@ -74,9 +79,9 @@ Grouped as in the trait.
   `toggle_autonomous(id, enabled)`, `disable_agent`, `enable_agent`.
   `take_agent_diagnostics() -> Vec<String>` (default empty) hands out, once,
   the effort diagnostics of the agent the last successful add/update wrote;
-  the dashboard shows each as a yellow `⚠` line. The engine backend's
-  add/update take `.definition.lock` and validate against the project config
-  read inside it.
+  the dashboard shows each as a yellow `⚠` line. The backend sends authored
+  agent requests; daemon handlers take `.definition.lock` and validate against
+  the project config read inside it (`orch-daemon/src/ops/authored.rs`).
 * **Teams** — `create_team(CreateTeamInput)`, `join_team`, `leave_team`,
   `disband_team`, `set_team_lead`.
 * **Goals** — `create_goal(CreateGoalInput)`, `update_goal(id, GoalFields)`,
@@ -100,16 +105,15 @@ Grouped as in the trait.
   does **not** pre-truncate the body, so a TUI-sent message is identical on
   disk to a CLI-sent one and `truncate_utf16` stays the only place the
   4000-unit cut happens. Both are pinned in
-  `crates/orch-cli/tests/tui_backend.rs`. It works in observer mode, where
-  `message:sent` goes to *this* process's bus rather than the queue the
-  dashboard drains — so confirmation is a locally emitted feed line, not an
-  event.
-* **Watch mode** — `start_watch`, `stop_watch` (reachable only through `/watch`
-  and `/pause`).
+  `crates/orch-cli/tests/tui_backend.rs`. The request runs in the daemon;
+  the dashboard also receives the daemon's bus through its observation session.
+* **Watch mode** — `start_watch`, `stop_watch` send `dispatch.set on/off`
+  through `/watch` and `/pause`. Turning dispatch off leaves running agents alive.
 * **Settings persistence** — `save_palette`, `save_activity_filter`,
-  `save_notifications`, `save_max_concurrent`, `complete_onboarding`. All write
-  `~/.orchestry/global.yml` or `.orchestry/config.yml`; the TUI treats a failure
-  as non-fatal.
+  `save_notifications`, `save_max_concurrent`, `complete_onboarding`. These
+  send daemon requests: preference patches update global config, max concurrency
+  updates project config, and onboarding updates orchestrator state
+  (`orch-daemon/src/ops/authored.rs`). The dashboard writes none of these files.
 * **Side channels** — `paste_image() -> ClipboardPaste` (the TUI writes nothing
   itself; the implementation puts the image in a temp file and returns its path
   plus its size) and `bell()`, a direct terminal write outside the draw loop.
@@ -127,59 +131,41 @@ Grouped as in the trait.
 * `CreateTaskOpts::attachments` / `TaskFields::attachments` carry the pasted
   image paths; the TUI clears its pending list once the call returns.
 
-## Wiring sketch
+## Wiring and lifecycle
 
-```rust
-struct EngineBackend {
-    container: Container,
-    runtime: tokio::runtime::Handle,
-    events: broadcast::Receiver<OrchestratorEvent>,
-    history: mpsc::Receiver<Vec<HistoryEntry>>,
-    catalog: mpsc::Receiver<ModelCatalog>,
-}
-
-impl TuiBackend for EngineBackend {
-    fn refresh_tasks(&mut self) -> BackendResult<Vec<Task>> {
-        self.runtime
-            .block_on(self.container.task_service.list())
-            .map_err(|e| e.to_string())
-    }
-
-    fn poll_events(&mut self) -> Vec<OrchestratorEvent> {
-        let mut out = Vec::new();
-        while let Ok(event) = self.events.try_recv() {
-            out.push(event);
-        }
-        out
-    }
-    // …
-}
+```text
+Connector -> DaemonBackend::launch
+                | subscribe to all stores + bus first
+                | open request session, verify same daemon instance, ui.bootstrap
+                v
+          plain draw thread: TuiBackend calls -> bounded socket requests
+                ^
+background observation pump -> event queue + coalesced store invalidations
+                |
+         gap/resync -> subscribe again -> refetch every view
+         EOF/new instance -> no-daemon screen -> explicit retry or quit
 ```
 
-The event loop lives in the CLI: read a crossterm event (with a poll timeout no
-longer than the 120 ms animation tick), call `app.handle_key(key)` or
-`app.state.width/height = …` on a resize, then `app.tick()` and
-`terminal.draw(|f| orch_tui::views::draw(f, &app))`. Exit when
-`app.state.should_exit` is set, then stop watch mode / the disk observer and
-clear the event bus.
+The implementation is `crates/orch-cli/src/tui/backend.rs`; the connection and
+retry loop is `tui/command.rs`. `Connector` opens sessions without starting a
+process. The backend subscribes before reading so a change between subscription
+and bootstrap still reaches the dashboard. The observation pump only fills
+memory; the draw loop drains it through `poll_events` and `poll_observations`.
+There is no disk observer or periodic state poll. History, model-catalog loads,
+prompt-mode writes and run observations use separate sessions.
 
-Enable the Kitty keyboard protocol at startup
-(`PushKeyboardEnhancementFlags(DISAMBIGUATE_ESCAPE_CODES)`) so `Ctrl+Enter` is
-distinguishable from `Enter` in the wizard textarea; the `Tab` confirm fallback
-stays for terminals that refuse it.
+The CLI runs `orch_tui::run_until_with_view_intent` on a plain thread because
+synchronous facade calls use `Handle::block_on`. `orch-tui` owns raw mode,
+alternate screen, keyboard enhancement flags and terminal restoration. Closing
+the dashboard drops its backend and observation tasks; it does not stop dispatch
+or the daemon's agents. On a lost session, `tui/command.rs` returns to the
+`r retry · q quit` screen. Retry makes a new subscription and bootstrap; mutations
+are not replayed.
 
-## Entry point
-
-`orch_tui::run(backend)` owns the whole terminal lifecycle — raw mode, the
-alternate screen, the Kitty enhancement flags (popped on exit), the
-poll/tick/draw loop at one animation tick, and restoring the terminal on every
-exit path including a panic. `orch tui` should be:
-
-```rust
-let backend = EngineBackend::new(container, handle);
-orch_tui::run(backend)?;
-// then: stop watch mode or the disk observer, and clear the event bus.
-```
+The source-level push tests are in `crates/orch-cli/src/tui/push_tests.rs`:
+subscription-before-read, store and bus delivery, commit ordinals, gap/resync,
+new daemon instance and observation EOF. `crates/orch-cli/tests/tui_backend.rs`
+exercises facade operations through a daemon harness.
 
 ## Implementer answers
 
@@ -203,26 +189,27 @@ orch_tui::run(backend)?;
 
    `approval_policy` is deliberately absent from `AgentFields`: the edit-agent
    wizard never passes it and its step is always skipped, so no edit path can produce one.
-3. **Fire-and-forget is about *dispatch*, not validation.** `run_task`,
-   `run_all` and `start_watch` must return `Err` for anything knowable before an
-   agent starts — a lock conflict, an unknown id, no eligible agent — because
-   the TUI prints `Failed: {err}` for them, and because **the TUI does not render
-   `orchestrator:error`**: the event formatter has no case for it, so an error delivered only through the event stream is
-   invisible. Everything that happens *after* the run starts belongs in
-   `poll_events`.
-4. **`stop_watch`** may spawn and return `Ok(())` — the TUI only needs the
-   request accepted. It sets `watch_active = false` and prints
-   `✓ Watch mode paused` on `Ok`; the header chip follows that flag.
+3. **Run observation is separate from the frame loop.** `run_task` and
+   `run_all` open a background session and wait for its first streamed event,
+   terminal result or refusal for at most 60 seconds. If that confirmation
+   wait expires, the method returns `Ok(())` while observation continues; it
+   does not prove that a child started. The remaining run stream is
+   drained in the background; the dedicated observation feed supplies activity.
+   `start_watch` waits for the dispatch-switch reply. Ordinary refusals return
+   `Err`; a lost session returns to the no-daemon screen
+   (`crates/orch-cli/src/tui/backend.rs`).
+4. **`stop_watch`** waits for the daemon's `dispatch.set off` reply and returns
+   its result. It does not shut down the daemon or cancel running agents;
+   the header follows the daemon's dispatch switch.
 5. **The update facade is intentionally inert.** Leave `poll_update`,
    `background_install` and `installed_version` at their trait defaults
    (there is no self-update and no network access). No test requires a real version —
    case `v070` scripts one through `FakeBackend`. The header update chip then
    simply never appears.
-6. **`refresh_state`** re-reads `state.json` on every call; no caching. The TUI
-   calls it on launch, after each mutation, on the 150 ms event-driven refresh
-   and on the periodic poll (3 s observer / 5 s watch), and always commits the
-   result — unlike the entity lists, which it commits only when
-   `entityListChanged`.
+6. **`refresh_state`** sends `state.get`; it does not read `state.json` in the
+   frontend. `refresh_dispatch` separately reads `daemon.status`, because the
+   dispatch switch lives in daemon memory. Refreshes follow bootstrap and
+   invalidations, with no observer/watch periodic poll.
 7. **`poll_history` — the exact two batches:**
    * list **all** runs once (not per task), sort by `started_at` **descending**,
      keep only `succeeded` and `failed`;
@@ -238,12 +225,13 @@ orch_tui::run(backend)?;
    The TUI prepends each batch and re-truncates to 500 messages, de-duplicates
    repeated nested provider errors per `run_id`, and skips entries whose
    formatter yields no summary.
-8. **`save_max_concurrent`** writing `scheduling.max_concurrent_agents` with
-   silent-until-restart semantics is correct. The TUI
-   prints `Settings saved` and shows the new value in the wizard default.
-9. **Capability flags in observer mode** all stay `true`; let
-   `run_task`/`run_all`/`start_watch` fail with the lock holder's PID (see #3).
-   The flags mean "this build supports the operation", not "it will succeed now".
+8. **`save_max_concurrent`** sends `config.set` for
+   `scheduling.max_concurrent_agents`. The daemon refreshes engine configuration
+   after the write; subsequent dispatch uses the new cap
+   (`crates/orch-daemon/src/ops/authored.rs`, `orch-engine/src/container.rs`).
+9. **Capability flags** describe supported UI operations. The production
+   backend has no observer mode; run and watch requests return the daemon's
+   refusal when they cannot execute (including after ownership loss).
 10. **`bell()`** is yours: write `\x07` to stdout directly, outside the draw
     loop. The TUI calls it only for `failed` and `review` transitions and only
     when `notifications.bell` is set — never for `done`.
@@ -253,15 +241,15 @@ Two notes back:
 * **A lossy `poll_events` is fine.** The TUI's 80 ms batching, 500-message ring
   and 2 KB detail caps already assume `agent:output` can be dropped under load
   (ARCHITECTURE §6.5). Log the lag; never fail the call.
-* **Feeding `DiskObserver` into the same queue is exactly right.** The TUI has
-  no way to tell the sources apart and must not: `observer_mode` in
-  `LaunchContext` only drives the header chip and the 3 s poll interval.
+* **Keep store invalidations separate from the activity queue.**
+  `ObservationQueue` coalesces changes by store; a full bus-event queue may drop
+  old activity, while store invalidations still cause the necessary reads.
 
 ## Copy request and result boundary
 
 `copy_text(text)` delegates to `copy_text_via(text, CopyTarget::Auto)`. The explicit targets are Auto, Terminal
 and Native. Implementations return a `CopyTicket` or an immediate safe error; the default facade declines copy
-and drains no results. `EngineBackend` overrides both `copy_text_via` and `poll_copy_results` with its CLI
+and drains no results. `DaemonBackend` overrides both `copy_text_via` and `poll_copy_results` with its CLI
 transport. A ticket is registered with the full viewer/editor/field origin before input handling returns.
 
 Only the viewer Tick hook drains `poll_copy_results`, including when no viewer is open. Outcomes are

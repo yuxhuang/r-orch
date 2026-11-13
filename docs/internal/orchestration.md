@@ -106,19 +106,27 @@ and in-process ones within about 0.5 s.
 
 ### Who runs the orchestrator
 
-| Command | Owner lock | Reconcile | Creates `[auto]` tasks | Starts | Ends |
-|---|---|---|---|---|---|
-| `orch run <task-id>` | temporary (`orchestrator.rs:379-393`, `484-490`) | no | no | that task only; every other ready task is claimed so it cannot start (`orchestrator/dispatch.rs:264-293`), which also means it starts nothing and exits 0 when the assignee has another `todo`/`retrying` task ([§8](#8-known-gaps-pending-fixes) row 9) | when its collectors finish (`orchestrator.rs:681-688`) |
-| `orch run --all` | temporary (`orchestrator.rs:493-498`) | no | no | one pass over everything ready (`orchestrator/dispatch.rs:25-34`) | when its collectors finish |
-| `orch run --watch`, `orch serve`, the dashboard (`orch`, `orch tui`, `orch web`) | held while running (`orchestrator.rs:563-567`) | every tick | yes | every tick, plus reactive dispatch | on a signal, `/pause`, or the tick circuit breaker |
-| `orch serve --once` | held | every tick | **no** (`orchestrator.rs:165-172`) | every tick | when every task is terminal |
-| `orch tui --observe` | none | — | — | nothing on its own (one-shot actions from the dashboard still work) | — |
+The daemon owns the engine, project stores and agent processes. Frontend commands request work
+through its socket; opening or closing a dashboard does not change dispatch. Sources:
+`crates/orch-cli/src/commands/{daemon,run}.rs`, `crates/orch-cli/src/tui/{backend,command}.rs`,
+`crates/orch-daemon/src/{lifecycle,dispatch/mod,ops/control}.rs`.
 
-Only one process can hold the lock. Another watch-mode start fails with `LockConflict`
-(`orchestrator.rs:563-566`). The lock file holds a PID; it is stale when that PID is dead or the file has not
-been touched for 60 s (`infra/storage/lock.rs:27`, `41-60`), and every tick touches it
-(`orchestrator/tick.rs:36-38`). One-shot commands such as `orch task add` never take the lock; the
-consequences are in [ARCHITECTURE §2.1](../ARCHITECTURE.md#21-a2-in-detail--the-concurrency-story-is-weaker-than-single-writer).
+| Command | Ownership | Scheduling behavior | Lifetime |
+|---|---|---|---|
+| `orch daemon start` | acquires owner guard and PID lock; performs startup recovery before serving | dispatch off by default; `--dispatch on` enables automatic scheduling | until explicit stop or termination |
+| `orch run --watch`, `orch serve` without `--once` | explicit foreground daemon start | dispatch on | until daemon shutdown |
+| `orch run <task-id>` | client of the running daemon | requests the named task and observes its outcome | client observation ends; disconnect does not kill the run |
+| `orch run --all` | client | one pass over eligible work, then observes those runs | client observation ends |
+| `orch run --once` | client | one scheduling tick | returns after the tick |
+| `orch serve --once` | client | dispatch-until-terminal batch, without autonomous seeding | batch result or observation cancellation; daemon stays running |
+| `orch`, `orch tui`, `orch web` | clients | show the daemon's switch; `/watch` and `/pause` set it on/off | dashboard closes independently of daemon/agents |
+
+`OwnerGuard` holds the stable `.daemon-owner.lock` advisory lock; `PidLock` maintains the decimal
+PID file. A live holder is not evicted because its PID file is old. The independent heartbeat
+checks it every 10 seconds. `--observe` is removed: every dashboard is a client. State commands,
+including commands issued by agents, use the daemon's operation boundary rather than writing
+alongside it. Guarantees and the crash/external-writer limits are in
+[ARCHITECTURE §2.1](../ARCHITECTURE.md#21-daemon-ownership-guarantees-and-limits).
 
 ---
 
@@ -550,9 +558,10 @@ point it.
 To read it: `orch task show <id>`, `orch logs <run-id>`, `orch logs --task <id>`, `orch goal show <id>`,
 `orch status` ([manual: View logs](../manual/07-running-and-monitoring.md#view-logs)).
 
-Concurrent writers can lose an index entry (a task file exists but `_index.json` does not list it, so dispatch
-does not see it). This is a known hazard with a recovery procedure:
-[ARCHITECTURE §2.1](../ARCHITECTURE.md#21-a2-in-detail--the-concurrency-story-is-weaker-than-single-writer).
+Frontend mutations share the daemon's operation boundary. An entity and its index are still separate
+writes, so a crash or I/O failure between them can leave a valid index missing an entity; a direct
+filesystem writer can also bypass the boundary (`crates/orch-infra/src/storage/task.rs`, `index.rs`).
+See [ARCHITECTURE §2.1](../ARCHITECTURE.md#21-daemon-ownership-guarantees-and-limits).
 
 ### 2.12 Checklist: will this task be handled?
 
@@ -938,23 +947,29 @@ the run-end resets `orchestrator/collect.rs:508-511` (success), `589-593` (failu
 
 ### 6.2 State diagrams
 
-The orchestrator process, as the dashboard sees it:
+The daemon's dispatch switch, as the dashboard sees it:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> idle : orch tui (no watch)
-    [*] --> watching : orch serve, run --watch, dashboard default
-    [*] --> observing : orch tui --observe
-    idle --> watching : /watch
-    watching --> stopping : /pause, SIGINT, SIGTERM, 5 failed ticks
-    stopping --> idle : runs killed, tasks retrying, lock released (dashboard)
-    stopping --> [*] : serve or run --watch exits
-    watching --> crashed : kill -9 or panic
-    crashed --> watching : next start runs recovery
+    [*] --> idle : daemon start (default dispatch off)
+    [*] --> watching : explicit start with dispatch on
+    idle --> watching : /watch or daemon dispatch on
+    watching --> idle : /pause or daemon dispatch off
+    watching --> ownership_lost : PID ownership loss detected
+    idle --> ownership_lost : PID ownership loss detected
+    idle --> stopping : daemon stop or termination signal
+    watching --> stopping : daemon stop or termination signal
+    ownership_lost --> stopping : daemon stop or termination signal
+    stopping --> [*] : drain work and release ownership
 ```
 
-The dashboard's labels are `watching`, `observing` and `idle` (`tui/state.rs:3712-3720`). `stopping` and
-`crashed` are not shown states; they are drawn to show what happens.
+WATCHING / IDLE reflects the daemon's dispatch switch. `/pause` leaves running agents alive;
+closing the dashboard leaves both the switch and those agents alone. Ownership loss disables
+scheduling but is not a general write fence (ARCHITECTURE §2.1 N3). `ownership_lost` and `stopping`
+above describe lifecycle transitions, not extra dashboard chips. There is no production
+`observing` mode (`crates/orch-cli/src/tui/{backend,command}.rs`,
+`crates/orch-daemon/src/ops/control.rs`). A crashed daemon requires an explicit restart;
+its next start runs recovery before serving (`crates/orch-daemon/src/lifecycle.rs`).
 
 A goal and what each status does to its queued work (the goal's own state machine is in [§5.1](#51-goal-state-machine)):
 
