@@ -63,6 +63,21 @@ impl AgentStore for FileAgentStore {
 
     async fn delete(&self, id: &str) -> Result<()> {
         let path = self.paths.agent_path(id)?;
+        // Do not open a device or FIFO that can otherwise simply be unlinked.
+        // Reading identity must not make an unreadable or malformed file
+        // undeletable. The caller's spelling is still retired in that case.
+        let stored_id = if tokio::fs::metadata(&path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+        {
+            read_yaml::<Agent>(&path)
+                .await
+                .ok()
+                .flatten()
+                .map(|entity| entity.id)
+        } else {
+            None
+        };
         match tokio::fs::remove_file(&path).await {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -70,9 +85,32 @@ impl AgentStore for FileAgentStore {
                 return Err(Error::io(format!("delete {}", path.display()), &path, err));
             }
         }
+        // An alias may share an identity with a separate real record. Keep
+        // that record listed; resolve only identities the path builder accepts.
+        let retired_id = if let Some(stored_id) = stored_id
+            && stored_id != id
+            && let Ok(stored_path) = self.paths.agent_path(&stored_id)
+            && !tokio::fs::metadata(&stored_path)
+                .await
+                .is_ok_and(|metadata| !metadata.is_file())
+            && read_yaml::<Agent>(&stored_path)
+                .await
+                .is_ok_and(|record| record.is_none_or(|record| record.id != stored_id))
+        {
+            Some(stored_id)
+        } else {
+            None
+        };
         let id = id.to_owned();
         self.index
-            .update_index(move |items| items.into_iter().filter(|a| a.id != id).collect())
+            .update_index(move |items| {
+                items
+                    .into_iter()
+                    .filter(|a| {
+                        a.id != id && retired_id.as_ref().is_none_or(|retired| a.id != *retired)
+                    })
+                    .collect()
+            })
             .await
     }
 }

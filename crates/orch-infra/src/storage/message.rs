@@ -266,10 +266,47 @@ impl MessageStore for FileMessageStore {
     async fn delete(&self, id: &str) -> Result<()> {
         let id = id.to_owned();
         self.transaction(move |store| async move {
+            let path = store.paths.message_path(&id)?;
+            // Do not open a device or FIFO that can otherwise simply be unlinked.
+            // Best-effort identity read: malformed or unreadable files still delete.
+            let stored_id = if tokio::fs::metadata(&path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file())
+            {
+                read_json::<Message>(&path)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|message| message.id)
+            } else {
+                None
+            };
             store.remove_file(&id).await?;
+            // Keep a separate real record listed when deleting an alias.
+            let retired_id = if let Some(stored_id) = stored_id
+                && stored_id != id
+                && let Ok(stored_path) = store.paths.message_path(&stored_id)
+                && !tokio::fs::metadata(&stored_path)
+                    .await
+                    .is_ok_and(|metadata| !metadata.is_file())
+                && read_json::<Message>(&stored_path)
+                    .await
+                    .is_ok_and(|record| record.is_none_or(|record| record.id != stored_id))
+            {
+                Some(stored_id)
+            } else {
+                None
+            };
             store
                 .index
-                .update_index(move |items| items.into_iter().filter(|m| m.id != id).collect())
+                .update_index(move |items| {
+                    items
+                        .into_iter()
+                        .filter(|m| {
+                            m.id != id && retired_id.as_ref().is_none_or(|retired| m.id != *retired)
+                        })
+                        .collect()
+                })
                 .await
         })
         .await
