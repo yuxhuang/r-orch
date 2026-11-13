@@ -77,7 +77,7 @@ What the daemon does **not** promise:
 |---|---|---|
 | `orch daemon start [--detach] [--dispatch on\|off] [--from-agent]` | Starts the daemon for the project, in the foreground unless `--detach`. Dispatch is **off** unless `--dispatch on`. Peer-link listener options are start options too; `orch daemon start --help` lists them. | 0 after a clean stop (foreground) or after readiness (`--detach`); 2, 3, 4 on refusal |
 | `orch daemon status` | Asks the running daemon for its live status. | 0; 1 with `request cancelled before execution` when the daemon lost ownership of the project while the request was waiting ([Lost ownership](#status)); 7 when no compatible daemon answers |
-| `orch daemon stop` | Asks the daemon to shut down cleanly and waits until it confirms its cleanup and has released the project (its process has exited or it has released its ownership lock), for at most 30 s. Works across a version mismatch. | 0 on a completed clean stop; 7 when no daemon answers, the outcome is unknown or the wait times out (with a message of its own) |
+| `orch daemon stop` | Asks the daemon to shut down cleanly and waits until it confirms its cleanup and has released the project (its process has exited or it has released its ownership lock), for at most 30 s. Works across a version mismatch. | 0 on a completed clean stop; 1 when the daemon reports incomplete cleanup (`daemon shutdown cleanup failed; recovery evidence was retained`); 7 when no daemon answers, the outcome is unknown or the wait times out (with a message of its own) |
 | `orch daemon dispatch on\|off` | Turns dispatching of future work on or off in the running daemon. | 0; 7 when no compatible daemon answers |
 
 | Flag | Meaning |
@@ -305,7 +305,7 @@ it is killed), records the runs it stopped as cancelled and settles their tasks'
   It is checked against your user and the project, and does nothing else.
 - If cleanup fails, the command reports the failure instead of a clean stop and exits 1 with
   `daemon shutdown cleanup failed; recovery evidence was retained`, and the daemon keeps the evidence needed for
-  recovery. This happens when it cannot verify an agent's saved PID or cannot confirm that an agent stopped; the
+  recovery. This happens, for example, when it cannot verify an agent's saved PID or cannot confirm that an agent stopped; the
   descendants of an agent can also survive a stop. Check the result before you start the daemon again.
 - If the daemon accepted the stop but the connection closed before it confirmed that it finished, the outcome is
   unknown: the message says that the stop may have been applied and to inspect state before retrying, and the
@@ -541,10 +541,10 @@ is something you do.
 | Situation | What you see | What to do |
 |---|---|---|
 | The daemon crashed or was killed (`kill -9`) | The next command of every client reports no daemon (exit 7); nothing restarts it. The stale socket and `daemon.json` stay until the next start. | Start it again. The new daemon has dispatch off, clears stale claims, records runs whose agent died as cancelled and their agents as idle, and leaves remote work as unknown until the peer syncs. Check tasks and runs before you retry anything or turn dispatch on. |
-| A foreground daemon's terminal or pane closed | SIGHUP: a clean stop, the same as `orch daemon stop`; its agents are stopped. | Start it again in a new pane, or use `--detach`. |
+| A foreground daemon's terminal or pane closed | SIGHUP: a clean stop, the same as `orch daemon stop`; its local agents are stopped (unless cleanup fails; see the stop section). | Start it again in a new pane, or use `--detach`. |
 | A detached daemon after a reboot (logout is untested) | No daemon answers. | Start it again. orch supplies no launchd job, watchdog or restart. |
 | Recovery at start cannot save a task, run or agent change | The start exits 1 and names the write that failed; `orch daemon status` exits 7. | Fix the cause (permissions, disk space), then start again; the state needed to finish the recovery is kept. |
-| You upgraded orch and the old daemon still runs | Version skew message, exit 7. | `orch daemon stop` (either binary), then start the new one. Running agents are stopped and reconciled; this is not a transparent upgrade. |
+| You upgraded orch and the old daemon still runs | Version skew message, exit 7. | `orch daemon stop` (either binary), then start the new one. Running local agents are stopped and reconciled, unless cleanup fails; this is not a transparent upgrade. |
 | The daemon hangs, or its socket was removed | Commands time out or report no daemon; status never claims liveness from files. | Read the PID in `daemon.json` as an untrusted hint. Only if `ps -p <pid> -o command=` shows an orch daemon for this project, send `kill -TERM <pid>`. If you cannot verify the process, do not signal it. If `orch daemon stop` already timed out, SIGTERM does nothing: see the next row. |
 | `orch daemon stop` timed out (exit 7) and `orch daemon start` says `already running (PID <pid>)` | The daemon is still finishing an operation it accepted, such as a hung `git worktree add`, and owns the project until it returns. `orch daemon status` reports no daemon (exit 7) and `kill -TERM` does nothing. | Wait: the daemon exits by itself when the call returns. To end it now, check that `ps -p <pid> -o command=` shows an orch daemon, list its child processes with `pgrep -P <pid>`, then `kill -KILL <pid>`. The children are not killed with it: a stuck `git worktree add` kept running under PID 1. Check each child with `ps -p <child-pid> -o command=` and stop it too, or wait until it has exited, before you start the daemon again; the crash row above then applies. |
 | orch crashed between writing an entity and its `_index.json` | One writer does not make two file writes one transaction. Start-up rebuilds a missing or corrupt index of tasks, agents, goals, messages or context (runs and teams have no index), but cannot detect a stale index that is still valid. | Offline repair only: stop the daemon, remove the affected `_index.json`, start it. Never remove an index while a daemon runs. |
