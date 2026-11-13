@@ -41,14 +41,16 @@ impl Orchestrator {
             .await
             .value?;
         let mut failures = Vec::new();
+        let mut survivors = Vec::new();
         for entry in &entries {
             if entry.remote.is_none() {
                 self.deps()
                     .processes
                     .kill_with_grace(entry.pid, orch_core::process::DEFAULT_KILL_GRACE)
                     .await;
-                if self.deps().processes.is_alive(entry.pid) {
+                if !self.daemon_confirm_child_stopped(entry.pid).await {
                     failures.push(entry.task_id.clone());
+                    survivors.push(Self::daemon_survivor_identity(&entry.run_id, entry.pid));
                 }
             }
         }
@@ -124,9 +126,10 @@ impl Orchestrator {
             .await
             .value?;
         if !failures.is_empty() {
-            return Err(Error::other(
-                "Daemon shutdown incomplete; local children remain alive",
-            ));
+            return Err(Error::other(format!(
+                "Daemon shutdown incomplete; local children remain alive: {}",
+                survivors.join("; ")
+            )));
         }
         tokio::time::timeout(
             std::time::Duration::from_secs(10),

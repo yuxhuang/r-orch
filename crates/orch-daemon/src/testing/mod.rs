@@ -452,6 +452,12 @@ impl DaemonHarness {
         self.handler.observe_spawns(observer);
     }
 
+    /// Close request and spawn admission the way daemon shutdown does, without
+    /// stopping execution, for isolated tests only.
+    pub fn seal_admission(&self) {
+        self.handler.seal_requests();
+    }
+
     /// The engine, for seeding and peeking from **test code only**.
     pub fn engine(&self) -> &orch_engine::FullEngine {
         &self.engine

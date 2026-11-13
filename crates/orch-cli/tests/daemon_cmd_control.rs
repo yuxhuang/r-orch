@@ -1,6 +1,7 @@
 //! `orch daemon *` verbs need no opt-in env. Every child has explicit isolated routing;
 //! none of the client error fixtures starts a daemon or inherits an agent CLI.
 use std::fs;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -22,7 +23,10 @@ fn orch(root: &Path, socket: &Path, test_root: &Path) -> Command {
 }
 fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    fs::create_dir(dir.path().join(".orchestry")).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.path().join(".orchestry"))
+        .unwrap();
     dir
 }
 fn short_dir() -> tempfile::TempDir {

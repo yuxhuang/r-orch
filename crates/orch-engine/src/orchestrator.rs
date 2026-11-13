@@ -1,6 +1,7 @@
-//! The orchestrator.
+//! The daemon state machine and the legacy unit-test scheduler.
 //!
-//! Conceptually **reconcile → dispatch → collect**, but only the first two are
+//! The legacy unit-test scheduler is **reconcile → dispatch → collect**; the
+//! daemon uses phased selection and launch. Only the first two legacy steps are
 //! tick phases: collection runs as a detached task per run and completion is
 //! handled by [`Orchestrator::handle_run_success`] /
 //! [`Orchestrator::handle_run_failure`], each of which takes the state lock.
@@ -39,6 +40,7 @@
 mod collect;
 mod daemon;
 mod dispatch;
+mod preparation_cleanup;
 mod recovery;
 mod remote;
 mod tick;
@@ -49,7 +51,9 @@ mod tests;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use orch_core::adapter::AdapterRegistry;
@@ -62,7 +66,9 @@ use orch_core::template::TemplateEngine;
 use orch_core::workspace::WorkspaceManager;
 use orch_domain::{DomainError, OrchestratorConfig, OrchestratorEvent, OrchestratorState};
 use orch_infra::storage::cached::{CachedAgentStore, CachedGoalStore, CachedTaskStore};
-use tokio::sync::{Mutex, watch};
+use tokio::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_service::AgentService;
@@ -77,21 +83,25 @@ const MAX_EVENT_DATA_LEN: usize = 8192;
 /// Max event data forwarded to the bus for TUI consumption (4 KB) — layer 3.
 const MAX_BUS_DATA_LEN: usize = 4096;
 /// Consecutive tick rejections before the orchestrator shuts itself down.
+#[cfg(test)]
 const MAX_CONSECUTIVE_TICK_FAILURES: u32 = 5;
 /// The retry queue is deduplicated by task id and bounded to this many entries;
 /// on overflow the oldest is dropped.
 const MAX_RETRY_QUEUE_SIZE: usize = 100;
 /// Minimum interval between auto-seeded tasks for the same agent.
 const AUTO_SEED_COOLDOWN_MS: i64 = 30_000;
-/// The reactive-dispatch debounce, and the debounce on the lazy state write.
+/// The lazy state-write debounce, shared with legacy unit-test dispatch.
 const DEBOUNCE: Duration = Duration::from_millis(500);
 /// How many times a reactive dispatch reschedules itself while a tick is in
 /// flight before giving up (≈5 s).
+#[cfg(test)]
 const MAX_IMMEDIATE_DISPATCH_RETRIES: u32 = 10;
 /// Grace period for the kill in `cancel_task` / `force_stop_agent`.
 const CANCEL_KILL_GRACE: Duration = Duration::from_millis(3_000);
 /// Grace period for the kill that follows stall detection.
 const STALL_KILL_GRACE: Duration = Duration::from_millis(5_000);
+/// Post-kill confirmation shared by daemon recovery and shutdown.
+const DAEMON_KILL_CONFIRMATION: Duration = Duration::from_secs(1);
 /// `proof.agent_summary` cap.
 const MAX_AGENT_SUMMARY_LEN: usize = 2000;
 /// `last_error.message` cap.
@@ -110,6 +120,7 @@ const REMOTE_CLOCK_MIN_SAMPLE_MS: i64 = 10_000;
 const REMOTE_QUEUED_WARN_MS: i64 = 60 * 60_000;
 /// Per-wait budget for watch lifecycle synchronization. Expiry leaves the
 /// current cycle intact; callers may retry once startup/cleanup has progressed.
+#[cfg(test)]
 const WATCH_LIFECYCLE_WAIT: Duration = Duration::from_secs(3);
 
 /// Everything the orchestrator needs: the project lock is an injected
@@ -141,12 +152,15 @@ pub struct OrchestratorDeps {
     pub skill_loader: Option<Arc<dyn SkillLoader>>,
 }
 
+/// Options for the legacy unit-test scheduler.
+///
 /// Deliberately **not** `Default`: `handle_signals` would default to `false`,
 /// so a caller writing `..Default::default()` would get a watch loop that
 /// ignores `SIGTERM` — a daemon that cannot be shut down by its supervisor,
 /// with nothing at the call site to hint at it. Use the named constructors;
 /// a caller that wants something else spells both fields out.
 #[derive(Debug, Clone)]
+#[cfg(test)]
 pub struct WatchOptions {
     /// `tick()` skips `seed_autonomous_tasks` — `serve --once` sets it.
     pub skip_autonomous_seeding: bool,
@@ -156,6 +170,7 @@ pub struct WatchOptions {
     pub handle_signals: bool,
 }
 
+#[cfg(test)]
 impl WatchOptions {
     /// Long-running watch mode (`orch serve`, `orch run --watch`, the TUI):
     /// The default watch options.
@@ -184,8 +199,10 @@ struct LazySave {
 }
 
 /// Release waiters even if shutdown is cancelled or unwinds before cleanup ends.
+#[cfg(test)]
 struct StopNotification(watch::Sender<bool>);
 
+#[cfg(test)]
 impl Drop for StopNotification {
     fn drop(&mut self) {
         // Retain the value even when no waiter has subscribed yet.
@@ -214,11 +231,16 @@ struct Inner {
     cancels: Mutex<HashMap<String, CancellationToken>>,
     /// Task ids started by `run <id>`; these must not trigger a reactive
     /// dispatch of anything else.
+    #[cfg(test)]
     single_task_runs: Mutex<HashSet<String>>,
     /// Per-agent auto-seed cooldown. In-memory — a restart reseeds.
     last_auto_seed_at: Mutex<HashMap<String, i64>>,
 
     remote_state_dirty: AtomicBool,
+    /// Exact serialized state from the latest successful read or write, never
+    /// a previous tick. Unknown before an attempted write until it succeeds.
+    /// Access is serialized by `state`; this leaf lock never spans I/O.
+    persisted_state_bytes: std::sync::Mutex<Option<Vec<u8>>>,
     remote_bridge: std::sync::RwLock<Arc<dyn orch_core::remote::RemoteBridge>>,
     /// Where dispatch re-reads the project prompt mode; see
     /// [`Orchestrator::set_config_store`].
@@ -232,16 +254,23 @@ struct Inner {
     /// deadline applies to, so there is nothing to carry across one.
     remote_clocks: Mutex<HashMap<String, remote::RemoteClock>>,
     lazy_save: Mutex<LazySave>,
+    #[cfg(test)]
     immediate_dispatch: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    #[cfg(test)]
     watch_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 
     /// Serializes watch starts, including joining the previous watch loop.
+    #[cfg(test)]
     watch_start: Mutex<()>,
     /// Serializes startup with the selection of a stop owner.
     lifecycle: Mutex<()>,
     daemon_mode: AtomicBool,
     daemon_batch_active: AtomicBool,
     preparing_agents: Mutex<HashMap<String, (u64, String)>>,
+    /// Failed releases retain their generation and reservation until both run
+    /// finalization and the claim removal are durable. Restart uses the
+    /// existing claimed/preparing-run sweep instead of a persisted ledger.
+    pending_preparation_cleanup: Mutex<HashMap<String, u64>>,
     preparation_seq: std::sync::atomic::AtomicU64,
     spawn_admission: std::sync::RwLock<Arc<dyn orch_core::process::SpawnAdmission>>,
     deferred_kills: Mutex<Vec<(String, orch_domain::RunningEntry, String)>>,
@@ -250,17 +279,23 @@ struct Inner {
     cleanup_draining: Mutex<()>,
     lock_acquired: AtomicBool,
     shutting_down: AtomicBool,
+    #[cfg(test)]
     tick_in_progress: AtomicBool,
+    #[cfg(test)]
     skip_autonomous_seeding: AtomicBool,
+    #[cfg(test)]
     consecutive_tick_failures: AtomicU32,
 
     /// Cancels the watch loop.
+    #[cfg(test)]
     shutdown: std::sync::Mutex<CancellationToken>,
     /// Latched by a signal on the standalone paths (`run <id>`, `run --all`);
     /// see [`Orchestrator::interrupt`]. Never cancelled in watch mode, whose
     /// signal arms go through [`Orchestrator::stop`] instead.
+    #[cfg(test)]
     interrupt: CancellationToken,
     /// Flips to `true` once `stop` completes or is aborted, releasing waiters.
+    #[cfg(test)]
     stopped: std::sync::Mutex<watch::Sender<bool>>,
 
     /// Tick-scoped memoized reads. Invalidated at the top of every tick and of
@@ -304,11 +339,13 @@ impl Orchestrator {
             .goal_store
             .as_ref()
             .map(|goals| CachedGoalStore::new(Arc::clone(goals)));
+        #[cfg(test)]
         let (stopped, _) = watch::channel(false);
 
         let orchestrator = Orchestrator {
             inner: Arc::new(Inner {
                 remote_state_dirty: AtomicBool::new(false),
+                persisted_state_bytes: std::sync::Mutex::new(None),
                 remote_bridge: std::sync::RwLock::new(Arc::new(
                     orch_core::remote::NoopRemoteBridge,
                 )),
@@ -322,17 +359,22 @@ impl Orchestrator {
                 active_collectors: Mutex::new(HashSet::new()),
                 finishing_collectors: Mutex::new(HashSet::new()),
                 cancels: Mutex::new(HashMap::new()),
+                #[cfg(test)]
                 single_task_runs: Mutex::new(HashSet::new()),
                 last_auto_seed_at: Mutex::new(HashMap::new()),
                 remote_clocks: Mutex::new(HashMap::new()),
                 lazy_save: Mutex::new(LazySave::default()),
+                #[cfg(test)]
                 immediate_dispatch: Mutex::new(None),
+                #[cfg(test)]
                 watch_task: Mutex::new(None),
+                #[cfg(test)]
                 watch_start: Mutex::new(()),
                 lifecycle: Mutex::new(()),
                 daemon_mode: AtomicBool::new(false),
                 daemon_batch_active: AtomicBool::new(false),
                 preparing_agents: Mutex::new(HashMap::new()),
+                pending_preparation_cleanup: Mutex::new(HashMap::new()),
                 preparation_seq: std::sync::atomic::AtomicU64::new(0),
                 spawn_admission: std::sync::RwLock::new(Arc::new(
                     orch_core::process::NoopSpawnAdmission,
@@ -343,11 +385,17 @@ impl Orchestrator {
                 cleanup_draining: Mutex::new(()),
                 lock_acquired: AtomicBool::new(false),
                 shutting_down: AtomicBool::new(false),
+                #[cfg(test)]
                 tick_in_progress: AtomicBool::new(false),
+                #[cfg(test)]
                 skip_autonomous_seeding: AtomicBool::new(false),
+                #[cfg(test)]
                 consecutive_tick_failures: AtomicU32::new(0),
+                #[cfg(test)]
                 shutdown: std::sync::Mutex::new(CancellationToken::new()),
+                #[cfg(test)]
                 interrupt: CancellationToken::new(),
+                #[cfg(test)]
                 stopped: std::sync::Mutex::new(stopped),
                 cached_tasks,
                 cached_agents,
@@ -445,6 +493,7 @@ impl Orchestrator {
     }
 
     /// Whether a standalone signal has been latched by [`Orchestrator::interrupt`].
+    #[cfg(test)]
     pub fn is_interrupted(&self) -> bool {
         self.inner.interrupt.is_cancelled()
     }
@@ -485,14 +534,53 @@ impl Orchestrator {
         {
             self.save_state(state).await?;
         }
-        *slot = Some(self.deps().state_store.read().await?);
+        let state = self.deps().state_store.read().await?;
+        *self
+            .inner
+            .persisted_state_bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = serde_json::to_vec(&state).ok();
+        *slot = Some(state);
         Ok(())
     }
 
     async fn save_state(&self, state: &OrchestratorState) -> Result<()> {
+        // Invalidate before tracked I/O: failure or cancellation may have
+        // partially written, so equality cannot prove that a save is redundant.
+        *self
+            .inner
+            .persisted_state_bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         self.deps().state_store.write(state).await?;
+        *self
+            .inner
+            .persisted_state_bytes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = serde_json::to_vec(state).ok();
         self.inner.remote_state_dirty.store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Only reconciliation's redundant checkpoint may be skipped. Transition
+    /// saves still always reach the tracked store, even for identical bytes.
+    /// The lazy-dirty check is defence in depth: callers flush the debounce
+    /// before reconciliation, but pending collector updates must never skip.
+    async fn save_reconciled_state(&self, state: &OrchestratorState) -> Result<()> {
+        if !self.inner.remote_state_dirty.load(Ordering::SeqCst)
+            && !self.inner.lazy_save.lock().await.dirty
+            && let Some(bytes) = serde_json::to_vec(state).ok()
+            && self
+                .inner
+                .persisted_state_bytes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                == Some(&bytes)
+        {
+            return Ok(());
+        }
+        self.save_state(state).await
     }
 
     async fn save_remote_state(&self, state: &OrchestratorState) -> Result<()> {
@@ -573,6 +661,7 @@ impl Orchestrator {
     ///
     /// Dispatches inline when watch mode already holds the lock; otherwise
     /// takes a temporary one.
+    #[cfg(test)]
     pub async fn run_task(&self, task_id: &str) -> Result<()> {
         if self.is_owner() {
             return self.fresh_dispatch_only(task_id).await;
@@ -582,6 +671,7 @@ impl Orchestrator {
     }
 
     /// Run every dispatchable task.
+    #[cfg(test)]
     pub async fn run_all(&self) -> Result<()> {
         if self.is_owner() {
             return self.fresh_dispatch_all().await;
@@ -593,12 +683,14 @@ impl Orchestrator {
     /// run one tick immediately, then poll.
     ///
     /// Returns once the loop is running. Use [`Orchestrator::wait_for_stop`] to block.
+    #[cfg(test)]
     pub async fn start_watch(&self, options: WatchOptions) -> Result<()> {
         self.start_watch_with(options, || async { Ok(()) }).await
     }
 
     /// Install owner-only runtime services after recovery and before the first
     /// dispatch. A failed setup releases the owner lock like any startup error.
+    #[cfg(test)]
     pub async fn start_watch_with<F, Fut>(&self, options: WatchOptions, prepare: F) -> Result<()>
     where
         F: FnOnce() -> Fut,
@@ -724,6 +816,7 @@ impl Orchestrator {
 
     /// The fallible half of [`Orchestrator::start_watch`], split out so one
     /// `match` can release the lock on every error path.
+    #[cfg(test)]
     async fn start_watch_prepared<F, Fut>(
         &self,
         signals: SignalArms,
@@ -798,6 +891,7 @@ impl Orchestrator {
     /// Resolves once stop has completed (or the orchestrator is dropped).
     /// Cancellation or panic in [`Orchestrator::stop`] also releases waiters;
     /// in that case cleanup may be incomplete.
+    #[cfg(test)]
     pub async fn wait_for_stop(&self) {
         let stopped = self
             .inner
@@ -808,6 +902,7 @@ impl Orchestrator {
         Self::wait_for_completion(stopped).await;
     }
 
+    #[cfg(test)]
     async fn wait_for_watch_lifecycle<T>(
         &self,
         context: &'static str,
@@ -822,6 +917,7 @@ impl Orchestrator {
             })
     }
 
+    #[cfg(test)]
     async fn wait_for_completion(mut stopped: watch::Receiver<bool>) {
         while !*stopped.borrow_and_update() {
             if stopped.changed().await.is_err() {
@@ -832,6 +928,7 @@ impl Orchestrator {
 
     /// What a `SIGINT`/`SIGTERM` arm does. Public so a test can exercise it
     /// without signalling the test process.
+    #[cfg(test)]
     pub async fn handle_signal(&self, signal: &str) {
         self.emit(OrchestratorEvent::OrchestratorShutdown {
             reason: format!("Received {signal}"),
@@ -856,6 +953,7 @@ impl Orchestrator {
     /// deadlock: both call from the watch loop's select body with no lock,
     /// guard or tick in flight, and the owner's cleanup never awaits the watch
     /// task (the next start joins it instead).
+    #[cfg(test)]
     pub async fn stop(&self) -> Result<()> {
         let lifecycle = self
             .wait_for_watch_lifecycle("watch stop", self.inner.lifecycle.lock())
@@ -953,6 +1051,7 @@ impl Orchestrator {
     ///
     /// Watch mode does not use this; its signal arms call
     /// [`Orchestrator::stop`].
+    #[cfg(test)]
     pub fn interrupt(&self) {
         self.inner.interrupt.cancel();
     }
@@ -971,6 +1070,7 @@ impl Orchestrator {
     /// first; when another process owns it, the write goes through the state
     /// this process holds, the way its collectors would have written the same
     /// outcomes. The collector wait is bounded by the kill grace.
+    #[cfg(test)]
     pub async fn stop_interrupted_runs(&self, signal: &str) -> Result<()> {
         self.interrupt();
         self.emit(OrchestratorEvent::OrchestratorShutdown {
@@ -1002,6 +1102,7 @@ impl Orchestrator {
         saved
     }
 
+    #[cfg(test)]
     async fn stop_interrupted_runs_locked(&self, reload: bool) -> Result<()> {
         let mut slot = self.inner.state.lock().await;
         // Read under the state lock: a dispatch registers its collector before
@@ -1220,6 +1321,7 @@ impl Orchestrator {
 
     // ── watch loop ───────────────────────────────────────────────────────
 
+    #[cfg(test)]
     async fn spawn_watch_loop(
         &self,
         signals: SignalArms,
@@ -1284,6 +1386,7 @@ impl Orchestrator {
     /// The circuit breaker: five consecutive rejections shut the orchestrator
     /// down, and every failure reports its running count so a watcher can see
     /// the breaker approaching.
+    #[cfg(test)]
     async fn on_tick_failure(&self, err: Error) {
         let count = self
             .inner
@@ -1308,11 +1411,13 @@ impl Orchestrator {
 }
 
 /// The `SIGINT`/`SIGTERM` arms of the watch loop. Dropping it removes the handlers.
+#[cfg(test)]
 struct SignalArms {
     interrupt: Option<tokio::signal::unix::Signal>,
     terminate: Option<tokio::signal::unix::Signal>,
 }
 
+#[cfg(test)]
 impl SignalArms {
     fn install() -> Self {
         use tokio::signal::unix::{SignalKind, signal};

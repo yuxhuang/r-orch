@@ -152,6 +152,7 @@ async fn serve(settings: server::Settings, config: ClientConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::DirBuilderExt;
     use std::path::PathBuf;
 
     fn root_of(cwd: &Path, requested: Option<&Path>) -> std::result::Result<PathBuf, ClientError> {
@@ -167,7 +168,10 @@ mod tests {
     #[test]
     fn the_root_override_selects_exactly_the_requested_project() {
         let outer = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(outer.path().join(".orchestry")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(outer.path().join(".orchestry"))
+            .unwrap();
         let nested = outer.path().join("child");
         std::fs::create_dir_all(&nested).unwrap();
         let canonical_outer = std::fs::canonicalize(outer.path()).unwrap();
@@ -202,7 +206,10 @@ mod tests {
     fn the_session_is_an_mcp_session_in_the_launch_mode_with_the_identity() {
         use orch_proto::handshake::SessionMode;
         let project = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(project.path().join(".orchestry")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(project.path().join(".orchestry"))
+            .unwrap();
         let (settings, config) = launch(
             project.path(),
             None,

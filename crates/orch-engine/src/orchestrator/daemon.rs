@@ -76,6 +76,25 @@ impl Orchestrator {
             .value
     }
 
+    /// Owner maintenance independent of scheduling. The operation boundary
+    /// serializes this with cancellation, startup and collector completion.
+    pub async fn daemon_reconcile_dead_local_runs(&self) -> Result<()> {
+        self.deps()
+            .events
+            .operation_boundary()
+            .run(false, async {
+                if self.is_shutting_down() {
+                    return Ok(());
+                }
+                let mut slot = self.inner.state.lock().await;
+                self.load_state(&mut slot).await?;
+                self.reconcile_dead_local_runs(slot.as_mut().expect("state loaded"))
+                    .await
+            })
+            .await
+            .value
+    }
+
     /// Reconcile and select under the boundary, then prepare each candidate
     /// outside it. The caller owns persistent dispatch/batch policy.
     pub async fn daemon_tick(&self, skip_autonomous_seeding: bool) -> Result<()> {
@@ -377,7 +396,21 @@ impl Orchestrator {
                     .insert(task_id.to_owned(), (generation, agent.id.clone()));
                 let launch_config = self.config();
                 let cancel = self.register_cancel(task_id).await;
-                self.save_state(state).await?;
+                if let Err(error) = self.save_state(state).await {
+                    state.claimed.shift_remove(task_id);
+                    // No launch began. Roll back before a collector's debounced
+                    // save can persist the claim, then release this reservation.
+                    let mut preparing = self.inner.preparing_agents.lock().await;
+                    if preparing
+                        .get(task_id)
+                        .is_some_and(|(current, _)| *current == generation)
+                    {
+                        preparing.remove(task_id);
+                        drop(preparing);
+                        self.drop_cancel(task_id).await;
+                    }
+                    return Err(error);
+                }
                 Ok::<_, Error>(Some((
                     task,
                     agent,
@@ -556,7 +589,8 @@ impl Orchestrator {
             if let (Some(preparation), Some(adapter)) = (preparation, adapter.as_ref()) {
                 let preparation = match preparation {
                     Ok(preparation) => preparation,
-                    Err(error) => {
+                    Err(mut error) => {
+                        error.message = format!("effort preparation failed: {error}");
                         if let PreparationFailureOutcome::Cancelled = self.daemon_fail_preparation(
                             &task, &agent, generation, &run.id, &error, &workspace,
                         )
@@ -660,8 +694,55 @@ impl Orchestrator {
                             },
                         );
                         state.claimed.shift_remove(task_id);
+                        if let Err(error) = self.save_state(state).await {
+                            use orch_core::storage::TaskStore;
+
+                            // Nothing was submitted. Restore the slot while we
+                            // still hold its lock, before any debounce can write
+                            // it. The preparing owner stays for error-path release.
+                            state.running.shift_remove(task_id);
+                            state.claimed.insert(task_id.to_owned());
+                            // The InProgress save already spent this attempt.
+                            // Use the same retry policy as fail_before_spawn,
+                            // without treating a remote agent as a local one or
+                            // inserting an unsubmitted run for its failure handler.
+                            let recorded = async {
+                                self.deps().run_service.finish(
+                                    &run.id, RunStatus::Failed, None, Some(error.to_string()),
+                                ).await?;
+                                let fresh = self.deps().task_service.get(task_id).await?;
+                                let status = orch_domain::resolve_failure_status(&fresh);
+                                self.deps().task_service.update_status(task_id, status).await?;
+                                if status == TaskStatus::Retrying {
+                                    let delay = orch_domain::calculate_retry_delay(
+                                        fresh.attempts.saturating_sub(1),
+                                        self.config().scheduling.retry_base_delay_ms,
+                                        self.config().scheduling.retry_max_delay_ms,
+                                    );
+                                    self.enqueue_retry(state, task_id, fresh.attempts + 1, delay, &error.to_string());
+                                    self.emit(OrchestratorEvent::RunRetry {
+                                        run_id: run.id.clone(), attempt: fresh.attempts + 1, delay_ms: delay,
+                                    });
+                                } else {
+                                    self.inner.cached_tasks.invalidate_async().await;
+                                    let tasks = self.inner.cached_tasks.list(&Default::default()).await?;
+                                    self.cascade_fail_dependents(task_id, &tasks,
+                                        &format!("dependency {task_id} failed: {error}")).await;
+                                    state.stats.total_tasks_failed += 1;
+                                }
+                                state.stats.total_runs += 1;
+                                self.emit(OrchestratorEvent::AgentError {
+                                    run_id: run.id.clone(), agent_id: agent.id.clone(),
+                                    error: error.to_string(), error_kind: None,
+                                });
+                                self.save_remote_state(state).await
+                            }.await;
+                            if let Err(record_error) = recorded {
+                                self.emit_error(record_error, format!("record remote pre-submit failure for {task_id}"));
+                            }
+                            return Err(error);
+                        }
                         self.inner.preparing_agents.lock().await.remove(task_id);
-                        self.save_state(state).await?;
                         let request = orch_core::remote::RemoteSubmit {
                             alias: remote.alias.clone(),
                             exec_key: run.id.clone(),
@@ -930,7 +1011,7 @@ impl Orchestrator {
 
     /// Whether this generation still owns the task's preparation. A
     /// generation is never reissued, so once false it stays false.
-    async fn owns_preparation(&self, task_id: &str, generation: u64) -> bool {
+    pub(super) async fn owns_preparation(&self, task_id: &str, generation: u64) -> bool {
         self.inner
             .preparing_agents
             .lock()
@@ -952,22 +1033,45 @@ impl Orchestrator {
                 if self.is_shutting_down() || !self.owns_preparation(task_id, generation).await {
                     return Ok(());
                 }
+                self.inner
+                    .pending_preparation_cleanup
+                    .lock()
+                    .await
+                    .insert(task_id.to_owned(), generation);
                 let mut slot = self.inner.state.lock().await;
+                // The previous release reached its final state write. Leave
+                // that failed write for the next operation, as the recorder's
+                // dirty-state contract requires, instead of flushing it from
+                // the launch's immediate error-path release.
+                if self.inner.remote_state_dirty.load(Ordering::SeqCst)
+                    && slot
+                        .as_ref()
+                        .is_some_and(|state| !state.claimed.contains(task_id))
+                {
+                    return Err(Error::other("Preparation cleanup awaits state persistence"));
+                }
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
-                self.release_preparation_locked(state, task_id).await?;
-                self.save_state(state).await
+                self.release_preparation_locked(state, task_id, generation)
+                    .await
             })
             .await
             .value
     }
 
-    /// Cancel the preparing runs and drop the claim; the caller saves state.
-    async fn release_preparation_locked(
+    /// Retain the reservation until run finalization and claim removal are
+    /// durable. Every caller holds the project boundary and the state lock.
+    pub(super) async fn release_preparation_locked(
         &self,
         state: &mut OrchestratorState,
         task_id: &str,
+        generation: u64,
     ) -> Result<()> {
+        self.inner
+            .pending_preparation_cleanup
+            .lock()
+            .await
+            .insert(task_id.to_owned(), generation);
         for run in self.deps().run_store.list_for_task(task_id).await? {
             if run.status == RunStatus::Preparing {
                 self.deps()
@@ -977,8 +1081,16 @@ impl Orchestrator {
             }
         }
         state.claimed.shift_remove(task_id);
+        // A failed write must not reload the old claim or lose a recorder's
+        // queued retry. The preparation still reserves the task and agent.
+        self.save_remote_state(state).await?;
         self.inner.preparing_agents.lock().await.remove(task_id);
         self.drop_cancel(task_id).await;
+        self.inner
+            .pending_preparation_cleanup
+            .lock()
+            .await
+            .remove(task_id);
         Ok(())
     }
 
@@ -1015,8 +1127,8 @@ impl Orchestrator {
                     // rather than replace it, or the retry runs with no wait.
                     self.inner.remote_state_dirty.store(true, Ordering::SeqCst);
                 }
-                self.release_preparation_locked(state, task_id).await?;
-                self.save_state(state).await?;
+                self.release_preparation_locked(state, task_id, generation)
+                    .await?;
                 Ok(PreparationFailureOutcome::Failed)
             })
             .await

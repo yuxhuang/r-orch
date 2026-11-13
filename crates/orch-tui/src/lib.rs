@@ -50,5 +50,8 @@ pub mod wizard;
 pub use app::App;
 pub use backend::{FakeBackend, TuiBackend};
 pub use clock::{Clock, SystemClock, TestClock};
-pub use runner::{Exit, run, run_until};
-pub use state::{AppState, ViewId};
+pub use runner::{
+    DashboardDriver, Exit, TerminalDashboard, run, run_until, run_until_with_filters,
+    run_until_with_view_intent,
+};
+pub use state::{AppState, KeywordFilters, ViewId, ViewIntent};

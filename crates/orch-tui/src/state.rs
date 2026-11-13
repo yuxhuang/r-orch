@@ -260,6 +260,29 @@ pub enum InputMode {
     Keyword,
 }
 
+/// View intent retained across an explicit dashboard reconnect. Contains only
+/// the three list keywords: no entity data, selection, draft or backend state.
+/// A new dashboard starts with the empty default; nothing is persisted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeywordFilters {
+    tasks: String,
+    goals: String,
+    agents: String,
+}
+
+/// List view intent retained within one dashboard lifetime. This is plain
+/// data: no entities, selection, scroll, prompts, backend or pending actions.
+/// A new dashboard starts with defaults; nothing is persisted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViewIntent {
+    pub(crate) keywords: KeywordFilters,
+    task_sort: TaskSort,
+    goal_sort: GoalSort,
+    agent_sort: AgentSort,
+    agent_group_by: AgentGroupBy,
+    group_by_goal: bool,
+}
+
 /// The most a list keyword may hold, in Unicode scalar values (D1). Typed
 /// keys past it are ignored and a paste is cut to fit.
 pub const KEYWORD_MAX_CHARS: usize = 256;
@@ -2277,6 +2300,42 @@ impl AppState {
     }
 
     // ── Keyword filter (D1, R3–R5) ─────────────────────────────────────────
+
+    /// Capture only the list keywords for an explicit retry.
+    pub fn keyword_filters(&self) -> KeywordFilters {
+        KeywordFilters {
+            tasks: self.task_keyword.value().to_owned(),
+            goals: self.goal_keyword.value().to_owned(),
+            agents: self.agent_keyword.value().to_owned(),
+        }
+    }
+
+    pub(crate) fn restore_keyword_filters(&mut self, filters: &KeywordFilters) {
+        self.task_keyword.reset(&filters.tasks);
+        self.goal_keyword.reset(&filters.goals);
+        self.agent_keyword.reset(&filters.agents);
+    }
+
+    /// Capture only the list keywords, sorts and grouping modes.
+    pub fn view_intent(&self) -> ViewIntent {
+        ViewIntent {
+            keywords: self.keyword_filters(),
+            task_sort: self.task_sort,
+            goal_sort: self.goal_sort,
+            agent_sort: self.agent_sort,
+            agent_group_by: self.agent_group_by,
+            group_by_goal: self.group_by_goal,
+        }
+    }
+
+    pub(crate) fn restore_view_intent(&mut self, intent: &ViewIntent) {
+        self.restore_keyword_filters(&intent.keywords);
+        self.task_sort = intent.task_sort;
+        self.goal_sort = intent.goal_sort;
+        self.agent_sort = intent.agent_sort;
+        self.agent_group_by = intent.agent_group_by;
+        self.group_by_goal = intent.group_by_goal;
+    }
 
     /// The keyword input of an entity list; `None` for the Logs view, which
     /// has filters of its own.

@@ -2208,15 +2208,21 @@ mod tests {
     /// Dispatch every ready task once (`orch run --all`) and the mirror by id
     /// (`orch run <id>`), then wait for whatever started to be collected.
     ///
-    /// The collectors are drained between the two calls: `run_all` returns as
+    /// The collectors are drained between the two calls: `daemon_tick` returns as
     /// soon as the child is spawned, and until its collector clears
-    /// `state.running`, `run_task` on the same id is `TaskAlreadyRunning` —
+    /// `state.running`, `daemon_launch_task` on the same id is `TaskAlreadyRunning` —
     /// correct for the CLI, a race here. It lost reliably on Linux CI.
     async fn dispatch_mirror(worker: &Worker, task_id: &str) {
         timeout(Duration::from_secs(30), async {
-            worker.ctx.engine.orchestrator.run_all().await?;
+            worker.ctx.engine.orchestrator.enable_daemon_mode();
+            worker.ctx.engine.orchestrator.daemon_tick(true).await?;
             worker.ctx.engine.orchestrator.wait_for_collectors().await;
-            worker.ctx.engine.orchestrator.run_task(task_id).await?;
+            worker
+                .ctx
+                .engine
+                .orchestrator
+                .daemon_launch_task(task_id)
+                .await?;
             worker.ctx.engine.orchestrator.wait_for_collectors().await;
             Result::<()>::Ok(())
         })
@@ -2262,7 +2268,7 @@ mod tests {
         assert!(task.review_criteria.as_ref().unwrap().is_empty());
 
         dispatch_mirror(&worker, &task.id).await;
-        worker.ctx.engine.orchestrator.stop().await.unwrap();
+        worker.ctx.engine.orchestrator.daemon_stop().await.unwrap();
         assert_succeeded_and_reported(&worker).await;
     }
 
@@ -2339,7 +2345,7 @@ mod tests {
             .await
             .unwrap();
         dispatch_mirror(&worker, &task.id).await;
-        worker.ctx.engine.orchestrator.stop().await.unwrap();
+        worker.ctx.engine.orchestrator.daemon_stop().await.unwrap();
         assert_succeeded_and_reported(&worker).await;
     }
 

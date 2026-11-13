@@ -1,19 +1,25 @@
-//! The tick loop: reconcile, autonomous seeding, and the reactive dispatch
-//! debounce.
+//! Shared reconciliation and autonomous seeding, with the legacy unit-test
+//! tick loop and reactive dispatch debounce.
 //!
 //! Phase order is contract and the whole tick runs under the
 //! state lock.
 
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 
 use orch_core::error::Result;
 use orch_core::storage::{AgentStore, GoalStore, TaskStore};
 use orch_domain::{
     AgentStatus, OrchestratorEvent, OrchestratorState, RunStatus, RunningEntry, TaskStatus,
-    is_dispatchable, is_terminal,
+    is_terminal,
 };
 
-use super::{AUTO_SEED_COOLDOWN_MS, DEBOUNCE, MAX_IMMEDIATE_DISPATCH_RETRIES, Orchestrator};
+#[cfg(test)]
+use orch_domain::is_dispatchable;
+
+use super::{AUTO_SEED_COOLDOWN_MS, Orchestrator};
+#[cfg(test)]
+use super::{DEBOUNCE, MAX_IMMEDIATE_DISPATCH_RETRIES};
 
 /// `new Date(value).getTime()`. Now lives beside the formatter it inverts,
 /// in `orch-core`, so both share one node-verified test vector.
@@ -24,6 +30,7 @@ impl Orchestrator {
     /// tick-scoped caches, load state, reconcile, seed autonomous work,
     /// dispatch, emit `orchestrator:tick`. Then, **outside** the lock, touch
     /// the lock file so a slow tick is not mistaken for a dead holder.
+    #[cfg(test)]
     pub(super) async fn tick_once(&self) -> Result<()> {
         if self.is_shutting_down() {
             return Ok(());
@@ -39,6 +46,7 @@ impl Orchestrator {
         result
     }
 
+    #[cfg(test)]
     async fn tick_body(&self) -> Result<()> {
         let mut slot = self.inner.state.lock().await;
         if self.is_shutting_down() {
@@ -83,6 +91,7 @@ impl Orchestrator {
     /// Check PID liveness, detect stalls, fix stale agents and orphaned tasks,
     /// and dispatch anything whose retry has come due.
     pub(super) async fn reconcile(&self, state: &mut OrchestratorState) -> Result<()> {
+        self.reconcile_preparation_cleanup(state).await;
         let now = self.deps().clock.now_ms();
         let entries: Vec<(String, RunningEntry)> = state
             .running
@@ -143,41 +152,7 @@ impl Orchestrator {
             // token cancels a local collector, whose adapter kills the child;
             // a remote run also gets a cancel sent to its worker.
             if !live {
-                if let Some(remote) = &entry.remote {
-                    self.cancel_remote(remote).await;
-                }
-                self.take_cancel(task_id).await;
-                // Once the entry is gone the collector's outcome is ignored,
-                // so an unfinished run record is finished here or never.
-                let unfinished = matches!(
-                    self.deps().run_store.get(&entry.run_id).await,
-                    Ok(Some(run)) if matches!(run.status, RunStatus::Preparing | RunStatus::Running)
-                );
-                if unfinished
-                    && let Err(err) = self
-                        .deps()
-                        .run_service
-                        .finish(&entry.run_id, RunStatus::Cancelled, None, None)
-                        .await
-                {
-                    self.emit_error(err, format!("reconcile finish run {}", entry.run_id));
-                }
-                state.running.shift_remove(task_id);
-                if entry.remote.is_none()
-                    && let Err(err) = self
-                        .deps()
-                        .agent_service
-                        .set_status(&entry.agent_id, AgentStatus::Idle)
-                        .await
-                {
-                    self.emit_error(
-                        err,
-                        format!(
-                            "reconcile setStatus idle for stale agent {} (task {task_id})",
-                            entry.agent_id
-                        ),
-                    );
-                }
+                self.reconcile_terminal_entry(state, task_id, entry).await;
                 continue;
             }
 
@@ -234,37 +209,7 @@ impl Orchestrator {
 
             // 3. PID liveness, for runs no collector in this process watches.
             if !collector_live && !self.deps().processes.is_alive(entry.pid) {
-                // A failure *inside* the failure handler — an invalid
-                // transition, say — must still free the slot, or the entry
-                // leaks and the agent stays busy forever. The handler has
-                // already reported whatever went wrong.
-                if self
-                    .handle_run_failure_locked(
-                        state,
-                        task_id,
-                        entry,
-                        "Process crashed unexpectedly",
-                        None,
-                    )
-                    .await
-                    .is_err()
-                {
-                    state.running.shift_remove(task_id);
-                    if let Err(err) = self
-                        .deps()
-                        .agent_service
-                        .set_status(&entry.agent_id, AgentStatus::Idle)
-                        .await
-                    {
-                        self.emit_error(
-                            err,
-                            format!(
-                                "reconcile crash fallback setStatus idle for agent {} (task {task_id})",
-                                entry.agent_id
-                            ),
-                        );
-                    }
-                }
+                self.reconcile_crashed_entry(state, task_id, entry).await;
                 continue;
             }
 
@@ -333,11 +278,129 @@ impl Orchestrator {
 
         self.reconcile_stale_agents(state).await?;
         self.reconcile_orphaned_tasks(state).await?;
+        #[cfg(test)]
         if !self.is_daemon_mode() {
             self.process_retry_queue(state).await?;
         }
         self.prune_remote_clocks(state).await;
-        self.save_state(state).await
+        self.save_reconciled_state(state).await
+    }
+
+    /// Retry owned preparation releases and reap collectorless local deaths.
+    /// Safe with dispatch off: no stalls, remote deadlines, orphan sweeps,
+    /// seeding or retry execution.
+    pub(super) async fn reconcile_dead_local_runs(
+        &self,
+        state: &mut OrchestratorState,
+    ) -> Result<()> {
+        self.reconcile_preparation_cleanup(state).await;
+        let entries: Vec<_> = state
+            .running
+            .iter()
+            .filter(|(_, entry)| entry.remote.is_none())
+            .map(|(id, entry)| (id.clone(), entry.clone()))
+            .collect();
+        for (task_id, entry) in entries {
+            let active = self.inner.active_collectors.lock().await;
+            let finishing = self.inner.finishing_collectors.lock().await;
+            let collected = active.contains(&task_id) || finishing.contains(&task_id);
+            drop(finishing);
+            drop(active);
+            if collected
+                || self.deps().processes.is_alive(entry.pid)
+                || !state
+                    .running
+                    .get(&task_id)
+                    .is_some_and(|current| current.run_id == entry.run_id)
+                || self.worker_signal_unverified(&entry).await
+            {
+                continue;
+            }
+            // A store read failure is not evidence of cancellation or death.
+            let task = self.deps().task_store.get(&task_id).await?;
+            if task.as_ref().is_some_and(|task| !is_terminal(task.status)) {
+                self.reconcile_crashed_entry(state, &task_id, &entry).await;
+            } else {
+                self.reconcile_terminal_entry(state, &task_id, &entry).await;
+            }
+        }
+        self.save_reconciled_state(state).await
+    }
+
+    async fn reconcile_terminal_entry(
+        &self,
+        state: &mut OrchestratorState,
+        task_id: &str,
+        entry: &RunningEntry,
+    ) {
+        if let Some(remote) = &entry.remote {
+            self.cancel_remote(remote).await;
+        }
+        self.take_cancel(task_id).await;
+        // Once the entry is gone the collector's outcome is ignored,
+        // so an unfinished run record is finished here or never.
+        let unfinished = matches!(
+            self.deps().run_store.get(&entry.run_id).await,
+            Ok(Some(run)) if matches!(run.status, RunStatus::Preparing | RunStatus::Running)
+        );
+        if unfinished
+            && let Err(err) = self
+                .deps()
+                .run_service
+                .finish(&entry.run_id, RunStatus::Cancelled, None, None)
+                .await
+        {
+            self.emit_error(err, format!("reconcile finish run {}", entry.run_id));
+        }
+        state.running.shift_remove(task_id);
+        if entry.remote.is_none()
+            && let Err(err) = self
+                .deps()
+                .agent_service
+                .set_status(&entry.agent_id, AgentStatus::Idle)
+                .await
+        {
+            self.emit_error(
+                err,
+                format!(
+                    "reconcile setStatus idle for stale agent {} (task {task_id})",
+                    entry.agent_id
+                ),
+            );
+        }
+    }
+
+    async fn reconcile_crashed_entry(
+        &self,
+        state: &mut OrchestratorState,
+        task_id: &str,
+        entry: &RunningEntry,
+    ) {
+        // A failure *inside* the failure handler — an invalid
+        // transition, say — must still free the slot, or the entry
+        // leaks and the agent stays busy forever. The handler has
+        // already reported whatever went wrong.
+        if self
+            .handle_run_failure_locked(state, task_id, entry, "Process crashed unexpectedly", None)
+            .await
+            .is_err()
+        {
+            state.running.shift_remove(task_id);
+            if let Err(err) = self
+                .deps()
+                .agent_service
+                .set_status(&entry.agent_id, AgentStatus::Idle)
+                .await
+            {
+                self.emit_error(
+                    err,
+                    format!(
+                        "reconcile crash fallback setStatus idle for agent {} (task {task_id})",
+                        entry.agent_id
+                    ),
+                );
+            }
+        }
     }
 
     /// Agents stuck in `running` with no running entry — the mirror image of
@@ -435,6 +498,7 @@ impl Orchestrator {
 
     /// Dispatch everything whose `due_at` has passed, re-reading each task
     /// first: it may have succeeded through another path while it waited.
+    #[cfg(test)]
     async fn process_retry_queue(&self, state: &mut OrchestratorState) -> Result<()> {
         let now = self.deps().clock.now_ms();
         let mut due = Vec::new();
@@ -591,6 +655,7 @@ impl Orchestrator {
     /// The debounce is observable — tests wait past it — so
     /// it stays even though the `select!` arms already reduce the contention
     /// the retry loop was written for.
+    #[cfg(test)]
     pub(super) fn schedule_immediate_dispatch(&self, retries: u32) {
         if self.is_daemon_mode() || self.is_shutting_down() {
             return;
@@ -626,6 +691,7 @@ impl Orchestrator {
     /// A mini-tick: invalidate, load, dispatch, save. **No reconcile.**
     /// Skipped entirely while a `run <id>` single-task run is in flight, so a
     /// one-shot command cannot opportunistically start other work.
+    #[cfg(test)]
     async fn immediate_dispatch(&self) -> Result<()> {
         if self.is_shutting_down() {
             return Ok(());

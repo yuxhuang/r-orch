@@ -64,7 +64,7 @@ async fn pi_drives_a_task_from_todo_to_done() {
         Arc::clone(&processes),
     );
 
-    rig.orchestrator.run_all().await.unwrap();
+    rig.orchestrator.daemon_tick(true).await.unwrap();
 
     // Dispatch: the adapter spawned `pi --mode rpc`.
     let spawns = rig.processes.spawns();
@@ -163,7 +163,7 @@ async fn a_rate_limited_pi_run_fails_and_never_reaches_done() {
         Arc::clone(&processes),
     );
 
-    rig.orchestrator.run_all().await.unwrap();
+    rig.orchestrator.daemon_tick(true).await.unwrap();
 
     let message = "Permission denied: Reached overall message rate limit. Please try again later.";
     rig.processes
@@ -221,7 +221,7 @@ async fn grok_drives_a_task_from_todo_to_done() {
         Arc::clone(&processes),
     );
 
-    rig.orchestrator.run_all().await.unwrap();
+    rig.orchestrator.daemon_tick(true).await.unwrap();
 
     let spawns = rig.processes.spawns();
     assert_eq!(spawns.len(), 1);
@@ -291,7 +291,7 @@ async fn antigravity_drives_a_task_from_todo_to_done() {
         Arc::clone(&processes),
     );
 
-    rig.orchestrator.run_all().await.unwrap();
+    rig.orchestrator.daemon_tick(true).await.unwrap();
 
     let spawns = rig.processes.spawns();
     assert_eq!(spawns.len(), 1);
@@ -364,7 +364,7 @@ async fn a_grok_child_that_floods_stderr_still_completes_and_leaks_nothing_into_
         Arc::clone(&processes),
     );
 
-    rig.orchestrator.run_all().await.unwrap();
+    rig.orchestrator.daemon_tick(true).await.unwrap();
 
     // Well past a Linux pipe buffer, and a recognizable substring that would
     // flip `classify_adapter_error` if it ever reached the message.

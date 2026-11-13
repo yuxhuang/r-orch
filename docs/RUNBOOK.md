@@ -393,8 +393,11 @@ fail it, which is the worse failure mode.
 > daemon as the only writer, two writers can no longer leave an index behind its files; a crash of the daemon
 > between the two writes still can. The daemon rebuilds a **missing or corrupt** `_index.json` at start, but not
 > one that is stale and still valid. The procedure with a daemon: `orch daemon stop`, remove the affected
-> `_index.json`, `orch daemon start`; never remove an index while the daemon runs. The 0.13.0 text below is
-> removed in a later release.
+> `_index.json`, `orch daemon start`; never remove an index while the daemon runs. A listing that an earlier
+> version left inconsistent on a disk that ignores case (a deleted context key or agent that is still listed, or
+> one key listed under two spellings) is not repaired by upgrading and is not detected by `orch doctor`; remove the
+> affected `_index.json` as above to rebuild it from the files (`orch agent remove` cannot clear a listed agent
+> whose file is gone: it reports `Agent not found`). The 0.13.0 text below is removed in a later release.
 
 **Symptom.** `orch task show <id>` returns the task, but `orch task list` and `orch status` do not show it,
 and the orchestrator never dispatches it. The entity's `.yml` file exists on disk.
@@ -733,9 +736,12 @@ git status --short | grep orchestry             # should be empty
    un-ignore it deliberately to share agent definitions. Once a key is in a repository, **`0600` protects
    nothing** — git preserves no mode beyond the executable bit, and anyone who can read the repo can read
    the key.
-2. **Only those two files are owner-only.** `tasks/`, `goals/`, `teams/`, `messages/` and `context/` keep
-   umask modes, so a credential pasted into a task description or a context value **is** world-readable to
-   other local users.
+2. **Not every file is owner-only.** Orch writes the entity YAML files in `tasks/`, `goals/` and `teams/` with an
+   owner-only mode, but their `_index.json` files (`tasks/_index.json` holds every task's description) and
+   message/context files follow the process umask. A credential pasted into a task description or context value may be
+   readable by other local accounts, including group members, when file permissions, directory permissions and ACLs
+   allow access. For what a 0700 `.orchestry` does and does not protect, see [Permissions of
+   `.orchestry/`](manual/18-daemon.md#permissions-of-orchestry).
 3. **The child process still receives it.** `env:` is passed to every agent the entry spawns, so anything
    that agent logs, echoes or sends onward can leak it.
 4. **Backups and sync tools do not read `.gitignore`.** Dropbox, Time Machine, `rsync` without

@@ -911,3 +911,20 @@ async fn linked_idle_peer_wake_ticks_over_ten_seconds() {
     worker_runtime.shutdown().await;
     proxy.abort();
 }
+
+#[tokio::test(start_paused = true)]
+async fn peer_wake_preserves_its_commit_without_a_redundant_state_commit() {
+    let mut rig = Rig::new(true).await;
+    for _ in 0..2 {
+        let before = rig.handler.engine.operation_boundary().current_commit_seq();
+        rig.commit(CommitSource::Peer).await;
+        advance(500).await;
+        rig.wait_ticks(1).await;
+        assert_eq!(
+            rig.handler.engine.operation_boundary().current_commit_seq(),
+            before + 1,
+            "the peer commit remains; the unchanged tick adds none"
+        );
+        assert!(rig.handler.wake.deadline().is_none());
+    }
+}

@@ -107,6 +107,19 @@ async fn initialize_project(options: InitOptions) -> Result<InitOutcome> {
         .adapter
         .clone()
         .unwrap_or_else(|| "claude".to_owned());
+    // Create the private boundary before any children. An AlreadyExists race
+    // is an error, never permission repair of a directory we did not create.
+    tokio::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(paths.root())
+        .await
+        .map_err(|err| {
+            Error::io(
+                format!("create {}", paths.root().display()),
+                paths.root(),
+                err,
+            )
+        })?;
     for dir in [
         paths.tasks_dir(),
         paths.agents_dir(),
@@ -244,6 +257,36 @@ mod tests {
             interactive: false,
             project_root: Default::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn new_state_is_private_and_existing_uninitialized_state_is_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        assert!(!init(temp.path(), shell_args()).await.already_initialized);
+        assert_eq!(
+            std::fs::metadata(temp.path().join(".orchestry"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        let existing = tempfile::tempdir().unwrap();
+        let state = existing.path().join(".orchestry");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(
+            init(existing.path(), shell_args())
+                .await
+                .already_initialized
+        );
+        assert_eq!(
+            std::fs::metadata(&state).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
+        assert_eq!(std::fs::read_dir(state).unwrap().count(), 0);
     }
 
     #[tokio::test]

@@ -2,6 +2,7 @@
 //! router, with `sh -c ...` standing in for `orch tui`.
 
 use std::net::SocketAddr;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,7 +28,10 @@ const ECHO: &str = "echo hello; cat";
 /// task, so every session here sees a daemon.
 async fn start(auth: Auth, script: &str) -> (SocketAddr, Arc<WebState>) {
     let project = tempfile::tempdir().expect("project");
-    std::fs::create_dir_all(project.path().join(".orchestry")).expect(".orchestry");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(project.path().join(".orchestry"))
+        .expect(".orchestry");
     let daemon = tui_support::TestDaemon::start_default(project.path()).await;
     let state = Arc::new(WebState::new(
         &auth,
