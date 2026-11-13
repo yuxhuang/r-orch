@@ -92,6 +92,7 @@ pub async fn run_dashboard(connector: Connector, cwd: PathBuf, version: &str) ->
     watch_termination(Arc::clone(&stop), Arc::clone(&signalled));
 
     let mut screen: Option<Screen> = None;
+    let mut filters = orch_tui::KeywordFilters::default();
     loop {
         let failure =
             match DaemonBackend::launch(connector.clone(), version, cwd.clone(), Arc::clone(&stop))
@@ -101,7 +102,9 @@ pub async fn run_dashboard(connector: Connector, cwd: PathBuf, version: &str) ->
                     // Leave the screen before the dashboard enters its own.
                     drop(screen.take());
                     let loss = backend.session_loss();
-                    let outcome = run_draw_loop(backend, Arc::clone(&stop)).await?;
+                    let (outcome, retained) =
+                        run_draw_loop(backend, Arc::clone(&stop), filters).await?;
+                    filters = retained;
                     if signalled.load(Ordering::SeqCst) {
                         return Ok(ExitCode::SUCCESS);
                     }
@@ -193,10 +196,17 @@ fn client_error(error: ClientError) -> Error {
 /// synchronous and its methods call `Handle::block_on`, which panics inside a
 /// runtime context. A plain `std::thread` has no such context, so the handle
 /// the backend carries resolves against the runtime this task is running on.
-async fn run_draw_loop(backend: DaemonBackend, stop: Arc<AtomicBool>) -> Result<ExitCode> {
+async fn run_draw_loop(
+    backend: DaemonBackend,
+    stop: Arc<AtomicBool>,
+    mut filters: orch_tui::KeywordFilters,
+) -> Result<(ExitCode, orch_tui::KeywordFilters)> {
     let draw = std::thread::Builder::new()
         .name("orch-tui".to_owned())
-        .spawn(move || orch_tui::run_until(backend, &stop))
+        .spawn(move || {
+            orch_tui::run_until_with_filters(backend, &stop, &mut filters)
+                .map(|exit| (exit, filters))
+        })
         .map_err(|err| Error::other(format!("cannot start the dashboard thread: {err}")))?;
     // `join` blocks, so it goes to the blocking pool rather than a worker:
     // awaiting here keeps the runtime free to serve the draw thread's calls.
@@ -211,7 +221,7 @@ async fn run_draw_loop(backend: DaemonBackend, stop: Arc<AtomicBool>) -> Result<
             panic_message(&panic)
         ))),
         Ok(Err(err)) => Err(Error::other(format!("dashboard: {err}"))),
-        Ok(Ok(_)) => Ok(ExitCode::SUCCESS),
+        Ok(Ok((_, filters))) => Ok((ExitCode::SUCCESS, filters)),
     }
 }
 

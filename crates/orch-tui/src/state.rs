@@ -260,6 +260,16 @@ pub enum InputMode {
     Keyword,
 }
 
+/// View intent retained across an explicit dashboard reconnect. Contains only
+/// the three list keywords: no entity data, selection, draft or backend state.
+/// A new dashboard starts with the empty default; nothing is persisted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeywordFilters {
+    tasks: String,
+    goals: String,
+    agents: String,
+}
+
 /// The most a list keyword may hold, in Unicode scalar values (D1). Typed
 /// keys past it are ignored and a paste is cut to fit.
 pub const KEYWORD_MAX_CHARS: usize = 256;
@@ -2277,6 +2287,21 @@ impl AppState {
     }
 
     // ── Keyword filter (D1, R3–R5) ─────────────────────────────────────────
+
+    /// Capture only the list keywords for an explicit retry.
+    pub fn keyword_filters(&self) -> KeywordFilters {
+        KeywordFilters {
+            tasks: self.task_keyword.value().to_owned(),
+            goals: self.goal_keyword.value().to_owned(),
+            agents: self.agent_keyword.value().to_owned(),
+        }
+    }
+
+    pub(crate) fn restore_keyword_filters(&mut self, filters: &KeywordFilters) {
+        self.task_keyword.reset(&filters.tasks);
+        self.goal_keyword.reset(&filters.goals);
+        self.agent_keyword.reset(&filters.agents);
+    }
 
     /// The keyword input of an entity list; `None` for the Logs view, which
     /// has filters of its own.

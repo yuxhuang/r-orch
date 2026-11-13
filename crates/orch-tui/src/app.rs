@@ -216,6 +216,15 @@ impl<B: TuiBackend, C: Clock> App<B, C> {
         app
     }
 
+    /// Bootstrap fresh data, restoring only the list keywords of this dashboard
+    /// lifetime. Selections and all other state start anew against the live rows.
+    pub fn new_with_filters(backend: B, clock: C, filters: &crate::state::KeywordFilters) -> Self {
+        let mut app = Self::new(backend, clock);
+        app.state.restore_keyword_filters(filters);
+        app.state.clamp_all(app.backend.can_create_task());
+        app
+    }
+
     pub fn now(&self) -> i64 {
         self.clock.now_ms()
     }
