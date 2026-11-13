@@ -358,7 +358,7 @@ fn s3<'a>(
     Box::pin(async move {
         set_mode(rig, modes[0]).await;
         rig.adapter.hang_next(1);
-        let _ = rig.orchestrator.run_all().await;
+        let _ = rig.orchestrator.daemon_tick(true).await;
         // The task is running; flip the project default under it.
         set_mode(rig, modes[1]).await;
         rig.orchestrator.cancel_task("tsk_long").await.unwrap();
@@ -405,7 +405,7 @@ async fn a_toggle_during_an_active_run_leaves_that_runs_captured_mode_unchanged(
     })
     .await;
     rig.adapter.hang_next(1);
-    let _ = rig.orchestrator.run_all().await;
+    let _ = rig.orchestrator.daemon_tick(true).await;
     let captured = rig.adapter.for_task("tsk_long");
     assert!(captured.is_eco());
     assert_eq!(captured.config.prompt_mode, Some(PromptMode::Eco));

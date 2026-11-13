@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use orch_domain::{Message, MessageChannel, MessageStatus};
-use orch_engine::{EngineSeams, WatchOptions, build_full_with};
+use orch_engine::{EngineSeams, build_full_with};
 use orch_infra::storage::Paths;
 use orch_peer::PeerRuntime;
 
@@ -97,21 +97,8 @@ async fn check_owner_start() {
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].id, message.id);
 
-    let mut peers = None;
-    engine
-        .orchestrator
-        .start_watch_with(
-            WatchOptions {
-                skip_autonomous_seeding: true,
-                handle_signals: false,
-            },
-            || async {
-                peers = Some(PeerRuntime::start(engine.clone()).await?);
-                Ok(())
-            },
-        )
-        .await
-        .unwrap();
+    engine.daemon_initialize().await.unwrap();
+    let peers = PeerRuntime::start(engine.clone()).await.unwrap();
     // Observe disk directly: MessageStore::list can rebuild an index, hiding
     // a missing index update. No remote is configured to trigger outbox().
     let pruned = tokio::time::timeout(Duration::from_secs(5), async {
@@ -125,7 +112,7 @@ async fn check_owner_start() {
         }
     })
     .await;
-    engine.orchestrator.stop().await.unwrap();
+    engine.orchestrator.daemon_stop().await.unwrap();
     drop(peers);
     assert!(!engine.orchestrator.is_owner());
     assert!(

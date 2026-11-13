@@ -2,13 +2,15 @@
 
 use orch_core::error::{Error, Result};
 use orch_core::storage::TaskStore;
-use orch_domain::{
-    AgentStatus, OrchestratorState, RunStatus, TaskStatus, is_terminal, resolve_failure_status,
-};
+use orch_domain::{AgentStatus, OrchestratorState, RunStatus, TaskStatus, is_terminal};
+
+#[cfg(test)]
+use orch_domain::resolve_failure_status;
 
 use super::Orchestrator;
 
 // Leave room inside the TUI's five-second dead-terminal wind-down budget.
+#[cfg(test)]
 const REMOTE_CANCEL_DRAIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Orchestrator {
@@ -499,6 +501,7 @@ impl Orchestrator {
     /// Worker mirrors have already been quarantined by startup recovery.
     /// For local runs the pid is the only handle, and it
     /// is on the run record, so the existing local path kills then finalizes.
+    #[cfg(test)]
     pub(super) async fn cleanup_orphaned_running_runs(
         &self,
         state: &OrchestratorState,
@@ -633,6 +636,7 @@ impl Orchestrator {
     /// error (`orch logs <exec_key>`), independent of whichever terminal or
     /// event subscriber outlives the process. This moves those existing
     /// `finish` writes out of the state mutex; it adds no await.
+    #[cfg(test)]
     pub(super) async fn drain_remote_cancellations(&self) {
         match self
             .remote_bridge()
@@ -670,6 +674,7 @@ impl Orchestrator {
     /// it. The entry stays in `state.running` as `unknown` and the next start
     /// rehydrates it. Returns the task ids that were detached, which the
     /// caller must keep when it clears the rest of `state.running`.
+    #[cfg(test)]
     pub(super) async fn shutdown_running_entries(
         &self,
         state: &mut OrchestratorState,
@@ -680,6 +685,7 @@ impl Orchestrator {
     /// [`Self::shutdown_running_entries`] for the entries whose task id
     /// `select` accepts; the rest are left untouched. The standalone
     /// interrupt uses it to wind down only this process's own runs.
+    #[cfg(test)]
     pub(super) async fn shutdown_running_entries_where(
         &self,
         state: &mut OrchestratorState,

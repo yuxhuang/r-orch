@@ -102,10 +102,10 @@ async fn env_redaction_child() {
         .await
         .unwrap();
     let remote = mirror(&worker, "env-key").await;
-    // Sequential: a single-task run treats every other dispatchable task as
-    // claimed, so the local control is only created once the mirror is done.
+    // Dispatch the mirror and local control sequentially on the same agent.
+    worker.ctx.engine.orchestrator.enable_daemon_mode();
     let execution = timeout(Duration::from_secs(20), async {
-        worker.ctx.engine.orchestrator.run_task(&remote.id).await?;
+        worker.ctx.engine.orchestrator.daemon_launch_task(&remote.id).await?;
         worker.ctx.engine.orchestrator.wait_for_collectors().await;
         let local = worker
             .ctx
@@ -117,12 +117,12 @@ async fn env_redaction_child() {
                 ..Default::default()
             })
             .await?;
-        worker.ctx.engine.orchestrator.run_task(&local.id).await?;
+        worker.ctx.engine.orchestrator.daemon_launch_task(&local.id).await?;
         worker.ctx.engine.orchestrator.wait_for_collectors().await;
         Result::<Task>::Ok(local)
     })
     .await;
-    let stopped = worker.ctx.engine.orchestrator.stop().await;
+    let stopped = worker.ctx.engine.orchestrator.daemon_stop().await;
     let local = execution.unwrap().unwrap();
     stopped.unwrap();
 

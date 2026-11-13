@@ -6,6 +6,7 @@
 //! write.
 
 use std::collections::BTreeSet;
+#[cfg(test)]
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -14,17 +15,20 @@ use orch_core::adapter::{AdapterError, AgentEvent, AgentEventKind};
 use orch_core::error::Result;
 use orch_core::storage::TaskStore;
 use orch_domain::{
-    AdapterErrorKind, AgentLastError, AgentStatus, OrchestratorEvent, OrchestratorState,
-    ReviewCriterion, RunStatus, RunningEntry, Task, TaskProof, TaskStatus, TokenUsage,
-    TokenUsageOpts, classify_adapter_error, create_token_usage, resolve_completion_status,
-    resolve_failure_status,
+    AdapterErrorKind, AgentLastError, AgentStatus, OrchestratorEvent, OrchestratorState, RunStatus,
+    RunningEntry, Task, TaskProof, TaskStatus, TokenUsage, TokenUsageOpts, classify_adapter_error,
+    create_token_usage, resolve_failure_status,
 };
+
+#[cfg(test)]
+use orch_domain::{ReviewCriterion, resolve_completion_status};
 
 use super::{
     MAX_AGENT_SUMMARY_LEN, MAX_BUS_DATA_LEN, MAX_EVENT_DATA_LEN, MAX_LAST_ERROR_LEN, Orchestrator,
 };
 use crate::agent_service::AgentStatsUpdate;
 use crate::orchestrator::tick::epoch_ms_from_iso;
+#[cfg(test)]
 use crate::review_runner::{ReviewRunner, ReviewRunnerOptions, all_passed, format_report};
 
 /// Whether a string is a timestamp `Date.prototype.toISOString` would produce.
@@ -356,9 +360,15 @@ impl Orchestrator {
         result_text: Option<String>,
         files_changed: Vec<String>,
     ) -> Result<()> {
-        if self.is_daemon_mode() {
+        #[cfg(test)]
+        if !self.is_daemon_mode() {
+            let mut slot = self.inner.state.lock().await;
+            let Some(state) = slot.as_mut() else {
+                return Ok(());
+            };
             return self
-                .daemon_handle_success(
+                .handle_run_success_locked(
+                    state,
                     task_id,
                     run_id,
                     agent_id,
@@ -368,12 +378,7 @@ impl Orchestrator {
                 )
                 .await;
         }
-        let mut slot = self.inner.state.lock().await;
-        let Some(state) = slot.as_mut() else {
-            return Ok(());
-        };
-        self.handle_run_success_locked(
-            state,
+        self.daemon_handle_success(
             task_id,
             run_id,
             agent_id,
@@ -388,6 +393,7 @@ impl Orchestrator {
         clippy::too_many_arguments,
         reason = "each argument is a separate id or result of one run; no params struct exists yet"
     )]
+    #[cfg(test)]
     pub(super) async fn handle_run_success_locked(
         &self,
         state: &mut OrchestratorState,
@@ -799,6 +805,7 @@ impl Orchestrator {
 
     /// Run the review criteria and, if they pass — or if auto-approve is set —
     /// move the task to `done`.
+    #[cfg(test)]
     async fn run_auto_review(
         &self,
         task_id: &str,
@@ -916,13 +923,18 @@ impl Orchestrator {
         self.save_state(state).await
     }
 
-    /// Schedule a reactive dispatch now that an agent is free — unless this
-    /// was a `run <id>` single-task run, which must not start anything else.
+    /// The legacy unit-test scheduler reacts to completion, except single-task
+    /// runs. Normal builds leave scheduling to the daemon's owner loop.
     pub(super) async fn schedule_dispatch_after_run(&self, task_id: &str) {
-        let was_single = self.inner.single_task_runs.lock().await.remove(task_id);
-        if !was_single {
-            self.schedule_immediate_dispatch(0);
+        #[cfg(test)]
+        {
+            let was_single = self.inner.single_task_runs.lock().await.remove(task_id);
+            if !was_single {
+                self.schedule_immediate_dispatch(0);
+            }
         }
+        #[cfg(not(test))]
+        let _ = task_id;
     }
 
     /// Wall-clock runtime of a running entry. `None` when `started_at` does

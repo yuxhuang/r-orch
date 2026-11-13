@@ -457,32 +457,46 @@ fn dispatch_is_the_only_production_caller_of_adapter_execute_and_awaits_preparat
     );
     assert!(text.contains("adapter.execute("), "{text}");
 
-    // The awaited hook, and the contract guard, sit before that call.
-    let dispatch =
-        std::fs::read_to_string(crates.join("orch-engine/src/orchestrator/dispatch.rs")).unwrap();
-    let execute_at = dispatch
-        .find("adapter.execute(params)")
-        .expect("the one execute call");
-    let prepare_at = dispatch
-        .find(".prepare_effort(&params)")
-        .expect("the hook call");
-    assert!(
-        prepare_at < execute_at,
-        "prepare_effort must precede execute"
-    );
-    let between = &dispatch[prepare_at..execute_at];
-    assert!(
-        between.contains(".await"),
-        "the hook result must be awaited"
-    );
-    assert!(
-        between.contains("check_preparation"),
-        "the contract guard sits between hook and spawn"
-    );
-    assert!(
-        between.contains("params.config = preparation.config"),
-        "the prepared config is what executes"
-    );
+    // The only execute call stays shared. Both launch paths must await the
+    // hook and install its checked config before handing off to that helper.
+    for (file, entry) in [
+        ("dispatch.rs", "async fn dispatch_claimed("),
+        ("daemon.rs", "async fn daemon_launch_task_with_guard("),
+    ] {
+        let source =
+            std::fs::read_to_string(crates.join("orch-engine/src/orchestrator").join(file))
+                .unwrap();
+        let launch = &source[source.find(entry).expect("launch entry point")..];
+        let execute_at = launch
+            .find("self.execute_prepared(")
+            .expect("launch hands off to the shared execute helper");
+        let prepare_at = launch[..execute_at]
+            .find(".prepare_effort(&params)")
+            .expect("launch invokes the preparation hook before execute_prepared");
+        let between = &launch[prepare_at..execute_at];
+        if file == "daemon.rs" {
+            assert!(
+                between
+                    .trim_start_matches(".prepare_effort(&params)")
+                    .trim_start()
+                    .starts_with(".await"),
+                "the daemon launch must await the hook result"
+            );
+        } else {
+            // The retained unit-test scheduler polls its pinned hook future in
+            // select!, so cancellation can settle before a model is spawned.
+            assert!(between.contains("tokio::pin!(preparation)"));
+            assert!(between.contains("prepared = &mut preparation => prepared"));
+        }
+        assert!(
+            between.contains("check_preparation"),
+            "{file}: the contract guard sits between hook and spawn"
+        );
+        assert!(
+            between.contains("params.config = preparation.config"),
+            "{file}: the prepared config is what executes"
+        );
+    }
 }
 
 #[test]
