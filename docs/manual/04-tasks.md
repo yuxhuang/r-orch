@@ -122,6 +122,26 @@ orch also matches labels to agents. For a task without an assignee, an agent sco
 
 `--scope` lists the files a task is expected to touch. orch does not start a task whose scope overlaps with a task that is already in progress. That keeps two agents from working on the same files at once.
 
+#### The scope-hold warning
+
+A task that waits only because of its scope stays `todo` (or `retrying`). `orch serve --once` logs a `task:scope_overlap` warning for it with the held task (`taskId`), the task that blocks it (`overlappingTaskId`) and the held task's scope (`patterns`). `overlappingTaskId` always names a real blocker: a task that is running or has been claimed. In v0.13.0 it sometimes repeated the held task's own id.
+
+Unlike v0.13.0's warning on every reached dispatch pass, `orch serve --once` reports a scope hold when it is first observed or its blocker changes. It then reminds you at the next eligibility check after five minutes since the last report. Time with dispatch off counts, missed reminders are not replayed, and a late follower can see the next reminder.
+
+What this does and does not tell you:
+
+- **Reminders need an evaluation.** A reminder comes only when dispatch evaluates the held task. With dispatch off no reminder comes by itself; `orch daemon status` says that dispatch is off.
+- **The five minutes are a minimum.** A reminder comes at the first evaluation at or after five minutes, not exactly on the fifth minute. At most 12 reminders per held task and hour, plus one report each time the blocker changes.
+- **A daemon restart repeats the first report** of a hold that still exists, because the daemon does not keep what it reported across a restart.
+- **Setting the wall clock back** silences the reminders of an unchanged hold until the clock passes the last report plus five minutes. A daemon restart resets this.
+- **There is no "hold ended" event.** The absence of a reminder is not evidence that the hold ended: the task may simply not have been evaluated. `orch task list` shows whether the task has started.
+- **A hold that ends and returns** between two evaluations of the same pair (a scope or a reservation ends and comes back) may be reported only at the next reminder, not at once.
+- **Delivery is best effort, with no replay.** A follower that falls behind (more than 256 queued events, or one event larger than the 1 MiB frame) gets a resync, and the reason is not printed. A follower that attaches later does not see earlier lines.
+- **The event is not bounded by size.** It carries the held task's whole scope list, so a task with a very large scope makes a large event.
+- **Odd characters in scope strings.** The `patterns` field is written as JSON in both log formats, so control characters in a scope string are escaped. Other Unicode is not filtered.
+
+The daemon keeps, in memory only, what it last reported for each held task. It drops an entry when dispatch evaluates a task (also by a manual run) or at a dispatch tick and finds the hold gone, so the entries are bounded by the live tasks. Switching automatic dispatch off does not clear or reset them. There is nothing to configure, and there is no new message, setting, wire or disk format.
+
 ## List and show tasks
 
 ```sh

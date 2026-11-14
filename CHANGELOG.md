@@ -31,6 +31,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - For new projects, `orch init` creates `.orchestry` with mode 0700. A project whose `.orchestry` is writable by group or others, or belongs to another user, is refused and no permission is changed. The refusal names the project and the directory; it prints the owner's repair and start commands, with the paths shell-quoted, only when the directory is yours and is group- or world-writable.
 
 - The engine's per-operation domain-event buffer is not capped: it holds one operation's events until release and grows with the number emitted. Commit metadata (256 entries / 64 KiB) and subscription/session output have separate limits. Idle worker heartbeats are silent; an idle controller still publishes Remote status about once per second.
+- `orch serve --once` scope-overlap warnings now report the first observed hold and blocker changes, then repeat unchanged holds at most once per five minutes when dispatch evaluates them, instead of once per reached dispatch pass in v0.13.0, and `overlappingTaskId` always names a real blocking task rather than sometimes the held task itself. See [Tasks](docs/manual/04-tasks.md#the-scope-hold-warning) for what this does and does not tell you.
 
 ### Removed
 - `orch tui --observe` and `orch tui --listen`: the dashboard is always a client of the daemon, and listening is a start option of the daemon.
@@ -48,6 +49,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - Daemon: `orch daemon start` replaces a leftover socket only when connecting to it is refused; on permission denied or any other connect error it cannot tell whether a daemon listens, so it leaves the socket alone and exits 2.
 - Daemon: when the connection breaks after a request was sent, the command says that the request may have been applied and to inspect state before retrying (exit 7), rather than that no daemon is running.
 - Daemon: `orch daemon start` fails with exit 1, naming the failed write, when recovery cannot save a task, run or agent change, rather than become ready with the change lost.
+- Daemon: when it finds that it no longer owns the project lock, the daemon also writes one fixed line starting `⚠ ownership lost` to its standard error (the capped `daemon.log` of a detached daemon), once and on a best-effort basis, next to `ownership: LOST` in `orch daemon status`. The line does not stop the daemon and does not stop another process from writing; see [Lost ownership](docs/manual/18-daemon.md#status).
 
 ### Fixed
 - OpenCode effort compatibility probes yield while waiting for spawn admission and can be cancelled before a diagnostic holder returns. Explicit daemon starts show only payload-free spawn warnings by default on stderr or the private detached log; explicit logging filters, including `RUST_LOG=off`, still apply.

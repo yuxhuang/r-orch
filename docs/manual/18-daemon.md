@@ -248,6 +248,28 @@ turns dispatch off. It does not recreate the lock. Plain `orch daemon status` th
 `ownership: LOST — stop and restart the daemon`; `--json` and `--yaml` show `ownership` as `lost`. To recover, stop
 the daemon and start it again.
 
+The daemon also writes one fixed line to its standard error when it finds its ownership lost (two spaces, then `⚠`):
+
+```text
+  ⚠ ownership lost: the project PID lock is missing or names another process; dispatch is off and this daemon is still running
+```
+
+A foreground daemon writes it to its terminal; a detached daemon (`--detach`) writes it to the capped
+`.orchestry/daemon.log`. `RUST_LOG` does not suppress it. The daemon attempts it once, from a separate thread that
+nothing waits for, and also when recording the loss failed. It is best effort: it arrives late when standard error is
+drained later, it is lost if the daemon exits before anyone reads it, and it is absent if the thread or the duplicate
+of the descriptor cannot be created (a failed write is not retried). `orch daemon status` stays the authoritative
+signal. The notice does not stop a second writer: the daemon disables dispatch and reports LOST, but it does not exit
+by itself and it does not prevent another process from writing to the project.
+
+Two ways to get here that are worth knowing. If you delete `.orchestry/orchestry.lock` while a daemon runs (the
+[troubleshooting steps](13-troubleshooting.md#orch-daemon-already-running-pid-unavailable-and-no-daemon-is-running)
+tell you to delete it only after checking that no daemon runs), the daemon reports LOST at its next check. And orch
+0.13.0 treats a lock file that has not been touched for 60 seconds as abandoned even when its process is alive; the
+daemon touches the file every 10 seconds, so only a daemon suspended for longer (a laptop with its lid closed) is
+exposed to a 0.13.0 binary that starts. That is read from the code, not observed. Stop every 0.13.0 process before you
+start the daemon.
+
 From then until it stops, the daemon refuses the requests that switch dispatch or start a run, from every client,
 with `daemon ownership was lost` (exit 1; nothing was executed):
 
@@ -540,7 +562,7 @@ is something you do.
 
 | Situation | What you see | What to do |
 |---|---|---|
-| The daemon crashed or was killed (`kill -9`) | The next command of every client reports no daemon (exit 7); nothing restarts it. The stale socket and `daemon.json` stay until the next start. | Start it again. The new daemon has dispatch off, clears stale claims, records runs whose agent died as cancelled and their agents as idle, and leaves remote work as unknown until the peer syncs. Check tasks and runs before you retry anything or turn dispatch on. |
+| The daemon crashed or was killed (`kill -9`) | The next command of every client reports no daemon (exit 7); nothing restarts it. The stale socket and `daemon.json` stay until the next start. | Start it again. The new daemon has dispatch off, clears stale claims, records runs whose agent died as cancelled and their agents as idle, and leaves remote work as unknown until the peer syncs. Check tasks and runs before you retry anything or turn dispatch on. Agents that survived the crash get the no-daemon message too: with `ORCH_TASK_ID` or `ORCH_AGENT_ID` set it says not to start the daemon, without both it prints `Start it with: orch daemon start`, and a start from an agent context is refused (exit 2) in words that name `--from-agent`. |
 | A foreground daemon's terminal or pane closed | SIGHUP: a clean stop, the same as `orch daemon stop`; its local agents are stopped (unless cleanup fails; see the stop section). | Start it again in a new pane, or use `--detach`. |
 | A detached daemon after a reboot (logout is untested) | No daemon answers. | Start it again. orch supplies no launchd job, watchdog or restart. |
 | Recovery at start cannot save a task, run or agent change | The start exits 1 and names the write that failed; `orch daemon status` exits 7. | Fix the cause (permissions, disk space), then start again; the state needed to finish the recovery is kept. |

@@ -109,6 +109,13 @@ retry it. A restart does not resume the agent's conversation. `orch daemon start
 `orch run --watch` refuse to start from such an environment (exit 2); each accepts `--from-agent` to override
 that on purpose.
 
+This is also what the agents that survive a daemon crash meet. An agent process whose environment has neither
+variable (a child that cleared its environment, for example) gets the ordinary message with
+`Start it with: orch daemon start`. If it tries, the start is refused (exit 2) with `Refusing to start the orch daemon
+from an agent context (ORCH_TASK_ID or ORCH_AGENT_ID is set). The owner starts the daemon; pass --from-agent only if
+the owner deliberately intends this.`, which names `--from-agent`. Whether your agent roles or sandboxes forbid that
+flag is your decision; orch does not.
+
 **Not this entry:** `daemon_busy` (the daemon runs but found no room for the client within about 13 s, that is 10 s
 of waiting plus one last connection attempt, for a session
 or for the connection itself, so the count can read `1/64 sessions`: close clients and retry), `wrong_project` (the socket
@@ -181,13 +188,41 @@ show `"ownership": "lost"`). A command that switches dispatch or starts a run fa
 - the dashboard's `/watch`, `/run` and `/run-all`, which show `Failed: daemon ownership was lost` (`/pause` has
   nothing to stop: the header shows dispatch off, and it answers `Watch mode not active`).
 
-Nothing is written to `.orchestry/daemon.log` when this happens (without `RUST_LOG` and without
-`ORCHESTRY_DEBUG` the daemon's log records only process-spawn warnings and a one-line `⚠ orchestrator:error` notice
-per engine error, and losing ownership produces neither). Often the first sign is that tasks stop starting and `orch daemon status` shows
+Besides the notice below, the daemon's log records nothing about it (without `RUST_LOG` and without
+`ORCHESTRY_DEBUG` it records only process-spawn warnings and a one-line `⚠ orchestrator:error` notice
+per engine error, and losing ownership produces neither of those). Often the first sign is that tasks stop starting and `orch daemon status` shows
 `dispatch OFF`.
+
+**The notice.** When the daemon finds its ownership lost it writes one fixed line to its standard error (two spaces,
+then `⚠`):
+
+```text
+  ⚠ ownership lost: the project PID lock is missing or names another process; dispatch is off and this daemon is still running
+```
+
+In a foreground daemon that is the terminal; in a detached daemon (`--detach`) it is the capped `.orchestry/daemon.log`.
+`RUST_LOG` does not suppress it. The daemon attempts it once, from a separate thread that nothing waits for, and
+it is written even when recording the loss failed. It is best effort:
+
+- it arrives late when standard error is drained later (for example a pipe whose reader is slow);
+- it is lost if the daemon exits before anyone reads it;
+- it is absent if the thread or the duplicate of the standard-error descriptor cannot be created; a failed write is
+  not retried.
+
+Do not conclude from a missing line that ownership is held: `orch daemon status` is the authoritative signal.
+**The notice does not stop a second writer.** The daemon turns dispatch off and reports LOST; it does not exit by
+itself, and it does not prevent another process from writing to the project.
 
 **Cause.** The daemon re-checks `.orchestry/orchestry.lock` every 10 seconds. The file was deleted, it names
 another PID, or it no longer holds a PID (it is damaged). The daemon does not recreate it.
+
+- **You deleted it while the daemon ran.** The [Corrupt lock file](#corrupt-lock-file) steps tell you to
+  `rm .orchestry/orchestry.lock` only after you checked that no daemon runs. If one does run, it finds the file
+  missing at its next check, reports LOST and turns dispatch off, as described here.
+- **An orch 0.13.0 binary took the lock.** orch 0.13.0 treats a lock file that has not been touched for 60 seconds as
+  abandoned, even when its process is alive. The daemon touches the file every 10 seconds, so this concerns a daemon
+  that was suspended for longer (a laptop with its lid closed, for example). This is read from the code, not
+  observed. Stop every 0.13.0 process of the project before you start the daemon, and do not run one beside it.
 
 **What the daemon still does.** Dispatch is off and stays off. Agents already running keep running. Every request
 that is not in the list above is still executed, reads and writes, for every client.

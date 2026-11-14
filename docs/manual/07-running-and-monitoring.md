@@ -87,7 +87,7 @@ The task cannot start when:
 
 - It is not `todo` or `retrying`, for example `done` or `cancelled`. Run `orch task retry` first for a `failed` or `cancelled` task.
 - Its agent is disabled, or busy with another run, or the concurrency limit is reached.
-- It waits for approval, has a dependency that is not `done`, belongs to a paused goal, or its scope overlaps a running task.
+- It waits for approval, has a dependency that is not `done`, belongs to a paused goal, or its scope overlaps a running task. `orch serve --once` warns about a scope hold when it first sees it and then reminds you; what that warning does and does not tell you is in [The scope-hold warning](04-tasks.md#the-scope-hold-warning).
 
 Other `todo` tasks of the same agent do not stop it. To see why a task cannot start, run `orch task show <task-id>` and `orch agent list`.
 
