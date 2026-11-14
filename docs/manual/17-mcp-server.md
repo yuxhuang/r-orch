@@ -165,7 +165,7 @@ stale.
 The `initialize` result names the server, its version, the project and the mode. This is the reply to a client
 that asked for protocol version `2025-11-25`, from `orch mcp --project-root /private/tmp/orch-w3-v2n5p_ww/p --agent agt_me` in a disposable
 project named `p`, captured from a 0.13.0 development build. The `serverInfo.version` comes from the installed
-build (1.0.0 in the versioned candidate); the historical reply below is preserved, not a new execution:
+build (`1.0.0` for orch 1.0.0); the historical reply below is preserved, not a new execution:
 
 ```json
 {

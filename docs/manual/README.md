@@ -34,8 +34,8 @@ Find your goal in the table, then read the chapter. The table lists every chapte
 | Let an MCP client or my agents use orch through MCP | [17. The MCP server](17-mcp-server.md) | Start `orch mcp`, modes, identity, client and worker setup, every tool and resource, errors, limitations |
 | Start, check or stop the daemon, or fix `No orch daemon is running` | [18. The orch daemon](18-daemon.md) | Why a daemon, start and stop it, dispatch on and off, the no-daemon message and exit code 7, sockets, version skew, upgrading from v0.13.0 (1.0.0) |
 
-This manual targets the 1.0.0 candidate; publication is pending. Historical captures keep their original build
-versions and dates and do not claim a new execution.
+This manual describes orch 1.0.0. Historical captures keep their original build versions and dates and do not claim
+a new execution.
 
 Each chapter starts with what you can do after reading it. Commands are in `sh` blocks. The output below
 them was checked against orch 0.9.3, so your IDs and times differ.

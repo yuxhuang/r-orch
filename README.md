@@ -45,9 +45,9 @@ cargo install --path crates/orch-cli
 
 ### Installing a release
 
-The 1.0.0 release candidate introduces explicit project daemons, a breaking change from 0.13.0. Read
+Version 1.0.0 introduces explicit project daemons, a breaking change from 0.13.0. Read
 [Upgrading from v0.13.0](#upgrading-from-v0130) and the [1.0.0 notes](CHANGELOG.md#100---2026-11-14),
-including the known gaps and pending release validation. Publication and the package recipe update remain pending.
+including the known gaps and the dated validation snapshots.
 
 Releases are tags on `main` (`vX.Y.Z`). v0.5.0 is the first release with
 [remote agents](#remote-agents); they were previewed in the pre-release tags `v0.5.0-alpha.1` and
@@ -669,9 +669,12 @@ Upgrade
 4. Restart your MCP sessions so that they run the new `orch mcp`.
 5. Stop it with `orch daemon stop`.
 
-The major version supplies no additional CLI, Rust API, wire or storage stability guarantee. The local protocol
-remains 2; ordinary sessions require the same package version and protocol, so stop/start explicitly and reconnect
-MCP when switching versions. Remote TCP peer protocol/schema is unchanged; no broader tested peer range is claimed.
+Versioning follows the project's declared SemVer policy. The version number is not evidence of compatibility or
+reliability beyond the recorded checks; the documented limitations and unproven items remain. The local protocol
+remains 2. Daemon-era builds whose package version or protocol differs refuse each other's ordinary sessions, so stop
+and start explicitly and reconnect MCP when switching them. Released 0.13.0 has no daemon handshake and is not
+refused: stop every 0.13.0 process first (step 1). Remote TCP peer protocol/schema is unchanged; no broader tested
+peer range is claimed.
 
 What else changes
 - `orch serve` and `orch run --watch` start the daemon (exit 4 with `Use: orch daemon dispatch on` if one already
@@ -699,7 +702,9 @@ What else changes
   restarts, and a connection from a second user account. Each is listed, with what was checked instead, under
   [Known limitations and unverified behaviour](CHANGELOG.md#known-limitations-and-unverified-behaviour).
 
-Roll back by stopping the daemon (`orch daemon stop`) and reinstalling v0.13.0; the stored formats are unchanged, so
+Roll back by stopping the daemon with the 1.0.0 binary (`orch daemon stop`; v0.13.0 has no such command) and
+reinstalling v0.13.0 only after the stop exits 0. On exit 1 or 7, let 1.0.0 reconcile and establish a clean stop
+first. v0.13.0 does not generally detect a running 1.0.0 daemon. The stored formats are unchanged, so
 v0.13.0 reads the project (checked once on a representative project, not on every file). The daemon adds entries to
 `.orchestry/.gitignore` and writes the optional task `workspace` field for a task it dispatches in shared-workspace
 mode; v0.13.0 reads that field. The daemon's runtime files (`run/`, `daemon.json`, `daemon.log`, `daemon.log.1` and `.daemon-owner.lock` in
