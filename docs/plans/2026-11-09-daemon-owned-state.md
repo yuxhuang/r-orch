@@ -1,7 +1,7 @@
 # Daemon-owned state: one orch process owns `.orchestry/`
 
 status: active
-progress: PR 1 to PR 4 are merged (#74 to #80); #81 (scope-overlap event and lost-ownership notice) is an open draft; the spec's Verification table is filled and the plan is not `done` until the owner has dealt with its list of unproven `must` rows
+progress: PR 1 to PR 4 are merged (#74 to #80); #81 (scope-overlap event and lost-ownership notice) is merged (fc8d8bf8); the spec's Verification table is filled and the plan is not `done` until the owner has dealt with its list of unproven `must` rows
 owner: orchestrator (lead)
 date: 2026-11-09
 spec: [../specs/2026-11-09-daemon-owned-state.md](../specs/2026-11-09-daemon-owned-state.md) (approved by the owner at gate 2, 2026-11-09)
@@ -19,8 +19,13 @@ class: one writer instead of a patch per race.
 The spec's won't rows W1–W10: auto-start of any kind (owner decision: the owner wants to know when a long-lived
 process starts on their machine); a direct-store fallback or offline read lane in any client; SQLite or any change
 to the YAML, index, `config.yml`, org-template or run-event formats; Windows; one daemon per user for several
-projects; changes to the remote peer protocol; an idle exit, watchdog or automatic restart; a release, tag or
-version bump (0.14.0 is separate).
+projects; changes to the remote peer protocol; an idle exit, watchdog or automatic restart.
+
+The owner amended the original release exclusion on 2026-11-14: a major release and tag follow the final
+documentation and acceptance decisions. The planned release is 1.0.0, replacing 0.14.0. The release cold gate is
+not run, skipped by the owner's word of 2026-11-14; one green Linux CI execution per PR remains required.
+The owner controls merges, tagging and publishing. See the spec's release amendment; no new protocol or
+on-disk stability guarantee follows from the package version alone.
 
 ## Context
 - Base: `main` at `8bab8d1c` (v0.13.0). Owner's request: the goal text, quoted in the spec's Source.
@@ -86,7 +91,7 @@ rejected alternatives. This section is the summary a builder needs to find the r
 ## Tasks
 
 Four stacked PRs against `main` (spec R29, regrouped after a red-team review found that a split cutover would
-ship a daemon client and a direct writer side by side), each green and leaving `main` working; the owner merges each, no version bump. PR *n*+1 is built once PR *n* is frozen for review and
+ship a daemon client and a direct writer side by side), each green and leaving `main` working; the owner merges each; implementation PRs make no version bump, and the subsequently ordered 1.0.0 release follows them. PR *n*+1 is built once PR *n* is frozen for review and
 rebases on its merge. Builders work in separate worktrees with disjoint scopes and integrate by merge, never by
 rebase of a shared branch. Owners are roles; task ids live in the tracker, not in this plan.
 
@@ -179,7 +184,7 @@ holds remain.
 
 ## Status
 
-Status as of #81 being an open draft (2026-11-14). The spec's [Verification](../specs/2026-11-09-daemon-owned-state.md#verification)
+Status as of the merge of #81 (2026-11-14). The spec's [Verification](../specs/2026-11-09-daemon-owned-state.md#verification)
 table gives the evidence per row and what is not proven.
 
 | Item | State |
@@ -191,7 +196,7 @@ table gives the evidence per row and what is not proven.
 | PR 3, `feature/daemon-push-i3e` | merged: [#76](https://github.com/yuxhuang/r-orch/pull/76), merge commit `47b3c5d9` |
 | PR 4, `feature/daemon-enforce` | merged in three pull requests: [#77](https://github.com/yuxhuang/r-orch/pull/77) (4a, `eae4f13d`), [#79](https://github.com/yuxhuang/r-orch/pull/79) (a test repair, `ab538dec`) and [#78](https://github.com/yuxhuang/r-orch/pull/78) (4b, `12b3bd28`) |
 | Documentation as built, and one registry-lock test repair | merged: [#80](https://github.com/yuxhuang/r-orch/pull/80), merge commit `2b91c674`, head `d002013f`; the cold gate passed on macOS at that head (9 of 9 steps, 6,935 tests) |
-| Scope-overlap event and lost-ownership notice (R40) | [#81](https://github.com/yuxhuang/r-orch/pull/81) is an open draft at `bed2b433`: Linux CI run 43552080077 green three times; the 60-second stress run and an automated end-to-end run passed on macOS; the cold gate was not run, by the owner's decision of 2026-11-13 |
+| Scope-overlap event and lost-ownership notice (R40) | [#81](https://github.com/yuxhuang/r-orch/pull/81) merged at head `bed2b433`, merge commit `fc8d8bf8`: Linux CI run 43552080077 green three times; the 60-second stress run and an automated end-to-end run passed on macOS; the cold gate was not run, by the owner's decision of 2026-11-13 |
 | Verification table, status lines, gate and CI statement | written in a documents-only change that follows #81; `in part` rows remain, so the spec and this plan are **not** `done` |
 | QA on the owner's Mac (R28, R35) | replaced by the owner, on 2026-11-13, by an automated end-to-end run in tmux; see R28 |
 

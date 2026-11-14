@@ -124,7 +124,7 @@ that finds no daemon returns a tool result with `isError: true`, and a resource 
 answered by the MCP library without asking the daemon, so it succeeds even while no daemon runs; the next tool call
 then reports no daemon. A client that reconnects starts a new `orch mcp` process, and that process fails its
 `initialize` as described above. Seen with a plain stdio client on macOS after `kill -9` of the daemon (two repeated
-`initialize` requests answered with success, each followed by a failing tool call); read from `until_daemon` and
+`initialize` requests answered with success one after the other, then one tool call that failed with exit code 7); read from `until_daemon` and
 `serve_transport` in `crates/orch-cli/src/mcp/server.rs`. It has not been fixed.
 
 ### Exit codes and startup errors
