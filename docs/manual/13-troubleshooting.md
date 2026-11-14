@@ -71,6 +71,8 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
   2. Look at the file: `cat .orchestry/orchestry.lock`. A number is a real process; anything else is damage.
   3. If it is damaged, delete it: `rm .orchestry/orchestry.lock`, then run your command again.
 
+  If a daemon does run when you delete the lock, it reports `ownership: LOST` at its next check (within about 10 seconds) and turns dispatch off, and it attempts to write one notice line to its standard error (best effort; `orch daemon status` is the authoritative signal). See [Lost ownership](18-daemon.md#status).
+
   More detail: [Corrupt lock file](../RUNBOOK.md#corrupt-lock-file).
 
 ### `orch serve` or `orch run --watch` exits 4 with `Use: orch daemon dispatch on`

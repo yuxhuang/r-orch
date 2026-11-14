@@ -140,6 +140,14 @@ async fn overlapping_scopes_serialize_while_disjoint_work_fills_the_free_slots()
         })
     };
 
+    let overlaps = Arc::new(Mutex::new(BTreeSet::new()));
+    let overlap_sink = overlaps.clone();
+    let overlap_subscription = runtime.events.on_any(move |event| {
+        if let OrchestratorEvent::TaskScopeOverlap { task_id, .. } = event {
+            overlap_sink.lock().unwrap().insert(task_id.clone());
+        }
+    });
+
     runtime
         .daemon_initialize()
         .await
@@ -224,6 +232,12 @@ async fn overlapping_scopes_serialize_while_disjoint_work_fills_the_free_slots()
     let started_db_child = index_of(&format!("started:{}", db_child.id));
     assert!(completed_db_parent > started_db_parent);
     assert!(started_db_child > completed_db_parent, "trace={trace:?}");
+
+    overlap_subscription.unsubscribe();
+    assert_eq!(
+        *overlaps.lock().unwrap(),
+        BTreeSet::from([auth_parent.id.clone(), db_child.id.clone()])
+    );
 
     // Four runs, all succeeded, one per task, each with at least one output
     // event written to its JSONL file.
@@ -328,6 +342,14 @@ async fn a_task_with_no_scope_is_never_blocked_by_one_that_has_scope() {
         .await
         .expect("create unscoped task");
 
+    let overlaps = Arc::new(Mutex::new(BTreeSet::new()));
+    let overlap_sink = overlaps.clone();
+    let overlap_subscription = runtime.events.on_any(move |event| {
+        if let OrchestratorEvent::TaskScopeOverlap { task_id, .. } = event {
+            overlap_sink.lock().unwrap().insert(task_id.clone());
+        }
+    });
+
     runtime
         .daemon_initialize()
         .await
@@ -367,6 +389,10 @@ async fn a_task_with_no_scope_is_never_blocked_by_one_that_has_scope() {
         .await
         .expect("daemon stop");
     runtime.lock.release().await;
+
+    overlap_subscription.unsubscribe();
+    // Unscoped work is exempt from scope exclusion.
+    assert!(overlaps.lock().unwrap().is_empty());
 
     // A task with no scope runs alongside the scoped task; both runs succeeded.
     let runs = runtime.run_service.list_all().await.expect("list runs");

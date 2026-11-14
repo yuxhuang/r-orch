@@ -27,6 +27,7 @@ use orch_proto::ops::args::{DaemonStopArgs, DispatchSetArgs, DispatchSwitch};
 use orch_proto::ops::results::{DaemonStatus, DispatchState, OwnershipStatus, StopOutcome};
 use orch_proto::path::WirePath;
 use std::io::Write;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -784,12 +785,39 @@ async fn heartbeat(lock: Arc<PidLock>, handler: ServiceHandler, mut quit: watch:
             tracing::error!(
                 "ownership_lost: the project PID lock is missing or names another process"
             );
-            if let Err(error) = handler.set_ownership_lost().await {
-                tracing::error!(code = ?error.code, "could not record ownership loss");
-            }
+            let recorded = handler.set_ownership_lost().await;
+            // The state operation has released its permit before reporting.
+            report_ownership_loss(recorded, || {
+                // One detached OS thread owns the potentially blocking write.
+                // Runtime shutdown must not join it, and it must never hold the
+                // process-wide stderr lock. A pending line is lost at exit.
+                let _ = std::thread::Builder::new()
+                    .name("ownership-notice".into())
+                    .spawn(|| {
+                        // Duplicate the descriptor: preserve daemon.log's open
+                        // file/append position without changing shared fd flags.
+                        if let Ok(fd) = std::io::stderr().as_fd().try_clone_to_owned() {
+                            write_ownership_notice(std::fs::File::from(fd));
+                        }
+                    });
+            });
             return;
         }
     }
+}
+
+fn report_ownership_loss(recorded: crate::coordinator::OpResult<()>, write_notice: impl FnOnce()) {
+    if let Err(error) = recorded {
+        tracing::error!(code = ?error.code, "could not record ownership loss");
+    }
+    write_notice();
+}
+
+fn write_ownership_notice(mut stderr: impl Write) {
+    let _ = writeln!(
+        stderr,
+        "  ⚠ ownership lost: the project PID lock is missing or names another process; dispatch is off and this daemon is still running"
+    );
 }
 
 pub use crate::bootstrap::{InitOptions, InitOutcome, initialize};
@@ -871,6 +899,25 @@ mod tests {
     use super::test_support::{project, scratch, spec};
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn failed_ownership_recording_still_writes_the_constant_notice() {
+        use orch_proto::error::{ErrorBody, ErrorCode, Execution};
+
+        let mut stderr = Vec::new();
+        report_ownership_loss(
+            Err(ErrorBody::new(
+                ErrorCode::General,
+                "untrusted error\nforged line",
+                Execution::Unknown,
+            )),
+            || write_ownership_notice(&mut stderr),
+        );
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "  ⚠ ownership lost: the project PID lock is missing or names another process; dispatch is off and this daemon is still running\n"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bring_up_publishes_private_files_and_shutdown_releases_ownership_last() {

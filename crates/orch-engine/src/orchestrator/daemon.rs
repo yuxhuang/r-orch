@@ -4,7 +4,7 @@ mod completion;
 mod shutdown;
 mod startup;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -12,8 +12,22 @@ use orch_core::adapter::ExecuteParams;
 use orch_core::error::{Error, Result};
 use orch_domain::{
     Agent, AgentStatus, GoalStatus, OrchestratorEvent, OrchestratorState, RunStatus, RunningEntry,
-    Task, TaskStatus, is_blocked, is_dispatchable, scopes_overlap,
+    Task, TaskStatus, is_blocked, is_dispatchable,
 };
+
+#[cfg(not(test))]
+use orch_domain::scopes_overlap;
+
+#[cfg(test)]
+thread_local! {
+    static SCOPE_MATCHER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn scopes_overlap(a: Option<&[String]>, b: Option<&[String]>) -> bool {
+    SCOPE_MATCHER_CALLS.with(|calls| calls.set(calls.get() + 1));
+    orch_domain::scopes_overlap(a, b)
+}
 
 use super::dispatch::{
     MailboxMode, PREPARATION_OWNS_EFFORT_DIAGNOSTICS, PreparedPrompt, check_preparation,
@@ -25,6 +39,12 @@ use super::{CANCEL_KILL_GRACE, Orchestrator};
 enum PreparationFailureOutcome {
     Failed,
     Cancelled,
+}
+
+const SCOPE_OVERLAP_REPEAT_MS: i64 = 300_000;
+
+fn scope_overlap_repeat_due(now_ms: i64, last_emitted_ms: i64) -> bool {
+    now_ms.saturating_sub(last_emitted_ms) >= SCOPE_OVERLAP_REPEAT_MS
 }
 
 impl Orchestrator {
@@ -147,6 +167,7 @@ impl Orchestrator {
                         self.seed_autonomous_tasks().await;
                     }
                     let mut tasks = self.deps().task_store.list(&Default::default()).await?;
+                    self.daemon_prune_scope_overlap_reports(&tasks, state, None);
                     tasks.sort_by(|a, b| {
                         a.priority
                             .cmp(&b.priority)
@@ -318,11 +339,11 @@ impl Orchestrator {
                 let mut slot = self.inner.state.lock().await;
                 self.load_state(&mut slot).await?;
                 let state = slot.as_mut().expect("state loaded");
-                if cancelled.load(Ordering::SeqCst)
-                    || self.is_shutting_down()
-                    || state.claimed.contains(task_id)
-                    || state.running.contains_key(task_id)
-                {
+                if cancelled.load(Ordering::SeqCst) || self.is_shutting_down() {
+                    return Ok(None);
+                }
+                if state.claimed.contains(task_id) || state.running.contains_key(task_id) {
+                    self.daemon_forget_scope_overlap(task_id);
                     return Ok(None);
                 }
                 if self.inner.active_collectors.lock().await.contains(task_id) {
@@ -385,6 +406,7 @@ impl Orchestrator {
                     agent
                 };
                 drop(preparing);
+                self.daemon_forget_scope_overlap(task_id);
                 state.claimed.insert(task_id.to_owned());
                 // Only the final launch phase consumes the due retry. A stop
                 // during preparation must leave its back-off intact.
@@ -912,7 +934,11 @@ impl Orchestrator {
         state: &OrchestratorState,
         override_retry_wait: bool,
     ) -> Result<bool> {
-        if !is_dispatchable(task.status) || task.awaits_approval() {
+        if !is_dispatchable(task.status) {
+            self.daemon_forget_scope_overlap(&task.id);
+            return Ok(false);
+        }
+        if task.awaits_approval() {
             return Ok(false);
         }
         if let Some(controller) = super::dispatch::mirror_controller(task)
@@ -945,20 +971,101 @@ impl Orchestrator {
             .any(|id| id != &task.id);
         let scoped = task.scope.as_deref().is_some_and(|scope| !scope.is_empty());
         if task.depends_on.is_empty() && !(scoped && reserved) {
+            self.daemon_forget_scope_overlap(&task.id);
             return Ok(true);
         }
         let tasks = self.deps().task_store.list(&Default::default()).await?;
+        self.daemon_prune_scope_overlap_reports(&tasks, state, Some(&task.id));
         if is_blocked(task, tasks.as_slice()) {
             return Ok(false);
         }
-        if tasks.iter().any(|running| {
+        // This observation has a repeat policy; it is not a scheduling
+        // authority. Events are buffered here and published only after this
+        // operation releases its permit, outside the project permit.
+        let mut reports = self
+            .inner
+            .scope_overlap_reports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let overlaps = |running: &&Task| {
             running.id != task.id
                 && (state.running.contains_key(&running.id) || state.claimed.contains(&running.id))
                 && scopes_overlap(task.scope.as_deref(), running.scope.as_deref())
-        }) {
+        };
+        let remembered = reports.get(&task.id).and_then(|(id, _)| {
+            tasks
+                .iter()
+                .find(|running| &running.id == id && overlaps(running))
+        });
+        let blocker =
+            remembered.or_else(|| tasks.iter().filter(overlaps).min_by(|a, b| a.id.cmp(&b.id)));
+        if let Some(blocker) = blocker {
+            let now_ms = self.deps().clock.now_ms();
+            if reports.get(&task.id).is_some_and(|(id, last)| {
+                id == &blocker.id && !scope_overlap_repeat_due(now_ms, *last)
+            }) {
+                return Ok(false);
+            }
+            reports.insert(task.id.clone(), (blocker.id.clone(), now_ms));
+            drop(reports);
+            self.emit(OrchestratorEvent::TaskScopeOverlap {
+                task_id: task.id.clone(),
+                overlapping_task_id: blocker.id.clone(),
+                patterns: task.scope.clone().unwrap_or_default(),
+            });
             return Ok(false);
         }
+        reports.remove(&task.id);
         Ok(true)
+    }
+
+    fn daemon_forget_scope_overlap(&self, task_id: &str) {
+        self.inner
+            .scope_overlap_reports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(task_id);
+    }
+
+    fn daemon_prune_scope_overlap_reports(
+        &self,
+        tasks: &[Task],
+        state: &OrchestratorState,
+        candidate: Option<&str>,
+    ) {
+        let mut reports = self
+            .inner
+            .scope_overlap_reports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if reports.is_empty() {
+            return;
+        }
+        let by_id: HashMap<&str, &Task> =
+            tasks.iter().map(|task| (task.id.as_str(), task)).collect();
+        let reserved = |id: &str| state.running.contains_key(id) || state.claimed.contains(id);
+        let valid = |id: &str, blocker_id: &str, compare_scopes: bool| {
+            let (Some(task), Some(blocker)) = (by_id.get(id), by_id.get(blocker_id)) else {
+                return false;
+            };
+            is_dispatchable(task.status)
+                && !reserved(id)
+                && id != blocker_id
+                && reserved(blocker_id)
+                && (!compare_scopes
+                    || scopes_overlap(task.scope.as_deref(), blocker.scope.as_deref()))
+        };
+        // Every snapshot removes dead observations, including manual-run
+        // history when dispatch is off. Only a tick or the entry's own
+        // evaluation compares scopes: unrelated live entries wait for those
+        // paths, avoiding Cartesian matching across the whole held population.
+        reports.retain(|id, (blocker, _)| {
+            valid(
+                id,
+                blocker,
+                candidate.is_none_or(|candidate| id == candidate),
+            )
+        });
     }
 
     async fn daemon_preparation_valid(
@@ -1225,5 +1332,293 @@ impl Orchestrator {
                 PreparationFailureOutcome::Failed
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod scope_overlap_tests {
+    use super::*;
+    use crate::orchestrator::tests::harness::Harness;
+    use orch_core::storage::TaskStore;
+    use orch_core::test_support::make_task;
+
+    #[tokio::test]
+    async fn t7_deleted_held_tasks_do_not_accumulate_observations() {
+        let blocker = Task {
+            id: "A".into(),
+            scope: Some(vec!["src/**".into()]),
+            ..make_task()
+        };
+        let mut state = OrchestratorState::default();
+        state.claimed.insert("A".into());
+        let h = Harness::builder().tasks([blocker]).state(state).build();
+        h.orchestrator.enable_daemon_mode();
+        for n in 0..20 {
+            let held = Task {
+                id: format!("held-{n}"),
+                scope: Some(vec!["src/auth/**".into()]),
+                ..make_task()
+            };
+            h.tasks.seed(held.clone());
+            h.orchestrator.daemon_launch_task(&held.id).await.unwrap();
+            assert_eq!(
+                h.events()
+                    .iter()
+                    .filter(|e| matches!(e, OrchestratorEvent::TaskScopeOverlap { .. }))
+                    .count(),
+                n + 1
+            );
+            assert_eq!(
+                h.orchestrator
+                    .inner
+                    .scope_overlap_reports
+                    .lock()
+                    .unwrap()
+                    .len(),
+                1
+            );
+            h.tasks.delete(&held.id).await.unwrap();
+            h.orchestrator.daemon_tick(true).await.unwrap();
+            assert!(
+                h.orchestrator
+                    .inner
+                    .scope_overlap_reports
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn t17_signed_extremes_do_not_wrap_the_repeat_interval() {
+        assert!(scope_overlap_repeat_due(i64::MAX, i64::MIN));
+        assert!(!scope_overlap_repeat_due(i64::MIN, i64::MAX));
+        assert!(!scope_overlap_repeat_due(i64::MIN, i64::MIN));
+        assert!(!scope_overlap_repeat_due(i64::MAX, i64::MAX));
+        assert!(!scope_overlap_repeat_due(i64::MAX, i64::MAX - 299_999));
+        assert!(scope_overlap_repeat_due(i64::MIN + 300_000, i64::MIN));
+    }
+}
+
+#[cfg(test)]
+mod scope_overlap_work_tests {
+    use super::*;
+    use crate::orchestrator::tests::harness::Harness;
+    use orch_core::clock::Clock;
+    use orch_core::test_support::make_task;
+
+    #[tokio::test]
+    async fn warm_scope_prune_comparison_work_is_linear() {
+        let mut counts = Vec::new();
+        for n in [16, 32, 64] {
+            // Only the last pattern on each side overlaps: every matcher
+            // call performs all 64 * 64 pattern-pair comparisons.
+            let patterns = |prefix: &str| {
+                let mut scope: Vec<String> = (0..63).map(|i| format!("{prefix}/{i}/**")).collect();
+                scope.push("shared/**".into());
+                scope
+            };
+            let blocker = Task {
+                id: "A".into(),
+                scope: Some(patterns("blocker")),
+                ..make_task()
+            };
+            let mut state = OrchestratorState::default();
+            state.claimed.insert(blocker.id.clone());
+            let h = Harness::builder().tasks([blocker]).state(state).build();
+            h.orchestrator.enable_daemon_mode();
+            let ids: Vec<String> = (0..n).map(|i| format!("held-{i}")).collect();
+            for id in &ids {
+                h.tasks.seed(Task {
+                    id: id.clone(),
+                    scope: Some(patterns("held")),
+                    ..make_task()
+                });
+                h.orchestrator.daemon_launch_task(id).await.unwrap();
+            }
+            let now = h.clock.now_ms();
+            SCOPE_MATCHER_CALLS.with(|calls| calls.set(0));
+            for id in &ids {
+                h.orchestrator.daemon_launch_task(id).await.unwrap();
+            }
+            let calls = SCOPE_MATCHER_CALLS.with(|calls| calls.get());
+            assert_eq!(h.clock.now_ms(), now, "fixed clock inside repeat interval");
+            assert_eq!(
+                h.events()
+                    .iter()
+                    .filter(|e| matches!(e, OrchestratorEvent::TaskScopeOverlap { .. }))
+                    .count(),
+                n,
+                "warm evaluations must not add events"
+            );
+            println!(
+                "warm N={n} matcher_calls={calls} bound={} events={n}",
+                2 * n
+            );
+            counts.push((n, calls));
+        }
+        for (n, calls) in counts {
+            assert_eq!(
+                calls,
+                2 * n,
+                "one current-pair prune and revalidation per evaluation, N={n}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod scope_overlap_retention_tests {
+    use super::*;
+    use crate::orchestrator::tests::harness::Harness;
+    use orch_core::storage::TaskStore;
+    use orch_core::test_support::make_task;
+
+    fn task(id: &str, scope: &str) -> Task {
+        Task {
+            id: id.into(),
+            scope: Some(vec![scope.into()]),
+            ..make_task()
+        }
+    }
+
+    fn retained(h: &Harness) -> usize {
+        h.orchestrator
+            .inner
+            .scope_overlap_reports
+            .lock()
+            .unwrap()
+            .len()
+    }
+
+    #[tokio::test]
+    async fn manual_run_delete_retained_entries_stay_bounded_without_tick() {
+        let mut observations = Vec::new();
+        for n in [16, 32, 64, 128] {
+            let mut state = OrchestratorState::default();
+            state.claimed.insert("A".into());
+            let h = Harness::builder()
+                .tasks([task("A", "src/**")])
+                .state(state)
+                .build();
+            h.orchestrator.enable_daemon_mode();
+            for cycle in 1..=n {
+                let held = task(&format!("held-{cycle}"), "src/auth/**");
+                h.tasks.seed(held.clone());
+                h.orchestrator.daemon_launch_task(&held.id).await.unwrap();
+                assert!(
+                    !h.state.peek().claimed.contains(&held.id),
+                    "overlap must refuse the explicit run"
+                );
+                let before_delete = retained(&h);
+                let live_before = h.tasks.list(&Default::default()).await.unwrap().len();
+                h.tasks.delete(&held.id).await.unwrap();
+                let after_delete = retained(&h);
+                let live_after = h.tasks.list(&Default::default()).await.unwrap().len();
+                observations.push((
+                    n,
+                    cycle,
+                    before_delete,
+                    live_before,
+                    after_delete,
+                    live_after,
+                ));
+            }
+            println!("manual N={n} retained={} live=1", retained(&h));
+            assert_eq!(
+                h.events()
+                    .iter()
+                    .filter(|e| matches!(e, OrchestratorEvent::TaskScopeOverlap { .. }))
+                    .count(),
+                n,
+                "each distinct held task must report its refusal"
+            );
+        }
+        // Check every cycle after collecting all four endpoints, so a failure
+        // still exposes the entire retained-count vector.
+        for (n, cycle, before, live_before, after, live_after) in observations {
+            assert_eq!((live_before, live_after), (2, 1));
+            assert!(
+                before < live_before,
+                "N={n} cycle={cycle}: {before} before deletion"
+            );
+            assert!(
+                after <= live_after,
+                "N={n} cycle={cycle}: {after} after deletion"
+            );
+            assert_eq!((before, after), (1, 1), "N={n} cycle={cycle}");
+        }
+    }
+
+    async fn unrelated_evaluation_removes_stale_entry(change: &str) {
+        let mut state = OrchestratorState::default();
+        state.claimed.extend(["A".into(), "C".into()]);
+        let h = Harness::builder()
+            .tasks([
+                task("A", "src/**"),
+                task("B", "src/auth/**"),
+                task("C", "docs/**"),
+                task("D", "docs/manual/**"),
+            ])
+            .state(state)
+            .build();
+        h.orchestrator.enable_daemon_mode();
+        h.orchestrator.daemon_launch_task("B").await.unwrap();
+        assert_eq!(retained(&h), 1);
+        match change {
+            "terminal" => {
+                let mut held = h.tasks.get("B").await.unwrap().unwrap();
+                held.status = TaskStatus::Done;
+                h.tasks.seed(held);
+            }
+            "self-reserved" => {
+                let mut state = h.state.peek();
+                state.claimed.insert("B".into());
+                h.state.seed(state);
+            }
+            "unreserved-blocker" => {
+                let mut state = h.state.peek();
+                state.claimed.shift_remove("A");
+                h.state.seed(state);
+            }
+            "deleted-blocker" => h.tasks.delete("A").await.unwrap(),
+            _ => unreachable!(),
+        }
+        // D's independent overlap forces the existing successful snapshot;
+        // neither B nor A is evaluated again, and no tick is run.
+        h.orchestrator.daemon_launch_task("D").await.unwrap();
+        let reports = h.orchestrator.inner.scope_overlap_reports.lock().unwrap();
+        println!(
+            "{change}: retained={} live={}",
+            reports.len(),
+            h.tasks.snapshot().len()
+        );
+        assert!(
+            !reports.contains_key("B"),
+            "stale {change} entry survived unrelated evaluation"
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports.get("D").unwrap().0, "C");
+    }
+
+    #[tokio::test]
+    async fn terminal_held_entry_is_removed_by_unrelated_candidate() {
+        unrelated_evaluation_removes_stale_entry("terminal").await;
+    }
+
+    #[tokio::test]
+    async fn self_reserved_held_entry_is_removed_by_unrelated_candidate() {
+        unrelated_evaluation_removes_stale_entry("self-reserved").await;
+    }
+
+    #[tokio::test]
+    async fn unreserved_blocker_entry_is_removed_by_unrelated_candidate() {
+        unrelated_evaluation_removes_stale_entry("unreserved-blocker").await;
+    }
+
+    #[tokio::test]
+    async fn deleted_blocker_entry_is_removed_by_unrelated_candidate() {
+        unrelated_evaluation_removes_stale_entry("deleted-blocker").await;
     }
 }
