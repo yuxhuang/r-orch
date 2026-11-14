@@ -63,7 +63,7 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 
 ## Running and tasks
 
-### `Orchestrator already running (PID: undefined)` and nothing is running
+### `orch daemon already running (PID unavailable)` and no daemon is running
 
 - **Cause.** The lock file `.orchestry/orchestry.lock` holds something that is not a process number, for example after an interrupted write. orch refuses it and never cleans it up, so a daemon cannot start (exit 4).
 - **Do.**
@@ -120,7 +120,7 @@ If you worry about API keys in agent settings, read [Secrets in agent config](..
 
 ### `update` or `patch` fails with `mutation lock timed out` or `read mutation input`
 
-- **Cause.** Another `update` or `patch` holds the lock, or the `-f` file cannot be read.
+- **Cause.** The daemon is running another change that holds the definition lock (another `update` or `patch`, for example) and kept it for 5 seconds, or the `-f` file cannot be read.
 - **Do.** Retry, and check the file path and permissions. A failed command leaves the definition unchanged. Table of causes: [File mutations: update and patch failures](../RUNBOOK.md#file-mutations-update-and-patch-failures).
 
 ### `--json` or `--yaml` output of `orch doctor` will not parse

@@ -75,29 +75,29 @@ goes away and you start it again, `r` connects to the new daemon and reads every
 
 *The Tasks view, which the dashboard opens on. Under the header, chips count tasks by status and count the teams. The `↑` after STATUS marks the sort column.*
 
-The screenshots in this chapter were taken with orch 0.13.0 in observe mode, so the header shows `OBSERVING` and the second header line reads `listen off · controller none`. With the daemon the header shows the daemon's dispatch state instead.
+The screenshots in this chapter were taken with orch 0.9.3 in observe mode, which the dashboard no longer has, so the header shows `OBSERVING` and the second header line reads `listen off · controller none`. With the daemon the header shows the daemon's dispatch state instead.
 The second line tells you about peer connections: whether this machine listens for other orch machines (`listen off` or an address), which machine controls it (`controller none`), and the state of each remote you registered. See [Remote agents](11-remote-agents.md).
 
 ## Read the screen
 
-From top to bottom the screen has these parts. This is the real layout of a small project in a 120-column terminal, started with `orch tui --observe`. No orchestrator had started for the project, so the header shows no uptime. Runs of empty rows are shortened to `…`. The last activity line, about disk polling, belongs to that removed mode; today's dashboard never polls:
+From top to bottom the screen has these parts. This is the real layout of a small project in a 120-column terminal, captured from `orch tui` against a running daemon with dispatch off, just after a second task was created with `orch task add` in another terminal, which is why the activity feed shows one line. Runs of empty rows are shortened to `…`:
 
 ```text
-◆ ORCH 0.10.2 · proj  G GOALS  T TASKS  A AGENTS L ACTIONS                     0 running │ 2 todo · normal · ● OBSERVING
+◆ ORCH 0.13.0 · proj  G GOALS   T TASKS   A AGENTS   L ACTIONS                 6s · 0 running │ 2 todo · normal · ○ IDLE
 listen off · controller none
  ○ TODO 2
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ━━━ > TASKS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   STATUS↑   PRI TITLE                                               GOAL               ASSIGNEE        STARTED  ELAPSED*
-▸ ○ TODO    !   Second task                                                            —
-  ○ TODO    !   Write the docs                                                         worker
+  ○ TODO    !   Second task                                                            —
+▸ ○ TODO    !   Write the docs                                                         worker
     + add task...
 ◆ Press R to run task  R run task
 …
 ━━━ ACTIVITY ━━F:ALL │ 1/1 · following━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 …
->  now         ◆ Observer mode: watching external orchestrator via disk polling.
+>  now         ◆ Created: Second task
 ↑↓   Tab panes; ←→ views   / cmd  ^K filter  N new  R run  C cancel  E edit  S show all  D delete  Enter detail  Q quit
 ```
 

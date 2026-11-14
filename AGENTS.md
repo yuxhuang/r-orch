@@ -7,7 +7,7 @@ Read this first, whatever your role. Reasons live in the linked docs.
 r-orch is a Rust AI-agent orchestrator: a CLI (`orch`), a terminal dashboard and a runtime that drives external
 AI coding CLIs as child processes and keeps all state as plain files under `.orchestry/`. It began as a port of
 `oxgeneral/ORCH` and is developed on its own terms.
-The repo is **private**, being prepared for open source.
+The repo is **public**.
 
 | Crate | Role |
 |---|---|
@@ -57,7 +57,7 @@ Authoritative docs:
    dirs; never `set_var` the home in a test (process-global, racy). Do not unset that env var.
 6. **No secrets and no private infrastructure names in the repo.** That covers tokens, personal machine paths,
    private Homebrew tap names, private hostnames and IPs. Use placeholders (`<tap>`, `<host>`).
-7. **The repo stays private.** Do not change visibility, publish crates (`publish = false` is deliberate), or
+7. **The repo stays public.** Do not change visibility, publish crates (`publish = false` is deliberate), or
    push to any other remote. Open-sourcing is the owner's decision.
 8. **Parity validation is gone.** There is no oracle, parity contract or differential harness; behaviour is
    specified by r-orch's own docs and tests. See [ADR 0009](docs/decisions/0009-remove-parity-tooling.md).
@@ -70,7 +70,7 @@ Authoritative docs:
 ## Licensing
 
 - r-orch is licensed under Apache-2.0 ([LICENSE](LICENSE), attribution in [NOTICE](NOTICE)); `Cargo.toml`
-  declares it for every crate. Rule 7 still applies: the licence does not make the repo public.
+  declares it for every crate. Rule 7 still applies: the licence does not change the rules on visibility, crate publishing or remotes.
 - Contributions are accepted under Apache-2.0 itself (§5, "Submission of Contributions"). There is no CLA and no
   DCO sign-off.
 - Material that originates outside this project (copied or adapted files, vendored assets, fixtures recorded
@@ -509,7 +509,7 @@ pushing a tag.
 - Don't bump `rust-toolchain.toml` without bumping `rust-version` in `Cargo.toml` to match and running the CI set
   under the new toolchain; new clippy lints are fixed in the same PR, not allowed.
 - Don't run tests or experiments against the real home directory or a real project's `.orchestry`.
-- Don't flip the repo public, add remotes, or paste private names (taps, hosts, paths) anywhere in the repo or PRs.
+- Don't change the repo's visibility, add remotes, or paste private names (taps, hosts, paths) anywhere in the repo or PRs.
 - Don't add a dependency without the §4.8 check; add an ADR when it is load-bearing.
 - Don't edit `docs/TRAITS-FROZEN.md` without an ADR.
 - Don't push to `main`, force-push shared branches, or merge your own PR.

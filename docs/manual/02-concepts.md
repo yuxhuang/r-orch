@@ -321,6 +321,6 @@ You do not need this section to use orch.
   priority number first, up to `scheduling.max_concurrent_agents` local runs (6 by default). Remote runs do not
   count toward that limit.
 - **Lock file.** The running daemon holds `.orchestry/orchestry.lock` and `.orchestry/.daemon-owner.lock`. A
-  second daemon in the same project cannot start; it exits 4. See the [runbook](../RUNBOOK.md#corrupt-lock-file) if the lock is damaged.
+  second daemon in the same project cannot start; it exits 4, as long as `.orchestry/` and these two files are not deleted or replaced under a running daemon (see [ARCHITECTURE.md](../ARCHITECTURE.md#21-daemon-ownership-guarantees-and-limits)). See the [runbook](../RUNBOOK.md#corrupt-lock-file) if the lock is damaged.
 - **Run files.** A run leaves `.orchestry/runs/<run-id>.json` (the summary: task, agent and outcome) and
   `<run-id>.jsonl` (the event log, to which orch only appends).

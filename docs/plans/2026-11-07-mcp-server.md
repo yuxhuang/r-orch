@@ -25,7 +25,7 @@ spec.
 ## Context
 - Branch `feature/mcp-server` from `main` at `8e39f2f` (v0.11.1).
 - Decision record: [ADR 0011](../decisions/0011-mcp-server.md). User manual:
-  [chapter 17](../manual/17-mcp-server.md). Concurrency: [ARCHITECTURE §2.1](../ARCHITECTURE.md#21-a2-in-detail--the-concurrency-story-is-weaker-than-single-writer).
+  [chapter 17](../manual/17-mcp-server.md). Concurrency: [ARCHITECTURE §2.1](../ARCHITECTURE.md#21-daemon-ownership-guarantees-and-limits).
 - Research (rmcp 3.9 API, client configuration formats) was fact-checked; a design was red-teamed and revised.
   Two lead decisions completed the spec: decision-1 (MCP-only result projections, store-only `task_cancel`, the
   `doctor` probe exception, `config update`/`patch` included, `file: "-"` refused) and decision-2 (pause and force

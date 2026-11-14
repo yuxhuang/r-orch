@@ -638,8 +638,6 @@ cleans up leftover task copies on a worker. See [docs/RUNBOOK.md](docs/RUNBOOK.m
 
 ### Upgrading from v0.13.0
 
-<!-- W2 (PR 2): goal row 12; PR 2 contract items 1-4 and 7; spec R35 and the normative recovery table; ADR 0012
-decision 2 (no auto-start, owner decision). -->
 **This is a behaviour change: no orch command that reads or changes a project works without a running daemon.**
 One orch daemon per project now owns `.orchestry/` and runs the agents; every other command, the dashboard,
 `orch web` and `orch mcp` asks it over a private Unix socket. **Nothing starts the daemon for you**: no command,

@@ -362,7 +362,7 @@ name and a row of view tabs. Use `Left` and `Right` to switch views and `Tab` to
 
 *The Tasks view, which the dashboard opens on. The header counts tasks by status.*
 
-The screenshot was taken with orch 0.13.0, so its header reads `OBSERVING`. With the daemon the header shows
+The screenshot was taken with orch 0.9.3 in observe mode, which the dashboard no longer has, so its header reads `OBSERVING`. With the daemon the header shows
 whether the daemon's dispatch is on. The dashboard never dispatches by itself; its watch toggle turns the daemon's
 dispatch on and off.
 
