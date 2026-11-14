@@ -125,7 +125,7 @@ answered by the MCP library without asking the daemon, so it succeeds even while
 then reports no daemon. A client that reconnects starts a new `orch mcp` process, and that process fails its
 `initialize` as described above. Seen with a plain stdio client on macOS after `kill -9` of the daemon (two repeated
 `initialize` requests answered with success one after the other, then one tool call that failed with exit code 7); read from `until_daemon` and
-`serve_transport` in `crates/orch-cli/src/mcp/server.rs`. It has not been fixed.
+`serve_transport` in `crates/orch-cli/src/mcp/server.rs`. It has not been fixed; the owner accepted it on 2026-11-14 as a known limitation to fix later. A test of a client that reconnects after the owner starts the daemon does not exist (unproven, waived by the owner's word of 2026-11-14).
 
 ### Exit codes and startup errors
 
@@ -915,6 +915,12 @@ daemon stops it (with the usual grace before it is killed) and only then reports
 does ([Cancel a task](04-tasks.md#cancel-a-task)). If the stop fails or times out, the tool returns an error.
 For a task running on a remote worker the cancel is sent to the worker as before; while the worker is unreachable
 the daemon cannot promise that its process has died.
+
+Checked once on macOS with a plain stdio client (`orch mcp --allow-destructive`) and a shell-script agent with a
+grandchild process: both were alive when the call was sent and gone 15 to 21 ms later, and the success came after
+about 263 ms. The agent exited 0 while it was being stopped, yet the task and its run stayed `cancelled` and were not
+started again. The dashboard's `C` behaved the same. This was one run per client, with a local agent; a remote
+worker's cancel was not exercised.
 
 ### `doctor` runs programs
 

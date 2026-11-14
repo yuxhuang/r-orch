@@ -442,7 +442,7 @@ Three cases are not "no daemon" and say so:
 | A CLI command | Prints the message on stderr and exits 7. |
 | The dashboard (`orch`, `orch tui`) | Shows the message full-screen. `r` tries to connect again, `q` quits with exit 7. It never starts anything. |
 | `orch web` | At start: prints the message and exits 7. If the daemon goes away while it serves: a new page or tab gets HTTP 503 with the message as plain text, after the usual login; with `--no-auth` it gets only `orch daemon unavailable`, never the project or socket path. A tab whose dashboard is already open shows the dashboard's own no-daemon screen. |
-| `orch mcp` | Stays running. `initialize` and every tool call return the message as an MCP error with `exit_code` 7, so a new MCP session's first call fails until you start the daemon. It exits 0 when its client closes stdin. A repeated `initialize` on a session that already initialised still succeeds while no daemon runs (a known limit). See [the MCP chapter](17-mcp-server.md#when-no-daemon-is-running). |
+| `orch mcp` | Stays running. `initialize` and every tool call return the message as an MCP error with `exit_code` 7, so a new MCP session's first call fails until you start the daemon. It exits 0 when its client closes stdin. A repeated `initialize` on a session that already initialised still succeeds while no daemon runs (a known limit, accepted for a later fix). See [the MCP chapter](17-mcp-server.md#when-no-daemon-is-running). |
 | `orch doctor` | Runs no check and starts no process. Prints `orch doctor · discovery only (daemon unavailable)`, the project root and `daemon discovery: available` or `unavailable`, then the message, and exits 7. Outside a project it prints `project discovery: unavailable`, then `Not initialized` and `Run: orch init`, and exits 3. See [Check your setup](07-running-and-monitoring.md#check-your-setup). |
 
 `orch --help`, `orch --version` and `orch init` never need a daemon.
@@ -550,7 +550,8 @@ protocols in `<detail>` and changes the hint:
     Start it with: orch daemon stop, then orch daemon start
 ```
 
-`orch daemon stop` works across the mismatch, with either binary, even if the old executable has been deleted.
+`orch daemon stop` works across the mismatch, with either binary. Whether it also works when the old executable has
+been deleted while its daemon runs has not been tested (unproven, waived by the owner's word of 2026-11-14).
 Stop the old daemon, then start the new one. orch never restarts the daemon for you.
 
 For developers: two builds with the same orch version and the same protocol version cannot tell each other
@@ -613,7 +614,7 @@ other way of running work asks the running daemon:
 | Dashboard start and stop watch | `orch daemon dispatch on` and `off`; never starts or stops a process. |
 | `orch tui --observe`, `orch tui --listen` | Removed: the dashboard is always a client; peer listening is a start option of the daemon. |
 | `orch doctor` | A client: with no daemon it runs no check, prints a discovery note and the no-daemon message, and exits 7; outside a project it prints `Not initialized` and exits 3. |
-| `orch init`, `--help`, `--version` | Need no daemon. `orch init` prints how to start one and never starts it; running it again changes nothing in an existing project. |
+| `orch init`, `--help`, `--version` | Need no daemon. `orch init` prints how to start one and never starts it; running it again changes nothing in an existing project. `orch --help` and `orch --version` work in any directory; the help of most other commands (seen on macOS for `orch serve --help`, `orch run --help`, `orch task add --help` and `orch agent add --help`) printed `Not initialized` outside an initialized project, and offline help for every command is unproven (waived by the owner's word of 2026-11-14). |
 
 **Dispatch follows changes.** With dispatch on, a change to the project wakes the daemon's scheduler: a new or
 edited task, a run that ends and unblocks another task, a message, from any client or from the daemon's own work.
@@ -712,7 +713,10 @@ commits can wake dispatch.
 This is a behaviour change: **no orch command that reads or changes project state works without a running
 daemon**, and nothing starts one for you. The owner decided this
 ([ADR 0012](../decisions/0012-daemon-owned-state.md), decision 2): you should know when a long-lived process starts
-on your machine. The project's files do not change format.
+on your machine. The project's file formats do not change. A v0.13.0 binary read a representative project after
+this build had written it (one check on macOS; the files differ in the daemon's `.gitignore` entries, runtime files
+and a populated optional task `workspace` field, and not every file or surface was compared: see
+[Known limitations and unverified behaviour](../../CHANGELOG.md#known-limitations-and-unverified-behaviour)).
 
 1. Stop every orch 0.13.0 process of the project, including `orch mcp` servers held open by IDE, Claude Code or
    Codex sessions, `orch serve`, `orch run --watch` and dashboards. `pgrep -fl orch` must show none.

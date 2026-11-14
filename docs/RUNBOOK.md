@@ -279,7 +279,8 @@ before any request is read, so nothing changed.
 
 **Fix (also the upgrade procedure).**
 
-1. `orch daemon stop`. It works with either binary, even after the old one was deleted. It stops the running agents
+1. `orch daemon stop`. It works with either binary (a test runs both directions; the case where the old executable
+   was deleted while its daemon runs has not been tested: unproven, waived by the owner's word of 2026-11-14). It stops the running agents
    (10 s grace) and records their runs as `cancelled`: an upgrade is not transparent to running work, so do it when
    nothing important runs.
 2. Install the new orch.
