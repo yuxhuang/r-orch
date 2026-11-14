@@ -277,7 +277,7 @@ its next scheduling round.
 
 In this run a failed task in the project gave `result=has_failed` and exit code 1. `--once` does not create tasks for autonomous agents.
 
-A later `orch daemon dispatch on` or `off`, from any terminal or the dashboard, ends the batch: `serve --once` reports `interrupted`, and the agents keep running. Stopping `serve --once` (`Ctrl+C`) also ends the batch and leaves its running agents running in the daemon; in orch 0.13.0 it stopped them. To run a batch from cron, start the daemon yourself first; see [Recovery](18-daemon.md#recovery) for a cron line that fails visibly.
+A later `orch daemon dispatch on` or `off`, from any terminal or the dashboard, ends the batch: `serve --once` reports `interrupted`, and the agents keep running. Stopping `serve --once` (`Ctrl+C`) also ends the batch and leaves its running agents running in the daemon; in orch 0.13.0 it stopped them. The daemon also ends the stream of a command that stops reading its output for about five seconds while the daemon has more to send (read from the source: an event that cannot be queued within the five-second write limit cancels the observation; not tested or timed here); the agents keep running. To run a batch from cron, start the daemon yourself first; see [Recovery](18-daemon.md#recovery) for a cron line that fails visibly.
 
 > **Note:** `serve --once` waits while a task is in `review`. If a task needs your approval and nobody gives it, the command never exits. It stays up until you run `orch task approve` from another terminal. To avoid this in scripts, give the agents the approval policy `auto`, or give the tasks review criteria ([Add review checks to a task](04-tasks.md#add-review-checks-to-a-task)).
 

@@ -644,7 +644,9 @@ One orch daemon per project now owns `.orchestry/` and runs the agents; every ot
 client, retry or `orch init` does. That is the owner's decision ([ADR 0012](docs/decisions/0012-daemon-owned-state.md)):
 you should know when a long-lived process starts on your machine. Without a daemon, a command prints
 `No orch daemon is running for <project root>` with `Start it with: orch daemon start` and exits 7, a new exit
-code. No file format changed.
+code. No stored file format changed; one representative v0.13.0 project was checked in both directions on macOS, and
+what that check did and did not cover is listed under
+[Known limitations and unverified behaviour](CHANGELOG.md#known-limitations-and-unverified-behaviour).
 
 Upgrade
 1. Stop **every** orch 0.13.0 process of the project, including `orch mcp` servers held open by IDE, Claude Code
@@ -684,9 +686,15 @@ What else changes
   is `scheduling.poll_interval_ms` (`orch config set`), and events stream with `orch logs --follow`.
 - Scripts and cron jobs must start the daemon themselves, or fail visibly; see
   [Recovery](docs/manual/18-daemon.md#recovery).
+- Some behaviour of this change was not verified before release, and the owner accepted that on 2026-11-14: for
+  example `orch daemon stop` after the old executable was deleted, an MCP client that reconnects after the daemon
+  restarts, and a connection from a second user account. Each is listed, with what was checked instead, under
+  [Known limitations and unverified behaviour](CHANGELOG.md#known-limitations-and-unverified-behaviour).
 
-Roll back by stopping the daemon (`orch daemon stop`) and reinstalling v0.13.0; the files are unchanged. The
-daemon's runtime files (`run/`, `daemon.json`, `daemon.log`, `daemon.log.1` and `.daemon-owner.lock` in
+Roll back by stopping the daemon (`orch daemon stop`) and reinstalling v0.13.0; the stored formats are unchanged, so
+v0.13.0 reads the project (checked once on a representative project, not on every file). The daemon adds entries to
+`.orchestry/.gitignore` and writes the optional task `workspace` field for a task it dispatches in shared-workspace
+mode; v0.13.0 reads that field. The daemon's runtime files (`run/`, `daemon.json`, `daemon.log`, `daemon.log.1` and `.daemon-owner.lock` in
 `.orchestry/`) are ignored by v0.13.0. The full guide is
 [Upgrading from orch 0.13.0](docs/manual/18-daemon.md#upgrading-from-orch-0130); recovery is in the
 [runbook](docs/RUNBOOK.md#the-orch-daemon).

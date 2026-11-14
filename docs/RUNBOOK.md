@@ -116,7 +116,7 @@ cannot tell that process from you. Only a start with `ORCH_TASK_ID` or `ORCH_AGE
 `Refusing to start the orch daemon from an agent context (ORCH_TASK_ID or ORCH_AGENT_ID is set). The owner starts the
 daemon; pass --from-agent only if the owner deliberately intends this.`, which names `--from-agent`. The check
 reads only those two variables, so it is not a security boundary: whether an agent can run `orch daemon start` with
-its variables cleared is decided by your agent roles or sandboxes, not by orch.
+its variables cleared, or with `--from-agent`, is decided by your agent roles or sandboxes, not by orch.
 
 **Not this entry:** `daemon_busy` (the daemon runs but found no room for the client within about 13 s, that is 10 s
 of waiting plus one last connection attempt, for a session
@@ -204,10 +204,14 @@ then `⚠`):
 
 In a foreground daemon that is the terminal; in a detached daemon (`--detach`) it is the capped `.orchestry/daemon.log`.
 `RUST_LOG` does not suppress it. The daemon attempts it once, from a separate thread that nothing waits for, and
-it is written even when recording the loss failed. It is best effort:
+it is written even when recording the loss returned an error. A recording that never completes, panics or is cancelled
+is not covered: the line is written only after the recording returns. It is best effort:
 
 - it arrives late when standard error is drained later (for example a pipe whose reader is slow);
 - it is lost if the daemon exits before anyone reads it;
+- a full standard-error pipe does not hold the daemon up at the default log level; with an explicit `RUST_LOG` the
+  daemon's other log lines go to the same standard error as before and are not made non-blocking, so a pipe that nobody
+  reads can still stall them (shown only with a standard error that is being read);
 - it is absent if the thread or the duplicate of the standard-error descriptor cannot be created; a failed write is
   not retried.
 
@@ -275,7 +279,8 @@ before any request is read, so nothing changed.
 
 **Fix (also the upgrade procedure).**
 
-1. `orch daemon stop`. It works with either binary, even after the old one was deleted. It stops the running agents
+1. `orch daemon stop`. It works with either binary (a test runs both directions; the case where the old executable
+   was deleted while its daemon runs has not been tested: unproven, waived by the owner's word of 2026-11-14). It stops the running agents
    (10 s grace) and records their runs as `cancelled`: an upgrade is not transparent to running work, so do it when
    nothing important runs.
 2. Install the new orch.
