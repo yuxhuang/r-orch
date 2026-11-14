@@ -80,7 +80,7 @@ The second line tells you about peer connections: whether this machine listens f
 
 ## Read the screen
 
-From top to bottom the screen has these parts. This is the real layout of a small project in a 120-column terminal, captured from `orch tui` against a running daemon with dispatch off, just after a second task was created with `orch task add` in another terminal, which is why the activity feed shows one line. Runs of empty rows are shortened to `…`:
+From top to bottom the screen has these parts. This is the real layout of a small project in a 120-column terminal, captured from a 0.13.0 development build of `orch tui` against a running daemon with dispatch off, just after a second task was created with `orch task add` in another terminal, which is why the activity feed shows one line. The 1.0.0 build reports 1.0.0 in the header; this historical capture is unchanged. Runs of empty rows are shortened to `…`:
 
 ```text
 ◆ ORCH 0.13.0 · proj  G GOALS   T TASKS   A AGENTS   L ACTIONS                 6s · 0 running │ 2 todo · normal · ○ IDLE

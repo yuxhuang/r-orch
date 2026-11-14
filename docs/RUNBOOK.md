@@ -277,6 +277,13 @@ daemon. Nothing retries any of these: repeat the command after the restart.
 **Cause.** The running daemon is a different orch or protocol version from the `orch` you ran. They refuse to talk,
 before any request is read, so nothing changed.
 
+**1.0.0 upgrade note (2026-11-14).** Ordinary local sessions require exact equality of both the package version
+and local protocol, so daemon-era builds whose package version or protocol differs refuse each other even when the
+local protocol is 2 on both sides. Released v0.13.0 has no daemon handshake and is **not** refused: it writes
+`.orchestry/` directly, so stop every 0.13.0 process, including editor-held `orch mcp` servers, before starting the
+daemon. Stop/start explicitly and restart MCP sessions as below. This is not remote TCP version negotiation, and the
+version number is not evidence of compatibility beyond the recorded checks.
+
 **Fix (also the upgrade procedure).**
 
 1. `orch daemon stop`. It works with either binary (a test runs both directions; the case where the old executable
