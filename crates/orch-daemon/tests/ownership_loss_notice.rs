@@ -61,7 +61,10 @@ fn run_child(case: &str, broken: bool) -> String {
         drop(reader);
         command.stderr(Stdio::from(writer));
     } else {
-        command.stderr(Stdio::piped());
+        let stderr = environment.path().join("notice.err");
+        command
+            .env("OWNERSHIP_NOTICE_STDERR", &stderr)
+            .stderr(std::fs::File::create(stderr).unwrap());
     }
     let mut child = command.spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -79,7 +82,11 @@ fn run_child(case: &str, broken: bool) -> String {
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("status checked after refreshes"));
-    String::from_utf8(output.stderr).unwrap()
+    if broken {
+        String::from_utf8(output.stderr).unwrap()
+    } else {
+        std::fs::read_to_string(environment.path().join("notice.err")).unwrap()
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -134,6 +141,24 @@ async fn notice_child() {
         assert!(!lock.exists());
     } else if case == "foreign" {
         assert_eq!(std::fs::read_to_string(&lock).unwrap(), "1\n");
+    }
+    if case != "held"
+        && let Some(stderr) = std::env::var_os("OWNERSHIP_NOTICE_STDERR")
+    {
+        // Paused Tokio time cannot schedule an OS thread. Observe the line
+        // before allowing the subprocess to exit, under a real deadline.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if std::fs::read_to_string(&stderr)
+                .unwrap()
+                .lines()
+                .any(|line| line == LINE)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "notice was not written");
+            tokio::task::yield_now().await;
+        }
     }
     println!("status checked after refreshes");
     daemon.shutdown().await.unwrap();
