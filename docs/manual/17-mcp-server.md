@@ -89,7 +89,8 @@ The server prints the project it chose in its `initialize` instructions (below).
 
 `orch mcp` stays running when no daemon answers, or when the daemon is a different orch or protocol version. It
 returns the [no-daemon message](18-daemon.md#when-no-daemon-answers) as an MCP error with `exit_code` 7, for
-`initialize` and for every tool call and resource read, and starts nothing:
+the first `initialize` of a session, for every tool call and for every resource read, and starts nothing (one case
+is a known limit, below):
 
 ```text
   ✕ No orch daemon is running for <project root> (<detail>)
@@ -113,6 +114,18 @@ So **the first call of a new MCP session fails until you start the daemon.** To 
 A call whose reply was lost because the daemon went away mid-call gets the
 [reply-lost message](18-daemon.md#when-no-daemon-answers) instead: the change may have been applied, so read the
 entity before you retry. The server stays alive and exits 0 when its client closes stdin, as before.
+
+The error has two shapes. Until a request finds a daemon (any request but `ping`), the server answers each request
+itself with a JSON-RPC error, code `-32001`, with `exit_code` 7 in `data`. Once a session is running, a tool call
+that finds no daemon returns a tool result with `isError: true`, and a resource read returns the JSON-RPC error;
+`tools/list` and `resources/list` need no daemon. Both shapes carry the same text.
+
+**Known limit: a repeated `initialize`.** On a session that has already initialised, a second `initialize` is
+answered by the MCP library without asking the daemon, so it succeeds even while no daemon runs; the next tool call
+then reports no daemon. A client that reconnects starts a new `orch mcp` process, and that process fails its
+`initialize` as described above. Seen with a plain stdio client on macOS after `kill -9` of the daemon (two repeated
+`initialize` requests answered with success, each followed by a failing tool call); read from `until_daemon` and
+`serve_transport` in `crates/orch-cli/src/mcp/server.rs`. It has not been fixed.
 
 ### Exit codes and startup errors
 

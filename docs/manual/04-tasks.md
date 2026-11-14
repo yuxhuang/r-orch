@@ -131,6 +131,7 @@ Unlike v0.13.0's warning on every reached dispatch pass, `orch serve --once` rep
 What this does and does not tell you:
 
 - **Reminders need an evaluation.** A reminder comes only when dispatch evaluates the held task. With dispatch off no reminder comes by itself; `orch daemon status` says that dispatch is off.
+- **The five minutes assume the task files and their index agree.** If they disagree (an index left behind by an earlier failed index update, or changed outside orch), an unrelated evaluation can drop a still-valid entry and you can see one extra warning inside the interval (seen in a synthetic fixture, not in normal use). This is a limit of what the tests show, not an instruction.
 - **The five minutes are a minimum.** A reminder comes at the first evaluation at or after five minutes, not exactly on the fifth minute. At most 12 reminders per held task and hour, plus one report each time the blocker changes.
 - **A daemon restart repeats the first report** of a hold that still exists, because the daemon does not keep what it reported across a restart.
 - **Setting the wall clock back** silences the reminders of an unchanged hold until the clock passes the last report plus five minutes. A daemon restart resets this.

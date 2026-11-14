@@ -188,7 +188,7 @@ $ orch daemon status
 orch daemon PID 76126 · dispatch OFF
   executable: /…/target/debug/orch
   started: 2026-11-09T12:07:26.840Z
-  version: orch 0.13.0 protocol 1
+  version: orch 0.13.0 protocol 2
   sessions: 1/64
   ownership: held
   socket: /private/tmp/i1b-status-demo/sk/s
@@ -210,7 +210,7 @@ $ orch --json daemon status
   "socket": {
     "utf8": "/tmp/twn-v0vgwbe_/o.sock"
   },
-  "protocol": 1,
+  "protocol": 2,
   "binary": "0.13.0",
   "instance": "daemon_hPQDKpz",
   "executable": {
@@ -256,7 +256,11 @@ The daemon also writes one fixed line to its standard error when it finds its ow
 
 A foreground daemon writes it to its terminal; a detached daemon (`--detach`) writes it to the capped
 `.orchestry/daemon.log`. `RUST_LOG` does not suppress it. The daemon attempts it once, from a separate thread that
-nothing waits for, and also when recording the loss failed. It is best effort: it arrives late when standard error is
+nothing waits for, and also when recording the loss returned an error. A recording that never completes, panics or is
+cancelled is not covered: the line is written only after the recording returns. That a full standard-error pipe does
+not hold the daemon up is shown at the default log level; with an explicit `RUST_LOG` the daemon's other log lines go
+to the same standard error as before and are not made non-blocking, so a pipe that nobody reads can still stall
+them (shown only with a standard error that is being read). It is best effort: it arrives late when standard error is
 drained later, it is lost if the daemon exits before anyone reads it, and it is absent if the thread or the duplicate
 of the descriptor cannot be created (a failed write is not retried). `orch daemon status` stays the authoritative
 signal. The notice does not stop a second writer: the daemon disables dispatch and reports LOST, but it does not exit
@@ -267,8 +271,8 @@ Two ways to get here that are worth knowing. If you delete `.orchestry/orchestry
 tell you to delete it only after checking that no daemon runs), the daemon reports LOST at its next check. And orch
 0.13.0 treats a lock file that has not been touched for 60 seconds as abandoned even when its process is alive; the
 daemon touches the file every 10 seconds, so a daemon whose lock has not been refreshed for more than 60 seconds, for
-example while suspended (a laptop with its lid closed), is exposed to a 0.13.0 binary that starts. That is read from the code, not observed. Stop every 0.13.0 process before you
-start the daemon.
+example while suspended (a laptop with its lid closed), is exposed to a 0.13.0 binary that starts. That is read from
+the code, not observed. Stop every 0.13.0 process before you start the daemon.
 
 From then until it stops, the daemon refuses the requests that switch dispatch or start a run, from every client,
 with `daemon ownership was lost` (exit 1; nothing was executed):
@@ -438,7 +442,7 @@ Three cases are not "no daemon" and say so:
 | A CLI command | Prints the message on stderr and exits 7. |
 | The dashboard (`orch`, `orch tui`) | Shows the message full-screen. `r` tries to connect again, `q` quits with exit 7. It never starts anything. |
 | `orch web` | At start: prints the message and exits 7. If the daemon goes away while it serves: a new page or tab gets HTTP 503 with the message as plain text, after the usual login; with `--no-auth` it gets only `orch daemon unavailable`, never the project or socket path. A tab whose dashboard is already open shows the dashboard's own no-daemon screen. |
-| `orch mcp` | Stays running. `initialize` and every tool call return the message as an MCP error with `exit_code` 7, so a new MCP session's first call fails until you start the daemon. It exits 0 when its client closes stdin. See [the MCP chapter](17-mcp-server.md#when-no-daemon-is-running). |
+| `orch mcp` | Stays running. `initialize` and every tool call return the message as an MCP error with `exit_code` 7, so a new MCP session's first call fails until you start the daemon. It exits 0 when its client closes stdin. A repeated `initialize` on a session that already initialised still succeeds while no daemon runs (a known limit). See [the MCP chapter](17-mcp-server.md#when-no-daemon-is-running). |
 | `orch doctor` | Runs no check and starts no process. Prints `orch doctor · discovery only (daemon unavailable)`, the project root and `daemon discovery: available` or `unavailable`, then the message, and exits 7. Outside a project it prints `project discovery: unavailable`, then `Not initialized` and `Run: orch init`, and exits 3. See [Check your setup](07-running-and-monitoring.md#check-your-setup). |
 
 `orch --help`, `orch --version` and `orch init` never need a daemon.
