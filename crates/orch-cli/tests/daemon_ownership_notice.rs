@@ -197,12 +197,10 @@ fn full_stderr(workers: usize, drain_later: bool) {
     fs::remove_file(sandbox.state_dir().join("orchestry.lock")).unwrap();
 
     let deadline = Instant::now() + READY;
+    let mut tolerated_cancellation = false;
     loop {
         let status = call(&["--json", "daemon", "status"]);
-        assert!(status.status.success(), "{status:?}");
-        let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-        if status["ownership"] == "lost" {
-            assert_eq!(status["dispatch"]["dispatch_on"], false);
+        if ownership_loss_probe(&mut tolerated_cancellation, status) {
             break;
         }
         assert!(Instant::now() < deadline, "ownership did not become lost");
@@ -274,5 +272,226 @@ fn full_stderr(workers: usize, drain_later: bool) {
             let _ = tx.send(captured);
         });
         assert_eq!(rx.recv_timeout(PROGRESS).unwrap(), vec![b'x'; filled]);
+    }
+}
+
+// A registered status request can be cancelled by the ownership-loss sweep.
+// Sequential probes permit that exact response once, then require Lost/OFF.
+fn ownership_loss_probe(tolerated_cancellation: &mut bool, output: std::process::Output) -> bool {
+    if !*tolerated_cancellation
+        && output.status.code() == Some(1)
+        && output.stdout.is_empty()
+        && output.stderr == "  ✕ request cancelled before execution\n".as_bytes()
+    {
+        *tolerated_cancellation = true;
+        eprintln!(
+            "{:?}: tolerated transition-time cancellation: {output:?}",
+            std::thread::current().name()
+        );
+        return false;
+    }
+    assert!(
+        output.status.success(),
+        "unexpected ownership-loss probe: {output:?}"
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "unexpected status stderr: {output:?}"
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("invalid ownership-loss status JSON");
+    let dispatch_on = status["dispatch"]["dispatch_on"]
+        .as_bool()
+        .expect("missing or invalid dispatch_on");
+    match status["ownership"].as_str() {
+        Some("lost") => {
+            assert!(!dispatch_on, "lost ownership with dispatch on: {status:?}");
+            true
+        }
+        Some("held") => {
+            assert!(
+                !*tolerated_cancellation,
+                "expected lost after transition-time cancellation: {status:?}"
+            );
+            false
+        }
+        _ => panic!("unexpected ownership-loss status: {status:?}"),
+    }
+}
+
+mod ownership_loss_poll_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::process::{ExitStatus, Output};
+
+    fn reply(code: i32, stdout: &[u8], stderr: &[u8]) -> Output {
+        Output {
+            status: ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        }
+    }
+
+    fn status(ownership: &str, dispatch_on: bool) -> Output {
+        reply(
+            0,
+            serde_json::json!({
+                "ownership": ownership,
+                "dispatch": {"dispatch_on": dispatch_on},
+            })
+            .to_string()
+            .as_bytes(),
+            b"",
+        )
+    }
+
+    fn refusal() -> Output {
+        reply(
+            1,
+            b"",
+            "  ✕ request cancelled before execution\n".as_bytes(),
+        )
+    }
+
+    fn decisions(replies: Vec<Output>) -> (Vec<bool>, bool) {
+        let mut tolerated = false;
+        let decisions = replies
+            .into_iter()
+            .map(|reply| ownership_loss_probe(&mut tolerated, reply))
+            .collect();
+        (decisions, tolerated)
+    }
+
+    #[test]
+    fn held_then_lost_off_completes_without_tolerance() {
+        assert_eq!(
+            decisions(vec![status("held", true), status("lost", false)]),
+            (vec![false, true], false)
+        );
+    }
+
+    #[test]
+    fn repeated_held_then_lost_off_completes_without_tolerance() {
+        assert_eq!(
+            decisions(vec![
+                status("held", true),
+                status("held", true),
+                status("lost", false)
+            ]),
+            (vec![false, false, true], false)
+        );
+    }
+
+    #[test]
+    fn refusal_then_lost_off_completes() {
+        assert_eq!(
+            decisions(vec![refusal(), status("lost", false)]),
+            (vec![false, true], true)
+        );
+    }
+
+    #[test]
+    fn held_then_refusal_then_lost_off_completes() {
+        assert_eq!(
+            decisions(vec![status("held", true), refusal(), status("lost", false)]),
+            (vec![false, false, true], true)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected ownership-loss probe:")]
+    fn refusal_then_refusal_fails_immediately() {
+        decisions(vec![refusal(), refusal()]);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected lost after transition-time cancellation:")]
+    fn refusal_then_held_fails_immediately() {
+        decisions(vec![refusal(), status("held", true)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected ownership-loss probe:")]
+    fn refusal_then_unrelated_error_fails_immediately() {
+        decisions(vec![refusal(), reply(7, b"", b"daemon unavailable\n")]);
+    }
+
+    #[test]
+    fn wrong_exit_stdout_stderr_and_signals_fail_before_or_after_refusal() {
+        let mut signal = refusal();
+        signal.status = ExitStatus::from_raw(15);
+        let mut stdout = refusal();
+        stdout.stdout = b"unexpected".to_vec();
+        let mut exit = refusal();
+        exit.status = ExitStatus::from_raw(7 << 8);
+        let mut success = refusal();
+        success.status = ExitStatus::from_raw(0);
+        let mut whitespace = refusal();
+        whitespace.stderr.insert(0, b' ');
+        let mut newline = refusal();
+        newline.stderr.pop();
+        let mut trailing = refusal();
+        trailing.stderr.extend_from_slice(b"extra\n");
+        let mut success_stderr = status("lost", false);
+        success_stderr.stderr = b"unexpected\n".to_vec();
+        let invalid = [
+            ("signal", signal),
+            ("stdout", stdout),
+            ("exit", exit),
+            ("success cancellation", success),
+            ("whitespace", whitespace),
+            ("newline", newline),
+            ("trailing bytes", trailing),
+            ("other stderr", reply(1, b"", b"another error\n")),
+            ("success stderr", success_stderr),
+        ];
+        for (name, output) in invalid {
+            for after_refusal in [false, true] {
+                let mut tolerated = false;
+                if after_refusal {
+                    ownership_loss_probe(&mut tolerated, refusal());
+                }
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| ownership_loss_probe(
+                        &mut tolerated,
+                        output.clone()
+                    )))
+                    .is_err(),
+                    "accepted {name}, after_refusal={after_refusal}: {output:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_or_invalid_status_and_lost_on_fail_before_or_after_refusal() {
+        let mut invalid = vec![status("lost", true), status("unknown", false)];
+        for json in [
+            "",
+            "{",
+            "{}",
+            "[]",
+            r#"{"ownership":"held"}"#,
+            r#"{"ownership":"lost","dispatch":{"dispatch_on":"false"}}"#,
+        ] {
+            invalid.push(reply(0, json.as_bytes(), b""));
+        }
+        for output in invalid {
+            for after_refusal in [false, true] {
+                let mut tolerated = false;
+                if after_refusal {
+                    ownership_loss_probe(&mut tolerated, refusal());
+                }
+                assert!(
+                    catch_unwind(AssertUnwindSafe(|| ownership_loss_probe(
+                        &mut tolerated,
+                        output.clone()
+                    )))
+                    .is_err(),
+                    "accepted invalid status, after_refusal={after_refusal}: {output:?}"
+                );
+            }
+        }
     }
 }
