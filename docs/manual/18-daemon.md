@@ -183,6 +183,9 @@ ownership: held
 ownership: LOST — stop and restart the daemon
 ```
 
+The following status captures are from 0.13.0 development builds on 2026-11-09. The 1.0.0 build reports
+orch 1.0.0 with the same local protocol 2; these historical outputs and timestamps are unchanged.
+
 ```console
 $ orch daemon status
 orch daemon PID 76126 · dispatch OFF
@@ -710,7 +713,7 @@ commits can wake dispatch.
 
 ## Upgrading from orch 0.13.0
 
-This is a behaviour change: **no orch command that reads or changes project state works without a running
+Upgrading to 1.0.0 is a behaviour change: **no orch command that reads or changes project state works without a running
 daemon**, and nothing starts one for you. The owner decided this
 ([ADR 0012](../decisions/0012-daemon-owned-state.md), decision 2): you should know when a long-lived process starts
 on your machine. The project's file formats do not change. A v0.13.0 binary read a representative project after
@@ -720,7 +723,7 @@ and a populated optional task `workspace` field, and not every file or surface w
 
 1. Stop every orch 0.13.0 process of the project, including `orch mcp` servers held open by IDE, Claude Code or
    Codex sessions, `orch serve`, `orch run --watch` and dashboards. `pgrep -fl orch` must show none.
-2. Install the new orch.
+2. Install orch 1.0.0.
 3. Start the daemon: `orch daemon start` in a pane you keep open, or `orch daemon start --detach` (add
    `--dispatch on`, or use `orch serve`, to start work at once).
 4. Check it: `orch daemon status`.

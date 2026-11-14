@@ -5,6 +5,16 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-14
+
+### 1.0.0: explicit project daemons
+
+This is a breaking change from 0.13.0. One explicitly started daemon per project owns project state and runs agents. The CLI, dashboard, web view and MCP server use its Unix socket for reads and changes. Clients never start or restart it automatically and have no direct-store fallback. 1.0.0 is the chosen major release number; it supplies no additional permanent CLI, Rust API, wire or storage stability guarantee. It does not introduce a new local protocol revision, remote peer schema or storage schema, or prove compatibility beyond the evidence recorded in the specification.
+
+Stop every old orch process for a project, including MCP servers held by editors and dashboards, before using the new build. Install the new build, run `orch daemon start --detach`, check `orch daemon status`, then restart MCP sessions. A plain daemon starts with dispatch off; use `orch daemon dispatch on` to begin work. `orch serve` and `orch run --watch` explicitly start a foreground daemon with dispatch on. `orch daemon stop` stops it. State commands fail with the documented no-daemon message and exit 7 until the owner starts it. Different package/protocol versions refuse ordinary local requests; stop the daemon explicitly, install the matching build, start it and reconnect. No automatic restart or request replay is added.
+
+`orch run <task-id>`, `run --all`, `run --once` and `serve --once` now ask the running daemon. The batch form needs dispatch off; disconnecting does not stop its agents. The dashboard and web view receive change notifications. Cancellation through the CLI, MCP or dashboard stops the running local agent before reporting success; pause is ordered with dispatch. Context reads no longer delete expired entries. Remote TCP peer protocol/schema is unchanged; the local exact-version rule does not apply to those peers. See the README upgrade section and daemon manual for command changes, failure handling and limits.
+
 **Behaviour change: no orch command that reads or changes a project works without a running daemon, and nothing starts one for you.** Stop every orch 0.13.0 process of the project, `orch mcp` servers included, before you start the daemon. See [Upgrading from v0.13.0](README.md#upgrading-from-v0130).
 
 ### Changed
@@ -71,17 +81,18 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - On a disk that ignores case (the macOS default), setting or deleting a context key, or removing an agent, under a spelling that differs in case from the stored one found the existing file but updated the listing under the spelling that was typed, so the listing and the files came apart. `orch context set foo` after `orch context set Foo` listed both keys for one file, `orch context delete KEEP` left `Keep` listed after its file was gone, and `orch agent remove` with the agent's ID in lower case left the agent listed; every command exited 0. This was so in 0.13.0 and earlier. The listing now follows the file for `orch context set`, `orch context delete` and `orch agent remove`. A listing that an earlier version left this way is not repaired by upgrading; see [Rebuilding an index after a lost update](docs/RUNBOOK.md#rebuilding-an-index-after-a-lost-update). On such a disk two context keys that differ only in case are one entry, and the spelling written last is the one listed.
 
 ### Known limitations and unverified behaviour
-On 2026-11-14 the project owner decided which unverified parts of this change to check before release and which to accept as unverified. Four checks were run once each and a fifth is still pending (all listed first below); the thirteen items after them are **unproven, waived by the owner's word of 2026-11-14**: they were neither shown to work nor shown to fail, none is a pass, and each stays a follow-up. The waiver does not cover continuous integration. The per-requirement record is in the spec's [Verification](docs/specs/2026-11-09-daemon-owned-state.md#verification) and the list of follow-ups under "Owner dispositions of 2026-11-14 and what stays unproven".
+On 2026-11-14 the project owner decided which unverified parts of this change to check before release and which to accept as unverified. Four targeted runtime checks were run once each at `760c270b`; subsequent documentation-candidate checks are recorded below, and the versioned release candidate still needs its own validation; the thirteen items after them are **unproven, waived by the owner's word of 2026-11-14**: they were neither shown to work nor shown to fail, none is a pass, and each stays a follow-up. The waiver does not cover continuous integration. The per-requirement record is in the spec's [Verification](docs/specs/2026-11-09-daemon-owned-state.md#verification) and the list of follow-ups under "Owner dispositions of 2026-11-14 and what stays unproven".
 
-**Checked once on macOS** (single runs, on disposable projects with shell-script agents, not permanent tests, not run on Linux):
+**Four targeted runtime checks on macOS** (single runs, on disposable projects with shell-script agents, not permanent tests, not run on Linux):
 - `orch serve` and `orch run --watch` start a foreground daemon with dispatch on, including for a task queued earlier under a dispatch-off daemon; `orch daemon status` reported dispatch on and the task started 0.4 to 0.7 s later.
 - Cancelling a task from `orch mcp --allow-destructive` and from the dashboard (`C`) stopped a live agent and its child process (gone 15 to 25 ms after the action) before success was reported, and the task stayed cancelled even though the agent exited 0 while being stopped. A remote worker's cancel and a natural exit at the same instant were not exercised.
 - A connected session cannot change its identity or mode: later authority fields were refused without effect on raw sessions, and persistent `orch mcp` bridges kept their launch identity and mode across repeated `initialize` requests. A new connection by the same user can still choose its own label and mode: identity is attribution, not authentication.
-- A representative v0.13.0 project was read and written by this build and read again by the v0.13.0 binary, with no incompatible file, field or value found. Differences: the daemon's `.gitignore` entries and runtime files, and the optional task `workspace` field now filled for a task dispatched in shared-workspace mode. This does **not** show that every stored file is byte-identical. Not compared: remote peer records, attachment files, user-written prompt templates, corrupt or oversized files, every historical optional field, run states other than success, error and token details, event types other than agent output, a missing index, crash recovery, concurrent writers outside orch, other versions and Linux. No permanent test compares a v0.13.0 project with this build.
-- Still to run, with no result claimed here: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask crate-graph` and `cargo test --workspace --no-fail-fast`, directly on macOS, at the final candidate of the documentation change and again at the release candidate. They were not run at the head of #81 (the cold gate was skipped), and that omission stays recorded.
+- A representative v0.13.0 project was read and written by this build and read again by the v0.13.0 binary, with no incompatible file, field or value found. Differences: the daemon's `.gitignore` entries and runtime files, and the optional task `workspace` field now filled for a task dispatched in shared-workspace mode. This does **not** show that every stored file is byte-identical. Not compared: remote peer records, caches and mirrors, attachment files, user-written prompt-template variants, corrupt, oversized or alias-heavy files, every historical optional field, run states other than success, error and token details, event types other than agent output, a missing index, crash recovery, concurrent writers outside orch, other versions and Linux. No permanent test compares a v0.13.0 project with this build.
+
+**Subsequent documentation checks, 2026-11-14:** the documentation candidate `984711b0` passed fmt, clippy, crate-graph, workspace tests and installed `cargo deny check`, once each; workspace totals were 6,974 passed, 0 failed, 7 ignored. These commands were not run directly at the head of #81, and that omission stays recorded. The 1.0.0 release-candidate checks remain pending; no earlier result is inherited.
 
 **Unproven, waived:**
-- No test shows that every command and client surface reaches the daemon. (`cargo xtask crate-graph` passes; its standing security-review limitation, accepted on 2026-11-12, is not cleared.)
+- No test shows that every command and client surface reaches the daemon. (`cargo xtask crate-graph` passes; its standing security-review block was accepted as a documented limitation on 2026-11-12, is not cleared and is not a security gate pass.)
 - What happens when the old executable is deleted while its daemon runs (including `orch daemon stop` with the other binary) was not tested; the two-binary version-mismatch tests pass.
 - The bodies of the earlier passing tests for identity and authorization, peer and goal-edit ordering, and dispatch and batch rules were not read clause by clause against the requirements.
 - Dispatch on/off in the web view and in the daemon's start output, the dashboard in tmux, and the hint when `orch serve` finds a daemon with dispatch off were not observed.
@@ -97,7 +108,25 @@ On 2026-11-14 the project owner decided which unverified parts of this change to
 
 **Known limitation, to be fixed later:** an `orch mcp` bridge that has already initialised answers a repeated `initialize` with success after the daemon died; the next tool call and a fresh bridge fail correctly. See [When no daemon is running](docs/manual/17-mcp-server.md#when-no-daemon-is-running).
 
-**Verification status of the code:** the Linux CI run on `main` after #81 (run 43561235069) failed one test, `orch-cli/daemon_ownership_notice::full_stderr_two_workers_status_request_and_stop`; that failed run stays recorded. A test-only repair is part of this change and has local macOS evidence only; it has not yet run on Linux. The cold gate was skipped for #81's code and is skipped for the release by the owner. The plan's held-permit p50/p95 measurement is not claimed.
+The engine’s per-operation event-buffer cap was waived on 2026-11-13; it remains uncapped. The kernel-process-group acknowledgement for agent-originated stop/dispatch-off was deferred on 2026-11-11 and is not implemented. Same-user authority and environment-based accident prevention are not authentication.
+
+The lost-ownership notice is best effort and does not stop another writer. Its evidence covers recording that returns an error, not one that never completes, panics or is cancelled. Full-stderr-pipe evidence is at the default log filter; the possible two-second exit lag is source analysis, not a timing result. Reminder timing is not guaranteed for a disagreeing task list and index.
+
+### Verification record
+
+The documentation/test candidate in [PR82](https://github.com/yuxhuang/r-orch/pull/82), commit `984711b0`, passed the five direct macOS checks once: fmt, clippy, crate-graph, workspace tests and installed cargo-deny. Workspace totals were 6,974 passed, 0 failed, 7 ignored; the repaired notice target passed 15/15. Its [original Linux CI](https://github.com/yuxhuang/r-orch/actions/runs/43597261918), attempt 1, passed both jobs: 6,944 passed, 0 failed, 7 ignored, notice 15/15. The actual synthetic merge checkout had the same tree as the candidate. These are documentation-candidate results, not the versioned 1.0.0 candidate's validation.
+
+The [main CI failure after PR81](https://github.com/yuxhuang/r-orch/actions/runs/43561235069), attempt 1, remains recorded, as do the direct macOS checks omitted at PR81's head. The test-only repair passed later; its corrected live runs did not observe the cancellation interleaving, which is covered by scripted cases rather than claimed as a live reproduction. Nonfatal macOS stripping diagnostics and duplicate-dependency warnings remain in the evidence; no advisory was suppressed.
+
+The cold gate was **not run, skipped by the owner's word of 2026-11-13** for PR81's code; the release cold gate is **not run, skipped by the owner's word of 2026-11-14**. Neither is a pass. The earlier macOS cold-gate pass belongs to `d002013f` only. The versioned release candidate still needs its own direct checks, original Linux CI, final text/link verification and release facts; their results must be inserted only when measured. The package number alone changes none of these dispositions.
+
+**Subsequent merge record, 2026-11-14:** [PR82](https://github.com/yuxhuang/r-orch/pull/82) merged as `c863494e25dc3a3b898eda18d8c19b5319552b59`, with head `984711b003e474c8e059d4150f811ee0c5dc2d0f` and API base/actual first parent `fc8d8bf8189a4c157b783d24304ca7791cd94978`. The merge tree `8ccd3decd521d672c5cee94d2095a8cc34d177aa` equals the tested documentation candidate. Its original [main push CI43604091956](https://github.com/yuxhuang/r-orch/actions/runs/43604091956), attempt 1, passed both jobs. This establishes the release preparation base, not validation of the versioned candidate.
+
+**RELEASE-CANDIDATE checks pending:** direct macOS validation, independent final fact/link review, original Linux CI and final release facts have not been completed for 1.0.0. This section is a local preparation record, not a publication or release-acceptance claim. The 1.0.0 tag and comparison links below are planned and remain pending until publication.
+
+### Rollback
+
+Choose a time without important work running. Run `orch daemon stop`, wait for confirmed cleanup and reconcile agent processes before installing 0.13.0 and restarting the old clients. Do not run old and new writers together. Representative backward-read evidence found no schema incompatibility, with the qualifications above; back up project definitions before switching. The old multiple-writer limitations return. Reverting a package recipe to the previous release requires both its previous tag and dereferenced commit. Preserve published tags; never move or delete them.
 
 ## [0.13.0] - 2026-11-09
 
@@ -386,7 +415,8 @@ Previewed as `v0.5.0-alpha.1` and `v0.5.0-alpha.2`.
 - [0.1.1] - 2026-10-14: `orch update` and the README point at Homebrew.
 - [0.1.0] - 2026-10-14: first tagged release of the Rust port.
 
-[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/yuxhuang/r-orch/compare/v0.13.0...v1.0.0
 [0.13.0]: https://github.com/yuxhuang/r-orch/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/yuxhuang/r-orch/compare/v0.11.1...v0.12.0
 [0.11.1]: https://github.com/yuxhuang/r-orch/compare/v0.11.0...v0.11.1

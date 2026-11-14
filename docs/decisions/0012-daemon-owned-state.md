@@ -227,6 +227,14 @@ authorize client recovery side effects, release or merge.
     single-writer behavior must hold at PR 2 head; PR 4 adds the structural check described, with its limits, in decision 16. The owner approved regrouping
     at gate 2 and merges each green PR. SE-20 developmental gating ends in PR 2, not the old PR 4 proposal.
 
+    **Implementation/release disposition, 2026-11-14.** The no-release/tag/version-bump restriction applies to
+    the implementation stack. After its documentation and acceptance decisions, the owner separately ordered a
+    1.0.0 release and tag after merge. PR82 has now merged as `c863494e`; its tested documentation tree and
+    original main CI passed. A separate versioned candidate is prepared locally; its checks and publication remain
+    pending. The release cold gate is **not run, skipped by the owner's word of 2026-11-14**, not passed.
+    Local protocol remains 2; no additional CLI, Rust API, wire or storage guarantee follows from 1.0.0.
+    Decision 16's accepted security-review limitation remains blocked, not cleared.
+
 14. **With no daemon, `orch doctor` is discovery-only, and the CLI's local store and execution frontends are
     removed.** Two PR 4 behaviour changes that make the code match decisions 4 and 7 and spec row R38.
 
@@ -380,7 +388,9 @@ authorize client recovery side effects, release or merge.
   connect to a real project or real global configuration. Mac QA and Linux CI cover different OS boundaries.
 - Four stacked PRs deliver the transition under decision 13. PR 1 is explicitly developmental; PR 2 has no
   supported mixed-writer frontend, with real-path stress evidence at that head. PR 3/4 finish push and the structural
-  check (its limits are in decision 16). Owner merges; no release/tag/version bump here.
+  check (its limits are in decision 16). Owner merges; no release/tag/version bump in that implementation scope.
+  The separate 2026-11-14 release disposition in decision 13 governs the subsequent 1.0.0 preparation; release
+  validation and publication are pending.
 - Rollback requires explicit owner stop and verification that agent children are reconciled, then selecting
   the previous binary. File formats remain readable; the old multiple-writer limitations return.
 - At stance 0.5, choose shared operation coordination and coarse push over a per-entity transactional framework:
