@@ -126,7 +126,7 @@ orch also matches labels to agents. For a task without an assignee, an agent sco
 
 A task that waits only because of its scope stays `todo` (or `retrying`). `orch serve --once` logs a `task:scope_overlap` warning for it with the held task (`taskId`), the task that blocks it (`overlappingTaskId`) and the held task's scope (`patterns`). `overlappingTaskId` always names a real blocker: a task that is running or has been claimed. In v0.13.0 it sometimes repeated the held task's own id.
 
-Unlike v0.13.0's warning on every reached dispatch pass, `orch serve --once` reports a scope hold when it is first observed or its blocker changes. It then reminds you at the next eligibility check after five minutes since the last report. Time with dispatch off counts, missed reminders are not replayed, and a late follower can see the next reminder.
+Unlike v0.13.0's warning on every reached dispatch pass, `orch serve --once` reports a scope hold when it is first observed or its blocker changes. It then reminds you at the next eligibility check after five minutes since the last report. Time with dispatch off counts, missed reminders are not replayed, and a late follower can see the next reminder. While dispatch is on, no command prints the warning (its only renderer is `orch serve --once`, which needs dispatch off), so the first `orch serve --once` afterwards can stay silent for up to five minutes about a hold that the daemon already reported; `orch task show <id>` and the status of the blocking task tell you whether the hold still exists.
 
 What this does and does not tell you:
 
@@ -136,7 +136,7 @@ What this does and does not tell you:
 - **Setting the wall clock back** silences the reminders of an unchanged hold until the clock passes the last report plus five minutes. A daemon restart resets this.
 - **There is no "hold ended" event.** The absence of a reminder is not evidence that the hold ended: the task may simply not have been evaluated. `orch task list` shows whether the task has started.
 - **A hold that ends and returns** between two evaluations of the same pair (a scope or a reservation ends and comes back) may be reported only at the next reminder, not at once.
-- **Delivery is best effort, with no replay.** A follower that falls behind (more than 256 queued events, or one event larger than the 1 MiB frame) gets a resync, and the reason is not printed. A follower that attaches later does not see earlier lines.
+- **Delivery is best effort, with no replay.** `orch serve --once` receives the warning in its own request stream. A warning that does not fit one 1 MiB frame, or that the stream misses when the daemon's event channel overflows, is dropped without a line. A follower that attaches later does not see earlier lines.
 - **The event is not bounded by size.** It carries the held task's whole scope list, so a task with a very large scope makes a large event.
 - **Odd characters in scope strings.** The `patterns` field is written as JSON in both log formats, so control characters in a scope string are escaped. Other Unicode is not filtered.
 

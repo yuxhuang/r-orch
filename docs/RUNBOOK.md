@@ -18,7 +18,7 @@ If you are looking for *what r-orch is* and how to build it, start at the [READM
 | How do I start, see or stop the daemon? | [Start, check and stop the daemon](#start-check-and-stop-the-daemon) |
 | `orch daemon start` exits 2 naming the socket, or `connection refused` in the no-daemon detail | [A stale or stuck socket](#a-stale-or-stuck-socket) |
 | The daemon crashed or was killed | [After a daemon crash](#after-a-daemon-crash-or-kill--9) |
-| `ownership: LOST — stop and restart the daemon` in `orch daemon status`, `daemon ownership was lost` from a dispatch command or the dashboard, or tasks stop starting and `orch daemon status` shows `dispatch OFF` | [A daemon that reports `ownership: LOST`](#a-daemon-that-reports-ownership-lost) |
+| `ownership: LOST — stop and restart the daemon` in `orch daemon status`, `⚠ ownership lost` on the daemon's standard error or in `daemon.log`, `daemon ownership was lost` from a dispatch command or the dashboard, or tasks stop starting and `orch daemon status` shows `dispatch OFF` | [A daemon that reports `ownership: LOST`](#a-daemon-that-reports-ownership-lost) |
 | `daemon is orch … protocol …, this client is orch …`, or upgrading orch | [Version skew and upgrading](#version-skew-and-upgrading-orch) |
 | Commands time out, or `orch daemon stop` says the PID is still running | [A hung daemon](#a-hung-daemon) |
 | `orch` commands, the dashboard or MCP tools are slow while many tasks fail to start | [Commands are slow while many tasks fail to start](#orch-commands-are-slow-while-many-tasks-fail-to-start) |
@@ -110,11 +110,13 @@ retry it. A restart does not resume the agent's conversation. `orch daemon start
 that on purpose.
 
 This is also what the agents that survive a daemon crash meet. An agent process whose environment has neither
-variable (a child that cleared its environment, for example) gets the ordinary message with
-`Start it with: orch daemon start`. If it tries, the start is refused (exit 2) with `Refusing to start the orch daemon
-from an agent context (ORCH_TASK_ID or ORCH_AGENT_ID is set). The owner starts the daemon; pass --from-agent only if
-the owner deliberately intends this.`, which names `--from-agent`. Whether your agent roles or sandboxes forbid that
-flag is your decision; orch does not.
+variable (a child that cleared its environment, for example) is not recognised as an agent: it gets the ordinary
+message with `Start it with: orch daemon start`. If it runs `orch daemon start`, the start is not refused, because orch
+cannot tell that process from you. Only a start with `ORCH_TASK_ID` or `ORCH_AGENT_ID` set is refused (exit 2), with
+`Refusing to start the orch daemon from an agent context (ORCH_TASK_ID or ORCH_AGENT_ID is set). The owner starts the
+daemon; pass --from-agent only if the owner deliberately intends this.`, which names `--from-agent`. The check
+reads only those two variables, so it is not a security boundary: whether an agent can run `orch daemon start` with
+its variables cleared is decided by your agent roles or sandboxes, not by orch.
 
 **Not this entry:** `daemon_busy` (the daemon runs but found no room for the client within about 13 s, that is 10 s
 of waiting plus one last connection attempt, for a session

@@ -266,8 +266,8 @@ Two ways to get here that are worth knowing. If you delete `.orchestry/orchestry
 [troubleshooting steps](13-troubleshooting.md#orch-daemon-already-running-pid-unavailable-and-no-daemon-is-running)
 tell you to delete it only after checking that no daemon runs), the daemon reports LOST at its next check. And orch
 0.13.0 treats a lock file that has not been touched for 60 seconds as abandoned even when its process is alive; the
-daemon touches the file every 10 seconds, so only a daemon suspended for longer (a laptop with its lid closed) is
-exposed to a 0.13.0 binary that starts. That is read from the code, not observed. Stop every 0.13.0 process before you
+daemon touches the file every 10 seconds, so a daemon whose lock has not been refreshed for more than 60 seconds, for
+example while suspended (a laptop with its lid closed), is exposed to a 0.13.0 binary that starts. That is read from the code, not observed. Stop every 0.13.0 process before you
 start the daemon.
 
 From then until it stops, the daemon refuses the requests that switch dispatch or start a run, from every client,
@@ -562,7 +562,7 @@ is something you do.
 
 | Situation | What you see | What to do |
 |---|---|---|
-| The daemon crashed or was killed (`kill -9`) | The next command of every client reports no daemon (exit 7); nothing restarts it. The stale socket and `daemon.json` stay until the next start. | Start it again. The new daemon has dispatch off, clears stale claims, records runs whose agent died as cancelled and their agents as idle, and leaves remote work as unknown until the peer syncs. Check tasks and runs before you retry anything or turn dispatch on. Agents that survived the crash get the no-daemon message too: with `ORCH_TASK_ID` or `ORCH_AGENT_ID` set it says not to start the daemon, without both it prints `Start it with: orch daemon start`, and a start from an agent context is refused (exit 2) in words that name `--from-agent`. |
+| The daemon crashed or was killed (`kill -9`) | The next command of every client reports no daemon (exit 7); nothing restarts it. The stale socket and `daemon.json` stay until the next start. | Start it again. The new daemon has dispatch off, clears stale claims, records runs whose agent died as cancelled and their agents as idle, and leaves remote work as unknown until the peer syncs. Check tasks and runs before you retry anything or turn dispatch on. Agents that survived the crash get the no-daemon message too: with `ORCH_TASK_ID` or `ORCH_AGENT_ID` set it says not to start the daemon, with neither it prints `Start it with: orch daemon start`. Only a start with one of the two variables set is refused (exit 2), in words that name `--from-agent`; a start with neither is not refused. |
 | A foreground daemon's terminal or pane closed | SIGHUP: a clean stop, the same as `orch daemon stop`; its local agents are stopped (unless cleanup fails; see the stop section). | Start it again in a new pane, or use `--detach`. |
 | A detached daemon after a reboot (logout is untested) | No daemon answers. | Start it again. orch supplies no launchd job, watchdog or restart. |
 | Recovery at start cannot save a task, run or agent change | The start exits 1 and names the write that failed; `orch daemon status` exits 7. | Fix the cause (permissions, disk space), then start again; the state needed to finish the recovery is kept. |
