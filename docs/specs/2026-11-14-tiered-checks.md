@@ -1,0 +1,126 @@
+# Tiered verification checks
+
+status: approved
+owner: orchestrator
+date: 2026-11-14
+plan: [../plans/2026-11-14-tiered-checks.md](../plans/2026-11-14-tiered-checks.md)
+decision record: [ADR 0013](../decisions/0013-tiered-verification-gates.md)
+
+## Source
+
+Goal goal_7ZJmm9k, “Faster iteration: tiered checks instead of the full cold gate on every change”. The following numbered source passages are verbatim. The complete operational request is retained in the lead's private goal record; machine-specific scheduling details are omitted here.
+
+> Tier definitions:
+> The full cold gate stops being the unit of iteration.
+>
+> 1. Fast check (target: 1 to 5 minutes), for every commit and every fix round: fmt, clippy, and the tests of the changed crates plus the crates that depend on them, computed from `git diff` against a base and the cargo workspace graph. A change that touches only documentation runs no tests (build, lints and the documentation checks only). A change to Cargo.lock, rust-toolchain.toml, .cargo/, xtask/, .github/, or shared test support selects everything. The selection must print what it selected and why, and must fail closed (unknown file kind = everything).
+> 2. Pull-request check (target: about 10 minutes, hard ceiling 20), once per pull request and the merge condition: ONE full suite run, the lint, advisories and crate-graph steps, warm target allowed. Test binaries run in parallel if the shake-out below succeeds.
+> 3. Full cold gate (target: about 20 minutes), once per goal or release, not per pull request: cold target as today, with the empty-HOME check and the no-real-CLI check folded into the single suite run instead of two extra runs. Every protection the current script documents must still hold: nothing passes on a stale artifact; no test writes into a developer's home (the check must still run from outside the workspace so `.cargo/config.toml` [env] cannot hide a writer, and must still fail if zero tests ran); no test execs a real agent CLI; the real ~/.orchestry is untouched.
+>
+> Required shape:
+> 1. `xtask/gate.sh` (or an xtask subcommand) offers the three tiers by name; the default invocation and its help say which tier is the merge condition and which is the release gate. The summary table keeps its per-step verdicts and adds per-step wall time.
+> 2. Folding: when the suite runs under the sentinel HOME and the shims, test failures are judged in that run. Before switching, run the folded form once and report every test that passes today but fails folded (today the sentinel run discards test results); each is fixed or brought to the owner, none is silently skipped.
+> 3. Parallel test binaries: evaluate cargo-nextest (process per test; no doc-tests, so doc-tests keep a separate step) against a simple split of the test binaries into N parallel cargo jobs. Measure both on the Mac and on Linux. Adopt one only if 20 consecutive runs are green on an otherwise idle machine and the wall time is at least halved; otherwise record the measurements and keep sequential binaries. Tests that need isolation get it explicitly (a serial group), not by slowing everything.
+> 4. Slowest tests: for each binary above 30 seconds, say where the time goes (fixed sleeps, timeouts, process starts, real cargo builds inside the test). Remove fixed waits where a controlled clock or an event can replace them without weakening the assertion. No test is deleted or weakened to save time; a test that cannot be made faster stays and is named.
+> 5. Change-based selection (tier 1) is a script with its own tests: for a table of changed-path sets it must select the expected crates, including the fail-closed cases.
+> 6. CI: the pull-request workflow runs the tier 2 check once. A documentation-only pull request runs the documentation job only. Keep a full run on pushes to main.
+> 7. Flaky tests are not managed by re-running: a test that fails intermittently is triaged and fixed or named, as in goal_zX0WXev. The tooling may record timings and failures per test to make that cheaper.
+> 8. Team rules, changed by the owner's word at the approval gate and then written into AGENTS.md and the team's rule files: which tier a builder runs, which tier a reviewer may rely on, which tier gates a merge, one green CI execution per pull request instead of three, and the full cold gate once per goal. Until the owner says so, the existing rules stand.
+> 9. Documentation: AGENTS.md, the developer section of the README or RUNBOOK, and the comments in the gate script say what each tier proves and what it does not.
+>
+> Acceptance:
+> - A before-and-after timing table, measured, not estimated: each tier on the owner's Mac (idle machine) and the pull-request workflow on Linux CI; today's baseline is in "The problem".
+> - Targets: tier 1 at most 5 minutes for a single-crate change and under 1 minute for a documentation-only change; tier 2 at most 20 minutes, 10 if parallel binaries are adopted; tier 3 at most 25 minutes.
+> - Every protection listed in tier 3 has a negative test or a demonstrated failing case: a planted stale artifact, a test that writes into HOME, a test that execs a shimmed CLI, a suite that runs zero tests.
+> - The selection script's table test passes, including the fail-closed rows.
+> - The full suite passes in the new tier 3 form on macOS and in the new CI form on Linux, with the same number of tests executed as before (a count comparison, by name, in the report).
+> - No test was removed; the report lists every test whose body changed and why.
+
+Delivery source:
+> tier=mid, stance=0.5, create PR. Small stacked pull requests against main, each leaving main working: 1 the folded gate with per-step timings; 2 the fast check with change-based selection and the documentation-only path; 3 CI workflow changes; 4 parallel binaries, only if the shake-out passes; 5 the slowest tests; 6 the rule and documentation changes after the owner's answers. The owner merges each PR; no release, tag or version bump. Approval gate first: present the open questions and the plan before building.
+
+## Owner amendments to the quoted source
+
+The Source above is kept verbatim as provenance. The owner answered the five open questions of the request and then approved the plan as a whole. The answers amend the Source. The owner's words are quoted exactly; the records are in the lead's private goal record. `<linux-host>` stands for the owner's native Linux worker; the host's name is not published.
+
+| Question | Owner's words | What it decides |
+|---|---|---|
+| Q1, CI run count | “Q1 1.” | One green Linux execution at the final PR head is the merge rule. A failed run is kept and diagnosed, not rerun away. Independent review and the full gate once per goal or release remain. |
+| Q2, native Linux worker | “1actually 2” | A suite run on `<linux-host>` may replace GitHub's Linux CI as the merge evidence. Chosen against the lead's recommendation. It does not by itself change a GitHub rule or permit a bypass. |
+| Q3, parallel runner | “2” | cargo-nextest is the only candidate; the split into parallel cargo jobs is not evaluated. Doc-tests keep a separate step. The qualification bar of shape item 3 still applies, and retries stay disabled. |
+| Q4, PR target | “1” | The PR check may use a warm target that is unique to its worktree, with the commit and tree recorded. The full gate stays cold. |
+| Q5, machine lease | “1” | One cooperative host-wide lease for measured and gating runs. Reading, documentation and review continue. No process is terminated to free it. |
+| Final plan | “1” | The plan is approved in full, including the removal of the required `test` check on `main` only, applied by the owner after PR 3 and the evidence procedure pass review. `check` and every `release/**` protection stay. Chosen against the monitor's recommendation. |
+| Unavailable host | “also the other thing - when one of [`<linux-host>`] or mac is down, you can just rely on the CI.” (host name replaced) | When `<linux-host>` or the Mac is unavailable, GitHub's Linux CI is the evidence for an ordinary pull request. A macOS check that did not run is reported as not run. This does not waive the per-platform qualification or the macOS cold gate for a goal or release; such a conflict returns to the owner. |
+
+## Requirements
+
+The commands and test paths below are the acceptance interface that the plan builds; they do not exist at the base commit. “Mac” means macOS. “Linux” means native Linux (GitHub CI or `<linux-host>`); an emulated container is labelled as such and does not count as native.
+
+| Id | Requirement | Source | Priority | Acceptance check; platform |
+|---|---|---|---|---|
+| R1 | The gate shall expose `fast`, `pr` and `full` tiers by name, say which is the merge condition and which the release gate, and print per-step verdicts and wall time. | shape 1 | must | `./xtask/gate.sh --help`; `cargo test -p xtask --test gate_tiers` (plan vectors TV70–TV76); Mac + Linux |
+| R2 | The full tier shall run the suite once, from outside the workspace, on a cold target, under a sentinel `HOME` and CLI recording shims, and shall fail when the suite fails or when no test executed. | tier 3; shape 2 | must | `./xtask/gate.sh full`; `cargo test -p xtask --test gate_protections` (TV1–TV6, TV12) and `--test gate_inventory` (TV7–TV11); Mac + Linux |
+| R3 | The gate shall reject a planted stale artifact, a write into `HOME` and an exec of an agent CLI, keep the evidence of each, and protect the real global state. | tier 3; acceptance | must | `cargo test -p xtask --test gate_protections` (TV1–TV6, TV13–TV16), each negative case shown to fail for the stated reason; Mac + Linux |
+| R4 | Before the folded run replaces the three runs, a comparison at one commit shall name every test whose result differs between the ordinary and the folded run; each is fixed or taken to the owner. | shape 2 | must | The two inventories and their difference, in the PR 1 report; Mac + Linux |
+| R5 | Fast selection shall select the changed crates and their transitive dependents, select everything for shared inputs, unknown paths and errors, and print its reasons. | tier 1; shape 5 | must | `cargo test -p xtask --test gate_selection` (TV20–TV37); Mac + Linux |
+| R6 | A documentation-only local fast check shall run build, lints and the documentation checks without tests; a documentation-only pull request shall run the documentation job only. | tier 1; shape 6 | must | `cargo test -p xtask --test gate_selection` (TV21, TV25, TV32, TV34); a real documentation-only pull request with the required checks satisfied (TV50); Mac + Linux CI |
+| R7 | PR verification shall run one full suite plus lint, advisories and crate graph, keep a full run on pushes to `main`, and surface failures without rerunning them away. | tier 2; shape 6–7 | must | `./xtask/gate.sh pr`; real Linux CI runs of a code pull request and of `main` (TV51–TV53) |
+| R8 | cargo-nextest alone shall be compared with the sequential baseline on Mac and native Linux. Adoption requires at most half the sequential wall time and 20 consecutive green runs per platform on an otherwise idle host, explicit serial groups, a separate doc-test step and no retries. | shape 3, amended by Q3 | must | Measured records, named inventories including doc-tests, and the 20-run records per platform. On a miss the sequential runner stays and the results go to the owner; nothing is substituted or waived silently |
+| R9 | Each test binary above 30 seconds shall have its time attributed, and removable fixed waits shall be replaced without deleting tests, weakening assertions or raising timeouts. | shape 4; scope | must | Per-binary measurements before and after; a ledger of every changed test body with its reason; targeted regression tests; Mac + Linux |
+| R10 | Team rules and developer documentation shall say what each tier proves and does not prove, and policy shall change only on the owner's word. | shape 8–9 | must | The owner's decisions as recorded above; commands in the documents run as written; an independent fact check of the final commit |
+| R11 | The report shall give measured timings before and after and a comparison of executed tests by name and count on both platforms, and list every test whose body changed and why. | acceptance | must | Timing records and inventories that can be regenerated, checked independently against the logs and the diff; Mac + Linux CI |
+| R12 | The fast check shall take at most 5 minutes for the named single-crate workload and under 1 minute for a documentation-only change; the PR check at most 20 minutes (10 if nextest is adopted); the full gate at most 25 minutes. | acceptance | must | `./xtask/gate.sh fast --base <base>` for the declared workloads, `./xtask/gate.sh pr`, `./xtask/gate.sh full`; wall times on an idle host; Mac + Linux PR CI. A miss goes to the owner and is never waived implicitly |
+| R13 | Pull requests shall stay independently reviewable and owner-merged, with no release, tag or version bump. | delivery | must | Each PR's diff, status and CI evidence; no unrelated product, protocol or storage change |
+| R14 | A run on `<linux-host>` shall count as merge evidence only when it records a clean tree at the exact PR head before and after, the pinned tools and configuration, a warm target unique to the worktree, the lease, complete logs, per-step exit status and the named test and doc-test inventory, and the PR links that record. Otherwise GitHub's PR run is the evidence. | Q1, Q2, unavailable-host answer | must | `cargo test -p xtask --test gate_evidence` (TV40–TV46); one real qualifying run, checked by a reviewer against the PR head; Linux |
+| R15 | The rules change shall remove only the required `test` check, only on `main`, keeping `check` and every `release/**` protection including its `test` requirement. The owner applies it after PR 3 and the evidence procedure pass review. Until it is applied and verified, `check` and `test` both remain required. | final approval | must | The proposed configuration and its rollback, reviewed before use; the live rules read back after the owner's change (TV54); no bypass and no synthetic success |
+| R16 | Measured and gating runs shall take a cooperative host-wide lease that survives interruption without a stale owner, shall record contention, and shall reject contaminated measurements; no other process is terminated. The full gate stays cold; PR targets are warm and unique to a worktree. | Q4, Q5 | must | `cargo test -p xtask --test gate_lease` (TV60–TV68); Mac + Linux |
+
+## Non-goals
+
+Deleting or weakening tests; raising timeouts to hide slowness; product changes beyond an injectable clock seam that already exists or is trivial; a remote build cache or a paid CI tier; Windows; changing what the crate-graph check enforces; any on-disk format or protocol. No release and no automatic merge.
+
+## Constraints
+
+The base is `main` at caefbadaf1f00c6fc9092acd1e01fcf26f894321. Every incident protection that `xtask/gate.sh` documents is kept, and a protection the script only describes in a comment is told apart from one it implements (the plan's incident ledger does this line by line). Existing rules apply until an explicit owner decision changes them. This document claims no measurement.
+
+Security checklist:
+- Default bind and exposure: no listener is added. CI keeps read-only permissions and does not persist checkout credentials.
+- Bounds on input: changed paths, base refs and Cargo metadata are untrusted. Errors select everything. Paths are read NUL-delimited and passed as arguments, never through a shell.
+- Files it writes: gate-owned targets inside the worktree, disposable directories under the temporary directory, and one lease file at a fixed host path. Nothing outside gate-owned paths is deleted. Run logs are bounded in number.
+- Secrets and environment passed to children: a sentinel home, shims in place of agent CLIs, explicit toolchain homes, no real agent CLI. The global-config redirect is removed from the suite's environment so it cannot mask a write into `HOME`.
+- Untrusted text in output: evidence copies replace the repository root, the home directory and the temporary directory with placeholders, and record environment variable names from an allow-list, never values of credentials.
+
+## Verification environment
+
+The release engineer runs the host gates and Linux CI. The performance engineer owns the idle-host measurements. Independent reviewers use bounded disposable probes, not competing full gates. Comparable runner experiments need a native Linux host; an emulated container is labelled and cannot stand in for an idle native timing. `<linux-host>` may supply the PR evidence under R14, with GitHub's PR run as the fallback; measurements on real Linux CI are still required for R11 and R12. The live ruleset (id 25285267, covering the default branch and `release/**`) requires `check` and `test`; R15 describes the approved change and who applies it. The existing suite needs tmux. No user interface changes.
+
+## Approval
+
+The owner's answers to Q1–Q5 and the final approval are in the amendments table. Scoped implementation is authorized. Applying the rule change and merging each pull request remain the owner's actions. A measured timing or qualification miss returns to the owner.
+
+## Verification
+
+Filled in by the PR that completes the work. All rows are pending: nothing is implemented and no test has run.
+
+| Id | Result (`pass` / `env-limited` / `waived by owner`) | Commit the check ran at | Platform |
+|---|---|---|---|
+| R1 | | | |
+| R2 | | | |
+| R3 | | | |
+| R4 | | | |
+| R5 | | | |
+| R6 | | | |
+| R7 | | | |
+| R8 | | | |
+| R9 | | | |
+| R10 | | | |
+| R11 | | | |
+| R12 | | | |
+| R13 | | | |
+| R14 | | | |
+| R15 | | | |
+| R16 | | | |
+
+Defects found outside the requirements:
+- `scratch_outlives_late_spawn_and_drop` in `crates/orch-daemon/tests/daemon_harness_hermetic.rs` was reported to fail intermittently with “conflict: diagnostic cancelled”. The root cause is unknown. The original failure is kept and is under investigation; it is not rerun away.
