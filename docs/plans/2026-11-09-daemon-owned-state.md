@@ -1,6 +1,7 @@
 # Daemon-owned state: one orch process owns `.orchestry/`
 
 status: active
+progress: PR 1 to PR 4 are merged (#74 to #80); #81 (scope-overlap event and lost-ownership notice) is an open draft; the spec's Verification table is filled and the plan is not `done` until the owner has dealt with its list of unproven `must` rows
 owner: orchestrator (lead)
 date: 2026-11-09
 spec: [../specs/2026-11-09-daemon-owned-state.md](../specs/2026-11-09-daemon-owned-state.md) (approved by the owner at gate 2, 2026-11-09)
@@ -178,16 +179,21 @@ holds remain.
 
 ## Status
 
-Status at 2026-11-10, including scoped PR 3 repairs. This table does not certify a new integrated freeze.
+Status as of #81 being an open draft (2026-11-14). The spec's [Verification](../specs/2026-11-09-daemon-owned-state.md#verification)
+table gives the evidence per row and what is not proven.
 
 | Item | State |
 |---|---|
 | Gate 1 (plan and design questions) | approved by the owner, 2026-11-09 |
 | Gate 2 (spec) | spec approved, ADR 0012 accepted, 2026-11-09 |
-| PR 1, `feature/daemon-core` | frozen at `051742bd`; draft PR [#74](https://github.com/yuxhuang/r-orch/pull/74) opened against `main`; the test-only CI fixture fix is included |
-| PR 2, `feature/daemon-clients` | integration frozen at `7fd1fa02`; board 2c and PR handoff are pending; this row does not certify Linux CI |
-| PR 3, `feature/daemon-push` | original freeze `9277f832`; acknowledgement repair `17fe365d`, deferred-refresh repair `c1b7194d` and MCP lifecycle repair `28fbfddd` have scoped qualified reviews. Actual PR 2 production/test integration, separate containment lineage, I3 re-freeze and exact-SHA delta reviews remain required before gate release and QA pass 1. |
-| PR 4, `feature/daemon-enforce` | pending; starts when PR 3 is frozen |
+| PR 1, `feature/daemon-core` | merged: [#74](https://github.com/yuxhuang/r-orch/pull/74), merge commit `d1951d29` |
+| PR 2, `feature/daemon-clients-i2d` | merged: [#75](https://github.com/yuxhuang/r-orch/pull/75), merge commit `d3c5e3f1` |
+| PR 3, `feature/daemon-push-i3e` | merged: [#76](https://github.com/yuxhuang/r-orch/pull/76), merge commit `47b3c5d9` |
+| PR 4, `feature/daemon-enforce` | merged in three pull requests: [#77](https://github.com/yuxhuang/r-orch/pull/77) (4a, `eae4f13d`), [#79](https://github.com/yuxhuang/r-orch/pull/79) (a test repair, `ab538dec`) and [#78](https://github.com/yuxhuang/r-orch/pull/78) (4b, `12b3bd28`) |
+| Documentation as built, and one registry-lock test repair | merged: [#80](https://github.com/yuxhuang/r-orch/pull/80), merge commit `2b91c674`, head `d002013f`; the cold gate passed on macOS at that head (9 of 9 steps, 6,935 tests) |
+| Scope-overlap event and lost-ownership notice (R40) | [#81](https://github.com/yuxhuang/r-orch/pull/81) is an open draft at `bed2b433`: Linux CI run 43552080077 green three times; the 60-second stress run and an automated end-to-end run passed on macOS; the cold gate was not run, by the owner's decision of 2026-11-13 |
+| Verification table, status lines, gate and CI statement | written in a documents-only change that follows #81; `in part` rows remain, so the spec and this plan are **not** `done` |
+| QA on the owner's Mac (R28, R35) | replaced by the owner, on 2026-11-13, by an automated end-to-end run in tmux; see R28 |
 
 ### Owner-amended performance acceptance and storage follow-up (2026-11-10)
 
@@ -214,7 +220,7 @@ changed formats or widened measurement window are authorized. The PR 4 hardening
 The integration lead must preserve the PR 2 board/draft handoff, qualify the actual production and test deltas,
 integrate and re-freeze PR 3, and obtain independent exact-SHA delta reviews before releasing its direct gate.
 QA follows that qualified candidate. Draft shipping requires three complete green GitHub CI executions on the
-identified head/tree and the other applicable gates; the lead reports readiness and the owner merges.
+identified head/tree and the other applicable gates; the lead reports readiness and the owner merges. (Owner amendment, 2026-11-13: one green Linux CI execution per pull request is enough.)
 
 ## Test plan
 - The spec's [requirements table](../specs/2026-11-09-daemon-owned-state.md#requirements) names the acceptance
@@ -250,7 +256,9 @@ identified head/tree and the other applicable gates; the lead reports readiness 
   Process snapshots are observations, not vetoes; custom test runners are retired from these gates.
   Linux coverage comes from GitHub CI after a qualified draft push; no local Linux/Docker prerequisite.
   CI retains its lockfile and cargo-deny checks. Each identified head/tree needs three complete green CI
-  executions; this supersedes the older cold-gate wording in the historical task tables above.
+  executions; this supersedes the older cold-gate wording in the historical task tables above. Owner amendment,
+  2026-11-13: one green Linux CI execution per pull request is enough, and the cold gate was skipped for #81's code;
+  see the spec's Verification.
 
 ## Rollback / compatibility
 No on-disk format changes (R23): entity, index, `config.yml`, org-template and run-event files keep their format.
