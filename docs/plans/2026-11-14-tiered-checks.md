@@ -5,9 +5,11 @@ owner: orchestrator
 date: 2026-11-14
 spec: [../specs/2026-11-14-tiered-checks.md](../specs/2026-11-14-tiered-checks.md)
 decision record: [ADR 0013](../decisions/0013-tiered-verification-gates.md)
-design revision: v2 (reconciled with the design challenge)
+design revision: v2 (reconciled with the design challenge), plus the staging amendments of section 12
 
 Changes from v1: ADR decisions D25–D31 and alternatives A19–A22; findings F14–F16; sections 3, 4, 5, 7 and 8 follow those decisions; new section 11 (the interface the builders share); new vectors TV17–TV19, TV38, TV47 and TV55, and a third case in TV15; the comparison procedure for R4 in the test plan; open items 2 and 5 updated, 7–11 added. No requirement, task id or existing vector number changed.
+
+Staging amendments (after the seam commit F0): new section 12 records which obligations are required in PR 1 and which in PR 2, the order in which the host runs the work, and what is still held. Sections 2, 6, 8 and the task and status tables carry short pointers to it; the notes of TV61–TV64 and TV72 and the "Verify" wording of tasks C and H are corrected. Requirement, vector and task ids are unchanged.
 
 ## Goal
 
@@ -89,8 +91,8 @@ The table gains a wall-time column per step and a total. `fast` runs its cheap s
 
 | PR | Exposed after it merges | Not yet |
 |---|---|---|
-| 1 | `gate.sh` starts the Rust gate. Tiers `full` (default) and `pr`. Folded suite, judged. `--plan`, `--part`, `--evidence`, `--keep`, legacy `--warm`. `gate inventory`, `gate evidence verify`, `gate lease`. Per-step time. | `fast` answers “not available yet” with exit 2. `gate select` exists only as the stub that selects everything. CI is unchanged. |
-| 2 | `fast`, `gate select`, the local documentation-only path. | CI still runs its current commands. |
+| 1 | `gate.sh` starts the Rust gate. Tiers `full` (default) and `pr`. Folded suite, judged. `--plan`, `--part`, `--evidence`, `--keep`, legacy `--warm`. `gate inventory`, `gate evidence verify`, `gate lease` (exclusive and inherited holders). Per-step time. A single writer per warm target, tested through the entries PR 1 has (section 12). | `fast` answers “not available yet” with exit 2, so there is no shared-lease requester and TV61, TV62 and the shared-fast case of RS1 are not executable (section 12). `gate select` exists only as the stub that selects everything. CI is unchanged. |
+| 2 | `fast`, `gate select`, the local documentation-only path. `fast` is the first real shared-lease requester, so TV61, TV62 and the shared-fast case of RS1 are required and executed here (section 12). | CI still runs its current commands. |
 | 3 | CI: selector job, `check` as anchor, `test` runs `pr --part suite`, documentation-only mode, everything on a push to `main`, and the `ambient` job on a push to `main` (D25). | The rule on `main` changes only when the owner applies it afterwards. |
 | 4, only if nextest qualifies | `test` uses nextest; `doc-test` becomes its own step; serial groups. | — |
 | 5 | Slow tests shortened, one slice per pull request. | — |
@@ -163,11 +165,11 @@ The coupling table is maintained by hand and has two rows today. A document row:
 
 Lock file: `/tmp/r-orch-gate.lease`, created with mode 0600 and never through a symbolic link. A file owned by another account is refused with a message. A second file is the turnstile that keeps an exclusive waiter from starving. `XTASK_GATE_LEASE_DIR` moves both files; the gate's own tests always set it, so a nested gate inside the suite never touches the host lease. A run that used it cannot qualify.
 
-`gate lease exec` holds the exclusive lease around any command, for timing series and qualification. It passes a token to its children; a gate that finds its token in the holder record proceeds and records `lease: inherited`.
+`gate lease exec` holds the exclusive lease around any command, for timing series and qualification. It passes a token to its children; a gate that finds its token in the holder record proceeds and records `lease: inherited`. Obligation RS7 (section 12) limits this: the holder record is a diagnostic, so the token counts only while the exclusive lock is still held by a live holder; if a non-blocking lock attempt succeeds, the holder is gone and the gate must take the lease normally.
 
 Contention is sampled every 15 seconds: the one-minute load average (`/proc/loadavg` on Linux, `sysctl -n vm.loadavg` on macOS) and the count of `cargo`, `rustc`, `rustdoc`, `clippy-driver` and `cargo-nextest` processes that do not descend from the gate (`ps -axo pid=,ppid=,comm=`). The result records the maxima and `foreign-build-activity: yes|no|unavailable`. The load threshold that makes a timing sample “idle” is the performance engineer's, declared before measuring.
 
-On interrupt the gate stops its own children, releases the lease, cleans a cold target and writes `INTERRUPTED`.
+On interrupt the gate stops its own children, releases the lease, cleans a cold target and writes `INTERRUPTED`. Obligation INV-T (section 12) bounds every wait the gate performs, including this one.
 
 ### 7. Evidence, CI and the rules change (D17, D23; R14, R15)
 
@@ -223,7 +225,7 @@ pub fn select_from_git(repo: &Path, base: &str) -> Selection;             // git
 pub fn run_cli(repo: &Path, args: SelectArgs) -> anyhow::Result<()>;      // `gate select`
 ```
 
-How three builders work in disjoint paths without touching the registry:
+How three builders work in disjoint paths without touching the registry (the order the host runs them in is section 12):
 
 - **Seam first (task F0, the architect's addition; needs the lead's ruling).** Before the tests and the selector start, the release engineer lands one small commit on the PR 1 branch: the `Gate` entry in `main.rs`, `gate.rs` with the argument types and every tier answering “not available yet” (exit 2), and `gate_selection.rs` as a stub with the surface above that selects everything and says so in its reason. It changes no behaviour of the existing commands. From then on the registry files belong to the release engineer alone, and `gate_selection.rs` to the selector builder alone.
 - The gate tests (test engineer) and the selection tests (second test engineer) are black-box: they run the built `xtask` binary. They compile against F0 and fail until the implementation exists, which is the failing test first.
@@ -319,6 +321,79 @@ Evidence directory: `result.txt`, `steps/` (one log per step), `inventory.tsv`, 
 
 Selection output is the JSON of section 5 with `schema` 1.
 
+### 12. Staging amendments after the seam commit
+
+This section records decisions taken after the design froze at v2 and F0 was committed. It does not remove or relax a requirement, a decision of the ADR or a vector; it adds stage and detail to TV61–TV64 and TV72, corrects two "Verify" cells, and says when each obligation is executed and in what order the host runs the work. Every row is an obligation. Nothing here says that a protection works, that a tier is valid evidence or that any timing is met; those are shown only by executed tests and real runs.
+
+**F0, the state of the seam.** F0 is one local commit, `12c263bc8e43df6bdf05efa770876ccd6eabc199` (tree `07df11a462b7259eb7f23dc2225dff1d7a4ad847`), whose parent is the frozen v2 design `e96803e50c2815100e96ee55b439f392b0b5d2b4`. It adds three files and 353 lines: `xtask/src/main.rs` (+9), `xtask/src/gate.rs` (+178) and `xtask/src/gate_selection.rs` (+166). It is not in a pull request.
+
+- Implemented: the `gate` subcommand with the argument shapes of section 1; the selector types and signatures of section 8 (`Change`, `Class`, `Mode`, `Format`, `SelectArgs`, `Reason`, `Selection`); `gate inventory --exit` as an `i32` that defaults to 0; the trailing `lease exec` argument vector, which is never started; no shared-lease flag.
+- Behaviour: every tier, `--plan`, `gate inventory`, `gate evidence verify` and `gate lease …` print `not available yet` and exit 2. `gate select` prints the schema-1 result with mode `all`, no packages and one `error` reason, and reads no fixture file. `--help` exits 0 and says which tier is the merge condition and which is the default.
+- Targeted verification, run by F0's producer and retained, not repeated by anyone else: `cargo test -p xtask` (64 unit and 28 `client_boundary` tests passed, none failed or ignored), `cargo xtask crate-graph`, `cargo fmt --all --check`, and 18 checks of the built binary's exit codes. A reviewer then compared the committed bytes with the handoff statically.
+- Not run: clippy, any gate, any CI run, the full workspace suite, a measurement. F0 is not F and certifies nothing.
+- Synthetic fixture for the evidence tests: the F0 handoff supplies a field grammar and a recipe that builds a complete, explicitly synthetic evidence bundle and a miniature repository. It is a test input. It is never evidence of a real qualifying run and never replaces the real run of PR 1.
+
+**Where the vectors stand against F0.** Against F0, every test that expects success is red because the command answers exit 2, and the selector's per-path reasons are red because the stub gives one `error` reason. That red result shows the tests compile and the seam answers; it does not show that any planted negative reaches its own oracle. Two results are therefore recorded separately: the F0 red result, and, once F exists, the exact planted-failure reason of each negative case together with its matching positive control. A generic non-zero exit never counts as protection evidence. A positive control must return 0 before its negatives count (TV40; TV47's matching case). No test is ignored or weakened to turn it green.
+
+**Staged to PR 2: TV61, TV62 and the shared-fast case of RS1.**
+
+- Why: in PR 1 `fast` is unavailable (section 2), `gate lease exec` takes the exclusive lease, and no shared acquisition command is specified. A fixture that holds a shared kernel lock itself would test the kernel, not the gate's admission and fairness. No `--shared` flag is added to fill the gap.
+- Required in PR 2, with `fast` as the real shared requester: TV61 (two shared requesters both acquire), TV62 (a shared holder, a queued exclusive waiter and a new shared requester, each observed through a handshake; the newcomer runs only after the exclusive waiter completes) and RS1's concurrent warm-target case with two `fast` runs. A sleep, a fixture's own shared lock, an ignored test or a waiver does not satisfy them. PR 2 is not accepted without them.
+- Required in PR 1 regardless: the warm and cold target is protected by a single writer, tested through the entries PR 1 has (exclusive and inherited holders). The test must make two requests contend on the same target in a way the host lease does not serialize; two requests that the host lease alone orders prove nothing about the target lock.
+- This is a staging decision, not a waiver. The frozen spec and ADR are not rewritten; where their wording lets TV61 or TV62 read as PR 1 work, this section governs the order.
+- The gate's TV63 (the holder is killed and the lease is free at once) and a measurement supervisor's guardian that keeps a lease through its own teardown are different contracts. Neither stands in for the other.
+
+**Obligations of PR 1, from the resilience, security and release readiness checks.** Test files are those of task C; the implementation is task F's. Each case uses a disposable miniature workspace, a private home and lease directory, fake commands and short bounds, and never the real home, the host lease or a real agent CLI.
+
+| Id | Obligation | Required test |
+|---|---|---|
+| RS1 | A warm target has one writer. A second run waits or refuses (`warm target in use`) and never resets the target under the first. The per-target lock lives outside `target/gate-warm` and is held from marker to record. | Two runs contend on one target (PR 1: through the available entries; the shared-fast case is PR 2, above) |
+| RS2 | A hard-killed gate may leave build processes writing into its target. The next run does not delete or reuse a warm or cold target while the previous process tree lives; it refuses and names the process ids (sending no signal) or waits for a bounded time. | SIGKILL the gate during a warm build and during a `full` build with a live child, then start the next run |
+| RS3 | The warm record is written to a temporary file and renamed, before the marker is removed. A truncated record reads as `record unreadable`; a file missing from the record counts as changed. | A fault after the record and before the marker is removed; a truncated record; a missing entry |
+| RS5, INV-T | Every wait the gate performs is bounded: the lease wait, the wait for children after a signal, and the wait for the build tree to finish. On INT, TERM or HUP the whole attributable descendant set is stopped within a bounded grace period, including `setsid` and `process_group(0)` members and a child that ignores TERM (escalated to KILL). The result is `INTERRUPTED`, listing survivors, never `PASSED`; no warm record is written while a build process survives; the lease is released. | TV64 plus a TERM-ignoring child and a `setsid` grandchild |
+| RS6 | TV63 is meaningful only if the holder has live descendants when it dies and they do not keep the lease. | TV63 with live descendants |
+| RS7 | `lease: inherited` counts only while a live holder holds the exclusive lock and the token matches. A stale holder record, or a token carried by an orphaned child, grants nothing; the gate takes the lease normally. | `lease exec` killed while its child gate holds the token (also TV67) |
+| RS4, RS8, RS10 | Retained follow-ups, not part of PR 1 acceptance: an edit during the build that is reverted with an old modification time resets the next run (RS4); `lease exec` with a detached descendant delays or reports release (RS8); an orphaned test binary counts as foreign build activity (RS10). | Named when taken up |
+| RS9 | Verified on each real host before anything relies on the lease: on Linux two sessions resolve the same device and inode for the lease file (no per-service private `/tmp`); on macOS the `/tmp` symlink's parent is not refused while a symbolic link as the lock file still is (TV66). | A check on each host |
+| ENV-REFUSE | TV17 extended: each old-reader opt-in alone and together, the blessing, stress and index knobs, an unknown name and an empty value refuse before the lease and the suite, and a secret canary never appears in output or evidence; all session names together proceed; an invalid-UTF-8 name is refused where the OS allows it. | TV17 and extensions |
+| JUDGE-PATHS | The judge identity is the same from working files and from the commit, for names with spaces, tabs, newlines, quotes, backslashes, a leading dash and non-UTF-8 bytes; added, deleted, renamed, tracked-but-ignored and untracked inputs change it; a hashing or enumeration failure never gives a trusted stamp. No path reaches a shell. | TV19 and TV47 extended |
+| JUDGE-OWNERSHIP, BOOT-OWNER | Symbolic links at `target`, `target/gate-xtask` or the stamp, special files and an inherited target are refused before any deletion or build, with an outside canary untouched; two bootstraps in one worktree do not interleave deletion and execution. | TV19 extended |
+| BOOT-PATH, BOOT-INT, BOOT-RACE | The hostile-name identity above; a build that fails, receives INT or TERM, or is killed before the stamp is published leaves no trusted stamp; a source change during the build cannot publish a stamp for different bytes. | Named cases of TV19 |
+| EVIDENCE-INTEGRITY | Changed exported bytes, an absent or wrong judge identity, malformed, duplicate or traversing manifest paths, symbolic-link entries, and missing or extra files are rejected before any entry is followed. | TV41, TV47 and extensions |
+| EVIDENCE-REDACTION | Canaries for a password, a prompt, a token and path strings (also in escaped forms) are absent from the exported copy, which is redacted before it is hashed. | TV17, TV46 |
+| LEASE-FILES | The no-follow, mode and ownership checks apply to the lock, the turnstile and the holder record. A foreign-owned file is a refusal, never unlinked and never replaced by another lease. TV66's foreign-owner case needs a disposable ownership fixture or a reviewed boundary seam; an unprivileged test cannot create one, and a permission error is not a refusal. It is not silently skipped. | TV60, TV63, TV65–TV67 |
+
+The ordering these obligations imply for the warm target (D30): take the per-target lock; write the marker; capture the identities; build; wait, bounded, until no process of the build tree is alive; write the record by temporary file and rename; remove the marker; release the lock. If the bounded wait expires, no record is written and the marker stays. If the marker cannot be written, nothing builds.
+
+An internal suite deadline is optional. If one is added it can only fail the run (`FAIL: suite deadline exceeded`), never pass it and never mark it `ENV-LIMITED`, and it is a safety cap, not a timing waiver.
+
+**Evidence-fixture rules.** TV41 corrupts a log and leaves the manifest stale on purpose. Every other semantic case (TV42–TV45, TV47) starts from a fresh copy of the positive, changes one condition, and regenerates every affected manifest entry and the manifest's digest, while the independently supplied expected commit, source identity and judge identity stay correct unless one of them is the subject of the case. Wrong digest or wrong commit cannot stand in for the judge case, and the reverse. Several rows of TV43–TV45 need one case per field. The `status` and `exit` fields of a step are changed separately when a case claims to test one of them. For inherited-lease cases the inherited positive is established first. TV46 uses an actual otherwise-successful partial miniature run, never the synthetic bundle.
+
+**Inventory and ordering cases that are required in addition to TV7–TV11.**
+
+- `merged_child_output_cannot_inflate_passing_inventory`: one real passing test, a child-written `test forged … ok` line outside a `failures:` block, summary `1 passed`, exit 0: rejected as `inconsistent inventory`; the clean control is accepted.
+- `split_result_line_cannot_be_accepted_as_complete_inventory`: a real result line split by child bytes, summary intact: rejected as `inconsistent inventory`. A mapped executable without its completed summary is rejected separately as `incomplete inventory`. Fake lines inside a `failures:` block stay ignored (TV11).
+- `selected_packages_build_current_cli_before_infra_path_exec` (D31): a disposable two-package workspace named `orch-cli` and `orch-infra` with no dependency between them; the CLI has an `orch` binary and an integration-test target, and the infra test runs `target/debug/orch` and asserts a source marker. One selected cargo invocation naming both packages with `-p`, on an empty target and again after the marker changes, runs the current binary both times, on macOS and on native Linux. The selector table proves neither build order nor binary freshness. The real `concurrent_index` test is run in isolation later, against the integrated selection.
+- R4: every test whose outcome differs between the ordinary and the folded run is diagnosed by running it alone in both environments; failures are kept; a later green never replaces the first red.
+- The aggregate cost of the new test files stays inside the budget of section 8 and is measured, not assumed.
+
+**Daemon-harness test.** The intermittent `daemon_harness_hermetic` failure (F7) has a hypothesis, not a reproduction or a fix: a deterministic `request.cancel` fence while the held spawn stays parked, rather than an expectation of a successful response during teardown. A test-only repair is a recommended follow-up. It keeps the scratch-lifetime, cleanup and `StopIncomplete` assertions and the original failure evidence, and is not a speedup or a passing baseline.
+
+**Order of work on the host.** One heavy build, test or probe per host at a time, so the pre-implementation wave is a pipeline whose ordering is a host-resource exclusion, not a data dependency.
+
+1. Author, in parallel and in disjoint paths, each in its own worktree and branch from F0: C (the seven test files of section 8), G (`xtask/src/gate_selection.rs` and `xtask/src/gate_selection/**`), H (`xtask/tests/gate_selection.rs`) and this plan. Authors use static checks only: no cargo, build, test or probe. Their handoffs are provisional and are not executable readiness.
+2. Validate, one after another: C, then G, then H. Each owner may repair only its own scope while validating, keeps every failed attempt and freezes its final commit. Every worktree has its own target; none is shared. Validation is bounded, targeted work, not a measurement. If a fixture cannot be run without an uncontained process tree, validation stops and says so.
+3. Review frozen commits: C's code review follows C's validation and may overlap G's and H's validation; the G and H review follows both and includes this plan. Reviewers run no builds or probes in this wave; they read the retained execution evidence and name any further check that is needed.
+4. F-SIGNAL-SEAM runs after H's validation. Security and resilience then review the frozen C, G and H sources and the probe's bytes and evidence. A checkpoint reads the actual verdicts, commit identities and validation records, not task statuses, and then schedules only concrete fixes or rechecks. An edit after validation is a new identity and gets a delta review.
+
+**Held work.** The following are not ready, and listing them is not a promise of when they will be.
+
+- **D, the measured baseline (task D).** It waits for a measurement-only supervisor that has been reviewed independently: a lease bridge on the gate's lock path, containment that also reaches detached and re-parented processes (unknown attribution is an incomplete teardown and no measurement, and no unrelated process is ever signalled), a termination ladder, loss of the supervisor, resource stops, a telemetry list declared before measuring (thermal pressure is required, and no required item is relaxed after a failure), durable logs, and a dry run on each platform used. The first candidate was reviewed by release engineering, security and resilience and was blocked by each; its ownership, lease and containment defects are open. No baseline measurement, full suite, gate or benchmark has run. Native Linux access, durable evidence transfer and routing are unassigned. An ordinary CI result does not stand in for native macOS acceptance; the report names which platform did not run.
+- **F, the folded gate.** It waits for C's executable red evidence in both phases above, the actual baseline of D, the applicable challenge dispositions and F-SIGNAL-SEAM.
+- **F-SIGNAL-SEAM.** Rust's `std` has no safe signal-handler registration, so INT and TERM handling, a lease that outlives its direct holder until teardown, and stopping the whole owned tree are not delivered by Drop guards or `Child::kill`. A no-manifest mechanism is acceptable only if a bounded disposable probe, with private fixtures and independent cleanup, shows direct-holder INT and TERM, the lease's lifetime through teardown and teardown of the whole owned tree. Failing to show that is a valid block, not permission for a dependency or an unsafe workaround; a manifest or dependency exception needs an explicit, recorded scope decision. Section 8's statement that `xtask/Cargo.toml` does not change stands until such a decision exists.
+
+**Rules and merges.** `check` and `test` both stay required until the owner applies, and the lead verifies, the reviewed main-only change after PR 3 and the evidence are ready (section 7). The owner merges every pull request. This section changes no rule, no AGENTS.md text and no policy.
+
 ## Test vectors
 
 Each vector says what must happen. A negative vector must fail for the stated reason; a case that fails for another reason does not count.
@@ -412,10 +487,10 @@ Lease and contention (`gate_lease`), with an isolated lease directory:
 | # | Case | Must |
 |---|---|---|
 | TV60 | Exclusive while exclusive is held, wait 0 | Exit 75 naming the holder; nothing ran |
-| TV61 | Shared while shared is held | Both proceed |
-| TV62 | Exclusive waiting on a shared holder; a new shared request arrives | The new request queues behind the exclusive waiter |
-| TV63 | The holder is killed with SIGKILL | The lease is free at once; the stale record is replaced; no signal is sent |
-| TV64 | The holder gets SIGINT or SIGTERM | Lease released; cold target removed; result `INTERRUPTED` |
+| TV61 | Shared while shared is held | Both proceed. Required, executed in PR 2 with `fast` as the real shared requester (section 12); handshake-based, not timing-based |
+| TV62 | Exclusive waiting on a shared holder; a new shared request arrives | The new request queues behind the exclusive waiter. Required, executed in PR 2 with `fast` (section 12); the acquired holder, the queued exclusive waiter and the new shared requester are each observed through a handshake, and the newcomer runs only after the exclusive waiter completes |
+| TV63 | The holder is killed with SIGKILL | The lease is free at once; the stale record is replaced; no signal is sent. The holder has live descendants when it dies, and the lock descriptor is not inherited by them (RS6) |
+| TV64 | The holder gets SIGINT or SIGTERM | Lease released; cold target removed; result `INTERRUPTED`. Teardown is bounded (INV-T, RS5) |
 | TV65 | The lock file is replaced while held | The holder records the lease as lost; the run does not qualify |
 | TV66 | The lock path is a symbolic link; the file has another owner | Refused with the reason; not followed |
 | TV67 | A gate under `lease exec`; the same without the token | `lease: inherited`; waits |
@@ -427,7 +502,7 @@ Tiers (`gate_tiers`):
 |---|---|---|
 | TV70 | `--help` | Names the three tiers, `pr` as the merge condition, `full` as the goal and release gate and as the default |
 | TV71 | `--plan` with no tier; with each tier | `full`; each tier's steps, target and lease mode as in section 1 |
-| TV72 | An unknown tier or option; `fast` before PR 2; `--warm` with `pr` | Exit 2 with the reason |
+| TV72 | An unknown tier or option; `fast` before PR 2; `--warm` with `pr` | Exit 2 with the reason. The `fast` case is stage-specific: it holds only while `fast` is unavailable, and PR 2 replaces it with `fast`'s real behaviour; it is never a permanent assertion that `fast` is unavailable |
 | TV73 | A miniature run | Each row has verdict, name, wall time and detail; a total; the result file has `tier`, `part`, `run-dir` and the times |
 | TV74 | `--part suite`; `full --warm` | The result says `part: suite` and never `PASSED (tier`; the legacy run says “not a gate” and cannot qualify |
 | TV75 | A preflight refusal | Exit 1; the result file says `REFUSED`; the table is printed |
@@ -465,10 +540,10 @@ Owners are roles. Each task runs in its own worktree and branch, never shares a 
 | D | Baseline measurements and attribution of every binary above 30 s (performance engineer) | R9, R11, R12 | own report and timing records | approval; exclusive lease while measuring | records regenerate from the logs | evidence |
 | E | Challenge: can one folded run replace three without a false green (red team) | R2, R3 | own report | A | verdict on the frozen design | evidence |
 | F0 | Registry seam: `Gate` entry, argument types, stubs (release engineer) | R1 | `xtask/src/main.rs`, `xtask/src/gate.rs`, stub `xtask/src/gate_selection.rs` | A, E disposition | `cargo test -p xtask`; `cargo xtask crate-graph` unchanged | 1 |
-| C | Gate tests, written to fail first (test engineer) | R1–R3, R14, R16 | `xtask/tests/gate_tiers.rs`, `gate_protections.rs`, `gate_bootstrap.rs`, `gate_inventory.rs`, `gate_evidence.rs`, `gate_lease.rs`, `gate_witness.rs` | F0 | each negative case fails for its stated reason against F0 | 1 |
-| F | Folded gate, timings, lease, evidence (release engineer) | R1–R4, R7, R14, R16 | `xtask/gate.sh`, `xtask/src/gate.rs`, `xtask/src/gate/**` | C, D baseline | C's tests pass; the old and the folded run compared at one commit (R4); `./xtask/gate.sh full` on Mac and native Linux | 1 |
+| C | Gate tests, written to fail first (test engineer) | R1–R3, R14, R16 | `xtask/tests/gate_tiers.rs`, `gate_protections.rs`, `gate_bootstrap.rs`, `gate_inventory.rs`, `gate_evidence.rs`, `gate_lease.rs`, `gate_witness.rs` | F0 | Against F0: record the expected red result, which is exit 2 “not available yet” and says nothing about any planted protection. Against implemented F: each negative case fails for its own stated reason, after its matching positive control returns 0 (section 12) | 1 |
+| F | Folded gate, timings, lease, evidence (release engineer) | R1–R4, R7, R14, R16 | `xtask/gate.sh`, `xtask/src/gate.rs`, `xtask/src/gate/**` | C, D baseline, F-SIGNAL-SEAM (section 12) | C's tests pass; the old and the folded run compared at one commit (R4); `./xtask/gate.sh full` on Mac and native Linux | 1 |
 | G | Selector (senior engineer) | R5, R6 | `xtask/src/gate_selection.rs`, `xtask/src/gate_selection/**` | F0 | inline unit tests; H's table | 2 |
-| H | Selection table tests, from the vectors and independent of G (second test engineer) | R5, R6 | `xtask/tests/gate_selection.rs` | F0 | fails against the stub except the select-everything rows | 2 |
+| H | Selection table tests, from the vectors and independent of G (second test engineer) | R5, R6 | `xtask/tests/gate_selection.rs` | F0 | fails against the stub except where the stub's mode and package projection already match (the select-everything rows); per-path reasons and classes stay red until G | 2 |
 | I | Integrate the selector with `fast` (release engineer) | R5, R6, R12 | `xtask/src/gate.rs`, `xtask/src/gate/**` | F, G, H | `cargo test -p xtask --test gate_selection`; `./xtask/gate.sh fast --base <base>` on the declared workloads | 2 |
 | J | CI workflow, with the `ambient` job; proposed rule configuration and rollback, for review (release engineer) | R6, R7, R14, R15 | `.github/workflows/ci.yml`, `xtask/src/linux.rs` (the test that mirrors it) | I | TV50–TV53 on real runs; TV55 | 3 |
 | K | nextest pilot against the sequential baseline; 20-run qualification per platform; a series stops at its first failure, which is kept and diagnosed, and a fixed candidate starts a new series (performance engineer) | R8 | own report and records | F; native Linux; exclusive lease | records per platform | evidence |
@@ -477,7 +552,7 @@ Owners are roles. Each task runs in its own worktree and branch, never shares a 
 | N | Rules and documentation (technical writer) | R10 | `README.md`, `AGENTS.md` (after the owner's word), the spec and plan status, the comments in `xtask/gate.sh` | implemented interfaces; all decisions | every command runs as written; fact check | 6 |
 | O | Final validation, no source edits (release engineer) | R11, R12 | — | all accepted slices | `./xtask/gate.sh full` on Mac; native Linux CI; timings and inventories checked against the logs | final |
 
-Order: A → E → F0 → C, G, H in parallel → F → I → J → (L) → N → O. B and D are independent inputs; M follows their findings. F0 is the one change to the approved order; without it the fallback of section 8 applies.
+Order: A → E → F0 → C, G, H in parallel → F → I → J → (L) → N → O. B and D are independent inputs; M follows their findings. F0 is the one change to the approved order; without it the fallback of section 8 applies. “In parallel” is authoring only: the three are validated one after another on the host, and F waits for more than C (section 12).
 
 One heavy build or measurement per host at a time. Measurement windows hold the exclusive lease; documentation, review and reading continue.
 
@@ -485,7 +560,13 @@ One heavy build or measurement per host at a time. Measurement windows hold the 
 
 | Item | State |
 |---|---|
-| A | design v2 committed: challenged once, reconciled; awaiting the lead's rulings on the open items |
+| A | design v2 committed: challenged once, reconciled; frozen at `e96803e50c2815100e96ee55b439f392b0b5d2b4` |
+| F0 | committed locally as `12c263bc8e43df6bdf05efa770876ccd6eabc199`, not in a pull request. Targeted verification by its producer: `cargo test -p xtask`, `crate-graph`, `fmt --check` and 18 dispatch checks. Not run: clippy, any gate, CI, the full suite. Every tier still answers exit 2 (section 12) |
+| C, G, H | released for authoring from F0; not executed or validated; no result is claimed |
+| TV61, TV62, shared-fast RS1 | required in PR 2 (section 12); not yet executable |
+| RS1–RS3, RS5–RS7, INV-T and the security and release cases of section 12 | required in PR 1; none implemented or run |
+| D | held; the measurement supervisor needs an independent review it has not passed. No baseline exists |
+| F, F-SIGNAL-SEAM | held (section 12) |
 | all others | pending |
 
 ## Test plan
@@ -510,14 +591,14 @@ No product data, on-disk format or protocol changes. Each pull request is revert
 
 For the lead; none blocks the design challenge.
 
-1. F0 (section 8): adopt the seam-first commit, or keep the approved order with the fallback.
+1. F0 (section 8): settled. The seam-first commit is adopted and committed locally on the PR 1 branch (section 12).
 2. The test engineer's scope grows from two files to seven (section 8). They are disjoint from every other task.
-3. AGENTS.md in PR 1: correct the one sentence about `advisories` there (a factual fix in an owner-merged file), or carry the mismatch until PR 6.
+3. AGENTS.md in PR 1: settled. The one sentence about `advisories` is corrected in PR 1, in the same change that makes it false, by the technical writer, who also owns the decision index row; the broader verification policy stays in PR 6.
 4. D13 can fail because another `orch` process changed the real global directory during a gate. If that proves frequent, it needs the owner: accept manual attribution, or run gates with `orch` idle.
 5. D8 and D26 keep `ORCH_*` out of the suite's environment. A test that relied on an inherited variable will show up in the R4 comparison. The session list of D26 is a constant; when `orch` starts exporting a new variable to agent sessions, a gate started from such a session is refused and names it, and the list gains a line.
 6. Unverified and settled only by running: GitHub's treatment of a job skipped by condition under this ruleset (TV50); nextest's reading of `[env]` (section 3); file locking and `ps` on Linux (F13, section 6); the cost of a from-nothing build of `xtask` (D27); that creating a file changes its parent directory's modification time on both platforms (TV18 c).
-7. D25: the `ambient` job runs on every push to `main`. Alternative A19 runs it weekly instead. Either answers the challenge; the lead picks, and the job is new work in task J.
-8. A suite that hangs holds the exclusive lease, and the design has no suite deadline. A waiter exits 75 after its wait and names the holder. Whether the gate needs its own deadline is for the resilience review of PR 1.
-9. The inventory parser reads one merged log (section 3). It fails closed. Whether to parse two streams is for the code review of PR 1.
+7. D25: settled. The `ambient` job runs on every push to `main`, never on a pull request (A19 is not taken). It is new work in task J.
+8. A suite that hangs holds the exclusive lease. Settled for now: bounded termination (INV-T) is a PR 1 obligation; an internal suite deadline is optional and can only fail the run (section 12).
+9. The inventory parser reads one merged log (section 3). It fails closed, and the merged-output cases of section 12 are required tests. Whether to parse two streams is for the code review of PR 1.
 10. PR 3 decides and measures what the CI cache saves (section 7).
 11. Possible follow-up, not in this plan: a source check that flags a `PATH` with host install directories in test code (D29).
