@@ -1,6 +1,8 @@
 //! Dev tooling for r-orch. `cargo xtask <command>`.
 
 mod crate_graph;
+mod gate;
+mod gate_selection;
 mod linux;
 
 use std::path::{Path, PathBuf};
@@ -21,6 +23,8 @@ enum Task {
     CrateGraph,
     /// Run the Linux checks from macOS in a linux/amd64 Docker container (AGENTS.md).
     Linux(linux::LinuxArgs),
+    /// Tiered verification helpers (gate execution is not available yet).
+    Gate(gate::GateArgs),
 }
 
 fn main() -> Result<()> {
@@ -30,6 +34,11 @@ fn main() -> Result<()> {
     match cli.command {
         Task::CrateGraph => crate_graph::run(&repo_root),
         Task::Linux(args) => linux::run(&repo_root, args),
+        Task::Gate(args) => {
+            // Helpers operate on the caller's repository, including disposable fixtures.
+            let code = gate::run(&std::env::current_dir()?, args)?;
+            std::process::exit(code);
+        }
     }
 }
 
