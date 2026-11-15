@@ -1,18 +1,13 @@
-//! Source-only cooperative target state. No tier calls this module.
+//! Cooperative target state and F2 direct-command publication. No tier calls it yet.
 //!
-//! Admission decisions are data, never capabilities to delete or signal. F2 must
-//! supply actual lease/direct-handle observations and source captures; no process
-//! or host-identity acquisition lives here. Recovery has no production supported
-//! constructor: RC18 is unshown for every filesystem and command.
+//! The lease/direct-reap/source-capture path is exercised with real native child
+//! fixtures. Recovery is still unsupported in production: one cargo observation
+//! on one native filesystem is not RC18 for every command/filesystem/platform.
 //!
-//! Candidate native primitives use std's Unix no-follow/nonblocking opens,
-//! try_lock and sync_all. They are deliberately behind an unavailable native
-//! admission: std alone supplies no descriptor-relative namespace mutation or
-//! mount-constrained recursive deletion. Rechecking a pathname cannot close a
-//! concurrent parent-replacement race. Native lock behavior and stable directory
-//! synchronization still need evidence. Do not turn the private
-//! primitive controls into a production permit. These are precise F2/platform
-//! prerequisites, not a fallback to a weaker boundary.
+//! Native admission retains F1's namespace refusal. Stable std alone supplies
+//! no descriptor-relative mutation or mount-confined recursive deletion. The
+//! pathname checks below do not close concurrent parent-replacement races. The
+//! independent F2 process/publication work is not permission to bypass D45.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -40,7 +35,7 @@ const END: &[u8; 8] = b"ENDREC01";
 const BOOT_OFFSET: usize = 12;
 
 #[derive(Debug)]
-enum Fault {
+pub(super) enum Fault {
     Boundary {
         path: PathBuf,
         why: &'static str,
@@ -588,7 +583,7 @@ fn check_metadata(
 
 // Constant ABI bits, not a dependency on a transitive libc crate. Only these
 // target ABIs are candidates. Linux arm64 and x86-64 differ for two of the bits.
-fn open_flags(directory: bool) -> Result<i32> {
+pub(super) fn open_flags(directory: bool) -> Result<i32> {
     #[cfg(target_os = "macos")]
     let (nofollow, nonblock, dir) = (0x100, 0x4, 0x100000);
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -963,7 +958,7 @@ enum Phase {
     Failed,
 }
 
-struct Marker<'a> {
+pub(super) struct Marker<'a> {
     files: &'a StateFiles,
     file: File,
     found: bool,
@@ -972,10 +967,11 @@ struct Marker<'a> {
 }
 
 // No Drop implementation: drop closes owned Files, NEVER unlocks or unlinks.
-// No clone/raw-FD/stdio accessor is supplied here. F2 must choose and review the
-// descriptor hand-over route and its R4/R11 consequences separately.
+// command_stdin duplicates the open description as a standard stream. No raw
+// FD or explicit unlock: the last close releases it. R4/R11 must compare the
+// changed standard stream, or diagnose the difference, at whole-gate validation.
 impl Marker<'_> {
-    fn check_identity(&self) -> Result<()> {
+    pub(super) fn check_identity(&self) -> Result<()> {
         self.files.check_parents()?;
         let held = at(
             self.file.metadata(),
@@ -992,6 +988,16 @@ impl Marker<'_> {
             ),
             _ => Err(Fault::MarkerChanged),
         }
+    }
+
+    pub(super) fn command_stdin(&self) -> Result<std::process::Stdio> {
+        self.check_identity()?;
+        Ok(at(
+            self.file.try_clone(),
+            "duplicate marker for direct command",
+            &self.files.path(Leaf::Marker),
+        )?
+        .into())
     }
 
     fn diagnostics(&mut self) -> Result<Vec<u8>> {
@@ -1302,6 +1308,251 @@ impl Marker<'_> {
                 Ok(())
             }
         }
+    }
+}
+
+// F2 integrates actual lease validation and direct reaping with F1 publication.
+// Native namespace admission/deletion is deliberately NOT bypassed here.
+impl StateFiles {
+    fn admit_configured(&self, lease: Option<&super::lease::Lease>) -> anyhow::Result<Marker<'_>> {
+        let lease = lease.ok_or_else(|| {
+            anyhow::anyhow!("REFUSED: configured lease required; --no-lease cannot admit a target")
+        })?;
+        lease.validate()?;
+        Ok(self.admit(true)?)
+    }
+}
+
+#[derive(Debug)]
+struct UseOutcome {
+    exits: Vec<std::process::ExitStatus>,
+    publication: Publication,
+    end_ns: i128,
+}
+
+impl Marker<'_> {
+    fn use_warm(
+        &mut self,
+        lease: &super::lease::Lease,
+        commands: &mut [std::process::Command],
+    ) -> anyhow::Result<UseOutcome> {
+        // The caller must have completed protect, target decision, invalidate.
+        // The borrow of self by Runner prevents a publication while it has a
+        // live direct command. Capture failures retain the invalidated marker.
+        anyhow::ensure!(
+            self.phase == Phase::Invalidated && self.files.kind == Kind::Warm,
+            "warm commands before protected target decision/invalidation"
+        );
+        let mut runner = super::steps::Runner::new(lease, self)?;
+        let captures = (|| {
+            let before = Captured::read(&mut runner, &self.files.root)?;
+            for command in commands {
+                if !runner.run(command)?.success() {
+                    break;
+                }
+            }
+            runner.finished()?;
+            let after = Captured::read(&mut runner, &self.files.root)?;
+            runner.finished()?;
+            anyhow::ensure!(
+                before.toolchain == after.toolchain && before.boot == after.boot,
+                "toolchain/boot identity changed; keep marker, no publication"
+            );
+            let end_ns = i128::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos(),
+            )?;
+            Ok((before, after, end_ns))
+        })();
+        let exits: Vec<_> = runner.statuses().iter().map(|s| s.exit).collect();
+        drop(runner);
+        let result = (|| {
+            let (before, after, end_ns) = captures?;
+            // Re-check the inherited live holder at the publication boundary.
+            lease.validate()?;
+            let publication = self.finish_warm(
+                Finished {
+                    direct_reaped: true,
+                    lease_held: true,
+                    inherited_holder_valid: true,
+                },
+                &before.sources,
+                Current {
+                    root: self.files.root.as_os_str().as_bytes(),
+                    toolchain: &after.toolchain,
+                    boot: Some(after.boot),
+                    sources: &after.sources,
+                },
+                end_ns,
+            )?;
+            Ok((publication, end_ns))
+        })();
+        match result {
+            Ok((publication, end_ns)) => Ok(UseOutcome {
+                exits,
+                publication,
+                end_ns,
+            }),
+            Err(source) => {
+                self.phase = Phase::Failed;
+                Err(UseFailure { exits, source }.into())
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct UseFailure {
+    exits: Vec<std::process::ExitStatus>,
+    source: anyhow::Error,
+}
+impl fmt::Display for UseFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "target: kept ({}); qualifying: no; reaped statuses: {:?}",
+            self.source, self.exits
+        )
+    }
+}
+impl std::error::Error for UseFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+struct Captured {
+    sources: Sources,
+    toolchain: String,
+    boot: BootId,
+}
+
+impl Captured {
+    fn read(runner: &mut super::steps::Runner<'_, '_>, root: &Path) -> anyhow::Result<Self> {
+        use std::ffi::OsStr;
+        use std::process::Command;
+        fn inventory(
+            runner: &mut super::steps::Runner<'_, '_>,
+            root: &Path,
+        ) -> anyhow::Result<Vec<Vec<u8>>> {
+            let bytes = runner.capture(
+                Command::new("git").current_dir(root).args([
+                    "ls-files",
+                    "--cached",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                ]),
+                MAX_SOURCE_BYTES,
+            )?;
+            anyhow::ensure!(
+                bytes.is_empty() || bytes.last() == Some(&0),
+                "incomplete git source inventory"
+            );
+            let mut paths: Vec<Vec<u8>> = if bytes.is_empty() {
+                Vec::new()
+            } else {
+                bytes[..bytes.len() - 1]
+                    .split(|b| *b == 0)
+                    .map(<[u8]>::to_vec)
+                    .collect()
+            };
+            anyhow::ensure!(
+                paths.len() <= MAX_SOURCES,
+                "source count exceeds record budget"
+            );
+            paths.sort();
+            anyhow::ensure!(
+                paths.windows(2).all(|p| p[0] != p[1]),
+                "duplicate source inventory"
+            );
+            for path in &paths {
+                source_path(path)?;
+            }
+            Ok(paths)
+        }
+        let paths = inventory(runner, root)?;
+        let mut entries = Vec::new();
+        for chunk in paths.chunks(32) {
+            let mut command = Command::new("git");
+            command
+                .current_dir(root)
+                .args(["hash-object", "--no-filters", "--"]);
+            let mut metadata = Vec::new();
+            for path in chunk {
+                let path = Path::new(OsStr::from_bytes(path));
+                let full = root.join(path);
+                // Check every source component before hashing. Symlinks and
+                // submodules are refused rather than following a source outside
+                // the root. Richer source kinds need an explicit capture design.
+                let mut component = root.to_path_buf();
+                for part in path.components() {
+                    component.push(part);
+                    let m = fs::symlink_metadata(&component)?;
+                    anyhow::ensure!(
+                        !m.file_type().is_symlink(),
+                        "symbolic source component: {}",
+                        component.display()
+                    );
+                }
+                let m = fs::symlink_metadata(&full)?;
+                anyhow::ensure!(m.is_file(), "non-regular source: {}", full.display());
+                metadata.push(m);
+                command.arg(path);
+            }
+            // argv is bounded in small batches and every path follows --. The
+            // marker owns stdin; --stdin-paths cannot share that descriptor.
+            let hashes = runner.capture(&mut command, 65 * chunk.len())?;
+            let hashes = std::str::from_utf8(&hashes)?;
+            let hashes: Vec<_> = hashes.lines().collect();
+            anyhow::ensure!(
+                hashes.len() == chunk.len(),
+                "incomplete content identity capture"
+            );
+            for ((path, before), hash) in chunk.iter().zip(metadata).zip(hashes) {
+                let full = root.join(OsStr::from_bytes(path));
+                let after = fs::symlink_metadata(&full)?;
+                anyhow::ensure!(
+                    after.is_file()
+                        && identity(&before) == identity(&after)
+                        && before.len() == after.len()
+                        && before.mtime() == after.mtime()
+                        && before.mtime_nsec() == after.mtime_nsec(),
+                    "source changed during capture"
+                );
+                entries.push(Source {
+                    path: path.clone(),
+                    content: hash.to_owned(),
+                    modified_ns: Some(
+                        i128::from(after.mtime()) * 1_000_000_000 + i128::from(after.mtime_nsec()),
+                    ),
+                });
+            }
+        }
+        anyhow::ensure!(
+            paths == inventory(runner, root)?,
+            "source set changed during capture"
+        );
+        let toolchain = runner.capture(
+            Command::new("rustc").current_dir(root).arg("-vV"),
+            MAX_FIELD,
+        )?;
+        let toolchain = String::from_utf8(toolchain)?;
+        anyhow::ensure!(!toolchain.trim().is_empty(), "empty toolchain identity");
+        #[cfg(target_os = "macos")]
+        let boot = runner.capture(
+            Command::new("/usr/sbin/sysctl").args(["-n", "kern.bootsessionuuid"]),
+            128,
+        )?;
+        #[cfg(target_os = "linux")]
+        let boot = fs::read("/proc/sys/kernel/random/boot_id")?;
+        let boot = BootId::parse(std::str::from_utf8(&boot)?.trim())?;
+        Ok(Self {
+            sources: Sources::new(entries)?,
+            toolchain,
+            boot,
+        })
     }
 }
 
@@ -2483,5 +2734,226 @@ mod tests {
             assert!(path.is_dir());
             f.canary_unchanged();
         }
+    }
+
+    fn f2_lease(f: &Fixture) -> super::super::lease::Lease {
+        super::super::lease::Lease::Owned(
+            super::super::lease::Owned::acquire(
+                &f.base,
+                f.files.owner,
+                super::super::lease::Mode::Exclusive,
+                std::time::Duration::ZERO,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn f2_repo(f: &Fixture) {
+        let exit = std::process::Command::new("/usr/bin/git")
+            .args(["init", "-q"])
+            .current_dir(&f.files.root)
+            .env_clear()
+            .env("HOME", &f.base)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(exit.success());
+        fs::write(f.files.root.join(".gitignore"), b"target/\n").unwrap();
+        fs::write(f.files.root.join("source.rs"), b"source bytes").unwrap();
+    }
+
+    fn f2_command(f: &Fixture, script: &str) -> std::process::Command {
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args(["-c", script])
+            .current_dir(&f.files.root)
+            .env_clear()
+            .env("HOME", &f.base)
+            .env("ORCHESTRY_GLOBAL_CONFIG_PATH", f.base.join("global.yml"));
+        command
+    }
+
+    #[test]
+    fn f2_real_normal_and_failed_commands_reap_then_publish_with_actual_boot_and_source() {
+        for code in [0, 7] {
+            let f = Fixture::new();
+            f2_repo(&f);
+            let lease = f2_lease(&f);
+            let mut marker = f.files.lock_marker_primitive().unwrap();
+            marker.protect().unwrap();
+            marker.invalidate().unwrap();
+            let start_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i128;
+            let result = marker
+                .use_warm(&lease, &mut [f2_command(&f, &format!("exit {code}"))])
+                .unwrap();
+            assert_eq!(result.publication, Publication::Record);
+            assert!(result.exits.iter().any(|e| e.code() == Some(code)));
+            assert!(result.end_ns >= start_ns);
+            assert!(f.files.check_leaf(Leaf::Marker).unwrap().is_none());
+            let Stored::Complete(record) = f.files.read_record().unwrap() else {
+                panic!("record absent")
+            };
+            assert_eq!(record.end_ns, result.end_ns);
+            assert!(record.sources.contains_key(b"source.rs".as_slice()));
+            assert_eq!(record.sources.len(), 2);
+        }
+    }
+
+    #[test]
+    fn f2_source_set_change_reaps_but_withholds_record() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let mut marker = f.files.lock_marker_primitive().unwrap();
+        marker.protect().unwrap();
+        marker.invalidate().unwrap();
+        let result = marker
+            .use_warm(&lease, &mut [f2_command(&f, "printf changed > added.rs")])
+            .unwrap();
+        assert_eq!(result.publication, Publication::SourceChanged);
+        assert!(matches!(f.files.read_record().unwrap(), Stored::Missing));
+        assert!(f.files.check_leaf(Leaf::Marker).unwrap().is_none());
+    }
+
+    #[test]
+    fn f2_capture_failure_retains_marker_and_prevents_second_publication() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let mut marker = f.files.lock_marker_primitive().unwrap();
+        marker.protect().unwrap();
+        marker.invalidate().unwrap();
+        // Removing the fixture's .git is an actual identity-command failure.
+        let error = marker
+            .use_warm(&lease, &mut [f2_command(&f, "rm -rf .git")])
+            .unwrap_err();
+        let error = error
+            .downcast_ref::<UseFailure>()
+            .expect("retained failure status");
+        assert!(error.exits.iter().any(|e| !e.success()));
+        assert!(f.files.check_leaf(Leaf::Marker).unwrap().is_some());
+        assert!(matches!(f.files.read_record().unwrap(), Stored::Missing));
+        assert!(marker.use_warm(&lease, &mut []).is_err());
+    }
+
+    #[test]
+    fn f2_lease_loss_after_reap_retains_marker_without_publication() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let mut marker = f.files.lock_marker_primitive().unwrap();
+        marker.protect().unwrap();
+        marker.invalidate().unwrap();
+        let mut command = std::process::Command::new("/bin/mv");
+        command
+            .arg(f.base.join("r-orch-gate.lease"))
+            .arg(f.base.join("replaced-lease"))
+            .env_clear()
+            .env("HOME", &f.base);
+        assert!(marker.use_warm(&lease, &mut [command]).is_err());
+        assert!(f.files.check_leaf(Leaf::Marker).unwrap().is_some());
+        assert!(matches!(f.files.read_record().unwrap(), Stored::Missing));
+    }
+
+    #[test]
+    fn f2_missing_lease_refuses_before_any_marker_or_directory_creation() {
+        let f = Fixture::new();
+        assert!(f.files.admit_configured(None).is_err());
+        assert!(f.files.check_leaf(Leaf::Marker).unwrap().is_none());
+    }
+
+    #[test]
+    fn f2_runner_hands_same_locked_description_to_direct_child_and_preserves_failed_status() {
+        let f = Fixture::new();
+        let lease = f2_lease(&f);
+        let marker = f.files.lock_marker_primitive().unwrap();
+        let mut runner = super::super::steps::Runner::new(&lease, &marker).unwrap();
+        // A separate process observes fd0's lock with a fresh open. If Runner
+        // replaces stdin with null (no handover), this cannot observe marker.
+        let script = "import os,fcntl\nst=os.fstat(0)\nassert (st.st_dev,st.st_ino)==(int(os.environ['DEV']),int(os.environ['INO']))\nf=open(os.environ['MARKER'],'r+')\ntry: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: pass\nelse: raise AssertionError('marker was not locked')\nraise SystemExit(7)";
+        let meta = marker.file.metadata().unwrap();
+        let mut command = std::process::Command::new("/usr/bin/python3");
+        command
+            .args(["-c", script])
+            .env_clear()
+            .env("HOME", &f.base)
+            .env("MARKER", f.files.path(Leaf::Marker))
+            .env("DEV", meta.dev().to_string())
+            .env("INO", meta.ino().to_string());
+        let status = runner.run(&mut command).unwrap();
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(runner.statuses().len(), 1);
+        assert_eq!(runner.statuses()[0].exit.code(), Some(7));
+        assert!(runner.statuses()[0].elapsed > std::time::Duration::ZERO);
+        runner.finished().unwrap();
+    }
+
+    #[test]
+    fn f2_runner_capture_failure_is_sticky_after_actual_reaping() {
+        let f = Fixture::new();
+        let lease = f2_lease(&f);
+        let marker = f.files.lock_marker_primitive().unwrap();
+        let mut runner = super::super::steps::Runner::new(&lease, &marker).unwrap();
+        assert!(
+            runner
+                .capture(&mut f2_command(&f, "printf over-budget"), 2)
+                .is_err()
+        );
+        assert_eq!(runner.statuses().len(), 1);
+        assert!(runner.statuses()[0].exit.success());
+        assert!(runner.finished().is_err());
+        assert!(runner.run(&mut f2_command(&f, "exit 0")).is_err());
+    }
+
+    #[test]
+    fn f2_inherited_actual_holder_death_after_command_reap_prevents_publication() {
+        use super::super::steps::tests::{ChildGuard, Scratch, fixture, ready};
+        let f = Fixture::new();
+        f2_repo(&f);
+        let machine = Scratch::new();
+        let sockets = Scratch::temporary();
+        let mut command = fixture(&machine, "holder", "server-holder");
+        command.env("F2_SOCKET_ROOT", &sockets.0);
+        let mut holder = ChildGuard(command.spawn().unwrap());
+        ready(&mut holder.0, &machine.0.join("holder.ready"));
+        let record: serde_json::Value =
+            serde_json::from_slice(&fs::read(machine.0.join("r-orch-gate.lease")).unwrap())
+                .unwrap();
+        let inherited = super::super::lease::Inherited::from_capability(
+            &machine.0,
+            machine.owner(),
+            PathBuf::from(record["socket"].as_str().unwrap()),
+            record["token"].as_str().unwrap(),
+        )
+        .unwrap();
+        let lease = super::super::lease::Lease::Inherited(inherited);
+        let mut direct = fixture(&machine, "command", "hold");
+        let root = machine.0.clone();
+        let killer = std::thread::spawn(move || {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while !root.join("command.ready").exists() {
+                assert!(std::time::Instant::now() < end, "command did not start");
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            holder.0.kill().unwrap();
+            assert!(!holder.0.wait().unwrap().success());
+            fs::write(root.join("command.release"), b"holder is gone").unwrap();
+        });
+        let mut marker = f.files.lock_marker_primitive().unwrap();
+        marker.protect().unwrap();
+        marker.invalidate().unwrap();
+        let error = marker
+            .use_warm(&lease, std::slice::from_mut(&mut direct))
+            .unwrap_err();
+        killer.join().unwrap();
+        let failure = error.downcast_ref::<UseFailure>().unwrap();
+        assert!(failure.exits.iter().all(|e| e.success()));
+        assert!(!failure.exits.is_empty());
+        assert!(f.files.check_leaf(Leaf::Marker).unwrap().is_some());
+        assert!(matches!(f.files.read_record().unwrap(), Stored::Missing));
     }
 }

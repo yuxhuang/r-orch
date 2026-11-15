@@ -1,9 +1,16 @@
-//! Registry seam only. No gate, inventory, evidence or lease executes here.
+//! Tier wiring remains a seam; F2 provides lease and direct-command primitives.
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code, reason = "F2 lifecycle awaits whole-gate integration")]
+mod lease;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code, reason = "F2 lifecycle awaits whole-gate integration")]
+mod steps;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(
     dead_code,
-    reason = "F1 source is disconnected pending independent review and later tier wiring"
+    reason = "Target mutation awaits a stable native namespace implementation and tier wiring"
 )]
 mod target;
 
@@ -112,7 +119,22 @@ pub fn run(repo: &Path, args: GateArgs) -> Result<i32> {
             gate_selection::run_cli(repo, select)?;
             Ok(0)
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Some(GateCommand::Lease {
+            command:
+                LeaseCommand::Exec {
+                    command,
+                    lease_wait,
+                    ..
+                },
+        }) => lease::exec(&command, std::time::Duration::from_secs(lease_wait)),
         _ => {
+            if args.no_lease.is_some() {
+                eprintln!(
+                    "gate: REFUSED: configured lease required before target admission; qualifying: no"
+                );
+                return Ok(1);
+            }
             eprintln!("gate: not available yet (registry seam only; nothing ran)");
             Ok(2)
         }
@@ -181,5 +203,13 @@ mod tests {
         ] {
             assert_eq!(Cli::try_parse_from(args).unwrap_err().exit_code(), 2);
         }
+    }
+
+    #[test]
+    fn no_lease_refuses_without_entering_target_lifecycle() {
+        assert_eq!(
+            run(Path::new("."), parse(&["pr", "--no-lease", "fixture"])).unwrap(),
+            1
+        );
     }
 }
