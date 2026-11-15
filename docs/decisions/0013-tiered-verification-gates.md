@@ -1,6 +1,6 @@
 # 0013. Tiered verification gates with one folded suite run
 
-- Status: proposed; frozen at revision 2 and not rewritten. [0014](0014-gate-target-recovery-and-selection-coupling.md) (proposed) supersedes named clauses of decisions 30 and 31 and qualifies decisions 14, 15 and 21; the rest stands
+- Status: accepted (revision 2, the design baseline; not rewritten). [0014](0014-gate-target-recovery-and-selection-coupling.md) is proposed and not yet accepted: it would supersede named clauses of decisions 30 and 31 and qualify decisions 14, 15, 17 and 21. No clause is superseded until 0014 is accepted; until then the lead's rulings recorded in the plan (section 12) bind on those points
 - Date: 2026-11-14
 - Revision: 2 (reconciled with the design challenge)
 

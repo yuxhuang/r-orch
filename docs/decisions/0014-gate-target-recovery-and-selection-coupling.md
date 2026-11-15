@@ -2,13 +2,31 @@
 
 - Status: proposed
 - Date: 2026-11-14
-- Supersedes: named clauses of [ADR 0013](0013-tiered-verification-gates.md) decisions 30 and 31, and
-  qualifies its decisions 14, 15 and 21. The clauses are listed under "What this changes in ADR 0013".
-  Everything else in ADR 0013 stands.
+- Revision: 2 (corrected after the security and resilience reviews of revision 1; still proposed)
+- Would supersede, once accepted: named clauses of [ADR 0013](0013-tiered-verification-gates.md) decisions
+  30 and 31. It would also qualify decisions 14, 15, 17 and 21. The clauses are listed under "What this
+  changes in ADR 0013". Everything else in ADR 0013 stands. Until this record is accepted, no clause of
+  ADR 0013 is superseded.
+
+Changes in revision 2. Decisions 32–40 keep their numbers. No mechanism is added and no number is chosen.
+
+- Decision 33: whether an existing target has a previous use is decided by affirmative provenance. The
+  exception of revision 1 for content "that no gate use is known to have produced" is withdrawn. Unknown
+  history is refused, for the warm and for the cold target.
+- Decision 34: a run whose cessation is unresolved does not qualify as evidence in any tier, and its result
+  shows that the target was kept and why.
+- Decisions 35 and 36: when the cessation of a use is established only after that use ended, the next run
+  resets or removes the target and never reuses it. An existing cold target is refused at the start of a
+  run until durable provenance exists.
+- Decision 38: every bound of the teardown and of a wait for cessation is listed. None has a value.
+- "What this record does not do": the durable provenance is named as a load-bearing prerequisite that is
+  not implemented. The sentence that the decisions did not depend on it is withdrawn.
+- "What this changes in ADR 0013": the effects are stated as proposed; a row for decision 17 is added.
+- Alternatives A31 and A32 are added.
 
 ## Context
 
-ADR 0013 is frozen at its revision 2 and its text is not rewritten. After it froze, the reviews of the gate's
+ADR 0013 is accepted at its revision 2 and its text is not rewritten. After it froze, the reviews of the gate's
 test files and a feasibility check of signal handling showed that two of its decisions say things the project
 cannot stand behind. The lead ruled on each point. This record carries those rulings into the decision text.
 It adds no mechanism, chooses no runtime and relaxes no requirement of the
@@ -70,13 +88,42 @@ gate run's building and testing in a target. "A writer" is any process of a use 
     present; the marker, present or absent; the end of a bounded wait; a signal that was handled; an
     operator's acknowledgement. Each is evidence for a diagnosis at most. None of them, and no number of them
     together, observes a re-parented descendant. The rule is about the gate's own uses. It does not ask the
-    gate to certify unrelated activity of the account, which decision 22 samples and reports. Content that
-    no gate use is known to have produced, such as a target planted by a plain cargo command, is not a
-    previous use: decisions 14 and 15 delete or reset it as before, under the cooperative lease of decision
-    21.
+    gate to certify unrelated activity of the account, which decision 22 samples and reports.
 
-34. **Without established cessation the operation is refused.** Unknown ownership is treated as a live
-    writer. The gate then does not publish, remove, reset or reuse; it leaves the target and the marker as
+    Whether an existing target has a previous use is decided by affirmative provenance, never by the absence
+    of a known use. There are three cases. Only the first two permit an operation.
+
+    - *Never used by a gate.* It is independently established that no gate use ever began in this target,
+      and its content is a closed, controlled plant: for example the target that a plain cargo command built
+      and has finished building (the plan's vector TV13). Decisions 14 and 15 then delete or reset it as
+      before, under the cooperative lease of decision 21.
+    - *A previous use that is closed.* A gate use began in this target, and the cessation of its writers was
+      independently established as this decision says. Decision 32 is then met. This is a separate case
+      from the first and needs its own proof. No token proves cessation: not a marker, a use token or a
+      record, and not by being present, absent or well formed. A token can record that a use began, or that
+      the observation was made. It does not replace the observation.
+    - *Unknown.* The history of the target is missing, unreadable, corrupt, incomplete or otherwise
+      unresolved. That is treated as a previous use whose writers are not known to have ceased, and
+      decision 34 refuses. This holds for the warm and for the cold target alike.
+
+    None of the following establishes that a target was never used by a gate: the absence of a marker or of
+    a record; the directory having been absent earlier, or having been recreated; the cooperative lease
+    being free or held (the kernel frees it at once when a holder is killed while its descendants live); a
+    recorded process id that is no longer present; an operator's acknowledgement. Creating a target that
+    does not exist stays outside the four operations of decision 32, but the absence of the directory is not
+    provenance: it does not show that no use began at that path, and it lifts no refusal that the
+    provenance requires for an unfinished use recorded there.
+
+    The provenance has to be durable and reviewed (the plan's prerequisite P5). Requiring it is part of this
+    decision. Its implementation is not designed here and does not exist. For the warm target, the marker
+    and the completed record of decisions 30 and 35 are the designed trace, and they cover a target only
+    while they are present, readable and complete. Whether a later run may rely on them as read, and how
+    they are protected, belongs to the review of that prerequisite; the open security finding on recovery
+    contents used as authority is not closed here. The cold target has no trace at all in ADR 0013.
+
+34. **Without established cessation the operation is refused, and the run does not qualify.** Unknown
+    ownership is treated as a live writer, and unknown history (decision 33) as a previous use that has not
+    ceased. The gate then does not publish, remove, reset or reuse; it leaves the target and the marker as
     they are, sends no signal to a process it cannot attribute, and says why, naming what it observed as a
     diagnostic. A wait for cessation is bounded. When it ends without proof, the outcome is this refusal: an
     expired wait is not permission, and neither is a process id that went missing during it. At the start of
@@ -84,6 +131,16 @@ gate run's building and testing in a target. "A writer" is any process of a use 
     and 18) and nothing builds. At the end of a run, the refusal leaves the target in place, unpublished.
     Recovery stays refused until cessation is established by decision 33's means; no later run, elapsed time
     or acknowledgement changes that.
+
+    A run that ends with the cessation of its writers unresolved is not qualifying evidence (decision 17):
+    not for a builder, a merge, a goal or a release, and not in any tier, `fast` included. The step results
+    that were observed may be kept and shown. They cannot add up to a qualifying overall success. The result
+    states `qualifying: no` with this reason, and its summary shows the target as kept and why
+    (`target: kept (<reason>)`), in every tier. A later run that is refused because of that earlier use
+    names the earlier run's identity and end time where validated diagnostics supply them, and says
+    `unavailable` where they do not. It invents no identity, treats no marker as authority and does not
+    count the disclosure as cessation. How the overall verdict and the exit status present such a run is
+    left to the implementation's interface and its review. The floor in this paragraph is not.
 
 35. **The warm record is published at established cessation, not at the end of the last command.** The
     marker and the source identities are written before the first building command, as decision 30 says.
@@ -93,14 +150,25 @@ gate run's building and testing in a target. "A writer" is any process of a use 
     time could otherwise leave an artifact that looks newer than a source edit it never saw. A marker
     therefore survives every use whose cessation was not established, not only a gate that was killed. A
     run that finds a marker refuses (decision 34) unless the cessation of that earlier use is established;
-    only then does it reset, with `reset: previous build did not finish`.
+    only then does it reset, with `reset: previous build did not finish`. This is the rule for every use
+    that ended without established cessation, however it ended: a normal finish, a failed compilation, a
+    handled interrupt or the death of the holder. No record was completed for such a use, so no later run
+    reports `reused` for it. Once its cessation is established, the next run resets. Until then every later
+    run is refused.
 
 36. **Deleting the cold target and resetting the warm target are removals under decision 32.** Decision 14's
     deletion of `target/gate` before and after a run, its cleanup on failure or interruption, and decision
     15's resets keep their conditions and their reasons. Each is carried out only when decision 32 is met.
     A cold target that is left in place because cessation was not established is not a defect of the run
     that left it. A cold target removed under a live writer would be: the writer can recreate it, and the
-    next cold run would start on a tree it believes is fresh.
+    next cold run would start on a tree it believes is fresh. A cold target that was left in place is
+    removed by a later run only once that cessation is established, and each later `full` run is refused
+    until then. The deletion before a run is covered in the same way. A `target/gate` that exists when a
+    `full` run starts, after `--keep`, after a killed run or from any other origin, is a possible previous
+    use, and deleting it needs the affirmative provenance of decision 33. No reviewed durable provenance
+    exists for the cold target, so that deletion is refused today. The plan's vector TV13, which expects a
+    planted cold target to be deleted, keeps its expected result and is unmet until the provenance exists.
+    It is not passing and it is not waived.
 
 37. **The lease holder is the process the caller started.** It may have replaced itself by `exec`. It is the
     only owner of the lease's file descriptor. No helper keeps that descriptor after the holder is killed,
@@ -110,12 +178,17 @@ gate run's building and testing in a target. "A writer" is any process of a use 
     the lease at once when the actual holder is killed with live descendants; a handled INT, TERM or HUP
     ends in a bounded teardown; a measurement supervisor may hold a lease of its own through its teardown.
 
-38. **No number is chosen for the grace period of a handled interrupt.** The teardown is bounded; the bound
-    has no value yet. The deadlines in the gate's test files are budgets of those tests. No product limit is
+38. **No number is chosen for the grace period of a handled interrupt, or for any other bound of the
+    teardown and of a wait for cessation.** The bounds are: the grace period of a handled interrupt; the
+    wait for the gate's children after a signal; the wait for cessation at the end of a run, before a
+    publication or a removal; and the wait for cessation at the start of a run that found an earlier use.
+    Each is bounded and none has a value yet. The wait for the lease has its value in decision 21 and is not
+    among them. The deadlines in the gate's test files are budgets of those tests. No product limit is
     taken from them, and none is stated as a supported property of the gate. The owner of the gate's
-    implementation and of the release supplies a value and its justification once a workable route for
-    decision 33 exists. Independent reviewers assess it. The test budgets are then derived from it, not the
-    reverse.
+    implementation and of the release says whether these are distinct bounds or one shared bound, and
+    supplies every supported value with its justification, once a workable route for decision 33 exists.
+    Independent reviewers assess the whole set. Only then are the test budgets derived from it, not the
+    reverse, and not from one of the bounds alone.
 
 ### Selection
 
@@ -140,6 +213,9 @@ gate run's building and testing in a target. "A writer" is any process of a use 
 
 ## What this changes in ADR 0013
 
+The effects in this table are proposed. They take hold when this record is accepted, and only for the
+clauses named. Until then ADR 0013 stands as accepted and the lead's rulings bind (below the table).
+
 | ADR 0013 | Clause | Effect |
 |---|---|---|
 | Decision 30 | "When the last building command ends, with success, with a compile error or after an interrupt that the gate handled (once its children have exited), it writes the record with those identities and the end time, and removes the marker." | Superseded by decision 35 as to *when*: at established cessation, with the end time taken then. What the record holds, and that it is also written after a compile error or a handled interrupt, stand |
@@ -151,12 +227,15 @@ gate run's building and testing in a target. "A writer" is any process of a use 
 | Decision 31 | The table is kept by hand; a coupling missing from it is caught by `pr`, not by `fast` | Stand |
 | Decision 14 | Deletion of `target/gate` before and after the run; cleanup on failure or interruption | Qualified by decisions 32 and 36. No word is replaced |
 | Decision 15 | The resets of `target/gate-warm` and the `reused` result | Qualified by decisions 32 and 36. No word is replaced |
+| Decision 17 | The conditions under which a run qualifies as evidence | Qualified by decision 34: a run whose cessation is unresolved does not qualify. No word is replaced |
 | Decision 21 | The holder of the lease | Qualified by decision 37. No word is replaced |
 
 Every other decision, consequence and alternative of ADR 0013 is unchanged.
 
-Until this record is accepted, the same points bind as the lead's rulings recorded in the plan (section 12,
-holds K-1 to K-5 and the broader coupling). A rejection of this record does not release them.
+Until this record is accepted, the same points bind as the lead's rulings recorded in the plan (section 12:
+holds K-1 to K-5, the broader coupling, and the rulings carried by the sixth amendment). A rejection of this
+record does not release them. Finishing a review of this record does not accept it; the lead records the
+acceptance.
 
 ## What this record does not do
 
@@ -169,22 +248,34 @@ state: a gate that always refuses does not meet decisions 14, 15 and 30, the vec
 a reset or a removed cold target, or the timing requirement of the warm tiers. Whether native Linux offers
 such an observation has not been evaluated.
 
-Not decided here, and the decisions above do not depend on it:
+Not decided here:
 
 - which mechanism establishes cessation, and on which hosts;
-- how a later run knows durably that a gate use began in a target and did not reach established cessation.
-  The marker of decision 30 does this for the warm target. The cold target has no equivalent in ADR 0013
-  and needs one, because a killed `full` run must be recognizable to the next run;
+- the values of the bounds of decision 38, and whether they are one bound or several;
 - the exact wording of the refusal;
-- what verdict a run reports when its steps passed and it could not establish cessation at its end, and
-  whether such a run can qualify as evidence (decision 17). Proposed, for the lead and the gate's owner: the
-  step verdicts stand, the result says that the target was kept and why, and the run does not qualify;
+- how the overall verdict and the exit status present a run whose steps passed and whose cessation was
+  unresolved at its end. That such a run does not qualify, and that its result shows the kept target, is
+  decided (decision 34);
 - a fresh target path instead of a reset, and a dedicated account for gate runs. Neither was evaluated;
   neither is adopted or ruled out.
 
-A limit that stays: the gate and its operator share one account. A marker deleted by hand looks to the next
-run like a target that was never in use. No document offers that as a recovery, and the gate cannot detect
-it.
+One prerequisite is load-bearing, and it is not implemented: the durable provenance of decision 33 (the
+plan's P5). A later run must be able to know, affirmatively, whether a gate use ever began in a target and
+whether that use reached established cessation. Decisions 33, 34 and 36 depend on it. Revision 1 of this
+record said that its decisions did not; that sentence was wrong and is withdrawn. The requirement is
+decided. Its implementation is not designed, chosen or started here. The marker and the record of decisions
+30 and 35 are the designed trace for the warm target. The cold target has none in ADR 0013 and needs one,
+because a killed or a kept `full` run must be recognizable to the next run. Until a reviewed provenance
+exists:
+
+- an existing cold target cannot be told apart from an unfinished use, so its deletion at the start of a
+  run is refused, and the plan's vector TV13 is unmet;
+- a warm target whose marker or record is missing, unreadable, corrupt or incomplete is refused in the same
+  way.
+
+A limit that stays: the gate and its operator share one account. A marker deleted by hand can look to the
+next run like a target whose last use had closed, and a history rewritten by hand can look like any of the
+three cases of decision 33. No document offers that as a recovery, and the gate cannot detect it.
 
 ## Consequences
 
@@ -192,6 +283,12 @@ it.
   rests on that, not on the gate having outlived its direct children.
 - A host without an accepted observation produces no reusable warm target and keeps its cold target. The
   price is paid in the open, as a refusal with a reason, not as a silent stale artifact.
+- An existing target without affirmative provenance is refused. Until the durable provenance exists, a
+  `target/gate` left by `--keep`, by a killed run or by anything else blocks the next `full` run on that
+  worktree, and a warm target with a damaged record blocks `pr` and `fast` there. No document offers a
+  recovery for that state yet.
+- A run that kept its target is visibly not qualifying in every tier, the builder's included. A builder sees
+  the reason in the run that caused it, not one run later as an unexplained refusal.
 - The frozen test files expect behaviour of decision 30 that is now superseded. The plan lists the edits;
   none is made or authorized by this record, and no expected protection is dropped.
 - The selector frozen for PR 2 implements the narrower trigger of decision 31. Its change, the added table
@@ -219,3 +316,9 @@ it.
   runs them in any case.
 - **A30. Rely on one cargo invocation to order the build.** The order is undocumented and unmeasured, and a
   warm target can already hold an older binary.
+- **A31. Treat a target that no gate use is known to have produced as having no previous use.** This was the
+  text of revision 1. Not knowing of a use is not knowing that there was none. A killed or a kept `full`
+  run leaves a cold target with no trace, and the rule would delete it under a writer that may still live.
+- **A32. Let a run whose steps passed qualify although its cessation is unresolved, or decide that per
+  tier.** Such a run cannot say that its artifacts are final. On the builder's tier it would report a
+  success whose price appears one run later, as a refusal with no visible cause.
