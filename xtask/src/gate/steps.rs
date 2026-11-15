@@ -32,6 +32,8 @@ pub(super) struct Runner<'a, 'm> {
     start: Option<Instant>,
     active_command: Option<String>,
     statuses: Vec<Status>,
+    probe_statuses: Vec<Status>,
+    unreaped_probe: bool,
     failed: bool,
     signals: Option<Signals>,
     kill_end: Option<Instant>,
@@ -68,6 +70,8 @@ impl<'a, 'm> Runner<'a, 'm> {
             start: None,
             active_command: None,
             statuses: Vec::new(),
+            probe_statuses: Vec::new(),
+            unreaped_probe: false,
             failed: false,
             signals: if marker.is_none() {
                 Some(Signals::new()?)
@@ -80,9 +84,28 @@ impl<'a, 'm> Runner<'a, 'm> {
         })
     }
 
-    pub(super) fn observation(&self) -> Result<super::contention::Observation> {
-        Self::with_marker(self.lease, self.marker)
-            .and_then(|mut probe| super::contention::query(&mut probe))
+    pub(super) fn probe_statuses(&self) -> &[Status] {
+        &self.probe_statuses
+    }
+    pub(super) fn observation(&mut self) -> Result<super::contention::Observation> {
+        let mut probe = Self::with_marker(self.lease, self.marker)?;
+        let result = super::contention::query(&mut probe);
+        if !probe.child_reaped() {
+            let _ = probe.stop();
+        }
+        let reaped = probe.child_reaped();
+        self.probe_statuses
+            .extend(probe.statuses().iter().cloned().map(|mut status| {
+                status.command = format!("sampler-probe {}", status.command);
+                status
+            }));
+        drop(probe);
+        if !reaped {
+            self.failed = true;
+            self.unreaped_probe = true;
+            bail!("sampler direct child unreaped; target kept; status unknown");
+        }
+        result
     }
     pub(super) fn observe(
         &mut self,
@@ -90,8 +113,8 @@ impl<'a, 'm> Runner<'a, 'm> {
     ) {
         self.observer = Some(observer);
     }
-    fn sample_due(&self) {
-        if let Some(observer) = &self.observer {
+    fn sample_due(&mut self) {
+        if let Some(observer) = self.observer.clone() {
             let due = observer.borrow().due();
             if !due {
                 return;
@@ -414,7 +437,7 @@ impl<'a, 'm> Runner<'a, 'm> {
         self.wait_signal(Duration::ZERO)
     }
     pub(super) fn child_reaped(&self) -> bool {
-        self.child.is_none()
+        self.child.is_none() && !self.unreaped_probe
     }
     pub(super) fn statuses(&self) -> &[Status] {
         &self.statuses
@@ -615,6 +638,98 @@ pub(super) mod tests {
             assert!(Instant::now() < end, "fixture handshake timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn sampler_failure_fixture() {
+        let Some(root) = std::env::var_os("XTASK_PROBE_FAILURE_ROOT").map(PathBuf::from) else {
+            return;
+        };
+        let owned = Owned::acquire(
+            &root,
+            fs::metadata(&root).unwrap().uid(),
+            Mode::Exclusive,
+            Duration::ZERO,
+        )
+        .unwrap();
+        let lease = Lease::Owned(owned);
+        let mut runner = Runner::without_marker(&lease).unwrap();
+        assert!(runner.observation().is_err());
+        runner.finished().unwrap();
+        assert_eq!(
+            runner.probe_statuses().len(),
+            1,
+            "query wait status was discarded"
+        );
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(runner.probe_statuses()[0].exit.signal(), Some(9));
+        assert!(
+            runner.statuses().is_empty(),
+            "probe polluted primary step status indices"
+        );
+        assert!(
+            runner
+                .run(&mut Command::new("/usr/bin/true"))
+                .unwrap()
+                .success()
+        );
+        assert_eq!(runner.statuses().len(), 1);
+        runner.finished().unwrap();
+    }
+
+    #[test]
+    fn overflowing_sampler_query_reaps_its_direct_child_and_retains_wait_status() {
+        let s = Scratch::new();
+        let bin = s.0.join("bin");
+        fs::create_dir(&bin).unwrap();
+        let script = bin.join("ps");
+        fs::write(&script,b"#!/bin/sh\ntrap '' TERM\nprintf '%s' \"$$\" > \"$XTASK_PROBE_FAILURE_ROOT/ps.pid\"\nwhile :; do printf '%s\\n' '900000 1 cargo'; done\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let log = File::create(s.0.join("fixture.log")).unwrap();
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gate::steps::tests::sampler_failure_fixture",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("HOME", &s.0)
+                .env("ORCHESTRY_GLOBAL_CONFIG_PATH", s.0.join("global.yml"))
+                .env("XTASK_PROBE_FAILURE_ROOT", &s.0)
+                .env(
+                    "PATH",
+                    std::env::join_paths([bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")])
+                        .unwrap(),
+                )
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "probe fixture did not finish within direct reap budget"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            status.success(),
+            "{}",
+            fs::read_to_string(s.0.join("fixture.log")).unwrap()
+        );
+        let pid = fs::read_to_string(s.0.join("ps.pid")).unwrap();
+        let output = Command::new("/bin/ps")
+            .args(["-p", &pid, "-o", "pid="])
+            .output()
+            .unwrap();
+        assert!(output.stdout.is_empty(), "reaped sampler PID still present");
     }
 
     #[test]

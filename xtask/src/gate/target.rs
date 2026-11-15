@@ -184,6 +184,7 @@ impl NativeUse<'_> {
         let direct_reaped = runner.child_reaped();
         let ordinary_finish = runner.finished();
         let mut statuses = runner.statuses().to_vec();
+        statuses.extend_from_slice(runner.probe_statuses());
         drop(runner);
         let captured = (|| {
             if interrupted && direct_reaped {

@@ -126,6 +126,11 @@ The sampler excludes the gate's process-parent closure, records maximum load,
 and preserves unavailable query data. macOS reads the unprivileged thermal
 pressure notification state; Linux discloses the unsupported portable query.
 These observations establish no idle threshold or timing acceptance by themselves.
+Probe statuses are retained separately from primary step indices; an unreaped
+probe poisons the whole use, including handled-interrupt finish, and keeps the
+target. Optional query failure is measurement data only after real probe reap.
+The public judge content identity is preserved by export redaction; secret tokens,
+session values and unknown gate-control values remain redacted.
 
 D45 remains owner-accepted interim checked-path/by-name mutation risk, to revisit
 when storage changes; it is not resolved. FS1 escaped descendants and manual

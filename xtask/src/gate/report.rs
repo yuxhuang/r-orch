@@ -131,7 +131,7 @@ impl Redactor {
                 .iter()
                 .any(|part| name.contains(part))
                 || super::hermetic::SESSION.contains(&name.as_str())
-                || name.starts_with("XTASK_GATE_"))
+                || (name.starts_with("XTASK_GATE_") && name != "XTASK_GATE_JUDGE_ID"))
                 && let Some(value) = value.to_str().filter(|s| s.len() >= 4)
             {
                 replacements.push((value.to_owned(), "<REDACTED>"));

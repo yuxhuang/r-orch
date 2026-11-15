@@ -189,8 +189,18 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
             files::real_directories(&repo.join("target"))?;
             outcome = "developer (not a gate)".into();
             let mut runner = super::steps::Runner::without_marker(lease)?;
-            work(&mut runner, &repo.join("target"))?;
-            runner.finished()?;
+            let work_result = work(&mut runner, &repo.join("target"));
+            let finished = runner.finished();
+            for status in runner.statuses().iter().chain(runner.probe_statuses()) {
+                command_statuses.push_str(&format!(
+                    "exit={} wall-ms={} {}\n",
+                    report::code(status.exit),
+                    status.elapsed.as_millis(),
+                    report::diagnostic(status.command.as_bytes())
+                ));
+            }
+            work_result?;
+            finished?;
             publication = "developer target (not a gate)";
         } else {
             let cold = args.tier == Tier::Full;
