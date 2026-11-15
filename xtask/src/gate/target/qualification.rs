@@ -127,14 +127,24 @@ assert resources.is_dir(),'installed pinned toolchains required'
 registry=pathlib.Path(outer.get('CARGO_HOME',str(pathlib.Path.home()/'.cargo')))/'registry'
 if registry.is_dir():(root/'cargo/registry').symlink_to(registry.resolve())
 rustup=shutil.which('rustup');assert rustup,'installed rustup required'
-for name in ['rustup','cargo','rustc','rustdoc','rustfmt','cargo-fmt','cargo-clippy','clippy-driver']:
- (root/'bin'/name).symlink_to(pathlib.Path(rustup).resolve())
+(root/'bin/rustup').symlink_to(pathlib.Path(rustup).resolve())
 deny=shutil.which('cargo-deny')
 if deny:(root/'bin/cargo-deny').symlink_to(pathlib.Path(deny).resolve())
 for name in ['claude','codex','cursor','cursor-agent','agent','opencode','pi','grok','agy']:
  p=root/'shims'/name;p.write_text('#!/bin/sh\nexit 127\n');p.chmod(0o700)
 base_env=dict(HOME=str(root/'home'),CARGO_HOME=str(root/'cargo'),RUSTUP_HOME=str(root/'rustup'),RUSTUP_TOOLCHAIN='1.99.1',RUSTUP_AUTO_INSTALL='0',RUSTUP_NO_UPDATE_CHECK='1',CARGO_NET_OFFLINE='true',CARGO_TERM_COLOR='never',ORCHESTRY_GLOBAL_CONFIG_PATH=str(root/'home/global.yml'),GIT_CONFIG_GLOBAL='/dev/null',GIT_CONFIG_NOSYSTEM='1',TMPDIR=str(root/'tmp'),PATH=os.pathsep.join([str(root/'shims'),str(root/'bin'),'/usr/bin','/bin','/usr/sbin','/sbin']))
 assert '.orchestry' not in root.parts
+# Canonicalizing every proxy to the rustup image changes its invocation name.
+# Resolve installed backends in the private view, then use the actual binaries.
+for name in ['cargo','rustc','rustdoc','rustfmt','cargo-fmt','cargo-clippy','clippy-driver']:
+ found=subprocess.run([str(root/'bin/rustup'),'which',name],env=base_env,capture_output=True,text=True,check=True).stdout.strip()
+ (root/'bin'/name).symlink_to(pathlib.Path(found).resolve())
+versions={}
+for name,args,prefix in [('cargo',['-V'],'cargo 1.99.1 '),('rustc',['-vV'],'rustc 1.99.1 ')]:
+ p=subprocess.run([name]+args,env=base_env,capture_output=True,text=True,check=True)
+ assert p.stdout.startswith(prefix),(name,p.stdout,p.stderr)
+ versions[name]={'stdout':p.stdout,'stderr':p.stderr,'status':p.returncode}
+(root/'verified-native-versions.json').write_text(json.dumps(versions,indent=2)+'\n')
 identity={}
 for tool in ['cargo','rustc','git','cargo-deny','ps','sysctl','notifyutil']:
  path=shutil.which(tool,path=base_env['PATH'])

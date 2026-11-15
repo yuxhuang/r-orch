@@ -87,6 +87,14 @@ qualification ledger; none of these scoped controls is whole-workspace acceptanc
 
 ### Native-recovery continuation result (2026-11-15; incomplete)
 
+The first private-tool view incorrectly canonicalized Cargo/rustc proxy links to
+Rustup itself. The later tool-output audit exposed this; its native Rust-command
+claims are withdrawn, with all raw results retained. The corrected fixture
+resolves actual installed pinned backend binaries through a private resource-only
+view, verifies native Cargo/rustc version output before the matrix, and requires
+a new exact-head package run. This corrects the fixture, not the red recovery
+positive; no capability was enabled by the invalid observations.
+
 The continuation adds test-only access to the real `NativeTarget::begin`,
 `NativeUse::run` and `Runner` start/drive path. Production recovery policy stays
 unchanged. On the measured Mac/APFS devices, the 19 fixed real command forms
