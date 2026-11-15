@@ -1,6 +1,6 @@
 # 0013. Tiered verification gates with one folded suite run
 
-- Status: accepted (revision 2, the design baseline; not rewritten); named clauses of decisions 30 and 31 superseded by [0014](0014-gate-target-recovery-and-selection-coupling.md) (accepted 2026-11-14), which also qualifies decisions 14, 15, 17 and 21 without replacing a word of them. Only the clauses listed in 0014 under "What this changes in ADR 0013" are affected; every other decision, consequence and alternative of this record stands
+- Status: accepted (revision 2, the design baseline; not rewritten); named clauses of decisions 30 and 31 superseded by [0014](0014-gate-target-recovery-and-selection-coupling.md) (accepted 2026-11-14), which also qualifies decisions 14, 15, 17 and 21 without replacing a word of them. Only the clauses listed in 0014 under "What this changes in ADR 0013" are affected; every other decision, consequence and alternative of this record stands. 0014 was amended by its revision 3 on 2026-11-15: the owner relaxed the cessation rule (binding), and the implementation contract derived from it (0014 decisions 42–47) is proposed, pending review. The supersession and the qualifications named here continue as 0014 now states them; no word of this record is replaced
 - Date: 2026-11-14
 - Revision: 2 (reconciled with the design challenge)
 
