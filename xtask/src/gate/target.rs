@@ -1,4 +1,5 @@
-//! Cooperative target state and F2 direct-command publication. No tier calls it yet.
+//! Cooperative target state and F2 direct-command publication. Tiers exercise
+//! only the strict native admission refusal; candidate mutations stay unwired.
 //!
 //! The lease/direct-reap/source-capture path is exercised with real native child
 //! fixtures. Recovery is still unsupported in production: one cargo observation
@@ -19,6 +20,59 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+/// Production entry used by the tier dispatcher. No miniature-workspace bypass.
+/// Successful native admission remains unavailable under the retained D45 guard.
+pub(super) fn native_admission(
+    root: &Path,
+    cold: bool,
+    lease: &super::lease::Lease,
+) -> anyhow::Result<()> {
+    lease.validate()?;
+    let owner = nix::unistd::geteuid().as_raw();
+    let files = StateFiles::inspect(root, owner, if cold { Kind::Cold } else { Kind::Warm })?;
+    let _marker = files.admit_configured(Some(lease))?;
+    anyhow::bail!("native lifecycle not implemented after admission")
+}
+
+pub(super) fn marker_diagnostics(root: &Path, cold: bool) -> Option<Vec<u8>> {
+    (|| -> Result<Vec<u8>> {
+        let owner = nix::unistd::geteuid().as_raw();
+        let files = StateFiles::inspect(root, owner, if cold { Kind::Cold } else { Kind::Warm })?;
+        let file = files.open_regular(Leaf::Marker, false, false)?;
+        let mut bytes = vec![];
+        file.take((MAX_DIAGNOSTIC + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| Fault::Io {
+                operation: "read marker diagnostic",
+                path: files.path(Leaf::Marker),
+                source: e,
+            })?;
+        if bytes.len() > MAX_DIAGNOSTIC {
+            return Err(Fault::Unavailable("marker diagnostic exceeds budget"));
+        }
+        Ok(bytes)
+    })()
+    .ok()
+}
+
+pub(super) fn cold_space(output: &str) -> anyhow::Result<()> {
+    let row = output
+        .lines()
+        .nth(1)
+        .ok_or_else(|| anyhow::anyhow!("free space unavailable: df row"))?;
+    let available = row
+        .split_whitespace()
+        .nth(3)
+        .ok_or_else(|| anyhow::anyhow!("free space unavailable: df columns"))?
+        .parse::<u64>()?;
+    anyhow::ensure!(
+        available >= 12 * 1024 * 1024,
+        "cold gate requires 12 GiB free; only {} KiB available",
+        available
+    );
+    Ok(())
+}
 
 // Encoding budgets, not timing/teardown bounds. 8 MiB contains a 32K-source
 // inventory with ordinary repository paths; 4096 bounds each path/tool identity.
@@ -1639,6 +1693,18 @@ mod tests {
             target_exists: true,
             kind: Kind::Warm,
             recovery: Recovery::Unsupported,
+        }
+    }
+
+    #[test]
+    fn cold_free_space_refuses_low_missing_or_invalid_portable_df_output() {
+        assert!(cold_space("Filesystem 1024-blocks Used Available Capacity Mounted on\nfixture 99999999 1000 12582912 1% /fixture\n").is_ok());
+        for text in [
+            "",
+            "header\nfixture 99999999 1 12582911 1% /fixture\n",
+            "header\nfixture bad bad bad\n",
+        ] {
+            assert!(cold_space(text).is_err());
         }
     }
 

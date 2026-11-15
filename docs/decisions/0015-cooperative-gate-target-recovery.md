@@ -639,3 +639,39 @@ replacement must remove both unconditional cold deletion and EXIT/INT/TERM clean
 traps; it must not wrap this owner in another deleting shell. Do not use the old
 wrapper as evidence for the new lifecycle. No full folded gate, native recovery,
 Linux qualification, timing acceptance or release clearance follows from F3 tests.
+
+## F4/F5 independent implementation (2026-11-15)
+
+The ordinary-development continuation implements independent folded-suite,
+status/time, inventory, witness, hygiene, real-home metadata and evidence helpers.
+This is not acceptance of D42–D47 or proof of a native target operation. The actual
+production dispatcher invokes the native D45 guard and refuses; no supported
+warm/cold/developer-target lifecycle is claimed on macOS or Linux. The source
+keeps unsafe_code=forbid and adds no dependency or manifest change in this slice.
+
+The wrapper's unconditional startup target removal and EXIT/INT/TERM cleanup are
+removed. Interim bootstrap uses a new private target under `target/gate-xtask`
+for every invocation and retains it. The source identity is rechecked before
+admission. This avoids trusting old judge bytes while leaving D27's reusable
+stamp and bounded retention incomplete. It is a development branch, not a working
+PR1 release-gate replacement. No wrapper deletes beneath a running command.
+
+The folded engine uses one ordered, bounded stdout/stderr pipe so that Cargo's
+executable headers and libtest records can be judged together. Actual child
+statuses remain separate from inventory/hygiene verdicts, including failed 101
+and unknown status. The build explicitly finishes workspace binaries before the
+executable map and tests. Static checks retain required advisories as
+ENV-LIMITED when cargo-deny is absent; `real-home` is last in the independent
+whole-step engine. Whole-step production integration remains blocked by D45.
+
+The metadata snapshot uses safe descriptor-relative no-follow directory opens and
+fstatat (no file contents), breadth-first name ordering, depth 4/count 5000.
+Relocation and concurrent writers can still invalidate a metadata-only observation;
+a snapshot is not an atomic transaction. Source capture likewise refuses links
+and submodules but is not an atomic snapshot against same-account rewriting.
+R4/R11 ordinary/folded comparisons must use matching marker stdin, or diagnose its
+effect. RC18 remains command/platform/filesystem scoped and incomplete. The
+configured machine lease is still required, no lock is stolen or explicitly
+unlocked, and diagnostics confer no process/deletion authority. FS1/D41 and
+cargo-clean/manual-removal residuals remain disclosed. No launch-review condition
+has been silently called resolved; whole-gate review remains before PR1.

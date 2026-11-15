@@ -81,6 +81,48 @@ a run-wide cancellation listener through reporting and integrate the candidate
 publication cancellation checks once the native boundary is decided. No whole-gate,
 Linux, timing, equivalence, PR or completion claim is made by this amendment.
 
+## F4/F5 development status (2026-11-15)
+
+F4/F5 is **incomplete**. The independent folded runner/report/inventory/witness,
+hermetic checks and evidence helpers are implemented and exercised with private
+cargo fixtures. Production `full` and `pr` still refuse at the real native D45
+boundary before any suite/build, target deletion or publication. Their `--plan`
+commands and helper subcommands are available; no successful tier is claimed.
+F3's native integration limitation carries forward. No acceptance row or complete
+PR1 readiness is inferred from miniature tests. The next C task must exercise the
+actual CLI and preserve the native refusal as a blocker of positive lifecycle
+cases, rather than modify the guard or accept refusal as a positive protection.
+
+`xtask/gate.sh` no longer deletes a target at startup or from any EXIT/INT/TERM
+handler. Its interim bootstrap compiles a fresh judge in a new private directory
+under `target/gate-xtask` each time. This deliberately leaves D27 stamp reuse and
+ten-run retention incomplete; no live target is deleted and no existing binary
+is trusted. A source identity is carried and rechecked before admission. The old
+gate at the base SHA remains the comparison reference; this branch cannot yet
+replace it. The trade-off is extra build/disk cost, not a timing claim.
+
+F4's fixed refusal includes `REFUSED:`, the absolute marker, `marker diagnostics
+(unvalidated):` (or `unavailable`), a read-only inspection hint, the warning not to
+remove `target/` with `cargo clean` or by hand while an earlier process lives, and
+`qualifying: no:` with its reason. Kept outcomes retain `target: kept (<reason>)`.
+Diagnostic pids are never process or deletion authority. Child exits are retained
+independently from judged checks: a hygiene or inventory failure can have child
+exit 0; a failed suite keeps its actual 101. Unknown exit stays `unknown`.
+Capture is 32 MiB per merged log; export is at most 32 files / 64 MiB and refuses
+an oversize/unreadable/non-UTF8 input. Metadata snapshots retain depth 4/count 5000
+and never label partial coverage `unchanged`. Evidence is an integrity record,
+not authentication of a malicious producer or a scrubber for unknown secrets.
+
+The source capture is set/inode/size/mtime checked, not an atomic source snapshot;
+links and submodules are refused. A same-account concurrent replacement or
+same-size rewrite with restored timestamps remains a limitation. Marker stdin
+must match across R4/R11 comparisons or the difference must be diagnosed. Complete
+RC18 command/platform/filesystem coverage, native Mac/Linux lifecycle and folded
+runs, R4/R11 names/counts/differences, measured R12, C controls, independent final
+security/reliability review, final-head Linux and owner merge remain due. No
+selector/CI/nextest/rule change, third legacy baseline, push or PR is made here.
+
+
 ## Goal
 
 A builder gets a verdict on a change in minutes (`fast`), a pull request is gated by one full suite run (`pr`), and a goal or release is gated by one cold, folded run (`full`), with every protection of today's gate still in force and shown to fail when it should.

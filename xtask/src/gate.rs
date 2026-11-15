@@ -1,4 +1,5 @@
-//! Tier wiring remains a seam; F2/F3 provide lease and direct-command primitives.
+//! Tier dispatch and independently tested folded-run components. Native D45
+//! admission remains unavailable; a refusal never becomes a passing tier.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(dead_code, reason = "F2 lifecycle awaits whole-gate integration")]
@@ -16,6 +17,39 @@ mod steps;
 )]
 mod target;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod files;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(
+    dead_code,
+    reason = "Native D45 admission blocks production suite execution; private live fixtures exercise it"
+)]
+mod hermetic;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod inventory;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod judge;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(
+    dead_code,
+    reason = "Snapshot integration awaits native target lifecycle"
+)]
+mod real_home;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(
+    dead_code,
+    reason = "Complete tier reporting awaits native target lifecycle"
+)]
+mod report;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(
+    dead_code,
+    reason = "Native D45 admission blocks production suite execution; private live fixtures exercise it"
+)]
+mod suite;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod tier;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -26,7 +60,7 @@ use crate::gate_selection::{self, SelectArgs};
 #[derive(Debug, Args)]
 #[command(
     about = "Tiered verification: full (default), pr (merge condition), fast (iteration)",
-    after_help = "full is the goal and release gate. All tiers are not available yet in this seam."
+    after_help = "full is the goal and release gate; pr is the merge condition after the policy transition. Native target lifecycle is unavailable: execution refuses; --plan and helpers work. fast is PR2 work."
 )]
 pub struct GateArgs {
     #[command(subcommand)]
@@ -127,18 +161,72 @@ pub fn run(repo: &Path, args: GateArgs) -> Result<i32> {
                 LeaseCommand::Exec {
                     command,
                     lease_wait,
-                    ..
+                    purpose,
                 },
-        }) => lease::exec(&command, std::time::Duration::from_secs(lease_wait)),
-        _ => {
-            if args.no_lease.is_some() {
-                eprintln!(
-                    "gate: REFUSED: configured lease required before target admission; qualifying: no"
+        }) => {
+            eprintln!(
+                "gate lease purpose (unvalidated): {}",
+                report::diagnostic(purpose.as_bytes())
+            );
+            lease::exec_purpose(
+                &command,
+                std::time::Duration::from_secs(
+                    lease_wait
+                        .checked_mul(60)
+                        .ok_or_else(|| anyhow::anyhow!("lease wait overflow"))?,
+                ),
+                &purpose,
+            )
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Some(GateCommand::Inventory(args)) => {
+            let result = (|| -> Result<()> {
+                let log = files::text(&args.log, inventory::MAX_LOG)?;
+                let map = files::text(&args.executables, inventory::MAX_LOG)?;
+                let rows = inventory::parse(&log, &map, args.exit)?;
+                let text = inventory::tsv(&rows);
+                if let Some(out) = args.out {
+                    files::write(&out, text.as_bytes())?;
+                } else {
+                    print!("{text}");
+                }
+                anyhow::ensure!(
+                    rows.iter().all(|r| r.status != "failed"),
+                    "suite test failure"
                 );
-                return Ok(1);
+                Ok(())
+            })();
+            match result {
+                Ok(()) => Ok(0),
+                Err(e) => {
+                    eprintln!("gate inventory: {e:#}");
+                    Ok(1)
+                }
             }
-            eprintln!("gate: not available yet (registry seam only; nothing ran)");
-            Ok(2)
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Some(GateCommand::Evidence {
+            command: EvidenceCommand::Verify { dir, commit },
+        }) => match report::verify(repo, &dir, &commit) {
+            Ok(()) => {
+                println!("evidence verified");
+                Ok(0)
+            }
+            Err(e) => {
+                eprintln!("evidence rejected: {e:#}");
+                Ok(1)
+            }
+        },
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Some(GateCommand::Lease {
+            command: LeaseCommand::Status,
+        }) => lease::status(),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        None => tier::run(repo, &args),
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        _ => {
+            eprintln!("gate: unsupported native platform; nothing ran");
+            Ok(1)
         }
     }
 }
@@ -162,9 +250,9 @@ mod tests {
     fn tier_defaults_and_refuses_execution() {
         let args = parse(&[]);
         assert_eq!(args.tier, Tier::Full);
-        assert_eq!(run(Path::new("."), args).unwrap(), 2);
-        for tier in ["full", "pr", "fast"] {
-            assert_eq!(run(Path::new("."), parse(&[tier, "--plan"])).unwrap(), 2);
+        assert!(args.command.is_none());
+        for tier in ["full", "pr"] {
+            assert_eq!(run(Path::new("."), parse(&[tier, "--plan"])).unwrap(), 0);
         }
     }
 
@@ -210,7 +298,10 @@ mod tests {
     #[test]
     fn no_lease_refuses_without_entering_target_lifecycle() {
         assert_eq!(
-            run(Path::new("."), parse(&["pr", "--no-lease", "fixture"])).unwrap(),
+            {
+                let scratch = steps::tests::Scratch::new();
+                run(&scratch.0, parse(&["pr", "--no-lease", "fixture"])).unwrap()
+            },
             1
         );
     }

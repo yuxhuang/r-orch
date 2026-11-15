@@ -163,6 +163,28 @@ impl Owned {
         self.held.validate()
     }
 
+    pub(super) fn purpose(&self, purpose: &str) -> Result<()> {
+        self.validate()?;
+        let path = self
+            .held
+            .path
+            .parent()
+            .context("lease parent")?
+            .join("r-orch-gate.holder");
+        let mut file = open(&path, self.held.owner)?;
+        let text = format!(
+            "purpose={}\npid={}\nstarted={:?}\n",
+            super::report::diagnostic(&purpose.as_bytes()[..purpose.len().min(512)]),
+            std::process::id(),
+            std::time::SystemTime::now()
+        );
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(text.as_bytes())?;
+        file.set_len(text.len() as u64)?;
+        file.sync_all()?;
+        self.validate()
+    }
+
     pub(super) fn serve(&self, private_parent: &Path) -> Result<Server> {
         self.validate()?;
         ensure!(
@@ -336,6 +358,14 @@ impl Lease {
 }
 
 pub(super) fn exec(command: &[std::ffi::OsString], wait: Duration) -> Result<i32> {
+    exec_purpose(command, wait, "gate lease exec")
+}
+
+pub(super) fn exec_purpose(
+    command: &[std::ffi::OsString],
+    wait: Duration,
+    purpose: &str,
+) -> Result<i32> {
     use std::os::unix::process::ExitStatusExt;
     let lease = match Lease::configured(false, Mode::Exclusive, wait) {
         Err(e) if e.is::<Contended>() => {
@@ -344,6 +374,9 @@ pub(super) fn exec(command: &[std::ffi::OsString], wait: Duration) -> Result<i32
         }
         other => other?,
     };
+    if let Lease::Owned(owned) = &lease {
+        owned.purpose(purpose)?;
+    }
     let mut child_command = Command::new(command.first().context("missing lease command")?);
     child_command.args(&command[1..]);
     let _server = match &lease {
@@ -376,6 +409,55 @@ pub(super) fn exec(command: &[std::ffi::OsString], wait: Duration) -> Result<i32
     Ok(status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))
+}
+
+/// Read-only observation, never creates a missing lock or adopts a diagnostic
+/// pid. A free observation is not permission for a later command to skip acquire.
+pub(super) fn status() -> Result<i32> {
+    let directory = std::env::var_os("XTASK_GATE_LEASE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| "/tmp".into())
+        .canonicalize()?;
+    let path = directory.join("r-orch-gate.lease");
+    let owner = nix::unistd::geteuid().as_raw();
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            println!("lease: absent (observation only)")
+        }
+        Err(e) => return Err(e.into()),
+        Ok(before) => {
+            check_file(&path, &before, owner)?;
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(super::target::open_flags(false)?)
+                .open(&path)?;
+            ensure!(
+                same(&before, &file.metadata()?) && same(&before, &fs::symlink_metadata(&path)?),
+                "lease identity changed during status"
+            );
+            let state = match file.try_lock() {
+                Ok(()) => "free (observation only)",
+                Err(TryLockError::WouldBlock) => "busy",
+                Err(TryLockError::Error(e)) => return Err(e.into()),
+            };
+            println!("lease: {state}\npath: {}", path.display());
+            // Close, never unlock an open description shared with anyone else.
+        }
+    }
+    let holder = directory.join("r-orch-gate.holder");
+    match fs::symlink_metadata(&holder)
+        .map_err(anyhow::Error::from)
+        .and_then(|meta| {
+            check_file(&holder, &meta, owner)?;
+            super::files::read(&holder, 4096)
+        }) {
+        Ok(bytes) => println!(
+            "purpose/holder diagnostics (unvalidated): {}",
+            super::report::diagnostic(&bytes)
+        ),
+        Err(_) => println!("purpose/holder diagnostics (unvalidated): unavailable"),
+    }
+    Ok(0)
 }
 
 pub(super) struct Server {

@@ -61,6 +61,49 @@ publication cancellation checks once the native boundary is decided. No whole-ga
 Linux, timing, equivalence, PR or completion claim is made by this amendment.
 
 
+## F4/F5 implementation status (2026-11-15)
+
+Independent components now implement the sequential judged fold, a combined
+ordered output pipe with a fixed capture budget, executable/name/count inventory,
+nonzero-execution and witness checks, sentinel/shim checks from that same run,
+metadata-only breadth-first real-home comparison, status/time tables, fixed
+marker/kept diagnostics, redacted bounded evidence and read-only verification.
+Private miniature workspaces exercise actual cargo build and test, including a
+failed test, HOME write, shim call and zero-test suite. These controls are not a
+workspace acceptance run, native target recovery, R4 comparison or R11 timing.
+
+The production `full`/`pr` dispatcher now plans and reports a real refusal through
+F2's unchanged native D45 guard. It does not execute a tier. Native admission,
+reset, warm publication and cold deletion remain unsupported on both platforms;
+`fast` remains PR2 work. The legacy wrapper's startup deletion and all target
+cleanup traps are removed. While native reset is unavailable, bootstrap uses a
+fresh private directory under `target/gate-xtask` on every invocation, retains it,
+and rechecks its content identity before admission. This conservatively avoids a
+stale judge but does not implement D27's reusable stamp or bounded retention.
+This is an incomplete development branch, not an independently working PR1 gate.
+The historical gate remains the reference at the base commit.
+
+The suite explicitly builds workspace binaries before constructing the test map;
+no path-executed `orch` is trusted from an older build. Rustup's Cargo bin directory
+is included behind the shims so rustup cannot prepend it ahead of them; the witness
+checks the resulting first entry. CLI coverage still excludes children with a
+cleared/custom PATH; sentinel coverage excludes `.cargo` and `.rustup`. Source
+capture refuses symlinks/submodules and rechecks set/inode/size/mtime around
+hashing, but is not an atomic snapshot against concurrent replacement or a
+same-size rewrite with restored timestamps. Judge capture likewise refuses links
+and unsupported control characters in source names. The inherited locked marker
+occupies stdin: R4/R11 must give ordinary and folded comparisons the same stdin or
+diagnose that difference. No content identity or diagnostic proves cessation.
+
+Remaining acceptance includes native D45 and RC18 on macOS/Linux, actual C
+positive/negative/mutation CLI controls, run-wide lifecycle and reporting,
+retention/contention sampling, R4 same-commit comparison with every difference
+named, R11 executed names/counts/doc-tests and changed-body ledger, idle timing
+R12, nextest R8 qualification, final-head Linux and whole-gate reviews. All
+verification rows below remain pending. Execution authorization is distinct from
+passing evidence; owner-set-aside launch findings stay on record.
+
+
 ## Source
 
 Goal goal_7ZJmm9k, “Faster iteration: tiered checks instead of the full cold gate on every change”. The following numbered source passages are verbatim. The complete operational request is retained in the lead's private goal record; machine-specific scheduling details are omitted here.

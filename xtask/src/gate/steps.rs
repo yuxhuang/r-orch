@@ -144,7 +144,7 @@ impl<'a, 'm> Runner<'a, 'm> {
         Ok(())
     }
 
-    fn drive(&mut self, mut capture: Option<&mut Capture>) -> Result<ExitStatus> {
+    fn drive(&mut self, mut capture: Option<&mut dyn Drain>) -> Result<ExitStatus> {
         let mut failure: Option<anyhow::Error> = None;
         let mut grace = None;
         let mut exit = None;
@@ -244,6 +244,22 @@ impl<'a, 'm> Runner<'a, 'm> {
     }
 
     pub(super) fn capture(&mut self, command: &mut Command, limit: usize) -> Result<Vec<u8>> {
+        let result = self.capture_raw(command, limit).and_then(|out| {
+            ensure!(
+                out.exit.success(),
+                "identity command exited {}: {}",
+                out.exit,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Ok(out.stdout)
+        });
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
+
+    pub(super) fn capture_raw(&mut self, command: &mut Command, limit: usize) -> Result<Raw> {
         let result = (|| {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
             self.start(command)?;
@@ -253,16 +269,54 @@ impl<'a, 'm> Runner<'a, 'm> {
                 err: Pipe::new(child.stderr.take().context("missing stderr")?, 16 * 1024)?,
             };
             let exit = self.drive(Some(&mut capture))?;
-            ensure!(
-                exit.success(),
-                "identity command exited {exit}: {}",
-                String::from_utf8_lossy(&capture.err.bytes)
-            );
-            Ok(capture.out.bytes)
+            Ok(Raw {
+                stdout: capture.out.bytes,
+                stderr: capture.err.bytes,
+                exit,
+            })
         })();
         if result.is_err() {
             self.failed = true;
             // Includes pipe setup failure after spawn. Still own/reap the child.
+            if self.child.is_some() && self.kill_end.is_none() {
+                let _ = self.stop();
+            }
+        }
+        result
+    }
+
+    /// Combined stdout/stderr through one kernel pipe preserves ordering for
+    /// Cargo's Running lines and libtest results. Nonzero child exit is data,
+    /// not a capture error. Never fabricate an exit on interrupted collection.
+    pub(super) fn logged(&mut self, command: &mut Command, limit: usize) -> Result<Logged> {
+        let result = (|| {
+            let (reader, writer) = nix::unistd::pipe()?;
+            for fd in [&reader, &writer] {
+                fcntl(fd, FcntlArg::F_SETFD(nix::fcntl::FdFlag::FD_CLOEXEC))?;
+            }
+            command
+                .stdout(Stdio::from(writer.try_clone()?))
+                .stderr(Stdio::from(writer));
+            let mut stream = Pipe::new(std::fs::File::from(reader), limit)?;
+            self.start(command)?;
+            // Command retains configured pipe handles after spawn. Close these
+            // parent-side duplicates before waiting for the pipe's real EOF.
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+            let result = self.drive(Some(&mut stream));
+            match result {
+                Ok(exit) => Ok(Logged {
+                    bytes: stream.bytes,
+                    exit,
+                }),
+                Err(error) => Err(LogFailure {
+                    error,
+                    bytes: stream.bytes,
+                }
+                .into()),
+            }
+        })();
+        if result.is_err() {
+            self.failed = true;
             if self.child.is_some() && self.kill_end.is_none() {
                 let _ = self.stop();
             }
@@ -314,6 +368,29 @@ impl<'a, 'm> Runner<'a, 'm> {
     }
 }
 
+#[derive(Debug)]
+pub(super) struct LogFailure {
+    pub(super) error: anyhow::Error,
+    pub(super) bytes: Vec<u8>,
+}
+impl std::fmt::Display for LogFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+impl std::error::Error for LogFailure {}
+
+pub(super) struct Raw {
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
+    pub(super) exit: ExitStatus,
+}
+
+pub(super) struct Logged {
+    pub(super) bytes: Vec<u8>,
+    pub(super) exit: ExitStatus,
+}
+
 struct Pipe<R> {
     reader: R,
     bytes: Vec<u8>,
@@ -357,11 +434,25 @@ impl<R: Read + AsFd> Pipe<R> {
         Ok(())
     }
 }
+trait Drain {
+    fn drain(&mut self) -> Result<()>;
+    fn eof(&self) -> bool;
+}
+
+impl<R: Read + AsFd> Drain for Pipe<R> {
+    fn drain(&mut self) -> Result<()> {
+        Pipe::drain(self)
+    }
+    fn eof(&self) -> bool {
+        self.eof
+    }
+}
+
 struct Capture {
     out: Pipe<std::process::ChildStdout>,
     err: Pipe<std::process::ChildStderr>,
 }
-impl Capture {
+impl Drain for Capture {
     fn drain(&mut self) -> Result<()> {
         // Always service both; a broken/full stdout cannot suppress stderr or
         // delay the lifecycle's signal/reap loop.
