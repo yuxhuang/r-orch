@@ -12,7 +12,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 exec /usr/bin/python3 - "$@" <<'PYTHON'
-import fcntl, os, pathlib, re, signal, stat, subprocess, sys, time
+import fcntl, json, os, pathlib, re, signal, socket, stat, subprocess, sys, time
 repo = pathlib.Path.cwd()
 target = repo / 'target'
 boot = target / 'gate-xtask'
@@ -21,6 +21,9 @@ uid = os.geteuid()
 child = None
 interrupted = None
 locks = []
+inherited = None
+class BootstrapBusy(RuntimeError):
+    def __init__(self, message, code): super().__init__(message); self.code=code
 def receive(number, frame):
     global interrupted
     if interrupted is None: interrupted = number
@@ -68,26 +71,66 @@ def identity():
         records.append(blob+b' '+encode(p)+b'\n')
     if not records: raise RuntimeError('empty judge source set')
     return git('hash-object','--stdin',data=b''.join(records)).strip()
-def lock(path):
+def lock(path, deadline, code=75):
     if os.path.lexists(path):
         m=check(path,'file')
-        if m.st_mode & 0o77: raise RuntimeError('lock mode')
+        if m.st_mode & 0o7077: raise RuntimeError('lock mode')
     fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK,0o600)
     locks.append((fd,path))
     held=os.fstat(fd); now=check(path,'file')
     if (held.st_dev,held.st_ino)!=(now.st_dev,now.st_ino): raise RuntimeError('lock replaced')
-    end=time.monotonic()+1800
     while True:
         if interrupted: raise RuntimeError('INTERRUPTED waiting for bootstrap lock')
         try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); break
         except BlockingIOError:
-            if time.monotonic()>=end: raise RuntimeError('bootstrap lease busy')
+            if time.monotonic()>=deadline: raise BootstrapBusy('bootstrap cooperative lease busy' if code==75 else 'bootstrap target in use',code)
             time.sleep(.01)
     return fd
+def holder_record(cap):
+    path=cap['lease']
+    before=check(path,'file')
+    if before.st_mode & 0o7077: raise RuntimeError('inherited lease mode')
+    fd=os.open(path,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        held=os.fstat(fd);now=check(path,'file')
+        identity=(held.st_dev,held.st_ino)
+        if identity!=(before.st_dev,before.st_ino) or identity!=(now.st_dev,now.st_ino): raise RuntimeError('inherited lease identity changed')
+        if cap.get('identity') is not None and identity!=cap['identity']: raise RuntimeError('inherited lease path replaced')
+        try: fcntl.flock(fd,fcntl.LOCK_SH|fcntl.LOCK_NB)
+        except BlockingIOError: pass
+        else: raise RuntimeError('inherited holder is not kernel-exclusive')
+        data=os.read(fd,4097)
+        if len(data)>4096: raise RuntimeError('inherited holder record budget')
+        record=json.loads(data)
+        if not isinstance(record,dict): raise RuntimeError('inherited holder record is not an object')
+        if record.get('socket')!=cap['socket'] or record.get('token')!=cap['token'].hex(): raise RuntimeError('inherited capability mismatch')
+        return identity
+    finally: os.close(fd) # close only, never unlock another description
+
+def validate_inherited(cap):
+    before=holder_record(cap)
+    with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as stream:
+        stream.settimeout(1)
+        stream.connect(cap['socket']);stream.sendall(cap['token'])
+        if stream.recv(1)!=b'\x01': raise RuntimeError('inherited holder challenge refused')
+    if holder_record(cap)!=before: raise RuntimeError('inherited holder changed during challenge')
+    return before
+
+def inherited_capability(directory):
+    name=os.environ.get('XTASK_GATE_LEASE_SOCKET');token=os.environ.get('XTASK_GATE_LEASE_TOKEN')
+    if name is None or token is None or len(token)!=64 or any(c not in '0123456789abcdefABCDEF' for c in token): return None
+    try:
+        name.encode('utf-8')
+        cap=dict(lease=directory/'r-orch-gate.lease',socket=name,token=bytes.fromhex(token))
+        cap['identity']=validate_inherited(cap)
+        return cap
+    except (OSError,ValueError,RuntimeError,TypeError): return None
+
 def validate_locks():
+    if inherited is not None: validate_inherited(inherited)
     for fd,path in locks:
         held=os.fstat(fd);now=check(path,'file')
-        if now.st_mode & 0o77 or (held.st_dev,held.st_ino)!=(now.st_dev,now.st_ino): raise RuntimeError('bootstrap lease/marker lost: '+str(path))
+        if now.st_mode & 0o7077 or (held.st_dev,held.st_ino)!=(now.st_dev,now.st_ino): raise RuntimeError('bootstrap lease/marker lost: '+str(path))
 def remove(path, budget):
     validate_locks()
     m=path.lstat();budget[0]+=1
@@ -100,10 +143,23 @@ def remove(path, budget):
     else: raise RuntimeError('bootstrap special entry')
 try:
     lease_dir=pathlib.Path(os.environ.get('XTASK_GATE_LEASE_DIR','/tmp')).resolve(strict=True)
-    lock(lease_dir/'r-orch-gate.turnstile')
-    lock(lease_dir/'r-orch-gate.lease')
+    wait=30
+    args=sys.argv[1:]
+    for index,arg in enumerate(args):
+        if arg=='--': break
+        raw=args[index+1] if arg=='--lease-wait' and index+1<len(args) else arg.split('=',1)[1] if arg.startswith('--lease-wait=') else None
+        if raw is not None:
+            if not raw.isascii() or not raw.isdigit() or int(raw)>2**64-1: raise RuntimeError('invalid --lease-wait')
+            wait=int(raw)
+    if wait>(2**64-1)//60: raise RuntimeError('lease wait overflow')
+    deadline=time.monotonic()+wait*60 # one admission deadline, CLI minutes
+    inherited=inherited_capability(lease_dir)
+    if inherited is None:
+        lock(lease_dir/'r-orch-gate.turnstile',deadline)
+        lock(lease_dir/'r-orch-gate.lease',deadline)
+    if interrupted: sys.exit(128+interrupted)
     directory(target)
-    marker=lock(target/'.gate-xtask.lock')
+    marker=lock(target/'.gate-xtask.lock',time.monotonic(),1)
     validate_locks()
     if os.path.lexists(boot): check(boot,'dir')
     if os.path.lexists(stamp):
@@ -150,10 +206,18 @@ try:
     if interrupted:
         stamp.unlink();sys.exit(128+interrupted)
     os.environ['XTASK_GATE_JUDGE_ID']=before.decode('ascii')
+    print('bootstrap-lease: '+('inherited' if inherited is not None else 'owned'),flush=True)
     for fd,path in reversed(locks): os.close(fd)
     locks=[]
     os.execv(str(boot/'debug/xtask'),[str(boot/'debug/xtask'),'gate',*sys.argv[1:]])
+except BootstrapBusy as e:
+    detail='unavailable'
+    if e.code==75:
+        try: detail=ascii(read(lease_dir/'r-orch-gate.holder',4096).decode('utf-8',errors='replace'))
+        except Exception: pass
+    print('REFUSED: '+str(e)+'; purpose/holder diagnostics (unvalidated, never signal authority): '+detail,file=sys.stderr)
+    sys.exit(e.code)
 except Exception as e:
     print('REFUSED: bootstrap: '+str(e),file=sys.stderr)
-    sys.exit(1)
+    sys.exit(128+interrupted if interrupted else 1)
 PYTHON

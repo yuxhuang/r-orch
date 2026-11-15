@@ -548,10 +548,15 @@ impl Server {
             while !stopping.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let _ = stream.set_read_timeout(Some(CHECK_TIMEOUT));
-                        let _ = stream.set_write_timeout(Some(CHECK_TIMEOUT));
+                        // BSD/macOS accepts can inherit the listener's
+                        // nonblocking mode. Wait for the complete challenge
+                        // within the existing timeout, rather than rejecting
+                        // a live client that has connected but not sent yet.
                         let mut request = [0; 32];
-                        let valid = stream.read_exact(&mut request).is_ok()
+                        let valid = stream.set_nonblocking(false).is_ok()
+                            && stream.set_read_timeout(Some(CHECK_TIMEOUT)).is_ok()
+                            && stream.set_write_timeout(Some(CHECK_TIMEOUT)).is_ok()
+                            && stream.read_exact(&mut request).is_ok()
                             && request == token
                             && held.validate().is_ok();
                         let _ = stream.write_all(&[u8::from(valid)]);
@@ -669,6 +674,33 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(Owned::acquire(&s.0, s.owner(), Mode::Exclusive, Duration::ZERO).is_err());
         assert_eq!(fs::read(&path).unwrap(), b"canary");
+    }
+
+    #[test]
+    fn live_holder_waits_for_delayed_and_fragmented_challenge_bytes() {
+        // A nonblocking listener must not turn its accepted challenge stream
+        // into an immediate false rejection before the client can send.
+        let s = Scratch::new();
+        let lease = Owned::acquire(&s.0, s.owner(), Mode::Exclusive, Duration::ZERO).unwrap();
+        let sockets = Scratch::temporary();
+        let server = lease.serve(&sockets.0).unwrap();
+        for split in [0, 16] {
+            let mut stream = UnixStream::connect(server.directory.join("s")).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+            stream.write_all(&server.token[..split]).unwrap();
+            let mut response = [0];
+            let pending = stream.read(&mut response);
+            assert!(
+                matches!(&pending, Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)),
+                "live holder rejected incomplete in-budget challenge: {pending:?}, {response:?}"
+            );
+            stream.write_all(&server.token[split..]).unwrap();
+            stream.set_read_timeout(Some(CHECK_TIMEOUT)).unwrap();
+            stream.read_exact(&mut response).unwrap();
+            assert_eq!(response, [1], "valid delayed challenge refused");
+        }
     }
 
     #[test]

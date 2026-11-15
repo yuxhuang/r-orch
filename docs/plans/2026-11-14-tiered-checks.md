@@ -95,7 +95,16 @@ reap and a matching second identity. The wrapper uses Python's existing standard
 library and the configured turnstile/lease plus a persistent bootstrap kernel
 lock. It does not remove a lock or delete a target from a signal/exit trap.
 A killed bootstrap leaves no completed stamp; its Cargo child inherits the
-bootstrap lock through stdin. Bootstrap and Rust source-name support differ:
+bootstrap lock through stdin. The wrapper also accepts a live inherited machine
+lease using the same bounded record/kernel-exclusive/challenge checks as Rust;
+invalid, missing or stale capabilities fall back to normal acquisition. One
+CLI-minute admission deadline covers turnstile plus lease, contention exits 75,
+and bootstrap target-lock contention is an immediate refusal. No diagnostic PID
+or record text alone grants authority. Accepted challenge streams explicitly use
+blocking mode with the existing one-second read/write timeout: on macOS they can
+inherit the listener's nonblocking mode and otherwise reject a valid client before
+its bytes arrive. Delayed and fragmented challenges exercise the real holder;
+invalid capabilities still grant nothing. Bootstrap and Rust source-name support differ:
 the bootstrap encodes Git-quoted path bytes losslessly, while Rust judge capture
 explicitly refuses unsupported control/non-UTF8 names. Such a run cannot qualify.
 
