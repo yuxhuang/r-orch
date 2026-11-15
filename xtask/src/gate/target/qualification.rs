@@ -31,20 +31,17 @@ fn production_holder_fixture() {
     }
     let use_ = started.unwrap();
     fs::write(use_.target().join("old-artifact"), b"must stay while live").unwrap();
-    if mode == "unlock" || mode == "record-lock" {
-        // Deliberate production-holder mutations: same NativeTarget marker,
-        // different release semantics. Never compiled into the CLI.
+    if mode == "record-lock" {
+        // Deliberate production-holder mutation, never compiled into the CLI.
         use_.marker.file.unlock().unwrap();
-        if mode == "record-lock" {
-            let lock = nix::libc::flock {
-                l_type: nix::libc::F_WRLCK as _,
-                l_whence: nix::libc::SEEK_SET as _,
-                l_start: 0,
-                l_len: 0,
-                l_pid: 0,
-            };
-            nix::fcntl::fcntl(&use_.marker.file, nix::fcntl::FcntlArg::F_SETLK(&lock)).unwrap();
-        }
+        let lock = nix::libc::flock {
+            l_type: nix::libc::F_WRLCK as _,
+            l_whence: nix::libc::SEEK_SET as _,
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        };
+        nix::fcntl::fcntl(&use_.marker.file, nix::fcntl::FcntlArg::F_SETLK(&lock)).unwrap();
     }
     let argv: Vec<String> =
         serde_json::from_slice(&fs::read(root.join("argv.json")).unwrap()).unwrap();
@@ -61,6 +58,7 @@ fn production_holder_fixture() {
                 &root.join("ready"),
                 mode == "no-inherit",
                 mode == "unlock" || mode == "prior-tool-close",
+                mode == "unlock",
             )
         })
         .unwrap();

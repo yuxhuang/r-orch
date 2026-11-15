@@ -1246,6 +1246,16 @@ impl Marker<'_> {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn qualification_unlock(&self) -> Result<()> {
+        self.check_identity()?;
+        at(
+            self.file.unlock(),
+            "intentional shared-description unlock discriminator",
+            &self.files.path(Leaf::Marker),
+        )
+    }
+
     pub(super) fn command_stdin(&self) -> Result<std::process::Stdio> {
         self.check_identity()?;
         Ok(at(

@@ -95,6 +95,12 @@ view, verifies native Cargo/rustc version output before the matrix, and requires
 a new exact-head package run. This corrects the fixture, not the red recovery
 positive; no capability was enabled by the invalid observations.
 
+The explicit-unlock discriminator is applied only after the actual child has
+inherited the locked description, acknowledged TERM resistance and remained
+live beyond the grace. The earlier before-spawn unlock characterized an already
+unlocked handover; it did not exercise release across existing sharers. Its raw
+results remain partial and are superseded by this corrected control.
+
 The continuation adds test-only access to the real `NativeTarget::begin`,
 `NativeUse::run` and `Runner` start/drive path. Production recovery policy stays
 unchanged. On the measured Mac/APFS devices, the 19 fixed real command forms

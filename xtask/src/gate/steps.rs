@@ -206,6 +206,7 @@ impl<'a, 'm> Runner<'a, 'm> {
         ready: &std::path::Path,
         drop_stdin: bool,
         resistant: bool,
+        shared_unlock: bool,
     ) -> Result<ExitStatus> {
         self.qualification_drop_stdin = drop_stdin;
         self.start(command)?;
@@ -222,6 +223,15 @@ impl<'a, 'm> Runner<'a, 'm> {
                 self.child.as_mut().unwrap().try_wait()?.is_none(),
                 "child did not resist TERM"
             );
+        }
+        if shared_unlock {
+            ensure!(
+                resistant,
+                "unlock discriminator needs a resistant direct child"
+            );
+            // The command has inherited the locked description and resisted TERM
+            // beyond the grace. Release ALL sharers only now, not before spawn.
+            self.marker.unwrap().qualification_unlock()?;
         }
         std::fs::write(ready, self.child.as_ref().unwrap().id().to_string())?;
         self.drive(None)
