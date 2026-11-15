@@ -1,18 +1,16 @@
 # 0014. Gate targets change only after their writers have ceased; a selected `orch-cli` couples `orch-infra`
 
-- Status: accepted (revision 2, with the lifecycle clarification). Amended on 2026-11-15 by revision 3,
-  which carries the owner's decision on the cessation rule. That decision (decision 41) is binding from
-  its date. The implementation contract that revision 3 derives from it (decisions 42–47) is **proposed**:
-  it awaits the check of its exact commit by the same security and resilience reviewers and the lead's
-  ruling. Until then decisions 42–47 are a proposal and no builder implements them.
-- Date: 2026-11-14 (revision 3: 2026-11-15)
-- Revision: 3 (the owner's amendment of the cessation rule; see "Changes in revision 3" below). The line
-  on revision 2 follows as it was accepted.
+- Status: accepted. Since 2026-11-15 a decision of the owner overrides the clauses of decisions 32–38 below
+  that demand independently established cessation of every writer. That decision is recorded as decision
+  41 of [ADR 0015](0015-cooperative-gate-target-recovery.md) and is binding. ADR 0015 itself is proposed:
+  its decisions 42–47 would supersede the clauses of this record that it names, and they do not do so
+  until it is accepted. When it is, this line changes to name the supersession. Decisions 37, 39 and 40
+  are not affected. The text from the next line to the end of this record is the text accepted on
+  2026-11-14. It is not rewritten.
+- Date: 2026-11-14
 - Revision: 2 (corrected after the security and resilience reviews of revision 1), accepted on 2026-11-14
   only together with the lead's lifecycle clarification of decision 33 (see "Acceptance" below). The text
   of revision 2 without that clarification was not accepted.
-- Title: the title is kept as accepted. Since revision 3, "ceased" in it is read as "the use is finished",
-  as decisions 41 and 42 define that.
 - Supersedes: named clauses of [ADR 0013](0013-tiered-verification-gates.md) decisions 30 and 31, and only
   those. It also qualifies decisions 14, 15, 17 and 21 without replacing a word of them. The clauses are
   listed under "What this changes in ADR 0013". Everything else in ADR 0013 stands.
@@ -49,27 +47,6 @@ The list of changes above describes revision 2 as it was reviewed, when it was s
 32–40 keep their numbers and their rules. No mechanism is added, no provenance is designed and no number
 is chosen. The acceptance is of the design. It clears no runtime hold: the observation of decision 33 and
 the durable provenance are still absent ("What this record does not do").
-
-Changes in revision 3 (2026-11-15). The owner was asked what should happen with the rule of decisions
-32–38, because the folded gate could not be built under it on a macOS host where every agent runs under
-one account. The owner answered "relax it". Revision 3 carries that answer and the smallest contract that
-follows from it.
-
-- Decisions 32–40 keep their numbers and their words. Nothing in them is rewritten. They are the text
-  that was accepted on 2026-11-14, kept as history.
-- Decisions 41–47 are added under "Target recovery since revision 3". Where the table "What revision 3
-  changes" names a clause of decisions 32–36 or 38, of the lead's clarification or of a later section,
-  decisions 41–47 are operative and that clause is not. A clause the table does not name stands.
-- Decision 41 is the owner's decision. It is binding. Decisions 42–47 are the implementation contract
-  derived from it. They are proposed, pending review.
-- Decisions 37, 39 and 40 are unchanged.
-- No independent provenance registry or provider is part of the contract. A preliminary model of one was
-  written and reviewed in part. It is kept outside this record, is not integrated, and its open findings
-  are not repaired or closed by this revision.
-- No number is chosen.
-
-How to read this record since revision 3: for selection, decisions 39 and 40; for the lease holder,
-decision 37; for the operations on a target, decisions 41–47 and the table "What revision 3 changes".
 
 ## Context
 
@@ -108,24 +85,6 @@ retained review report. Nothing was run for this record.
   named in one invocation. No document of cargo states that order as a guarantee, and no run has shown it.
   A warm target can hold an `orch` binary from an earlier tree.
 
-Facts that revision 3 rests on. Nothing was run for it.
-
-- The gate script at the base commit sets its build directory to `target/gate`, deletes and recreates it
-  at the start, and deletes it again from a handler for exit, INT and TERM. It runs its commands one
-  after another and waits for each. It observes no other process. (Read in the script.) The owner's rule
-  is therefore the guarantee the project has today, with the lease added.
-- A kernel advisory lock of the kind the lease uses belongs to an open file description. A process that
-  inherited the description keeps the lock after the process that took it has died. That is the
-  documented behaviour of this kind of lock on both platforms. It has not been shown in this project for
-  the file lock of the pinned toolchain, nor that the real `cargo` keeps an inherited descriptor until it
-  exits. Both are assumptions until the plan's case RC18 has run.
-- `cargo clean` deletes the whole `target/` directory, and with it every file the gate keeps there.
-  (Documented behaviour of cargo; not run.)
-- The reviews of the preliminary registry model found two defects that follow from keeping a second,
-  independent memory of a target: after `cargo clean` the registry and the disk contradict each other and
-  every later run is refused, with no way out; and the model bound the identity of a target directory
-  before the directory could exist. (Retained review findings; the model is not part of this record.)
-
 ## Decision
 
 The numbers continue those of ADR 0013, so that a decision number names one decision across both records.
@@ -133,9 +92,6 @@ The numbers continue those of ADR 0013, so that a decision number names one deci
 gate run's building and testing in a target. "A writer" is any process of a use that can write into its target.
 
 ### Target recovery
-
-Since revision 3: decisions 32–36 and 38 are kept below as accepted on 2026-11-14. The clauses of them
-that the table "What revision 3 changes" names are superseded by decisions 41–47. Decision 37 stands.
 
 32. **A target is changed only after the writers of its previous use have ceased.** Four operations are
     covered: *publication* (writing the completed warm record and removing the marker), *removal* (deleting a
@@ -302,241 +258,6 @@ that the table "What revision 3 changes" names are superseded by decisions 41–
     the marker changes, on macOS and on native Linux; and the real `concurrent_index` test run by itself
     against the integrated selection. Both are due and have not run.
 
-### Target recovery since revision 3
-
-Decision 41 is binding. Decisions 42–47 are proposed (see the status line). Terms used below. *The holder*
-is the gate process of decision 37. *A directly started process* is a process that the holder itself
-created for a step of the run, and whose exit status the holder collects through its own handle: `cargo`,
-`git` and the other commands the gate runs. A process that such a command starts is not one. *A
-descendant* is any process further down, whatever became of its parent.
-
-41. **The owner's decision: a use is finished when the processes the gate itself started have exited and
-    the gate holds the cooperative lease.** The question put to the owner was what should happen with the
-    rule that a target may be reused, reset or removed only after proof that every process of the previous
-    use has stopped, including a process that detached itself from the gate. The owner was told that
-    today's gate script deletes and recreates `target/gate` and waits only for the commands it started,
-    with no such proof. The owner's words, verbatim:
-
-    > relax it
-
-    Recorded with that answer: a use of a target counts as finished when the processes the gate itself
-    started have exited and the gate holds the cooperative machine lease. Proof that escaped, detached or
-    re-parented descendants have stopped is not required, on macOS or on any other platform. The decision
-    overrides the clauses of decisions 32–38 that demand independently established cessation. It overrules
-    the security finding on ownership and signal authority (review id FS1) as a block on the folded gate.
-
-    It is a decision about a risk, not a repair. FS1 is recorded as a risk the owner accepted. It is never
-    reported as resolved, fixed or passing. The accepted cost: a process that the gate did not start
-    itself, and that a test or a build script left behind, can still write into a warm target after its
-    record was published, or into a cold target while it is removed or after it was recreated. A later run
-    may then trust what that process wrote. Nothing in this contract detects it.
-
-    The decision removes the cessation requirement and nothing else. It waives no test and no review of
-    the folded gate. It changes no other decision of the owner: one green Linux run at the final head of a
-    pull request, the nextest qualification, the cooperative lease, and that the owner alone changes the
-    repository rules and merges.
-
-42. **Who observes that a use is finished.** There are two observers and no third.
-
-    *The holder, for its own use.* The use is finished when all of these hold: every directly started
-    process of the use has exited and the holder has collected its exit status; the holder holds the lease
-    in the mode its tier takes (decision 21) and has not recorded it as lost; and the holder holds the
-    lock of its use marker (decision 43), at a path that still names the file it locked. The exit status
-    decides the verdict of the step. It does not decide whether the use is finished: a command that failed
-    has exited, and a use that is finished has not thereby passed.
-
-    *A later run, for an earlier use that did not finish.* Such a use has left its marker (decision 43).
-    The later run holds the lease in its tier's mode and then acquires the lock of that marker. The
-    earlier holder gave an open description of that lock to every process it started directly. The kernel
-    grants the lock to the later run only when no process holds that description any more. That grant,
-    under the lease, is the observation that the directly started processes of the earlier use have
-    exited. Until it is granted the earlier use is unfinished, and the later run changes nothing.
-
-    None of these is an observation of either kind, alone or together: the lease being free, or being
-    held (the kernel frees it at once when a holder is killed while processes it started still run); a
-    recorded process id that is no longer present; the end of a bounded wait, or any elapsed time; a
-    marker being present or absent, or what it contains; end of file on a channel; an operator's
-    acknowledgement.
-
-    Three limits of the second observation are stated here and are not hidden:
-
-    - It shows that no process holds the description. A directly started process that closed the
-      description and kept running would not be seen. The gate starts a short, fixed list of commands. For
-      each of them, on each platform, the implementation shows that the command holds the description
-      until it exits (the plan's case RC18). Where that is not shown, this recovery is not supported on
-      that platform: an unfinished use stays refused there, and the documented way out is the operator's
-      own removal of the worktree's `target/` once the leftover processes are gone, which is the ordinary
-      case of an absent target (decision 46). The gate does not treat that removal as an observation.
-    - It says nothing about a process the gate did not start itself that dropped the description. That is
-      the risk of decision 41.
-    - A descendant that kept the description keeps the lock. The gate cannot tell it from a directly
-      started process, so it refuses. That is conservative. It is not relied on as proof about
-      descendants, and it ends when that process exits.
-
-43. **The local state is a use marker and a completed record. There is no registry.** For each target the
-    gate keeps its state in one gate-owned directory inside the worktree's `target/` and outside both
-    targets. The file names are the implementation's.
-
-    - *The use marker* exists exactly while a use is unfinished. The holder creates it, or takes over the
-      marker that an unfinished use left, and locks it before it examines or changes anything in the
-      target. The lock is a kernel advisory lock of the kind decision 21 uses. It is the single-writer
-      lock of the target. An open description of it is held by the holder and by every process the holder
-      starts directly for the use, and is used for nothing else. The holder removes the marker as its last
-      act on the target, when the use is finished. What the marker contains (the run's identity, its start
-      time, the process ids of the directly started processes) is a diagnostic. No decision reads it.
-    - *The completed record* belongs to the warm target only. It holds what decisions 15 and 30 of ADR
-      0013 say: the canonical worktree root, the toolchain identity, a content identity of every tracked
-      and untracked source file, and the end time. It is written to a temporary file and renamed. The cold
-      target has no record, because it is deleted at the start of every `full` run whatever its history.
-    - The marker and the record are the lifecycle trace of the lead's clarification (decision 33). A
-      finished use has a record and no marker. An unfinished use has a marker.
-    - The state is local, and it is deleted together with `target/`. Nothing outside the worktree
-      remembers a target. A `target/` that was removed, by `cargo clean` or by hand, is therefore the
-      ordinary case of an absent target, and no earlier state can contradict it.
-    - Metadata is data, not authority. Neither file names what to delete or what to signal. A record can
-      only withhold a reuse. A record or a state that is missing, unreadable, truncated, corrupt,
-      incomplete or inconsistent never authorizes a reuse. It does not refuse the run either: the target
-      is reset (decision 45). A reuse needs all of: no marker; a record that parses completely; the same
-      canonical worktree root; the same toolchain identity; and no file whose identity differs from the
-      record while its modification time is not later than the recorded end time. There is no fallback to
-      an older record or to a copy, and a leftover temporary file is never read as a record.
-
-44. **The order of a use.** The lease is taken first, as decision 21 says. Then:
-
-    1. *Admission.* The holder checks the structure of the state directory (decision 45) and acquires the
-       lock of the use marker, creating the marker if there is none. If the lock is not granted, the run
-       is refused (`REFUSED`, exit 1, never the exit status of lease contention), says that the target is
-       in use, and changes nothing. A wait for the lock is bounded, and its end without the lock is the
-       same refusal. If the marker was there before this run, an earlier use did not finish, and step 3
-       resets.
-    2. *Structure.* The holder checks the target as decision 45 says. On a failure the run is refused and
-       nothing is deleted.
-    3. *Decision.* Cold: an existing `target/gate` is deleted. Warm: reuse on the conditions of decision
-       43, otherwise reset, with the reason.
-    4. *Invalidation before the build.* Before the first building command the completed record of the
-       earlier use is removed. A marker that someone deletes by hand then leaves no record that could
-       revive a reuse. If the marker cannot be created or the record cannot be removed, nothing builds.
-    5. *The commands.* Each directly started process receives the description of the marker's lock. The
-       holder waits for each and collects its exit status.
-    6. *Finish* (decision 42). The end time is taken now.
-    7. *Publication.* Warm: the record is written by temporary file and rename, and then the marker is
-       removed. Cold: `target/gate` is deleted unless `--keep` was given, and then the marker is removed.
-    8. The lock and the lease are released.
-
-    A holder that dies anywhere between steps 1 and 7 leaves the marker, and the next run takes the
-    recovery of decision 42 and resets. That covers a death while the target directory was being created
-    (the marker exists and the target is absent or partly created), a death during a build, and a death
-    after the record was renamed and before the marker was removed. In the last case the marker decides:
-    the next run resets and does not report `reused`. The price is one rebuild after that crash.
-
-45. **The authority to delete comes from the structure of the path, never from data.** A reset or a
-    removal deletes exactly one path: the constant name of the target, joined to the canonical worktree
-    root that the gate computed itself. Before every deletion and before every build the gate checks that
-    `target/`, the state directory and the target are each either absent or a real directory: not a
-    symbolic link and not a special file, owned by the account the gate runs under, inside the worktree
-    and on the worktree's filesystem. The deletion follows no symbolic link and does not cross to another
-    filesystem. On any failure of these checks the run is refused, nothing is deleted, and a file outside
-    the target is untouched. No path, identity or process id that was read from a record, from a marker or
-    from the environment is deleted, followed or signalled.
-
-    The gate sends a signal only to a directly started process that it has not yet reaped, through its own
-    handle, or to the process group that the holder itself created for such a process while that process
-    is not yet reaped. It signals no process id taken from a file or from a listing of processes, no
-    process chosen by its parent, and no process chosen by its account.
-
-46. **The endings of a use.** "Reaped" means that the holder collected the exit status. In every row the
-    lease is held as decision 42 requires.
-
-    | The use ended by | What the holder observed | State left | Result, and the next run |
-    |---|---|---|---|
-    | A normal finish | Every directly started process reaped | Warm: record, no marker. Cold: target removed (or kept by `--keep`), no marker | The steps' verdicts. Next warm run on unchanged source: `reused`. Next `full`: deletes what is there |
-    | A failed compilation | The same; a command exited with a failure | The same | `FAILED` on that step. Next warm run on the same source: `reused` |
-    | A handled INT, TERM or HUP; the directly started processes exit within the bound | The holder signals them (decision 45) and reaps each | The same | `INTERRUPTED`; the lease is released. Next `pr` run: `reused` |
-    | A handled INT, TERM or HUP; a directly started process has not exited when the bound ends | Not finished | The marker stays. No record. `target/gate` is left | `INTERRUPTED`, naming the processes that did not exit; `target: kept (<reason>)`; `qualifying: no`. Next run: the row below |
-    | The death of the holder: SIGKILL, or any signal it does not handle | Nothing; the holder is gone | The marker stays, and its lock is held by whichever directly started processes are still running. No record. The kernel has freed the lease | No result from that run. Next run: the row below |
-    | The next run after an unfinished use | The lease, then the lock of the marker | While the lock is not granted: nothing changes. Once it is granted: the target is reset or removed, and the run goes on | Not granted: `REFUSED`, exit 1, the reason, the diagnostics of the marker, no signal; and again on every later run, however much time has passed. Granted: warm `reset: previous build did not finish`; cold deleted and built from nothing. Never `reused` |
-    | No use is known: an existing target with no marker and with a record that is missing or damaged, a target that a plain cargo command built, or a `target/gate` present at the start of `full` | The lease, then the lock of a new marker | Reset or removed | Warm `reset: <reason>`; cold deleted. Never `reused`, and not refused for want of a history |
-    | No target: `target/` or the target was removed, with or without the state | The lease, then the lock of a new marker | Created | Built from nothing |
-
-    A run whose own use is not finished when it ends publishes nothing and removes nothing. That is the
-    case when a directly started process had not exited at the end of the bound, when the lease was lost,
-    or when the marker's path no longer named the file the holder had locked. Such a run does not qualify
-    as evidence in any tier, and its result shows `target: kept (<reason>)` and `qualifying: no` with that
-    reason. This keeps the floor of decision 34 for the cases that are left. A normal finish with every
-    directly started process reaped is a finished use: there is no kept target in that case, also when a
-    descendant survived. That is the risk of decision 41, not a case the gate reports.
-
-47. **The bounds, and what is not chosen.** Decision 38 stands: no number is chosen here. The set of
-    bounds changes in one place. It is now: the grace period of a handled interrupt; the wait for the
-    directly started processes after a signal; and the wait for the lock of the use marker at admission,
-    which may be no wait at all. The wait for cessation at the end of a run is withdrawn as a bound of its
-    own: at a normal finish and after a failed compilation the holder's waits on its own commands are the
-    wait. The owner of the gate's implementation and of the release says whether the three are distinct,
-    and supplies every supported value with its justification. Independent reviewers assess the set, and
-    only then are the budgets of the test files derived from it. The mechanism by which the holder handles
-    INT, TERM and HUP is not chosen here either (the plan's prerequisite P2). The safety of a target does
-    not depend on it: a signal that the holder does not handle is the death of the holder, in decision
-    46.
-
-### What revision 3 changes
-
-Decisions 32–38 are not rewritten. This table says which of their clauses are no longer operative. A
-clause that is not named stands.
-
-| Where | Clause | Since revision 3 |
-|---|---|---|
-| Decision 32 | Publication, removal, reset and reuse each need "independently established cessation of every writer of the previous use"; "There is no exemption for a normal finish" | Superseded by decisions 41 and 42: each needs the use to be finished as decision 42 says. The four operations, both targets and every ending stay covered. "Creating a target that does not exist is none of the four operations" stands |
-| Decision 33 | The observation that covers "every process the use started, directly or indirectly" and must not rest on their cooperation | Superseded by decisions 41 and 42 |
-| Decision 33 | The list of what does not establish cessation | Stands, with one change: the holder's own reaping of the processes it started directly is now what finishes its use. End of file on a channel, a missing process id, the marker, the end of a wait, a handled signal and an operator's acknowledgement still establish nothing |
-| Decision 33 | The three cases of affirmative provenance; "unknown" is refused; the durable provenance (the plan's P5) | Superseded by decisions 43, 45 and 46: an unknown history never authorizes a reuse and leads to a reset. No registry is required |
-| Decision 33 | The lead's clarification of the lifecycle trace | Its first five sentences stand. "Neither a marker nor a completed record … independently proves cessation or authorizes recovery" stands: the authority is decisions 42 and 45. "Reliance on the trace remains subject to P5's independent review and P1's accepted observation", and the sentence that the established cases need P1 and P5, are superseded: the reliance is subject to the review of decisions 42–47 and of their implementation |
-| Decision 34 | Unknown history is treated as a previous use that has not ceased; the refusal for it | Superseded by decisions 43 and 46 |
-| Decision 34 | A bounded wait that ends without the observation is a refusal; no signal to a process the gate cannot attribute; recovery does not decay with time or with an acknowledgement | Stand, with the observation of decision 42 |
-| Decision 34 | A run with unresolved cessation does not qualify in any tier and shows the kept target; a later refusal names the earlier run from validated diagnostics or says `unavailable` | Stand for a use that is not finished (decision 46) |
-| Decision 35 | The record is published, and the end time taken, "at established cessation" | Superseded as to *when*: when the use is finished (decisions 42 and 44). That the marker and the identities precede the first build, that a marker survives every unfinished use, and that such a use is never reported as `reused` stand |
-| Decision 36 | An existing `target/gate` is refused at the start of `full` until durable provenance exists; the plan's vector TV13 is unmet until then | Superseded by decisions 44–46: it is deleted, under the lease and the marker's lock. TV13 becomes executable with the folded gate. It is still unrun |
-| Decision 36 | Deleting the cold target and resetting the warm one are removals; a cold target left by an unfinished use is not a defect of that run | Stand, under decision 42 |
-| Decision 37 | Whole | Stands. The description of the marker's lock is not the lease: the lease's descriptor is still owned by the holder alone and inherited by no process |
-| Decision 38 | The four bounds | Changed by decision 47. That no number is chosen, and that no product limit is taken from a test's deadline, stand |
-| "What this record does not do" | The folded gate is blocked until an observation of every descendant is accepted; the durable provenance is load-bearing; its three consequences | Superseded. The folded gate is no longer blocked by that. It is still not built, not reviewed and not run |
-| "Consequences" | A host without an accepted observation produces no reusable warm target; an existing target without provenance blocks the next run, with no recovery | Superseded |
-| Alternatives A23, A24 and A31 | Rejected because a descendant could still be writing | Overtaken by decision 41 to the extent of a process the gate did not start itself. The reasons stay on record as the description of the accepted risk |
-| Alternatives A25, A26, A27, A32 | Rejected | Stand |
-
-In ADR 0013 the effect is this. The clause of its decision 30 that the record is written "once its
-children have exited" was superseded by decision 35 and is not revived as written: decisions 42 and 44
-say when the record is written, and they add the lease, the marker's lock and the order of invalidation.
-The qualification of its decisions 14, 15, 17 and 21 by this record continues, now through decisions
-41–46. No word of ADR 0013 is replaced.
-
-What revision 3 does not do. It does not make the folded gate valid evidence. Nothing was built, run,
-probed, signalled or measured for it. It closes no finding of the preliminary provenance model. It chooses
-no signal mechanism and no number. The vectors that plant a stale artifact, write into `HOME`, start a
-shimmed CLI or run zero tests keep their expected results, and so do the comparison of the folded with
-the ordinary run, the timing targets, the equality of test names and counts, the evidence on each
-platform and the nextest qualification. A reviewer's finding outside the risk of decision 41 binds as
-before.
-
-Alternatives rejected in revision 3:
-
-- **A33. After the death of the holder, let the lease alone authorize the reset.** The kernel frees the
-  lease while the processes the holder started are still writing. The owner's rule asks for their exit as
-  well.
-- **A34. Record the process ids of the directly started processes and reset when they are gone.** A
-  process id is not an identity (A26).
-- **A35. Reset after a wait.** Time that passed observes no process.
-- **A36. Refuse for ever after the death of the holder, as the general rule.** Every killed run would
-  block its worktree until someone removed the state by hand. That stays only as the fallback on a
-  platform where the second observation of decision 42 cannot be shown.
-- **A37. Keep an independent registry of targets and generations.** Its purpose was to prove what the
-  owner no longer requires. It also turned `cargo clean` into a contradiction between the registry and
-  the disk that nothing could resolve, and it bound a target's identity before the directory could exist.
-- **A38. A separate writer lock that no process inherits, beside the marker.** Two locks would need an
-  order and a second recovery. The marker's lock already excludes a second gate.
-- **A39. A fresh target path after an unfinished use, instead of a reset.** It changes the fixed target
-  paths of the plan, leaves directories of several gigabytes behind, and still needs the same
-  observation before one of them may be deleted. Not adopted.
-
 ## What this changes in ADR 0013
 
 The effects in this table are in force since this record was accepted, and only for the clauses named. In
@@ -558,9 +279,6 @@ every other clause ADR 0013 stands as accepted.
 
 Every other decision, consequence and alternative of ADR 0013 is unchanged.
 
-Since revision 3 the decisions of this record that supersede or qualify those clauses are read as amended
-by decisions 41–47 ("What revision 3 changes"). The table above is unchanged.
-
 Before this record was accepted, the same points already bound as the lead's rulings recorded in the plan
 (section 12: holds K-1 to K-5, the broader coupling, and the rulings carried by the sixth amendment). They
 are now the decision record as well. Finishing the reviews of this record did not accept it; the lead
@@ -568,11 +286,6 @@ recorded the acceptance, with the clarification quoted in decision 33 (the plan,
 amendment).
 
 ## What this record does not do
-
-Since revision 3 this section describes the state under revision 2. Its statements that the folded gate
-is blocked until an observation of every descendant exists, and that a durable provenance is
-load-bearing, are superseded ("What revision 3 changes"). What revision 3 itself does not do is said
-there.
 
 It removes permissions that contradicted the rulings. It does not supply the observation that decision 33
 requires. No reviewed way exists today to establish, on a macOS host where all agents share one account,
@@ -622,25 +335,6 @@ next run like a target whose last use had closed, and a history rewritten by han
 three cases of decision 33. No document offers that as a recovery, and the gate cannot detect it.
 
 ## Consequences
-
-Since revision 3:
-
-- The warm record means "this tree was built here, the commands the gate started for it have exited, and
-  the gate held the lease". It no longer says that every writer is known to have stopped.
-- A process that a test or a build script left behind can write into a target that a later run trusts.
-  The owner accepted that (decision 41). The documents that describe the tiers have to say it.
-- A killed gate blocks its worktree only while a process it started directly is still running. After
-  that the next run resets by itself.
-- `cargo clean`, a target removed by hand and a damaged record cost one rebuild. None of them blocks a
-  run.
-- The gate hands a descriptor to the commands it starts. A leaked process that keeps it makes the next
-  run refuse until that process exits. The refusal has to say where the lock is, so that the operator can
-  find the process.
-- The frozen test files expect, in places, the refusals of revision 2. The plan lists the edits; none is
-  made or authorized by this record.
-
-Under revision 2 (kept as written; the first three items are superseded, and the fourth holds for a use
-that is not finished):
 
 - The warm record now means "this tree was built here and its writers are known to have stopped". A reuse
   rests on that, not on the gate having outlived its direct children.
