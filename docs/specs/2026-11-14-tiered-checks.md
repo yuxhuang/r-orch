@@ -4,7 +4,7 @@ status: approved
 owner: orchestrator
 date: 2026-11-14
 plan: [../plans/2026-11-14-tiered-checks.md](../plans/2026-11-14-tiered-checks.md)
-decision record: [ADR 0013](../decisions/0013-tiered-verification-gates.md)
+decision record: [ADR 0013](../decisions/0013-tiered-verification-gates.md), amended in part by [ADR 0014](../decisions/0014-gate-target-recovery-and-selection-coupling.md) (proposed)
 
 ## Source
 
@@ -84,6 +84,8 @@ Deleting or weakening tests; raising timeouts to hide slowness; product changes 
 
 The base is `main` at caefbadaf1f00c6fc9092acd1e01fcf26f894321. Every incident protection that `xtask/gate.sh` documents is kept, and a protection the script only describes in a comment is told apart from one it implements (the plan's incident ledger does this line by line). Existing rules apply until an explicit owner decision changes them. This document claims no measurement.
 
+Decision reconciliation: [ADR 0014](../decisions/0014-gate-target-recovery-and-selection-coupling.md) (proposed) supersedes named clauses of ADR 0013 decisions 30 and 31. It changes no requirement, priority, source passage or acceptance check in this document. For R3 it means that a gate-owned target is published, removed, reset or reused only after the writers of its previous use are independently known to have ceased, also after a normal finish; the stale-artifact protection is otherwise not kept. For R5 it means that a selection containing `orch-cli` also selects `orch-infra`, and that a test which starts a binary by path runs only after that binary was built from the same tree; TV38 gains a case inside its existing number. For R16 it pins which process holds the lease. The requirements stay `must`. ADR 0014 does not supply a way to establish that cessation on a macOS host where all agents share one account. Until one is established and reviewed, the vectors under R3, R12 and R16 that expect a reused, reset or removed target cannot be met there. That is reported as unmet, never as a pass or a waiver.
+
 Security checklist:
 - Default bind and exposure: no listener is added. CI keeps read-only permissions and does not persist checkout credentials.
 - Bounds on input: changed paths, base refs and Cargo metadata are untrusted. Errors select everything. Paths are read NUL-delimited and passed as arguments, never through a shell.
@@ -101,7 +103,7 @@ The owner's answers to Q1–Q5 and the final approval are in the amendments tabl
 
 ## Verification
 
-Filled in by the PR that completes the work. All rows are pending: nothing is implemented and no test has run.
+Filled in by the PR that completes the work. All rows are pending: no tier is implemented, and no acceptance check of a requirement has run. Controls of the test files' own helpers have run (plan section 12); they show that those helpers behave and are not a result for any row.
 
 | Id | Result (`pass` / `env-limited` / `waived by owner`) | Commit the check ran at | Platform |
 |---|---|---|---|
