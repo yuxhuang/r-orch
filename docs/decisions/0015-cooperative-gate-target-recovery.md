@@ -46,6 +46,54 @@ chosen.
 - "Consequences": the sentences on a killed gate and on `cargo clean` are corrected (CR-1, CR-8).
 - Alternatives A40–A43 are added.
 
+## Owner D45 native mutation amendment (2026-11-15)
+
+The owner answered: “make a note in your report and relax it for now. because we
+are going to change the storage backend in the future”. This supersedes the earlier
+D45 checked-inode/ancestry-pinning requirement and the historical native-unavailable
+status below. Under the configured cooperative lease, native admission, creation,
+reset, cleanup and publication use safe descriptor-relative no-follow operations,
+checking effective owner, device, type, private state-file modes and constant target
+boundaries, then deleting or renaming by name. Neither checked-inode atomicity nor
+pinning a directory's ancestry is required. Existing execution and dependency
+amendments remain in force; no unsafe code, new dependency or version change.
+
+**Owner-accepted interim risk, not resolved protection:** a process racing the last
+check and deletion/rename can redirect that operation to a different user-owned
+file. Revisit this relaxation when the storage backend changes; this work does not
+design that backend. The three native interleaving characterizations remain tests
+of this limitation, not protection passes. D41/FS1 escaped-descendant risk and the
+cargo-clean/manual-marker-removal residual are separate and remain disclosed.
+
+The native repair supplies a lifecycle API; final tier/bootstrap/report integration
+belongs to the integration owner. Recovery of an existing marker remains conditional
+on RC18 command/platform/filesystem evidence; D45 relaxation does not qualify it.
+Measured Mac/Linux acceptance, R4/R11 names/counts, final-head Linux, nextest
+qualification and whole-gate reviews remain due. Historical incomplete statuses
+below describe their dated slices, not a continuing D45 execution prohibition.
+
+The native repair now provides `native_admission` returning an inspected
+`NativeTarget`, `NativeTarget::begin` acquiring/protecting the marker and deciding
+reuse/reset, and consuming `NativeUse::run` to own direct commands through reap,
+source-at-finish capture and warm publication or cold removal/keep. The caller
+must retain the target and lease and route all direct commands through the supplied
+runner. The callback's judged result and the target's publication result are
+separate; failed compilation can finish a use without passing its step. A failed
+runner, interruption, lost lease/marker or failed publication retains the marker
+and target and does not qualify. Every state step revalidates the configured lease.
+Invalidation occurs after the decision and before destructive reset, so a failed
+reset leaves no reusable old record. Removal is failure-defined with the existing
+inspection budgets; filesystem syscalls have no hard time guarantee.
+
+Native controls exercise creation, stale/corrupt-record reset, warm reuse, cold
+removal/keep, link canaries, failed publication and inherited lock last-close.
+Recovery I/O after an unfinished use is tested with an explicitly injected policy
+observation. Production `begin` still refuses any pre-existing marker until the
+complete RC18 command/platform/filesystem matrix is qualified. A cargo observation
+and hermetic child controls do not qualify git, rustc, all static commands, Linux
+or every filesystem. This is a recovery-evidence condition, not the superseded
+D45 mutation-capability refusal. Whole-tier integration/acceptance remains separate.
+
 ## Context
 
 ADR 0014 is accepted. Its decisions 32–38 let the gate publish, remove, reset or reuse a target only after

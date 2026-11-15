@@ -27,6 +27,54 @@ Eighth amendment (the owner relaxes the cessation rule, by the architect; change
 
 Ninth amendment (correction of the eighth, by the architect; changes from the eighth): the security and resilience reviewers each passed the eighth amendment with conditions at its exact commit, and the lead ruled on every point. This amendment makes those corrections and nothing else. The decision index asks for a new record when an accepted decision changes, so D41–D47 move, with their numbers, from a “revision 3” of ADR 0014 into [ADR 0015](../decisions/0015-cooperative-gate-target-recovery.md), which is proposed; D41, the owner's decision, stays binding. ADR 0014 is restored to the text accepted on 2026-11-14; only its status line, ADR 0013's status line and the decision index point to ADR 0015. Where the eighth-amendment header paragraph above says “ADR 0014 … revision 3”, read “ADR 0015”. Corrected in place: the two header lines above; the first paragraph of “Design”; the eighth-amendment record of section 12 (its mechanism paragraph, the state table and the paragraph after it, the endings, RC14 and RC16–RC18, the obligation map, the slice table and the limits; RC19–RC23, the rows SR-8 and SR-9 and the edit C10 are added); the requirements map. Added as a sentence that begins “Ninth amendment”: the target table and the two paragraphs after it in section 4; the holder and interrupt paragraphs of section 6; the qualification sentence and the CI paragraph of section 7; row I5 of section 9; the reset reasons and the kept-target paragraph of section 11; rows RS1, RS2, RS3, RS5 and RS7 and the ordering paragraph of section 12; the notes of TV15 and TV63; status rows A, C and F; “Docs to update”; open items 16 and 19–21, with items 22 and 23 added. Section 12 gains the ninth-amendment record, with the disposition of every finding, the lead's rulings on the points the eighth amendment had left open, the conflicts that stay open, and the reason for this further round. The corrections are: the state files inside the structural boundary; a marker lock that belongs to the open file description and is closed, never unlocked; the identity of the locked marker checked at admission; a defined complete record and an order of synchronization; source identities captured again at the finish; a stated outcome for a failed publication or deletion; the configured lease required, so that a run without it is refused before it changes anything, and an inherited lease checked again at the finish; and the disclosure that `cargo clean` is the ordinary case only when no command of an earlier use is still running. Requirement, vector and task ids are unchanged. No mechanism is added, no number is chosen, no requirement, vector or protection is relaxed, and nothing was built, run, probed, signalled or measured for this amendment. It clears no runtime hold.
 
+## Owner D45 native mutation amendment (2026-11-15)
+
+The owner answered: “make a note in your report and relax it for now. because we
+are going to change the storage backend in the future”. This supersedes the earlier
+D45 checked-inode/ancestry-pinning requirement and the historical native-unavailable
+status below. Under the configured cooperative lease, native admission, creation,
+reset, cleanup and publication use safe descriptor-relative no-follow operations,
+checking effective owner, device, type, private state-file modes and constant target
+boundaries, then deleting or renaming by name. Neither checked-inode atomicity nor
+pinning a directory's ancestry is required. Existing execution and dependency
+amendments remain in force; no unsafe code, new dependency or version change.
+
+**Owner-accepted interim risk, not resolved protection:** a process racing the last
+check and deletion/rename can redirect that operation to a different user-owned
+file. Revisit this relaxation when the storage backend changes; this work does not
+design that backend. The three native interleaving characterizations remain tests
+of this limitation, not protection passes. D41/FS1 escaped-descendant risk and the
+cargo-clean/manual-marker-removal residual are separate and remain disclosed.
+
+The native repair supplies a lifecycle API; final tier/bootstrap/report integration
+belongs to the integration owner. Recovery of an existing marker remains conditional
+on RC18 command/platform/filesystem evidence; D45 relaxation does not qualify it.
+Measured Mac/Linux acceptance, R4/R11 names/counts, final-head Linux, nextest
+qualification and whole-gate reviews remain due. Historical incomplete statuses
+below describe their dated slices, not a continuing D45 execution prohibition.
+
+The native repair now provides `native_admission` returning an inspected
+`NativeTarget`, `NativeTarget::begin` acquiring/protecting the marker and deciding
+reuse/reset, and consuming `NativeUse::run` to own direct commands through reap,
+source-at-finish capture and warm publication or cold removal/keep. The caller
+must retain the target and lease and route all direct commands through the supplied
+runner. The callback's judged result and the target's publication result are
+separate; failed compilation can finish a use without passing its step. A failed
+runner, interruption, lost lease/marker or failed publication retains the marker
+and target and does not qualify. Every state step revalidates the configured lease.
+Invalidation occurs after the decision and before destructive reset, so a failed
+reset leaves no reusable old record. Removal is failure-defined with the existing
+inspection budgets; filesystem syscalls have no hard time guarantee.
+
+Native controls exercise creation, stale/corrupt-record reset, warm reuse, cold
+removal/keep, link canaries, failed publication and inherited lock last-close.
+Recovery I/O after an unfinished use is tested with an explicitly injected policy
+observation. Production `begin` still refuses any pre-existing marker until the
+complete RC18 command/platform/filesystem matrix is qualified. A cargo observation
+and hermetic child controls do not qualify git, rustc, all static commands, Linux
+or every filesystem. This is a recovery-evidence condition, not the superseded
+D45 mutation-capability refusal. Whole-tier integration/acceptance remains separate.
+
 ## Normal development execution amendment (2026-11-15)
 
 The owner chose normal development execution: ordinary pinned-toolchain cargo

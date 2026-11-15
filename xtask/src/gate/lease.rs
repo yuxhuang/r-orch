@@ -26,11 +26,17 @@ pub(super) enum Mode {
 }
 
 #[derive(Debug)]
-pub(super) struct Contended;
+pub(super) struct Contended {
+    diagnostics: String,
+}
 
 impl std::fmt::Display for Contended {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("cooperative lease is busy; nothing ran")
+        write!(
+            f,
+            "cooperative lease is busy; nothing ran; purpose/holder diagnostics (unvalidated, never signal authority): {}",
+            self.diagnostics
+        )
     }
 }
 impl std::error::Error for Contended {}
@@ -46,7 +52,7 @@ struct Held {
 fn check_file(path: &Path, meta: &fs::Metadata, owner: u32) -> Result<()> {
     ensure!(
         meta.is_file() && meta.uid() == owner && meta.nlink() == 1 && meta.mode() & 0o7077 == 0,
-        "lease structural refusal at {}: require private, singly linked regular file of effective account",
+        "REFUSED: lease structural refusal at {}: require private, singly linked regular file of effective account",
         path.display()
     );
     Ok(())
@@ -119,10 +125,48 @@ fn take(file: &File, mode: Mode, deadline: Instant) -> Result<()> {
             Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
                 thread::sleep(POLL.min(deadline.saturating_duration_since(Instant::now())));
             }
-            Err(TryLockError::WouldBlock) => return Err(Contended.into()),
+            Err(TryLockError::WouldBlock) => {
+                return Err(Contended {
+                    diagnostics: "unavailable".into(),
+                }
+                .into());
+            }
             Err(TryLockError::Error(e)) => return Err(e.into()),
         }
     }
+}
+
+fn contention_diagnostics(error: anyhow::Error, directory: &Path, owner: u32) -> anyhow::Error {
+    if !error.is::<Contended>() {
+        return error;
+    }
+    let path = directory.join("r-orch-gate.holder");
+    // Read only: never create a missing diagnostic or follow a link. Its
+    // contents are unvalidated text, with no signalling/reset authority.
+    let read = (|| -> Result<Vec<u8>> {
+        let before = fs::symlink_metadata(&path)?;
+        check_file(&path, &before, owner)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(super::target::open_flags(false)?)
+            .open(&path)?;
+        let held = file.metadata()?;
+        check_file(&path, &held, owner)?;
+        ensure!(
+            same(&before, &held) && same(&held, &fs::symlink_metadata(&path)?),
+            "holder diagnostic changed"
+        );
+        let mut bytes = Vec::new();
+        file.take(4097).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 4096, "holder diagnostic exceeds budget");
+        Ok(bytes)
+    })();
+    Contended {
+        diagnostics: read
+            .map(|b| super::report::diagnostic(&b))
+            .unwrap_or_else(|_| "unavailable".into()),
+    }
+    .into()
 }
 
 impl Owned {
@@ -139,10 +183,11 @@ impl Owned {
         let deadline = Instant::now()
             .checked_add(wait)
             .context("lease wait overflow")?;
-        take(&turnstile, Mode::Exclusive, deadline)?;
+        take(&turnstile, Mode::Exclusive, deadline)
+            .map_err(|e| contention_diagnostics(e, &directory, owner))?;
         let path = directory.join("r-orch-gate.lease");
         let file = open(&path, owner)?;
-        take(&file, mode, deadline)?;
+        take(&file, mode, deadline).map_err(|e| contention_diagnostics(e, &directory, owner))?;
         let lease = Self {
             held: Arc::new(Held {
                 file,
@@ -347,6 +392,19 @@ impl Lease {
         // A stale/invalid token is no authority. Acquire the configured lease
         // normally; do not adopt a claimed holder or release anybody's lock.
         Ok(Self::Owned(Owned::acquire(&directory, owner, mode, wait)?))
+    }
+
+    pub(super) fn validate_exclusive(&self) -> Result<()> {
+        self.validate()?;
+        if let Self::Owned(owned) = self {
+            ensure!(
+                owned.held.exclusive,
+                "REFUSED: target lifecycle requires the exclusive cooperative lease"
+            );
+        }
+        // Inherited::validate challenges a live holder and independently checks
+        // that a fresh shared attempt is excluded by its exclusive kernel lock.
+        Ok(())
     }
 
     pub(super) fn validate(&self) -> Result<()> {
@@ -561,6 +619,22 @@ mod tests {
         fn unwrap_err_is_contention(self) -> bool {
             matches!(self, Err(ref e) if e.is::<Contended>())
         }
+    }
+
+    #[test]
+    fn contention_includes_unvalidated_holder_purpose_and_pid_without_authority() {
+        let s = Scratch::new();
+        let lease = Owned::acquire(&s.0, s.owner(), Mode::Exclusive, Duration::ZERO).unwrap();
+        lease.purpose("private-contract-holder").unwrap();
+        let error = Owned::acquire(&s.0, s.owner(), Mode::Exclusive, Duration::ZERO)
+            .err()
+            .unwrap();
+        assert!(error.is::<Contended>());
+        let text = error.to_string();
+        assert!(text.contains("unvalidated"), "{text}");
+        assert!(text.contains("private-contract-holder"), "{text}");
+        assert!(text.contains(&std::process::id().to_string()), "{text}");
+        lease.validate().unwrap();
     }
 
     #[test]

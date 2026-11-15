@@ -1,38 +1,254 @@
-//! Cooperative target state and F2 direct-command publication. Tiers exercise
-//! only the strict native admission refusal; candidate mutations stay unwired.
+//! Cooperative target state, checked native lifecycle and direct-command publication.
+//! The final tier caller integrates NativeTarget::begin and NativeUse::run.
 //!
 //! The lease/direct-reap/source-capture path is exercised with real native child
 //! fixtures. Recovery is still unsupported in production: one cargo observation
 //! on one native filesystem is not RC18 for every command/filesystem/platform.
 //!
-//! Native read-only inspection uses safe nix descriptor-relative operations.
-//! Native mutation remains refused: unlinkat/renameat cannot condition the
-//! operation on the checked inode, and a directory FD does not pin its ancestry.
-//! Executed private counterexamples demonstrate both gaps; inspection/sync
-//! success is not D45 target admission or native RC18 recovery qualification.
+//! Safe nix operations check the namespace then mutate by name under the lease.
+//! D45's final-check race is owner-accepted, not inode-conditional atomicity.
+//! Marker recovery remains unsupported without RC18 command/platform/filesystem
+//! qualification; the native controls do not supply that missing whole-command set.
 
 mod native;
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
+use std::fs::{self, File, Metadata, TryLockError};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-/// Production entry used by the tier dispatcher. No miniature-workspace bypass.
-/// Successful native admission remains unavailable under the retained D45 guard.
+/// Inspect the constant paths without creating state or trusting diagnostics.
+/// Keep the returned target alive, then call `begin` and `NativeUse::run`.
+/// Inspection alone is never permission to build or a qualifying tier result.
 pub(super) fn native_admission(
     root: &Path,
     cold: bool,
     lease: &super::lease::Lease,
-) -> anyhow::Result<()> {
-    lease.validate()?;
+) -> anyhow::Result<NativeTarget> {
+    lease.validate_exclusive()?;
     let owner = nix::unistd::geteuid().as_raw();
     let files = StateFiles::inspect(root, owner, if cold { Kind::Cold } else { Kind::Warm })?;
-    let _marker = files.admit_configured(Some(lease))?;
-    anyhow::bail!("native lifecycle not implemented after admission")
+    native::Boundary::state(&files)?;
+    Ok(NativeTarget { files })
+}
+
+pub(super) struct NativeTarget {
+    files: StateFiles,
+}
+
+pub(super) struct NativeUse<'a> {
+    marker: Marker<'a>,
+    before: Captured,
+    action: Action,
+}
+
+impl NativeTarget {
+    pub(super) fn begin<'a>(
+        &'a self,
+        lease: &'a super::lease::Lease,
+    ) -> anyhow::Result<NativeUse<'a>> {
+        self.begin_with_recovery(lease, Recovery::Unsupported)
+    }
+
+    fn begin_with_recovery<'a>(
+        &'a self,
+        lease: &'a super::lease::Lease,
+        recovery: Recovery,
+    ) -> anyhow::Result<NativeUse<'a>> {
+        let mut marker = self.files.admit_configured(Some(lease))?;
+        marker.enable_signals()?;
+        // No file contents, elapsed time, PID or free lease qualifies RC18.
+        anyhow::ensure!(
+            !marker.found || recovery.shown(),
+            "REFUSED: previous build did not finish; command/platform/filesystem recovery unsupported"
+        );
+        marker.write_diagnostics(
+            format!(
+                "purpose=native-{}\npid={}\n",
+                self.files.build_name(),
+                std::process::id()
+            )
+            .as_bytes(),
+        )?;
+        marker.protect()?;
+        native::Boundary::inspect(&self.files)?;
+        let (before, action) = {
+            let mut runner = super::steps::Runner::new(lease, &marker)?;
+            let before = Captured::read(&mut runner, &self.files.root)?;
+            runner.finished()?;
+            let stored = if self.files.kind == Kind::Warm {
+                self.files.read_record()?
+            } else {
+                Stored::Missing
+            };
+            let action = decide(
+                Admission {
+                    lease: true,
+                    structure: true,
+                    marker_found: marker.found,
+                    lock_granted: true,
+                    marker_same: true,
+                    target_exists: self.files.check_target()?,
+                    kind: self.files.kind,
+                    recovery,
+                },
+                &stored,
+                before.current(&self.files.root),
+            );
+            (before, action)
+        };
+        anyhow::ensure!(
+            !matches!(action, Action::Refuse(_)),
+            "REFUSED: target decision {action:?}"
+        );
+        lease.validate()?;
+        marker.check_identity()?;
+        // Decide while the old record is available, then invalidate before any
+        // destructive operation. A failed removal leaves no reusable record.
+        marker.invalidate()?;
+        if action != Action::Reuse {
+            native::Boundary::state(&self.files)?.remove_build()?;
+        }
+        lease.validate()?;
+        marker.check_identity()?;
+        native::Boundary::state(&self.files)?.create_build()?;
+        lease.validate()?;
+        marker.check_identity()?;
+        Ok(NativeUse {
+            marker,
+            before,
+            action,
+        })
+    }
+}
+
+impl Captured {
+    fn current<'a>(&'a self, root: &'a Path) -> Current<'a> {
+        Current {
+            root: root.as_os_str().as_bytes(),
+            toolchain: &self.toolchain,
+            boot: Some(self.boot),
+            sources: &self.sources,
+        }
+    }
+}
+
+/// The callback receives the only runner for this use and the constant target.
+/// It must route every direct command through that runner. A nonzero command or
+/// a failed judged assertion may finish the target, while never passing the step.
+/// An interrupted/failed runner or lost authority retains marker and target.
+pub(super) struct NativeOutcome<T> {
+    pub(super) result: anyhow::Result<T>,
+    pub(super) statuses: Vec<super::steps::Status>,
+    pub(super) publication: &'static str,
+    pub(super) end_ns: i128,
+}
+
+impl NativeUse<'_> {
+    pub(super) fn target(&self) -> PathBuf {
+        self.marker.files.build_path()
+    }
+
+    pub(super) fn decision(&self) -> &'static str {
+        match self.action {
+            Action::Reuse => "reused",
+            Action::Cold => "cold",
+            Action::Reset(Reset::NoRecord) => "reset: no record",
+            Action::Reset(Reset::Unreadable) => "reset: unreadable record",
+            Action::Reset(Reset::Worktree) => "reset: different worktree",
+            Action::Reset(Reset::Toolchain) => "reset: toolchain changed",
+            Action::Reset(Reset::Content) => "reset: source content changed",
+            Action::Reset(Reset::Unfinished) => "reset: previous build did not finish",
+            Action::Reset(Reset::Boot) => "reset: boot changed",
+            Action::Refuse(_) => "REFUSED",
+        }
+    }
+
+    pub(super) fn run<T>(
+        mut self,
+        lease: &super::lease::Lease,
+        keep: bool,
+        work: impl FnOnce(&mut super::steps::Runner<'_, '_>, &Path) -> anyhow::Result<T>,
+    ) -> anyhow::Result<NativeOutcome<T>> {
+        let target = self.target();
+        native::Boundary::inspect(self.marker.files)?;
+        let mut runner = super::steps::Runner::new(lease, &self.marker)?;
+        let work_result = work(&mut runner, &target);
+        let captured = (|| {
+            runner.finished()?;
+            let after = Captured::read(&mut runner, &self.marker.files.root)?;
+            runner.finished()?;
+            anyhow::ensure!(
+                self.before.boot == after.boot && self.before.toolchain == after.toolchain,
+                "toolchain/boot identity changed; keep marker, no publication"
+            );
+            Ok(after)
+        })();
+        let statuses = runner
+            .statuses()
+            .iter()
+            .map(|s| super::steps::Status {
+                exit: s.exit,
+                elapsed: s.elapsed,
+            })
+            .collect::<Vec<_>>();
+        drop(runner); // teardown/actual reap precedes ALL publication/removal
+        let finished = (|| {
+            let after: Captured = captured?;
+            lease.validate()?;
+            self.marker.check_identity()?;
+            let end_ns = i128::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_nanos(),
+            )?;
+            let finished = Finished {
+                direct_reaped: true,
+                lease_held: true,
+                inherited_holder_valid: true,
+            };
+            let publication = if self.marker.files.kind == Kind::Warm {
+                match self.marker.finish_warm(
+                    finished,
+                    &self.before.sources,
+                    after.current(&self.marker.files.root),
+                    end_ns,
+                )? {
+                    Publication::Record => "record published",
+                    Publication::SourceChanged => "no record: source changed",
+                    Publication::NoBoot => "no record: boot unavailable",
+                }
+            } else {
+                if !keep {
+                    native::Boundary::state(self.marker.files)?.remove_build()?;
+                }
+                lease.validate()?;
+                self.marker.finish_cold(finished)?;
+                if keep {
+                    "cold target kept by request"
+                } else {
+                    "cold target removed"
+                }
+            };
+            Ok((publication, end_ns))
+        })();
+        match finished {
+            Ok((publication, end_ns)) => Ok(NativeOutcome {
+                result: work_result,
+                statuses,
+                publication,
+                end_ns,
+            }),
+            Err(source) => Err(UseFailure {
+                exits: statuses.iter().map(|s| s.exit).collect(),
+                source,
+            }
+            .into()),
+        }
+    }
 }
 
 pub(super) fn marker_diagnostics(root: &Path, cold: bool) -> Option<Vec<u8>> {
@@ -112,7 +328,11 @@ impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Boundary { path, why } => {
-                write!(f, "structural refusal at {}: {why}", path.display())
+                write!(
+                    f,
+                    "REFUSED: structural refusal at {}: {why}",
+                    path.display()
+                )
             }
             Self::Io {
                 operation,
@@ -788,36 +1008,8 @@ impl StateFiles {
     }
 
     fn open_regular(&self, leaf: Leaf, write: bool, exclusive: bool) -> Result<File> {
-        let before = self.check_leaf(leaf)?;
-        let path = self.path(leaf);
-        let mut options = OpenOptions::new();
-        options
-            .read(true)
-            .write(write)
-            .create_new(exclusive)
-            .mode(0o600)
-            .custom_flags(open_flags(false)?);
-        // No truncate(true), create(true), append or path-based diagnostic write.
-        let file = at(
-            options.open(&path),
-            "open state leaf no-follow/nonblocking",
-            &path,
-        )?;
-        let opened = at(file.metadata(), "fstat state leaf", &path)?;
-        check_metadata(&path, &opened, false, self.owner, self.device)?;
-        self.check_parents()?;
-        let now = self
-            .check_leaf(leaf)?
-            .ok_or_else(|| boundary(&path, "leaf disappeared"))?;
-        if identity(&opened) != identity(&now)
-            || (!exclusive
-                && before
-                    .as_ref()
-                    .is_none_or(|m| identity(m) != identity(&opened)))
-        {
-            return Err(boundary(&path, "leaf identity changed during open"));
-        }
-        Ok(file)
+        self.check_leaf(leaf)?;
+        native::Boundary::state(self)?.open_regular(leaf, write, exclusive)
     }
 
     fn read_record(&self) -> Result<Stored> {
@@ -903,84 +1095,37 @@ impl StateFiles {
     }
 
     fn sync_directory(&self) -> Result<()> {
-        self.check_parents()?;
-        let before = self
-            .check_directory(&self.state, false)?
-            .ok_or_else(|| boundary(&self.state, "missing state directory"))?;
-        let directory = at(
-            OpenOptions::new()
-                .read(true)
-                .custom_flags(open_flags(true)?)
-                .open(&self.state),
-            "open state directory no-follow/nonblocking",
-            &self.state,
-        )?;
-        let opened = at(directory.metadata(), "fstat state directory", &self.state)?;
-        check_metadata(&self.state, &opened, true, self.owner, self.device)?;
-        if identity(&before) != identity(&opened) {
-            return Err(boundary(&self.state, "directory changed during open"));
-        }
-        // Installed same-version std Unix source maps sync_all to fsync on Linux
-        // and F_FULLFSYNC on Apple. No fsync fallback on error. In particular,
-        // Apple's directory call may fail: that is an unavailable durability
-        // mechanism, not successful publication. Native evidence is still due.
-        at(
-            directory.sync_all(),
-            "synchronize state directory",
-            &self.state,
-        )
+        native::Boundary::state(self)?.sync_existing()
     }
 
     fn remove_leaf(&self, leaf: Leaf) -> Result<()> {
-        if self.check_leaf(leaf)?.is_some() {
-            at(
-                fs::remove_file(self.path(leaf)),
-                "remove state leaf",
-                &self.path(leaf),
-            )?;
-        }
-        Ok(())
+        self.check_leaf(leaf)?;
+        native::Boundary::state(self)?.remove_leaf(leaf)
     }
 
     fn admit(&self, configured_lease_observed: bool) -> Result<Marker<'_>> {
         if !configured_lease_observed {
             return Err(Fault::Unavailable("configured lease not observed"));
         }
-        self.check_parents()?;
-        for leaf in self.leaves() {
-            self.check_leaf(*leaf)?;
-        }
-        // Native inspection is real read-only descriptor I/O, not a permit.
-        // It supplies no unlink-by-checked-inode or pinned-ancestry primitive.
-        // Refuse BEFORE mkdir, marker creation, locking, deletion or build.
-        let native = native::Boundary::inspect(self)?;
-        native.sync_existing()?;
-        native.require_mutation()?;
-        Err(Fault::Unavailable("native mutation capability absent"))
+        native::Boundary::state(self)?;
+        native::Boundary::create_directories(self)?;
+        self.lock_marker_primitive()
     }
 
-    fn create_directories_candidate(&self) -> Result<()> {
-        // Candidate source only; admit never reaches this. No recursive mkdir
-        // through unknown parents, no repair of pre-existing directory modes.
-        for path in [self.root.join("target"), self.state.clone()] {
-            self.check_parents()?;
-            if self.check_directory(&path, true)?.is_none() {
-                at(
-                    fs::DirBuilder::new().mode(0o700).create(&path),
-                    "create state directory",
-                    &path,
-                )?;
-                self.check_directory(&path, false)?;
-                // Parent creation durability needs its own reviewed platform
-                // implementation before this candidate can be used by F2.
-            }
+    fn build_name(&self) -> &'static str {
+        match self.kind {
+            Kind::Warm => "gate-warm",
+            Kind::Cold => "gate",
         }
-        Ok(())
+    }
+
+    fn build_path(&self) -> PathBuf {
+        self.root.join("target").join(self.build_name())
     }
 
     fn lock_marker_primitive(&self) -> Result<Marker<'_>> {
-        // Private primitive for review/child-free controls. Native admission
-        // above is deliberately unavailable; no tier can reach this primitive.
+        // Acquire exactly the existing inode, or create it exclusively. Closing
+        // this File must never explicitly unlock descriptions inherited by children.
         let found = self.check_leaf(Leaf::Marker)?.is_some();
         let file = self.open_regular(Leaf::Marker, true, !found)?;
         match file.try_lock() {
@@ -996,6 +1141,7 @@ impl StateFiles {
         }
         let marker = Marker {
             files: self,
+            lease: None,
             file,
             found,
             temporary: None,
@@ -1018,12 +1164,13 @@ enum Phase {
 
 pub(super) struct Marker<'a> {
     files: &'a StateFiles,
+    lease: Option<&'a super::lease::Lease>,
     file: File,
     found: bool,
     temporary: Option<File>,
     phase: Phase,
     // Keep cancellation alive through the publication sequence, after Runner
-    // has relinquished its immutable borrow. Native admission remains disabled.
+    // has relinquished its immutable borrow.
     signals: std::cell::RefCell<Option<super::signals::Signals>>,
 }
 
@@ -1054,10 +1201,15 @@ impl Marker<'_> {
     }
 
     pub(super) fn check_identity(&self) -> Result<()> {
+        if let Some(lease) = self.lease {
+            lease
+                .validate_exclusive()
+                .map_err(|_| Fault::Unavailable("configured lease lost; keep marker and target"))?;
+        }
         if self.signal_wait(std::time::Duration::ZERO).is_some() {
             return Err(Fault::Unavailable("INTERRUPTED; keep marker and target"));
         }
-        self.files.check_parents()?;
+        native::Boundary::state(self.files)?;
         let held = at(
             self.file.metadata(),
             "fstat locked marker",
@@ -1372,23 +1524,12 @@ impl Marker<'_> {
                         "record appeared after invalidation",
                     ));
                 }
-                at(
-                    fs::rename(
-                        self.files.path(Leaf::Temporary),
-                        self.files.path(Leaf::Record),
-                    ),
-                    "rename completed record",
-                    &self.files.path(Leaf::Record),
-                )?;
+                native::Boundary::state(self.files)?.rename_record(identity(&held))?;
                 self.temporary = None;
                 Ok(())
             }
             Step::RemoveMarker => {
-                at(
-                    fs::remove_file(self.files.path(Leaf::Marker)),
-                    "remove finished marker",
-                    &self.files.path(Leaf::Marker),
-                )?;
+                self.files.remove_leaf(Leaf::Marker)?;
                 self.phase = Phase::Removed;
                 Ok(())
             }
@@ -1396,15 +1537,21 @@ impl Marker<'_> {
     }
 }
 
-// F2 integrates actual lease validation and direct reaping with F1 publication.
-// Native namespace admission/deletion is deliberately NOT bypassed here.
+// Bind the configured authority to the marker so each publication step checks
+// it again, including an inherited live holder. Diagnostics supply no authority.
 impl StateFiles {
-    fn admit_configured(&self, lease: Option<&super::lease::Lease>) -> anyhow::Result<Marker<'_>> {
+    fn admit_configured<'a>(
+        &'a self,
+        lease: Option<&'a super::lease::Lease>,
+    ) -> anyhow::Result<Marker<'a>> {
         let lease = lease.ok_or_else(|| {
             anyhow::anyhow!("REFUSED: configured lease required; --no-lease cannot admit a target")
         })?;
-        lease.validate()?;
-        Ok(self.admit(true)?)
+        lease.validate_exclusive()?;
+        let mut marker = self.admit(true)?;
+        marker.lease = Some(lease);
+        marker.check_identity()?;
+        Ok(marker)
     }
 }
 
@@ -1489,9 +1636,9 @@ impl Marker<'_> {
 }
 
 #[derive(Debug)]
-struct UseFailure {
-    exits: Vec<std::process::ExitStatus>,
-    source: anyhow::Error,
+pub(super) struct UseFailure {
+    pub(super) exits: Vec<std::process::ExitStatus>,
+    pub(super) source: anyhow::Error,
 }
 impl fmt::Display for UseFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2413,14 +2560,507 @@ mod tests {
     }
 
     #[test]
-    fn native_admission_withholds_unproved_platform_and_lease_without_creation() {
+    fn native_admission_withholds_missing_lease_and_preserves_exclusive_marker() {
         let f = Fixture::new();
         assert!(matches!(
             f.files.admit(false),
             Err(Fault::Unavailable("configured lease not observed"))
         ));
-        assert!(matches!(f.files.admit(true), Err(Fault::Unavailable(_))));
+        let marker = f.files.admit(true).unwrap();
+        marker.check_identity().unwrap();
+        assert!(matches!(f.files.admit(true), Err(Fault::Busy)));
+        assert!(f.files.path(Leaf::Marker).is_file());
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_owner_relaxation_admits_and_locks_without_mutation_capability_refusal() {
+        let f = Fixture::new();
+        assert!(f.files.admit(false).is_err());
         assert!(!f.files.path(Leaf::Marker).exists());
+        let marker = f.files.admit(true).unwrap();
+        marker.check_identity().unwrap();
+        assert!(matches!(f.files.admit(true), Err(Fault::Busy)));
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_lifecycle_begin_resets_unknown_target_and_invalidates_before_build() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        fs::create_dir(f.files.build_path()).unwrap();
+        fs::write(f.files.build_path().join("stale"), b"stale").unwrap();
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let use_ = target.begin(&lease).unwrap();
+        assert_eq!(use_.action, Action::Reset(Reset::NoRecord));
+        assert!(!f.files.build_path().join("stale").exists());
+        assert!(f.files.build_path().is_dir());
+        assert!(f.files.path(Leaf::Marker).is_file());
+        assert!(!f.files.path(Leaf::Record).exists());
+        assert_eq!(use_.marker.phase, Phase::Invalidated);
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_lifecycle_success_and_failed_command_publish_then_warm_reuse() {
+        for code in [0, 7] {
+            let f = Fixture::new();
+            f2_repo(&f);
+            let lease = f2_lease(&f);
+            let target = native_admission(&f.files.root, false, &lease).unwrap();
+            let use_ = target.begin(&lease).unwrap();
+            let result = use_
+                .run(&lease, false, |runner, path| {
+                    fs::write(path.join("built"), b"current artifact")?;
+                    let status = runner.run(&mut f2_command(&f, &format!("exit {code}")))?;
+                    anyhow::ensure!(status.success(), "actual command failed");
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(result.result.is_ok(), code == 0);
+            assert!(result.statuses.iter().any(|s| s.exit.code() == Some(code)));
+            assert!(result.end_ns > 0);
+            assert_eq!(result.publication, "record published");
+            assert!(matches!(
+                f.files.read_record().unwrap(),
+                Stored::Complete(_)
+            ));
+            assert!(!f.files.path(Leaf::Marker).exists());
+            let next = target.begin(&lease).unwrap();
+            assert_eq!(next.decision(), "reused");
+            assert_eq!(
+                fs::read(next.target().join("built")).unwrap(),
+                b"current artifact"
+            );
+            next.run(&lease, false, |_, _| Ok(()))
+                .unwrap()
+                .result
+                .unwrap();
+            f.canary_unchanged();
+        }
+    }
+
+    #[test]
+    fn native_lifecycle_backdated_source_and_damaged_record_reset_actual_artifacts() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        target
+            .begin(&lease)
+            .unwrap()
+            .run(&lease, false, |_, path| {
+                fs::write(path.join("stale"), b"old")?;
+                Ok(())
+            })
+            .unwrap();
+        let source = f.files.root.join("source.rs");
+        fs::write(&source, b"backdated changed content").unwrap();
+        File::open(&source)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+            .unwrap();
+        let use_ = target.begin(&lease).unwrap();
+        assert_eq!(use_.decision(), "reset: source content changed");
+        assert!(!use_.target().join("stale").exists());
+        use_.run(&lease, false, |_, _| Ok(())).unwrap();
+        for damaged in [
+            vec![],
+            b"truncated".to_vec(),
+            record().encode().unwrap()[..20].to_vec(),
+        ] {
+            fs::write(f.files.path(Leaf::Record), damaged).unwrap();
+            fs::write(f.files.build_path().join("stale"), b"old").unwrap();
+            let use_ = target.begin(&lease).unwrap();
+            assert_eq!(use_.decision(), "reset: unreadable record");
+            assert!(!use_.target().join("stale").exists());
+            use_.run(&lease, false, |_, _| Ok(())).unwrap();
+        }
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_lifecycle_source_change_finishes_without_record() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let result = target
+            .begin(&lease)
+            .unwrap()
+            .run(&lease, false, |runner, _| {
+                assert!(
+                    runner
+                        .run(&mut f2_command(&f, "printf changed > source.rs"))?
+                        .success()
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(result.publication, "no record: source changed");
+        assert!(!f.files.path(Leaf::Record).exists());
+        assert!(!f.files.path(Leaf::Marker).exists());
+        assert_eq!(target.begin(&lease).unwrap().decision(), "reset: no record");
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_lifecycle_cold_cleanup_and_keep_never_touch_warm_or_sibling() {
+        for keep in [false, true] {
+            let f = Fixture::new();
+            f2_repo(&f);
+            let lease = f2_lease(&f);
+            fs::create_dir(f.files.build_path()).unwrap();
+            fs::write(f.files.build_path().join("warm-canary"), b"warm").unwrap();
+            fs::write(f.files.path(Leaf::Record), b"warm-state").unwrap();
+            let cold = StateFiles::inspect(&f.files.root, f.files.owner, Kind::Cold).unwrap();
+            fs::create_dir(cold.build_path()).unwrap();
+            fs::write(cold.build_path().join("stale"), b"old").unwrap();
+            let target = native_admission(&f.files.root, true, &lease).unwrap();
+            let use_ = target.begin(&lease).unwrap();
+            assert_eq!(use_.decision(), "cold");
+            assert!(!use_.target().join("stale").exists());
+            let result = use_
+                .run(&lease, keep, |_, path| {
+                    fs::write(path.join("built"), b"new")?;
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(cold.build_path().exists(), keep);
+            assert!(!cold.path(Leaf::Marker).exists());
+            assert_eq!(fs::read(f.files.path(Leaf::Record)).unwrap(), b"warm-state");
+            assert_eq!(
+                fs::read(f.files.build_path().join("warm-canary")).unwrap(),
+                b"warm"
+            );
+            assert_eq!(
+                result.publication,
+                if keep {
+                    "cold target kept by request"
+                } else {
+                    "cold target removed"
+                }
+            );
+            f.canary_unchanged();
+        }
+    }
+
+    #[test]
+    fn native_lifecycle_failed_publication_keeps_marker_without_following_link() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let use_ = target.begin(&lease).unwrap();
+        let result = use_.run(&lease, false, |_, _| {
+            symlink(&f.outside, f.files.path(Leaf::Temporary))?;
+            Ok(())
+        });
+        let error = result.err().unwrap();
+        assert!(error.to_string().contains("kept"));
+        assert!(f.files.path(Leaf::Marker).exists());
+        assert!(!f.files.path(Leaf::Record).exists());
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_lifecycle_lease_loss_at_finish_keeps_marker_and_never_publishes() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let use_ = target.begin(&lease).unwrap();
+        let error = use_
+            .run(&lease, false, |_, _| {
+                fs::rename(f.base.join("r-orch-gate.lease"), f.base.join("lost-lease"))?;
+                Ok(())
+            })
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("kept"));
+        assert!(f.files.path(Leaf::Marker).exists());
+        assert!(!f.files.path(Leaf::Record).exists());
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_lifecycle_leaf_link_controls_preserve_canary_after_real_success() {
+        for leaf in [Leaf::Marker, Leaf::Record, Leaf::Temporary] {
+            let f = Fixture::new();
+            f2_repo(&f);
+            let lease = f2_lease(&f);
+            let target = native_admission(&f.files.root, false, &lease).unwrap();
+            target
+                .begin(&lease)
+                .unwrap()
+                .run(&lease, false, |_, _| Ok(()))
+                .unwrap();
+            let path = f.files.path(leaf);
+            if path.exists() {
+                fs::remove_file(&path).unwrap();
+            }
+            symlink(&f.outside, &path).unwrap();
+            assert!(target.begin(&lease).is_err());
+            assert!(
+                fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            f.canary_unchanged();
+        }
+    }
+
+    #[test]
+    fn native_lifecycle_artifact_symlink_is_unlinked_without_following_it() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        fs::create_dir(f.files.build_path()).unwrap();
+        symlink(&f.outside, f.files.build_path().join("artifact-link")).unwrap();
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let use_ = target.begin(&lease).unwrap();
+        assert!(!use_.target().join("artifact-link").exists());
+        use_.run(&lease, false, |_, _| Ok(())).unwrap();
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_lifecycle_unsupported_recovery_keeps_free_marker_and_target_unchanged() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let use_ = target.begin(&lease).unwrap();
+        fs::write(use_.target().join("unfinished"), b"untouched").unwrap();
+        let inode = use_.marker.file.metadata().unwrap().ino();
+        drop(use_);
+        let error = target.begin(&lease).err().unwrap();
+        assert!(
+            error.to_string().contains("recovery unsupported"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::metadata(f.files.path(Leaf::Marker)).unwrap().ino(),
+            inode
+        );
+        assert_eq!(
+            fs::read(f.files.build_path().join("unfinished")).unwrap(),
+            b"untouched"
+        );
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_lifecycle_inherited_marker_excludes_until_last_close_then_control_recovers() {
+        use super::super::steps::tests::{ChildGuard, Scratch, fixture, ready};
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let control = Scratch::new();
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let use_ = target.begin(&lease).unwrap();
+        let inode = use_.marker.file.metadata().unwrap().ino();
+        fs::write(use_.target().join("unfinished"), b"old").unwrap();
+        let mut child = ChildGuard(
+            fixture(&control, "direct", "hold")
+                .stdin(use_.marker.command_stdin().unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        ready(&mut child.0, &control.0.join("direct.ready"));
+        drop(use_); // close, NEVER unlock; direct child keeps same description
+        let error = target
+            .begin_with_recovery(&lease, Recovery::ShownInSimulation)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .downcast_ref::<Fault>()
+                .is_some_and(|f| matches!(f, Fault::Busy))
+        );
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert_eq!(
+            fs::metadata(f.files.path(Leaf::Marker)).unwrap().ino(),
+            inode
+        );
+        assert!(f.files.build_path().join("unfinished").exists());
+        fs::write(control.0.join("direct.release"), b"finish").unwrap();
+        assert!(child.0.wait().unwrap().success());
+        // Inject ONLY the policy observation for this hermetic control. This
+        // tests native recovery I/O, not production RC18 command qualification.
+        let use_ = target
+            .begin_with_recovery(&lease, Recovery::ShownInSimulation)
+            .unwrap();
+        assert_eq!(use_.decision(), "reset: previous build did not finish");
+        assert_eq!(use_.marker.file.metadata().unwrap().ino(), inode);
+        assert!(!use_.target().join("unfinished").exists());
+        use_.run(&lease, false, |_, _| Ok(())).unwrap();
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_lifecycle_every_publication_step_rechecks_configured_lease() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let mut use_ = target.begin(&lease).unwrap();
+        fs::rename(f.base.join("r-orch-gate.lease"), f.base.join("lost-lease")).unwrap();
+        let error = use_
+            .marker
+            .finish_warm(
+                finished_observations(),
+                &use_.before.sources,
+                use_.before.current(&f.files.root),
+                300,
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("configured lease lost"));
+        assert!(f.files.path(Leaf::Marker).exists());
+        assert!(!f.files.path(Leaf::Record).exists());
+        assert!(!f.files.path(Leaf::Temporary).exists());
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_lifecycle_existing_private_temporary_refuses_exclusive_publication() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let use_ = target.begin(&lease).unwrap();
+        let error = use_
+            .run(&lease, false, |_, _| {
+                fs::write(f.files.path(Leaf::Temporary), b"preexisting temporary")?;
+                fs::set_permissions(
+                    f.files.path(Leaf::Temporary),
+                    fs::Permissions::from_mode(0o600),
+                )?;
+                Ok(())
+            })
+            .err()
+            .unwrap();
+        let failure = error.downcast_ref::<UseFailure>().unwrap();
+        assert!(
+            matches!(failure.source.downcast_ref::<Fault>(), Some(Fault::Io { operation: "openat checked state", source, .. }) if source.kind() == io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(
+            fs::read(f.files.path(Leaf::Temporary)).unwrap(),
+            b"preexisting temporary"
+        );
+        assert!(f.files.path(Leaf::Marker).exists());
+        assert!(!f.files.path(Leaf::Record).exists());
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_lifecycle_shared_lease_refuses_before_state_creation() {
+        let f = Fixture::new();
+        let lease = super::super::lease::Lease::Owned(
+            super::super::lease::Owned::acquire(
+                &f.base,
+                f.files.owner,
+                super::super::lease::Mode::Shared,
+                std::time::Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        fs::remove_dir_all(f.files.root.join("target")).unwrap();
+        let error = native_admission(&f.files.root, false, &lease)
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("exclusive"), "{error}");
+        assert!(!f.files.root.join("target").exists());
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_lifecycle_real_cargo_build_and_compile_failure_finish_owned_target() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        fs::write(f.files.root.join("Cargo.toml"), "[package]\nname=\"native-lifecycle\"\nversion=\"0.0.0\"\nedition=\"2024\"\n[lib]\npath=\"source.rs\"\n[workspace]\n").unwrap();
+        fs::write(
+            f.files.root.join("Cargo.lock"),
+            r#"version = 4
+[[package]]
+name = "native-lifecycle"
+version = "0.0.0"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            f.files.root.join("source.rs"),
+            b"pub fn built() -> u8 { 7 }\n",
+        )
+        .unwrap();
+        let output = std::process::Command::new("rustup")
+            .args(["which", "rustc"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let rustc = PathBuf::from(std::str::from_utf8(&output.stdout).unwrap().trim());
+        let cargo = rustc.with_file_name("cargo");
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        for expected in [0, 101] {
+            if expected == 101 {
+                fs::write(
+                    f.files.root.join("source.rs"),
+                    b"compile_error!(\"intentional native control\");\n",
+                )
+                .unwrap();
+                File::open(f.files.root.join("source.rs"))
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+                    .unwrap();
+            }
+            let use_ = target.begin(&lease).unwrap();
+            assert_eq!(
+                use_.decision(),
+                if expected == 0 {
+                    "reset: no record"
+                } else {
+                    "reset: source content changed"
+                }
+            );
+            let result = use_
+                .run(&lease, false, |runner, path| {
+                    let mut command = std::process::Command::new(&cargo);
+                    command
+                        .args(["build", "--offline", "--locked", "--manifest-path"])
+                        .arg(f.files.root.join("Cargo.toml"))
+                        .current_dir(&f.files.root)
+                        .env_clear()
+                        .env("HOME", &f.base)
+                        .env("CARGO_HOME", f.base.join("cargo"))
+                        .env("CARGO_TARGET_DIR", path)
+                        .env("RUSTC", &rustc)
+                        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                        .env("ORCHESTRY_GLOBAL_CONFIG_PATH", f.base.join("global.yml"));
+                    let log = runner.logged(&mut command, 1024 * 1024)?;
+                    eprintln!(
+                        "native cargo control expected={expected} actual={:?}\n{}",
+                        log.exit.code(),
+                        String::from_utf8_lossy(&log.bytes)
+                    );
+                    assert_eq!(log.exit.code(), Some(expected));
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(result.publication, "record published");
+            assert!(
+                result
+                    .statuses
+                    .iter()
+                    .any(|s| s.exit.code() == Some(expected))
+            );
+            assert!(!f.files.path(Leaf::Marker).exists());
+        }
+        let next = target.begin(&lease).unwrap();
+        assert_eq!(next.decision(), "reused"); // failed compilation finished; it did not pass
+        next.run(&lease, false, |_, _| Ok(())).unwrap();
         f.canary_unchanged();
     }
 
@@ -3342,14 +3982,16 @@ mod tests {
     }
 
     #[test]
-    fn native_admission_names_the_specific_missing_mutation_capability() {
+    fn native_admission_creates_private_state_from_absence() {
         let f = Fixture::new();
-        let error = f.files.admit(true).err().unwrap();
+        fs::remove_dir_all(f.files.root.join("target")).unwrap();
+        let marker = f.files.admit(true).unwrap();
+        marker.check_identity().unwrap();
         assert_eq!(
-            error.to_string(),
-            "unavailable: native APIs cannot pin namespace or condition unlink/rename on checked inode"
+            fs::metadata(f.files.path(Leaf::Marker)).unwrap().mode() & 0o7777,
+            0o600
         );
-        assert!(!f.files.path(Leaf::Marker).exists());
+        assert_eq!(fs::metadata(&f.files.state).unwrap().mode() & 0o7777, 0o700);
         f.canary_unchanged();
     }
 

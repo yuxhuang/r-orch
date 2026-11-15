@@ -1,9 +1,9 @@
-//! Descriptor-relative *inspection*, not permission to mutate a target.
+//! Checked descriptor-relative native operations under the cooperative lease.
 //!
 //! Safe nix APIs close the pathname traversal gap, but do not pin a directory
 //! inside the worktree against relocation, or condition unlink/rename on the
-//! inspected inode. Keeping those distinctions explicit preserves D45. No
-//! destructive primitive is exported from this module.
+//! inspected inode. The owner accepts that last-check/mutation race temporarily
+//! (D45 amendment); these calls do not claim inode-conditional atomicity.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -11,9 +11,9 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Component, Path};
 
 use nix::dir::Dir;
-use nix::fcntl::{AtFlags, OFlag, open, openat};
-use nix::sys::stat::{FileStat, Mode, SFlag, fstatat};
-use nix::unistd::geteuid;
+use nix::fcntl::{AtFlags, OFlag, open, openat, renameat};
+use nix::sys::stat::{FileStat, Mode, SFlag, fstatat, mkdirat};
+use nix::unistd::{UnlinkatFlags, geteuid, unlinkat};
 
 use super::{
     Fault, Identity, Kind, Leaf, Result, StateFiles, at, boundary, check_metadata, identity,
@@ -167,6 +167,14 @@ pub(super) struct Boundary<'a> {
 
 impl<'a> Boundary<'a> {
     pub(super) fn inspect(files: &'a StateFiles) -> Result<Self> {
+        Self::inspect_inner(files, true)
+    }
+
+    pub(super) fn state(files: &'a StateFiles) -> Result<Self> {
+        Self::inspect_inner(files, false)
+    }
+
+    fn inspect_inner(files: &'a StateFiles, scan_build: bool) -> Result<Self> {
         let root = root(files)?;
         let target = directory(
             files,
@@ -184,7 +192,7 @@ impl<'a> Boundary<'a> {
             };
             let path = files.root.join("target").join(name);
             build = directory(files, target, OsStr::new(name), &path)?;
-            if let Some(build) = &build {
+            if scan_build && let Some(build) = &build {
                 let mut remaining = MAX_ENTRIES;
                 scan(files, build, &path, 0, &mut remaining)?;
             }
@@ -211,7 +219,7 @@ impl<'a> Boundary<'a> {
     }
 
     pub(super) fn recheck(&self) -> Result<()> {
-        let now = Self::inspect(self.files)?;
+        let now = Self::state(self.files)?;
         for (before, after) in [
             (Some(&self.root), Some(&now.root)),
             (self.target.as_ref(), now.target.as_ref()),
@@ -295,10 +303,159 @@ impl<'a> Boundary<'a> {
         self.recheck()
     }
 
-    pub(super) fn require_mutation(&self) -> Result<()> {
-        Err(Fault::Unavailable(
-            "native APIs cannot pin namespace or condition unlink/rename on checked inode",
-        ))
+    pub(super) fn create_directories(files: &'a StateFiles) -> Result<()> {
+        let root = root(files)?;
+        let target_path = files.root.join("target");
+        let target = make_directory(files, &root, OsStr::new("target"), &target_path)?;
+        make_directory(files, &target, OsStr::new(".gate-state"), &files.state)?;
+        Self::state(files)?.sync_existing()
+    }
+
+    pub(super) fn open_regular(&self, leaf: Leaf, write: bool, exclusive: bool) -> Result<File> {
+        self.recheck()?;
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| boundary(&self.files.state, "missing state directory"))?;
+        let path = self.files.path(leaf);
+        let name = path
+            .file_name()
+            .ok_or_else(|| boundary(&path, "missing state name"))?;
+        let before = stat(state, name, &path)?;
+        if let Some(meta) = &before {
+            check_stat(self.files, &path, meta, false)?;
+        }
+        let mut flags = OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
+        flags |= if write {
+            OFlag::O_RDWR
+        } else {
+            OFlag::O_RDONLY
+        };
+        if exclusive {
+            flags |= OFlag::O_CREAT | OFlag::O_EXCL;
+        }
+        let file = File::from(syscall(
+            openat(state, name, flags, Mode::S_IRUSR | Mode::S_IWUSR),
+            "openat checked state",
+            &path,
+        )?);
+        let held = at(file.metadata(), "fstat checked state", &path)?;
+        check_metadata(&path, &held, false, self.files.owner, self.files.device)?;
+        let now = stat(state, name, &path)?
+            .ok_or_else(|| boundary(&path, "state disappeared during open"))?;
+        check_stat(self.files, &path, &now, false)?;
+        if stat_identity(&now) != identity(&held)
+            || (!exclusive
+                && before
+                    .as_ref()
+                    .is_none_or(|m| stat_identity(m) != identity(&held)))
+        {
+            return Err(boundary(&path, "state replaced during descriptor open"));
+        }
+        self.recheck()?;
+        Ok(file)
+    }
+
+    pub(super) fn remove_leaf(&self, leaf: Leaf) -> Result<()> {
+        self.recheck()?;
+        let Some(state) = &self.state else {
+            return Ok(());
+        };
+        let path = self.files.path(leaf);
+        let name = path
+            .file_name()
+            .ok_or_else(|| boundary(&path, "missing state name"))?;
+        if let Some(meta) = stat(state, name, &path)? {
+            check_stat(self.files, &path, &meta, false)?;
+            syscall(
+                unlinkat(state, name, UnlinkatFlags::NoRemoveDir),
+                "unlinkat checked state",
+                &path,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn rename_record(&self, expected: Identity) -> Result<()> {
+        self.recheck()?;
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| boundary(&self.files.state, "missing state directory"))?;
+        let temporary = self.files.path(Leaf::Temporary);
+        let record = self.files.path(Leaf::Record);
+        let from = temporary
+            .file_name()
+            .ok_or_else(|| boundary(&temporary, "missing temporary name"))?;
+        let to = record
+            .file_name()
+            .ok_or_else(|| boundary(&record, "missing record name"))?;
+        let now = stat(state, from, &temporary)?
+            .ok_or_else(|| boundary(&temporary, "temporary disappeared"))?;
+        check_stat(self.files, &temporary, &now, false)?;
+        if stat_identity(&now) != expected {
+            return Err(boundary(&temporary, "temporary replaced"));
+        }
+        if stat(state, to, &record)?.is_some() {
+            return Err(boundary(&record, "record appeared after invalidation"));
+        }
+        syscall(
+            renameat(state, from, state, to),
+            "renameat completed record",
+            &record,
+        )
+    }
+
+    // Preflight the entire tree before deleting anything. During removal repeat
+    // the checks at each component; never follow an artifact symlink. A racing
+    // rename after the final check is the disclosed D45 residual.
+    pub(super) fn remove_build(&self) -> Result<()> {
+        self.recheck()?;
+        let Some(target) = &self.target else {
+            return Ok(());
+        };
+        let name = self.files.build_name();
+        let path = self.files.build_path();
+        if let Some(build) = directory(self.files, target, OsStr::new(name), &path)? {
+            let mut remaining = MAX_ENTRIES;
+            scan(self.files, &build, &path, 0, &mut remaining)?;
+            remaining = MAX_ENTRIES;
+            remove_contents(self.files, &build, &path, 0, &mut remaining)?;
+            let now = stat(target, OsStr::new(name), &path)?
+                .ok_or_else(|| boundary(&path, "target disappeared before removal"))?;
+            check_stat(self.files, &path, &now, true)?;
+            if stat_identity(&now)
+                != identity(&at(build.metadata(), "fstat removed target", &path)?)
+            {
+                return Err(boundary(&path, "target replaced before removal"));
+            }
+            syscall(
+                unlinkat(target, name, UnlinkatFlags::RemoveDir),
+                "unlinkat target directory",
+                &path,
+            )?;
+            at(
+                target.sync_all(),
+                "synchronize target parent",
+                &self.files.root.join("target"),
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn create_build(&self) -> Result<()> {
+        self.recheck()?;
+        let target = self
+            .target
+            .as_ref()
+            .ok_or_else(|| boundary(&self.files.root.join("target"), "missing target parent"))?;
+        make_directory(
+            self.files,
+            target,
+            OsStr::new(self.files.build_name()),
+            &self.files.build_path(),
+        )?;
+        Ok(())
     }
 }
 
@@ -350,6 +507,89 @@ fn scan(
                 scan(files, &directory, &child, depth + 1, remaining)?;
             }
             SFlag::S_IFREG | SFlag::S_IFLNK => {} // Never follow artifact symlinks.
+            _ => return Err(boundary(&child, "special entry inside target")),
+        }
+    }
+    Ok(())
+}
+
+fn make_directory(files: &StateFiles, parent: &File, name: &OsStr, path: &Path) -> Result<File> {
+    if let Some(file) = directory(files, parent, name, path)? {
+        return Ok(file);
+    }
+    syscall(
+        mkdirat(parent, name, Mode::S_IRWXU),
+        "mkdirat private directory",
+        path,
+    )?;
+    let file = directory(files, parent, name, path)?
+        .ok_or_else(|| boundary(path, "created directory disappeared"))?;
+    at(parent.sync_all(), "synchronize new directory parent", path)?;
+    Ok(file)
+}
+
+fn remove_contents(
+    files: &StateFiles,
+    parent: &File,
+    path: &Path,
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<()> {
+    if depth >= MAX_DEPTH {
+        return Err(Fault::Unavailable("native target removal depth limit"));
+    }
+    let mut dir = syscall(
+        Dir::openat(parent, ".", flags(), Mode::empty()),
+        "openat removal enumeration",
+        path,
+    )?;
+    let mut names = Vec::new();
+    for entry in dir.iter() {
+        let entry = syscall(entry, "read removal directory", path)?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        *remaining = remaining
+            .checked_sub(1)
+            .ok_or(Fault::Unavailable("native target removal entry limit"))?;
+        names.push(OsString::from_vec(name.to_vec()));
+    }
+    drop(dir);
+    names.sort();
+    for name in names {
+        let child = path.join(&name);
+        let meta = stat(parent, &name, &child)?
+            .ok_or_else(|| boundary(&child, "entry disappeared during removal"))?;
+        if meta.st_uid != files.owner || device(&meta) != files.device {
+            return Err(boundary(&child, "different owner or filesystem"));
+        }
+        match SFlag::from_bits_truncate(meta.st_mode) & SFlag::S_IFMT {
+            SFlag::S_IFDIR => {
+                let dir = directory(files, parent, &name, &child)?
+                    .ok_or_else(|| boundary(&child, "directory disappeared during removal"))?;
+                remove_contents(files, &dir, &child, depth + 1, remaining)?;
+                let now = stat(parent, &name, &child)?
+                    .ok_or_else(|| boundary(&child, "directory disappeared before unlink"))?;
+                check_stat(files, &child, &now, true)?;
+                if stat_identity(&now)
+                    != identity(&at(dir.metadata(), "fstat removal directory", &child)?)
+                {
+                    return Err(boundary(&child, "directory replaced before unlink"));
+                }
+                syscall(
+                    unlinkat(parent, name.as_os_str(), UnlinkatFlags::RemoveDir),
+                    "unlinkat child directory",
+                    &child,
+                )?;
+            }
+            SFlag::S_IFREG | SFlag::S_IFLNK => {
+                syscall(
+                    unlinkat(parent, name.as_os_str(), UnlinkatFlags::NoRemoveDir),
+                    "unlinkat target entry no-follow",
+                    &child,
+                )?;
+            }
             _ => return Err(boundary(&child, "special entry inside target")),
         }
     }
