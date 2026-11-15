@@ -9,6 +9,7 @@ use std::time::Duration;
 
 pub(super) const MAX_FILES: usize = 32;
 pub(super) const MAX_BUNDLE: usize = 64 * 1024 * 1024;
+const MAX_STRUCTURED: usize = 1024 * 1024;
 pub(super) const STEPS: &[&str] = &[
     "build",
     "test",
@@ -241,7 +242,9 @@ pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<()> 
         [40, 64].contains(&commit.len()) && commit.bytes().all(|b| b.is_ascii_hexdigit()),
         "expected commit must be a full object id"
     );
-    let directory = directory.canonicalize()?;
+    // Canonicalization first would erase a linked bundle root. Check every
+    // component before resolving it or reading any evidence through it.
+    let directory = std::path::absolute(directory)?;
     files::real_directories(&directory)?;
     let manifest = files::text(&directory.join("MANIFEST"), 16 * 1024)?;
     let mut entries = BTreeMap::new();
@@ -255,7 +258,20 @@ pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<()> 
         if name.starts_with("steps/") {
             files::real_directories(&directory.join("steps"))?;
         }
-        let bytes = files::read(&directory.join(name), inventory::MAX_LOG)?;
+        let structured = [
+            "result.txt",
+            "environment.txt",
+            "tools.txt",
+            "inventory.tsv",
+        ]
+        .contains(&name);
+        let limit = if structured && name != "inventory.tsv" {
+            MAX_STRUCTURED
+        } else {
+            inventory::MAX_LOG
+        };
+        let bytes = files::read(&directory.join(name), limit)?;
+        ensure!(!structured || !bytes.contains(&0), "NUL in {name}");
         total += bytes.len();
         ensure!(
             total <= MAX_BUNDLE && blob(repo, &bytes)? == digest,
@@ -270,6 +286,32 @@ pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<()> 
         "tools.txt",
     ] {
         ensure!(entries.contains_key(name), "missing {name}");
+    }
+    // An unmanifested file is not evidence. Inspect just the two permitted
+    // directory levels, never recurse through arbitrary entries or links.
+    for (path, prefix) in [(&directory, ""), (&directory.join("steps"), "steps/")] {
+        files::real_directories(path)?;
+        for (count, entry) in std::fs::read_dir(path)?.enumerate() {
+            ensure!(count <= MAX_FILES, "evidence file count budget");
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_str().context("evidence file name UTF-8")?;
+            if prefix.is_empty() && ["MANIFEST", "steps"].contains(&name) {
+                continue;
+            }
+            ensure!(
+                entries.contains_key(&format!("{prefix}{name}")),
+                "unexpected unmanifested file: {prefix}{name}"
+            );
+        }
+    }
+    let mut tool_fields = BTreeMap::new();
+    for line in entries["tools.txt"].lines() {
+        let (name, value) = line.split_once(':').context("tools.txt field")?;
+        ensure!(
+            !name.is_empty() && tool_fields.insert(name, value.trim()).is_none(),
+            "duplicate or empty tools.txt field {name}"
+        );
     }
     let result = &entries["result.txt"];
     let mut fields = BTreeMap::new();
@@ -293,8 +335,13 @@ pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<()> 
         ("dirty-end", "no"),
         ("moved", "no"),
         ("part", "-"),
-        ("lease", "exclusive"),
         ("lease-default", "yes"),
+        ("lease-path", "default"),
+        ("lease-override", "no"),
+        ("lease-held-through-teardown", "yes"),
+        ("lease-lost", "no"),
+        ("lease-holder-live", "yes"),
+        ("lease-token-match", "yes"),
         ("pinned-toolchain", "yes"),
         ("target-finished", "yes"),
     ] {
@@ -303,6 +350,25 @@ pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<()> 
             "evidence predicate {name}"
         );
     }
+    ensure!(
+        matches!(
+            (
+                fields.get("lease").copied(),
+                fields.get("lease-authority").copied()
+            ),
+            (Some("exclusive"), Some("kernel-exclusive"))
+                | (Some("inherited"), Some("live-exclusive-holder"))
+        ),
+        "evidence predicate lease authority"
+    );
+    let target = fields.get("target").context("missing target outcome")?;
+    ensure!(
+        ["created", "reused", "deleted"].contains(target)
+            || target
+                .strip_prefix("reset: ")
+                .is_some_and(|reason| !reason.is_empty()),
+        "target outcome did not finish"
+    );
     let tier = fields.get("tier").context("missing tier")?;
     ensure!(
         ["full", "pr"].contains(tier)
@@ -313,6 +379,16 @@ pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<()> 
         fields.get("judge-source-id") == Some(&super::judge::at_commit(repo, commit)?.as_str()),
         "judge-source-id mismatch"
     );
+    let tree = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--verify", &format!("{commit}^{{tree}}")])
+        .output()?;
+    ensure!(tree.status.success(), "expected commit tree unavailable");
+    let tree = String::from_utf8(tree.stdout)?;
+    for name in ["tree", "tree-start", "tree-end"] {
+        ensure!(fields.get(name) == Some(&tree.trim()), "{name} mismatch");
+    }
     for name in STEPS {
         ensure!(
             fields.get(format!("step-{name}-status").as_str()) == Some(&"pass"),
@@ -431,8 +507,16 @@ mod tests {
         assert!(head.status.success());
         let commit = String::from_utf8(head.stdout).unwrap().trim().to_owned();
         let judge = super::super::judge::at_commit(repo, &commit).unwrap();
+        let tree = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD^{tree}"])
+            .output()
+            .unwrap();
+        assert!(tree.status.success());
+        let tree = String::from_utf8(tree.stdout).unwrap().trim().to_owned();
         let mut result = format!(
-            "verdict: PASSED (tier pr)\ncommit: {commit}\nhead-end: {commit}\ntier: pr\npart: -\ndirty: no\ndirty-end: no\nmoved: no\nlease: exclusive\nlease-default: yes\npinned-toolchain: yes\ntarget-finished: yes\nreal-home-coverage: complete\njudge-source-id: {judge}\nqualifying: yes\n"
+            "verdict: PASSED (tier pr)\ncommit: {commit}\nhead-end: {commit}\ntree: {tree}\ntree-start: {tree}\ntree-end: {tree}\ntarget: reused\nlease-path: default\nlease-override: no\nlease-held-through-teardown: yes\nlease-lost: no\nlease-holder-live: yes\nlease-token-match: yes\nlease-authority: kernel-exclusive\ntier: pr\npart: -\ndirty: no\ndirty-end: no\nmoved: no\nlease: exclusive\nlease-default: yes\npinned-toolchain: yes\ntarget-finished: yes\nreal-home-coverage: complete\njudge-source-id: {judge}\nqualifying: yes\n"
         );
         let mut entries = BTreeMap::new();
         for step in STEPS {
@@ -475,6 +559,11 @@ mod tests {
         verify(repo, &root.0.join("positive"), &commit).unwrap();
         for (i, (from, to, reason)) in [
             ("qualifying: yes", "qualifying: no: partial", "qualifying"),
+            (
+                "qualifying: yes",
+                "qualifying: yes\nschema: 1\nschema: 1",
+                "duplicate",
+            ),
             ("step-test-exit: 0", "step-test-exit: 101", "test exit"),
             (
                 "step-test-status: pass",
@@ -483,6 +572,23 @@ mod tests {
             ),
             ("head-end: ", "head-end: wrong", "head-end"),
             ("judge-source-id: ", "judge-source-id: wrong", "judge"),
+            ("tree-end: ", "tree-end: wrong", "tree"),
+            ("target: reused", "target: kept (unreaped child)", "target"),
+            ("lease-override: no", "lease-override: yes", "lease"),
+            ("lease-lost: no", "lease-lost: yes", "lease"),
+            ("lease-path: default", "lease-path: /override", "lease"),
+            ("lease-holder-live: yes", "lease-holder-live: no", "lease"),
+            ("lease-token-match: yes", "lease-token-match: no", "lease"),
+            (
+                "lease-held-through-teardown: yes",
+                "lease-held-through-teardown: no",
+                "lease",
+            ),
+            (
+                "lease-authority: kernel-exclusive",
+                "lease-authority: diagnostic-only",
+                "lease",
+            ),
         ]
         .into_iter()
         .enumerate()
@@ -497,6 +603,86 @@ mod tests {
                     .contains(reason)
             );
         }
+        // Parser success is not suite success: a structurally valid failed
+        // inventory cannot verify even when every success alias is forged green.
+        entries.insert("result.txt".into(), result.as_bytes().to_vec());
+        entries.insert(
+            "steps/test.log".into(),
+            log.replace("example ... ok", "example ... FAILED")
+                .replace("ok. 1 passed; 0 failed", "FAILED. 0 passed; 1 failed")
+                .into_bytes(),
+        );
+        entries.insert(
+            "inventory.tsv".into(),
+            b"lib\tfixture\tfixture\texample\tfailed\n".to_vec(),
+        );
+        let failed = root.0.join("failed-suite");
+        export(repo, &failed, &entries, &redactor).unwrap();
+        assert!(
+            verify(repo, &failed, &commit)
+                .unwrap_err()
+                .to_string()
+                .contains("process exit")
+        );
+        entries.insert("steps/test.log".into(), log.as_bytes().to_vec());
+        entries.insert(
+            "inventory.tsv".into(),
+            b"lib\tfixture\tfixture\texample\tok\n".to_vec(),
+        );
+
+        let tools = String::from_utf8(entries["tools.txt"].clone()).unwrap();
+        let bounded = format!(
+            "{tools}git: git version {}\n",
+            "x".repeat(1024 * 1024 - tools.len() - "git: git version \n".len())
+        );
+        assert_eq!(bounded.len(), 1024 * 1024);
+        entries.insert("tools.txt".into(), bounded.as_bytes().to_vec());
+        let boundary = root.0.join("tools-boundary");
+        export(repo, &boundary, &entries, &redactor).unwrap();
+        verify(repo, &boundary, &commit).unwrap();
+        for (i, bad, reason) in [
+            (
+                0,
+                bounded.replacen("git: git version ", "git: git version x", 1),
+                "budget",
+            ),
+            (1, tools.clone() + "git: git version \0\n", "NUL"),
+            (2, tools.clone() + "rustc: duplicate\n", "duplicate"),
+        ] {
+            entries.insert("tools.txt".into(), bad.as_bytes().to_vec());
+            let path = root.0.join(format!("tools-negative-{i}"));
+            export(repo, &path, &entries, &redactor).unwrap();
+            // Export escapes NULs. An independent producer can supply raw bytes
+            // and a matching manifest, which the verifier must still reject.
+            std::fs::write(path.join("tools.txt"), bad).unwrap();
+            let manifest = entries
+                .keys()
+                .map(|name| {
+                    let bytes = std::fs::read(path.join(name)).unwrap();
+                    format!("{}  {name}\n", blob(repo, &bytes).unwrap())
+                })
+                .collect::<String>();
+            std::fs::write(path.join("MANIFEST"), manifest).unwrap();
+            let error = format!("{:#}", verify(repo, &path, &commit).unwrap_err());
+            assert!(
+                error.contains("tools.txt") && error.contains(reason),
+                "{error}"
+            );
+        }
+        entries.insert("tools.txt".into(), tools.into_bytes());
+        entries.insert(
+            "result.txt".into(),
+            result
+                .replace("lease: exclusive", "lease: inherited")
+                .replace(
+                    "lease-authority: kernel-exclusive",
+                    "lease-authority: live-exclusive-holder",
+                )
+                .into_bytes(),
+        );
+        let inherited = root.0.join("inherited");
+        export(repo, &inherited, &entries, &redactor).unwrap();
+        verify(repo, &inherited, &commit).unwrap();
         std::fs::write(root.0.join("positive/steps/test.log"), b"changed").unwrap();
         assert!(
             verify(repo, &root.0.join("positive"), &commit)

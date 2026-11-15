@@ -150,6 +150,12 @@ pub enum LeaseCommand {
 }
 
 pub fn run(repo: &Path, args: GateArgs) -> Result<i32> {
+    // Argument misuse is rejected before filesystem, environment or lease work,
+    // including --plan. The legacy warm mode belongs to full only.
+    if args.command.is_none() && args.warm && args.tier != Tier::Full {
+        eprintln!("gate: --warm is only valid for full");
+        return Ok(2);
+    }
     match args.command {
         Some(GateCommand::Select(select)) => {
             gate_selection::run_cli(repo, select)?;
@@ -190,10 +196,8 @@ pub fn run(repo: &Path, args: GateArgs) -> Result<i32> {
                 } else {
                     print!("{text}");
                 }
-                anyhow::ensure!(
-                    rows.iter().all(|r| r.status != "failed"),
-                    "suite test failure"
-                );
+                // This helper judges completeness/consistency. Suite execution
+                // and evidence verification separately reject failed tests.
                 Ok(())
             })();
             match result {
@@ -293,6 +297,54 @@ mod tests {
         ] {
             assert_eq!(Cli::try_parse_from(args).unwrap_err().exit_code(), 2);
         }
+    }
+
+    #[test]
+    fn pr_warm_is_usage_before_any_runtime_or_plan() {
+        let scratch = steps::tests::Scratch::new();
+        for flags in [vec!["pr", "--warm"], vec!["pr", "--warm", "--plan"]] {
+            assert_eq!(run(&scratch.0.join("missing"), parse(&flags)).unwrap(), 2);
+            assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn inventory_helper_accepts_consistent_failed_rows_without_passing_the_suite() {
+        let scratch = steps::tests::Scratch::new();
+        let log = scratch.0.join("test.log");
+        let map = scratch.0.join("map.jsonl");
+        let out = scratch.0.join("inventory.tsv");
+        std::fs::write(&log, "Running unittests src/lib.rs (/fixture/test)\nrunning 1 test\ntest actual ... FAILED\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n").unwrap();
+        std::fs::write(&map, serde_json::json!({"reason":"compiler-artifact","package_id":"path+file:///fixture#fixture@0.1.0","profile":{"test":true},"executable":"/fixture/test","target":{"kind":["lib"],"name":"fixture"}}).to_string()).unwrap();
+        let args = parse(&[
+            "inventory",
+            "--log",
+            log.to_str().unwrap(),
+            "--executables",
+            map.to_str().unwrap(),
+            "--exit",
+            "101",
+            "--out",
+            out.to_str().unwrap(),
+        ]);
+        assert_eq!(run(&scratch.0, args).unwrap(), 0);
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "lib\tfixture\tfixture\tactual\tfailed\n"
+        );
+        assert_eq!(
+            report::exit(
+                &[report::Step {
+                    name: "test",
+                    verdict: report::Verdict::Fail,
+                    exit: Some(101),
+                    elapsed: std::time::Duration::ZERO,
+                    detail: "failed suite; inventory parsed".into()
+                }],
+                false
+            ),
+            1
+        );
     }
 
     #[test]

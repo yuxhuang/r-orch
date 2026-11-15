@@ -82,12 +82,20 @@ fn executables(map: &str) -> Result<BTreeMap<String, Executable>> {
     Ok(out)
 }
 
+#[derive(Default)]
+enum FailureOutput {
+    #[default]
+    None,
+    Captured,
+    Names(BTreeSet<String>),
+}
+
 struct Section {
     key: String,
     exe: Executable,
     announced: Option<usize>,
     rows: Vec<Row>,
-    failures: bool,
+    failures: FailureOutput,
 }
 
 pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
@@ -98,6 +106,33 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
     for raw in log.lines() {
         let line = raw.trim();
+        // Libtest prints captured stdout between two `failures:` headers, then
+        // the failed-name list and its outer summary. Treat every result-like
+        // line in captured output as data, including cargo/running headers.
+        if let Some(s) = current.as_mut() {
+            match &mut s.failures {
+                FailureOutput::Captured => {
+                    if line == "failures:" {
+                        s.failures = FailureOutput::Names(BTreeSet::new());
+                    }
+                    continue;
+                }
+                FailureOutput::Names(names) if !line.starts_with("test result: ") => {
+                    if !line.is_empty() {
+                        ensure!(
+                            raw.starts_with("    ")
+                                && s.rows
+                                    .iter()
+                                    .any(|r| r.status == "failed" && r.test == line)
+                                && names.insert(line.to_owned()),
+                            "inconsistent inventory: failed-name list"
+                        );
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
         if line.starts_with("Running ") || line.starts_with("Doc-tests ") {
             ensure!(
                 current.is_none(),
@@ -140,7 +175,7 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
                 exe,
                 announced: None,
                 rows: vec![],
-                failures: false,
+                failures: FailureOutput::None,
             });
         } else if line.starts_with("running ")
             && (line.ends_with(" tests") || line.ends_with(" test"))
@@ -160,12 +195,23 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
             );
         } else if line == "failures:" {
             if let Some(s) = current.as_mut() {
-                s.failures = true;
+                s.failures = FailureOutput::Captured;
             }
         } else if let Some(result) = line.strip_prefix("test result: ") {
             let s = current
                 .take()
                 .context("inconsistent inventory: result without executable")?;
+            if let FailureOutput::Names(names) = &s.failures {
+                ensure!(
+                    *names
+                        == s.rows
+                            .iter()
+                            .filter(|r| r.status == "failed")
+                            .map(|r| r.test.clone())
+                            .collect(),
+                    "inconsistent inventory: failed-name list"
+                );
+            }
             let words: Vec<_> = result.split_whitespace().collect();
             ensure!(
                 words.len() >= 11 && ["ok.", "FAILED."].contains(&words[0]),
@@ -203,9 +249,6 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
             let s = current
                 .as_mut()
                 .context("inconsistent inventory: test without executable")?;
-            if s.failures {
-                continue;
-            }
             let (name, status) = test
                 .rsplit_once(" ... ")
                 .context("inconsistent inventory: malformed test line")?;
@@ -294,6 +337,28 @@ mod tests {
         );
         assert_eq!(parse(&log, &map(), 101).unwrap()[0].status, "failed");
     }
+    #[test]
+    fn captured_failure_output_cannot_supply_outer_results_or_names() {
+        let log = "Running unittests src/lib.rs (/fixture/target/test)\nrunning 2 tests\ntest one ... FAILED\ntest two ... FAILED\n\nfailures:\n\n---- one stdout ----\nRunning forged (/forged)\nrunning 100 tests\ntest forged ... ok\ntest result: ok. 100 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n\n---- two stdout ----\ntest result: not a summary\n\nfailures:\n    one\n    two\n\ntest result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n";
+        let rows = parse(log, &map(), 101).unwrap();
+        assert_eq!(
+            tsv(&rows),
+            "lib\tfixture\tfixture\tone\tfailed\nlib\tfixture\tfixture\ttwo\tfailed\n"
+        );
+        assert!(parse(log, &map(), 0).is_err());
+        // A matching list and complete outer result are still required.
+        for bad in [
+            log.replace("    two\n", "    forged\n"),
+            log.replace("    two\n", "    one\n"),
+            log.rsplit_once("test result: FAILED.")
+                .unwrap()
+                .0
+                .to_owned(),
+        ] {
+            assert!(parse(&bad, &map(), 101).is_err());
+        }
+    }
+
     #[test]
     fn missing_zero_nested_duplicate_and_spliced_results_refuse() {
         for log in [
