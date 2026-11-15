@@ -35,6 +35,7 @@ pub(super) struct Runner<'a, 'm> {
     probe_statuses: Vec<Status>,
     unreaped_probe: bool,
     failed: bool,
+    failure_detail: Option<String>,
     signals: Option<Signals>,
     kill_end: Option<Instant>,
     finishing: bool,
@@ -73,6 +74,7 @@ impl<'a, 'm> Runner<'a, 'm> {
             probe_statuses: Vec::new(),
             unreaped_probe: false,
             failed: false,
+            failure_detail: None,
             signals: if marker.is_none() {
                 Some(Signals::new()?)
             } else {
@@ -311,11 +313,20 @@ impl<'a, 'm> Runner<'a, 'm> {
         exit.context("missing terminal direct status")
     }
 
+    fn remember_failure<T>(&mut self, result: &Result<T>) {
+        if let Err(error) = result {
+            self.failed = true;
+            // The first failure can disappear before finish (for example a
+            // temporary link removed by another process). Keep its full causal
+            // chain rather than replacing it with the sticky lifecycle flag.
+            self.failure_detail
+                .get_or_insert_with(|| format!("{error:#}"));
+        }
+    }
+
     pub(super) fn run(&mut self, command: &mut Command) -> Result<ExitStatus> {
         let result = self.start(command).and_then(|()| self.drive(None));
-        if result.is_err() {
-            self.failed = true;
-        }
+        self.remember_failure(&result);
         result
     }
 
@@ -329,9 +340,7 @@ impl<'a, 'm> Runner<'a, 'm> {
             );
             Ok(out.stdout)
         });
-        if result.is_err() {
-            self.failed = true;
-        }
+        self.remember_failure(&result);
         result
     }
 
@@ -351,8 +360,8 @@ impl<'a, 'm> Runner<'a, 'm> {
                 exit,
             })
         })();
+        self.remember_failure(&result);
         if result.is_err() {
-            self.failed = true;
             // Includes pipe setup failure after spawn. Still own/reap the child.
             if self.child.is_some() && self.kill_end.is_none() {
                 let _ = self.stop();
@@ -391,11 +400,9 @@ impl<'a, 'm> Runner<'a, 'm> {
                 .into()),
             }
         })();
-        if result.is_err() {
-            self.failed = true;
-            if self.child.is_some() && self.kill_end.is_none() {
-                let _ = self.stop();
-            }
+        self.remember_failure(&result);
+        if result.is_err() && self.child.is_some() && self.kill_end.is_none() {
+            let _ = self.stop();
         }
         result
     }
@@ -428,7 +435,10 @@ impl<'a, 'm> Runner<'a, 'm> {
         );
         ensure!(
             !self.failed && self.child.is_none(),
-            "direct command not reaped or lifecycle failed"
+            "direct command not reaped or lifecycle failed: {}",
+            self.failure_detail
+                .as_deref()
+                .unwrap_or("no causal detail available")
         );
         self.validate()
     }
@@ -454,7 +464,11 @@ impl std::fmt::Display for LogFailure {
         write!(f, "{}", self.error)
     }
 }
-impl std::error::Error for LogFailure {}
+impl std::error::Error for LogFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.error.as_ref())
+    }
+}
 
 pub(super) struct Raw {
     pub(super) stdout: Vec<u8>,

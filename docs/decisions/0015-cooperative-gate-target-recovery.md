@@ -706,7 +706,7 @@ as preconditions by the normal-development amendment. D45 remains unchanged.
 | Grace after observing handled INT/TERM/HUP | 2 seconds from forwarding the first signal to the unreaped direct child | Gives ordinary command cleanup an opportunity without letting a TERM-ignoring command hold iteration indefinitely |
 | Wait after KILL | 3 seconds from the first KILL attempt, shared by normal error and Drop paths; no fresh allowance on retry/Drop | Poll `try_wait` through the exclusive owned Child; only an actually collected status establishes reaping. An unreaped child means incomplete teardown, unknown status, kept target/marker, no publication |
 | Marker lock at admission | 0 seconds (`try_lock` once), REFUSED exit 1 if busy | A live earlier direct child may own the inherited description. Never wait indefinitely, unlink, replace, steal or explicitly unlock the marker |
-| Machine lease | Existing caller-configured `--lease-wait`, default 30 seconds total across turnstile and lease; contention exit 75 | One shared admission deadline, distinct from the zero-wait target marker |
+| Machine lease | Existing caller-configured `--lease-wait`, default 30 minutes total across turnstile and lease; contention exit 75 | One shared admission deadline, distinct from the zero-wait target marker |
 | Capture after direct exit | 250 milliseconds for both output EOFs; then capture failure and kept state | Descendants can retain a pipe indefinitely under D41. Closing our pipe descriptors is allowed; their EOF is not proof that the direct child exited |
 | Poll/service interval | Nominal 10 milliseconds; at most 64 KiB per pipe per service batch | Continuous output cannot starve signal observation, escalation or reaping; capture retains only its requested stdout budget and 16 KiB stderr |
 | Target reset/deletion, cold removal at start/end/interrupt | No supported production operation yet: native D45 admission refuses before mutation | Native F2 is incomplete. No elapsed-time promise or destructive fallback is invented. The missing namespace primitive/assumption needs a product decision before native integration |
@@ -811,3 +811,12 @@ failure. Earlier private fixture logs revealed automatic downloads under an
 unresolved short alias; those logs are retained, not hermetic qualification.
 The fixed internal tooling control is not an extension of the seven-name
 exported environment allowlist. No dependency/toolchain version is changed.
+
+## D47 lease-unit correction (2026-11-15)
+
+The F3 proposal's machine-lease row originally said 30 seconds. This was a stale
+unit label, not an approved CLI change. The approved plan section 1 specifies
+`--lease-wait <min>` default 30; `gate.rs` help/parser and `tier.rs` and `gate.sh`
+convert those minutes to seconds. Retain 30 minutes and correct the row above.
+Marker admission remains a separate zero-wait operation. Other proposed D47
+values and open whole-gate qualification/review obligations are unchanged.

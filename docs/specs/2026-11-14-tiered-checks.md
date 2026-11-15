@@ -6,6 +6,48 @@ date: 2026-11-14
 plan: [../plans/2026-11-14-tiered-checks.md](../plans/2026-11-14-tiered-checks.md)
 decision record: [ADR 0013](../decisions/0013-tiered-verification-gates.md) (accepted at revision 2); [ADR 0014](../decisions/0014-gate-target-recovery-and-selection-coupling.md) (accepted) is its partial successor: it supersedes named clauses of decisions 30 and 31 and qualifies decisions 14, 15, 17 and 21. The owner's relaxation of ADR 0014's cessation rule on 2026-11-15 is recorded in [ADR 0015](../decisions/0015-cooperative-gate-target-recovery.md), which is proposed: its decision 41 is the owner's and is binding, and the implementation contract derived from it (decisions 42–47) is proposed, pending review
 
+## Integrated production defect repair (2026-11-15)
+
+Scoped repair starts at independent C head `608113814a64fdc12fd07141f14a3daf6efc4fce`.
+The seven existing C test files stay byte-for-byte unchanged. This amendment adds
+no contract relaxation and does not replace the original failed evidence.
+
+| Repair | Required behavior and verification |
+|---|---|
+| RC18 unfinished use | Enumerate the actual fixed direct commands, tool versions, platform and filesystem; exercise actual marker inheritance, holder KILL, live-direct-process exclusion and last-close recovery, with discriminators. Enable only combinations supported by that evidence. Neither a platform allowlist, simulation policy, free lease, PID census nor EOF grants recovery. If qualification is incomplete, keep Unsupported and the real red recovery positive, and provide an explicit command qualification ledger. |
+| Closed terminal | Fallible terminal output must not panic or bypass retained report/export/cleanup. Preserve handled TERM exit 143 and actual direct-child reap even when both terminal pipes are closed. Other terminal I/O errors remain failures, with their cause retained when possible. |
+| Causal fault path | Preserve the causal structural error and offending `warm.record.tmp` path through lifecycle validation and retained/redacted diagnostics. Refuse the link without touching the outside canary. Keep the separate private regular-temporary publication-collision control. |
+| Lease units | Retain public `--lease-wait <min>` default 30 minutes: approved plan section 1, CLI parsing and tier/bootstrap multiplication by 60 agree. The dated F3 proposed D47 table's seconds were stale; no numeric policy changes. |
+
+Run the three exact C reproducers, qualification positive/negative controls, then
+freeze a clean local SHA and run the full xtask package at that exact head plus
+build, scoped clippy, fmt and crate-graph. Record identities/counts, commands,
+statuses, source hashes and every changed/added test body. No full workspace or
+benchmark acceptance is supplied by these checks. Whole-gate reviews, Mac/Linux
+measurements, same-commit R4/R11, RC18 Linux, final-head Linux and nextest remain
+due. D45's interim same-account check-to-mutation race (revisit when storage
+changes), FS1 escaped descendants, and manual marker removal are distinct risks.
+
+
+Repair outcome before freeze: terminal EPIPE and causal temporary-path corrections
+pass the unchanged C reproducers. The added transient-link control also fails
+against the predecessor runner, then passes restored. `gate_recovery.rs` exercises
+19 real direct-command forms per filesystem on native macOS, on the worktree and
+scratch filesystems: Git version/inventory/deleted/hash, rustc identity/version,
+Cargo version/build/map/test/clippy/fmt/run-crate-graph, cargo-deny version/check,
+ps, load/boot sysctl and notifyutil. The observed kernel lock is busy after the
+primitive holder's KILL while the direct process is live, and granted after its
+last close. Dropped-stdin and explicit-unlock discriminators grant the lock while
+the command is live. These observations are **partial RC18**, not a successful
+native recovery/reset: the holder is a primitive test fixture, individual
+observations do not qualify complete command lifetimes, and direct stdin
+inspection of macOS setuid `ps` is unavailable. The real C native-gate reset
+positive remains red. Production `NativeTarget::begin` therefore still uses
+Unsupported; no simulation policy or platform-name allowlist is promoted.
+Linux, other tool sets/filesystems and native last-close reset remain unqualified.
+The external handoff contains exact tool/filesystem identities and the incomplete
+qualification ledger; none of these scoped controls is whole-workspace acceptance.
+
 ## Owner D45 native mutation amendment (2026-11-15)
 
 The owner answered: “make a note in your report and relax it for now. because we
@@ -165,7 +207,7 @@ remain due. AGENTS.md and live rules remain unchanged.
 The proposed D47 bounds are now recorded as one set in
 [ADR 0015, F3 implementation proposal](../decisions/0015-cooperative-gate-target-recovery.md#f3-implementation-proposal-2026-11-15):
 2s forwarded-signal grace, 3s KILL/reap (not reset by Drop), zero marker-lock wait,
-existing 30s default machine-lease wait, 250ms post-reap capture EOF drain and a
+existing 30-minute default machine-lease wait (the original F3 seconds label was stale), 250ms post-reap capture EOF drain and a
 nominal 10ms poll interval. Blocking filesystem/spawn/process syscalls have no hard
 elapsed-time guarantee. Publication is failure-defined; native deletion has no
 supported operation while D45 admission is unavailable. These values can be used

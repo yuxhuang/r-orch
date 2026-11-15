@@ -27,6 +27,48 @@ Eighth amendment (the owner relaxes the cessation rule, by the architect; change
 
 Ninth amendment (correction of the eighth, by the architect; changes from the eighth): the security and resilience reviewers each passed the eighth amendment with conditions at its exact commit, and the lead ruled on every point. This amendment makes those corrections and nothing else. The decision index asks for a new record when an accepted decision changes, so D41–D47 move, with their numbers, from a “revision 3” of ADR 0014 into [ADR 0015](../decisions/0015-cooperative-gate-target-recovery.md), which is proposed; D41, the owner's decision, stays binding. ADR 0014 is restored to the text accepted on 2026-11-14; only its status line, ADR 0013's status line and the decision index point to ADR 0015. Where the eighth-amendment header paragraph above says “ADR 0014 … revision 3”, read “ADR 0015”. Corrected in place: the two header lines above; the first paragraph of “Design”; the eighth-amendment record of section 12 (its mechanism paragraph, the state table and the paragraph after it, the endings, RC14 and RC16–RC18, the obligation map, the slice table and the limits; RC19–RC23, the rows SR-8 and SR-9 and the edit C10 are added); the requirements map. Added as a sentence that begins “Ninth amendment”: the target table and the two paragraphs after it in section 4; the holder and interrupt paragraphs of section 6; the qualification sentence and the CI paragraph of section 7; row I5 of section 9; the reset reasons and the kept-target paragraph of section 11; rows RS1, RS2, RS3, RS5 and RS7 and the ordering paragraph of section 12; the notes of TV15 and TV63; status rows A, C and F; “Docs to update”; open items 16 and 19–21, with items 22 and 23 added. Section 12 gains the ninth-amendment record, with the disposition of every finding, the lead's rulings on the points the eighth amendment had left open, the conflicts that stay open, and the reason for this further round. The corrections are: the state files inside the structural boundary; a marker lock that belongs to the open file description and is closed, never unlocked; the identity of the locked marker checked at admission; a defined complete record and an order of synchronization; source identities captured again at the finish; a stated outcome for a failed publication or deletion; the configured lease required, so that a run without it is refused before it changes anything, and an inherited lease checked again at the finish; and the disclosure that `cargo clean` is the ordinary case only when no command of an earlier use is still running. Requirement, vector and task ids are unchanged. No mechanism is added, no number is chosen, no requirement, vector or protection is relaxed, and nothing was built, run, probed, signalled or measured for this amendment. It clears no runtime hold.
 
+## Integrated production defect repair (2026-11-15)
+
+Scoped repair starts at independent C head `608113814a64fdc12fd07141f14a3daf6efc4fce`.
+The seven existing C test files stay byte-for-byte unchanged. This amendment adds
+no contract relaxation and does not replace the original failed evidence.
+
+| Repair | Required behavior and verification |
+|---|---|
+| RC18 unfinished use | Enumerate the actual fixed direct commands, tool versions, platform and filesystem; exercise actual marker inheritance, holder KILL, live-direct-process exclusion and last-close recovery, with discriminators. Enable only combinations supported by that evidence. Neither a platform allowlist, simulation policy, free lease, PID census nor EOF grants recovery. If qualification is incomplete, keep Unsupported and the real red recovery positive, and provide an explicit command qualification ledger. |
+| Closed terminal | Fallible terminal output must not panic or bypass retained report/export/cleanup. Preserve handled TERM exit 143 and actual direct-child reap even when both terminal pipes are closed. Other terminal I/O errors remain failures, with their cause retained when possible. |
+| Causal fault path | Preserve the causal structural error and offending `warm.record.tmp` path through lifecycle validation and retained/redacted diagnostics. Refuse the link without touching the outside canary. Keep the separate private regular-temporary publication-collision control. |
+| Lease units | Retain public `--lease-wait <min>` default 30 minutes: approved plan section 1, CLI parsing and tier/bootstrap multiplication by 60 agree. The dated F3 proposed D47 table's seconds were stale; no numeric policy changes. |
+
+Run the three exact C reproducers, qualification positive/negative controls, then
+freeze a clean local SHA and run the full xtask package at that exact head plus
+build, scoped clippy, fmt and crate-graph. Record identities/counts, commands,
+statuses, source hashes and every changed/added test body. No full workspace or
+benchmark acceptance is supplied by these checks. Whole-gate reviews, Mac/Linux
+measurements, same-commit R4/R11, RC18 Linux, final-head Linux and nextest remain
+due. D45's interim same-account check-to-mutation race (revisit when storage
+changes), FS1 escaped descendants, and manual marker removal are distinct risks.
+
+
+Repair outcome before freeze: terminal EPIPE and causal temporary-path corrections
+pass the unchanged C reproducers. The added transient-link control also fails
+against the predecessor runner, then passes restored. `gate_recovery.rs` exercises
+19 real direct-command forms per filesystem on native macOS, on the worktree and
+scratch filesystems: Git version/inventory/deleted/hash, rustc identity/version,
+Cargo version/build/map/test/clippy/fmt/run-crate-graph, cargo-deny version/check,
+ps, load/boot sysctl and notifyutil. The observed kernel lock is busy after the
+primitive holder's KILL while the direct process is live, and granted after its
+last close. Dropped-stdin and explicit-unlock discriminators grant the lock while
+the command is live. These observations are **partial RC18**, not a successful
+native recovery/reset: the holder is a primitive test fixture, individual
+observations do not qualify complete command lifetimes, and direct stdin
+inspection of macOS setuid `ps` is unavailable. The real C native-gate reset
+positive remains red. Production `NativeTarget::begin` therefore still uses
+Unsupported; no simulation policy or platform-name allowlist is promoted.
+Linux, other tool sets/filesystems and native last-close reset remain unqualified.
+The external handoff contains exact tool/filesystem identities and the incomplete
+qualification ledger; none of these scoped controls is whole-workspace acceptance.
+
 ## Owner D45 native mutation amendment (2026-11-15)
 
 The owner answered: “make a note in your report and relax it for now. because we
@@ -186,7 +228,7 @@ remain due. AGENTS.md and live rules remain unchanged.
 The proposed D47 bounds are now recorded as one set in
 [ADR 0015, F3 implementation proposal](../decisions/0015-cooperative-gate-target-recovery.md#f3-implementation-proposal-2026-11-15):
 2s forwarded-signal grace, 3s KILL/reap (not reset by Drop), zero marker-lock wait,
-existing 30s default machine-lease wait, 250ms post-reap capture EOF drain and a
+existing 30-minute default machine-lease wait (the original F3 seconds label was stale), 250ms post-reap capture EOF drain and a
 nominal 10ms poll interval. Blocking filesystem/spawn/process syscalls have no hard
 elapsed-time guarantee. Publication is failure-defined; native deletion has no
 supported operation while D45 admission is unavailable. These values can be used

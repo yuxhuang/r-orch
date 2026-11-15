@@ -4,6 +4,7 @@ use super::{
 };
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
@@ -603,19 +604,73 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
     run.finish(&repo, &entries, &command_statuses)?;
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME missing")?);
     let redactor = report::Redactor::new(&repo, &home, &std::env::temp_dir(), hostname.as_deref());
-    println!("{}", redactor.apply(text.as_bytes())?);
-    if let Some(destination) = &args.evidence {
-        ensure!(
-            hostname.is_some(),
-            "hostname unavailable; evidence export refused"
-        );
-        let digest = report::export(&repo, destination, &entries, &redactor)?;
-        println!("evidence manifest: {digest}; qualifying: {qualifying}");
-    }
+    // Report persistence and teardown do not depend on a terminal reader.
+    // In particular, EPIPE must not replace an already observed signal status.
+    let mut terminal_error = writeln!(
+        std::io::stdout().lock(),
+        "{}",
+        redactor.apply(text.as_bytes())?
+    )
+    .err();
+    let exported = (|| -> Result<()> {
+        if let Some(destination) = &args.evidence {
+            ensure!(
+                hostname.is_some(),
+                "hostname unavailable; evidence export refused"
+            );
+            let digest = report::export(&repo, destination, &entries, &redactor)?;
+            if let Err(error) = writeln!(
+                std::io::stdout().lock(),
+                "evidence manifest: {digest}; qualifying: {qualifying}"
+            ) {
+                terminal_error.get_or_insert(error);
+            }
+        }
+        Ok(())
+    })();
     // Keep unresolved scratch; successful finish leaves no directly owned child.
-    if target_finished && let Some(path) = scratch {
-        std::fs::remove_dir_all(path)?;
+    let cleanup = if target_finished && let Some(path) = scratch {
+        std::fs::remove_dir_all(path).context("remove finished gate scratch")
+    } else {
+        Ok(())
+    };
+    if let Some(error) = &terminal_error {
+        command_statuses.push_str(&format!("terminal-output-error: {error}\n"));
+        files::real_directories(&run.path)?;
+        files::read(&run.path.join("commands.txt"), 16 * 1024 * 1024)?;
+        let temporary = run.path.join("terminal-commands.tmp");
+        files::write(&temporary, command_statuses.as_bytes())?;
+        std::fs::rename(temporary, run.path.join("commands.txt"))?;
+        files::sync(&run.path)?;
     }
     drop(held);
-    Ok(code)
+    exported?;
+    cleanup?;
+    terminal_status(code, interrupted, terminal_error)
+}
+
+fn terminal_status(
+    code: i32,
+    interrupted: Option<i32>,
+    error: Option<std::io::Error>,
+) -> Result<i32> {
+    match (interrupted, error) {
+        (Some(_), _) | (_, None) => Ok(code),
+        (None, Some(error)) => {
+            Err(error).context("write terminal report (retained report is available)")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_failure_preserves_signal_but_fails_an_ordinary_run() {
+        let broken = || Some(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        assert_eq!(terminal_status(143, Some(15), broken()).unwrap(), 143);
+        assert!(terminal_status(0, None, broken()).is_err());
+        assert_eq!(terminal_status(1, None, None).unwrap(), 1);
+    }
 }

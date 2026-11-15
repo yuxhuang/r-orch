@@ -2983,6 +2983,41 @@ mod tests {
     }
 
     #[test]
+    fn native_lifecycle_retains_first_structural_cause_after_link_is_removed() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let use_ = target.begin(&lease).unwrap();
+        let temporary = f.files.path(Leaf::Temporary);
+        let error = use_
+            .run(&lease, false, |runner, _| {
+                symlink(&f.outside, &temporary).unwrap();
+                let first = runner
+                    .run(&mut std::process::Command::new("/usr/bin/true"))
+                    .unwrap_err();
+                assert!(format!("{first:#}").contains("warm.record.tmp"));
+                fs::remove_file(&temporary).unwrap();
+                // A later generic busy/failed flag must not overwrite the cause.
+                assert!(
+                    runner
+                        .run(&mut std::process::Command::new("/usr/bin/true"))
+                        .is_err()
+                );
+                Ok(())
+            })
+            .err()
+            .unwrap();
+        assert!(
+            format!("{error:#}").contains("warm.record.tmp"),
+            "{error:#}"
+        );
+        assert!(f.files.path(Leaf::Marker).exists());
+        assert!(!f.files.path(Leaf::Record).exists());
+        f.canary_unchanged();
+    }
+
+    #[test]
     fn native_lifecycle_every_publication_step_rechecks_configured_lease() {
         let f = Fixture::new();
         f2_repo(&f);
