@@ -27,6 +27,11 @@ use std::path::{Path, PathBuf};
 // The byte cap takes precedence over the count cap: hitting either withholds a
 // publication/reuse. Diagnostic bytes never participate in a state decision.
 const MAX_RECORD: usize = 8 * 1024 * 1024;
+// Header (44), two field lengths (8), count (4), terminator (8), and
+// maximum root/toolchain payloads. Any accepted Sources fits a complete record,
+// even with both identity fields at their limit; no subset/truncated publication.
+const MAX_RECORD_OVERHEAD: usize = 64 + 2 * MAX_FIELD;
+const MAX_SOURCE_BYTES: usize = MAX_RECORD - MAX_RECORD_OVERHEAD;
 const MAX_SOURCES: usize = 32 * 1024;
 const MAX_FIELD: usize = 4096;
 const MAX_DIAGNOSTIC: usize = 16 * 1024;
@@ -172,7 +177,7 @@ impl Sources {
             source_path(&entry.path)?;
             content_id(&entry.content)?;
             total = total.saturating_add(entry.path.len() + entry.content.len() + 8);
-            if total > MAX_RECORD {
+            if total > MAX_SOURCE_BYTES {
                 return Err(Fault::Codec("source inventory byte limit"));
             }
             if all.insert(entry.path.clone(), entry).is_some() {
@@ -230,9 +235,14 @@ impl Record {
             return Err(Fault::Codec("invalid root, toolchain or source count"));
         }
         BootId::from_bytes(self.boot.0)?;
+        let mut size = 64 + self.root.len() + self.toolchain.len();
         for (path, content) in &self.sources {
             source_path(path)?;
             content_id(content)?;
+            size = size.saturating_add(8 + path.len() + content.len());
+            if size > MAX_RECORD {
+                return Err(Fault::Codec("record byte limit"));
+            }
         }
         Ok(())
     }
@@ -380,6 +390,14 @@ impl<'a> Cursor<'a> {
 enum Stored {
     Missing,
     Damaged,
+    // Unreadable regular content still resets, with the original I/O context
+    // available for F4's diagnostic. Codec damage has no OS errno to preserve.
+    Unreadable {
+        operation: &'static str,
+        path: PathBuf,
+        errno: Option<i32>,
+        detail: String,
+    },
     Complete(Record),
 }
 
@@ -485,7 +503,7 @@ fn decide(o: Admission, record: &Stored, current: Current<'_>) -> Action {
     }
     match record {
         Stored::Missing => Action::Reset(Reset::NoRecord),
-        Stored::Damaged => Action::Reset(Reset::Unreadable),
+        Stored::Damaged | Stored::Unreadable { .. } => Action::Reset(Reset::Unreadable),
         Stored::Complete(record) => match record.compare(current) {
             Ok(()) => Action::Reuse,
             Err(why) => Action::Reset(why),
@@ -707,12 +725,14 @@ impl StateFiles {
     }
 
     fn read_record(&self) -> Result<Stored> {
-        if self.check_leaf(Leaf::Record)?.is_none() {
+        let Some(before) = self.check_leaf(Leaf::Record)? else {
             return Ok(Stored::Missing);
-        }
+        };
         let file = match self.open_regular(Leaf::Record, false, false) {
             Ok(file) => file,
-            Err(Fault::Io { .. }) => return Ok(Stored::Damaged),
+            Err(error @ Fault::Io { .. }) => {
+                return self.unreadable_record(error, identity(&before));
+            }
             Err(error) => return Err(error),
         };
         let opened = at(
@@ -721,8 +741,12 @@ impl StateFiles {
             &self.path(Leaf::Record),
         )?;
         let mut bytes = Vec::new();
-        if (&file).take((MAX_RECORD + 1) as u64).read_to_end(&mut bytes).is_err() {
-            return Ok(Stored::Damaged);
+        if let Err(error) = at(
+            (&file).take((MAX_RECORD + 1) as u64).read_to_end(&mut bytes),
+            "read completed record",
+            &self.path(Leaf::Record),
+        ) {
+            return self.unreadable_record(error, identity(&opened));
         }
         // Recheck the structural boundary even if bytes are malformed.
         let now = self
@@ -735,6 +759,32 @@ impl StateFiles {
             Ok(record) => Stored::Complete(record),
             Err(_) => Stored::Damaged,
         })
+    }
+
+    fn unreadable_record(&self, error: Fault, expected: Identity) -> Result<Stored> {
+        // Recheck on both open and read errors: ELOOP/special-file substitution
+        // must not be disguised as corrupt content. This is still a pathname
+        // recheck, not atomic confinement against concurrent namespace changes.
+        let path = self.path(Leaf::Record);
+        let now = self
+            .check_leaf(Leaf::Record)?
+            .ok_or_else(|| boundary(&path, "record disappeared after I/O failure"))?;
+        if identity(&now) != expected {
+            return Err(boundary(&path, "record replaced after I/O failure"));
+        }
+        match error {
+            Fault::Io {
+                operation,
+                path,
+                source,
+            } => Ok(Stored::Unreadable {
+                operation,
+                path,
+                errno: source.raw_os_error(),
+                detail: source.to_string(),
+            }),
+            other => Err(other),
+        }
     }
 
     fn create_temporary(&self, bytes: &[u8]) -> Result<File> {
@@ -921,8 +971,7 @@ impl Marker<'_> {
         if self.phase != Phase::Locked {
             return Err(Fault::Unavailable("invalid protect order"));
         }
-        self.step(Step::MarkerSync, None)?;
-        self.step(Step::DirectorySync, None)?;
+        protect_order(self)?;
         self.phase = Phase::Protected;
         Ok(())
     }
@@ -933,11 +982,8 @@ impl Marker<'_> {
         }
         // F2 inserts its structurally checked target decision after protect and
         // before invalidate. These are state operations, not recursive deletion.
-        if self.files.kind == Kind::Warm {
-            self.step(Step::RemoveTemporary, None)?;
-            self.step(Step::RemoveRecord, None)?;
-        }
-        self.step(Step::DirectorySync, None)?;
+        let kind = self.files.kind;
+        invalidate_order(self, kind)?;
         self.phase = Phase::Invalidated;
         Ok(())
     }
@@ -1026,32 +1072,61 @@ trait StateIo {
     fn step(&mut self, step: Step, bytes: Option<&[u8]>) -> Result<()>;
 }
 
-// The logical journal records the state-file subsequence of D44. Target
-// decisions/builds/captures and real crash/power-loss injection are F2 work.
-fn begin_order(io: &mut impl StateIo) -> Result<()> {
-    for step in [
-        Step::MarkerSync,
-        Step::DirectorySync,
-        Step::RemoveTemporary,
-        Step::RemoveRecord,
-        Step::DirectorySync,
-    ] {
-        io.step(step, None)?;
+// Shared phase sequences: production and the logical journal consume these
+// same steps. Independent literal expected orders in tests guard missing syncs.
+// Target decisions stay BETWEEN protect and invalidate; no combined begin phase
+// can accidentally move that F2 boundary. Journal failures remain simulations.
+const PROTECT_STEPS: &[Step] = &[Step::MarkerSync, Step::DirectorySync];
+const WARM_INVALIDATE_STEPS: &[Step] = &[
+    Step::RemoveTemporary,
+    Step::RemoveRecord,
+    Step::DirectorySync,
+];
+const COLD_INVALIDATE_STEPS: &[Step] = &[Step::DirectorySync];
+const RECORD_FINISH_STEPS: &[Step] = &[
+    Step::WriteTemporary,
+    Step::TemporarySync,
+    Step::RenameRecord,
+    Step::DirectorySync,
+    Step::RemoveMarker,
+];
+// No post-unlink directory sync: D44 permits resurrection of the marker on
+// power loss (a rebuild). A failure after unlink could not retain that inode
+// at its path. Close follows the final successful unlink.
+const NO_RECORD_FINISH_STEPS: &[Step] = &[Step::RemoveMarker];
+
+fn sequence(io: &mut impl StateIo, steps: &[Step], bytes: Option<&[u8]>) -> Result<()> {
+    for &step in steps {
+        io.step(step, if step == Step::WriteTemporary { bytes } else { None })?;
     }
     Ok(())
 }
 
+fn protect_order(io: &mut impl StateIo) -> Result<()> {
+    sequence(io, PROTECT_STEPS, None)
+}
+
+fn invalidate_order(io: &mut impl StateIo, kind: Kind) -> Result<()> {
+    sequence(
+        io,
+        match kind {
+            Kind::Warm => WARM_INVALIDATE_STEPS,
+            Kind::Cold => COLD_INVALIDATE_STEPS,
+        },
+        None,
+    )
+}
+
 fn finish_order(io: &mut impl StateIo, bytes: Option<&[u8]>) -> Result<()> {
-    if let Some(bytes) = bytes {
-        io.step(Step::WriteTemporary, Some(bytes))?;
-        io.step(Step::TemporarySync, None)?;
-        io.step(Step::RenameRecord, None)?;
-        io.step(Step::DirectorySync, None)?;
-    }
-    // No post-unlink directory sync: D44 permits resurrection of the marker on
-    // power loss (a rebuild). A failing operation after unlink could not keep
-    // that same inode at its path. Close follows this final successful act.
-    io.step(Step::RemoveMarker, None)
+    sequence(
+        io,
+        if bytes.is_some() {
+            RECORD_FINISH_STEPS
+        } else {
+            NO_RECORD_FINISH_STEPS
+        },
+        bytes,
+    )
 }
 
 impl StateIo for Marker<'_> {
@@ -1145,7 +1220,7 @@ impl Marker<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt, symlink};
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1351,16 +1426,18 @@ mod tests {
     }
 
     #[test]
-    fn invalid_schema_missing_boot_and_field_count_limits_are_damaged() {
+    fn invalid_schema_misaligned_frame_and_field_count_limits_are_damaged() {
         let encoded = record().encode().unwrap();
         let mut bad_schema = encoded.clone();
         bad_schema[0] ^= 1;
         assert!(Record::decode(&bad_schema).is_err());
-        let mut no_boot = encoded.clone();
-        no_boot.drain(BOOT_OFFSET..BOOT_OFFSET + 16);
-        let length = (no_boot.len() as u32).to_be_bytes();
-        no_boot[8..12].copy_from_slice(&length);
-        assert!(Record::decode(&no_boot).is_err());
+        // Removing a positional field misaligns the frame; nil-boot validation
+        // is discriminated separately by boot_missing_invalid_or_cross_boot.
+        let mut misaligned = encoded.clone();
+        misaligned.drain(BOOT_OFFSET..BOOT_OFFSET + 16);
+        let length = (misaligned.len() as u32).to_be_bytes();
+        misaligned[8..12].copy_from_slice(&length);
+        assert!(Record::decode(&misaligned).is_err());
         let mut bad_field = encoded.clone();
         bad_field[44..48].copy_from_slice(&((MAX_FIELD + 1) as u32).to_be_bytes());
         assert!(Record::decode(&bad_field).is_err());
@@ -1433,7 +1510,8 @@ mod tests {
     fn crash_prefixes_never_reuse_an_old_record_without_a_marker() {
         // Logical crash prefixes; these do not prove stable storage or a live death.
         let mut io = Journal::default();
-        begin_order(&mut io).unwrap();
+        protect_order(&mut io).unwrap();
+        invalidate_order(&mut io, Kind::Warm).unwrap();
         finish_order(&mut io, Some(b"new-record")).unwrap();
         assert_eq!(io.events, [Step::MarkerSync, Step::DirectorySync, Step::RemoveTemporary,
             Step::RemoveRecord, Step::DirectorySync, Step::WriteTemporary, Step::TemporarySync,
@@ -1453,11 +1531,14 @@ mod tests {
     #[test]
     fn each_ordering_error_stops_once_and_retains_marker() {
         let mut reference = Journal::default();
-        begin_order(&mut reference).unwrap();
+        protect_order(&mut reference).unwrap();
+        invalidate_order(&mut reference, Kind::Warm).unwrap();
         finish_order(&mut reference, Some(b"new")).unwrap();
         for fail in 0..reference.events.len() {
             let mut io = Journal { fail: Some(fail), ..Journal::default() };
-            let result = begin_order(&mut io).and_then(|()| finish_order(&mut io, Some(b"new")));
+            let result = protect_order(&mut io)
+                .and_then(|()| invalidate_order(&mut io, Kind::Warm))
+                .and_then(|()| finish_order(&mut io, Some(b"new")));
             assert!(result.is_err());
             assert_eq!(io.events.len(), fail + 1);
             assert!(!io.events[..fail].contains(&Step::RemoveMarker));
@@ -1488,17 +1569,26 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
-            let private = std::env::var_os("XTASK_F1_PRIVATE_ROOT")
-                .expect("future recipe must set a private absolute fixture root");
-            let private = PathBuf::from(private);
-            assert!(private.is_absolute());
-            let private_meta = fs::symlink_metadata(&private).unwrap();
-            assert!(private_meta.is_dir());
-            assert_eq!(private_meta.mode() & 0o777, 0o700);
-            let base = private.join(format!("case-{}-{}", std::process::id(), SEQUENCE.fetch_add(1, Ordering::Relaxed)));
-            fs::DirBuilder::new().mode(0o700).create(&base).unwrap();
-            let root = base.join("repo");
+            let private = std::env::var_os("XTASK_F1_PRIVATE_ROOT").map(PathBuf::from);
+            Self::with_root(private.as_deref())
+        }
+
+        fn with_root(private: Option<&Path>) -> Self {
+            let parent = match private {
+                Some(path) => {
+                    assert!(path.is_absolute(), "fixture override must be absolute");
+                    let meta = fs::symlink_metadata(path).unwrap();
+                    assert!(meta.is_dir(), "fixture override must be a real directory");
+                    assert_eq!(meta.mode() & 0o7777, 0o700, "fixture override must be private");
+                    path.canonicalize().unwrap()
+                }
+                None => std::env::temp_dir().canonicalize().unwrap(),
+            };
+            let base = fresh_case(&parent);
+            let meta = fs::symlink_metadata(&base).unwrap();
+            assert!(meta.is_dir());
+            assert_eq!(meta.mode() & 0o7777, 0o700);
+            let root = base.join("r");
             fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
             fs::DirBuilder::new().mode(0o700).create(root.join("target")).unwrap();
             fs::DirBuilder::new().mode(0o700).create(root.join("target/.gate-state")).unwrap();
@@ -1513,6 +1603,27 @@ mod tests {
         fn canary_unchanged(&self) {
             assert_eq!(fs::read(&self.outside).unwrap(), b"outside stays unchanged");
         }
+    }
+
+    fn fresh_case(parent: &Path) -> PathBuf {
+        static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+        // create, never create_dir_all: a collision is never adopted or cleaned.
+        // Short hex names and the one-character repo name leave room for the
+        // socket boundary plant under an ordinary macOS temporary directory.
+        // PID is just a name, not authority or a boot observation.
+        for _ in 0..128 {
+            let path = parent.join(format!(
+                "f1-{:x}-{:x}",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed),
+            ));
+            match fs::DirBuilder::new().mode(0o700).create(&path) {
+                Ok(()) => return path,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create private fixture {}: {error}", path.display()),
+            }
+        }
+        panic!("exclusive fixture creation exhausted its finite name attempts");
     }
 
     impl Drop for Fixture {
@@ -1536,7 +1647,7 @@ mod tests {
         let f = Fixture::new();
         let path = f.files.path(Leaf::Marker);
         symlink(&f.outside, &path).unwrap();
-        boundary_at(f.files.check_leaf(Leaf::Marker).map(|_| ()), &path);
+        boundary_at(f.files.lock_marker_primitive().map(|_| ()), &path);
         assert!(path.symlink_metadata().unwrap().file_type().is_symlink());
         f.canary_unchanged();
     }
@@ -1724,5 +1835,369 @@ mod tests {
         assert!(matches!(f.files.admit(true), Err(Fault::Unavailable(_))));
         assert!(!f.files.path(Leaf::Marker).exists());
         f.canary_unchanged();
+    }
+
+    #[test]
+    fn source_budget_reserves_complete_record_overhead_at_capacity() {
+        // 2022 * (4096 + 40 + 8) + (1136 + 40 + 8) = 8 MiB - 8256.
+        // Removing the overhead reserve accepts the one-byte-too-large capture.
+        let mut entries: Vec<_> = (0..2022)
+            .map(|index| Source {
+                path: format!("{index:04}{}", "x".repeat(4092)).into_bytes(),
+                content: "a".repeat(40),
+                modified_ns: Some(100),
+            })
+            .collect();
+        entries.push(Source {
+            path: vec![b'z'; 1136],
+            content: "a".repeat(40),
+            modified_ns: Some(100),
+        });
+        let at_capacity = Sources::new(entries.clone()).unwrap();
+        let r = Record::new(
+            format!("/{}", "r".repeat(4095)).into_bytes(),
+            "t".repeat(4096),
+            boot(),
+            200,
+            &at_capacity,
+        )
+        .unwrap();
+        let encoded = r.encode().unwrap();
+        assert_eq!(encoded.len(), 8 * 1024 * 1024);
+        assert_eq!(Record::decode(&encoded).unwrap(), r);
+        entries.last_mut().unwrap().path.push(b'z');
+        assert!(matches!(
+            Sources::new(entries),
+            Err(Fault::Codec("source inventory byte limit")),
+        ));
+        // Even a hand-constructed Record cannot evade complete-size validation.
+        let mut too_large = r;
+        let content = too_large.sources.remove(&vec![b'z'; 1136]).unwrap();
+        too_large.sources.insert(vec![b'z'; 1137], content);
+        assert!(matches!(too_large.validate(), Err(Fault::Codec("record byte limit"))));
+        assert!(too_large.encode().is_err());
+    }
+
+    #[test]
+    fn shared_phase_sequences_match_independent_expected_orders() {
+        // Each literal is independent of the production step lists. In
+        // particular, dropping a sync from a shared list must fail this oracle.
+        let mut io = Journal::default();
+        protect_order(&mut io).unwrap();
+        assert_eq!(io.events, [Step::MarkerSync, Step::DirectorySync]);
+        io.events.clear();
+        invalidate_order(&mut io, Kind::Warm).unwrap();
+        assert_eq!(
+            io.events,
+            [Step::RemoveTemporary, Step::RemoveRecord, Step::DirectorySync],
+        );
+        io.events.clear();
+        invalidate_order(&mut io, Kind::Cold).unwrap();
+        assert_eq!(io.events, [Step::DirectorySync]);
+        io.events.clear();
+        finish_order(&mut io, Some(b"complete")).unwrap();
+        assert_eq!(
+            io.events,
+            [
+                Step::WriteTemporary,
+                Step::TemporarySync,
+                Step::RenameRecord,
+                Step::DirectorySync,
+                Step::RemoveMarker,
+            ],
+        );
+        io.events.clear();
+        finish_order(&mut io, None).unwrap();
+        assert_eq!(io.events, [Step::RemoveMarker]);
+    }
+
+    #[test]
+    fn fixture_fallback_and_override_are_private_exclusive_and_cleaned() {
+        // Direct selection exercises both configuration paths without changing
+        // process-global environment or silently skipping ordinary suite tests.
+        let fallback = Fixture::with_root(None);
+        let fallback_base = fallback.base.clone();
+        assert_eq!(fallback_base.parent().unwrap(), std::env::temp_dir().canonicalize().unwrap());
+        assert_eq!(fs::symlink_metadata(&fallback_base).unwrap().mode() & 0o7777, 0o700);
+        let nested = Fixture::with_root(Some(&fallback.base));
+        let nested_base = nested.base.clone();
+        assert_eq!(nested_base.parent().unwrap(), fallback.base.as_path());
+        assert_ne!(nested_base, fallback_base);
+        assert_eq!(fs::symlink_metadata(&nested_base).unwrap().mode() & 0o7777, 0o700);
+        nested.canary_unchanged();
+        drop(nested);
+        assert!(!nested_base.exists());
+        fallback.canary_unchanged();
+        drop(fallback);
+        assert!(!fallback_base.exists());
+    }
+
+    #[test]
+    fn fixture_retains_its_case_during_unwind() {
+        let outer = Fixture::with_root(None);
+        let mut retained = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let inner = Fixture::with_root(Some(&outer.base));
+            retained = Some(inner.base.clone());
+            panic!("intentional fixture unwind");
+        }));
+        assert!(result.is_err());
+        let retained = retained.unwrap();
+        assert!(retained.is_dir());
+        // The simulated panic has ended; no child or file handle exists.
+        // Remove only the exclusive nested case, never the shared temp parent.
+        fs::remove_dir_all(&retained).unwrap();
+        outer.canary_unchanged();
+    }
+
+    fn finished_observations() -> Finished {
+        // Injected observations only: these do not establish a lease or reaping.
+        Finished {
+            direct_reaped: true,
+            lease_held: true,
+            inherited_holder_valid: true,
+        }
+    }
+
+    fn prepare_warm_marker(f: &Fixture) -> Marker<'_> {
+        let mut old = f.files.open_regular(Leaf::Record, true, true).unwrap();
+        old.write_all(b"old complete record must be invalidated").unwrap();
+        drop(old);
+        let temporary = f.files.create_temporary(b"old temporary must be removed").unwrap();
+        drop(temporary);
+        let mut held = f.files.lock_marker_primitive().unwrap();
+        held.protect().unwrap();
+        assert_eq!(held.phase, Phase::Protected);
+        // Target-action boundary: protect cannot invalidate either old name.
+        assert_eq!(
+            fs::read(f.files.path(Leaf::Record)).unwrap(),
+            b"old complete record must be invalidated",
+        );
+        assert_eq!(
+            fs::read(f.files.path(Leaf::Temporary)).unwrap(),
+            b"old temporary must be removed",
+        );
+        held.invalidate().unwrap();
+        assert_eq!(held.phase, Phase::Invalidated);
+        assert!(!f.files.path(Leaf::Record).exists());
+        assert!(!f.files.path(Leaf::Temporary).exists());
+        held
+    }
+
+    fn assert_removed(held: &mut Marker<'_>) {
+        assert_eq!(held.phase, Phase::Removed);
+        assert!(!held.files.path(Leaf::Marker).exists());
+        assert!(!held.files.path(Leaf::Temporary).exists());
+        assert!(matches!(held.step(Step::MarkerSync, None), Err(Fault::Unavailable(_))));
+        assert!(matches!(held.step(Step::RemoveMarker, None), Err(Fault::Unavailable(_))));
+        assert_eq!(held.phase, Phase::Removed);
+    }
+
+    #[test]
+    fn real_marker_warm_finish_publishes_exact_record_and_removes_old_names() {
+        // Real private I/O, including directory sync; no platform success is
+        // presumed. Any sync error fails, never skips or weakens this control.
+        let f = Fixture::new();
+        let mut held = prepare_warm_marker(&f);
+        let s = sources();
+        let mut current = context(&s);
+        current.root = f.files.root.as_os_str().as_bytes();
+        assert_eq!(
+            held.finish_warm(finished_observations(), &s, current, 300).unwrap(),
+            Publication::Record,
+        );
+        let expected = Record {
+            root: f.files.root.as_os_str().as_bytes().to_vec(),
+            toolchain: "rust-1.99.1".into(),
+            boot: boot(),
+            end_ns: 300,
+            sources: BTreeMap::from([(b"src/main.rs".to_vec(), "a".repeat(40))]),
+        };
+        let bytes = fs::read(f.files.path(Leaf::Record)).unwrap();
+        assert_eq!(Record::decode(&bytes).unwrap(), expected);
+        assert_eq!(f.files.read_record().unwrap(), Stored::Complete(expected));
+        assert_removed(&mut held);
+        drop(held); // Close own descriptor before Fixture removes its case.
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn real_marker_source_changed_finish_publishes_no_record_and_removes_names() {
+        let f = Fixture::new();
+        let mut held = prepare_warm_marker(&f);
+        let before = sources();
+        let mut after = sources();
+        after.0.get_mut(b"src/main.rs".as_slice()).unwrap().content = "b".repeat(40);
+        assert_eq!(
+            held.finish_warm(finished_observations(), &before, context(&after), 300).unwrap(),
+            Publication::SourceChanged,
+        );
+        assert_eq!(f.files.read_record().unwrap(), Stored::Missing);
+        assert_removed(&mut held);
+        drop(held);
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn real_marker_no_boot_finish_publishes_no_record_and_removes_names() {
+        let f = Fixture::new();
+        let mut held = prepare_warm_marker(&f);
+        let s = sources();
+        let mut current = context(&s);
+        current.boot = None;
+        assert_eq!(
+            held.finish_warm(finished_observations(), &s, current, 300).unwrap(),
+            Publication::NoBoot,
+        );
+        assert_eq!(f.files.read_record().unwrap(), Stored::Missing);
+        assert_removed(&mut held);
+        drop(held);
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn real_marker_cold_finish_removes_only_cold_marker() {
+        let mut f = Fixture::new();
+        let record_path = f.files.path(Leaf::Record);
+        let temp_path = f.files.path(Leaf::Temporary);
+        let mut record = f.files.open_regular(Leaf::Record, true, true).unwrap();
+        record.write_all(b"warm record unchanged").unwrap();
+        drop(record);
+        let temporary = f.files.create_temporary(b"warm temporary unchanged").unwrap();
+        drop(temporary);
+        f.files.kind = Kind::Cold;
+        let mut held = f.files.lock_marker_primitive().unwrap();
+        held.protect().unwrap();
+        held.invalidate().unwrap();
+        assert_eq!(fs::read(&record_path).unwrap(), b"warm record unchanged");
+        assert_eq!(fs::read(&temp_path).unwrap(), b"warm temporary unchanged");
+        // No cold target removal is implemented/proved; F2 owns that boundary.
+        held.finish_cold(finished_observations()).unwrap();
+        assert_eq!(held.phase, Phase::Removed);
+        assert!(!f.files.path(Leaf::Marker).exists());
+        assert!(matches!(held.step(Step::MarkerSync, None), Err(Fault::Unavailable(_))));
+        assert!(matches!(held.step(Step::RemoveMarker, None), Err(Fault::Unavailable(_))));
+        assert_eq!(fs::read(record_path).unwrap(), b"warm record unchanged");
+        assert_eq!(fs::read(temp_path).unwrap(), b"warm temporary unchanged");
+        drop(held);
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn record_io_error_recheck_retains_regular_fault_context_and_reset() {
+        let f = Fixture::new();
+        let path = f.files.path(Leaf::Record);
+        let file = f.files.open_regular(Leaf::Record, true, true).unwrap();
+        let expected = identity(&file.metadata().unwrap());
+        // Injected EACCES/EIO, not an OS permission/media-failure demonstration.
+        for (operation, errno) in [
+            ("open state leaf no-follow/nonblocking", 13),
+            ("read completed record", 5),
+        ] {
+            let source = io::Error::from_raw_os_error(errno);
+            let detail = source.to_string();
+            let unreadable = f.files.unreadable_record(
+                Fault::Io {
+                    operation,
+                    path: path.clone(),
+                    source,
+                },
+                expected,
+            ).unwrap();
+            assert_eq!(
+                unreadable,
+                Stored::Unreadable {
+                    operation,
+                    path: path.clone(),
+                    errno: Some(errno),
+                    detail,
+                },
+            );
+            assert_eq!(
+                decide(observation(), &unreadable, context(&sources())),
+                Action::Reset(Reset::Unreadable),
+            );
+        }
+        drop(file);
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn record_io_error_recheck_refuses_unsafe_or_replaced_leaf() {
+        for replacement in 0..4 {
+            let f = Fixture::new();
+            let path = f.files.path(Leaf::Record);
+            let file = f.files.open_regular(Leaf::Record, true, true).unwrap();
+            let expected = identity(&file.metadata().unwrap());
+            fs::remove_file(&path).unwrap();
+            let mut socket = None;
+            let mut regular = None;
+            match replacement {
+                0 => symlink(&f.outside, &path).unwrap(),
+                1 => socket = Some(UnixListener::bind(&path).unwrap()),
+                2 => regular = Some(f.files.open_regular(Leaf::Record, true, true).unwrap()),
+                _ => {} // Missing after an I/O error is also a structural refusal.
+            }
+            // Simulates an I/O error after the checked open/read raced a swap.
+            for operation in ["open state leaf no-follow/nonblocking", "read completed record"] {
+                let error = Fault::Io {
+                    operation,
+                    path: path.clone(),
+                    source: io::Error::from_raw_os_error(5),
+                };
+                boundary_at(f.files.unreadable_record(error, expected).map(|_| ()), &path);
+            }
+            f.canary_unchanged();
+            drop(regular);
+            drop(socket);
+            drop(file);
+        }
+    }
+
+    #[test]
+    fn directory_special_files_are_refused_at_each_directory_boundary() {
+        for name in ["target", "target/.gate-state", "target/gate-warm"] {
+            let f = Fixture::new();
+            let path = f.files.root.join(name);
+            if name == "target" {
+                fs::rename(&path, f.base.join("saved-target")).unwrap();
+            } else if path.exists() {
+                fs::remove_dir(&path).unwrap();
+            }
+            let socket = UnixListener::bind(&path).unwrap();
+            let result = if name == "target/gate-warm" {
+                f.files.check_target().map(|_| ())
+            } else {
+                f.files.check_parents()
+            };
+            boundary_at(result, &path);
+            assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
+            f.canary_unchanged();
+            drop(socket);
+        }
+    }
+
+    #[test]
+    fn directory_owner_and_device_observations_refuse_each_boundary() {
+        for name in ["target", "target/.gate-state", "target/gate-warm"] {
+            let mut f = Fixture::new();
+            let path = f.files.root.join(name);
+            if !path.exists() {
+                fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            }
+            f.files.check_directory(&path, false).unwrap();
+            // Inject expected observations at the directory operation boundary;
+            // no chown or mount fixture, and no ancestor refusal substitutes.
+            let owner = f.files.owner;
+            f.files.owner = owner.wrapping_add(1);
+            boundary_at(f.files.check_directory(&path, false).map(|_| ()), &path);
+            f.files.owner = owner;
+            let device = f.files.device;
+            f.files.device = device.wrapping_add(1);
+            boundary_at(f.files.check_directory(&path, false).map(|_| ()), &path);
+            f.files.device = device;
+            assert!(path.is_dir());
+            f.canary_unchanged();
+        }
     }
 }
