@@ -94,6 +94,69 @@ and hermetic child controls do not qualify git, rustc, all static commands, Linu
 or every filesystem. This is a recovery-evidence condition, not the superseded
 D45 mutation-capability refusal. Whole-tier integration/acceptance remains separate.
 
+## Folded whole-run integration amendment (2026-11-15)
+
+This amendment supersedes the dated F4/F5 unavailable-dispatch/bootstrap status
+below; it does not rewrite historical evidence or change an acceptance row.
+The native lifecycle is wired to cold `full`, warm `pr`, and the `--part`
+dispatch. `full --warm` uses the developer target, is explicitly not a gate,
+and never qualifies. `fast` and hosted-CI `--no-lease` reconciliation remain
+later-PR work. No rules, toolchain, dependency or version changes are made.
+
+D27 bootstrap uses the fixed `target/gate-xtask`, a completed judge-id stamp,
+and content identities of tracked and nonignored untracked tooling inputs.
+Missing/changed identities reset the bootstrap target; the stamp is removed
+before every incremental build and published only after successful direct-child
+reap and a matching second identity. The wrapper uses Python's existing standard
+library and the configured turnstile/lease plus a persistent bootstrap kernel
+lock. It does not remove a lock or delete a target from a signal/exit trap.
+A killed bootstrap leaves no completed stamp; its Cargo child inherits the
+bootstrap lock through stdin. Bootstrap and Rust source-name support differ:
+the bootstrap encodes Git-quoted path bytes losslessly, while Rust judge capture
+explicitly refuses unsupported control/non-UTF8 names. Such a run cannot qualify.
+
+The whole-run producer reserves an IN PROGRESS report before admission, retains
+step logs/inventory/environment names/tool versions and real command statuses,
+and atomically publishes the final result. It keeps the ten latest completed,
+validated run directories, preserving pending and unknown entries. The complete
+marker denotes report completion, never a passed suite. A consistent inventory
+helper may return zero with failed rows; the actual suite's exit and those rows
+still fail the test step. Partial exports are nonqualifying and return 3 when
+otherwise passing. A clean real full/pr run must establish all predicate fields,
+the exact judge/commit/tree, pinned tools, default live lease and finished target.
+A direct invocation without a matching stamp at the fixed bootstrap executable
+path remains nonqualifying even if every check passes.
+
+A run-wide sticky listener stays alive through reporting. After a handled signal,
+only a finish-only path may run, and only after actual directly owned child reap;
+it rechecks marker/lease and captures source identities before publication or
+cold cleanup. The INTERRUPTED verdict and actual signal wait status remain.
+No suite command resumes after cancellation. Unreaped children, output-collection
+failure, lease/marker loss or failed publication keep the target and cannot
+qualify. This narrows the native repair amendment's conservative all-interrupt
+retention to the accepted D44/D45 finished-use rule. Tracked source deletions
+are captured through Git's explicit deleted inventory and invalidate older sets;
+a disappearing untracked source still fails capture.
+
+Contention sampling occurs at start/end and every 15 seconds while the command
+runner is driven. Probes own/reap their direct children, inherit the same marker
+open description, and never acquire signalling authority from process metadata.
+The sampler excludes the gate's process-parent closure, records maximum load,
+and preserves unavailable query data. macOS reads the unprivileged thermal
+pressure notification state; Linux discloses the unsupported portable query.
+These observations establish no idle threshold or timing acceptance by themselves.
+
+D45 remains owner-accepted interim checked-path/by-name mutation risk, to revisit
+when storage changes; it is not resolved. FS1 escaped descendants and manual
+cargo-clean/marker removal remain separate residuals. Existing-marker production
+recovery stays unsupported until the complete RC18 command/platform/filesystem
+qualification. Historical launch findings remain owner-set-aside preconditions.
+The unchanged seven C files are independent reproducers; fixture/contract
+mismatches must be named for their owner, never silently edited here. Whole-gate
+reviews, final-head Linux, Mac/Linux timings, R4/R11 names/counts and nextest's
+qualification (or sequential fallback) remain due. No miniature is a workspace
+acceptance run and no PR is authorized by this amendment.
+
 ## Context
 
 ADR 0014 is accepted. Its decisions 32–38 let the gate publish, remove, reset or reuse a target only after

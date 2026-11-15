@@ -177,25 +177,36 @@ impl NativeUse<'_> {
         native::Boundary::inspect(self.marker.files)?;
         let mut runner = super::steps::Runner::new(lease, &self.marker)?;
         let work_result = work(&mut runner, &target);
+        // A handled signal changes the verdict, not the definition of a finished
+        // use. Real direct-child reap plus retained marker/lease authority permits
+        // finish-only source capture. EOF and an elapsed grace never suffice.
+        let interrupted = runner.interrupted().is_some();
+        let direct_reaped = runner.child_reaped();
+        let ordinary_finish = runner.finished();
+        let mut statuses = runner.statuses().to_vec();
+        drop(runner);
         let captured = (|| {
-            runner.finished()?;
-            let after = Captured::read(&mut runner, &self.marker.files.root)?;
-            runner.finished()?;
+            if interrupted && direct_reaped {
+                self.marker.finishing_interrupted.set(true);
+                lease.validate_exclusive()?;
+                self.marker.check_identity()?;
+            } else {
+                ordinary_finish?;
+            }
+            let mut finish_runner = if interrupted {
+                super::steps::Runner::finish_only(lease, &self.marker)?
+            } else {
+                super::steps::Runner::new(lease, &self.marker)?
+            };
+            let after = Captured::read(&mut finish_runner, &self.marker.files.root)?;
+            finish_runner.finished()?;
+            statuses.extend(finish_runner.statuses().iter().cloned());
             anyhow::ensure!(
                 self.before.boot == after.boot && self.before.toolchain == after.toolchain,
                 "toolchain/boot identity changed; keep marker, no publication"
             );
             Ok(after)
         })();
-        let statuses = runner
-            .statuses()
-            .iter()
-            .map(|s| super::steps::Status {
-                exit: s.exit,
-                elapsed: s.elapsed,
-            })
-            .collect::<Vec<_>>();
-        drop(runner); // teardown/actual reap precedes ALL publication/removal
         let finished = (|| {
             let after: Captured = captured?;
             lease.validate()?;
@@ -244,6 +255,7 @@ impl NativeUse<'_> {
             }),
             Err(source) => Err(UseFailure {
                 exits: statuses.iter().map(|s| s.exit).collect(),
+                statuses,
                 source,
             }
             .into()),
@@ -1147,6 +1159,7 @@ impl StateFiles {
             temporary: None,
             phase: Phase::Locked,
             signals: std::cell::RefCell::new(None),
+            finishing_interrupted: std::cell::Cell::new(false),
         };
         marker.check_identity()?; // Immediately after grant, before target inspection.
         Ok(marker)
@@ -1172,6 +1185,7 @@ pub(super) struct Marker<'a> {
     // Keep cancellation alive through the publication sequence, after Runner
     // has relinquished its immutable borrow.
     signals: std::cell::RefCell<Option<super::signals::Signals>>,
+    finishing_interrupted: std::cell::Cell<bool>,
 }
 
 // No Drop implementation: drop closes owned Files, NEVER unlocks or unlinks.
@@ -1206,7 +1220,9 @@ impl Marker<'_> {
                 .validate_exclusive()
                 .map_err(|_| Fault::Unavailable("configured lease lost; keep marker and target"))?;
         }
-        if self.signal_wait(std::time::Duration::ZERO).is_some() {
+        if self.signal_wait(std::time::Duration::ZERO).is_some()
+            && !self.finishing_interrupted.get()
+        {
             return Err(Fault::Unavailable("INTERRUPTED; keep marker and target"));
         }
         native::Boundary::state(self.files)?;
@@ -1599,6 +1615,7 @@ impl Marker<'_> {
             Ok((before, after, end_ns))
         })();
         let exits: Vec<_> = runner.statuses().iter().map(|s| s.exit).collect();
+        let statuses = runner.statuses().to_vec();
         drop(runner);
         let result = (|| {
             let (before, after, end_ns) = captures?;
@@ -1629,7 +1646,12 @@ impl Marker<'_> {
             }),
             Err(source) => {
                 self.phase = Phase::Failed;
-                Err(UseFailure { exits, source }.into())
+                Err(UseFailure {
+                    exits,
+                    statuses,
+                    source,
+                }
+                .into())
             }
         }
     }
@@ -1638,6 +1660,7 @@ impl Marker<'_> {
 #[derive(Debug)]
 pub(super) struct UseFailure {
     pub(super) exits: Vec<std::process::ExitStatus>,
+    pub(super) statuses: Vec<super::steps::Status>,
     pub(super) source: anyhow::Error,
 }
 impl fmt::Display for UseFailure {
@@ -1703,6 +1726,28 @@ impl Captured {
             for path in &paths {
                 source_path(path)?;
             }
+            // A tracked deletion is part of the current source set, not a
+            // missing-file I/O error. Query Git explicitly so a vanished
+            // untracked file/racing parent still fails the capture checks.
+            let deleted = runner.capture(
+                Command::new("git")
+                    .current_dir(root)
+                    .args(["ls-files", "--deleted", "-z"]),
+                MAX_SOURCE_BYTES,
+            )?;
+            anyhow::ensure!(
+                deleted.is_empty() || deleted.last() == Some(&0),
+                "incomplete deleted source inventory"
+            );
+            let deleted: std::collections::BTreeSet<_> = deleted
+                .split(|b| *b == 0)
+                .filter(|p| !p.is_empty())
+                .map(<[u8]>::to_vec)
+                .collect();
+            for path in &deleted {
+                source_path(path)?;
+            }
+            paths.retain(|p| !deleted.contains(p));
             Ok(paths)
         }
         let paths = inventory(runner, root)?;
@@ -2581,6 +2626,42 @@ mod tests {
         let marker = f.files.admit(true).unwrap();
         marker.check_identity().unwrap();
         assert!(matches!(f.files.admit(true), Err(Fault::Busy)));
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_periodic_sampler_runs_while_a_direct_command_is_live_and_finish_reaps_it() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let use_ = target.begin(&lease).unwrap();
+        let observation = std::rc::Rc::new(std::cell::RefCell::new(
+            crate::gate::contention::Sampler::new(),
+        ));
+        let outcome = use_
+            .run(&lease, false, |runner, _| {
+                runner.observe(observation.clone());
+                let exit = runner.run(
+                    std::process::Command::new("/usr/bin/python3")
+                        .args(["-c", "import time; time.sleep(16)"])
+                        .env_clear()
+                        .env("HOME", &f.base)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null()),
+                )?;
+                assert!(exit.success());
+                assert!(runner.child_reaped());
+                assert!(
+                    observation.borrow().samples >= 2,
+                    "no periodic sample during the live command"
+                );
+                Ok(())
+            })
+            .unwrap();
+        outcome.result.unwrap();
+        assert_eq!(outcome.publication, "record published");
+        assert!(!f.files.path(Leaf::Marker).exists());
         f.canary_unchanged();
     }
 

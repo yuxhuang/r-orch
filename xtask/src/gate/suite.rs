@@ -1,5 +1,5 @@
 //! Independent folded-suite engine. Production tiers call this only after a
-//! supported native target admission; fixtures exercise it without weakening D45.
+//! supported native target admission; fixtures exercise the identical judgments.
 use super::{
     hermetic::Hermetic,
     inventory,
@@ -199,6 +199,16 @@ pub(super) fn run_all(
     hermetic: &Hermetic,
     runner: &mut Runner<'_, '_>,
 ) -> Suite {
+    run_selected(repo, real_home, hermetic, runner, None)
+}
+
+pub(super) fn run_selected(
+    repo: &Path,
+    real_home: &Path,
+    hermetic: &Hermetic,
+    runner: &mut Runner<'_, '_>,
+    part: Option<super::Part>,
+) -> Suite {
     let before = super::real_home::snapshot(real_home);
     if let Err(e) = &before {
         let mut suite = Suite {
@@ -213,12 +223,23 @@ pub(super) fn run_all(
         );
         return suite;
     }
-    let mut suite = run(repo, hermetic, runner);
+    let mut suite = if part == Some(super::Part::Static) {
+        Suite {
+            steps: vec![],
+            logs: BTreeMap::new(),
+            inventory: String::new(),
+        }
+    } else {
+        run(repo, hermetic, runner)
+    };
     suite.steps.truncate(2); // Re-evaluate hygiene after the static commands.
-    for name in ["clippy", "fmt", "advisories", "crate-graph"] {
+    for name in ["clippy", "fmt", "advisories", "crate-graph"]
+        .into_iter()
+        .filter(|_| part != Some(super::Part::Suite))
+    {
         let start = Instant::now();
         if name == "advisories" && !hermetic.available("cargo-deny") {
-            let detail="cargo-deny not installed; required advisories/licenses/bans/sources were not evaluated".to_owned();
+            let detail="cargo-deny not installed; required advisories/licenses/bans/sources were not evaluated; cargo install cargo-deny --locked".to_owned();
             suite
                 .logs
                 .insert(format!("steps/{name}.log"), detail.as_bytes().to_vec());
@@ -307,6 +328,9 @@ pub(super) fn run_all(
             elapsed: start.elapsed(),
             detail,
         });
+    }
+    if part == Some(super::Part::Static) {
+        return suite;
     }
     let start = Instant::now();
     suite.checked("home-hygiene", start, hermetic.hygiene());

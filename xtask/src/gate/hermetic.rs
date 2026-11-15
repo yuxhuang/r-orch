@@ -124,6 +124,7 @@ pub(super) struct Hermetic {
     pub shims: PathBuf,
     pub witness: PathBuf,
     pub removed: BTreeSet<String>,
+    pub pin: String,
     env: BTreeMap<OsString, OsString>,
 }
 impl Hermetic {
@@ -224,6 +225,7 @@ impl Hermetic {
             shims,
             witness,
             removed,
+            pin: channel.to_owned(),
             env,
         })
     }
@@ -294,7 +296,11 @@ impl Hermetic {
         ensure!(
             found.is_empty(),
             "the suite wrote into a sentinel HOME: {}",
-            found.join(", ")
+            found
+                .iter()
+                .map(|p| format!("<HOME>/{p}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         Ok("a sentinel HOME is still empty after the judged suite (except .cargo/.rustup)".into())
     }

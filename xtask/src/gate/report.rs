@@ -127,9 +127,11 @@ impl Redactor {
         }
         for (name, value) in std::env::vars_os() {
             let name = name.to_string_lossy().to_ascii_uppercase();
-            if ["TOKEN", "SECRET", "PASSWORD", "API_KEY"]
+            if (["TOKEN", "SECRET", "PASSWORD", "API_KEY"]
                 .iter()
                 .any(|part| name.contains(part))
+                || super::hermetic::SESSION.contains(&name.as_str())
+                || name.starts_with("XTASK_GATE_"))
                 && let Some(value) = value.to_str().filter(|s| s.len() >= 4)
             {
                 replacements.push((value.to_owned(), "<REDACTED>"));
@@ -489,10 +491,217 @@ pub(super) fn write_result(repo: &Path, text: &str) -> Result<PathBuf> {
     Ok(run)
 }
 
+/// A report is reserved before admission. It survives failure and interruption;
+/// only complete, validated old report directories are eligible for retention.
+pub(super) struct Run {
+    pub(super) path: PathBuf,
+}
+impl Run {
+    pub(super) fn begin(repo: &Path) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        let target = repo.join("target");
+        if !target.try_exists()? {
+            std::fs::DirBuilder::new().mode(0o700).create(&target)?;
+        }
+        files::real_directories(&target)?;
+        let runs = target.join("gate-runs");
+        if !runs.try_exists()? {
+            std::fs::DirBuilder::new().mode(0o700).create(&runs)?;
+        }
+        files::real_directories(&runs)?;
+        let path = files::private_dir(&runs, "run")?;
+        files::write(
+            &path.join("result.txt"),
+            b"verdict: IN PROGRESS\nqualifying: no: run not finished\n",
+        )?;
+        let run = Self { path };
+        run.latest(repo)?;
+        Ok(run)
+    }
+    fn latest(&self, repo: &Path) -> Result<()> {
+        let target = repo.join("target");
+        files::real_directories(&target)?;
+        let latest = target.join("gate-result.txt");
+        if let Ok(meta) = std::fs::symlink_metadata(&latest) {
+            ensure!(
+                meta.is_file() && meta.len() <= 128 * 1024,
+                "result leaf refused"
+            );
+        }
+        let tmp = self.path.join("latest.tmp");
+        files::write(
+            &tmp,
+            &files::read(&self.path.join("result.txt"), 128 * 1024)?,
+        )?;
+        std::fs::rename(tmp, latest)?;
+        files::sync(&target)
+    }
+    pub(super) fn finish(
+        &self,
+        repo: &Path,
+        entries: &BTreeMap<String, Vec<u8>>,
+        commands: &str,
+    ) -> Result<()> {
+        files::real_directories(&self.path)?;
+        std::fs::create_dir(self.path.join("steps"))?;
+        for (name, bytes) in entries {
+            ensure!(bundle_name(name), "run entry name");
+            if name == "result.txt" {
+                continue;
+            }
+            files::write(&self.path.join(name), bytes)?;
+        }
+        files::write(&self.path.join("commands.txt"), commands.as_bytes())?;
+        files::write(
+            &self.path.join("result.tmp"),
+            entries.get("result.txt").context("result missing")?,
+        )?;
+        std::fs::rename(self.path.join("result.tmp"), self.path.join("result.txt"))?;
+        files::write(&self.path.join("complete"), b"schema=1\n")?;
+        files::sync(&self.path)?;
+        self.latest(repo)?;
+        self.retain()
+    }
+    fn retain(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let parent = self.path.parent().unwrap();
+        let mut eligible = vec![];
+        for entry in std::fs::read_dir(parent)? {
+            let entry = entry?;
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path)?;
+            if !entry.file_name().to_string_lossy().starts_with("run-")
+                || !meta.is_dir()
+                || meta.uid() != nix::unistd::geteuid().as_raw()
+            {
+                continue;
+            }
+            if files::text(&path.join("complete"), 64).ok().as_deref() != Some("schema=1\n") {
+                continue;
+            }
+            let Ok(result) = files::text(&path.join("result.txt"), 128 * 1024) else {
+                continue;
+            };
+            if result.starts_with("verdict: IN PROGRESS") {
+                continue;
+            }
+            let mut leaves = vec![];
+            let mut valid = true;
+            for child in std::fs::read_dir(&path)? {
+                let child = child?;
+                let name = child.file_name();
+                let name = name.to_string_lossy();
+                let m = std::fs::symlink_metadata(child.path())?;
+                if m.uid() != meta.uid() {
+                    valid = false;
+                    break;
+                }
+                if name == "steps" && m.is_dir() {
+                    for leaf in std::fs::read_dir(child.path())? {
+                        let leaf = leaf?;
+                        let m = std::fs::symlink_metadata(leaf.path())?;
+                        if !m.is_file()
+                            || m.nlink() != 1
+                            || m.uid() != meta.uid()
+                            || !bundle_name(&format!(
+                                "steps/{}",
+                                leaf.file_name().to_string_lossy()
+                            ))
+                        {
+                            valid = false;
+                            break;
+                        }
+                        leaves.push(leaf.path());
+                    }
+                } else if m.is_file()
+                    && m.nlink() == 1
+                    && (bundle_name(&name) || name == "commands.txt" || name == "complete")
+                {
+                    leaves.push(child.path());
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                eligible.push((meta.modified()?, path, leaves));
+            }
+        }
+        eligible.sort_by_key(|(time, _, _)| *time);
+        let remove = eligible.len().saturating_sub(10);
+        for (_, path, leaves) in eligible.into_iter().take(remove) {
+            if path == self.path {
+                continue;
+            }
+            // Revalidate every leaf immediately before by-name deletion. D45's
+            // accepted replacement race remains; no arbitrary recursive delete.
+            for leaf in leaves {
+                let m = std::fs::symlink_metadata(&leaf)?;
+                ensure!(
+                    m.is_file() && m.uid() == nix::unistd::geteuid().as_raw() && m.nlink() == 1,
+                    "retention leaf changed"
+                );
+                std::fs::remove_file(leaf)?;
+            }
+            let steps = path.join("steps");
+            files::real_directories(&steps)?;
+            std::fs::remove_dir(steps)?;
+            files::real_directories(&path)?;
+            std::fs::remove_dir(path)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gate::steps::tests::Scratch;
+
+    #[test]
+    fn report_reservation_is_in_progress_and_retention_keeps_ten_complete_runs() {
+        let scratch = Scratch::new();
+        let pending = Run::begin(&scratch.0).unwrap();
+        assert!(
+            files::text(&scratch.0.join("target/gate-result.txt"), 4096)
+                .unwrap()
+                .contains("IN PROGRESS")
+        );
+        let unknown = scratch.0.join("target/gate-runs/unknown");
+        std::fs::create_dir(&unknown).unwrap();
+        let mut last = None;
+        for _ in 0..12 {
+            let run = Run::begin(&scratch.0).unwrap();
+            let entries = BTreeMap::from([
+                (
+                    "result.txt".into(),
+                    b"verdict: FAILED (part suite)\nqualifying: no: controlled failure\n".to_vec(),
+                ),
+                ("environment.txt".into(), Vec::new()),
+                ("tools.txt".into(), Vec::new()),
+                ("inventory.tsv".into(), Vec::new()),
+                ("steps/test.log".into(), b"retained failure\n".to_vec()),
+            ]);
+            run.finish(&scratch.0, &entries, "exit=101\n").unwrap();
+            last = Some(run.path);
+        }
+        let dirs: Vec<_> = std::fs::read_dir(scratch.0.join("target/gate-runs"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(dirs.len(), 12); // ten completed, one pending, one unknown
+        assert!(pending.path.join("result.txt").is_file());
+        assert!(unknown.is_dir());
+        let last = last.unwrap();
+        assert_eq!(
+            files::text(&last.join("steps/test.log"), 4096).unwrap(),
+            "retained failure\n"
+        );
+        assert_eq!(
+            files::text(&scratch.0.join("target/gate-result.txt"), 4096).unwrap(),
+            files::text(&last.join("result.txt"), 4096).unwrap()
+        );
+    }
 
     // Deliberately synthetic, file-only verifier control, NOT a qualifying run.
     #[test]

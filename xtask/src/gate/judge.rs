@@ -95,3 +95,52 @@ pub(super) fn at_commit(repo: &Path, commit: &str) -> Result<String> {
     }
     finish(repo, entries)
 }
+
+/// A direct invocation may run development checks but cannot attest that its
+/// executable came from these source bytes. Only the content-stamped bootstrap
+/// path supplies that producer provenance; this is not malicious-user auth.
+pub(super) fn stamped(repo: &Path, id: &str, executable: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let boot = repo.join("target/gate-xtask");
+    files::real_directories(&boot.join("debug"))?;
+    ensure!(
+        executable == boot.join("debug/xtask"),
+        "judge executable is not bootstrap output"
+    );
+    for path in [boot.join("judge-id"), executable.to_path_buf()] {
+        let meta = std::fs::symlink_metadata(&path)?;
+        ensure!(
+            meta.is_file() && meta.uid() == nix::unistd::geteuid().as_raw() && meta.nlink() == 1,
+            "judge stamp/executable structure refused"
+        );
+    }
+    ensure!(
+        files::text(&boot.join("judge-id"), 128)?.trim() == id,
+        "completed judge stamp mismatch"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod bootstrap_tests {
+    use super::*;
+    use crate::gate::steps::tests::Scratch;
+    #[test]
+    fn stamp_requires_matching_identity_and_executable_and_refuses_links() {
+        let scratch = Scratch::new();
+        let boot = scratch.0.join("target/gate-xtask");
+        std::fs::create_dir_all(boot.join("debug")).unwrap();
+        let executable = boot.join("debug/xtask");
+        files::write(&executable, b"fixture executable bytes").unwrap();
+        let id = "a".repeat(40);
+        assert!(stamped(&scratch.0, &id, &executable).is_err());
+        files::write(&boot.join("judge-id"), format!("{id}\n").as_bytes()).unwrap();
+        stamped(&scratch.0, &id, &executable).unwrap();
+        assert!(stamped(&scratch.0, &"b".repeat(40), &executable).is_err());
+        files::write(&scratch.0.join("old-xtask"), b"stale fixture executable").unwrap();
+        assert!(stamped(&scratch.0, &id, &scratch.0.join("old-xtask")).is_err());
+        std::fs::rename(boot.join("judge-id"), boot.join("outside")).unwrap();
+        std::os::unix::fs::symlink("outside", boot.join("judge-id")).unwrap();
+        assert!(stamped(&scratch.0, &id, &executable).is_err());
+    }
+}

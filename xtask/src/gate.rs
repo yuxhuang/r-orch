@@ -1,28 +1,36 @@
-//! Tier dispatch and independently tested folded-run components. Native D45
-//! admission remains unavailable; a refusal never becomes a passing tier.
+//! Tier dispatch and independently tested folded-run components. Refusals and
+//! failed test rows never become passing tier evidence.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(dead_code, reason = "F2 lifecycle awaits whole-gate integration")]
+#[allow(
+    dead_code,
+    reason = "Low-level lease and simulation controls are also exercised by private fixtures"
+)]
 mod lease;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod signals;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(dead_code, reason = "F3 lifecycle awaits whole-gate integration")]
+#[allow(
+    dead_code,
+    reason = "Private fixture lifecycle helpers also exercise direct-child behavior"
+)]
 mod steps;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(
     dead_code,
-    reason = "Target mutation awaits a stable native namespace implementation and tier wiring"
+    reason = "Independent model and native limitation controls remain for qualified recovery"
 )]
 mod target;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod contention;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod files;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(
     dead_code,
-    reason = "Native D45 admission blocks production suite execution; private live fixtures exercise it"
+    reason = "Private live fixtures exercise the same folded suite and environment checks"
 )]
 mod hermetic;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -32,19 +40,19 @@ mod judge;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(
     dead_code,
-    reason = "Snapshot integration awaits native target lifecycle"
+    reason = "Private metadata fixture controls retain independent snapshot coverage"
 )]
 mod real_home;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(
     dead_code,
-    reason = "Complete tier reporting awaits native target lifecycle"
+    reason = "Private verifier/retention fixture controls retain independent coverage"
 )]
 mod report;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(
     dead_code,
-    reason = "Native D45 admission blocks production suite execution; private live fixtures exercise it"
+    reason = "Private live fixtures exercise the same folded suite and environment checks"
 )]
 mod suite;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -60,7 +68,7 @@ use crate::gate_selection::{self, SelectArgs};
 #[derive(Debug, Args)]
 #[command(
     about = "Tiered verification: full (default), pr (merge condition), fast (iteration)",
-    after_help = "full is the goal and release gate; pr is the merge condition after the policy transition. Native target lifecycle is unavailable: execution refuses; --plan and helpers work. fast is PR2 work."
+    after_help = "full is the goal and release gate; pr is the merge condition after the policy transition. full uses a cold target; pr allows content-checked warm reuse. --warm is developer-only and not a gate. fast is PR2 work."
 )]
 pub struct GateArgs {
     #[command(subcommand)]

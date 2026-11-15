@@ -18,10 +18,11 @@ pub(super) const KILL_REAP: Duration = Duration::from_secs(3);
 pub(super) const PIPE_DRAIN: Duration = Duration::from_millis(250);
 const POLL: Duration = Duration::from_millis(10);
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct Status {
     pub(super) exit: ExitStatus,
     pub(super) elapsed: Duration,
+    pub(super) command: String,
 }
 
 pub(super) struct Runner<'a, 'm> {
@@ -29,10 +30,13 @@ pub(super) struct Runner<'a, 'm> {
     marker: Option<&'m Marker<'m>>,
     child: Option<Child>,
     start: Option<Instant>,
+    active_command: Option<String>,
     statuses: Vec<Status>,
     failed: bool,
     signals: Option<Signals>,
     kill_end: Option<Instant>,
+    finishing: bool,
+    observer: Option<std::rc::Rc<std::cell::RefCell<super::contention::Sampler>>>,
 }
 
 impl<'a, 'm> Runner<'a, 'm> {
@@ -40,6 +44,14 @@ impl<'a, 'm> Runner<'a, 'm> {
         marker.enable_signals()?;
         marker.check_identity()?;
         Self::with_marker(lease, Some(marker))
+    }
+
+    /// Only lifecycle finish may enter after a handled cancellation, and only
+    /// after the old runner has reaped its owned child. No suite work resumes.
+    pub(super) fn finish_only(lease: &'a Lease, marker: &'m Marker<'m>) -> Result<Self> {
+        let mut runner = Self::new(lease, marker)?;
+        runner.finishing = true;
+        Ok(runner)
     }
 
     // Lease exec has no target, but owns its direct command through interruption.
@@ -54,6 +66,7 @@ impl<'a, 'm> Runner<'a, 'm> {
             marker,
             child: None,
             start: None,
+            active_command: None,
             statuses: Vec::new(),
             failed: false,
             signals: if marker.is_none() {
@@ -62,10 +75,39 @@ impl<'a, 'm> Runner<'a, 'm> {
                 None
             },
             kill_end: None,
+            finishing: false,
+            observer: None,
         })
     }
 
+    pub(super) fn observation(&self) -> Result<super::contention::Observation> {
+        Self::with_marker(self.lease, self.marker)
+            .and_then(|mut probe| super::contention::query(&mut probe))
+    }
+    pub(super) fn observe(
+        &mut self,
+        observer: std::rc::Rc<std::cell::RefCell<super::contention::Sampler>>,
+    ) {
+        self.observer = Some(observer);
+    }
+    fn sample_due(&self) {
+        if let Some(observer) = &self.observer {
+            let due = observer.borrow().due();
+            if !due {
+                return;
+            }
+            // The probe owns its direct children too and duplicates the same
+            // marker description. It has no observer, so sampling cannot recur.
+            let result = self.observation();
+            observer.borrow_mut().record(result);
+        }
+    }
+
     fn wait_signal(&mut self, delay: Duration) -> Option<i32> {
+        if self.finishing {
+            self.pause(delay);
+            return None;
+        }
         match self.marker {
             Some(marker) => marker.signal_wait(delay),
             None => self.signals.as_mut().unwrap().wait(delay),
@@ -102,10 +144,17 @@ impl<'a, 'm> Runner<'a, 'm> {
             command.stdin(marker.command_stdin()?);
         }
         let start = Instant::now();
+        let identity = format!(
+            "program={:?} args={:?} cwd={:?}",
+            command.get_program(),
+            command.get_args().collect::<Vec<_>>(),
+            command.get_current_dir()
+        );
         match command.spawn() {
             Ok(child) => {
                 self.child = Some(child);
                 self.start = Some(start);
+                self.active_command = Some(identity);
                 Ok(())
             }
             Err(e) => {
@@ -124,6 +173,7 @@ impl<'a, 'm> Runner<'a, 'm> {
             self.statuses.push(Status {
                 exit,
                 elapsed: self.start.take().unwrap().elapsed(),
+                command: self.active_command.take().unwrap(),
             });
             Ok(Some(exit))
         } else {
@@ -150,6 +200,9 @@ impl<'a, 'm> Runner<'a, 'm> {
         let mut exit = None;
         let mut drain_end = None;
         loop {
+            if failure.is_none() {
+                self.sample_due();
+            }
             let mut interrupted = self.wait_signal(Duration::ZERO);
             if failure.is_none() {
                 if let Some(number) = interrupted {
