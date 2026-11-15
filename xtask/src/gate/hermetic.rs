@@ -202,6 +202,10 @@ impl Hermetic {
             env.insert(key.into(), value);
         }
         env.insert("CARGO_TERM_COLOR".into(), "never".into());
+        // A missing explicitly selected tool home must fail, not provision a
+        // different environment while the gate is trying to judge it (TV6).
+        // This fixed tooling control is not an exported credential/env value.
+        env.insert("RUSTUP_AUTO_INSTALL".into(), "0".into());
         files::write(&root.join("calls.log"), b"")?;
         // Fixed script; arguments are length limited, passed through printf as
         // data and never evaluated. One append per invocation. Total evidence

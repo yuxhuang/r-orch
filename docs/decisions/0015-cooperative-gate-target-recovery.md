@@ -675,3 +675,11 @@ configured machine lease is still required, no lock is stolen or explicitly
 unlocked, and diagnostics confer no process/deletion authority. FS1/D41 and
 cargo-clean/manual-removal residuals remain disclosed. No launch-review condition
 has been silently called resolved; whole-gate review remains before PR1.
+
+Fixture provisioning correction: private Rustup homes link the installed
+fully qualified pinned toolchain directory; suite commands disable Rustup
+auto-install. An explicit empty tool home therefore remains a missing-tool
+failure. Earlier private fixture logs revealed automatic downloads under an
+unresolved short alias; those logs are retained, not hermetic qualification.
+The fixed internal tooling control is not an extension of the seven-name
+exported environment allowlist. No dependency/toolchain version is changed.

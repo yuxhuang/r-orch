@@ -48,6 +48,7 @@ pub(super) fn run(repo: &Path, hermetic: &Hermetic, runner: &mut Runner<'_, '_>)
         .args(["build", "--locked", "--manifest-path"])
         .arg(repo.join("Cargo.toml"))
         .args(["--workspace", "--all-targets"]);
+    let workspace_start = runner.statuses().len();
     let workspace_status = runner.logged(&mut workspace, inventory::MAX_LOG);
     let mut build = hermetic.command(repo);
     build
@@ -72,7 +73,10 @@ pub(super) fn run(repo: &Path, hermetic: &Hermetic, runner: &mut Runner<'_, '_>)
             .get(map_start)
             .map(|s| report::code(s.exit))
     } else {
-        runner.statuses().last().map(|s| report::code(s.exit))
+        runner
+            .statuses()
+            .get(workspace_start)
+            .map(|s| report::code(s.exit))
     };
     let built = mapped
         .as_ref()
@@ -361,7 +365,9 @@ mod tests {
             "failure" => "panic!(\"folded-only fixture failure\");",
             _ => "",
         };
-        let source = if case == "zero" {
+        let source = if case == "compile" {
+            String::from("this is a planted Rust compilation error")
+        } else if case == "zero" {
             String::from("pub fn no_tests() {}\n")
         } else {
             format!(
@@ -394,7 +400,15 @@ mod tests {
         assert!(output.status.success());
         let compiler = std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
         let toolchain = compiler.parent().unwrap().parent().unwrap();
-        std::os::unix::fs::symlink(toolchain, rustup.join("toolchains/1.99.1")).unwrap();
+        if case != "toolchain" {
+            std::os::unix::fs::symlink(
+                toolchain,
+                rustup
+                    .join("toolchains")
+                    .join(toolchain.file_name().unwrap()),
+            )
+            .unwrap();
+        }
         let rustup_bin = std::process::Command::new("/usr/bin/which")
             .arg("rustup")
             .output()
@@ -404,7 +418,7 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf();
-        let path = std::env::join_paths([
+        let mut path = std::env::join_paths([
             proxy,
             toolchain.join("bin"),
             "/usr/bin".into(),
@@ -413,6 +427,11 @@ mod tests {
             "/sbin".into(),
         ])
         .unwrap();
+        if case == "spawn" {
+            let empty = resources.join("empty-bin");
+            std::fs::create_dir(&empty).unwrap();
+            path = empty.into_os_string();
+        }
         let env: BTreeMap<OsString, OsString> = [
             ("HOME".into(), home.into_os_string()),
             ("PATH".into(), path),
@@ -434,9 +453,26 @@ mod tests {
     #[test]
     fn actual_folded_suite_judges_failures_and_both_hygiene_checks() {
         let root = Scratch::new();
-        for case in ["positive", "failure", "home", "cli", "zero"] {
+        for case in [
+            "positive",
+            "failure",
+            "home",
+            "cli",
+            "zero",
+            "toolchain",
+            "compile",
+            "spawn",
+        ] {
             let (repo, _target, h, lease) = fixture(&root.0, case);
             let mut runner = Runner::without_marker(&lease).unwrap();
+            if case == "spawn" {
+                assert!(
+                    runner
+                        .run(std::process::Command::new("/bin/sh").args(["-c", "exit 0"]))
+                        .unwrap()
+                        .success()
+                );
+            }
             let suite = run(&repo, &h, &mut runner);
             if let Some(directory) = std::env::var_os("XTASK_F45_RETAIN") {
                 let directory = std::path::PathBuf::from(directory);
@@ -464,7 +500,7 @@ mod tests {
                 "failure" => (true, false, false),
                 "home" => (false, true, false),
                 "cli" => (false, false, true),
-                "zero" => (true, true, true),
+                "zero" | "toolchain" | "compile" | "spawn" => (true, true, true),
                 _ => unreachable!(),
             };
             assert_eq!(
@@ -480,7 +516,31 @@ mod tests {
             if case == "zero" {
                 assert!(suite.steps[1].detail.contains("no test executed"));
             }
-            runner.finished().unwrap();
+            if case == "toolchain" {
+                assert!(fail("build"));
+                assert_eq!(suite.steps[0].exit, Some(1));
+                assert!(
+                    !String::from_utf8_lossy(&suite.logs["steps/build.log"])
+                        .contains("downloading")
+                );
+            }
+            if case == "compile" {
+                assert!(fail("build"));
+                assert_eq!(suite.steps[0].exit, Some(101));
+                assert!(
+                    String::from_utf8_lossy(&suite.logs["steps/build.log"]).contains("planted")
+                );
+            }
+            if case == "spawn" {
+                assert!(fail("build"));
+                assert_eq!(
+                    suite.steps[0].exit, None,
+                    "no spawned build: never reuse an earlier child status"
+                );
+                assert!(runner.finished().is_err());
+            } else {
+                runner.finished().unwrap();
+            }
             // No fixture worker remains; only then may scratch be removed.
         }
     }
