@@ -1,5 +1,12 @@
 //! Registry seam only. No gate, inventory, evidence or lease executes here.
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(
+    dead_code,
+    reason = "F1 source is disconnected pending independent review and later tier wiring"
+)]
+mod target;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
