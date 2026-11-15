@@ -696,3 +696,21 @@ fn judge_control_character_paths_are_explicitly_refused() {
         output.contains("judge source path unsupported");
     }
 }
+
+#[test]
+fn kept_target_cannot_qualify_even_when_aliases_claim_finished() {
+    let evidence = Evidence::new();
+    evidence.positive();
+    evidence.key("target", "kept (direct child was not reaped)");
+    // Deliberately retain qualifying=yes and target-finished=yes. C8 requires
+    // the explicit kept outcome to override contradictory success aliases.
+    evidence.reject("target");
+}
+
+#[test]
+fn unfinished_target_cannot_qualify_even_when_qualifying_yes() {
+    let evidence = Evidence::new();
+    evidence.positive();
+    evidence.key("target-finished", "no");
+    evidence.reject("target-finished");
+}
