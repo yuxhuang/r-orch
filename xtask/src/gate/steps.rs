@@ -29,6 +29,8 @@ pub(super) struct Runner<'a, 'm> {
     lease: &'a Lease,
     marker: Option<&'m Marker<'m>>,
     child: Option<Child>,
+    #[cfg(test)]
+    qualification_drop_stdin: bool,
     start: Option<Instant>,
     active_command: Option<String>,
     statuses: Vec<Status>,
@@ -68,6 +70,8 @@ impl<'a, 'm> Runner<'a, 'm> {
             lease,
             marker,
             child: None,
+            #[cfg(test)]
+            qualification_drop_stdin: false,
             start: None,
             active_command: None,
             statuses: Vec::new(),
@@ -168,6 +172,10 @@ impl<'a, 'm> Runner<'a, 'm> {
         if let Some(marker) = self.marker {
             command.stdin(marker.command_stdin()?);
         }
+        #[cfg(test)]
+        if self.qualification_drop_stdin {
+            command.stdin(Stdio::null());
+        }
         let start = Instant::now();
         let identity = format!(
             "program={:?} args={:?} cwd={:?}",
@@ -187,6 +195,36 @@ impl<'a, 'm> Runner<'a, 'm> {
                 Err(e).context("start direct command")
             }
         }
+    }
+
+    // Test-only access to the real start/drive path. No recovery policy is
+    // injected: qualification records the actual native admission outcome.
+    #[cfg(test)]
+    pub(super) fn qualification_run(
+        &mut self,
+        command: &mut Command,
+        ready: &std::path::Path,
+        drop_stdin: bool,
+        resistant: bool,
+    ) -> Result<ExitStatus> {
+        self.qualification_drop_stdin = drop_stdin;
+        self.start(command)?;
+        if resistant {
+            let prepared = ready.with_file_name("resistant.ready");
+            let end = Instant::now() + Duration::from_secs(10);
+            while !prepared.exists() {
+                ensure!(Instant::now() < end, "resistant child handshake");
+                std::thread::sleep(POLL);
+            }
+            self.forward(nix::libc::SIGTERM)?;
+            std::thread::sleep(SIGNAL_GRACE + Duration::from_millis(100));
+            ensure!(
+                self.child.as_mut().unwrap().try_wait()?.is_none(),
+                "child did not resist TERM"
+            );
+        }
+        std::fs::write(ready, self.child.as_ref().unwrap().id().to_string())?;
+        self.drive(None)
     }
 
     fn observe_exit(&mut self) -> Result<Option<ExitStatus>> {

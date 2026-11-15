@@ -11,6 +11,8 @@
 //! qualification; the native controls do not supply that missing whole-command set.
 
 mod native;
+#[cfg(test)]
+mod qualification;
 
 use std::collections::BTreeMap;
 use std::fmt;

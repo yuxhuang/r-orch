@@ -29,7 +29,22 @@ Ninth amendment (correction of the eighth, by the architect; changes from the ei
 
 ## Integrated production defect repair (2026-11-15)
 
-Scoped repair starts at independent C head `608113814a64fdc12fd07141f14a3daf6efc4fce`.
+Bounded native-recovery continuation starts at independent C head
+`9c73b6e50d7b017e67bd65795c54ee483175e912`. Before any capability is enabled,
+exercise real fixed commands through the production `NativeTarget`/`Runner`
+holder, kill that holder, verify next-admission exclusion for the live direct
+command, then observe actual exit/last-close and native reset. Cover command
+lifetimes, exact tools/platform/filesystem, setuid-`ps` observation limits, and
+three production-path discriminators: dropped inheritance, explicit shared-
+description unlock with a resistant direct command, and per-process record-lock
+replacement. Test-only seams may expose the production path but may not supply
+recovery authority. Unknown combinations remain unsupported. If the mechanism
+cannot meet the contract, retain the red positive and provide a concrete
+counterexample and the minimum decision needed, rather than count unsupported
+recovery as delivery. The original seven C files remain byte-identical.
+
+The preceding repair started at independent C head
+`608113814a64fdc12fd07141f14a3daf6efc4fce`.
 The seven existing C test files stay byte-for-byte unchanged. This amendment adds
 no contract relaxation and does not replace the original failed evidence.
 
@@ -68,6 +83,44 @@ Unsupported; no simulation policy or platform-name allowlist is promoted.
 Linux, other tool sets/filesystems and native last-close reset remain unqualified.
 The external handoff contains exact tool/filesystem identities and the incomplete
 qualification ledger; none of these scoped controls is whole-workspace acceptance.
+
+
+### Native-recovery continuation result (2026-11-15; incomplete)
+
+The continuation adds test-only access to the real `NativeTarget::begin`,
+`NativeUse::run` and `Runner` start/drive path. Production recovery policy stays
+unchanged. On the measured Mac/APFS devices, the 19 fixed real command forms
+remain excluded after holder KILL while output backpressure keeps the direct
+command live; real native admission refuses, the marker inode and artifact stay
+unchanged, and exit/last-close are subsequently observed. The three production-
+holder discriminators detect dropped stdin, explicit shared-description unlock
+with a TERM-resistant direct child alive beyond the grace, and per-process
+record-lock replacement (probed with the same record-lock API). Samples and
+setuid-`ps` observation failures are retained; these finite workloads do not
+prove arbitrary command inputs, future tool versions or unmeasured filesystems.
+Successful native reset remains unmet and the unchanged C positive remains red.
+
+A new concrete counterexample prevents enabling a capability based only on the
+current tools/platform/filesystem: a previously admitted cargo-named tool closes
+its marker stdin, ignores TERM, and stays live after the real production holder
+is killed. Replacing that tool outside the source tree with native pinned Cargo
+leaves the current tool combination native, the unchanged marker lock free, and
+the earlier direct process live. The marker contains only unvalidated purpose/PID
+diagnostics; it does not bind the prior use to a qualified tool set. Neither that
+PID nor a current-tool check supplies the missing authority. The existing warm
+record has already been invalidated. This is not the owner-accepted D45 namespace
+race or FS1 escaped-descendant residual: the gate's own direct command is live.
+
+No capability, diagnostic authority, format/protocol change or acceptance waiver
+is introduced. The minimum new decision is whether to authorize authoritative
+prior-use qualification/cutover state and launch enforcement (including refusal
+of unknown prior uses), and permit the independent test owner to replace the
+synthetic-cargo recovery fixture with an equally strong real-Cargo lifecycle.
+Without that decision, the unchanged synthetic positive and a tool-specific
+production qualification cannot both establish safe supported recovery. The
+lead must adjudicate the counterexample before dependent implementation; the
+existing independent verifier consumes these artifacts without another unchanged
+probe loop. All other acceptance and risk disclosures above remain in force.
 
 ## Owner D45 native mutation amendment (2026-11-15)
 
