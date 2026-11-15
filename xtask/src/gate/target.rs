@@ -159,7 +159,9 @@ fn source_path(path: &[u8]) -> Result<()> {
 
 fn content_id(text: &str) -> Result<()> {
     if ![40, 64].contains(&text.len())
-        || !text.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        || !text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     {
         return Err(Fault::Codec("source content is not a Git object identity"));
     }
@@ -283,10 +285,16 @@ impl Record {
             return Err(Fault::Codec("schema or exact length mismatch"));
         }
         let boot = BootId::from_bytes(
-            cursor.take(16)?.try_into().map_err(|_| Fault::Codec("boot field"))?,
+            cursor
+                .take(16)?
+                .try_into()
+                .map_err(|_| Fault::Codec("boot field"))?,
         )?;
         let end_ns = i128::from_be_bytes(
-            cursor.take(16)?.try_into().map_err(|_| Fault::Codec("end field"))?,
+            cursor
+                .take(16)?
+                .try_into()
+                .map_err(|_| Fault::Codec("end field"))?,
         );
         let root = cursor.field()?.to_vec();
         let toolchain = cursor.text()?;
@@ -331,7 +339,11 @@ impl Record {
         if self.toolchain != current.toolchain {
             return Err(Reset::Toolchain);
         }
-        if self.sources.keys().any(|p| !current.sources.0.contains_key(p)) {
+        if self
+            .sources
+            .keys()
+            .any(|p| !current.sources.0.contains_key(p))
+        {
             return Err(Reset::Content);
         }
         for (path, source) in &current.sources.0 {
@@ -361,15 +373,23 @@ struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     fn take(&mut self, length: usize) -> Result<&'a [u8]> {
-        let end = self.offset.checked_add(length).ok_or(Fault::Codec("length overflow"))?;
-        let result = self.bytes.get(self.offset..end).ok_or(Fault::Codec("truncated record"))?;
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or(Fault::Codec("length overflow"))?;
+        let result = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(Fault::Codec("truncated record"))?;
         self.offset = end;
         Ok(result)
     }
 
     fn u32(&mut self) -> Result<u32> {
         Ok(u32::from_be_bytes(
-            self.take(4)?.try_into().map_err(|_| Fault::Codec("integer field"))?,
+            self.take(4)?
+                .try_into()
+                .map_err(|_| Fault::Codec("integer field"))?,
         ))
     }
 
@@ -549,13 +569,19 @@ fn check_metadata(
     device: u64,
 ) -> Result<()> {
     if (directory && !meta.is_dir()) || (!directory && !meta.is_file()) {
-        return Err(boundary(path, "not the required real directory/regular leaf"));
+        return Err(boundary(
+            path,
+            "not the required real directory/regular leaf",
+        ));
     }
     if meta.uid() != owner || meta.dev() != device {
         return Err(boundary(path, "different owner or filesystem"));
     }
     if !directory && (meta.mode() & 0o7077 != 0 || meta.nlink() != 1) {
-        return Err(boundary(path, "state leaf must be owner-only and singly linked"));
+        return Err(boundary(
+            path,
+            "state leaf must be owner-only and singly linked",
+        ));
     }
     Ok(())
 }
@@ -571,14 +597,20 @@ fn open_flags(directory: bool) -> Result<i32> {
     let (nofollow, nonblock, dir) = (0x8000, 0x800, 0x4000);
     #[cfg(any(
         target_os = "macos",
-        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     ))]
     {
         Ok(nofollow | nonblock | if directory { dir } else { 0 })
     }
     #[cfg(not(any(
         target_os = "macos",
-        all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64"))
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
     )))]
     {
         let _ = directory;
@@ -607,7 +639,10 @@ impl StateFiles {
     // boundary. A metadata owner or environment value is not proof of that fact.
     fn inspect(root: &Path, owner: u32, kind: Kind) -> Result<Self> {
         if !root.is_absolute() || at(root.canonicalize(), "canonicalize root", root)? != root {
-            return Err(boundary(root, "worktree root must already be canonical and absolute"));
+            return Err(boundary(
+                root,
+                "worktree root must already be canonical and absolute",
+            ));
         }
         let meta = at(fs::symlink_metadata(root), "inspect root", root)?;
         check_metadata(root, &meta, true, owner, meta.dev())?;
@@ -672,7 +707,11 @@ impl StateFiles {
 
     fn check_target(&self) -> Result<bool> {
         self.check_parents()?;
-        let name = if self.kind == Kind::Warm { "gate-warm" } else { "gate" };
+        let name = if self.kind == Kind::Warm {
+            "gate-warm"
+        } else {
+            "gate"
+        };
         Ok(self
             .check_directory(&self.root.join("target").join(name), true)?
             .is_some())
@@ -680,7 +719,9 @@ impl StateFiles {
 
     fn check_leaf(&self, leaf: Leaf) -> Result<Option<Metadata>> {
         if self.kind == Kind::Cold && !matches!(leaf, Leaf::Marker) {
-            return Err(Fault::Unavailable("cold target has no completed record or temporary"));
+            return Err(Fault::Unavailable(
+                "cold target has no completed record or temporary",
+            ));
         }
         self.check_parents()?;
         let path = self.path(leaf);
@@ -717,7 +758,10 @@ impl StateFiles {
             .check_leaf(leaf)?
             .ok_or_else(|| boundary(&path, "leaf disappeared"))?;
         if identity(&opened) != identity(&now)
-            || (!exclusive && before.as_ref().is_none_or(|m| identity(m) != identity(&opened)))
+            || (!exclusive
+                && before
+                    .as_ref()
+                    .is_none_or(|m| identity(m) != identity(&opened)))
         {
             return Err(boundary(&path, "leaf identity changed during open"));
         }
@@ -742,7 +786,9 @@ impl StateFiles {
         )?;
         let mut bytes = Vec::new();
         if let Err(error) = at(
-            (&file).take((MAX_RECORD + 1) as u64).read_to_end(&mut bytes),
+            (&file)
+                .take((MAX_RECORD + 1) as u64)
+                .read_to_end(&mut bytes),
             "read completed record",
             &self.path(Leaf::Record),
         ) {
@@ -753,7 +799,10 @@ impl StateFiles {
             .check_leaf(Leaf::Record)?
             .ok_or_else(|| boundary(&self.path(Leaf::Record), "record disappeared during read"))?;
         if identity(&opened) != identity(&now) {
-            return Err(boundary(&self.path(Leaf::Record), "record replaced during read"));
+            return Err(boundary(
+                &self.path(Leaf::Record),
+                "record replaced during read",
+            ));
         }
         Ok(match Record::decode(&bytes) {
             Ok(record) => Stored::Complete(record),
@@ -823,7 +872,11 @@ impl StateFiles {
         // and F_FULLFSYNC on Apple. No fsync fallback on error. In particular,
         // Apple's directory call may fail: that is an unavailable durability
         // mechanism, not successful publication. Native evidence is still due.
-        at(directory.sync_all(), "synchronize state directory", &self.state)
+        at(
+            directory.sync_all(),
+            "synchronize state directory",
+            &self.state,
+        )
     }
 
     fn remove_leaf(&self, leaf: Leaf) -> Result<()> {
@@ -882,7 +935,11 @@ impl StateFiles {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => return Err(Fault::Busy),
             Err(TryLockError::Error(e)) => {
-                return at(Err(e), "try marker OFD-class lock", &self.path(Leaf::Marker));
+                return at(
+                    Err(e),
+                    "try marker OFD-class lock",
+                    &self.path(Leaf::Marker),
+                );
             }
         }
         let marker = Marker {
@@ -926,15 +983,13 @@ impl Marker<'_> {
             &self.files.path(Leaf::Marker),
         )?;
         match self.files.check_leaf(Leaf::Marker)? {
-            Some(now) if identity(&held) == identity(&now) => {
-                check_metadata(
-                    &self.files.path(Leaf::Marker),
-                    &held,
-                    false,
-                    self.files.owner,
-                    self.files.device,
-                )
-            }
+            Some(now) if identity(&held) == identity(&now) => check_metadata(
+                &self.files.path(Leaf::Marker),
+                &held,
+                false,
+                self.files.owner,
+                self.files.device,
+            ),
             _ => Err(Fault::MarkerChanged),
         }
     }
@@ -943,10 +998,16 @@ impl Marker<'_> {
         // Never open a second descriptor of the marker, even for diagnostics.
         self.check_identity()?;
         let path = self.files.path(Leaf::Marker);
-        at(self.file.seek(SeekFrom::Start(0)), "seek marker diagnostic", &path)?;
+        at(
+            self.file.seek(SeekFrom::Start(0)),
+            "seek marker diagnostic",
+            &path,
+        )?;
         let mut bytes = Vec::new();
         at(
-            (&mut self.file).take((MAX_DIAGNOSTIC + 1) as u64).read_to_end(&mut bytes),
+            (&mut self.file)
+                .take((MAX_DIAGNOSTIC + 1) as u64)
+                .read_to_end(&mut bytes),
             "read marker diagnostic",
             &path,
         )?;
@@ -962,9 +1023,17 @@ impl Marker<'_> {
         }
         self.check_identity()?;
         let path = self.files.path(Leaf::Marker);
-        at(self.file.seek(SeekFrom::Start(0)), "seek checked marker", &path)?;
+        at(
+            self.file.seek(SeekFrom::Start(0)),
+            "seek checked marker",
+            &path,
+        )?;
         at(self.file.write_all(bytes), "write checked marker", &path)?;
-        at(self.file.set_len(bytes.len() as u64), "size checked marker", &path)
+        at(
+            self.file.set_len(bytes.len() as u64),
+            "size checked marker",
+            &path,
+        )
     }
 
     fn protect(&mut self) -> Result<()> {
@@ -996,11 +1065,15 @@ impl Marker<'_> {
         end_ns: i128,
     ) -> Result<Publication> {
         if self.phase != Phase::Invalidated || self.files.kind != Kind::Warm {
-            return Err(Fault::Unavailable("warm finish before invalidation or for cold target"));
+            return Err(Fault::Unavailable(
+                "warm finish before invalidation or for cold target",
+            ));
         }
         if !finished.direct_reaped || !finished.lease_held || !finished.inherited_holder_valid {
             self.phase = Phase::Failed;
-            return Err(Fault::Unavailable("use not finished; keep marker and target"));
+            return Err(Fault::Unavailable(
+                "use not finished; keep marker and target",
+            ));
         }
         let result = self.finish_warm_inner(before, current, end_ns);
         if result.is_err() {
@@ -1018,7 +1091,9 @@ impl Marker<'_> {
         self.check_identity()?;
         let verdict = publication(before, current.sources, current.boot);
         let encoded = if verdict == Publication::Record {
-            let boot = current.boot.ok_or(Fault::Unavailable("current boot identity unavailable"))?;
+            let boot = current
+                .boot
+                .ok_or(Fault::Unavailable("current boot identity unavailable"))?;
             Some(
                 Record::new(
                     self.files.root.as_os_str().as_bytes().to_vec(),
@@ -1040,11 +1115,15 @@ impl Marker<'_> {
         // F2 first removes the cold target (or keeps it on --keep), with its
         // structural checks and reviewed removal mechanism. No warm leaf is used.
         if self.phase != Phase::Invalidated || self.files.kind != Kind::Cold {
-            return Err(Fault::Unavailable("cold finish before invalidation or for warm target"));
+            return Err(Fault::Unavailable(
+                "cold finish before invalidation or for warm target",
+            ));
         }
         if !finished.direct_reaped || !finished.lease_held || !finished.inherited_holder_valid {
             self.phase = Phase::Failed;
-            return Err(Fault::Unavailable("use not finished; keep marker and target"));
+            return Err(Fault::Unavailable(
+                "use not finished; keep marker and target",
+            ));
         }
         finish_order(self, None)
     }
@@ -1097,7 +1176,14 @@ const NO_RECORD_FINISH_STEPS: &[Step] = &[Step::RemoveMarker];
 
 fn sequence(io: &mut impl StateIo, steps: &[Step], bytes: Option<&[u8]>) -> Result<()> {
     for &step in steps {
-        io.step(step, if step == Step::WriteTemporary { bytes } else { None })?;
+        io.step(
+            step,
+            if step == Step::WriteTemporary {
+                bytes
+            } else {
+                None
+            },
+        )?;
     }
     Ok(())
 }
@@ -1180,10 +1266,9 @@ impl Marker<'_> {
                     "fstat temporary",
                     &self.files.path(Leaf::Temporary),
                 )?;
-                let now = self
-                    .files
-                    .check_leaf(Leaf::Temporary)?
-                    .ok_or_else(|| boundary(&self.files.path(Leaf::Temporary), "temporary disappeared"))?;
+                let now = self.files.check_leaf(Leaf::Temporary)?.ok_or_else(|| {
+                    boundary(&self.files.path(Leaf::Temporary), "temporary disappeared")
+                })?;
                 if identity(&held) != identity(&now) {
                     return Err(boundary(
                         &self.files.path(Leaf::Temporary),
@@ -1197,7 +1282,10 @@ impl Marker<'_> {
                     ));
                 }
                 at(
-                    fs::rename(self.files.path(Leaf::Temporary), self.files.path(Leaf::Record)),
+                    fs::rename(
+                        self.files.path(Leaf::Temporary),
+                        self.files.path(Leaf::Record),
+                    ),
                     "rename completed record",
                     &self.files.path(Leaf::Record),
                 )?;
@@ -1273,7 +1361,11 @@ mod tests {
     #[test]
     fn same_boot_complete_record_reuses_existing_warm_target() {
         assert_eq!(
-            decide(observation(), &Stored::Complete(record()), context(&sources())),
+            decide(
+                observation(),
+                &Stored::Complete(record()),
+                context(&sources())
+            ),
             Action::Reuse,
         );
     }
@@ -1287,14 +1379,25 @@ mod tests {
         assert_eq!(decide(observation(), &r, c), Action::Reset(Reset::Worktree));
         let mut c = context(&s);
         c.toolchain = "different";
-        assert_eq!(decide(observation(), &r, c), Action::Reset(Reset::Toolchain));
+        assert_eq!(
+            decide(observation(), &r, c),
+            Action::Reset(Reset::Toolchain)
+        );
         let mut changed = sources();
-        changed.0.get_mut(b"src/main.rs".as_slice()).unwrap().content = "b".repeat(40);
+        changed
+            .0
+            .get_mut(b"src/main.rs".as_slice())
+            .unwrap()
+            .content = "b".repeat(40);
         assert_eq!(
             decide(observation(), &r, context(&changed)),
             Action::Reset(Reset::Content),
         );
-        changed.0.get_mut(b"src/main.rs".as_slice()).unwrap().modified_ns = Some(201);
+        changed
+            .0
+            .get_mut(b"src/main.rs".as_slice())
+            .unwrap()
+            .modified_ns = Some(201);
         assert_eq!(decide(observation(), &r, context(&changed)), Action::Reuse);
     }
 
@@ -1359,14 +1462,20 @@ mod tests {
     fn cold_always_rebuilds_but_never_bypasses_unsupported_recovery() {
         let mut o = observation();
         o.kind = Kind::Cold;
-        assert_eq!(decide(o, &Stored::Missing, context(&sources())), Action::Cold);
+        assert_eq!(
+            decide(o, &Stored::Missing, context(&sources())),
+            Action::Cold
+        );
         o.marker_found = true;
         assert_eq!(
             decide(o, &Stored::Missing, context(&sources())),
             Action::Refuse(Refusal::UnsupportedRecovery),
         );
         o.recovery = Recovery::ShownInSimulation;
-        assert_eq!(decide(o, &Stored::Missing, context(&sources())), Action::Cold);
+        assert_eq!(
+            decide(o, &Stored::Missing, context(&sources())),
+            Action::Cold
+        );
     }
 
     #[test]
@@ -1454,21 +1563,50 @@ mod tests {
     #[test]
     fn omitted_old_source_and_deleted_listed_source_reset() {
         let mut current = sources();
-        current.0.insert(b"old.rs".to_vec(), Source {
-            path: b"old.rs".to_vec(), content: "b".repeat(40), modified_ns: Some(200),
-        });
-        assert_eq!(decide(observation(), &Stored::Complete(record()), context(&current)), Action::Reset(Reset::Content));
+        current.0.insert(
+            b"old.rs".to_vec(),
+            Source {
+                path: b"old.rs".to_vec(),
+                content: "b".repeat(40),
+                modified_ns: Some(200),
+            },
+        );
+        assert_eq!(
+            decide(
+                observation(),
+                &Stored::Complete(record()),
+                context(&current)
+            ),
+            Action::Reset(Reset::Content)
+        );
         current.0.get_mut(b"old.rs".as_slice()).unwrap().modified_ns = Some(201);
-        assert_eq!(decide(observation(), &Stored::Complete(record()), context(&current)), Action::Reuse);
+        assert_eq!(
+            decide(
+                observation(),
+                &Stored::Complete(record()),
+                context(&current)
+            ),
+            Action::Reuse
+        );
         let empty = Sources::new(vec![]).unwrap();
-        assert_eq!(decide(observation(), &Stored::Complete(record()), context(&empty)), Action::Reset(Reset::Content));
+        assert_eq!(
+            decide(observation(), &Stored::Complete(record()), context(&empty)),
+            Action::Reset(Reset::Content)
+        );
     }
 
     #[test]
     fn duplicate_unsafe_paths_and_invalid_content_are_not_complete_sources() {
         let s = sources().0.into_values().next().unwrap();
         assert!(Sources::new(vec![s.clone(), s.clone()]).is_err());
-        for path in [b"../outside".as_slice(), b"/absolute", b"a/../b", b"a//b", b"a\0b", b"."] {
+        for path in [
+            b"../outside".as_slice(),
+            b"/absolute",
+            b"a/../b",
+            b"a//b",
+            b"a\0b",
+            b".",
+        ] {
             let mut invalid = s.clone();
             invalid.path = path.to_vec();
             assert!(Sources::new(vec![invalid]).is_err());
@@ -1483,11 +1621,24 @@ mod tests {
         let a = sources();
         assert_eq!(publication(&a, &a, Some(boot())), Publication::Record);
         let mut changed = sources();
-        changed.0.get_mut(b"src/main.rs".as_slice()).unwrap().content = "b".repeat(40);
-        assert_eq!(publication(&a, &changed, Some(boot())), Publication::SourceChanged);
+        changed
+            .0
+            .get_mut(b"src/main.rs".as_slice())
+            .unwrap()
+            .content = "b".repeat(40);
+        assert_eq!(
+            publication(&a, &changed, Some(boot())),
+            Publication::SourceChanged
+        );
         let empty = Sources::new(vec![]).unwrap();
-        assert_eq!(publication(&a, &empty, Some(boot())), Publication::SourceChanged);
-        assert_eq!(publication(&empty, &a, Some(boot())), Publication::SourceChanged);
+        assert_eq!(
+            publication(&a, &empty, Some(boot())),
+            Publication::SourceChanged
+        );
+        assert_eq!(
+            publication(&empty, &a, Some(boot())),
+            Publication::SourceChanged
+        );
     }
 
     #[test]
@@ -1495,15 +1646,27 @@ mod tests {
         // State simulations only: no cargo clean, crash or live writer is proved.
         let mut o = observation();
         o.target_exists = false;
-        assert_eq!(decide(o, &Stored::Missing, context(&sources())), Action::Reset(Reset::NoRecord));
+        assert_eq!(
+            decide(o, &Stored::Missing, context(&sources())),
+            Action::Reset(Reset::NoRecord)
+        );
         o.target_exists = true;
-        assert_eq!(decide(o, &Stored::Missing, context(&sources())), Action::Reset(Reset::NoRecord));
+        assert_eq!(
+            decide(o, &Stored::Missing, context(&sources())),
+            Action::Reset(Reset::NoRecord)
+        );
         o.target_exists = false;
         o.marker_found = true;
         o.recovery = Recovery::ShownInSimulation;
-        assert_eq!(decide(o, &Stored::Complete(record()), context(&sources())), Action::Reset(Reset::Unfinished));
+        assert_eq!(
+            decide(o, &Stored::Complete(record()), context(&sources())),
+            Action::Reset(Reset::Unfinished)
+        );
         o.lock_granted = false;
-        assert_eq!(decide(o, &Stored::Complete(record()), context(&sources())), Action::Refuse(Refusal::Busy));
+        assert_eq!(
+            decide(o, &Stored::Complete(record()), context(&sources())),
+            Action::Refuse(Refusal::Busy)
+        );
     }
 
     #[test]
@@ -1513,9 +1676,21 @@ mod tests {
         protect_order(&mut io).unwrap();
         invalidate_order(&mut io, Kind::Warm).unwrap();
         finish_order(&mut io, Some(b"new-record")).unwrap();
-        assert_eq!(io.events, [Step::MarkerSync, Step::DirectorySync, Step::RemoveTemporary,
-            Step::RemoveRecord, Step::DirectorySync, Step::WriteTemporary, Step::TemporarySync,
-            Step::RenameRecord, Step::DirectorySync, Step::RemoveMarker]);
+        assert_eq!(
+            io.events,
+            [
+                Step::MarkerSync,
+                Step::DirectorySync,
+                Step::RemoveTemporary,
+                Step::RemoveRecord,
+                Step::DirectorySync,
+                Step::WriteTemporary,
+                Step::TemporarySync,
+                Step::RenameRecord,
+                Step::DirectorySync,
+                Step::RemoveMarker
+            ]
+        );
         let mut marker = true;
         let mut old_record = true;
         for event in &io.events {
@@ -1535,7 +1710,10 @@ mod tests {
         invalidate_order(&mut reference, Kind::Warm).unwrap();
         finish_order(&mut reference, Some(b"new")).unwrap();
         for fail in 0..reference.events.len() {
-            let mut io = Journal { fail: Some(fail), ..Journal::default() };
+            let mut io = Journal {
+                fail: Some(fail),
+                ..Journal::default()
+            };
             let result = protect_order(&mut io)
                 .and_then(|()| invalidate_order(&mut io, Kind::Warm))
                 .and_then(|()| finish_order(&mut io, Some(b"new")));
@@ -1579,7 +1757,11 @@ mod tests {
                     assert!(path.is_absolute(), "fixture override must be absolute");
                     let meta = fs::symlink_metadata(path).unwrap();
                     assert!(meta.is_dir(), "fixture override must be a real directory");
-                    assert_eq!(meta.mode() & 0o7777, 0o700, "fixture override must be private");
+                    assert_eq!(
+                        meta.mode() & 0o7777,
+                        0o700,
+                        "fixture override must be private"
+                    );
                     path.canonicalize().unwrap()
                 }
                 None => std::env::temp_dir().canonicalize().unwrap(),
@@ -1590,14 +1772,24 @@ mod tests {
             assert_eq!(meta.mode() & 0o7777, 0o700);
             let root = base.join("r");
             fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
-            fs::DirBuilder::new().mode(0o700).create(root.join("target")).unwrap();
-            fs::DirBuilder::new().mode(0o700).create(root.join("target/.gate-state")).unwrap();
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(root.join("target"))
+                .unwrap();
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(root.join("target/.gate-state"))
+                .unwrap();
             let root = root.canonicalize().unwrap();
             let owner = fs::symlink_metadata(&root).unwrap().uid();
             let files = StateFiles::inspect(&root, owner, Kind::Warm).unwrap();
             let outside = base.join("outside-canary");
             fs::write(&outside, b"outside stays unchanged").unwrap();
-            Self { base, files, outside }
+            Self {
+                base,
+                files,
+                outside,
+            }
         }
 
         fn canary_unchanged(&self) {
@@ -1706,8 +1898,10 @@ mod tests {
             assert!(f.files.check_leaf(leaf).unwrap().is_some());
         }
         assert!(!f.files.check_target().unwrap());
-        fs::DirBuilder::new().mode(0o700)
-            .create(f.files.root.join("target/gate-warm")).unwrap();
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(f.files.root.join("target/gate-warm"))
+            .unwrap();
         assert!(f.files.check_target().unwrap());
         f.canary_unchanged();
     }
@@ -1719,8 +1913,26 @@ mod tests {
         fs::write(&path, b"damaged content").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         let meta = fs::symlink_metadata(&path).unwrap();
-        boundary_at(check_metadata(&path, &meta, false, f.files.owner.wrapping_add(1), f.files.device), &path);
-        boundary_at(check_metadata(&path, &meta, false, f.files.owner, f.files.device.wrapping_add(1)), &path);
+        boundary_at(
+            check_metadata(
+                &path,
+                &meta,
+                false,
+                f.files.owner.wrapping_add(1),
+                f.files.device,
+            ),
+            &path,
+        );
+        boundary_at(
+            check_metadata(
+                &path,
+                &meta,
+                false,
+                f.files.owner,
+                f.files.device.wrapping_add(1),
+            ),
+            &path,
+        );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         boundary_at(f.files.read_record().map(|_| ()), &path);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1737,7 +1949,10 @@ mod tests {
         drop(file);
         fs::write(f.files.path(Leaf::Temporary), b"existing").unwrap();
         assert!(f.files.open_regular(Leaf::Temporary, true, true).is_err());
-        assert_eq!(fs::read(f.files.path(Leaf::Temporary)).unwrap(), b"existing");
+        assert_eq!(
+            fs::read(f.files.path(Leaf::Temporary)).unwrap(),
+            b"existing"
+        );
         f.canary_unchanged();
     }
 
@@ -1757,7 +1972,10 @@ mod tests {
     #[test]
     fn temporary_record_is_never_a_completed_record_fallback() {
         let f = Fixture::new();
-        let temporary = f.files.create_temporary(&record().encode().unwrap()).unwrap();
+        let temporary = f
+            .files
+            .create_temporary(&record().encode().unwrap())
+            .unwrap();
         drop(temporary);
         assert_eq!(f.files.read_record().unwrap(), Stored::Missing);
         f.canary_unchanged();
@@ -1772,7 +1990,10 @@ mod tests {
         drop(file);
         f.files.kind = Kind::Cold;
         assert!(matches!(f.files.read_record(), Err(Fault::Unavailable(_))));
-        assert!(matches!(f.files.remove_leaf(Leaf::Record), Err(Fault::Unavailable(_))));
+        assert!(matches!(
+            f.files.remove_leaf(Leaf::Record),
+            Err(Fault::Unavailable(_))
+        ));
         assert_eq!(fs::read(warm_record).unwrap(), b"warm record is separate");
         f.canary_unchanged();
     }
@@ -1785,7 +2006,8 @@ mod tests {
             let held = f.files.lock_marker_primitive().unwrap();
             let path = f.files.path(Leaf::Marker);
             fs::remove_file(&path).unwrap();
-            let replacement = recreate.then(|| f.files.open_regular(Leaf::Marker, true, true).unwrap());
+            let replacement =
+                recreate.then(|| f.files.open_regular(Leaf::Marker, true, true).unwrap());
             assert!(matches!(held.check_identity(), Err(Fault::MarkerChanged)));
             assert!(!f.files.root.join("target/gate-warm").exists());
             f.canary_unchanged();
@@ -1800,10 +2022,16 @@ mod tests {
         let mut held = f.files.lock_marker_primitive().unwrap();
         held.write_diagnostics(b"diagnostic only").unwrap();
         assert_eq!(held.diagnostics().unwrap(), b"diagnostic only");
-        assert!(held.write_diagnostics(&vec![0; MAX_DIAGNOSTIC + 1]).is_err());
+        assert!(
+            held.write_diagnostics(&vec![0; MAX_DIAGNOSTIC + 1])
+                .is_err()
+        );
         let id = identity(&held.file.metadata().unwrap());
         drop(held);
-        assert_eq!(identity(&fs::symlink_metadata(f.files.path(Leaf::Marker)).unwrap()), id);
+        assert_eq!(
+            identity(&fs::symlink_metadata(f.files.path(Leaf::Marker)).unwrap()),
+            id
+        );
         f.canary_unchanged();
     }
 
@@ -1819,9 +2047,15 @@ mod tests {
                 lease_held: missing != 1,
                 inherited_holder_valid: missing != 2,
             };
-            assert!(held.finish_warm(finished, &sources(), context(&sources()), 300).is_err());
+            assert!(
+                held.finish_warm(finished, &sources(), context(&sources()), 300)
+                    .is_err()
+            );
             assert_eq!(held.phase, Phase::Failed);
-            assert!(matches!(held.step(Step::RemoveMarker, None), Err(Fault::Unavailable(_))));
+            assert!(matches!(
+                held.step(Step::RemoveMarker, None),
+                Err(Fault::Unavailable(_))
+            ));
             assert!(f.files.path(Leaf::Marker).exists());
             assert!(!f.files.path(Leaf::Record).exists());
             f.canary_unchanged();
@@ -1831,7 +2065,10 @@ mod tests {
     #[test]
     fn native_admission_withholds_unproved_platform_and_lease_without_creation() {
         let f = Fixture::new();
-        assert!(matches!(f.files.admit(false), Err(Fault::Unavailable("configured lease not observed"))));
+        assert!(matches!(
+            f.files.admit(false),
+            Err(Fault::Unavailable("configured lease not observed"))
+        ));
         assert!(matches!(f.files.admit(true), Err(Fault::Unavailable(_))));
         assert!(!f.files.path(Leaf::Marker).exists());
         f.canary_unchanged();
@@ -1874,7 +2111,10 @@ mod tests {
         let mut too_large = r;
         let content = too_large.sources.remove(&vec![b'z'; 1136]).unwrap();
         too_large.sources.insert(vec![b'z'; 1137], content);
-        assert!(matches!(too_large.validate(), Err(Fault::Codec("record byte limit"))));
+        assert!(matches!(
+            too_large.validate(),
+            Err(Fault::Codec("record byte limit"))
+        ));
         assert!(too_large.encode().is_err());
     }
 
@@ -1889,7 +2129,11 @@ mod tests {
         invalidate_order(&mut io, Kind::Warm).unwrap();
         assert_eq!(
             io.events,
-            [Step::RemoveTemporary, Step::RemoveRecord, Step::DirectorySync],
+            [
+                Step::RemoveTemporary,
+                Step::RemoveRecord,
+                Step::DirectorySync
+            ],
         );
         io.events.clear();
         invalidate_order(&mut io, Kind::Cold).unwrap();
@@ -1917,13 +2161,22 @@ mod tests {
         // process-global environment or silently skipping ordinary suite tests.
         let fallback = Fixture::with_root(None);
         let fallback_base = fallback.base.clone();
-        assert_eq!(fallback_base.parent().unwrap(), std::env::temp_dir().canonicalize().unwrap());
-        assert_eq!(fs::symlink_metadata(&fallback_base).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(
+            fallback_base.parent().unwrap(),
+            std::env::temp_dir().canonicalize().unwrap()
+        );
+        assert_eq!(
+            fs::symlink_metadata(&fallback_base).unwrap().mode() & 0o7777,
+            0o700
+        );
         let nested = Fixture::with_root(Some(&fallback.base));
         let nested_base = nested.base.clone();
         assert_eq!(nested_base.parent().unwrap(), fallback.base.as_path());
         assert_ne!(nested_base, fallback_base);
-        assert_eq!(fs::symlink_metadata(&nested_base).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(
+            fs::symlink_metadata(&nested_base).unwrap().mode() & 0o7777,
+            0o700
+        );
         nested.canary_unchanged();
         drop(nested);
         assert!(!nested_base.exists());
@@ -1961,9 +2214,13 @@ mod tests {
 
     fn prepare_warm_marker(f: &Fixture) -> Marker<'_> {
         let mut old = f.files.open_regular(Leaf::Record, true, true).unwrap();
-        old.write_all(b"old complete record must be invalidated").unwrap();
+        old.write_all(b"old complete record must be invalidated")
+            .unwrap();
         drop(old);
-        let temporary = f.files.create_temporary(b"old temporary must be removed").unwrap();
+        let temporary = f
+            .files
+            .create_temporary(b"old temporary must be removed")
+            .unwrap();
         drop(temporary);
         let mut held = f.files.lock_marker_primitive().unwrap();
         held.protect().unwrap();
@@ -1988,8 +2245,14 @@ mod tests {
         assert_eq!(held.phase, Phase::Removed);
         assert!(!held.files.path(Leaf::Marker).exists());
         assert!(!held.files.path(Leaf::Temporary).exists());
-        assert!(matches!(held.step(Step::MarkerSync, None), Err(Fault::Unavailable(_))));
-        assert!(matches!(held.step(Step::RemoveMarker, None), Err(Fault::Unavailable(_))));
+        assert!(matches!(
+            held.step(Step::MarkerSync, None),
+            Err(Fault::Unavailable(_))
+        ));
+        assert!(matches!(
+            held.step(Step::RemoveMarker, None),
+            Err(Fault::Unavailable(_))
+        ));
         assert_eq!(held.phase, Phase::Removed);
     }
 
@@ -2003,7 +2266,8 @@ mod tests {
         let mut current = context(&s);
         current.root = f.files.root.as_os_str().as_bytes();
         assert_eq!(
-            held.finish_warm(finished_observations(), &s, current, 300).unwrap(),
+            held.finish_warm(finished_observations(), &s, current, 300)
+                .unwrap(),
             Publication::Record,
         );
         let expected = Record {
@@ -2029,7 +2293,8 @@ mod tests {
         let mut after = sources();
         after.0.get_mut(b"src/main.rs".as_slice()).unwrap().content = "b".repeat(40);
         assert_eq!(
-            held.finish_warm(finished_observations(), &before, context(&after), 300).unwrap(),
+            held.finish_warm(finished_observations(), &before, context(&after), 300)
+                .unwrap(),
             Publication::SourceChanged,
         );
         assert_eq!(f.files.read_record().unwrap(), Stored::Missing);
@@ -2046,7 +2311,8 @@ mod tests {
         let mut current = context(&s);
         current.boot = None;
         assert_eq!(
-            held.finish_warm(finished_observations(), &s, current, 300).unwrap(),
+            held.finish_warm(finished_observations(), &s, current, 300)
+                .unwrap(),
             Publication::NoBoot,
         );
         assert_eq!(f.files.read_record().unwrap(), Stored::Missing);
@@ -2063,7 +2329,10 @@ mod tests {
         let mut record = f.files.open_regular(Leaf::Record, true, true).unwrap();
         record.write_all(b"warm record unchanged").unwrap();
         drop(record);
-        let temporary = f.files.create_temporary(b"warm temporary unchanged").unwrap();
+        let temporary = f
+            .files
+            .create_temporary(b"warm temporary unchanged")
+            .unwrap();
         drop(temporary);
         f.files.kind = Kind::Cold;
         let mut held = f.files.lock_marker_primitive().unwrap();
@@ -2075,8 +2344,14 @@ mod tests {
         held.finish_cold(finished_observations()).unwrap();
         assert_eq!(held.phase, Phase::Removed);
         assert!(!f.files.path(Leaf::Marker).exists());
-        assert!(matches!(held.step(Step::MarkerSync, None), Err(Fault::Unavailable(_))));
-        assert!(matches!(held.step(Step::RemoveMarker, None), Err(Fault::Unavailable(_))));
+        assert!(matches!(
+            held.step(Step::MarkerSync, None),
+            Err(Fault::Unavailable(_))
+        ));
+        assert!(matches!(
+            held.step(Step::RemoveMarker, None),
+            Err(Fault::Unavailable(_))
+        ));
         assert_eq!(fs::read(record_path).unwrap(), b"warm record unchanged");
         assert_eq!(fs::read(temp_path).unwrap(), b"warm temporary unchanged");
         drop(held);
@@ -2096,14 +2371,17 @@ mod tests {
         ] {
             let source = io::Error::from_raw_os_error(errno);
             let detail = source.to_string();
-            let unreadable = f.files.unreadable_record(
-                Fault::Io {
-                    operation,
-                    path: path.clone(),
-                    source,
-                },
-                expected,
-            ).unwrap();
+            let unreadable = f
+                .files
+                .unreadable_record(
+                    Fault::Io {
+                        operation,
+                        path: path.clone(),
+                        source,
+                    },
+                    expected,
+                )
+                .unwrap();
             assert_eq!(
                 unreadable,
                 Stored::Unreadable {
@@ -2139,13 +2417,19 @@ mod tests {
                 _ => {} // Missing after an I/O error is also a structural refusal.
             }
             // Simulates an I/O error after the checked open/read raced a swap.
-            for operation in ["open state leaf no-follow/nonblocking", "read completed record"] {
+            for operation in [
+                "open state leaf no-follow/nonblocking",
+                "read completed record",
+            ] {
                 let error = Fault::Io {
                     operation,
                     path: path.clone(),
                     source: io::Error::from_raw_os_error(5),
                 };
-                boundary_at(f.files.unreadable_record(error, expected).map(|_| ()), &path);
+                boundary_at(
+                    f.files.unreadable_record(error, expected).map(|_| ()),
+                    &path,
+                );
             }
             f.canary_unchanged();
             drop(regular);
