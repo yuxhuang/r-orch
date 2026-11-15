@@ -4,10 +4,13 @@
 //! fixtures. Recovery is still unsupported in production: one cargo observation
 //! on one native filesystem is not RC18 for every command/filesystem/platform.
 //!
-//! Native admission retains F1's namespace refusal. Stable std alone supplies
-//! no descriptor-relative mutation or mount-confined recursive deletion. The
-//! pathname checks below do not close concurrent parent-replacement races. The
-//! independent F2 process/publication work is not permission to bypass D45.
+//! Native read-only inspection uses safe nix descriptor-relative operations.
+//! Native mutation remains refused: unlinkat/renameat cannot condition the
+//! operation on the checked inode, and a directory FD does not pin its ancestry.
+//! Executed private counterexamples demonstrate both gaps; inspection/sync
+//! success is not D45 target admission or native RC18 recovery qualification.
+
+mod native;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -893,13 +896,13 @@ impl StateFiles {
         for leaf in self.leaves() {
             self.check_leaf(*leaf)?;
         }
-        // There is no bypass boolean or environment opt-in. The standard library
-        // has no approved stable openat/renameat/unlinkat/mount-confined removal
-        // interface (its documented Dir interface still requires feature dirfd).
-        // This guard is BEFORE mkdir, marker creation and lock acquisition.
-        Err(Fault::Unavailable(
-            "native namespace confinement and directory durability not qualified",
-        ))
+        // Native inspection is real read-only descriptor I/O, not a permit.
+        // It supplies no unlink-by-checked-inode or pinned-ancestry primitive.
+        // Refuse BEFORE mkdir, marker creation, locking, deletion or build.
+        let native = native::Boundary::inspect(self)?;
+        native.sync_existing()?;
+        native.require_mutation()?;
+        Err(Fault::Unavailable("native mutation capability absent"))
     }
 
     fn create_directories_candidate(&self) -> Result<()> {
@@ -2955,5 +2958,296 @@ mod tests {
         assert!(!failure.exits.is_empty());
         assert!(f.files.check_leaf(Leaf::Marker).unwrap().is_some());
         assert!(matches!(f.files.read_record().unwrap(), Stored::Missing));
+    }
+    #[test]
+    fn native_existing_directories_open_and_sync_by_descriptor() {
+        let f = Fixture::new();
+        let boundary = native::Boundary::inspect(&f.files).unwrap();
+        boundary.sync_existing().unwrap();
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_absent_directories_are_observed_without_creation() {
+        let f = Fixture::new();
+        fs::remove_dir(f.files.state.clone()).unwrap();
+        fs::remove_dir(f.files.root.join("target")).unwrap();
+        let boundary = native::Boundary::inspect(&f.files).unwrap();
+        boundary.sync_existing().unwrap();
+        assert!(boundary.read_regular(Leaf::Marker).unwrap().is_none());
+        assert!(!f.files.root.join("target").exists());
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_root_walk_never_follows_an_ancestor_link() {
+        let mut f = Fixture::new();
+        let alias = f.base.join("alias");
+        symlink(&f.files.root, &alias).unwrap();
+        f.files.root = alias;
+        assert!(native::Boundary::inspect(&f.files).is_err());
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_directory_links_and_specials_refuse_without_opening_children() {
+        for name in ["target", "target/.gate-state", "target/gate-warm"] {
+            for special in [false, true] {
+                let f = Fixture::new();
+                let path = f.files.root.join(name);
+                if path.exists() {
+                    fs::remove_dir_all(&path).unwrap();
+                }
+                let socket = if special {
+                    Some(UnixListener::bind(&path).unwrap())
+                } else {
+                    symlink(&f.base, &path).unwrap();
+                    None
+                };
+                assert!(native::Boundary::inspect(&f.files).is_err());
+                assert!(fs::symlink_metadata(&path).is_ok());
+                f.canary_unchanged();
+                drop(socket);
+            }
+        }
+    }
+
+    #[test]
+    fn native_all_state_leaf_kinds_are_checked_without_touching_canary() {
+        for leaf in [Leaf::Marker, Leaf::Record, Leaf::Temporary] {
+            for plant in ["link", "socket", "public", "hardlink"] {
+                let f = Fixture::new();
+                let path = f.files.path(leaf);
+                let socket = match plant {
+                    "link" => {
+                        symlink(&f.outside, &path).unwrap();
+                        None
+                    }
+                    "socket" => Some(UnixListener::bind(&path).unwrap()),
+                    _ => {
+                        let mut file = f.files.open_regular(leaf, true, true).unwrap();
+                        file.write_all(b"preserved state").unwrap();
+                        drop(file);
+                        if plant == "public" {
+                            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+                        } else {
+                            fs::hard_link(&path, f.base.join("alias")).unwrap();
+                        }
+                        None
+                    }
+                };
+                assert!(native::Boundary::inspect(&f.files).is_err(), "{plant}");
+                assert!(fs::symlink_metadata(&path).is_ok());
+                f.canary_unchanged();
+                drop(socket);
+            }
+        }
+    }
+
+    #[test]
+    fn native_effective_owner_and_device_are_not_inferred_from_path() {
+        for change_owner in [false, true] {
+            let mut f = Fixture::new();
+            if change_owner {
+                f.files.owner = f.files.owner.wrapping_add(1);
+            } else {
+                f.files.device = f.files.device.wrapping_add(1);
+            }
+            assert!(native::Boundary::inspect(&f.files).is_err());
+            f.canary_unchanged();
+        }
+    }
+
+    #[test]
+    fn native_checked_regular_read_preserves_busy_marker_and_inode() {
+        let f = Fixture::new();
+        let mut marker = f.files.lock_marker_primitive().unwrap();
+        marker
+            .write_diagnostics(b"not admission authority")
+            .unwrap();
+        let boundary = native::Boundary::inspect(&f.files).unwrap();
+        let mut file = boundary.read_regular(Leaf::Marker).unwrap().unwrap();
+        assert_eq!(
+            identity(&file.metadata().unwrap()),
+            identity(&marker.file.metadata().unwrap())
+        );
+        assert!(matches!(file.try_lock(), Err(TryLockError::WouldBlock)));
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"not admission authority");
+        assert!(matches!(f.files.lock_marker_primitive(), Err(Fault::Busy)));
+        drop(file);
+        marker.check_identity().unwrap();
+        assert!(f.files.path(Leaf::Marker).is_file());
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_pinned_parent_replacement_is_detected_before_regular_read() {
+        let f = Fixture::new();
+        let file = f.files.open_regular(Leaf::Record, true, true).unwrap();
+        drop(file);
+        let boundary = native::Boundary::inspect(&f.files).unwrap();
+        fs::rename(&f.files.state, f.base.join("saved-state")).unwrap();
+        fs::create_dir(&f.files.state).unwrap();
+        assert!(boundary.recheck().is_err());
+        assert!(boundary.read_regular(Leaf::Record).is_err());
+        assert!(f.base.join("saved-state/warm.record").is_file());
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_target_scan_does_not_follow_artifact_symlinks() {
+        let f = Fixture::new();
+        let target = f.files.root.join("target/gate-warm");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("artifact"), b"artifact").unwrap();
+        symlink(&f.base, target.join("outside-link")).unwrap();
+        native::Boundary::inspect(&f.files)
+            .unwrap()
+            .recheck()
+            .unwrap();
+        assert_eq!(fs::read(target.join("artifact")).unwrap(), b"artifact");
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_nested_special_target_entry_and_depth_exhaustion_refuse() {
+        for deep in [false, true] {
+            let f = Fixture::new();
+            let target = f.files.root.join("target/gate-warm");
+            fs::create_dir(&target).unwrap();
+            let socket = if deep {
+                let mut path = target;
+                for _ in 0..128 {
+                    path.push("d");
+                    fs::create_dir(&path).unwrap();
+                }
+                None
+            } else {
+                Some(UnixListener::bind(target.join("socket")).unwrap())
+            };
+            let error = native::Boundary::inspect(&f.files)
+                .err()
+                .expect("must refuse target");
+            if deep {
+                assert!(
+                    matches!(
+                        error,
+                        Fault::Unavailable("native target inspection depth limit")
+                    ),
+                    "{error}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        error,
+                        Fault::Boundary {
+                            why: "special entry inside target",
+                            ..
+                        }
+                    ),
+                    "{error}"
+                );
+            }
+            drop(socket);
+            f.canary_unchanged();
+        }
+    }
+
+    #[test]
+    fn native_unlinkat_is_not_conditioned_on_the_last_checked_marker_inode() {
+        use nix::unistd::{UnlinkatFlags, unlinkat};
+        let f = Fixture::new();
+        let marker = f.files.lock_marker_primitive().unwrap();
+        let boundary = native::Boundary::inspect(&f.files).unwrap();
+        let parent = File::open(&f.files.state).unwrap();
+        boundary.recheck().unwrap();
+        marker.check_identity().unwrap(); // the last possible pre-syscall check
+        fs::rename(f.files.path(Leaf::Marker), f.base.join("locked-old-marker")).unwrap();
+        symlink(&f.outside, f.files.path(Leaf::Marker)).unwrap();
+        // Characterization of the permitted API, NOT the gate's implementation.
+        // This deterministic interleaving would violate D45 even with openat.
+        unlinkat(&parent, "warm.use", UnlinkatFlags::NoRemoveDir).unwrap();
+        assert!(f.files.path(Leaf::Marker).symlink_metadata().is_err());
+        assert!(matches!(
+            File::open(f.base.join("locked-old-marker"))
+                .unwrap()
+                .try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        eprintln!(
+            "D45 counterexample: unlinkat removed an unchecked replacement link while the checked inode remained locked"
+        );
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_renameat_is_not_conditioned_on_the_checked_temporary_inode() {
+        use nix::fcntl::renameat;
+        let f = Fixture::new();
+        let temp = f.files.open_regular(Leaf::Temporary, true, true).unwrap();
+        let boundary = native::Boundary::inspect(&f.files).unwrap();
+        let parent = File::open(&f.files.state).unwrap();
+        let inspected = boundary.read_regular(Leaf::Temporary).unwrap().unwrap();
+        assert_eq!(
+            identity(&temp.metadata().unwrap()),
+            identity(&inspected.metadata().unwrap())
+        );
+        fs::rename(
+            f.files.path(Leaf::Temporary),
+            f.base.join("checked-old-temp"),
+        )
+        .unwrap();
+        symlink(&f.outside, f.files.path(Leaf::Temporary)).unwrap();
+        renameat(&parent, "warm.record.tmp", &parent, "warm.record").unwrap();
+        assert!(
+            f.files
+                .path(Leaf::Record)
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(f.base.join("checked-old-temp").is_file());
+        eprintln!(
+            "D45 counterexample: renameat published an unchecked replacement link instead of the checked temporary inode"
+        );
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_directory_descriptor_survives_relocation_outside_the_target() {
+        use nix::unistd::{UnlinkatFlags, unlinkat};
+        let f = Fixture::new();
+        let target = f.files.root.join("target/gate-warm");
+        fs::create_dir(&target).unwrap();
+        let inside = target.join("nested");
+        fs::create_dir(&inside).unwrap();
+        let boundary = native::Boundary::inspect(&f.files).unwrap();
+        let pinned = File::open(&inside).unwrap();
+        boundary.recheck().unwrap(); // the last possible pre-syscall check
+        let outside = f.base.join("outside-target");
+        fs::rename(&inside, &outside).unwrap();
+        // Entirely private canary created OUTSIDE target after relocation.
+        fs::write(outside.join("new-outside-canary"), b"outside the target").unwrap();
+        unlinkat(&pinned, "new-outside-canary", UnlinkatFlags::NoRemoveDir).unwrap();
+        assert!(!outside.join("new-outside-canary").exists());
+        eprintln!(
+            "D45 counterexample: an open directory descriptor did not keep it inside target; unlinkat removed a private outside-target canary"
+        );
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn native_admission_names_the_specific_missing_mutation_capability() {
+        let f = Fixture::new();
+        let error = f.files.admit(true).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "unavailable: native APIs cannot pin namespace or condition unlink/rename on checked inode"
+        );
+        assert!(!f.files.path(Leaf::Marker).exists());
+        f.canary_unchanged();
     }
 }

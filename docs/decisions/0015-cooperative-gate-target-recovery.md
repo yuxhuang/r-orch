@@ -513,3 +513,54 @@ Not decided here:
   the contract does not need it. Not adopted now.
 - **A43. Retry admission when the marker's path no longer names the locked file.** A refusal is simpler
   and changes nothing; the next run starts clean. A retry would add a loop that needs a bound of its own.
+
+
+## Native implementation dependency decision (2026-11-15)
+
+The normal-development execution amendment in the spec/plan supersedes historical
+execution preconditions only; D45 and unsafe_code=forbid remain intact. The lead's
+scoped continuation permits xtask to use workspace nix at the already resolved
+0.31.3, with `fs`, `dir` and `user` features selected: safe descriptor-relative
+open/stat/inspection, native directory iteration, and effective-account identity. No
+version upgrade or alternative crate is authorized. Safe openat/fstatat/mkdirat,
+renameat/unlinkat, directory iteration and synchronization APIs are evaluated
+against D45; an API's existence alone proves no boundary. Missing native
+capability remains a refusal. RC18 is qualified only by actual retained native
+command/filesystem evidence, never a filesystem-name allowlist.
+
+ARCHITECTURE section 4.8 check: nix is the maintained Unix syscall wrapper already
+selected in the workspace; its pinned source declares Rust 1.69 MSRV (below the
+pinned 1.99.1) and MIT licence (allowed by deny.toml). Reuse avoids handwritten
+unsafe syscall/ABI wrappers. Feature selection and exact native evidence are
+recorded in the F2 handoff; no product runtime dependency is added. This does not
+claim whole-gate or cross-platform qualification.
+
+
+### Native capability result (F2 continuation; incomplete)
+
+Read-only inspection now opens the canonical root one component at a time from
+`/`, then opens `target`, the state directory and the constant build directory
+relative to checked descriptors with no-follow/nonblocking flags. State leaves
+are inspected without following links. Ownership, root device, private regular
+state type/mode/link count and opened inode identity remain required. The target
+inventory is bounded and does not follow artifact symlinks. Existing-directory
+synchronization retains the pinned std implementation's errors (no weaker Apple
+fallback). This is inspection evidence only, never authority to delete.
+
+The scoped safe API route does not provide an atomic operation that conditions
+unlink/rename on the checked inode, or a mechanism that pins an opened directory's
+ancestry. Native private-fixture interleavings demonstrate (1) `unlinkat` removes
+a replaced marker name while the checked original stays locked, (2) `renameat`
+can publish a replaced temporary name, and (3) an opened directory remains usable
+after relocation outside the constant target, where relative unlink can remove
+a newly created outside-target canary. Checks immediately before these calls do
+not close the final interval. No production destructive wrapper is introduced.
+
+Admission retains an explicit capability refusal before mkdir, marker creation,
+locking, target deletion or build. Native reset/cold deletion and successful F2
+admission remain incomplete. A namespace-stability assumption would change this
+boundary and is not adopted here. RC18 remains unsupported in production: the
+prior one-command observation plus these inspection controls is not qualification
+of the gate's fixed command list on a platform/filesystem. Native Linux remains
+unrun. Existing owner-set-aside execution findings and owner-accepted FS1 risk
+remain distinct from this product capability failure.

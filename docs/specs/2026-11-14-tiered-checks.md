@@ -6,6 +6,32 @@ date: 2026-11-14
 plan: [../plans/2026-11-14-tiered-checks.md](../plans/2026-11-14-tiered-checks.md)
 decision record: [ADR 0013](../decisions/0013-tiered-verification-gates.md) (accepted at revision 2); [ADR 0014](../decisions/0014-gate-target-recovery-and-selection-coupling.md) (accepted) is its partial successor: it supersedes named clauses of decisions 30 and 31 and qualifies decisions 14, 15, 17 and 21. The owner's relaxation of ADR 0014's cessation rule on 2026-11-15 is recorded in [ADR 0015](../decisions/0015-cooperative-gate-target-recovery.md), which is proposed: its decision 41 is the owner's and is binding, and the implementation contract derived from it (decisions 42–47) is proposed, pending review
 
+## Normal development execution amendment (2026-11-15)
+
+The owner chose normal development execution: ordinary pinned-toolchain cargo
+build/test in an isolated worktree under the cooperative machine lease. Earlier
+static-only, controller, execution-contract and per-slice launch-review holds are
+historical and superseded as execution preconditions. Their findings remain
+**owner-set-aside as preconditions**, not resolved or proven. No special runner or
+launch clearance is required. One security and one reliability review examine the
+complete folded gate before PR 1; implementation slices are built and tested as
+they go. Product correctness, hermetic tests, nonzero counts and all acceptance
+criteria remain required. D41/FS1 remains owner-accepted risk.
+
+F1 has scoped retained evidence; F2's direct-command/publication primitives have
+scoped evidence, but native D45 admission/reset/removal remains incomplete at this
+amendment. The continuation uses the existing resolved nix version through safe
+APIs, only necessary features, with unsafe_code=forbid and no dependency upgrades.
+F2 native repair precedes F3 signals/teardown, F4/F5 integration, C integration
+tests and the artifact checkpoint. No per-slice review or controller loop is a
+dependency. Native RC18 recovery evidence is command/platform/filesystem scoped;
+unsupported capability refuses explicitly.
+
+No third legacy Mac baseline, push, PR, merge, live rule change, release, tag or
+version bump is authorized in this implementation wave. Final Linux evidence,
+folded comparison/names/counts, native results, timings and whole-gate reviews
+remain due. AGENTS.md and live rules remain unchanged.
+
 ## Source
 
 Goal goal_7ZJmm9k, “Faster iteration: tiered checks instead of the full cold gate on every change”. The following numbered source passages are verbatim. The complete operational request is retained in the lead's private goal record; machine-specific scheduling details are omitted here.

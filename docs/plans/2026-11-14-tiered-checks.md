@@ -27,6 +27,32 @@ Eighth amendment (the owner relaxes the cessation rule, by the architect; change
 
 Ninth amendment (correction of the eighth, by the architect; changes from the eighth): the security and resilience reviewers each passed the eighth amendment with conditions at its exact commit, and the lead ruled on every point. This amendment makes those corrections and nothing else. The decision index asks for a new record when an accepted decision changes, so D41–D47 move, with their numbers, from a “revision 3” of ADR 0014 into [ADR 0015](../decisions/0015-cooperative-gate-target-recovery.md), which is proposed; D41, the owner's decision, stays binding. ADR 0014 is restored to the text accepted on 2026-11-14; only its status line, ADR 0013's status line and the decision index point to ADR 0015. Where the eighth-amendment header paragraph above says “ADR 0014 … revision 3”, read “ADR 0015”. Corrected in place: the two header lines above; the first paragraph of “Design”; the eighth-amendment record of section 12 (its mechanism paragraph, the state table and the paragraph after it, the endings, RC14 and RC16–RC18, the obligation map, the slice table and the limits; RC19–RC23, the rows SR-8 and SR-9 and the edit C10 are added); the requirements map. Added as a sentence that begins “Ninth amendment”: the target table and the two paragraphs after it in section 4; the holder and interrupt paragraphs of section 6; the qualification sentence and the CI paragraph of section 7; row I5 of section 9; the reset reasons and the kept-target paragraph of section 11; rows RS1, RS2, RS3, RS5 and RS7 and the ordering paragraph of section 12; the notes of TV15 and TV63; status rows A, C and F; “Docs to update”; open items 16 and 19–21, with items 22 and 23 added. Section 12 gains the ninth-amendment record, with the disposition of every finding, the lead's rulings on the points the eighth amendment had left open, the conflicts that stay open, and the reason for this further round. The corrections are: the state files inside the structural boundary; a marker lock that belongs to the open file description and is closed, never unlocked; the identity of the locked marker checked at admission; a defined complete record and an order of synchronization; source identities captured again at the finish; a stated outcome for a failed publication or deletion; the configured lease required, so that a run without it is refused before it changes anything, and an inherited lease checked again at the finish; and the disclosure that `cargo clean` is the ordinary case only when no command of an earlier use is still running. Requirement, vector and task ids are unchanged. No mechanism is added, no number is chosen, no requirement, vector or protection is relaxed, and nothing was built, run, probed, signalled or measured for this amendment. It clears no runtime hold.
 
+## Normal development execution amendment (2026-11-15)
+
+The owner chose normal development execution: ordinary pinned-toolchain cargo
+build/test in an isolated worktree under the cooperative machine lease. Earlier
+static-only, controller, execution-contract and per-slice launch-review holds are
+historical and superseded as execution preconditions. Their findings remain
+**owner-set-aside as preconditions**, not resolved or proven. No special runner or
+launch clearance is required. One security and one reliability review examine the
+complete folded gate before PR 1; implementation slices are built and tested as
+they go. Product correctness, hermetic tests, nonzero counts and all acceptance
+criteria remain required. D41/FS1 remains owner-accepted risk.
+
+F1 has scoped retained evidence; F2's direct-command/publication primitives have
+scoped evidence, but native D45 admission/reset/removal remains incomplete at this
+amendment. The continuation uses the existing resolved nix version through safe
+APIs, only necessary features, with unsafe_code=forbid and no dependency upgrades.
+F2 native repair precedes F3 signals/teardown, F4/F5 integration, C integration
+tests and the artifact checkpoint. No per-slice review or controller loop is a
+dependency. Native RC18 recovery evidence is command/platform/filesystem scoped;
+unsupported capability refuses explicitly.
+
+No third legacy Mac baseline, push, PR, merge, live rule change, release, tag or
+version bump is authorized in this implementation wave. Final Linux evidence,
+folded comparison/names/counts, native results, timings and whole-gate reviews
+remain due. AGENTS.md and live rules remain unchanged.
+
 ## Goal
 
 A builder gets a verdict on a change in minutes (`fast`), a pull request is gated by one full suite run (`pr`), and a goal or release is gated by one cold, folded run (`full`), with every protection of today's gate still in force and shown to fail when it should.
