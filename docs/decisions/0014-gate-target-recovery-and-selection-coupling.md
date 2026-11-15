@@ -1,12 +1,13 @@
 # 0014. Gate targets change only after their writers have ceased; a selected `orch-cli` couples `orch-infra`
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-11-14
-- Revision: 2 (corrected after the security and resilience reviews of revision 1; still proposed)
-- Would supersede, once accepted: named clauses of [ADR 0013](0013-tiered-verification-gates.md) decisions
-  30 and 31. It would also qualify decisions 14, 15, 17 and 21. The clauses are listed under "What this
-  changes in ADR 0013". Everything else in ADR 0013 stands. Until this record is accepted, no clause of
-  ADR 0013 is superseded.
+- Revision: 2 (corrected after the security and resilience reviews of revision 1), accepted on 2026-11-14
+  only together with the lead's lifecycle clarification of decision 33 (see "Acceptance" below). The text
+  of revision 2 without that clarification was not accepted.
+- Supersedes: named clauses of [ADR 0013](0013-tiered-verification-gates.md) decisions 30 and 31, and only
+  those. It also qualifies decisions 14, 15, 17 and 21 without replacing a word of them. The clauses are
+  listed under "What this changes in ADR 0013". Everything else in ADR 0013 stands.
 
 Changes in revision 2. Decisions 32–40 keep their numbers. No mechanism is added and no number is chosen.
 
@@ -23,6 +24,23 @@ Changes in revision 2. Decisions 32–40 keep their numbers. No mechanism is add
   not implemented. The sentence that the decisions did not depend on it is withdrawn.
 - "What this changes in ADR 0013": the effects are stated as proposed; a row for decision 17 is added.
 - Alternatives A31 and A32 are added.
+
+Acceptance. The lead accepted this record after the same security and resilience reviewers had re-checked
+revision 2 at its exact commit. The acceptance is of revision 2 together with one binding clarification,
+and not of revision 2 without it. The security re-check had found that the text on the warm trace required
+the marker and the completed record to be present at once, which decision 35 rules out for a use that
+closed. The clarification is quoted in decision 33. With it, and with nothing else:
+
+- the header says `accepted`, and the supersession of the named clauses of ADR 0013 is in force;
+- decision 33 and the prerequisite paragraph of "What this record does not do" state the provenance that
+  each lifecycle state requires, in place of "present, readable and complete" for both files at once;
+- the sentence on the measured baseline in "What this record does not do" follows the owner's later
+  decision on that measurement.
+
+The list of changes above describes revision 2 as it was reviewed, when it was still proposed. Decisions
+32–40 keep their numbers and their rules. No mechanism is added, no provenance is designed and no number
+is chosen. The acceptance is of the design. It clears no runtime hold: the observation of decision 33 and
+the durable provenance are still absent ("What this record does not do").
 
 ## Context
 
@@ -116,10 +134,33 @@ gate run's building and testing in a target. "A writer" is any process of a use 
 
     The provenance has to be durable and reviewed (the plan's prerequisite P5). Requiring it is part of this
     decision. Its implementation is not designed here and does not exist. For the warm target, the marker
-    and the completed record of decisions 30 and 35 are the designed trace, and they cover a target only
-    while they are present, readable and complete. Whether a later run may rely on them as read, and how
-    they are protected, belongs to the review of that prerequisite; the open security finding on recovery
-    contents used as authority is not closed here. The cold target has no trace at all in ADR 0013.
+    and the completed record of decisions 30 and 35 are the designed trace. They are a lifecycle trace:
+    which valid provenance is required depends on the state that the use is in, as the clarification below
+    says. Whether a later run may rely on them as read, and how they are protected, belongs to the review
+    of that prerequisite; the open security finding on recovery contents used as authority is not closed
+    here. The cold target has no trace at all in ADR 0013.
+
+    The lead's binding clarification, accepted with this record and quoted word for word. In it, "D35" is
+    decision 35, "P1" is the plan's name for the observation that this decision requires and "P5" its
+    name for the durable provenance; "RC" and "TV" name the plan's recovery cases and vectors.
+
+    > The marker and completed record form a lifecycle trace; the required valid provenance depends on the
+    > lifecycle state. In a completed state, D35 intentionally removes the unfinished marker after
+    > independently established cessation and completed-record publication. That intentional absence is not,
+    > by itself, missing or corrupt provenance, and the completed state does not require both files
+    > simultaneously. An unfinished state is not classified as never-used merely because it has no completed
+    > record. Missing, unreadable, corrupt, incomplete or unresolved provenance required for the applicable
+    > state refuses for both warm and cold targets. Neither a marker nor a completed record, by presence,
+    > absence or well-formed content, independently proves cessation or authorizes recovery. Reliance on the
+    > trace remains subject to P5's independent review and P1's accepted observation. P5 is unimplemented.
+    >
+    > All cases described as established, including RC1/3/5 reuse, RC8, TV14 and TV15 resets, require both P1
+    > and P5's review of the trace before execution.
+
+    Read with the three cases above: a completed state belongs to the second case only on the proof that
+    the second case requires, and the marker that decision 35 removed does not move it to the third. An
+    unfinished state is never the first case, and it stays refused under decisions 34 and 35 until the
+    cessation of that use is established. Neither file is an authority for cessation in either state.
 
 34. **Without established cessation the operation is refused, and the run does not qualify.** Unknown
     ownership is treated as a live writer, and unknown history (decision 33) as a previous use that has not
@@ -213,8 +254,8 @@ gate run's building and testing in a target. "A writer" is any process of a use 
 
 ## What this changes in ADR 0013
 
-The effects in this table are proposed. They take hold when this record is accepted, and only for the
-clauses named. Until then ADR 0013 stands as accepted and the lead's rulings bind (below the table).
+The effects in this table are in force since this record was accepted, and only for the clauses named. In
+every other clause ADR 0013 stands as accepted.
 
 | ADR 0013 | Clause | Effect |
 |---|---|---|
@@ -232,10 +273,11 @@ clauses named. Until then ADR 0013 stands as accepted and the lead's rulings bin
 
 Every other decision, consequence and alternative of ADR 0013 is unchanged.
 
-Until this record is accepted, the same points bind as the lead's rulings recorded in the plan (section 12:
-holds K-1 to K-5, the broader coupling, and the rulings carried by the sixth amendment). A rejection of this
-record does not release them. Finishing a review of this record does not accept it; the lead records the
-acceptance.
+Before this record was accepted, the same points already bound as the lead's rulings recorded in the plan
+(section 12: holds K-1 to K-5, the broader coupling, and the rulings carried by the sixth amendment). They
+are now the decision record as well. Finishing the reviews of this record did not accept it; the lead
+recorded the acceptance, with the clarification quoted in decision 33 (the plan, section 12, seventh
+amendment).
 
 ## What this record does not do
 
@@ -243,10 +285,13 @@ It removes permissions that contradicted the rulings. It does not supply the obs
 requires. No reviewed way exists today to establish, on a macOS host where all agents share one account,
 which processes belong to a run after a descendant is re-parented. Until one is established and accepted by
 the security and resilience reviewers, the gate cannot publish, remove, reset or reuse a target there, and
-the folded gate and the measured baseline stay blocked. This record does not turn that block into a passing
-state: a gate that always refuses does not meet decisions 14, 15 and 30, the vectors that expect `reused`,
-a reset or a removed cold target, or the timing requirement of the warm tiers. Whether native Linux offers
-such an observation has not been evaluated.
+the folded gate stays blocked. The measured baseline is a separate matter: the owner has since authorized
+it as a simple, best-effort measurement of the unchanged earlier gate script under the cooperative lease,
+with no containment supervisor (the plan, section 12, seventh amendment). That authorization lifts no hold
+of this record, and its result is no evidence for any decision here. This record does not turn the block
+of the folded gate into a passing state: a gate that always refuses does not meet decisions 14, 15 and 30,
+the vectors that expect `reused`, a reset or a removed cold target, or the timing requirement of the warm
+tiers. Whether native Linux offers such an observation has not been evaluated.
 
 Not decided here:
 
@@ -264,14 +309,20 @@ plan's P5). A later run must be able to know, affirmatively, whether a gate use 
 whether that use reached established cessation. Decisions 33, 34 and 36 depend on it. Revision 1 of this
 record said that its decisions did not; that sentence was wrong and is withdrawn. The requirement is
 decided. Its implementation is not designed, chosen or started here. The marker and the record of decisions
-30 and 35 are the designed trace for the warm target. The cold target has none in ADR 0013 and needs one,
-because a killed or a kept `full` run must be recognizable to the next run. Until a reviewed provenance
-exists:
+30 and 35 are the designed trace for the warm target: a lifecycle trace, in which the provenance that is
+required depends on the state (decision 33 and the clarification quoted there). The cold target has none
+in ADR 0013 and needs one, because a killed or a kept `full` run must be recognizable to the next run.
+Until a reviewed provenance exists:
 
 - an existing cold target cannot be told apart from an unfinished use, so its deletion at the start of a
   run is refused, and the plan's vector TV13 is unmet;
-- a warm target whose marker or record is missing, unreadable, corrupt or incomplete is refused in the same
-  way.
+- a warm target is refused in the same way when the provenance that its lifecycle state requires is
+  missing, unreadable, corrupt, incomplete or unresolved. The marker that decision 35 removed when the
+  completed record was published is not, by that absence, missing or corrupt provenance, and a use
+  without a completed record is not thereby a target that was never used;
+- no later run relies on the trace as read: every case that the plan describes as established, a reuse
+  and a reset included, waits for the review of that provenance as well as for the observation of
+  decision 33.
 
 A limit that stays: the gate and its operator share one account. A marker deleted by hand can look to the
 next run like a target whose last use had closed, and a history rewritten by hand can look like any of the
