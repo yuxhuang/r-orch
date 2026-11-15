@@ -356,16 +356,23 @@ pub(super) fn exec(command: &[std::ffi::OsString], wait: Duration) -> Result<i32
         }
         Lease::Inherited(_) => None,
     };
-    let mut child = child_command.spawn().context("start lease command")?;
-    let status = match child.wait() {
-        Ok(status) => status,
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e).context("reap lease command");
-        }
-    };
-    lease.validate()?;
+    let mut runner = super::steps::Runner::without_marker(&lease)?;
+    let result = runner.run(&mut child_command);
+    // Only after teardown; closed stderr must not suppress cleanup or statuses.
+    if let Some(number) = runner.interrupted() {
+        let _ = writeln!(
+            io::stderr(),
+            "gate: INTERRUPTED by signal {number}; statuses: {:?}",
+            runner.statuses()
+        );
+        ensure!(
+            runner.child_reaped(),
+            "interrupted direct child not reaped; status unknown"
+        );
+        return Ok(128 + number);
+    }
+    let status = result?;
+    runner.finished()?;
     Ok(status
         .code()
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)))

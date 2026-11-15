@@ -946,6 +946,7 @@ impl StateFiles {
             found,
             temporary: None,
             phase: Phase::Locked,
+            signals: std::cell::RefCell::new(None),
         };
         marker.check_identity()?; // Immediately after grant, before target inspection.
         Ok(marker)
@@ -967,6 +968,9 @@ pub(super) struct Marker<'a> {
     found: bool,
     temporary: Option<File>,
     phase: Phase,
+    // Keep cancellation alive through the publication sequence, after Runner
+    // has relinquished its immutable borrow. Native admission remains disabled.
+    signals: std::cell::RefCell<Option<super::signals::Signals>>,
 }
 
 // No Drop implementation: drop closes owned Files, NEVER unlocks or unlinks.
@@ -974,7 +978,31 @@ pub(super) struct Marker<'a> {
 // FD or explicit unlock: the last close releases it. R4/R11 must compare the
 // changed standard stream, or diagnose the difference, at whole-gate validation.
 impl Marker<'_> {
+    pub(super) fn enable_signals(&self) -> anyhow::Result<()> {
+        let mut signals = self.signals.borrow_mut();
+        if signals.is_none() {
+            *signals = Some(super::signals::Signals::new()?);
+        }
+        Ok(())
+    }
+
+    pub(super) fn signal_wait(&self, delay: std::time::Duration) -> Option<i32> {
+        self.signals
+            .borrow_mut()
+            .as_mut()
+            .and_then(|s| s.wait(delay))
+    }
+
+    pub(super) fn signal_pause(&self, delay: std::time::Duration) {
+        if let Some(signals) = self.signals.borrow().as_ref() {
+            signals.pause(delay);
+        }
+    }
+
     pub(super) fn check_identity(&self) -> Result<()> {
+        if self.signal_wait(std::time::Duration::ZERO).is_some() {
+            return Err(Fault::Unavailable("INTERRUPTED; keep marker and target"));
+        }
         self.files.check_parents()?;
         let held = at(
             self.file.metadata(),
@@ -1346,6 +1374,7 @@ impl Marker<'_> {
             self.phase == Phase::Invalidated && self.files.kind == Kind::Warm,
             "warm commands before protected target decision/invalidation"
         );
+        self.enable_signals()?;
         let mut runner = super::steps::Runner::new(lease, self)?;
         let captures = (|| {
             let before = Captured::read(&mut runner, &self.files.root)?;
@@ -1562,6 +1591,7 @@ impl Captured {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt, symlink};
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2944,7 +2974,8 @@ mod tests {
             }
             holder.0.kill().unwrap();
             assert!(!holder.0.wait().unwrap().success());
-            fs::write(root.join("command.release"), b"holder is gone").unwrap();
+            // F3 observes loss while this direct child is still live. Do not
+            // release it: a terminal SIGTERM status must prove actual teardown.
         });
         let mut marker = f.files.lock_marker_primitive().unwrap();
         marker.protect().unwrap();
@@ -2954,8 +2985,13 @@ mod tests {
             .unwrap_err();
         killer.join().unwrap();
         let failure = error.downcast_ref::<UseFailure>().unwrap();
-        assert!(failure.exits.iter().all(|e| e.success()));
-        assert!(!failure.exits.is_empty());
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(failure.exits.last().unwrap().signal(), Some(15));
+        assert!(
+            failure.exits[..failure.exits.len() - 1]
+                .iter()
+                .all(|e| e.success())
+        );
         assert!(f.files.check_leaf(Leaf::Marker).unwrap().is_some());
         assert!(matches!(f.files.read_record().unwrap(), Stored::Missing));
     }
@@ -3249,5 +3285,431 @@ mod tests {
         );
         assert!(!f.files.path(Leaf::Marker).exists());
         f.canary_unchanged();
+    }
+
+    // This subprocess boundary keeps handled test signals out of the test
+    // supervisor. All workload processes are hermetic fixtures, never agent CLIs.
+    #[test]
+    fn f3_holder_fixture() {
+        let Ok(mode) = std::env::var("F3_MODE") else {
+            return;
+        };
+        let control = PathBuf::from(std::env::var_os("F3_CONTROL").unwrap());
+        let f = Fixture::new();
+        f2_repo(&f);
+        let lease = f2_lease(&f);
+        let mut marker = f.files.lock_marker_primitive().unwrap();
+        marker.protect().unwrap();
+        marker.invalidate().unwrap();
+        if mode == "publication" {
+            marker.enable_signals().unwrap();
+            fs::write(control.join("ready"), b"ready").unwrap();
+            while !control.join("release").exists() {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let source = sources();
+            let error = marker
+                .finish_warm(finished_observations(), &source, context(&source), 300)
+                .unwrap_err();
+            let value = serde_json::json!({ "error": error.to_string(),
+                "marker": f.files.check_leaf(Leaf::Marker).unwrap().is_some(),
+                "record_missing": matches!(f.files.read_record().unwrap(), Stored::Missing) });
+            fs::write(
+                control.join("result.json"),
+                serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
+            return;
+        }
+        fs::write(
+            control.join("lease.path"),
+            f.base.join("r-orch-gate.lease").as_os_str().as_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            control.join("marker.path"),
+            f.files.path(Leaf::Marker).as_os_str().as_bytes(),
+        )
+        .unwrap();
+        let mut command = std::process::Command::new("/usr/bin/python3");
+        command.args(["-c", r#"
+import os, signal, time, pathlib, subprocess, sys
+root = pathlib.Path(os.environ['F3_CONTROL'])
+mode = os.environ['F3_MODE']
+def caught(number, frame):
+    (root/'caught').write_text(str(number))
+    sys.exit(40 + number)
+for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(number, signal.SIG_IGN if mode == 'ignore' else caught)
+if mode == 'closed':
+    os.close(1)
+    os.close(2)
+if mode == 'descendant':
+    leaf = subprocess.Popen([sys.executable, '-c',
+        "import pathlib,os,time; r=pathlib.Path(os.environ['F3_CONTROL']); "
+        "(r/'leaf.ready').write_text(str(os.getpid())); "
+        "exec(\"while not (r/'release').exists():\\n (r/'heartbeat').write_text(str(time.monotonic_ns()))\\n time.sleep(.01)\"); "
+        "(r/'leaf.done').write_text('done')"])
+    while not (root/'leaf.ready').exists(): time.sleep(.01)
+(root/'ready').write_text(str(os.getpid()))
+if mode == 'burst': os.write(1, b'x' * 4096)
+if mode == 'normal': os.write(1, b'captured')
+if mode == 'descendant': sys.exit(0)
+while not (root/'release').exists(): time.sleep(.01)
+"#]).env_clear().env("HOME", &f.base)
+            .env("ORCHESTRY_GLOBAL_CONFIG_PATH", f.base.join("global.yml"))
+            .env("F3_CONTROL", &control).env("F3_MODE", &mode)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+        if mode == "lease-exec" || mode == "lease-normal" {
+            let argv: Vec<_> = std::iter::once(command.get_program().to_owned())
+                .chain(command.get_args().map(|s| s.to_owned()))
+                .collect();
+            let code = super::super::lease::exec(&argv, std::time::Duration::ZERO).unwrap();
+            fs::write(control.join("result.json"), format!("{{\"code\":{code}}}")).unwrap();
+            return;
+        }
+        let (error, statuses, finished) = if mode == "use-warm" || mode == "loss" {
+            let error = marker.use_warm(&lease, &mut [command]).unwrap_err();
+            let failure = error.downcast_ref::<UseFailure>().unwrap();
+            (error.to_string(), failure.exits.clone(), false)
+        } else {
+            let mut runner = super::super::steps::Runner::new(&lease, &marker).unwrap();
+            let result = if mode == "ignore" {
+                runner.run(&mut command).map(|_| Vec::new())
+            } else {
+                runner.capture(&mut command, 1024)
+            };
+            let finished = runner.finished().is_ok();
+            let statuses = runner.statuses().iter().map(|s| s.exit).collect::<Vec<_>>();
+            let error = result.err().map(|e| e.to_string()).unwrap_or_default();
+            (error, statuses, finished)
+        };
+        use std::os::unix::process::ExitStatusExt;
+        let statuses: Vec<_> = statuses
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "code": s.code(), "signal": s.signal()
+                })
+            })
+            .collect();
+        let value = serde_json::json!({ "error": error, "statuses": statuses,
+            "finished": finished, "marker": f.files.check_leaf(Leaf::Marker).unwrap().is_some(),
+            "record_missing": matches!(f.files.read_record().unwrap(), Stored::Missing) });
+        fs::write(
+            control.join("result.json"),
+            serde_json::to_vec_pretty(&value).unwrap(),
+        )
+        .unwrap();
+    }
+
+    struct F3Holder {
+        child: std::process::Child,
+        control: super::super::steps::tests::Scratch,
+        mode: String,
+    }
+    impl F3Holder {
+        fn new(mode: &str, closed_output: bool) -> Self {
+            let control = super::super::steps::tests::Scratch::new();
+            let rustc = std::process::Command::new("rustup")
+                .args(["which", "rustc"])
+                .output()
+                .unwrap();
+            assert!(rustc.status.success());
+            let rustc = PathBuf::from(std::str::from_utf8(&rustc.stdout).unwrap().trim());
+            let path = format!("{}:/usr/bin:/bin", rustc.parent().unwrap().display());
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "gate::target::tests::f3_holder_fixture",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("XTASK_GATE_LEASE_DIR", &control.0)
+                .env("PATH", path)
+                .env("F3_MODE", mode)
+                .env("F3_CONTROL", &control.0)
+                .env("XTASK_F1_PRIVATE_ROOT", control.0.parent().unwrap())
+                .env("HOME", &control.0)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("ORCHESTRY_GLOBAL_CONFIG_PATH", control.0.join("global.yml"))
+                .stdin(std::process::Stdio::null())
+                .stdout(if closed_output {
+                    std::process::Stdio::null()
+                } else {
+                    std::process::Stdio::from(
+                        fs::File::create(control.0.join("holder.log")).unwrap(),
+                    )
+                })
+                .stderr(if closed_output {
+                    std::process::Stdio::piped()
+                } else {
+                    std::process::Stdio::null()
+                })
+                .spawn()
+                .unwrap();
+            drop(child.stderr.take()); // a genuinely closed logging pipe
+            Self {
+                child,
+                control,
+                mode: mode.to_owned(),
+            }
+        }
+        fn ready(&mut self) {
+            super::super::steps::tests::ready(&mut self.child, &self.control.0.join("ready"));
+        }
+        fn signal(&mut self, signal: nix::sys::signal::Signal) {
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "holder already exited"
+            );
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(self.child.id() as i32), signal)
+                .unwrap();
+        }
+        fn result(&mut self) -> serde_json::Value {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            let status = loop {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(
+                    std::time::Instant::now() < end,
+                    "holder failed to complete teardown"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            };
+            assert!(
+                status.success(),
+                "holder failed: {:?}",
+                fs::read_to_string(self.control.0.join("holder.log"))
+            );
+            let value =
+                serde_json::from_slice(&fs::read(self.control.0.join("result.json")).unwrap())
+                    .unwrap();
+            eprintln!("F3 retained {} outcome: {value}", self.mode);
+            value
+        }
+    }
+    impl Drop for F3Holder {
+        fn drop(&mut self) {
+            // Explicit fixture release on both assertion failure and success;
+            // workload has NO self-expiry that could masquerade as teardown.
+            let _ = fs::write(self.control.0.join("release"), b"release");
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(4);
+            while self.child.try_wait().ok().flatten().is_none() && std::time::Instant::now() < end
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if self.control.0.join("leaf.ready").exists() {
+                let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !self.control.0.join("leaf.done").exists() && std::time::Instant::now() < end
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn f3_handled_int_term_hup_reap_live_direct_child_and_withhold_record() {
+        use nix::sys::signal::Signal;
+        for signal in [Signal::SIGINT, Signal::SIGTERM, Signal::SIGHUP] {
+            let mut holder = F3Holder::new("use-warm", false);
+            holder.ready();
+            holder.signal(signal);
+            let result = holder.result();
+            assert!(
+                result["error"].as_str().unwrap().contains("INTERRUPTED"),
+                "{result}"
+            );
+            assert!(
+                result["statuses"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["code"] == 40 + signal as i32),
+                "{result}"
+            );
+            assert_eq!(
+                fs::read_to_string(holder.control.0.join("caught")).unwrap(),
+                (signal as i32).to_string()
+            );
+            assert_eq!(result["marker"], true);
+            assert_eq!(result["record_missing"], true);
+        }
+    }
+
+    #[test]
+    fn f3_hup_with_closed_output_reaps_instead_of_treating_eof_as_completion() {
+        let mut holder = F3Holder::new("closed", true);
+        holder.ready();
+        assert!(
+            !holder.control.0.join("result.json").exists(),
+            "EOF falsely completed a live child"
+        );
+        holder.signal(nix::sys::signal::Signal::SIGHUP);
+        let result = holder.result();
+        assert!(
+            result["error"].as_str().unwrap().contains("INTERRUPTED"),
+            "{result}"
+        );
+        assert_eq!(result["statuses"][0]["code"], 41);
+        assert_eq!(result["finished"], false);
+        assert_eq!(result["marker"], true);
+        assert_eq!(result["record_missing"], true);
+    }
+
+    #[test]
+    fn f3_ignored_signal_escalates_to_kill_and_retains_actual_signal_status() {
+        let mut holder = F3Holder::new("ignore", false);
+        holder.ready();
+        let start = std::time::Instant::now();
+        holder.signal(nix::sys::signal::Signal::SIGTERM);
+        let result = holder.result();
+        assert!(start.elapsed() >= super::super::steps::SIGNAL_GRACE);
+        assert!(
+            start.elapsed()
+                < super::super::steps::SIGNAL_GRACE
+                    + super::super::steps::KILL_REAP
+                    + std::time::Duration::from_secs(1)
+        );
+        assert_eq!(result["statuses"][0]["signal"], 9, "{result}");
+        assert!(!holder.control.0.join("caught").exists());
+        assert_eq!(result["marker"], true);
+        assert_eq!(result["record_missing"], true);
+    }
+
+    #[test]
+    fn f3_descendant_held_pipes_fail_capture_after_direct_exit_without_waiting_for_eof() {
+        let mut holder = F3Holder::new("descendant", false);
+        holder.ready();
+        let start = std::time::Instant::now();
+        let result = holder.result();
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(
+            result["error"]
+                .as_str()
+                .unwrap()
+                .contains("capture EOF deadline"),
+            "{result}"
+        );
+        assert_eq!(result["statuses"][0]["code"], 0);
+        assert_eq!(result["finished"], false);
+        assert_eq!(result["marker"], true);
+        assert_eq!(result["record_missing"], true);
+        assert!(
+            !holder.control.0.join("leaf.done").exists(),
+            "descendant self-exit is not pipe handling"
+        );
+        assert!(!holder.control.0.join("release").exists());
+        let heartbeat = holder.control.0.join("heartbeat");
+        let before = fs::read(&heartbeat).unwrap();
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while fs::read(&heartbeat).unwrap() == before {
+            assert!(
+                std::time::Instant::now() < end,
+                "descendant stopped; no post-reap signal authority"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn f3_live_lease_and_marker_loss_stop_owned_child_without_publication() {
+        for name in ["lease", "marker"] {
+            let mut holder = F3Holder::new("loss", false);
+            holder.ready();
+            let path = PathBuf::from(std::ffi::OsString::from_vec(
+                fs::read(holder.control.0.join(format!("{name}.path"))).unwrap(),
+            ));
+            let moved = holder.control.0.join(format!("moved-{name}"));
+            fs::rename(path, &moved).unwrap();
+            let result = holder.result();
+            assert!(
+                result["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("lease/marker lost"),
+                "{result}"
+            );
+            assert!(
+                result["statuses"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["code"] == 55),
+                "{result}"
+            );
+            assert_eq!(result["record_missing"], true);
+            assert!(moved.is_file());
+            assert_eq!(result["marker"], name == "lease");
+        }
+    }
+
+    #[test]
+    fn f3_live_capture_overrun_tears_down_without_waiting_for_fixture_eof() {
+        let mut holder = F3Holder::new("burst", false);
+        holder.ready();
+        let result = holder.result();
+        assert!(
+            result["error"].as_str().unwrap().contains("capture budget"),
+            "{result}"
+        );
+        assert_eq!(result["statuses"][0]["code"], 55, "{result}");
+        assert_eq!(result["finished"], false);
+        assert_eq!(result["marker"], true);
+        assert_eq!(result["record_missing"], true);
+        assert!(!holder.control.0.join("release").exists());
+    }
+
+    #[test]
+    fn f3_normal_capture_requires_reap_and_eof_and_retains_real_success() {
+        let mut holder = F3Holder::new("normal", false);
+        holder.ready();
+        assert!(!holder.control.0.join("result.json").exists());
+        fs::write(holder.control.0.join("release"), b"finish").unwrap();
+        let result = holder.result();
+        assert_eq!(result["error"], "", "{result}");
+        assert_eq!(result["statuses"][0]["code"], 0);
+        assert_eq!(result["finished"], true);
+    }
+
+    #[test]
+    fn f3_lease_exec_hup_closed_log_reaps_then_returns_interrupted_code() {
+        let mut holder = F3Holder::new("lease-exec", true);
+        holder.ready();
+        holder.signal(nix::sys::signal::Signal::SIGHUP);
+        let result = holder.result();
+        assert_eq!(result["code"], 129);
+        assert_eq!(
+            fs::read_to_string(holder.control.0.join("caught")).unwrap(),
+            "1"
+        );
+    }
+
+    #[test]
+    fn f3_lease_exec_normal_returns_real_direct_status() {
+        let mut holder = F3Holder::new("lease-normal", false);
+        holder.ready();
+        fs::write(holder.control.0.join("release"), b"finish").unwrap();
+        assert_eq!(holder.result()["code"], 0);
+    }
+
+    #[test]
+    fn f3_publication_boundary_observes_cancellation_after_command_owner_lifetime() {
+        let mut holder = F3Holder::new("publication", false);
+        holder.ready();
+        holder.signal(nix::sys::signal::Signal::SIGHUP);
+        fs::write(holder.control.0.join("release"), b"finish").unwrap();
+        let result = holder.result();
+        assert!(
+            result["error"].as_str().unwrap().contains("INTERRUPTED"),
+            "{result}"
+        );
+        assert_eq!(result["marker"], true);
+        assert_eq!(result["record_missing"], true);
     }
 }

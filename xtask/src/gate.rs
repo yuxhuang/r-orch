@@ -1,10 +1,12 @@
-//! Tier wiring remains a seam; F2 provides lease and direct-command primitives.
+//! Tier wiring remains a seam; F2/F3 provide lease and direct-command primitives.
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(dead_code, reason = "F2 lifecycle awaits whole-gate integration")]
 mod lease;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-#[allow(dead_code, reason = "F2 lifecycle awaits whole-gate integration")]
+mod signals;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(dead_code, reason = "F3 lifecycle awaits whole-gate integration")]
 mod steps;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

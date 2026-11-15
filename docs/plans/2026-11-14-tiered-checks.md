@@ -53,6 +53,34 @@ version bump is authorized in this implementation wave. Final Linux evidence,
 folded comparison/names/counts, native results, timings and whole-gate reviews
 remain due. AGENTS.md and live rules remain unchanged.
 
+## F3 signal and teardown implementation (2026-11-15)
+
+The proposed D47 bounds are now recorded as one set in
+[ADR 0015, F3 implementation proposal](../decisions/0015-cooperative-gate-target-recovery.md#f3-implementation-proposal-2026-11-15):
+2s forwarded-signal grace, 3s KILL/reap (not reset by Drop), zero marker-lock wait,
+existing 30s default machine-lease wait, 250ms post-reap capture EOF drain and a
+nominal 10ms poll interval. Blocking filesystem/spawn/process syscalls have no hard
+elapsed-time guarantee. Publication is failure-defined; native deletion has no
+supported operation while D45 admission is unavailable. These values can be used
+in ordinary development tests now and require the final whole-gate reliability
+and security assessment before PR 1, not per-slice approval.
+
+F3 owns only unreaped directly started children; it never creates/signals a process
+group. Real status retention, no-record/kept outcomes on interruption or lost
+lease/marker, KILL escalation and finite capture drainage need live hermetic
+controls, including closed-output HUP and a descendant-held pipe. A fixture's
+self-expiry or EOF is not teardown evidence. D41 does not waive directly started
+child handling. Existing inherited-holder-loss control is updated to keep its
+command live and require its real SIGTERM status rather than race a release file
+against loss detection. No existing test is removed.
+
+Native F2 admission/reset/cold deletion remains incomplete; independent F3 controls
+cannot establish integrated native lifecycle success. The legacy wrapper is
+unwired. F5 must replace its unconditional deletion and EXIT/INT/TERM traps, keep
+a run-wide cancellation listener through reporting and integrate the candidate
+publication cancellation checks once the native boundary is decided. No whole-gate,
+Linux, timing, equivalence, PR or completion claim is made by this amendment.
+
 ## Goal
 
 A builder gets a verdict on a change in minutes (`fast`), a pull request is gated by one full suite run (`pr`), and a goal or release is gated by one cold, folded run (`full`), with every protection of today's gate still in force and shown to fail when it should.

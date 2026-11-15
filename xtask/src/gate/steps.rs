@@ -1,13 +1,22 @@
-//! Direct command lifecycle. F3 must add handled signals and bounded teardown;
-//! F4 must render the statuses and kept-target reasons. No tier runs here yet.
+//! Direct owned children only: no group signaling, descendant census or PID reuse
+//! after reaping. Capture never joins a thread waiting for a descendant's EOF.
 
 use std::io::{self, Read};
+use std::os::fd::AsFd;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 
-use super::{lease::Lease, target::Marker};
+use super::{lease::Lease, signals::Signals, target::Marker};
+
+pub(super) const SIGNAL_GRACE: Duration = Duration::from_secs(2);
+pub(super) const KILL_REAP: Duration = Duration::from_secs(3);
+pub(super) const PIPE_DRAIN: Duration = Duration::from_millis(250);
+const POLL: Duration = Duration::from_millis(10);
 
 #[derive(Debug)]
 pub(super) struct Status {
@@ -17,39 +26,87 @@ pub(super) struct Status {
 
 pub(super) struct Runner<'a, 'm> {
     lease: &'a Lease,
-    marker: &'m Marker<'m>,
+    marker: Option<&'m Marker<'m>>,
     child: Option<Child>,
+    start: Option<Instant>,
     statuses: Vec<Status>,
     failed: bool,
+    signals: Option<Signals>,
+    kill_end: Option<Instant>,
 }
 
 impl<'a, 'm> Runner<'a, 'm> {
     pub(super) fn new(lease: &'a Lease, marker: &'m Marker<'m>) -> Result<Self> {
+        marker.enable_signals()?;
+        marker.check_identity()?;
+        Self::with_marker(lease, Some(marker))
+    }
+
+    // Lease exec has no target, but owns its direct command through interruption.
+    pub(super) fn without_marker(lease: &'a Lease) -> Result<Self> {
+        Self::with_marker(lease, None)
+    }
+
+    fn with_marker(lease: &'a Lease, marker: Option<&'m Marker<'m>>) -> Result<Self> {
         lease.validate()?;
         Ok(Self {
             lease,
             marker,
             child: None,
+            start: None,
             statuses: Vec::new(),
             failed: false,
+            signals: if marker.is_none() {
+                Some(Signals::new()?)
+            } else {
+                None
+            },
+            kill_end: None,
         })
     }
 
-    fn start(&mut self, command: &mut Command) -> Result<Instant> {
+    fn wait_signal(&mut self, delay: Duration) -> Option<i32> {
+        match self.marker {
+            Some(marker) => marker.signal_wait(delay),
+            None => self.signals.as_mut().unwrap().wait(delay),
+        }
+    }
+
+    fn pause(&self, delay: Duration) {
+        match self.marker {
+            Some(marker) => marker.signal_pause(delay),
+            None => self.signals.as_ref().unwrap().pause(delay),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.lease.validate()?;
+        if let Some(marker) = self.marker {
+            marker.check_identity()?;
+        }
+        Ok(())
+    }
+
+    fn start(&mut self, command: &mut Command) -> Result<()> {
         ensure!(
             !self.failed && self.child.is_none(),
             "command lifecycle already failed or busy"
         );
-        self.lease.validate()?;
-        // Stdio duplicates the SAME open description. No raw descriptors, no
-        // pre_exec, no explicit unlock. This changes stdin from an ordinary
-        // cargo run; R4/R11 must use the same stream or diagnose differences.
-        command.stdin(self.marker.command_stdin()?);
+        ensure!(
+            self.wait_signal(Duration::ZERO).is_none(),
+            "INTERRUPTED before command"
+        );
+        self.validate()?;
+        // Duplicate the SAME locked open description. No pre_exec or unlock.
+        if let Some(marker) = self.marker {
+            command.stdin(marker.command_stdin()?);
+        }
         let start = Instant::now();
         match command.spawn() {
             Ok(child) => {
                 self.child = Some(child);
-                Ok(start)
+                self.start = Some(start);
+                Ok(())
             }
             Err(e) => {
                 self.failed = true;
@@ -58,103 +115,272 @@ impl<'a, 'm> Runner<'a, 'm> {
         }
     }
 
-    fn reap(&mut self, start: Instant) -> Result<ExitStatus> {
-        let result = self.child.as_mut().context("no direct command")?.wait();
-        match result {
-            Ok(exit) => {
-                self.child = None; // only after collecting the status
-                self.statuses.push(Status {
-                    exit,
-                    elapsed: start.elapsed(),
-                });
-                Ok(exit)
-            }
-            Err(e) => {
-                self.failed = true; // retain the own Child handle, no publication
-                Err(e).context("wait/reap direct command")
-            }
+    fn observe_exit(&mut self) -> Result<Option<ExitStatus>> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        if let Some(exit) = child.try_wait().context("try_wait direct command")? {
+            self.child = None; // signal authority ends here; retain the real status
+            self.statuses.push(Status {
+                exit,
+                elapsed: self.start.take().unwrap().elapsed(),
+            });
+            Ok(Some(exit))
+        } else {
+            Ok(None)
         }
     }
 
-    pub(super) fn run(&mut self, command: &mut Command) -> Result<ExitStatus> {
-        let start = self.start(command)?;
-        self.reap(start)
+    fn forward(&mut self, number: i32) -> Result<()> {
+        if let Some(child) = &self.child {
+            // The child is unreaped and exclusively owned. An exited zombie
+            // retains its PID until our next try_wait; never signal saved PIDs.
+            let pid = i32::try_from(child.id()).context("direct child pid overflow")?;
+            match kill(Pid::from_raw(pid), Signal::try_from(number)?) {
+                Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+                Err(e) => return Err(e).context("forward signal to direct child"),
+            }
+        }
+        Ok(())
     }
 
-    pub(super) fn capture(&mut self, command: &mut Command, limit: usize) -> Result<Vec<u8>> {
-        let result = self.capture_inner(command, limit);
+    fn drive(&mut self, mut capture: Option<&mut Capture>) -> Result<ExitStatus> {
+        let mut failure: Option<anyhow::Error> = None;
+        let mut grace = None;
+        let mut exit = None;
+        let mut drain_end = None;
+        loop {
+            let mut interrupted = self.wait_signal(Duration::ZERO);
+            if failure.is_none() {
+                if let Some(number) = interrupted {
+                    failure = Some(anyhow::anyhow!("INTERRUPTED by signal {number}"));
+                } else if let Err(e) = self.validate() {
+                    // Validation may itself deliver a signal through the shared
+                    // marker listener. Preserve its number before forwarding;
+                    // never translate a late HUP/INT into a spurious TERM.
+                    interrupted = self.wait_signal(Duration::ZERO);
+                    failure = Some(if let Some(number) = interrupted {
+                        anyhow::anyhow!("INTERRUPTED by signal {number}")
+                    } else {
+                        e.context("lease/marker lost; target kept")
+                    });
+                }
+            }
+            match self.observe_exit() {
+                Ok(Some(status)) => {
+                    exit = Some(status);
+                    drain_end = Some(Instant::now() + PIPE_DRAIN);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    if failure.is_none() {
+                        failure = Some(e);
+                    }
+                }
+            }
+            if let Some(streams) = capture.as_deref_mut()
+                && let Err(e) = streams.drain()
+                && failure.is_none()
+            {
+                failure = Some(e);
+            }
+            if exit.is_some() {
+                if capture.as_ref().is_none_or(|c| c.eof()) {
+                    break;
+                }
+                if Instant::now() >= drain_end.unwrap() || failure.is_some() {
+                    if failure.is_none() {
+                        failure = Some(anyhow::anyhow!(
+                            "capture EOF deadline; descendant may hold output; target kept"
+                        ));
+                    }
+                    break;
+                }
+                // No signaling here: the leader is already reaped.
+            } else if failure.is_some() {
+                self.failed = true;
+                if grace.is_none() {
+                    // Teardown never writes a log or waits for an output pipe.
+                    if let Err(e) = self.forward(interrupted.unwrap_or(nix::libc::SIGTERM)) {
+                        failure = Some(failure.unwrap().context(e));
+                    }
+                    grace = Some(Instant::now() + SIGNAL_GRACE);
+                }
+                if self.kill_end.is_none() && Instant::now() >= grace.unwrap() {
+                    if let Some(child) = self.child.as_mut() {
+                        let _ = child.kill(); // still our unreaped direct child
+                    }
+                    self.kill_end = Some(Instant::now() + KILL_REAP);
+                }
+                if self.kill_end.is_some_and(|end| Instant::now() >= end) {
+                    bail!(
+                        "{}; direct child not reaped after KILL; target kept; status unknown",
+                        failure.unwrap()
+                    );
+                }
+            }
+            // Polling drives signal delivery without collector threads. Bound
+            // each capture read batch so continuous output cannot starve teardown.
+            if interrupted.is_some() {
+                self.pause(POLL);
+            } else {
+                self.wait_signal(POLL);
+            }
+        }
+        if let Some(e) = failure {
+            self.failed = true;
+            return Err(e);
+        }
+        self.validate().inspect_err(|_| self.failed = true)?;
+        exit.context("missing terminal direct status")
+    }
+
+    pub(super) fn run(&mut self, command: &mut Command) -> Result<ExitStatus> {
+        let result = self.start(command).and_then(|()| self.drive(None));
         if result.is_err() {
             self.failed = true;
         }
         result
     }
 
-    fn capture_inner(&mut self, command: &mut Command, limit: usize) -> Result<Vec<u8>> {
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let start = self.start(command)?;
-        let child = self.child.as_mut().context("no direct command")?;
-        let stdout = child.stdout.take().context("missing captured stdout")?;
-        let stderr = child.stderr.take().context("missing captured stderr")?;
-        // Drain concurrently, retaining bounded bytes even on an overrun. F3
-        // still owes bounds on blocked I/O and descendant-held output pipes.
-        let out = std::thread::spawn(move || bounded(stdout, limit));
-        let err = std::thread::spawn(move || bounded(stderr, 16 * 1024));
-        let exit = self.reap(start);
-        let output = out
-            .join()
-            .map_err(|_| anyhow::anyhow!("stdout collector panicked"))?;
-        let error = err
-            .join()
-            .map_err(|_| anyhow::anyhow!("stderr collector panicked"))?;
-        let exit = exit?;
-        let output = output?;
-        let error = error?;
-        if !exit.success() {
-            // Keep command stderr in the task's redirected raw logs, not an
-            // assertion that a failed capture produced an empty source set.
-            bail!(
+    pub(super) fn capture(&mut self, command: &mut Command, limit: usize) -> Result<Vec<u8>> {
+        let result = (|| {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            self.start(command)?;
+            let child = self.child.as_mut().context("no direct command")?;
+            let mut capture = Capture {
+                out: Pipe::new(child.stdout.take().context("missing stdout")?, limit)?,
+                err: Pipe::new(child.stderr.take().context("missing stderr")?, 16 * 1024)?,
+            };
+            let exit = self.drive(Some(&mut capture))?;
+            ensure!(
+                exit.success(),
                 "identity command exited {exit}: {}",
-                String::from_utf8_lossy(&error)
+                String::from_utf8_lossy(&capture.err.bytes)
             );
+            Ok(capture.out.bytes)
+        })();
+        if result.is_err() {
+            self.failed = true;
+            // Includes pipe setup failure after spawn. Still own/reap the child.
+            if self.child.is_some() && self.kill_end.is_none() {
+                let _ = self.stop();
+            }
         }
-        Ok(output)
+        result
     }
 
-    pub(super) fn finished(&self) -> Result<()> {
+    fn stop(&mut self) -> Result<()> {
+        self.failed = true;
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+        }
+        let end = *self
+            .kill_end
+            .get_or_insert_with(|| Instant::now() + KILL_REAP);
+        while self.child.is_some() && Instant::now() < end {
+            self.observe_exit()?;
+            if self.child.is_some() {
+                std::thread::sleep(POLL);
+            }
+        }
         ensure!(
-            !self.failed && self.child.is_none(),
-            "direct command not reaped"
+            self.child.is_none(),
+            "direct child not reaped; target kept; status unknown"
         );
-        self.lease.validate()?;
-        self.marker.check_identity()?;
         Ok(())
     }
 
+    pub(super) fn finished(&mut self) -> Result<()> {
+        ensure!(
+            self.wait_signal(Duration::ZERO).is_none(),
+            "INTERRUPTED at finish; target kept"
+        );
+        ensure!(
+            !self.failed && self.child.is_none(),
+            "direct command not reaped or lifecycle failed"
+        );
+        self.validate()
+    }
+
+    pub(super) fn interrupted(&mut self) -> Option<i32> {
+        self.wait_signal(Duration::ZERO)
+    }
+    pub(super) fn child_reaped(&self) -> bool {
+        self.child.is_none()
+    }
     pub(super) fn statuses(&self) -> &[Status] {
         &self.statuses
     }
 }
 
-fn bounded(mut reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
-    reader
-        .by_ref()
-        .take(limit.saturating_add(1) as u64)
-        .read_to_end(&mut bytes)?;
-    io::copy(&mut reader, &mut io::sink())?;
-    if bytes.len() > limit {
-        return Err(io::Error::other("command output exceeds capture budget"));
+struct Pipe<R> {
+    reader: R,
+    bytes: Vec<u8>,
+    limit: usize,
+    eof: bool,
+}
+impl<R: Read + AsFd> Pipe<R> {
+    fn new(reader: R, limit: usize) -> Result<Self> {
+        let flags = OFlag::from_bits_truncate(fcntl(&reader, FcntlArg::F_GETFL)?);
+        fcntl(&reader, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
+        Ok(Self {
+            reader,
+            bytes: Vec::new(),
+            limit,
+            eof: false,
+        })
     }
-    Ok(bytes)
+    fn drain(&mut self) -> Result<()> {
+        if self.eof {
+            return Ok(());
+        }
+        let mut chunk = [0u8; 8192];
+        // Pinned capture semantics need a byte budget and a finite service batch;
+        // a general line/async stream collector does not supply these together.
+        for _ in 0..8 {
+            match self.reader.read(&mut chunk) {
+                Ok(0) => {
+                    self.eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    let remaining = self.limit.saturating_sub(self.bytes.len());
+                    self.bytes.extend_from_slice(&chunk[..n.min(remaining)]);
+                    ensure!(n <= remaining, "command output exceeds capture budget");
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e).context("capture pipe read"),
+            }
+        }
+        Ok(())
+    }
+}
+struct Capture {
+    out: Pipe<std::process::ChildStdout>,
+    err: Pipe<std::process::ChildStderr>,
+}
+impl Capture {
+    fn drain(&mut self) -> Result<()> {
+        // Always service both; a broken/full stdout cannot suppress stderr or
+        // delay the lifecycle's signal/reap loop.
+        let out = self.out.drain();
+        let err = self.err.drain();
+        out.and(err)
+    }
+    fn eof(&self) -> bool {
+        self.out.eof && self.err.eof
+    }
 }
 
 impl Drop for Runner<'_, '_> {
     fn drop(&mut self) {
-        // Only a handle we created; never a PID from diagnostics. This ordinary
-        // error-path cleanup is not the F3 signal/bounded teardown contract.
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        // Last resort on unwind. No indefinite wait and no target cleanup. A
+        // pathological unreapable child leaves an unfinished marker, never a
+        // fabricated status. OS blocking spawn/fs calls are not hard bounded.
+        if self.child.is_some() {
+            let _ = self.stop();
         }
     }
 }

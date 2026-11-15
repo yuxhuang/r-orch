@@ -3382,6 +3382,7 @@ dependencies = [
  "clap",
  "nix 0.31.3",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

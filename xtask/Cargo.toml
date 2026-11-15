@@ -14,7 +14,10 @@ anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 # Existing resolved Unix wrapper; native boundary uses only safe descriptor APIs.
-nix = { workspace = true, features = ["fs", "dir", "user"] }
+nix = { workspace = true, features = ["fs", "dir", "user", "signal", "process"] }
+
+# Safe Unix signal registration; no async subprocess rewrite or extra worker threads.
+tokio = { workspace = true, features = ["rt", "signal", "time"] }
 
 [lints]
 workspace = true

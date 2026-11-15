@@ -564,3 +564,78 @@ prior one-command observation plus these inspection controls is not qualificatio
 of the gate's fixed command list on a platform/filesystem. Native Linux remains
 unrun. Existing owner-set-aside execution findings and owner-accepted FS1 risk
 remain distinct from this product capability failure.
+
+
+## F3 implementation proposal (2026-11-15)
+
+This is a proposed complete D47 value set for final whole-gate review, not an
+accepted ADR or whole-gate readiness claim. Ordinary development execution is
+already authorized; historical per-slice launch conditions above are superseded
+as preconditions by the normal-development amendment. D45 remains unchanged.
+
+| Work | Proposed supported value / outcome | Reason |
+|---|---|---|
+| Grace after observing handled INT/TERM/HUP | 2 seconds from forwarding the first signal to the unreaped direct child | Gives ordinary command cleanup an opportunity without letting a TERM-ignoring command hold iteration indefinitely |
+| Wait after KILL | 3 seconds from the first KILL attempt, shared by normal error and Drop paths; no fresh allowance on retry/Drop | Poll `try_wait` through the exclusive owned Child; only an actually collected status establishes reaping. An unreaped child means incomplete teardown, unknown status, kept target/marker, no publication |
+| Marker lock at admission | 0 seconds (`try_lock` once), REFUSED exit 1 if busy | A live earlier direct child may own the inherited description. Never wait indefinitely, unlink, replace, steal or explicitly unlock the marker |
+| Machine lease | Existing caller-configured `--lease-wait`, default 30 seconds total across turnstile and lease; contention exit 75 | One shared admission deadline, distinct from the zero-wait target marker |
+| Capture after direct exit | 250 milliseconds for both output EOFs; then capture failure and kept state | Descendants can retain a pipe indefinitely under D41. Closing our pipe descriptors is allowed; their EOF is not proof that the direct child exited |
+| Poll/service interval | Nominal 10 milliseconds; at most 64 KiB per pipe per service batch | Continuous output cannot starve signal observation, escalation or reaping; capture retains only its requested stdout budget and 16 KiB stderr |
+| Target reset/deletion, cold removal at start/end/interrupt | No supported production operation yet: native D45 admission refuses before mutation | Native F2 is incomplete. No elapsed-time promise or destructive fallback is invented. The missing namespace primitive/assumption needs a product decision before native integration |
+| Publication and filesystem synchronization | Failure-defined operations, no hard syscall wall bound; stop at the first error, keep marker and target, no fallback/retry | The pinned safe filesystem APIs cannot preempt a blocking open/stat/read/write/rename/unlink/sync. This also applies to validation during the signal/reap loop. Review must assess this disclosed limitation; a timer outside a syscall is not a cancellation mechanism |
+
+The grace and reap values are distinct: nominal command teardown is at most five
+seconds after observation **only while the OS calls and scheduler progress**,
+plus finite poll/service overhead. This is not a hard wall limit for spawn,
+filesystem calls, `kill`, or `try_wait`; normal build duration has no new timeout.
+No lease release or completed status is claimed for a stuck kernel operation.
+After the reap allowance, the Runner retains its handle until destruction; Drop
+attempts KILL without resetting the allowance. If still unreaped, dropping std's
+Child does not magically reap it: the inherited marker/kept state is the residual
+protection, and teardown is explicitly incomplete. No target cleanup is attempted.
+
+Mechanism: existing workspace Tokio 1.53.3, only `rt`, `signal`, `time`; existing
+nix 0.31.3 additionally `signal`, `process` (`fs`, `dir`, `user` retained). Tokio's
+safe Unix signal streams replace handwritten signal registration; a current-thread
+reactor is driven by the synchronous command owner. nix sends a positive PID signal
+only while that exclusive Child is unreaped; no process group is created or
+signalled, no saved PID is signalled after reaping. D41 escaped-descendant risk is
+unchanged. Capture uses safe nonblocking descriptor reads; no collector thread or
+unbounded pipe join exists. A failed capture or closed output cannot gate teardown
+logging. Lease exec also uses this owner and renders only after teardown, ignoring
+stderr write errors.
+
+ARCHITECTURE 4.8 check: both are existing maintained workspace libraries, with no
+new version/resolution; cached pinned manifests declare Tokio MIT/MSRV 1.71 and
+nix MIT/MSRV 1.69, compatible with pinned Rust 1.99.1 and `deny.toml`. Upstream
+[Tokio](https://tokio.rs/) and its [signal API](https://docs.rs/tokio/latest/tokio/signal/unix/fn.signal.html)
+document Unix listeners and their process-global lifetime; pinned local source
+confirms that behavior for 1.53.3. [nix's pinned API](https://docs.rs/nix/0.31.3/nix/sys/signal/fn.kill.html)
+documents positive-PID signaling. Tokio listeners coalesce signals and do not
+restore default dispositions on Drop. This is a standalone CLI lifecycle, not an
+embeddable service component. No unsafe code, new library, version/toolchain bump,
+macros, multi-thread runtime, process or sync Tokio feature is added. The lockfile
+adds only xtask's existing Tokio dependency edge.
+
+If another actor removes or moves the marker, keeping state means retaining our
+owned descriptor through teardown, withholding publication and leaving the target;
+it does not mean recreating the missing name or resetting beside a live child.
+The separately disclosed manual-removal residual is unchanged.
+
+The marker owns one shared sticky cancellation listener. The command Runner
+uses that same listener and re-observes its signal number after a failed validation,
+so a HUP delivered during a marker check is never translated into TERM. The
+listener stays alive through publication and is checked at every state step. This does not make a state
+syscall atomic with signal observation: cancellation during a syscall is observed
+at the next check. Marker removal is the current candidate finish point; a signal
+concurrent with that operation may arrive after it has completed. Native admission
+remains disabled, so this is no proof of a supported native publication/interrupt
+transaction. F5 must retain a run-wide listener from before admission through final
+reporting and integrate these outcomes once the native boundary is decided.
+
+The legacy `gate.sh` remains **unwired** to this lifecycle. Because F2 cannot own
+native admission/deletion, F3 does not replace the wrapper yet. F5's mandatory
+replacement must remove both unconditional cold deletion and EXIT/INT/TERM cleanup
+traps; it must not wrap this owner in another deleting shell. Do not use the old
+wrapper as evidence for the new lifecycle. No full folded gate, native recovery,
+Linux qualification, timing acceptance or release clearance follows from F3 tests.
