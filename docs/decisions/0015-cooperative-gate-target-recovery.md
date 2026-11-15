@@ -101,7 +101,10 @@ below; it does not rewrite historical evidence or change an acceptance row.
 The native lifecycle is wired to cold `full`, warm `pr`, and the `--part`
 dispatch. `full --warm` uses the developer target, is explicitly not a gate,
 and never qualifies. `fast` and hosted-CI `--no-lease` reconciliation remain
-later-PR work. No rules, toolchain, dependency or version changes are made.
+later-PR work. No rules, toolchain, dependency versions or package versions are changed.
+The release owner enables only the existing pinned nix hostname feature for its
+safe read-only hostname API, so exports can redact this datum without starting
+an unowned helper process. Export refuses if that privacy datum is unavailable.
 
 D27 bootstrap uses the fixed `target/gate-xtask`, a completed judge-id stamp,
 and content identities of tracked and nonignored untracked tooling inputs.

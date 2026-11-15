@@ -83,7 +83,7 @@ fn foreign(bytes: &[u8], root: u32) -> Result<usize> {
         .map(|line| {
             let f: Vec<_> = line.split_whitespace().collect();
             ensure!(f.len() >= 3, "ps record");
-            Ok((f[0].parse::<u32>()?, f[1].parse::<u32>()?, f[2].to_owned()))
+            Ok((f[0].parse::<u32>()?, f[1].parse::<u32>()?, f[2..].join(" ")))
         })
         .collect::<Result<Vec<_>>>()?;
     let mut ours = BTreeSet::from([root]);
@@ -179,6 +179,7 @@ mod tests {
             .unwrap(),
             2
         );
+        assert_eq!(foreign(b"100 1 /private/space dir/cargo\n", 10).unwrap(), 1);
         assert!(foreign(b"broken\n", 10).is_err());
         assert!(foreign(b"10 nope cargo\n", 10).is_err());
     }

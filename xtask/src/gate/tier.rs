@@ -83,6 +83,12 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
     let start = Instant::now();
     let started = SystemTime::now();
     let env: BTreeMap<_, _> = std::env::vars_os().collect();
+    // Safe pinned Unix wrapper: no helper child or PATH trust for the privacy
+    // datum, including reports that refuse before acquiring a machine lease.
+    let hostname = nix::unistd::gethostname()
+        .ok()
+        .and_then(|s| s.into_string().ok())
+        .filter(|s| !s.is_empty());
     let run = report::Run::begin(&repo)?;
     let head = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "unknown".into());
     let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]).unwrap_or_else(|_| "unknown".into());
@@ -373,6 +379,9 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
     if !bootstrap_verified {
         reasons.push("judge executable is not content-stamped bootstrap output");
     }
+    if hostname.is_none() {
+        reasons.push("hostname unavailable for evidence redaction");
+    }
     let qualifying = reasons.is_empty();
     let base_code = report::exit(steps, args.evidence.is_some() && !qualifying);
     let code = if let Some(sig) = interrupted {
@@ -593,9 +602,13 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
     command_statuses.push_str(&observations.borrow().log);
     run.finish(&repo, &entries, &command_statuses)?;
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME missing")?);
-    let redactor = report::Redactor::new(&repo, &home, &std::env::temp_dir(), None);
+    let redactor = report::Redactor::new(&repo, &home, &std::env::temp_dir(), hostname.as_deref());
     println!("{}", redactor.apply(text.as_bytes())?);
     if let Some(destination) = &args.evidence {
+        ensure!(
+            hostname.is_some(),
+            "hostname unavailable; evidence export refused"
+        );
         let digest = report::export(&repo, destination, &entries, &redactor)?;
         println!("evidence manifest: {digest}; qualifying: {qualifying}");
     }
