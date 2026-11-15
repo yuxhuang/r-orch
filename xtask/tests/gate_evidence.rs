@@ -612,9 +612,9 @@ fn missing_extra_and_oversized_structured_files_are_rejected() {
                 let path = evidence.sandbox.root.join("bundle/tools.txt");
                 let original = fs::read_to_string(&path).unwrap();
                 let padded = original.replace(
-                    "git=git version ",
+                    "git: git version ",
                     &format!(
-                        "git=git version {}",
+                        "git: git version {}",
                         "x".repeat(1024 * 1024 - original.len())
                     ),
                 );
@@ -622,11 +622,11 @@ fn missing_extra_and_oversized_structured_files_are_rejected() {
                 fs::write(&path, &padded).unwrap();
                 evidence.rehash();
                 evidence.positive(); // Grammar-valid exactly-at-bound control.
-                let oversized = padded.replacen("git=git version ", "git=git version x", 1);
+                let oversized = padded.replacen("git: git version ", "git: git version x", 1);
                 assert_eq!(oversized.len(), 1024 * 1024 + 1);
                 fs::write(path, oversized).unwrap();
                 evidence.rehash();
-                ("tools.txt", &["bound", "large", "size", "limit"])
+                ("tools.txt", &["bound", "large", "size", "limit", "budget"])
             }
             "nul" => {
                 // Keep every required key and value predicate intact: a free
@@ -634,10 +634,10 @@ fn missing_extra_and_oversized_structured_files_are_rejected() {
                 // validation from missing/unknown environment-name checks.
                 let path = evidence.sandbox.root.join("bundle/tools.txt");
                 let text = fs::read_to_string(&path).unwrap();
-                assert!(text.contains("git=git version "));
+                assert!(text.contains("git: git version "));
                 fs::write(
                     path,
-                    text.replacen("git=git version ", "git=git version \0", 1),
+                    text.replacen("git: git version ", "git: git version \0", 1),
                 )
                 .unwrap();
                 evidence.rehash();

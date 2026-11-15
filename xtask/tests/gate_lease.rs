@@ -1,4 +1,4 @@
-//! Lease processes use only private lease directories and self-bounded workers.
+//! Lease processes use private lease directories and explicitly controlled workers.
 //! No test signals a discovered PID or touches the cooperative host lease.
 
 #[path = "gate_witness.rs"]
@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use witness::fixture::{
@@ -36,23 +37,18 @@ if mode == 'resistant-direct':
     for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(number, forwarded)
 reader = connection.makefile('rb')
-connection.sendall((json.dumps({'role': mode, 'pid': os.getpid(), 'token': os.environ.get('XTASK_GATE_LEASE_TOKEN', '')}) + '\n').encode())
+connection.sendall((json.dumps({'role': mode, 'pid': os.getpid(), 'stdin_inode': os.fstat(0).st_ino, 'stdin_device': os.fstat(0).st_dev, 'token': os.environ.get('XTASK_GATE_LEASE_TOKEN', '')}) + '\n').encode())
 child = None
 try:
     if mode == 'resistant':
         child = subprocess.Popen([sys.executable, __file__, 'detached', address], start_new_session=True)
     while True:
-        if mode == 'resistant-direct':
-            connection.settimeout(None)
-            line = reader.readline(65536)
-            if not line or json.loads(line)['op'] == 'release': break
-            continue
         deadline = time.monotonic() + 30
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             connection.sendall(b'{"expired":true}\n')
             break
-        connection.settimeout(remaining)
+        connection.settimeout(None if mode in ('holder', 'resistant-direct') else remaining)
         try:
             line = reader.readline(65536)
         except (TimeoutError, socket.timeout):
@@ -60,6 +56,9 @@ try:
             break
         if not line: break
         request = json.loads(line)
+        if request['op'] == 'ping':
+            connection.sendall((json.dumps({'alive': os.getpid()}) + '\n').encode())
+            continue
         if request['op'] == 'release': break
         if request['op'] == 'gate':
             env = dict(os.environ)
@@ -168,6 +167,10 @@ impl Peer {
         writeln!(self.output, "{request}").unwrap();
         self.output.flush().unwrap();
     }
+    fn alive(&mut self) {
+        self.request(serde_json::json!({"op": "ping"}));
+        assert_eq!(self.response()["alive"], self.ready["pid"]);
+    }
     fn release(&mut self) {
         self.request(serde_json::json!({"op": "release"}));
     }
@@ -217,8 +220,8 @@ impl Peer {
 impl Drop for Peer {
     fn drop(&mut self) {
         // Closing both halves releases workers even when an assertion unwinds.
-        // The 30 s idle deadline and per-nested 30 s runtime are separate.
-        // EOF/self-expiry are not death/cleanup authority; lifecycle runs held.
+        // Holder/direct workers have no idle expiry; nested command runtimes are bounded.
+        // Death assertions use process observations and real status/lock results.
         let _ = self.output.shutdown(std::net::Shutdown::Both);
     }
 }
@@ -296,6 +299,7 @@ fn killed_holder_releases_kernel_lease_while_descendant_with_token_is_still_live
         "recovery must not unlink the shared lock"
     );
     peer.release();
+    require_process_gone(&sandbox, peer.ready["pid"].as_u64().unwrap());
 }
 
 #[test]
@@ -336,6 +340,7 @@ fn stale_inherited_token_after_holder_death_cannot_grant_inherited_authority() {
     );
     assert_eq!(field(&sandbox.result(), "lease"), "exclusive");
     peer.release();
+    require_process_gone(&sandbox, peer.ready["pid"].as_u64().unwrap());
 }
 
 #[test]
@@ -755,8 +760,20 @@ fn warm_and_cold_orphan_writers_are_not_reset_under_after_direct_holder_kill() {
         require_selected_target(&sandbox, &target);
         let canary = target.join("orphan-writer-canary");
         fs::write(&canary, "alive\n").unwrap();
+        writer.alive();
+        let marker = sandbox.root.join(if tier == "pr" {
+            "target/.gate-state/warm.use"
+        } else {
+            "target/.gate-state/cold.use"
+        });
+        assert_eq!(
+            writer.ready["stdin_inode"].as_u64(),
+            Some(fs::metadata(&marker).unwrap().ino())
+        );
         holder.signal("KILL");
-        let _ = holder.finish(HANDSHAKE_BUDGET);
+        assert_eq!(holder.finish(HANDSHAKE_BUDGET).status.signal(), Some(9));
+        writer.alive();
+        marker_lock(&sandbox, &marker, 75);
         // The gate-tier lock FD must not leak into the still-live writer.
         sandbox
             .run(&mut sandbox.gate(&[
@@ -815,16 +832,15 @@ fn warm_and_cold_orphan_writers_are_not_reset_under_after_direct_holder_kill() {
             "build"
         };
         output.contains(reason);
-        let pid = writer.ready["pid"].as_u64().unwrap().to_string();
-        assert!(
-            output
-                .text()
-                .split(|c: char| !c.is_ascii_digit())
-                .any(|token| token == pid),
-            "missing exact live writer PID: {}",
-            output.text()
-        );
+        // The marker records the gate holder, not the cargo worker. Its PID is
+        // unvalidated diagnostic data; exclusion comes from the actual lock.
+        output.contains("marker diagnostics (unvalidated)");
+        output.contains("Do not remove target/");
+        assert!(fs::read_to_string(target.join("orphan-writer-canary")).unwrap() == "alive\n");
+        writer.alive();
         writer.release();
+        require_process_gone(&sandbox, writer.ready["pid"].as_u64().unwrap());
+        marker_lock(&sandbox, &marker, 0);
     }
 }
 
@@ -843,10 +859,21 @@ fn unfinished_warm_build_resets_after_owned_orphan_writer_has_exited() {
     let mut holder =
         sandbox.spawn(&mut sandbox.gate(&["pr", "--part", "suite", "--lease-wait", "0"]));
     let mut worker = boundary.accept(&mut holder);
+    worker.alive();
+    let marker = sandbox.root.join("target/.gate-state/warm.use");
+    assert_eq!(
+        worker.ready["stdin_inode"].as_u64(),
+        Some(fs::metadata(&marker).unwrap().ino())
+    );
     holder.signal("KILL");
-    let _ = holder.finish(HANDSHAKE_BUDGET);
+    assert_eq!(holder.finish(HANDSHAKE_BUDGET).status.signal(), Some(9));
+    worker.alive();
+    marker_lock(&sandbox, &marker, 75);
     worker.release();
-    worker.require_closed_without_self_expiry();
+    // No EOF/expiry inference: read-only process absence and a granted lock
+    // independently observe the writer's exit and last close.
+    require_process_gone(&sandbox, worker.ready["pid"].as_u64().unwrap());
+    marker_lock(&sandbox, &marker, 0);
     fs::remove_file(sandbox.temporary.join("bin/cargo")).unwrap();
     symlink(real_cargo, sandbox.temporary.join("bin/cargo")).unwrap();
     sandbox.suite().code(0);
@@ -965,4 +992,403 @@ fn lease_exec_int_term_hup_kills_and_reaps_resistant_direct_child_before_releasi
             ]))
             .code(0);
     }
+}
+
+fn require_process_gone(sandbox: &Sandbox, pid: u64) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let out =
+            sandbox.run(
+                sandbox
+                    .command("/bin/ps")
+                    .args(["-p", &pid.to_string(), "-o", "pid="]),
+            );
+        if out.status.code() == Some(1) && out.stdout.trim().is_empty() {
+            return;
+        }
+        assert!(
+            out.status.success(),
+            "process observation failed: {}",
+            out.text()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "task-owned writer {pid} still exists: {}",
+            out.text()
+        );
+        std::thread::park_timeout(POLL_INTERVAL);
+    }
+}
+
+fn marker_lock(sandbox: &Sandbox, marker: &Path, expected: i32) {
+    let mut command = sandbox.command("/usr/bin/python3");
+    command
+        .args([
+            "-c",
+            r#"import fcntl,os,sys
+fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW)
+try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except BlockingIOError: sys.exit(75)
+print(os.fstat(fd).st_ino)
+"#,
+        ])
+        .arg(marker);
+    sandbox.run(&mut command).code(expected);
+}
+
+#[test]
+fn live_marker_or_lease_loss_reaps_direct_writer_and_exports_kept_unfinished_target() {
+    for lost in ["marker", "lease"] {
+        let sandbox = Sandbox::new();
+        sandbox.mini("#[test]\nfn sample() {}\n", true);
+        sandbox.suite().code(0);
+        let boundary = Boundary::new(&sandbox);
+        parked_build(&sandbox, &boundary, "resistant-direct");
+        let export = sandbox.temporary.join("lost-export");
+        let mut holder = sandbox.spawn(
+            sandbox
+                .gate(&["pr", "--part", "suite", "--lease-wait", "0", "--evidence"])
+                .arg(&export),
+        );
+        let mut writer = boundary.accept(&mut holder);
+        writer.alive();
+        let path = if lost == "marker" {
+            sandbox.root.join("target/.gate-state/warm.use")
+        } else {
+            sandbox.temporary.join("lease/r-orch-gate.lease")
+        };
+        let saved = sandbox.temporary.join("saved-owned-lock");
+        fs::rename(&path, &saved).unwrap();
+        let output = holder.finish(Duration::from_secs(10));
+        require_process_gone(&sandbox, writer.ready["pid"].as_u64().unwrap());
+        output.code(1);
+        let record = sandbox.result();
+        assert!(field(&record, "target").starts_with("kept ("), "{record}");
+        assert_eq!(field(&record, "target-finished"), "no");
+        assert!(field(&record, "qualifying").starts_with("no"));
+        assert!(!sandbox.root.join("target/.gate-state/warm.record").exists());
+        assert!(sandbox.root.join("target/gate-warm").is_dir());
+        let commands =
+            fs::read_to_string(Path::new(field(&record, "run-dir")).join("commands.txt")).unwrap();
+        assert!(
+            commands.contains("reaped-exit=137"),
+            "no direct KILL status: {commands}"
+        );
+        if lost == "lease" {
+            assert_eq!(field(&record, "lease"), "lost");
+            assert!(sandbox.root.join("target/.gate-state/warm.use").exists());
+        }
+        let copied = fs::read_to_string(export.join("result.txt")).unwrap();
+        assert_eq!(field(&copied, "target-finished"), "no");
+        assert!(field(&copied, "target").starts_with("kept ("));
+        marker_lock(&sandbox, &saved, 0);
+    }
+}
+
+#[test]
+fn closed_terminal_pipes_cannot_prevent_signal_reap_or_replace_interrupted_exit() {
+    let sandbox = Sandbox::new();
+    sandbox.mini("#[test]\nfn sample() {}\n", true);
+    sandbox.suite().code(0);
+    let boundary = Boundary::new(&sandbox);
+    parked_build(&sandbox, &boundary, "resistant-direct");
+    let mut holder = sandbox.spawn_with_closed_pipes(&mut sandbox.gate(&[
+        "pr",
+        "--part",
+        "suite",
+        "--lease-wait",
+        "0",
+    ]));
+    let mut writer = boundary.accept(&mut holder);
+    writer.alive();
+    holder.signal("TERM");
+    assert_eq!(writer.response()["forwarded"], 15);
+    let output = holder.finish(Duration::from_secs(10));
+    require_process_gone(&sandbox, writer.ready["pid"].as_u64().unwrap());
+    let record = sandbox.result();
+    assert!(field(&record, "verdict").starts_with("INTERRUPTED"));
+    assert_eq!(field(&record, "target-finished"), "yes");
+    assert!(!sandbox.root.join("target/.gate-state/warm.use").exists());
+    let commands =
+        fs::read_to_string(Path::new(field(&record, "run-dir")).join("commands.txt")).unwrap();
+    assert!(
+        commands.contains("exit=137"),
+        "missing actual direct-child status: {commands}"
+    );
+    sandbox
+        .run(&mut sandbox.gate(&[
+            "lease",
+            "exec",
+            "--purpose",
+            "closed-pipe-successor",
+            "--lease-wait",
+            "0",
+            "--",
+            "/usr/bin/true",
+        ]))
+        .code(0);
+    // Preserve the signal contract even when the terminal has disconnected.
+    output.code(143);
+}
+
+#[test]
+fn inherited_holder_loss_during_real_use_reaps_writer_without_publishing_a_record() {
+    let sandbox = Sandbox::new();
+    sandbox.mini("#[test]\nfn sample() {}\n", true);
+    let outer = Boundary::new(&sandbox);
+    let mut holder = outer.exec(&sandbox, "holder");
+    let mut client = outer.accept(&mut holder);
+    assert_eq!(
+        client.nested("keep", &["pr", "--part", "suite", "--lease-wait", "0"]),
+        0
+    );
+    assert_eq!(field(&sandbox.result(), "lease"), "inherited");
+    // A second socket distinguishes the gate's direct cargo worker from the
+    // still-live client whose inherited token alone confers no authority.
+    let address = sandbox.temporary.join("inner-boundary");
+    let listener = UnixListener::bind(&address).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let inner = Boundary {
+        listener,
+        path: address,
+    };
+    parked_build(&sandbox, &inner, "resistant-direct");
+    let argv = [
+        env!("CARGO_BIN_EXE_xtask"),
+        "gate",
+        "pr",
+        "--part",
+        "suite",
+        "--lease-wait",
+        "0",
+    ];
+    client.request(serde_json::json!({"op":"gate", "argv":argv, "token":"keep"}));
+    let mut writer = inner.accept(&mut holder);
+    writer.alive();
+    holder.signal("KILL");
+    assert_eq!(holder.finish(HANDSHAKE_BUDGET).status.signal(), Some(9));
+    assert_eq!(client.response()["exit"], 1);
+    require_process_gone(&sandbox, writer.ready["pid"].as_u64().unwrap());
+    client.alive();
+    let record = sandbox.result();
+    assert_eq!(field(&record, "lease"), "lost");
+    assert_eq!(field(&record, "target-finished"), "no");
+    assert!(field(&record, "target").starts_with("kept ("));
+    assert!(!sandbox.root.join("target/.gate-state/warm.record").exists());
+    assert!(sandbox.root.join("target/.gate-state/warm.use").exists());
+    let commands =
+        fs::read_to_string(Path::new(field(&record, "run-dir")).join("commands.txt")).unwrap();
+    assert!(
+        commands.contains("reaped-exit=137"),
+        "missing resistant direct-child KILL status: {commands}"
+    );
+    client.release();
+    require_process_gone(&sandbox, client.ready["pid"].as_u64().unwrap());
+}
+
+#[test]
+fn native_foreign_cargo_and_periodic_samples_are_observed_while_gate_build_is_live() {
+    use witness::fixture::{rust_literal, wait_for};
+    let sandbox = Sandbox::new();
+    sandbox.mini("#[test]\nfn sample() {}\n", true);
+    sandbox.suite().code(0);
+    let foreign_ready = sandbox.temporary.join("foreign-ready");
+    let foreign_release = sandbox.temporary.join("foreign-release");
+    let gate_ready = sandbox.temporary.join("gate-ready");
+    let gate_release = sandbox.temporary.join("gate-release");
+    let build = |ready: &Path, release: &Path| {
+        format!(
+            r#"fn main() {{
+        std::fs::write({ready}, "ready").unwrap();
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);
+        while !std::path::Path::new({release}).exists() {{
+            assert!(std::time::Instant::now()<deadline, "fixture handshake expired");
+            std::thread::park_timeout(std::time::Duration::from_millis(10));
+        }}
+    }}"#,
+            ready = rust_literal(ready),
+            release = rust_literal(release)
+        )
+    };
+    let foreign_root = sandbox.temporary.join("foreign");
+    fs::create_dir_all(foreign_root.join("src")).unwrap();
+    fs::write(
+        foreign_root.join("Cargo.toml"),
+        "[package]\nname='foreign-fixture'\nversion='0.0.0'\nedition='2024'\n[workspace]\n",
+    )
+    .unwrap();
+    fs::write(
+        foreign_root.join("src/lib.rs"),
+        "pub fn value() -> u8 { 1 }\n",
+    )
+    .unwrap();
+    fs::write(
+        foreign_root.join("build.rs"),
+        build(&foreign_ready, &foreign_release),
+    )
+    .unwrap();
+    let mut foreign = sandbox.spawn(
+        sandbox
+            .command("cargo")
+            .arg("build")
+            .arg("--offline")
+            .arg("--manifest-path")
+            .arg(foreign_root.join("Cargo.toml"))
+            .env("CARGO_TARGET_DIR", sandbox.temporary.join("foreign-target")),
+    );
+    wait_for(&foreign_ready, HANDSHAKE_BUDGET);
+    assert!(foreign.child.try_wait().unwrap().is_none());
+    // This wrapper records calls but delegates every process observation to the
+    // actual native ps. It supplies neither synthetic rows nor load values.
+    let samples = sandbox.temporary.join("ps-calls");
+    let periodic = sandbox.temporary.join("periodic-observed");
+    sandbox.script(
+        &sandbox.temporary.join("bin/ps"),
+        &format!(
+            r#"#!/usr/bin/python3
+import os, subprocess, sys
+from pathlib import Path
+p=Path({samples:?})
+n=int(p.read_text())+1 if p.exists() else 1
+p.write_text(str(n))
+if n>=2: Path({periodic:?}).write_text('observed')
+out=subprocess.run(['/bin/ps', '-axo', 'pid=,ppid=,comm='],capture_output=True,timeout=2)
+Path(str(p)+'-'+str(n)+'.txt').write_bytes(out.stdout)
+sys.stdout.buffer.write(out.stdout)
+sys.exit(out.returncode)
+"#,
+            samples = samples.to_str().unwrap(),
+            periodic = periodic.to_str().unwrap()
+        ),
+    );
+    sandbox.write("fixture/build.rs", build(&gate_ready, &gate_release));
+    let gate = sandbox.spawn(&mut sandbox.gate(&["pr", "--part", "suite", "--lease-wait", "0"]));
+    let gate_pid = gate.child.id();
+    let foreign_pid = foreign.child.id();
+    wait_for(&gate_ready, HANDSHAKE_BUDGET);
+    wait_for(&periodic, HANDSHAKE_BUDGET);
+    assert!(foreign.child.try_wait().unwrap().is_none());
+    fs::write(&gate_release, "finish").unwrap();
+    let output = gate.finish(COMMAND_BUDGET);
+    fs::write(&foreign_release, "finish").unwrap();
+    foreign.finish(COMMAND_BUDGET).code(0);
+    output.code(0);
+    let record = sandbox.result();
+    assert_eq!(field(&record, "foreign-build-activity"), "yes");
+    let mut maximum = 0;
+    let mut observed_owned_foreign = false;
+    for entry in fs::read_dir(&sandbox.temporary).unwrap() {
+        let path = entry.unwrap().path();
+        if !path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("ps-calls-")
+        {
+            continue;
+        }
+        let bytes = fs::read_to_string(path).unwrap();
+        let rows: Vec<_> = bytes
+            .lines()
+            .map(|line| {
+                let mut fields = line.split_whitespace();
+                (
+                    fields.next().unwrap().parse::<u32>().unwrap(),
+                    fields.next().unwrap().parse::<u32>().unwrap(),
+                    fields.collect::<Vec<_>>().join(" "),
+                )
+            })
+            .collect();
+        let mut ours = std::collections::BTreeSet::from([gate_pid]);
+        loop {
+            let previous = ours.len();
+            for (pid, parent, _) in &rows {
+                if ours.contains(parent) {
+                    ours.insert(*pid);
+                }
+            }
+            if ours.len() == previous {
+                break;
+            }
+        }
+        let foreign_rows: Vec<_> = rows
+            .iter()
+            .filter(|(pid, _, command)| {
+                !ours.contains(pid)
+                    && [
+                        "cargo",
+                        "rustc",
+                        "rustdoc",
+                        "clippy-driver",
+                        "cargo-nextest",
+                    ]
+                    .iter()
+                    .any(|name| Path::new(command).file_name().is_some_and(|n| n == *name))
+            })
+            .collect();
+        observed_owned_foreign |= foreign_rows.iter().any(|(pid, _, _)| *pid == foreign_pid);
+        maximum = maximum.max(foreign_rows.len());
+    }
+    assert!(
+        observed_owned_foreign,
+        "native process rows did not identify the task-owned foreign cargo"
+    );
+    assert_eq!(
+        field(&record, "foreign-build-count-max")
+            .parse::<usize>()
+            .unwrap(),
+        maximum
+    );
+    let commands =
+        fs::read_to_string(Path::new(field(&record, "run-dir")).join("commands.txt")).unwrap();
+    assert!(
+        commands.contains("sample=3"),
+        "start, periodic and end samples absent: {commands}"
+    );
+    assert!(field(&record, "contention-sampling").contains("every 15s"));
+}
+
+#[test]
+fn completed_direct_command_with_live_output_holder_keeps_target_until_fixture_cleanup() {
+    use witness::fixture::rust_literal;
+    let sandbox = Sandbox::new();
+    sandbox.mini("#[test]\nfn sample() {}\n", true);
+    sandbox.suite().code(0);
+    let boundary = Boundary::new(&sandbox);
+    sandbox.write(
+        "fixture/src/lib.rs",
+        format!(
+            r#"
+#[test]
+fn leaves_an_explicitly_controlled_output_holder() {{
+    let _owned = std::process::Command::new("/usr/bin/python3")
+        .args([{payload}, "holder", {socket}]).spawn().unwrap();
+}}
+"#,
+            payload = rust_literal(&sandbox.temporary.join("payload.py")),
+            socket = rust_literal(&boundary.path)
+        ),
+    );
+    let mut gate =
+        sandbox.spawn(&mut sandbox.gate(&["pr", "--part", "suite", "--lease-wait", "0"]));
+    let mut leaf = boundary.accept(&mut gate);
+    leaf.alive();
+    let output = gate.finish(Duration::from_secs(10));
+    // It really is still live after the gate returned. The fixture releases
+    // its own child by protocol, observes process absence, then removes scratch.
+    leaf.alive();
+    leaf.release();
+    require_process_gone(&sandbox, leaf.ready["pid"].as_u64().unwrap());
+    output.code(1);
+    let record = sandbox.result();
+    assert!(field(&record, "target").starts_with("kept ("), "{record}");
+    assert_eq!(field(&record, "target-finished"), "no");
+    assert!(sandbox.root.join("target/.gate-state/warm.use").exists());
+    assert!(!sandbox.root.join("target/.gate-state/warm.record").exists());
+    let commands =
+        fs::read_to_string(Path::new(field(&record, "run-dir")).join("commands.txt")).unwrap();
+    assert!(
+        commands.contains("reaped-exit=0"),
+        "no actual completed cargo status: {commands}"
+    );
 }

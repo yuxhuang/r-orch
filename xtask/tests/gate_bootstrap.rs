@@ -363,10 +363,12 @@ if cargo_subcommand(sys.argv[1:]) != "build":
     os.execv({real:?}, [{real:?}] + sys.argv[1:])
 ready = Path({ready:?})
 release = Path({release:?})
-ready.write_text('ready\n')
+ready.write_text(str(os.getpid()))
 deadline = time.monotonic() + 30
 while not release.exists():
-    if time.monotonic() > deadline: sys.exit(97)
+    if time.monotonic() > deadline:
+        Path(str(ready)+'.expired').write_text('expired')
+        sys.exit(97)
     time.sleep(0.01)
 os.execv({real:?}, [{real:?}] + sys.argv[1:])
 "#,
@@ -394,6 +396,7 @@ fn source_mutation_during_bootstrap_cannot_publish_a_trusted_stamp() {
     sandbox.write("xtask/src/main.rs", source("MUTATED_DURING_BUILD"));
     fs::write(sandbox.temporary.join("build-release"), "release\n").unwrap();
     let output = child.finish(COMMAND_BUDGET);
+    require_parked_worker_exit(&sandbox);
     assert!(
         !output.status.success(),
         "identity race was accepted: {}",
@@ -418,6 +421,7 @@ fn interrupted_bootstrap_never_leaves_a_completed_stamp() {
         // it. Boundary timeout/build failure can no longer satisfy BOOT-INT.
         fs::write(sandbox.temporary.join("build-release"), "release\n").unwrap();
         let output = child.finish(COMMAND_BUDGET);
+        require_parked_worker_exit(&sandbox);
         assert!(!output.status.success());
         assert!(!stamp(&sandbox).exists());
     }
@@ -447,7 +451,55 @@ fn missing_tracked_judge_input_cannot_reuse_a_trusted_success_stamp() {
 // ownership/fault/admission observation seam; see the frozen handoff ledger.
 // They are neither silently skipped nor replaced with arbitrary private files.
 
-// BOOT-INT's successful-release oracle is repaired, but authoritative child
-// lifecycle/independent cleanup is still missing (FS2/I3). Never execute these
-// signal or source-race boundaries under the current safety hold. Socket EOF,
-// a self-deadline, absent stamp or absence of files is not proof of child death.
+// Normal-development authorization supersedes the historical launch hold.
+// Signal/race controls observe the parked process itself and reject its expiry;
+// absence of a stamp or EOF alone is not a process-exit oracle.
+
+#[test]
+fn unchanged_bootstrap_preserves_target_and_stamp_identity_and_invalid_stamp_resets() {
+    let sandbox = bootstrap();
+    let first = require_first(&sandbox);
+    let canary = sandbox.root.join("target/gate-xtask/unchanged-canary");
+    fs::write(&canary, "same judge\n").unwrap();
+    let output = run(&sandbox);
+    output.code(0);
+    assert_eq!(returned_id(&output), first);
+    assert_eq!(fs::read_to_string(&canary).unwrap(), "same judge\n");
+    fs::write(stamp(&sandbox), "not a trusted identity\n").unwrap();
+    let output = run(&sandbox);
+    output.code(0);
+    assert_eq!(returned_id(&output), first);
+    assert_eq!(fs::read_to_string(stamp(&sandbox)).unwrap().trim(), first);
+    assert!(!canary.exists());
+}
+
+fn require_parked_worker_exit(sandbox: &Sandbox) {
+    let ready = sandbox.temporary.join("build-ready");
+    let pid = fs::read_to_string(&ready).unwrap().parse::<u32>().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let out =
+            sandbox.run(
+                sandbox
+                    .command("/bin/ps")
+                    .args(["-p", &pid.to_string(), "-o", "pid="]),
+            );
+        if out.status.code() == Some(1) && out.stdout.trim().is_empty() {
+            break;
+        }
+        assert!(out.status.success(), "process query failed: {}", out.text());
+        assert!(
+            std::time::Instant::now() < deadline,
+            "parked bootstrap worker still exists: {}",
+            out.text()
+        );
+        std::thread::park_timeout(witness::fixture::POLL_INTERVAL);
+    }
+    assert!(
+        !sandbox.temporary.join("build-ready.expired").exists(),
+        "fixture self-expiry cannot prove interrupt/race protection"
+    );
+    let mut command = sandbox.command("/usr/bin/python3");
+    command.args(["-c", "import fcntl,os,sys; fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW); fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)"]).arg(sandbox.root.join("target/.gate-xtask.lock"));
+    sandbox.run(&mut command).code(0);
+}

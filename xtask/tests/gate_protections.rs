@@ -558,6 +558,16 @@ fn main() {{
         "{}",
         output.text()
     );
+    assert!(
+        !sandbox.root.join("target/.gate-state/warm.record").exists(),
+        "changed source published a reusable record"
+    );
+    if output.status.success() {
+        let record = sandbox.result();
+        assert_eq!(field(&record, "publication"), "no record: source changed");
+        assert_eq!(field(&record, "target-finished"), "yes");
+        assert!(!sandbox.root.join("target/.gate-state/warm.use").exists());
+    }
     sandbox.write("fixture/src/lib.rs", PASS);
     backdate(&sandbox.root.join("fixture/src/lib.rs"));
     sandbox.suite().code(0);
@@ -565,4 +575,139 @@ fn main() {{
         field(&sandbox.result(), "target").starts_with("reset:"),
         "racing source record was reused"
     );
+}
+
+// C9 / RC16, RC20: real matching publication precedes each damaged-state input.
+#[test]
+fn missing_truncated_corrupt_and_oversized_warm_records_reset_actual_artifacts() {
+    for damage in ["missing", "truncated", "corrupt", "oversized"] {
+        let sandbox = passing();
+        let record = sandbox.root.join("target/.gate-state/warm.record");
+        let original = fs::read(&record).unwrap();
+        assert!(!original.is_empty());
+        let canary = sandbox.root.join("target/gate-warm/stale-artifact");
+        fs::write(&canary, "previous build\n").unwrap();
+        match damage {
+            "missing" => fs::remove_file(&record).unwrap(),
+            "truncated" => fs::write(&record, &original[..original.len() / 2]).unwrap(),
+            "corrupt" => fs::write(&record, b"not a completed record\n").unwrap(),
+            "oversized" => fs::write(&record, vec![b'x'; 8 * 1024 * 1024 + 1]).unwrap(),
+            _ => unreachable!(),
+        }
+        sandbox.suite().code(0);
+        assert_eq!(
+            field(&sandbox.result(), "target"),
+            if damage == "missing" {
+                "reset: no record"
+            } else {
+                "reset: unreadable record"
+            }
+        );
+        assert!(!canary.exists(), "{damage} retained stale artifact");
+        assert!(record.is_file());
+        assert!(!sandbox.root.join("target/.gate-state/warm.use").exists());
+        sandbox.suite().code(0);
+        assert_eq!(field(&sandbox.result(), "target"), "reused");
+    }
+}
+
+#[test]
+fn added_and_removed_source_entries_reset_a_previously_completed_warm_target() {
+    let sandbox = passing();
+    for added in [true, false] {
+        let canary = sandbox.root.join("target/gate-warm/stale-artifact");
+        fs::write(&canary, "old set\n").unwrap();
+        if added {
+            sandbox.write("fixture/src/new_source.rs", "// source inventory entry\n");
+            // RC20: Cargo cannot repair an omitted old-mtime input by freshness.
+            backdate(&sandbox.root.join("fixture/src/new_source.rs"));
+        } else {
+            fs::remove_file(sandbox.root.join("fixture/src/new_source.rs")).unwrap();
+        }
+        sandbox.suite().code(0);
+        assert!(field(&sandbox.result(), "target").starts_with("reset:"));
+        assert!(!canary.exists());
+        sandbox.suite().code(0);
+        assert_eq!(field(&sandbox.result(), "target"), "reused");
+    }
+}
+
+#[test]
+fn failed_warm_publication_keeps_marker_and_target_without_touching_outside_canary() {
+    let sandbox = passing();
+    let canary = sandbox.temporary.join("outside-publication-canary");
+    fs::write(&canary, "untouched\n").unwrap();
+    let temporary = sandbox.root.join("target/.gate-state/warm.record.tmp");
+    sandbox.write(
+        "fixture/src/lib.rs",
+        format!(
+            r#"
+#[test]
+fn plants_publication_link_after_native_admission() {{
+    std::os::unix::fs::symlink({canary}, {temporary}).unwrap();
+}}
+"#,
+            canary = rust_literal(&canary),
+            temporary = rust_literal(&temporary)
+        ),
+    );
+    sandbox.suite().code(1);
+    let record = sandbox.result();
+    assert!(field(&record, "target").starts_with("kept ("), "{record}");
+    assert_eq!(field(&record, "target-finished"), "no");
+    assert!(field(&record, "qualifying").starts_with("no"));
+    assert!(sandbox.root.join("target/gate-warm").is_dir());
+    assert!(sandbox.root.join("target/.gate-state/warm.use").is_file());
+    assert!(!sandbox.root.join("target/.gate-state/warm.record").exists());
+    assert!(
+        fs::symlink_metadata(temporary)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(fs::read_to_string(canary).unwrap(), "untouched\n");
+    assert!(
+        record.contains("warm.record.tmp"),
+        "missing fault path: {record}"
+    );
+}
+
+#[test]
+fn existing_regular_publication_temporary_causes_real_finish_failure_without_replacement() {
+    let sandbox = passing();
+    let temporary = sandbox.root.join("target/.gate-state/warm.record.tmp");
+    sandbox.write(
+        "fixture/src/lib.rs",
+        format!(
+            r#"
+#[test]
+fn plants_regular_temporary_during_an_admitted_use() {{
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::io::Write;
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .open({temporary}).unwrap().write_all(b"occupied temporary\n").unwrap();
+}}
+"#,
+            temporary = rust_literal(&temporary)
+        ),
+    );
+    sandbox.suite().code(1);
+    let record = sandbox.result();
+    assert_eq!(
+        row(&record, "test")[1],
+        "pass",
+        "suite failed before publication: {record}"
+    );
+    assert!(field(&record, "target").starts_with("kept ("));
+    assert!(
+        record.contains("warm.record.tmp"),
+        "publication failure lacks its path: {record}"
+    );
+    assert_eq!(field(&record, "target-finished"), "no");
+    assert_eq!(
+        fs::read_to_string(temporary).unwrap(),
+        "occupied temporary\n"
+    );
+    assert!(sandbox.root.join("target/.gate-state/warm.use").exists());
+    assert!(!sandbox.root.join("target/.gate-state/warm.record").exists());
 }

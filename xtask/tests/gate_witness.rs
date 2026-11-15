@@ -260,6 +260,14 @@ def cargo_subcommand(args):
         }
 
         pub fn spawn(&self, command: &mut Command) -> OwnedChild {
+            self.spawn_io(command, false)
+        }
+
+        pub fn spawn_with_closed_pipes(&self, command: &mut Command) -> OwnedChild {
+            self.spawn_io(command, true)
+        }
+
+        fn spawn_io(&self, command: &mut Command, closed: bool) -> OwnedChild {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let serial = NEXT.fetch_add(1, Ordering::Relaxed);
             let stdout = self.temporary.join(format!("capture/{serial}.out"));
@@ -269,7 +277,15 @@ def cargo_subcommand(args):
                 .stdout(fs::File::create(&stdout).unwrap())
                 .stderr(fs::File::create(&stderr).unwrap())
                 .process_group(0);
-            let child = command.spawn().expect("setup: start owned process");
+            if closed {
+                command.stdout(Stdio::piped()).stderr(Stdio::piped());
+            }
+            let mut child = command.spawn().expect("setup: start owned process");
+            if closed {
+                // Disconnect actual kernel pipes; no logger mock or production seam.
+                drop(child.stdout.take());
+                drop(child.stderr.take());
+            }
             OwnedChild {
                 child,
                 stdout,
@@ -763,7 +779,7 @@ def cargo_subcommand(args):
 
     pub fn backdate(path: &Path) {
         fs::File::options()
-            .write(true)
+            .read(true)
             .open(path)
             .unwrap()
             .set_times(

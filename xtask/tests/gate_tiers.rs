@@ -162,16 +162,20 @@ fn preflight_refusal_retains_refused_result_and_table() {
 #[test]
 fn missing_advisories_tool_is_env_limited_with_install_guidance() {
     let sandbox = Sandbox::new();
-    // An explicit system-process boundary lets this case isolate advisories.
-    // It proves neither the static tools themselves nor crate-graph on a miniature.
+    sandbox.mini("#[test]\nfn sample() {}\n", true);
+    // Forward native version/identity queries; stub only the static boundary.
+    let real = sandbox.cargo_forwarder();
     sandbox.script(
         &sandbox.temporary.join("bin/cargo"),
-        r#"#!/bin/sh
+        &format!(
+            r#"#!/bin/sh
 case "$*" in
   *fmt*|*clippy*|*crate-graph*) exit 0 ;;
-  *) exit 96 ;;
+  *) exec '{}' "$@" ;;
 esac
 "#,
+            real.display()
+        ),
     );
     let tools = sandbox.temporary.join("static-tools");
     fs::create_dir(&tools).unwrap();
@@ -188,6 +192,20 @@ esac
         }
     }
     std::os::unix::fs::symlink(sandbox.temporary.join("bin/cargo"), tools.join("cargo")).unwrap();
+    std::os::unix::fs::symlink(sandbox.temporary.join("bin/rustc"), tools.join("rustc")).unwrap();
+    let deny = tools.join("cargo-deny");
+    sandbox.script(
+        &deny,
+        "#!/bin/sh\nprintf '%s\\n' 'cargo-deny synthetic-static-boundary'\n",
+    );
+    let mut positive = sandbox.gate(&["pr", "--part", "static", "--lease-wait", "0"]);
+    positive.env("PATH", &tools);
+    sandbox.run(&mut positive).code(0);
+    for step in ["clippy", "fmt", "advisories", "crate-graph"] {
+        assert_eq!(row(&sandbox.result(), step)[1], "pass");
+    }
+    // Remove just the advisory executable after actual native admission.
+    fs::remove_file(&deny).unwrap();
     let mut command = sandbox.gate(&["pr", "--part", "static", "--lease-wait", "0"]);
     command.env("PATH", &tools);
     let output = sandbox.run(&mut command);
@@ -325,4 +343,56 @@ fn emits_known_sensitive_diagnostic_values() {{
     if output.status.code() == Some(1) {
         output.contains("REFUSED");
     }
+}
+
+#[test]
+fn explicitly_kept_cold_export_is_finished_but_cannot_qualify_or_damage_warm_sibling() {
+    let sandbox = Sandbox::new();
+    sandbox.mini("#[test]\nfn sample() {}\n", true);
+    sandbox.suite().code(0);
+    let warm_record = sandbox.root.join("target/.gate-state/warm.record");
+    let warm_bytes = fs::read(&warm_record).unwrap();
+    let canary = sandbox.root.join("target/gate-warm/warm-sibling");
+    fs::write(&canary, "warm\n").unwrap();
+    sandbox
+        .run(&mut sandbox.gate(&["full", "--part", "suite", "--lease-wait", "0"]))
+        .code(0);
+    assert_eq!(field(&sandbox.result(), "target"), "deleted");
+    assert!(!sandbox.root.join("target/gate").exists());
+    let export = sandbox.temporary.join("kept-export");
+    sandbox
+        .run(
+            sandbox
+                .gate(&[
+                    "full",
+                    "--part",
+                    "suite",
+                    "--keep",
+                    "--lease-wait",
+                    "0",
+                    "--evidence",
+                ])
+                .arg(&export),
+        )
+        .code(3);
+    let record = sandbox.result();
+    assert_eq!(field(&record, "target"), "kept by request");
+    assert_eq!(field(&record, "target-finished"), "yes");
+    assert!(field(&record, "qualifying").contains("target kept by request"));
+    assert!(sandbox.root.join("target/gate").is_dir());
+    assert!(!sandbox.root.join("target/.gate-state/cold.use").exists());
+    assert_eq!(fs::read(&warm_record).unwrap(), warm_bytes);
+    assert_eq!(fs::read_to_string(canary).unwrap(), "warm\n");
+    let copied = fs::read_to_string(export.join("result.txt")).unwrap();
+    assert_eq!(field(&copied, "target-finished"), "yes");
+    assert_eq!(field(&copied, "target"), "kept by request");
+    let commit = sandbox.git(&["rev-parse", "HEAD"]);
+    sandbox
+        .run(
+            sandbox
+                .gate(&["evidence", "verify"])
+                .arg(&export)
+                .args(["--commit", &commit]),
+        )
+        .code(1);
 }

@@ -219,3 +219,32 @@ fn malformed_executable_map_cannot_be_a_passing_empty_inventory() {
     let (_, log) = passing();
     inventory(&sandbox, "{not cargo json}\n", &log, Some(0)).code(1);
 }
+
+#[test]
+fn consistent_failed_inventory_parses_successfully_while_real_folded_suite_stays_failed() {
+    let sandbox = Sandbox::new();
+    sandbox.mini("#[test]\nfn sample() {}\n", true);
+    sandbox.suite().code(0);
+    sandbox.write(
+        "fixture/src/lib.rs",
+        "#[test]\nfn planted_failure() { panic!(\"required failure\"); }\n",
+    );
+    sandbox.suite().code(1);
+    let record = sandbox.result();
+    assert!(witness::fixture::field(&record, "verdict").starts_with("FAILED"));
+    assert_eq!(witness::fixture::row(&record, "test")[1], "FAIL");
+    let run = std::path::Path::new(witness::fixture::field(&record, "run-dir"));
+    let failed_rows = fs::read_to_string(run.join("inventory.tsv")).unwrap();
+    assert!(failed_rows.contains("lib\tfixture\tfixture\tplanted_failure\tfailed\n"));
+    // Structural parser success is deliberately independent from suite success.
+    let (map, log) = passing();
+    let log = log
+        .replace("test actual ... ok", "test actual ... FAILED")
+        .replace("ok. 1 passed; 0 failed", "FAILED. 0 passed; 1 failed");
+    inventory(&sandbox, &map, &log, Some(101)).code(0);
+    assert_eq!(
+        fs::read_to_string(sandbox.root.join("rows.tsv")).unwrap(),
+        "test\tfixture\tprobe\tactual\tfailed\n"
+    );
+    assert!(witness::fixture::field(&sandbox.result(), "verdict").starts_with("FAILED"));
+}
