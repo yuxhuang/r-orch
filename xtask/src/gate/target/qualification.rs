@@ -1,5 +1,5 @@
-//! Production-holder RC18 controls. Unsupported is recorded, never reclassified
-//! as delivered recovery. The commands run through NativeTarget and Runner.
+//! Production-holder lifecycle observations under the owner-approved policy.
+//! These finite controls do not establish arbitrary-descendant protection.
 use super::*;
 use std::os::fd::AsFd;
 use std::process::Command;
@@ -21,9 +21,47 @@ fn production_holder_fixture() {
     );
     let target = native_admission(&root.join("repo"), false, &lease).unwrap();
     let started = target.begin(&lease);
-    if mode == "admit" {
+    if mode == "admit" || mode == "propagation" {
         let text = match started {
-            Ok(use_) => format!("ADMITTED {}", use_.decision()),
+            Ok(use_) => {
+                let decision = use_.decision();
+                let probe = fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(root.join("repo/target/.gate-state/warm.use"))
+                    .unwrap();
+                assert!(matches!(
+                    probe.try_lock(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ));
+                let propagation = mode == "propagation";
+                let output = use_
+                    .run(&lease, false, |runner, path| {
+                        let mut command = Command::new("cargo");
+                        command
+                            .args([
+                                if propagation { "test" } else { "build" },
+                                "--locked",
+                                "--workspace",
+                                "--all-targets",
+                            ])
+                            .current_dir(root.join("repo"))
+                            .env("CARGO_TARGET_DIR", path);
+                        runner.capture(&mut command, 1024 * 1024)
+                    })
+                    .unwrap();
+                assert!(output.result.is_ok(), "{:?}", output.result);
+                probe.try_lock().unwrap(); // same inode, no parent/child lock leak
+                fs::write(root.join("post-use-lock-free"), b"observed").unwrap();
+                assert!(output.statuses.iter().all(|s| s.exit.success()));
+                if !propagation {
+                    assert!(
+                        root.join("repo/target/gate-warm/debug/librc18_production.rlib")
+                            .is_file()
+                    );
+                }
+                format!("ADMITTED {decision}; native rebuild completed")
+            }
             Err(e) => format!("REFUSED {e:#}"),
         };
         fs::write(root.join("admission"), text).unwrap();
@@ -48,7 +86,9 @@ fn production_holder_fixture() {
     let mut command = Command::new(&argv[0]);
     command.args(&argv[1..]).current_dir(root.join("repo"));
     // The observer supplies an already-full output pipe as this helper's fd0.
-    // Runner still supplies the actual locked marker as the direct child's fd0.
+    // Runner leaves fd0 alone and supplies the marker on a separate descriptor.
+    // Native matrix commands do not read this pipe; the stdin-specific control
+    // separately verifies ordinary caller bytes.
     let output = File::from(std::io::stdin().as_fd().try_clone_to_owned().unwrap());
     command.stdout(output.try_clone().unwrap()).stderr(output);
     let outcome = use_
@@ -110,6 +150,37 @@ fn production_holder_commands_and_discriminators_on_scratch_filesystem() {
     qualification(&std::env::temp_dir());
 }
 
+#[test]
+fn production_native_build_script_test_and_child_descriptor_propagation() {
+    let root = std::env::temp_dir().join(format!(
+        "propagation-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir(&root).unwrap();
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", PROBE])
+        .env("RC18_PROPAGATION_ONLY", "1")
+        .env(
+            "RC18_WORKTREE",
+            Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap(),
+        )
+        .arg(&root)
+        .arg(std::env::current_exe().unwrap())
+        .output()
+        .unwrap();
+    eprintln!("native propagation retained: {}", root.display());
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 const PROBE: &str = r###"
 import os,sys,pathlib,subprocess,fcntl,json,time,select,shutil,hashlib
 root=pathlib.Path(sys.argv[1]);exe=sys.argv[2]
@@ -157,12 +228,19 @@ for tool in ['cargo','rustc','rustdoc','rustfmt','cargo-fmt','cargo-clippy','cli
 def exists(pid):
  p=subprocess.run(['/bin/ps','-p',str(pid),'-o','stat='],capture_output=True,text=True)
  return p.returncode==0 and bool(p.stdout.strip()) and not p.stdout.strip().startswith('Z')
+observers={}
 def granted(marker,record=False):
- with marker.open('r+b',buffering=0) as f:
-  try:
-   (fcntl.lockf if record else fcntl.flock)(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
-   return True
+ # Independent fresh open description, retained across by-name removal. Never
+ # unlock a duplicate of the holder's description. Close only our own probe.
+ if marker not in observers:observers[marker]=os.open(marker,os.O_RDWR|os.O_NOFOLLOW)
+ fd=os.dup(observers[marker])
+ try:
+  lock=fcntl.lockf if record else fcntl.flock
+  try:lock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
   except BlockingIOError:return False
+  lock(fd,fcntl.LOCK_UN) # only this independent observer's lock
+  return True
+ finally:os.close(fd)
 
 def admission(case,env):
  env={**env,'RC18_MODE':'admit'}
@@ -186,7 +264,7 @@ def probe(label,argv,mode='normal',source=None):
  if mode=='prior-tool-close':
   (case/'bin').mkdir()
   previous=case/'bin/cargo'
-  previous.write_text('#!/usr/bin/python3\nimport os,signal,time,pathlib\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nos.close(0)\nroot=pathlib.Path('+repr(str(case))+')\n(root/"resistant.ready").touch()\nprint("ready",flush=True)\nwhile not (root/"release").exists():time.sleep(.005)\n')
+  previous.write_text('#!/usr/bin/python3\nimport os,signal,time,pathlib\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\nroot=pathlib.Path('+repr(str(case))+')\nst=(root/"repo/target/.gate-state/warm.use").stat()\nfor fd in range(3,1024):\n try: m=os.fstat(fd)\n except OSError: continue\n if (m.st_dev,m.st_ino)==(st.st_dev,st.st_ino):os.close(fd)\n(root/"resistant.ready").touch()\nprint("ready",flush=True)\nwhile not (root/"release").exists():time.sleep(.005)\n(root/"repo/target/gate-warm/accepted-risk-write").write_text("writer remained alive through reset")\n')
   previous.chmod(0o700)
   env['PATH']=str(case/'bin')+os.pathsep+env['PATH']
 
@@ -230,15 +308,17 @@ def probe(label,argv,mode='normal',source=None):
   row['live_after_admission']=exists(pid)
   assert row['live_after_admission'],row
   assert row['live_after_kill']
-  assert (repo/'target/gate-warm/old-artifact').read_bytes()==b'must stay while live'
+  row['artifact_retained_while_live']=(repo/'target/gate-warm/old-artifact').exists()
   if mode=='normal':
+   assert (repo/'target/gate-warm/old-artifact').read_bytes()==b'must stay while live'
    assert not row['grant_live'],row
    assert 'marker lock not granted' in row['admission_live'],row
   else:
    assert row['grant_live'],row
    # Record replacement is probed with lockf too; flock and record locks are
    # independent, so a flock grant alone would not discriminate this mutation.
-   assert 'recovery unsupported' in row['admission_live'],row
+   assert 'ADMITTED reset: previous build did not finish; native rebuild completed' in row['admission_live'],row
+   assert not row['artifact_retained_while_live'],row
  finally:
   if holder.poll() is None:holder.kill();holder.wait(timeout=5)
   # Only release this test's output backpressure. Never signal an orphan PID.
@@ -257,15 +337,86 @@ def probe(label,argv,mode='normal',source=None):
     select.select([reader],[],[],.001)
   os.close(reader);log.close()
  row['samples']=samples;row['actual_exit_observed']=not exists(pid);row['last_close_granted']=granted(marker,mode=='record-lock')
- row['same_inode']=marker.stat().st_ino==inode
+ row['same_inode']=marker.exists() and marker.stat().st_ino==inode
+ if mode=='prior-tool-close':
+  row['direct_writer_write_after_reset']=(repo/'target/gate-warm/accepted-risk-write').read_text()
+  assert row['direct_writer_write_after_reset']=='writer remained alive through reset'
  row['admission_after_exit']=admission(case,env)
- row['old_artifact_retained']=(repo/'target/gate-warm/old-artifact').read_bytes()==b'must stay while live'
+ row['old_artifact_retained']=(repo/'target/gate-warm/old-artifact').exists()
  (case/'command-output').write_bytes(out)
  (case/'result.json').write_text(json.dumps(row,indent=2)+'\n')
  print(json.dumps({k:v for k,v in row.items() if k not in ['samples','stdin_observation']}),flush=True)
- assert row['actual_exit_observed'] and row['last_close_granted'] and row['same_inode'] and row['old_artifact_retained']
- assert 'recovery unsupported' in row['admission_after_exit']
+ assert row['actual_exit_observed'] and row['last_close_granted']
+ if mode=='normal':
+  assert row['same_inode']
+  assert 'ADMITTED reset: previous build did not finish; native rebuild completed' in row['admission_after_exit']
+ else:
+  assert 'ADMITTED reused; native rebuild completed' in row['admission_after_exit']
+ assert not row['old_artifact_retained']
+ assert not marker.exists()
+ row['post_use_marker_absent']=True
+ (case/'result.json').write_text(json.dumps(row,indent=2)+'\n')
  return row
+def propagation():
+ case=root/'propagation';repo=case/'repo';(repo/'src').mkdir(parents=True);(case/'lease').mkdir(mode=0o700)
+ (case/'observations').mkdir()
+ (repo/'.gitignore').write_text('target/\n')
+ (repo/'Cargo.toml').write_text('[package]\nname="rc18-production"\nversion="0.0.0"\nedition="2024"\n[workspace]\n')
+ (repo/'Cargo.lock').write_text('version = 4\n[[package]]\nname = "rc18-production"\nversion = "0.0.0"\n')
+ observer=r'''import os,pathlib,json,sys
+marker=pathlib.Path(os.environ['PROP_MARKER']);m=marker.stat();found=[]
+for fd in range(3,1024):
+ try:s=os.fstat(fd)
+ except OSError:continue
+ if (s.st_dev,s.st_ino)==(m.st_dev,m.st_ino):found.append(fd)
+assert len(found)==1,(sys.argv,found)
+s=os.fstat(0);assert (s.st_dev,s.st_ino)!=(m.st_dev,m.st_ino)
+row=dict(tag=sys.argv[1],pid=os.getpid(),fds=found,marker_inode=m.st_ino,stdin_inode=s.st_ino)
+p=pathlib.Path(os.environ['PROP_OUT'])/(sys.argv[1]+'-'+str(os.getpid())+'.json');p.write_text(json.dumps(row))
+'''
+ (case/'observe.py').write_text(observer)
+ # Observe the real Rust build-script/test process using descriptor metadata.
+ common=r'''use std::os::unix::fs::MetadataExt;
+fn observe(tag: &str) {
+ let marker=std::fs::metadata(std::env::var_os("PROP_MARKER").unwrap()).unwrap();
+ let mut found=Vec::new();
+ for e in std::fs::read_dir("/dev/fd").unwrap() {
+  let e=e.unwrap();let Ok(fd)=e.file_name().to_string_lossy().parse::<i32>() else {continue};
+  if fd<3 {continue;}
+  // fdescfs pathname stat has a synthetic device on macOS; fstat the duplicate.
+  let Ok(m)=std::fs::File::open(e.path()).and_then(|f|f.metadata()) else {continue};
+  if (m.dev(),m.ino())==(marker.dev(),marker.ino()) {found.push(fd);}
+ }
+ assert_eq!(found.len(),1,"{tag}: {found:?}");
+ let stdin=std::fs::File::open("/dev/fd/0").unwrap().metadata().unwrap();assert_ne!((stdin.dev(),stdin.ino()),(marker.dev(),marker.ino()));
+ let out=std::path::PathBuf::from(std::env::var_os("PROP_OUT").unwrap()).join(format!("{tag}-{}.json",std::process::id()));
+ std::fs::write(out,format!("{{\"tag\":\"{tag}\",\"pid\":{},\"fds\":{:?},\"marker_inode\":{},\"stdin_inode\":{}}}",std::process::id(),found,marker.ino(),stdin.ino())).unwrap();
+}
+'''
+ (repo/'probe.rs').write_text(common)
+ (repo/'build.rs').write_text('include!("probe.rs");\nfn main(){observe("build-script");}\n')
+ (repo/'src/lib.rs').write_text('include!("../probe.rs");\n#[test] fn native(){observe("test-binary");assert!(std::process::Command::new("/usr/bin/python3").arg(std::env::var_os("PROP_OBSERVER").unwrap()).arg("test-child").status().unwrap().success());}\n')
+ for tag,tool in [('cargo-wrapper','cargo'),('rustc-wrapper','rustc')]:
+  path=case/tag
+  body='#!/usr/bin/python3\n'+observer.replace('sys.argv[1]',repr(tag))
+  args='sys.argv[1:]' if tool=='cargo' else 'sys.argv[2:]'
+  body+='\nos.execv('+repr(str(root/'bin'/tool))+',['+repr(tool)+']+'+args+')\n'
+  path.write_text(body);path.chmod(0o700)
+ subprocess.run(['/usr/bin/git','init','-q',str(repo)],env=base_env,check=True)
+ subprocess.run(['/usr/bin/git','-C',str(repo),'add','.'],env=base_env,check=True)
+ (case/'bin').mkdir();(case/'bin/cargo').symlink_to(case/'cargo-wrapper')
+ env={**base_env,'RC18_ROOT':str(case),'RC18_MODE':'propagation','PROP_MARKER':str(repo/'target/.gate-state/warm.use'),'PROP_OUT':str(case/'observations'),'PROP_OBSERVER':str(case/'observe.py'),'RUSTC_WRAPPER':str(case/'rustc-wrapper'),'PATH':str(case/'bin')+os.pathsep+base_env['PATH'],'CARGO_TARGET_DIR':str(repo/'target/gate-warm')}
+ p=subprocess.run([exe,'--exact',fixture,'--nocapture'],env=env,capture_output=True,timeout=60)
+ (case/'holder.stdout').write_bytes(p.stdout);(case/'holder.stderr').write_bytes(p.stderr)
+ assert p.returncode==0,p.stderr
+ rows=[json.loads(p.read_text()) for p in (case/'observations').glob('*.json')]
+ tags={r['tag'] for r in rows};assert tags=={'cargo-wrapper','rustc-wrapper','build-script','test-binary','test-child'},tags
+ assert (case/'post-use-lock-free').read_text()=='observed'
+ assert not (repo/'target/.gate-state/warm.use').exists()
+ (case/'summary.json').write_text(json.dumps(dict(rows=rows,post_use_lock_free=True,marker_removed=True,native_rustc_exec='wrapper observes immediately before exec; separate native rustc matrix observes actual process lock'),indent=2)+'\n')
+ print(json.dumps(dict(propagation_tags=sorted(tags),observations=len(rows),post_use_lock_free=True)),flush=True)
+if os.environ.get('RC18_PROPAGATION_ONLY')=='1':
+ propagation();sys.exit(0)
 cases=[
  ('git-version',['git','--version']),
  ('git-inventory',['git','ls-files','--cached','--others','--exclude-standard','-z']),
@@ -296,5 +447,5 @@ for mode in ['no-inherit','record-lock']:
 results.append(probe('unlock',['/usr/bin/python3','-c',resistant],'unlock'))
 results.append(probe('prior-tool-close',['cargo','--color','never','build','--locked','--manifest-path','@manifest','--workspace','--all-targets'],'prior-tool-close'))
 (root/'summary.json').write_text(json.dumps(results,indent=2)+'\n')
-print('PRODUCTION HOLDER RC18: native last-close reset remains Unsupported; no capability enabled',flush=True)
+print('PRODUCTION HOLDER: native recovery exercised; direct-close overlap is accepted risk, not fixed',flush=True)
 "###;

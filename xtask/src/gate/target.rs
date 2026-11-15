@@ -1,14 +1,10 @@
 //! Cooperative target state, checked native lifecycle and direct-command publication.
 //! The final tier caller integrates NativeTarget::begin and NativeUse::run.
 //!
-//! The lease/direct-reap/source-capture path is exercised with real native child
-//! fixtures. Recovery is still unsupported in production: one cargo observation
-//! on one native filesystem is not RC18 for every command/filesystem/platform.
-//!
-//! Safe nix operations check the namespace then mutate by name under the lease.
-//! D45's final-check race is owner-accepted, not inode-conditional atomicity.
-//! Marker recovery remains unsupported without RC18 command/platform/filesystem
-//! qualification; the native controls do not supply that missing whole-command set.
+//! Recovery follows the owner's cooperative policy: a free same-inode marker
+//! permits reset under the lease. A direct writer that closes its inherited
+//! description can overlap recovery; that legacy/direct-writer risk is accepted,
+//! not fixed. FS1 descendants and D45 namespace races remain distinct residuals.
 
 mod native;
 #[cfg(test)]
@@ -52,21 +48,10 @@ impl NativeTarget {
         &'a self,
         lease: &'a super::lease::Lease,
     ) -> anyhow::Result<NativeUse<'a>> {
-        self.begin_with_recovery(lease, Recovery::Unsupported)
-    }
-
-    fn begin_with_recovery<'a>(
-        &'a self,
-        lease: &'a super::lease::Lease,
-        recovery: Recovery,
-    ) -> anyhow::Result<NativeUse<'a>> {
+        // The owner permits recovery on a free same-inode marker under the
+        // lease. Diagnostics, PID, EOF and current-tool identity add no authority.
         let mut marker = self.files.admit_configured(Some(lease))?;
         marker.enable_signals()?;
-        // No file contents, elapsed time, PID or free lease qualifies RC18.
-        anyhow::ensure!(
-            !marker.found || recovery.shown(),
-            "REFUSED: previous build did not finish; command/platform/filesystem recovery unsupported"
-        );
         marker.write_diagnostics(
             format!(
                 "purpose=native-{}\npid={}\n",
@@ -95,7 +80,6 @@ impl NativeTarget {
                     marker_same: true,
                     target_exists: self.files.check_target()?,
                     kind: self.files.kind,
-                    recovery,
                 },
                 &stored,
                 before.current(&self.files.root),
@@ -722,25 +706,6 @@ enum Kind {
     Cold,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Recovery {
-    Unsupported,
-    // There is intentionally no production success value, filesystem allowlist,
-    // environment switch or "local disk" guess standing in for RC18 evidence.
-    #[cfg(test)]
-    ShownInSimulation,
-}
-
-impl Recovery {
-    fn shown(self) -> bool {
-        match self {
-            Self::Unsupported => false,
-            #[cfg(test)]
-            Self::ShownInSimulation => true,
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 struct Admission {
     lease: bool,
@@ -750,7 +715,6 @@ struct Admission {
     marker_same: bool,
     target_exists: bool,
     kind: Kind,
-    recovery: Recovery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -770,7 +734,6 @@ enum Refusal {
     Structure,
     Busy,
     MarkerChanged,
-    UnsupportedRecovery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -782,7 +745,7 @@ enum Action {
 }
 
 // All observations are injected. This function performs no filesystem action
-// and cannot validate the lease or prove RC18. Its result is never an I/O permit.
+// and cannot validate the lease or marker identity. It is never an I/O permit.
 fn decide(o: Admission, record: &Stored, current: Current<'_>) -> Action {
     if !o.lease {
         return Action::Refuse(Refusal::Lease);
@@ -795,9 +758,6 @@ fn decide(o: Admission, record: &Stored, current: Current<'_>) -> Action {
     }
     if !o.marker_same {
         return Action::Refuse(Refusal::MarkerChanged);
-    }
-    if o.marker_found && !o.recovery.shown() {
-        return Action::Refuse(Refusal::UnsupportedRecovery);
     }
     if o.kind == Kind::Cold {
         return Action::Cold;
@@ -1192,9 +1152,8 @@ pub(super) struct Marker<'a> {
 }
 
 // No Drop implementation: drop closes owned Files, NEVER unlocks or unlinks.
-// command_stdin duplicates the open description as a standard stream. No raw
-// FD or explicit unlock: the last close releases it. R4/R11 must compare the
-// changed standard stream, or diagnose the difference, at whole-gate validation.
+// command_descriptor duplicates the same open description on an extra inherited
+// fd. Runner owns the duplicate only across spawn; stdin remains caller-owned.
 impl Marker<'_> {
     pub(super) fn enable_signals(&self) -> anyhow::Result<()> {
         let mut signals = self.signals.borrow_mut();
@@ -1256,14 +1215,25 @@ impl Marker<'_> {
         )
     }
 
-    pub(super) fn command_stdin(&self) -> Result<std::process::Stdio> {
+    pub(super) fn command_descriptor(&self) -> Result<File> {
         self.check_identity()?;
-        Ok(at(
+        let file = at(
             self.file.try_clone(),
             "duplicate marker for direct command",
             &self.files.path(Leaf::Marker),
-        )?
-        .into())
+        )?;
+        // Only this short-lived duplicate is inherited. The marker and lease
+        // keep CLOEXEC, and no shared-description unlock is ever performed.
+        at(
+            nix::fcntl::fcntl(
+                &file,
+                nix::fcntl::FcntlArg::F_SETFD(nix::fcntl::FdFlag::empty()),
+            )
+            .map_err(io::Error::from),
+            "inherit marker for direct command",
+            &self.files.path(Leaf::Marker),
+        )?;
+        Ok(file)
     }
 
     fn diagnostics(&mut self) -> Result<Vec<u8>> {
@@ -1792,8 +1762,8 @@ impl Captured {
                 metadata.push(m);
                 command.arg(path);
             }
-            // argv is bounded in small batches and every path follows --. The
-            // marker owns stdin; --stdin-paths cannot share that descriptor.
+            // argv is bounded in small batches and every path follows --.
+            // stdin is left at its ordinary configuration.
             let hashes = runner.capture(&mut command, 65 * chunk.len())?;
             let hashes = std::str::from_utf8(&hashes)?;
             let hashes: Vec<_> = hashes.lines().collect();
@@ -1897,7 +1867,6 @@ mod tests {
             marker_same: true,
             target_exists: true,
             kind: Kind::Warm,
-            recovery: Recovery::Unsupported,
         }
     }
 
@@ -1984,15 +1953,14 @@ mod tests {
             let mut o = observation();
             o.marker_found = true;
             o.target_exists = exists;
-            o.recovery = Recovery::ShownInSimulation;
             assert_eq!(
                 decide(o, &Stored::Complete(record()), context(&sources())),
                 Action::Reset(Reset::Unfinished),
             );
-            o.recovery = Recovery::Unsupported;
+            o.marker_same = false;
             assert_eq!(
                 decide(o, &Stored::Complete(record()), context(&sources())),
-                Action::Refuse(Refusal::UnsupportedRecovery),
+                Action::Refuse(Refusal::MarkerChanged),
             );
         }
     }
@@ -2014,7 +1982,7 @@ mod tests {
     }
 
     #[test]
-    fn cold_always_rebuilds_but_never_bypasses_unsupported_recovery() {
+    fn cold_always_rebuilds_but_never_bypasses_busy_marker() {
         let mut o = observation();
         o.kind = Kind::Cold;
         assert_eq!(
@@ -2022,11 +1990,12 @@ mod tests {
             Action::Cold
         );
         o.marker_found = true;
+        o.lock_granted = false;
         assert_eq!(
             decide(o, &Stored::Missing, context(&sources())),
-            Action::Refuse(Refusal::UnsupportedRecovery),
+            Action::Refuse(Refusal::Busy),
         );
-        o.recovery = Recovery::ShownInSimulation;
+        o.lock_granted = true;
         assert_eq!(
             decide(o, &Stored::Missing, context(&sources())),
             Action::Cold
@@ -2212,7 +2181,6 @@ mod tests {
         );
         o.target_exists = false;
         o.marker_found = true;
-        o.recovery = Recovery::ShownInSimulation;
         assert_eq!(
             decide(o, &Stored::Complete(record()), context(&sources())),
             Action::Reset(Reset::Unfinished)
@@ -2921,7 +2889,7 @@ mod tests {
     }
 
     #[test]
-    fn native_lifecycle_unsupported_recovery_keeps_free_marker_and_target_unchanged() {
+    fn native_lifecycle_free_same_inode_marker_resets_and_rebuilds_under_lease() {
         let f = Fixture::new();
         f2_repo(&f);
         let lease = f2_lease(&f);
@@ -2930,19 +2898,27 @@ mod tests {
         fs::write(use_.target().join("unfinished"), b"untouched").unwrap();
         let inode = use_.marker.file.metadata().unwrap().ino();
         drop(use_);
-        let error = target.begin(&lease).err().unwrap();
-        assert!(
-            error.to_string().contains("recovery unsupported"),
-            "{error}"
-        );
+        let use_ = target.begin(&lease).unwrap();
+        assert_eq!(use_.decision(), "reset: previous build did not finish");
+        assert_eq!(use_.marker.file.metadata().unwrap().ino(), inode);
+        assert!(!use_.target().join("unfinished").exists());
+        let outcome = use_
+            .run(&lease, false, |runner, path| {
+                runner.run(
+                    std::process::Command::new("/bin/sh")
+                        .args(["-c", "printf rebuilt > rebuilt"])
+                        .current_dir(path),
+                )
+            })
+            .unwrap();
+        assert!(outcome.result.unwrap().success());
         assert_eq!(
-            fs::metadata(f.files.path(Leaf::Marker)).unwrap().ino(),
-            inode
+            fs::read(f.files.build_path().join("rebuilt")).unwrap(),
+            b"rebuilt"
         );
-        assert_eq!(
-            fs::read(f.files.build_path().join("unfinished")).unwrap(),
-            b"untouched"
-        );
+        let reused = target.begin(&lease).unwrap();
+        assert_eq!(reused.decision(), "reused");
+        reused.run(&lease, false, |_, _| Ok(())).unwrap();
         f.canary_unchanged();
     }
 
@@ -2957,18 +2933,12 @@ mod tests {
         let use_ = target.begin(&lease).unwrap();
         let inode = use_.marker.file.metadata().unwrap().ino();
         fs::write(use_.target().join("unfinished"), b"old").unwrap();
-        let mut child = ChildGuard(
-            fixture(&control, "direct", "hold")
-                .stdin(use_.marker.command_stdin().unwrap())
-                .spawn()
-                .unwrap(),
-        );
+        let inherited = use_.marker.command_descriptor().unwrap();
+        let mut child = ChildGuard(fixture(&control, "direct", "hold").spawn().unwrap());
+        drop(inherited);
         ready(&mut child.0, &control.0.join("direct.ready"));
         drop(use_); // close, NEVER unlock; direct child keeps same description
-        let error = target
-            .begin_with_recovery(&lease, Recovery::ShownInSimulation)
-            .err()
-            .unwrap();
+        let error = target.begin(&lease).err().unwrap();
         assert!(
             error
                 .downcast_ref::<Fault>()
@@ -2982,11 +2952,8 @@ mod tests {
         assert!(f.files.build_path().join("unfinished").exists());
         fs::write(control.0.join("direct.release"), b"finish").unwrap();
         assert!(child.0.wait().unwrap().success());
-        // Inject ONLY the policy observation for this hermetic control. This
-        // tests native recovery I/O, not production RC18 command qualification.
-        let use_ = target
-            .begin_with_recovery(&lease, Recovery::ShownInSimulation)
-            .unwrap();
+        // Last close allows the same production policy used by normal admission.
+        let use_ = target.begin(&lease).unwrap();
         assert_eq!(use_.decision(), "reset: previous build did not finish");
         assert_eq!(use_.marker.file.metadata().unwrap().ino(), inode);
         assert!(!use_.target().join("unfinished").exists());
@@ -3740,9 +3707,11 @@ version = "0.0.0"
         let lease = f2_lease(&f);
         let marker = f.files.lock_marker_primitive().unwrap();
         let mut runner = super::super::steps::Runner::new(&lease, &marker).unwrap();
-        // A separate process observes fd0's lock with a fresh open. If Runner
-        // replaces stdin with null (no handover), this cannot observe marker.
-        let script = "import os,fcntl\nst=os.fstat(0)\nassert (st.st_dev,st.st_ino)==(int(os.environ['DEV']),int(os.environ['INO']))\nf=open(os.environ['MARKER'],'r+')\ntry: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: pass\nelse: raise AssertionError('marker was not locked')\nraise SystemExit(7)";
+        // Discover the extra descriptor by inode, and read ordinary caller stdin.
+        // A missing inherited description or stdin substitution fails this oracle.
+        let script = "import os,fcntl\nassert os.read(0,64)==b'normal stdin\\n'\nfound=[]\nfor fd in range(3,256):\n try: st=os.fstat(fd)\n except OSError: continue\n if (st.st_dev,st.st_ino)==(int(os.environ['DEV']),int(os.environ['INO'])): found.append(fd)\nassert len(found)==1,found\nf=open(os.environ['MARKER'],'r+')\ntry: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: pass\nelse: raise AssertionError('marker was not locked')\nraise SystemExit(7)";
+        let input = f.base.join("input");
+        fs::write(&input, b"normal stdin\n").unwrap();
         let meta = marker.file.metadata().unwrap();
         let mut command = std::process::Command::new("/usr/bin/python3");
         command
@@ -3751,13 +3720,46 @@ version = "0.0.0"
             .env("HOME", &f.base)
             .env("MARKER", f.files.path(Leaf::Marker))
             .env("DEV", meta.dev().to_string())
-            .env("INO", meta.ino().to_string());
+            .env("INO", meta.ino().to_string())
+            .stdin(File::open(input).unwrap());
         let status = runner.run(&mut command).unwrap();
         assert_eq!(status.code(), Some(7));
         assert_eq!(runner.statuses().len(), 1);
         assert_eq!(runner.statuses()[0].exit.code(), Some(7));
         assert!(runner.statuses()[0].elapsed > std::time::Duration::ZERO);
         runner.finished().unwrap();
+        let flags = nix::fcntl::fcntl(&marker.file, nix::fcntl::FcntlArg::F_GETFD).unwrap();
+        assert_ne!(flags & nix::fcntl::FdFlag::FD_CLOEXEC.bits(), 0);
+        drop(runner);
+        drop(marker);
+        // Command is still alive: it must not retain a marker duplicate.
+        let probe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(f.files.path(Leaf::Marker))
+            .unwrap();
+        probe.try_lock().unwrap();
+    }
+
+    #[test]
+    fn f2_runner_spawn_failure_closes_temporary_inherited_description() {
+        let f = Fixture::new();
+        let lease = f2_lease(&f);
+        let marker = f.files.lock_marker_primitive().unwrap();
+        let mut runner = super::super::steps::Runner::new(&lease, &marker).unwrap();
+        let mut command = std::process::Command::new(f.base.join("absent-program"));
+        assert!(runner.run(&mut command).is_err());
+        assert!(runner.child_reaped());
+        assert!(runner.statuses().is_empty());
+        assert!(runner.finished().is_err());
+        drop(runner);
+        drop(marker);
+        let probe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(f.files.path(Leaf::Marker))
+            .unwrap();
+        probe.try_lock().unwrap();
     }
 
     #[test]

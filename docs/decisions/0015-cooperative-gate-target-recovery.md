@@ -1,5 +1,55 @@
 # 0015. A use of a gate target is finished when the processes the gate started have exited under the cooperative lease
 
+## Owner-authorized inherited-descriptor recovery (2026-11-15)
+
+The owner chose escalation option 3: “3. i'll accept the risk.” This section
+controls conflicting recovery, standard-input and RC18 precondition statements
+below, which are retained as historical design and evidence. It authorizes this
+bounded implementation; it does not mark ADR 0015 accepted or clear whole-gate
+review or runtime acceptance.
+
+A direct command receives an extra descriptor duplicated from the marker's
+locked open file description. Only that temporary duplicate has close-on-exec
+cleared, using existing safe nix APIs; it is kept through spawn and closed in the
+parent immediately afterward, including spawn failure. The original marker and
+lease descriptors retain close-on-exec. Never explicitly unlock a shared marker.
+The Runner preserves the command's normal configured stdin; the marker is never
+substituted for it. No fixed descriptor number or environment token is required.
+
+Under the configured exclusive cooperative lease, an unchanged same-inode marker
+whose lock is granted permits native unfinished-use reset and rebuild (including
+cold admission). Busy markers refuse before target mutation. Identity, structural,
+invalid-record, source capture, publication, canary, actual exit/reap and lease
+checks remain. Free lock means no holder of that open description, not cessation
+of every writer or identification of a prior use. No prior-use state, format,
+allowlist, custodian, fixture exception, dependency or unsafe code is introduced.
+
+Three owner-accepted risks remain distinct: (1) FS1/D41 escaped or indirect
+writers; (2) D45's interim checked-path/by-name mutation race, to revisit when the
+storage backend changes; (3) direct-writer/legacy-use recovery overlap: a directly
+started process, including one from the old stdin implementation, can close the
+description and remain a live writer during reset. The third counterexample is
+accepted, not fixed. Manual marker removal or cargo clean during unresolved use
+is a separate disclosed, unprevented residual; operators must preserve such
+targets. None of these is universal descendant protection.
+
+RC18's command/platform/filesystem matrix is replaced **as a precondition** for
+recovery. Its old evidence and failures stay historical. Real native verification
+still requires descriptor propagation to Cargo/rustc/build scripts/tests/children
+where observable, normal stdin, actual holder kill, live exclusion, explicit
+release, independently observed exit/last-close, successful native reset/rebuild,
+and post-use lock lifetime. The no-inheritance, shared unlock after handover, and
+per-process-lock mutants must remain discriminating. Finite observations never
+prove arbitrary descendants. The independent test owner corrects obsolete fd0
+integration premises while preserving recovery positives and every other oracle.
+
+Mac/Linux measurements, R4 same-commit ordinary/folded comparison, R11 identities,
+counts/doc-tests/stdin effects, final-head green native Linux, nextest qualification
+with sequential fallback, whole-gate security/reliability review and later PR
+acceptance all remain due. Old 392/1 at 5569773 is historical, not changed-source
+verification. No retry-to-green, third legacy baseline, push or PR is authorized.
+
+
 - Status: proposed. Decision 41 records a decision of the owner. It is binding from 2026-11-15, whatever
   the status of this record. Decisions 42–47 are the implementation contract derived from it. They are
   **proposed**: they await the check of this record's exact commit by the same security and resilience

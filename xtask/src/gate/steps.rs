@@ -30,7 +30,7 @@ pub(super) struct Runner<'a, 'm> {
     marker: Option<&'m Marker<'m>>,
     child: Option<Child>,
     #[cfg(test)]
-    qualification_drop_stdin: bool,
+    qualification_drop_inheritance: bool,
     start: Option<Instant>,
     active_command: Option<String>,
     statuses: Vec<Status>,
@@ -71,7 +71,7 @@ impl<'a, 'm> Runner<'a, 'm> {
             marker,
             child: None,
             #[cfg(test)]
-            qualification_drop_stdin: false,
+            qualification_drop_inheritance: false,
             start: None,
             active_command: None,
             statuses: Vec::new(),
@@ -168,14 +168,16 @@ impl<'a, 'm> Runner<'a, 'm> {
             "INTERRUPTED before command"
         );
         self.validate()?;
-        // Duplicate the SAME locked open description. No pre_exec or unlock.
-        if let Some(marker) = self.marker {
-            command.stdin(marker.command_stdin()?);
-        }
+        // Duplicate the SAME locked open description on an extra fd. Keep it
+        // only across spawn, never in Command's retained stdio configuration.
+        let inherited = self.marker.map(Marker::command_descriptor).transpose()?;
         #[cfg(test)]
-        if self.qualification_drop_stdin {
-            command.stdin(Stdio::null());
-        }
+        let inherited = if self.qualification_drop_inheritance {
+            drop(inherited);
+            None
+        } else {
+            inherited
+        };
         let start = Instant::now();
         let identity = format!(
             "program={:?} args={:?} cwd={:?}",
@@ -183,7 +185,9 @@ impl<'a, 'm> Runner<'a, 'm> {
             command.get_args().collect::<Vec<_>>(),
             command.get_current_dir()
         );
-        match command.spawn() {
+        let spawned = command.spawn();
+        drop(inherited); // close, NEVER unlock, on success and spawn failure
+        match spawned {
             Ok(child) => {
                 self.child = Some(child);
                 self.start = Some(start);
@@ -204,11 +208,11 @@ impl<'a, 'm> Runner<'a, 'm> {
         &mut self,
         command: &mut Command,
         ready: &std::path::Path,
-        drop_stdin: bool,
+        drop_inheritance: bool,
         resistant: bool,
         shared_unlock: bool,
     ) -> Result<ExitStatus> {
-        self.qualification_drop_stdin = drop_stdin;
+        self.qualification_drop_inheritance = drop_inheritance;
         self.start(command)?;
         if resistant {
             let prepared = ready.with_file_name("resistant.ready");
