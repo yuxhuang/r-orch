@@ -1740,8 +1740,9 @@ impl Captured {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::OpenOptions;
     use std::os::unix::ffi::OsStringExt;
-    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt, symlink};
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -4272,7 +4273,17 @@ while not (root/'release').exists(): time.sleep(.01)
     }
     impl F3Holder {
         fn new(mode: &str, closed_output: bool) -> Self {
-            let control = super::super::steps::tests::Scratch::new();
+            Self::with_control(
+                mode,
+                closed_output,
+                super::super::steps::tests::Scratch::new(),
+            )
+        }
+        fn with_control(
+            mode: &str,
+            closed_output: bool,
+            control: super::super::steps::tests::Scratch,
+        ) -> Self {
             let rustc = std::process::Command::new("rustup")
                 .args(["which", "rustc"])
                 .output()
@@ -4291,7 +4302,8 @@ while not (root/'release').exists(): time.sleep(.01)
                 .env("PATH", path)
                 .env("F3_MODE", mode)
                 .env("F3_CONTROL", &control.0)
-                .env("XTASK_F1_PRIVATE_ROOT", control.0.parent().unwrap())
+                // The shared temporary parent need not be private; this root is.
+                .env("XTASK_F1_PRIVATE_ROOT", &control.0)
                 .env("HOME", &control.0)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -4301,13 +4313,25 @@ while not (root/'release').exists(): time.sleep(.01)
                     std::process::Stdio::null()
                 } else {
                     std::process::Stdio::from(
-                        fs::File::create(control.0.join("holder.log")).unwrap(),
+                        OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(control.0.join("holder.log"))
+                            .unwrap(),
                     )
                 })
                 .stderr(if closed_output {
                     std::process::Stdio::piped()
                 } else {
-                    std::process::Stdio::null()
+                    std::process::Stdio::from(
+                        OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .mode(0o600)
+                            .open(control.0.join("holder.stderr"))
+                            .unwrap(),
+                    )
                 })
                 .spawn()
                 .unwrap();
@@ -4318,8 +4342,50 @@ while not (root/'release').exists(): time.sleep(.01)
                 mode: mode.to_owned(),
             }
         }
+        fn diagnostics(&self) -> String {
+            use std::io::Read as _;
+            const LIMIT: u64 = 16 * 1024;
+            let mut output = String::new();
+            for (stream, name) in [("stdout", "holder.log"), ("stderr", "holder.stderr")] {
+                let mut bytes = Vec::new();
+                match fs::File::open(self.control.0.join(name))
+                    .and_then(|file| file.take(LIMIT + 1).read_to_end(&mut bytes))
+                {
+                    Ok(_) => {
+                        let truncated = bytes.len() > LIMIT as usize;
+                        bytes.truncate(LIMIT as usize);
+                        output.push_str(&super::super::steps::tests::labelled_description_output(
+                            stream, &bytes,
+                        ));
+                        if truncated {
+                            output.push_str(&format!(
+                                "child {stream} | [truncated at {LIMIT} bytes]\n"
+                            ));
+                        }
+                    }
+                    Err(error) => {
+                        output.push_str(&format!("child {stream} | [unavailable: {error}]\n"))
+                    }
+                }
+            }
+            output
+        }
         fn ready(&mut self) {
-            super::super::steps::tests::ready(&mut self.child, &self.control.0.join("ready"));
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(8);
+            while !self.control.0.join("ready").exists() {
+                if let Some(status) = self.child.try_wait().unwrap() {
+                    panic!(
+                        "fixture exited before handshake ({status}):\n{}",
+                        self.diagnostics()
+                    );
+                }
+                assert!(
+                    std::time::Instant::now() < end,
+                    "fixture handshake timed out:\n{}",
+                    self.diagnostics()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
         fn signal(&mut self, signal: nix::sys::signal::Signal) {
             assert!(
@@ -4343,8 +4409,8 @@ while not (root/'release').exists(): time.sleep(.01)
             };
             assert!(
                 status.success(),
-                "holder failed: {:?}",
-                fs::read_to_string(self.control.0.join("holder.log"))
+                "holder failed ({status}):\n{}",
+                self.diagnostics()
             );
             let value =
                 serde_json::from_slice(&fs::read(self.control.0.join("result.json")).unwrap())
@@ -4373,6 +4439,70 @@ while not (root/'release').exists(): time.sleep(.01)
                 }
             }
         }
+    }
+
+    #[test]
+    fn f3_private_control_reaches_handshake_under_shared_temporary_parent() {
+        use super::super::steps::tests::Scratch;
+        let outer = Scratch::new();
+        let shared = outer.0.join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        let control = Scratch::new_at(&shared);
+        assert_eq!(fs::metadata(&control.0).unwrap().mode() & 0o7777, 0o700);
+        let mut holder = F3Holder::with_control("normal", false, control);
+        holder.ready();
+        assert!(!holder.control.0.join("result.json").exists());
+        fs::write(holder.control.0.join("release"), b"finish").unwrap();
+        let result = holder.result();
+        assert_eq!(result["error"], "", "{result}");
+        assert_eq!(result["statuses"][0]["code"], 0);
+        assert_eq!(result["finished"], true);
+    }
+
+    #[test]
+    fn f3_early_exit_retains_status_and_bounded_labelled_diagnostics() {
+        use super::super::steps::tests::Scratch;
+        let outer = Scratch::new();
+        let control = Scratch::new_at(&outer.0);
+        // Deliberately invalid override, still beneath the private outer root.
+        fs::set_permissions(&control.0, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut holder = F3Holder::with_control("normal", false, control);
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| holder.ready()))
+            .expect_err("nonprivate fixture override must exit before readiness");
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(
+            message.contains("fixture exited before handshake (exit status: 101)"),
+            "{message}"
+        );
+        assert!(
+            message.contains(
+                "child stderr | assertion `left == right` failed: fixture override must be private"
+            ),
+            "{message}"
+        );
+        assert!(
+            message.contains("child stdout | running 1 test"),
+            "{message}"
+        );
+        assert!(
+            !message.lines().any(|line| line.starts_with("test result:")),
+            "{message}"
+        );
+        assert_eq!(holder.child.try_wait().unwrap().unwrap().code(), Some(101));
+        assert!(!holder.control.0.join("ready").exists());
+        for name in ["holder.log", "holder.stderr"] {
+            assert_eq!(
+                fs::metadata(holder.control.0.join(name)).unwrap().mode() & 0o7777,
+                0o600
+            );
+        }
+        let mut oversized = vec![b'x'; 16 * 1024];
+        oversized.extend_from_slice(b"DO_NOT_RENDER_TAIL");
+        fs::write(holder.control.0.join("holder.stderr"), oversized).unwrap();
+        let bounded = holder.diagnostics();
+        assert!(bounded.contains("child stderr | [truncated at 16384 bytes]"));
+        assert!(!bounded.contains("DO_NOT_RENDER_TAIL"));
     }
 
     #[test]

@@ -670,7 +670,7 @@ pub(super) mod tests {
         pub(crate) fn temporary() -> Self {
             Self::new_at(&std::env::temp_dir().canonicalize().unwrap())
         }
-        fn new_at(parent: &Path) -> Self {
+        pub(crate) fn new_at(parent: &Path) -> Self {
             static NEXT: AtomicUsize = AtomicUsize::new(0);
             assert!(
                 !parent
@@ -788,7 +788,7 @@ pub(super) mod tests {
         false
     }
 
-    fn labelled_description_output(stream: &str, bytes: &[u8]) -> String {
+    pub(crate) fn labelled_description_output(stream: &str, bytes: &[u8]) -> String {
         let text = match std::str::from_utf8(bytes) {
             Ok(text) => std::borrow::Cow::Borrowed(text),
             Err(_) => std::borrow::Cow::Owned(format!("{bytes:?}")),
