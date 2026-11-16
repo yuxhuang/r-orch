@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use witness::fixture::{
     CARGO_SUBCOMMAND_PY, COMMAND_BUDGET, HANDSHAKE_BUDGET, OwnedChild, POLL_INTERVAL, Sandbox,
-    field,
+    field, wait_for,
 };
 
 const PAYLOAD: &str = r#"#!/usr/bin/python3
@@ -1472,4 +1472,241 @@ fn leaves_an_explicitly_controlled_output_holder() {{
         commands.contains("reaped-exit=0"),
         "no actual completed cargo status: {commands}"
     );
+}
+
+// Cargo does not forward gate-only TERM to its test process. The test owns and
+// waits for the protocol worker; last-close is observed separately on the inode
+// opened before TERM, even if a broken finish unlinks the marker pathname.
+fn retain_native_control(
+    tag: &str,
+    output: &witness::fixture::Capture,
+    record: Option<&str>,
+    details: serde_json::Value,
+) {
+    let Some(root) = std::env::var_os("XTASK_NATIVE_CONTROL_EVIDENCE") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    assert!(root.is_absolute() && root.is_dir());
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let serial = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dest = root.join(format!("{tag}-{}-{serial}", std::process::id()));
+    fs::create_dir(&dest).unwrap();
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(dest.join("stdout"), &output.stdout_bytes).unwrap();
+    fs::write(dest.join("stderr"), &output.stderr_bytes).unwrap();
+    fs::write(
+        dest.join("observation.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "status": output.status.code(), "details": details,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    if let Some(record) = record {
+        fs::write(dest.join("result.txt"), record).unwrap();
+        fn copy(from: &Path, to: &Path) {
+            fs::create_dir(to).unwrap();
+            fs::set_permissions(to, fs::Permissions::from_mode(0o700)).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    copy(&entry.path(), &to.join(entry.file_name()));
+                } else {
+                    assert!(kind.is_file());
+                    fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+                }
+            }
+        }
+        copy(Path::new(field(record, "run-dir")), &dest.join("run"));
+    }
+}
+
+fn interrupted_output_holder(tier: &str) {
+    use witness::fixture::rust_literal;
+    let sandbox = Sandbox::new();
+    sandbox.mini("#[test]\nfn sample() {}\n", true);
+    let boundary = Boundary::new(&sandbox);
+    let waited = sandbox.temporary.join("worker.waited");
+    sandbox.write(
+        "fixture/src/lib.rs",
+        format!(
+            r#"
+#[test]
+fn controlled_output_holder() {{
+    let mut child = std::process::Command::new("/usr/bin/python3")
+        .args([{payload}, "holder", {socket}]).spawn().unwrap();
+    let status = child.wait().unwrap();
+    std::fs::write({waited}, format!("{{status}}")).unwrap();
+    assert!(status.success());
+}}
+"#,
+            payload = rust_literal(&sandbox.temporary.join("payload.py")),
+            socket = rust_literal(&boundary.path),
+            waited = rust_literal(&waited),
+        ),
+    );
+    let mut gate =
+        sandbox.spawn(&mut sandbox.gate(&[tier, "--part", "suite", "--lease-wait", "0"]));
+    let mut worker = boundary.accept(&mut gate);
+    let name = if tier == "full" { "cold" } else { "warm" };
+    let marker = sandbox.root.join(format!("target/.gate-state/{name}.use"));
+    require_extra_marker_and_normal_stdin(&worker, &marker);
+    let retained = fs::File::open(&marker).unwrap();
+    let target = sandbox.root.join(if tier == "full" {
+        "target/gate"
+    } else {
+        "target/gate-warm"
+    });
+    gate.signal("TERM");
+    let output = gate.finish(Duration::from_secs(10));
+    let record = sandbox.result();
+    let marker_kept = marker.exists();
+    let target_kept = target.is_dir();
+    let no_record = !sandbox
+        .root
+        .join(format!("target/.gate-state/{name}.record"))
+        .exists();
+    retain_native_control(
+        &format!("{tier}-interrupted"),
+        &output,
+        Some(&record),
+        serde_json::json!({
+            "marker_kept": marker_kept, "target_kept": target_kept, "no_record": no_record,
+            "marker_inode": retained.metadata().unwrap().ino(), "worker": worker.ready,
+        }),
+    );
+    worker.alive();
+    assert!(matches!(
+        retained.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    // A broken implementation has already unlinked the marker. Do not start
+    // another copy of the parked fixture in that case; release before failing.
+    let successor = marker_kept
+        .then(|| sandbox.run(&mut sandbox.gate(&[tier, "--part", "suite", "--lease-wait", "0"])));
+    worker.alive();
+    worker.release();
+    wait_for(&waited, HANDSHAKE_BUDGET);
+    assert!(fs::read_to_string(waited).unwrap().contains("0"));
+    require_process_gone(&sandbox, worker.ready["pid"].as_u64().unwrap());
+    // Blocking acquisition observes the actual last close. Neither PID absence
+    // nor EOF authorizes the reset; no retry of a failed nonblocking assertion.
+    retained.lock().unwrap();
+    drop(retained); // close our independent description, never shared unlock
+    output.code(143);
+    assert!(marker_kept && target_kept && no_record, "{record}");
+    assert!(field(&record, "target").starts_with("kept ("), "{record}");
+    assert_eq!(field(&record, "target-finished"), "no");
+    let successor = successor.expect("unfinished marker was removed");
+    retain_native_control(
+        &format!("{tier}-busy"),
+        &successor,
+        None,
+        serde_json::json!({
+            "worker_wait_observed": true, "same_inode_last_close_granted": true,
+        }),
+    );
+    successor.code(1);
+    successor.contains("marker lock not granted");
+    sandbox.write("fixture/src/lib.rs", "#[test]\nfn sample() {}\n");
+    let reset = sandbox.run(&mut sandbox.gate(&[tier, "--part", "suite", "--lease-wait", "0"]));
+    retain_native_control(
+        &format!("{tier}-reset"),
+        &reset,
+        Some(&sandbox.result()),
+        serde_json::json!({}),
+    );
+    reset.code(0);
+    if tier == "pr" {
+        assert_eq!(
+            field(&sandbox.result(), "target"),
+            "reset: previous build did not finish"
+        );
+    }
+    assert!(!marker.exists());
+}
+
+#[test]
+fn pr_gate_only_term_retains_live_output_holder_until_explicit_release_and_last_close() {
+    interrupted_output_holder("pr");
+}
+
+#[test]
+fn full_gate_only_term_retains_live_output_holder_until_explicit_release_and_last_close() {
+    interrupted_output_holder("full");
+}
+
+#[test]
+fn lease_exec_closed_stderr_keeps_busy_exit_and_does_not_run_command() {
+    let sandbox = Sandbox::new();
+    let boundary = Boundary::new(&sandbox);
+    let mut holder = boundary.exec(&sandbox, "holder");
+    let mut peer = boundary.accept(&mut holder);
+    let touched = sandbox.temporary.join("must-not-run");
+    let mut command = sandbox.gate(&[
+        "lease",
+        "exec",
+        "--purpose",
+        "closed-stderr-busy",
+        "--lease-wait",
+        "0",
+        "--",
+        "/usr/bin/touch",
+    ]);
+    command.arg(&touched);
+    let output = sandbox
+        .spawn_with_closed_pipes(&mut command)
+        .finish(COMMAND_BUDGET);
+    peer.alive();
+    peer.release();
+    holder.finish(COMMAND_BUDGET).code(0);
+    output.code(75);
+    assert!(!touched.exists());
+}
+
+#[test]
+fn lease_exec_closed_stderr_keeps_signal_exit_and_reaps_resistant_direct_child() {
+    let sandbox = Sandbox::new();
+    let boundary = Boundary::new(&sandbox);
+    let mut command = sandbox.gate(&[
+        "lease",
+        "exec",
+        "--purpose",
+        "closed-stderr-term",
+        "--lease-wait",
+        "0",
+        "--",
+        "/usr/bin/python3",
+    ]);
+    command
+        .arg(sandbox.temporary.join("payload.py"))
+        .arg("resistant-direct")
+        .arg(&boundary.path);
+    let mut holder = sandbox.spawn_with_closed_pipes(&mut command);
+    let mut worker = boundary.accept(&mut holder);
+    holder.signal("TERM");
+    assert_eq!(worker.response()["forwarded"], 15);
+    let output = holder.finish(Duration::from_secs(10));
+    require_process_gone(&sandbox, worker.ready["pid"].as_u64().unwrap());
+    output.code(143);
+    sandbox
+        .run(&mut sandbox.gate(&[
+            "lease",
+            "exec",
+            "--purpose",
+            "after-closed-stderr-term",
+            "--lease-wait",
+            "0",
+            "--",
+            "/usr/bin/true",
+        ]))
+        .code(0);
 }
