@@ -1564,6 +1564,13 @@ The wrapper privately publishes a single-link executable after Cargo success and
 source rechecks before stamping; do not manually copy/unlink output for acceptance.
 
 Handled cancellation retains targets on capture/reap failure or unresolved output.
+A cooperative lease busy refusal includes `stage=admission-turnstile` while
+waiting for admission, or `stage=lease-shared` / `stage=lease-exclusive` for the
+requested lease mode behind a holder. It still exits 75 without running work.
+Purpose/holder text remains unvalidated and gives no signal or reset authority.
+The stage labels describe current contention; they do not identify a holder or
+establish the cause of a historical failure.
+
 Do not delete a busy/unfinished marker or run `cargo clean` to force admission.
 Special target entries and inspection-budget refusals remain fail-closed; preserve
 the target and diagnostics for owner disposition rather than removing it while

@@ -1,5 +1,48 @@
 # Tiered verification checks — plan
 
+## NM1 prospective isolation, stage diagnostics and capture modes (2026-11-16)
+
+The bounded C3/C1/DMS-1 correction follows independent review of the preceding
+integration. S1 is independently closed on that delta; M2-message is closed
+within its helper. Broad workspace M2/raw confirmation and native acceptance
+remain open. Historical NM1 stage, holder and mechanism remain UNESTABLISHED
+(turnstile is inferred only); original failed evidence is immutable. A measured
+host mechanism includes transient descriptor retention by both posix_spawn and
+fork. It supports a prospective mitigation, not historical attribution.
+
+- C3 uses the existing isolated description-owner dispatch for
+  `shared_lease_coexists_and_excludes_exclusive`, preserving its entire original
+  assertion suffix and all zero waits. The child must still report exactly one
+  passed test. Update only the existing two explanatory comments to include both
+  spawn mechanisms; add no retry, wait or global serialization.
+- C1 carries `admission-turnstile`, `lease-shared` or `lease-exclusive` through
+  Contended and holder-diagnostic enrichment. Display adds `stage=<label>` while
+  preserving the existing refusal wording, error class/downcast, exit 75,
+  sanitization, deadlines, admission order and close-only lock semantics. Known
+  turnstile and exclusive-lease holders distinguish both requested modes; a
+  swapped-stage-label mutant must fail. No holder census is added.
+- DMS-1 creates the shutdown capture directory with explicit 0700 permissions
+  using the existing tempfile Builder API. The existing capture fixture asserts
+  directory 0700 and regular, single-link 0600 streams under umask 022; removing
+  creation permissions must fail. No global umask mutation, capture/reap wiring
+  or deadline changes. Earlier reports claimed 0700 but measured 0755; private
+  ancestors and 0600 files mean this discrepancy is not content-disclosure proof.
+- Verify one changed-source xtask package, orch-infra lib plus spawn_gate,
+  affected all-target check/clippy, fmt, crate-graph and explicit xtask build.
+  Resolve the isolated exact name once with `--list --exact`; retain assertion
+  suffix hashes. Use pre-run separate-channel JSON maps and original live logs
+  from a private external Cargo cwd, absolute identities and unchanged inventory.
+  Freeze clean source before workloads and preserve negative statuses/evidence.
+
+Prospective interpretation: green is consistent with mitigation, not history;
+isolated turnstile recurrence challenges the explanation; lease-stage recurrence
+challenges fixture invariants. No unchanged retry is authorized. This correction
+is scoped readiness only, subject to original security and SRE delta review.
+ADR 0015 remains PROPOSED. Option3 ACCEPTED NOT FIXED, distinct FS1/D45/manual
+removal risks, RC18 not prerequisite, historical C-N1 unknown/current mitigation,
+R4/R11/idle/nextest/slow tests/PR2–6, both check/test and owner-only merges/rules
+remain. Exporter, inventory parser, manifests, lockfiles and rules stay unchanged.
+
 ## Duplicate-member export and message-capture integration (2026-11-16)
 
 This bounded amendment integrates the delivered exporter and M2-message leaves.

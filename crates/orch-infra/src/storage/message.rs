@@ -915,8 +915,10 @@ mod tests {
     #[cfg(unix)]
     impl ShutdownChild {
         fn spawn(root: &Path, control: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
             let capture = tempfile::Builder::new()
                 .prefix("orch-message-shutdown-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
                 .tempdir()
                 .unwrap();
             let path = capture.path().to_path_buf();
@@ -1126,11 +1128,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn shutdown_capture_retains_complete_concurrent_streams() {
+        use std::os::unix::fs::MetadataExt;
         let mut child = shutdown_scenario("hostile");
+        let directory = std::fs::symlink_metadata(&child.path).unwrap();
+        assert!(directory.is_dir());
+        assert_eq!(directory.mode() & 0o7777, 0o700);
         child
             .success()
             .unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
         for stream in ["stdout", "stderr"] {
+            let metadata = std::fs::symlink_metadata(child.path.join(stream)).unwrap();
+            assert!(metadata.is_file());
+            assert_eq!(metadata.mode() & 0o7777, 0o600);
+            assert_eq!(metadata.nlink(), 1);
             let expected = shutdown_output(stream);
             let actual = child.bytes(stream);
             assert!(

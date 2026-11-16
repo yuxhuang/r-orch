@@ -7,6 +7,8 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Development tooling
 
+- Label cooperative gate contention by admission or requested lease mode.
+- Isolate the immediate shared-lease fixture and create message-test capture directories with explicit private permissions.
 - Retain interrupted gate targets when capture or EOF collection remains unresolved.
 - Refuse unsafe known-secret exports before publication and witness removed environment names.
 - Capture noisy test diagnostics in test processes while preserving failure output.

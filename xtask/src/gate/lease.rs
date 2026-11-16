@@ -27,6 +27,7 @@ pub(super) enum Mode {
 
 #[derive(Debug)]
 pub(super) struct Contended {
+    stage: &'static str,
     diagnostics: String,
 }
 
@@ -34,8 +35,8 @@ impl std::fmt::Display for Contended {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cooperative lease is busy; nothing ran; purpose/holder diagnostics (unvalidated, never signal authority): {}",
-            self.diagnostics
+            "cooperative lease is busy; nothing ran; purpose/holder diagnostics (unvalidated, never signal authority): {}; stage={}",
+            self.diagnostics, self.stage
         )
     }
 }
@@ -114,7 +115,7 @@ pub(super) struct Owned {
     held: Arc<Held>,
 }
 
-fn take(file: &File, mode: Mode, deadline: Instant) -> Result<()> {
+fn take(file: &File, mode: Mode, deadline: Instant, stage: &'static str) -> Result<()> {
     loop {
         let result = match mode {
             Mode::Exclusive => file.try_lock(),
@@ -127,6 +128,7 @@ fn take(file: &File, mode: Mode, deadline: Instant) -> Result<()> {
             }
             Err(TryLockError::WouldBlock) => {
                 return Err(Contended {
+                    stage,
                     diagnostics: "unavailable".into(),
                 }
                 .into());
@@ -137,9 +139,10 @@ fn take(file: &File, mode: Mode, deadline: Instant) -> Result<()> {
 }
 
 fn contention_diagnostics(error: anyhow::Error, directory: &Path, owner: u32) -> anyhow::Error {
-    if !error.is::<Contended>() {
+    let Some(contended) = error.downcast_ref::<Contended>() else {
         return error;
-    }
+    };
+    let stage = contended.stage;
     let path = directory.join("r-orch-gate.holder");
     // Read only: never create a missing diagnostic or follow a link. Its
     // contents are unvalidated text, with no signalling/reset authority.
@@ -162,6 +165,7 @@ fn contention_diagnostics(error: anyhow::Error, directory: &Path, owner: u32) ->
         Ok(bytes)
     })();
     Contended {
+        stage,
         diagnostics: read
             .map(|b| super::report::diagnostic(&b))
             .unwrap_or_else(|_| "unavailable".into()),
@@ -183,11 +187,16 @@ impl Owned {
         let deadline = Instant::now()
             .checked_add(wait)
             .context("lease wait overflow")?;
-        take(&turnstile, Mode::Exclusive, deadline)
+        take(&turnstile, Mode::Exclusive, deadline, "admission-turnstile")
             .map_err(|e| contention_diagnostics(e, &directory, owner))?;
         let path = directory.join("r-orch-gate.lease");
         let file = open(&path, owner)?;
-        take(&file, mode, deadline).map_err(|e| contention_diagnostics(e, &directory, owner))?;
+        let stage = match mode {
+            Mode::Shared => "lease-shared",
+            Mode::Exclusive => "lease-exclusive",
+        };
+        take(&file, mode, deadline, stage)
+            .map_err(|e| contention_diagnostics(e, &directory, owner))?;
         let lease = Self {
             held: Arc::new(Held {
                 file,
@@ -744,6 +753,11 @@ mod tests {
 
     #[test]
     fn shared_lease_coexists_and_excludes_exclusive() {
+        if !super::super::steps::tests::isolated_description_owner(
+            "gate::lease::tests::shared_lease_coexists_and_excludes_exclusive",
+        ) {
+            return;
+        }
         let s = Scratch::new();
         let _one = Owned::acquire(&s.0, s.owner(), Mode::Shared, Duration::ZERO).unwrap();
         let _two = Owned::acquire(&s.0, s.owner(), Mode::Shared, Duration::ZERO).unwrap();
@@ -768,10 +782,20 @@ mod tests {
         // A known separate holder reproduces the second shared admission's
         // exact error while another shared lock on the lease itself is granted.
         // This is a stage discriminator, not attribution of a historical holder.
-        let error = Owned::acquire(&s.0, s.owner(), Mode::Shared, Duration::ZERO)
-            .err()
-            .unwrap();
-        assert!(error.is::<Contended>());
+        for purpose in [None, Some("private-turnstile-holder")] {
+            if let Some(purpose) = purpose {
+                one.purpose(purpose).unwrap();
+            }
+            for mode in [Mode::Shared, Mode::Exclusive] {
+                let error = Owned::acquire(&s.0, s.owner(), mode, Duration::ZERO)
+                    .err()
+                    .unwrap();
+                assert!(error.is::<Contended>());
+                let text = error.to_string();
+                assert!(text.contains("stage=admission-turnstile"), "{text}");
+                assert!(text.contains(purpose.unwrap_or("unavailable")), "{text}");
+            }
+        }
         let probe = open(&one.held.path, s.owner()).unwrap();
         probe.try_lock_shared().unwrap();
         assert!(matches!(probe.try_lock(), Err(TryLockError::WouldBlock)));
@@ -785,6 +809,35 @@ mod tests {
                 .unwrap_err_is_contention()
         );
         drop((one, two));
+    }
+
+    #[test]
+    fn exclusive_lease_holder_reports_requested_mode_through_diagnostics() {
+        if !super::super::steps::tests::isolated_description_owner(
+            "gate::lease::tests::exclusive_lease_holder_reports_requested_mode_through_diagnostics",
+        ) {
+            return;
+        }
+        for (mode, stage) in [
+            (Mode::Shared, "lease-shared"),
+            (Mode::Exclusive, "lease-exclusive"),
+        ] {
+            let s = Scratch::new();
+            let lease = Owned::acquire(&s.0, s.owner(), Mode::Exclusive, Duration::ZERO).unwrap();
+            for purpose in [None, Some("private-stage-holder")] {
+                if let Some(purpose) = purpose {
+                    lease.purpose(purpose).unwrap();
+                }
+                let error = Owned::acquire(&s.0, s.owner(), mode, Duration::ZERO)
+                    .err()
+                    .unwrap();
+                assert!(error.is::<Contended>());
+                let text = error.to_string();
+                assert!(text.contains(&format!("stage={stage}")), "{text}");
+                assert!(text.contains(purpose.unwrap_or("unavailable")), "{text}");
+                lease.validate().unwrap();
+            }
+        }
     }
 
     #[test]

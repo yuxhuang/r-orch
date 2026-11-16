@@ -735,9 +735,9 @@ pub(super) mod tests {
         }
     }
 
-    // CLOEXEC does not prevent another test thread's in-flight fork from
-    // copying a locked description before exec. Clearing CLOEXEC for a Runner
-    // handover can also let that unrelated command retain it after exec. Tests
+    // CLOEXEC does not prevent another test thread's in-flight posix_spawn or
+    // fork from retaining a locked description before exec. Clearing CLOEXEC for
+    // a Runner handover can also let that unrelated command retain it after exec. Tests
     // asserting the final close need a process that owns only their lifecycle.
     // They still run in parallel; every original immediate lock assertion runs
     // unchanged in the child, without an unlock, retry or delayed probe.
