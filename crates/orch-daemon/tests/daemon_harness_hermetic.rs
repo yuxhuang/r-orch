@@ -725,7 +725,7 @@ fn capture_fixture_output(name: &str) -> std::process::Output {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join("home")).unwrap();
     std::fs::write(root.path().join("global.yml"), "{}\n").unwrap();
-    std::process::Command::new(std::env::current_exe().unwrap())
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", name])
         .env_clear()
         .env("ORCH_HERMETIC_CAPTURE_FIXTURE", name)
@@ -738,7 +738,13 @@ fn capture_fixture_output(name: &str) -> std::process::Output {
         .env("PATH", "/usr/bin:/bin")
         .current_dir(root.path())
         .output()
-        .unwrap()
+        .unwrap();
+    if !output.status.success() {
+        // The hostile helper retains its failed fixture beneath this TMPDIR.
+        // Keep the enclosing fixture too, so this control cannot erase it.
+        root.keep();
+    }
+    output
 }
 
 #[test]
