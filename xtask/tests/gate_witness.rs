@@ -260,20 +260,29 @@ def cargo_subcommand(args):
         }
 
         pub fn spawn(&self, command: &mut Command) -> OwnedChild {
-            self.spawn_io(command, false)
+            self.spawn_io(command, false, None)
         }
 
         pub fn spawn_with_closed_pipes(&self, command: &mut Command) -> OwnedChild {
-            self.spawn_io(command, true)
+            self.spawn_io(command, true, None)
         }
 
-        fn spawn_io(&self, command: &mut Command, closed: bool) -> OwnedChild {
+        pub fn spawn_with_input(&self, command: &mut Command, input: fs::File) -> OwnedChild {
+            self.spawn_io(command, false, Some(input))
+        }
+
+        fn spawn_io(
+            &self,
+            command: &mut Command,
+            closed: bool,
+            input: Option<fs::File>,
+        ) -> OwnedChild {
             static NEXT: AtomicU64 = AtomicU64::new(0);
             let serial = NEXT.fetch_add(1, Ordering::Relaxed);
             let stdout = self.temporary.join(format!("capture/{serial}.out"));
             let stderr = self.temporary.join(format!("capture/{serial}.err"));
             command
-                .stdin(Stdio::null())
+                .stdin(input.map(Stdio::from).unwrap_or_else(Stdio::null))
                 .stdout(fs::File::create(&stdout).unwrap())
                 .stderr(fs::File::create(&stderr).unwrap())
                 .process_group(0);

@@ -37,7 +37,12 @@ if mode == 'resistant-direct':
     for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
         signal.signal(number, forwarded)
 reader = connection.makefile('rb')
-connection.sendall((json.dumps({'role': mode, 'pid': os.getpid(), 'stdin_inode': os.fstat(0).st_ino, 'stdin_device': os.fstat(0).st_dev, 'token': os.environ.get('XTASK_GATE_LEASE_TOKEN', '')}) + '\n').encode())
+descriptors = []
+for fd in range(3, 1024):
+    try: metadata = os.fstat(fd)
+    except OSError: continue
+    descriptors.append({'fd': fd, 'device': metadata.st_dev & ((1 << 64) - 1), 'inode': metadata.st_ino})
+connection.sendall((json.dumps({'role': mode, 'pid': os.getpid(), 'stdin_inode': os.fstat(0).st_ino, 'stdin_device': os.fstat(0).st_dev & ((1 << 64) - 1), 'descriptors': descriptors, 'token': os.environ.get('XTASK_GATE_LEASE_TOKEN', '')}) + '\n').encode())
 child = None
 try:
     if mode == 'resistant':
@@ -81,6 +86,31 @@ finally:
         child.wait(timeout=2)
     connection.close()
 "#;
+
+// Observe the child itself: no fixed descriptor number and no marker reopen.
+// Sandbox launches with /dev/null stdin; the Runner must preserve that input.
+fn require_extra_marker_and_normal_stdin(peer: &Peer, marker: &Path) {
+    let marker = fs::metadata(marker).unwrap();
+    let matches: Vec<_> = peer.ready["descriptors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|fd| {
+            fd["device"].as_u64() == Some(marker.dev())
+                && fd["inode"].as_u64() == Some(marker.ino())
+        })
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "expected one inherited extra marker: {}",
+        peer.ready
+    );
+    let stdin = fs::metadata("/dev/null").unwrap();
+    assert_eq!(peer.ready["stdin_device"].as_u64(), Some(stdin.dev()));
+    assert_eq!(peer.ready["stdin_inode"].as_u64(), Some(stdin.ino()));
+    assert_ne!((stdin.dev(), stdin.ino()), (marker.dev(), marker.ino()));
+}
 
 struct Boundary {
     listener: UnixListener,
@@ -766,10 +796,7 @@ fn warm_and_cold_orphan_writers_are_not_reset_under_after_direct_holder_kill() {
         } else {
             "target/.gate-state/cold.use"
         });
-        assert_eq!(
-            writer.ready["stdin_inode"].as_u64(),
-            Some(fs::metadata(&marker).unwrap().ino())
-        );
+        require_extra_marker_and_normal_stdin(&writer, &marker);
         holder.signal("KILL");
         assert_eq!(holder.finish(HANDSHAKE_BUDGET).status.signal(), Some(9));
         writer.alive();
@@ -861,14 +888,20 @@ fn unfinished_warm_build_resets_after_owned_orphan_writer_has_exited() {
     let mut worker = boundary.accept(&mut holder);
     worker.alive();
     let marker = sandbox.root.join("target/.gate-state/warm.use");
-    assert_eq!(
-        worker.ready["stdin_inode"].as_u64(),
-        Some(fs::metadata(&marker).unwrap().ino())
-    );
+    require_extra_marker_and_normal_stdin(&worker, &marker);
+    let old_artifact = sandbox.root.join("target/gate-warm/abandoned-artifact");
+    fs::write(&old_artifact, "unfinished\n").unwrap();
+    let outside = sandbox.temporary.join("outside-recovery-canary");
+    fs::write(&outside, "outside\n").unwrap();
     holder.signal("KILL");
     assert_eq!(holder.finish(HANDSHAKE_BUDGET).status.signal(), Some(9));
     worker.alive();
     marker_lock(&sandbox, &marker, 75);
+    let refused = sandbox.suite();
+    refused.code(1);
+    refused.contains("marker lock not granted");
+    assert_eq!(fs::read_to_string(&old_artifact).unwrap(), "unfinished\n");
+    worker.alive();
     worker.release();
     // No EOF/expiry inference: read-only process absence and a granted lock
     // independently observe the writer's exit and last close.
@@ -881,6 +914,54 @@ fn unfinished_warm_build_resets_after_owned_orphan_writer_has_exited() {
         field(&sandbox.result(), "target"),
         "reset: previous build did not finish"
     );
+    assert!(
+        !old_artifact.exists(),
+        "native reset retained abandoned output"
+    );
+    assert!(
+        !marker.exists(),
+        "successful rebuild left the use unfinished"
+    );
+    assert!(
+        sandbox
+            .root
+            .join("target/.gate-state/warm.record")
+            .is_file()
+    );
+    assert_eq!(fs::read_to_string(outside).unwrap(), "outside\n");
+}
+
+#[test]
+fn target_runner_preserves_caller_stdin_bytes_through_native_rebuild() {
+    let sandbox = Sandbox::new();
+    sandbox.mini("#[test]\nfn sample() {}\n", true);
+    let real = sandbox.cargo_forwarder();
+    let observed = sandbox.temporary.join("stdin-observed");
+    sandbox.script(
+        &sandbox.temporary.join("bin/cargo"),
+        &format!(
+            r#"#!/bin/sh
+for arg do
+    if [ "$arg" = build ] && [ ! -f {observed:?} ]; then
+        /bin/cat > {observed:?}
+    fi
+done
+exec {real:?} "$@"
+"#,
+            observed = observed.to_str().unwrap(),
+            real = real.to_str().unwrap(),
+        ),
+    );
+    let input = sandbox.temporary.join("caller-input");
+    let bytes = b"ordinary caller stdin\nsecond line\0tail";
+    fs::write(&input, bytes).unwrap();
+    let mut command = sandbox.gate(&["pr", "--part", "suite", "--lease-wait", "0"]);
+    sandbox
+        .spawn_with_input(&mut command, fs::File::open(input).unwrap())
+        .finish(COMMAND_BUDGET)
+        .code(0);
+    assert_eq!(fs::read(observed).unwrap(), bytes);
+    assert!(!sandbox.root.join("target/.gate-state/warm.use").exists());
 }
 
 #[test]

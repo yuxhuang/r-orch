@@ -1,5 +1,5 @@
-//! Portable native inheritance observations, deliberately not a production
-//! recovery capability. The live native gate reset positive remains in C.
+//! Portable extra-descriptor inheritance snapshots, separate from production
+//! reset/rebuild controls. Finite native observations do not cover all writers.
 use std::fs;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -160,7 +160,8 @@ cases=[(label,argv) for label,argv in cases if shutil.which(argv[0])]
 print(json.dumps({'unmeasured_missing_tools':missing}),flush=True)
 holder_code='''import os,sys,json,fcntl,subprocess,pathlib,time
 marker,pidfile,writer,argv,mutant=sys.argv[1:];fd=os.open(marker,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);fcntl.flock(fd,fcntl.LOCK_EX)
-child=subprocess.Popen(json.loads(argv),stdin=subprocess.DEVNULL if mutant=='no-inherit' else fd,stdout=int(writer),stderr=int(writer))
+os.set_inheritable(fd,True)
+child=subprocess.Popen(json.loads(argv),stdin=subprocess.DEVNULL,pass_fds=() if mutant=='no-inherit' else (fd,),stdout=int(writer),stderr=int(writer))
 if mutant=='unlock': fcntl.flock(fd,fcntl.LOCK_UN)
 pathlib.Path(pidfile).write_text(str(child.pid));child.wait()
 '''
@@ -195,13 +196,28 @@ def probe(label,argv,mutant='none'):
    time.sleep(.005)
   pid=int(pidfile.read_text());observations.update(pid=pid,marker_inode=marker.stat().st_ino,argv=argv)
   if sys.platform=='darwin':
-   ls=subprocess.run(['/usr/sbin/lsof','-a','-p',str(pid),'-d','0','-Ffin'],capture_output=True,text=True,timeout=10)
-   observations['stdin']=ls.stdout
-   observations['stdin_identity']='same inode' if ('i'+str(marker.stat().st_ino)+'\n') in ls.stdout else 'unavailable'
-   if argv[0]!='ps' and mutant!='no-inherit': assert observations['stdin_identity']=='same inode',ls
+   ls=subprocess.run(['/usr/sbin/lsof','-a','-p',str(pid),'-Ffin'],capture_output=True,text=True,timeout=10)
+   observations['descriptor_observation']=ls.stdout
+   marker_seen=('i'+str(marker.stat().st_ino)+'\n') in ls.stdout
+   observations['extra_marker_seen']=marker_seen
+   stdin=subprocess.run(['/usr/sbin/lsof','-a','-p',str(pid),'-d','0','-Ffin'],capture_output=True,text=True,timeout=10)
+   observations['stdin']=stdin.stdout
+   if argv[0]!='ps':
+    assert 'i'+str(marker.stat().st_ino)+'\n' not in stdin.stdout,stdin
+    if mutant!='no-inherit':assert marker_seen,ls
+    else:assert not marker_seen,ls
   else:
-   try:observations['stdin_inode']=os.stat('/proc/%s/fd/0'%pid).st_ino
-   except FileNotFoundError:observations['stdin_inode']=None
+   try:
+    observations['stdin_inode']=os.stat('/proc/%s/fd/0'%pid).st_ino
+    st=marker.stat(); found=[]
+    for f in pathlib.Path('/proc/%s/fd'%pid).iterdir():
+     try:m=f.stat()
+     except FileNotFoundError:continue
+     if (m.st_dev,m.st_ino)==(st.st_dev,st.st_ino):found.append(int(f.name))
+    observations['marker_fds']=found
+    assert observations['stdin_inode']!=st.st_ino
+    assert bool(found)==(mutant!='no-inherit')
+   except FileNotFoundError:raise AssertionError('native process disappeared before fd observation')
   holder.kill();assert holder.wait(timeout=5)==-9
   observations['direct_live_after_holder_kill']=bool(exists(pid))
   observations['lock_granted_while_live']=grant(marker)
@@ -241,5 +257,5 @@ for mutant in ['no-inherit','unlock']:
  row=probe(mutant,['rustc','-vV'],mutant);results.append((mutant,row))
  assert row['direct_live_after_holder_kill'] and row['lock_granted_while_live'] and row['same_marker'] and row['last_close_granted'] and row['direct_absent'],(mutant,row)
 (root/'summary.json').write_text(json.dumps(dict(results),indent=2)+'\n')
-print('PARTIAL RC18: inheritance snapshots only; native recovery/reset and complete command lifetimes are not qualified; Linux is unmeasured until actually run.',flush=True)
+print('Finite extra-descriptor snapshots only; production native reset/rebuild is verified separately; Linux is unmeasured until actually run.',flush=True)
 "###;
