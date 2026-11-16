@@ -165,10 +165,12 @@ impl<'a, 'm> Runner<'a, 'm> {
             !self.failed && self.child.is_none(),
             "command lifecycle already failed or busy"
         );
-        ensure!(
-            self.wait_signal(Duration::ZERO).is_none(),
-            "INTERRUPTED before command"
-        );
+        if let Some(number) = self.wait_signal(Duration::ZERO) {
+            // No child or capture exists yet, and the preceding guard excludes
+            // an earlier failed lifecycle. Preserve clean handled cancellation.
+            self.interrupted_cleanly = true;
+            bail!("INTERRUPTED before command by signal {number}");
+        }
         self.validate()?;
         // Duplicate the SAME locked open description on an extra fd. Keep it
         // only across spawn, never in Command's retained stdio configuration.

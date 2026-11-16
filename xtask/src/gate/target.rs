@@ -125,7 +125,8 @@ impl Captured {
 /// The callback receives the only runner for this use and the constant target.
 /// It must route every direct command through that runner. A nonzero command or
 /// a failed judged assertion may finish the target, while never passing the step.
-/// An interrupted/failed runner or lost authority retains marker and target.
+/// A failed collection/lifecycle or lost authority retains marker and target.
+/// Clean handled cancellation may finish after reap/drain; its verdict stays interrupted.
 pub(super) struct NativeOutcome<T> {
     pub(super) result: anyhow::Result<T>,
     pub(super) statuses: Vec<super::steps::Status>,
@@ -4092,6 +4093,32 @@ version = "0.0.0"
         f2_repo(&f);
         let lease = f2_lease(&f);
         let target = native_admission(&f.files.root, false, &lease).unwrap();
+        if mode == "cancel-before-command" {
+            let outcome = target
+                .begin(&lease)
+                .unwrap()
+                .run(&lease, false, |runner, _| -> anyhow::Result<()> {
+                    fs::write(control.join("ready"), b"ready").unwrap();
+                    while runner.interrupted().is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    runner.run(&mut f2_command(&f, "touch must-not-start"))?;
+                    Ok(())
+                })
+                .ok()
+                .expect("clean pre-command cancellation must finish");
+            let error = outcome.result.unwrap_err();
+            let value = serde_json::json!({ "error": format!("{error:#}"),
+                "marker": f.files.path(Leaf::Marker).exists(),
+                "record_missing": matches!(f.files.read_record().unwrap(), Stored::Missing),
+                "command_started": f.files.root.join("must-not-start").exists() });
+            fs::write(
+                control.join("result.json"),
+                serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
+            return;
+        }
         if mode == "capture-then-signal" {
             let error = target
                 .begin(&lease)
@@ -4392,6 +4419,21 @@ while not (root/'release').exists(): time.sleep(.01)
         );
         assert_eq!(result["marker"], true);
         assert_eq!(result["record_missing"], true);
+    }
+
+    #[test]
+    fn native_clean_pre_command_cancellation_finishes_without_starting_work() {
+        let mut holder = F3Holder::new("cancel-before-command", false);
+        holder.ready();
+        holder.signal(nix::sys::signal::Signal::SIGTERM);
+        let result = holder.result();
+        assert!(
+            result["error"].as_str().unwrap().contains("INTERRUPTED"),
+            "{result}"
+        );
+        assert_eq!(result["command_started"], false);
+        assert_eq!(result["marker"], false);
+        assert_eq!(result["record_missing"], false);
     }
 
     #[test]
