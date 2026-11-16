@@ -1,5 +1,67 @@
 # Tiered verification checks — plan
 
+## Bounded native-test and export correction integration (2026-11-16)
+
+This amendment carries the authorized MN1/LN1, MN3, C-N1-S, n7 and S1
+corrections from the failed completed-head acceptance. Earlier results below
+remain historical; their failed raw streams and incomplete verdicts are retained.
+Scoped implementation checks do not replace changed-source native acceptance or
+independent security and reliability assessment. ADR 0015 stays proposed.
+
+- MN1/LN1: the shared test capture uses the existing gated diagnostic runtime.
+  The spawn guard, its exception counts and all serving scheduler behavior stay
+  unchanged. Capture retains both streams, actual status, cleanup/reap completion,
+  exactly one passed test and the private-HOME audit.
+- MN3: the hostile-environment test helper captures both child streams into
+  exclusive private files. Its existing 60-second deadline, canaries and scenario
+  assertions stay. It waits the owned child, requires exactly one passed and zero
+  failed/ignored tests, and retains complete labelled failure diagnostics/files.
+  Concurrent-output, zero-match and kill/reap/label controls remain required.
+- C-N1-S: the twelve remaining paused Rig sibling scenarios receive the existing
+  process-capture guard. Their timing, counts and event assertions stay exact.
+  Historical C-N1 eligible-launch assertion/cause remains UNESTABLISHED; paused
+  storage-retry dependency is measured, a cross-test holder is inferred, and
+  isolation is current mitigation only. Feature-off tests share one private
+  crate-root capture module under cfg(test); the feature-on facade is unchanged.
+- n7: isolated_description_owner requires actual success and the final summary
+  of exactly one passed, zero failed and zero ignored. A zero-match child exiting
+  zero must be rejected. Existing lock assertions are unchanged.
+- S1: after literal/escaped substitution, inspect JSON object, array and string
+  fragments after arbitrary diagnostic text, recursively including decoded keys
+  and values. A surviving known sensitive value refuses before export-directory
+  creation. Depth remains 128; one per-input allowance of four maximum-log
+  lengths (128 MiB charged bytes/nodes) covers decoded data and candidate suffixes
+  charged before parsing, including malformed overlaps. Exhaustion refuses.
+  Benign nested text remains exportable, and ordinary redacted exports, failed
+  suite status, manifest/judge/source predicates and nonqualification stay intact.
+  Private local records remain unredacted; unknown secrets remain outside scope.
+
+MN2 changes the future ordinary capture recipe, not inventory parsing: use a
+private external cwd, canonical absolute manifest and target paths, and separate
+raw map stdout from Cargo stderr. Before the next full ordinary capture, a small
+real Cargo capture must show raw absolute Running headers matching the original
+JSON map and an actual unchanged-product inventory result. Keep unknown-path and
+zero-executed-test negatives. Never transform old logs, recollect their maps or
+broaden parsing to obtain acceptance; original ordinary inventory1 stays failed.
+
+Additional static diagnostic writers in storage/message, index_cross_process and
+failure-only child-output assertions remain outside this correction. No
+workspace-wide M2/capture closure is claimed. Retain cumulative body/helper/minor
+ledgers and enumerate every changed or added identity, with no removed tests,
+weaker assertion or increased timeout. Combined verification covers the full
+xtask package, infra spawn_gate, affected daemon feature-on/off targets, fmt,
+workspace all-target clippy and crate graph. No full workspace suite or third
+legacy baseline runs in this integration wave, and failures are never retried
+unchanged to obtain green.
+
+Option3 direct-writer/legacy overlap is ACCEPTED NOT FIXED. FS1, interim D45
+(revisit with storage changes) and manual marker/cargo-clean removal remain
+distinct; RC18 is not a prerequisite. R4 literal-base comparison, complete R11,
+changed-source Mac folded/ordinary and native Linux PR acceptance, idle targets,
+nextest qualification or explicitly approved fallback, slow-test work and PR2–6
+remain due. Existing check/test and owner-only merges/rules stand. No PR or goal
+acceptance follows from this amendment.
+
 ## Bounded Linux test completion (2026-11-16)
 
 The preceding consolidated snapshot is incomplete: native Linux feature-off
