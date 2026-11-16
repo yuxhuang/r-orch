@@ -23,7 +23,7 @@ enum Task {
     CrateGraph,
     /// Run the Linux checks from macOS in a linux/amd64 Docker container (AGENTS.md).
     Linux(linux::LinuxArgs),
-    /// Tiered verification helpers (gate execution is not available yet).
+    /// Tiered checks: full is the goal/release gate; pr is the merge tier after policy transition; fast is staged.
     Gate(gate::GateArgs),
 }
 

@@ -1,5 +1,48 @@
 # Tiered verification checks — plan
 
+## Real libtest inventory repair (2026-11-15)
+
+Standard `test NAME has been running for over 60 seconds` is nonterminal:
+require its named terminal result in the same completed group. A notice cannot
+supply an executed test or relax count/status reconciliation.
+
+Recognize nested successful single-test filtered helpers only with balanced
+one-test announcements and summaries whose filtered complement matches the
+outer announcement. Every excluded child observation must be a same-name,
+same-status redundant row, occur between a paired child announcement/summary,
+and leave exactly one outer row per identity. Match redundant observations in
+chronological order; refuse if that conservative assignment cannot reconcile
+the transcript. Arbitrary duplicates, conflicting statuses, missing child rows,
+unbalanced helpers and unsupported nested shapes refuse. Child attribution may
+be interchangeable; the resulting outer name/status inventory must be unique.
+No test-name allowlist or arbitrary deduplication is introduced.
+
+Rustdoc can emit multiple complete result groups beneath one mapped Doc-tests
+header. Reconcile each group separately; retain the doc target until the next
+executable header and reject duplicate identities across its groups. Incomplete
+groups, ambiguous targets and process-exit disagreement still refuse. Consistent
+failed input may parse, but Cargo 101 and the failed suite remain failed.
+
+Acceptance is scoped: minimal red-first and adversarial inline fixtures, the
+existing unit/inventory/evidence checks, and exact retained real log/map replay
+must reconstruct 7278 passed / 1 failed / 7 ignored (docs 19/0/1). No real suite
+rerun, schema change, whole-gate, Mac/Linux, R4/R11, nextest or PR acceptance is
+implied. Preserve the failed source run and all newly observed failures.
+
+
+### Parser repair sequence — tsk_zyVACyG
+
+1. Preserve exact 70b54dc inputs and read actual failed log/map and predecessor
+   artifacts; amend this contract before tests or implementation.
+2. Add minimal notice, concurrent/earlier-outer helper and split-doc regressions;
+   retain red failures at the unchanged production parser.
+3. Implement bounded reconciliation within inventory.rs and correct only the
+   obsolete main help sentence; preserve every independent test source.
+4. Run scoped checks and reverted-fix discriminators under the ordinary lease,
+   private resource view and umask022. Commit only the four owned paths.
+5. Replay retained log/map with the committed product helper; preserve actual
+   Cargo101 and hand the exact SHA/evidence to the existing independent owner.
+
 ### Scoped implementation sequence — tsk_zYynHBB
 
 1. Amend this plan, the existing spec and ADR 0015 before code; preserve input

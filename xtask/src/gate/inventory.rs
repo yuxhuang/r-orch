@@ -3,7 +3,7 @@
 
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub(super) const MAX_LOG: usize = 32 * 1024 * 1024;
 const MAX_TESTS: usize = 50_000;
@@ -96,6 +96,79 @@ struct Section {
     announced: Option<usize>,
     rows: Vec<Row>,
     failures: FailureOutput,
+    notices: BTreeSet<String>,
+    pending_helpers: VecDeque<usize>,
+    helpers: Vec<(usize, usize)>,
+}
+
+impl Section {
+    fn new(key: String, exe: Executable) -> Self {
+        Self {
+            key,
+            exe,
+            announced: None,
+            rows: vec![],
+            failures: FailureOutput::None,
+            notices: BTreeSet::new(),
+            pending_helpers: VecDeque::new(),
+            helpers: vec![],
+        }
+    }
+
+    fn reconcile_helpers(&mut self) -> Result<()> {
+        ensure!(
+            self.pending_helpers.is_empty(),
+            "incomplete inventory: nested helper"
+        );
+        let mut remaining = BTreeMap::new();
+        for row in &self.rows {
+            let (status, count) = remaining
+                .entry(row.test.as_str())
+                .or_insert((&row.status, 0));
+            ensure!(
+                *status == &row.status,
+                "inconsistent inventory: conflicting test status"
+            );
+            *count += 1;
+        }
+        let mut child = vec![false; self.rows.len()];
+        // Filtered single-test helpers may interleave with the outer harness.
+        // Exclude only a redundant successful observation within a balanced
+        // announcement/summary interval, leaving one identical outer result.
+        // A conservative chronological assignment may refuse harder streams;
+        // it never invents a missing outer identity or status.
+        for &(start, end) in &self.helpers {
+            let index = (start..end)
+                .find(|&i| {
+                    !child[i]
+                        && self.rows[i].status == "ok"
+                        && remaining[self.rows[i].test.as_str()].1 > 1
+                })
+                .context("inconsistent inventory: ambiguous or missing nested helper row")?;
+            child[index] = true;
+            remaining
+                .get_mut(self.rows[index].test.as_str())
+                .context("helper row")?
+                .1 -= 1;
+        }
+        ensure!(
+            remaining.values().all(|(_, n)| *n == 1),
+            "inconsistent inventory: duplicate test"
+        );
+        ensure!(
+            self.notices
+                .iter()
+                .all(|name| remaining.contains_key(name.as_str())),
+            "incomplete inventory: running notice without terminal row"
+        );
+        let mut i = 0;
+        self.rows.retain(|_| {
+            let keep = !child[i];
+            i += 1;
+            keep
+        });
+        Ok(())
+    }
 }
 
 pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
@@ -103,6 +176,7 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
     let expected = executables(map)?;
     let mut seen = BTreeSet::new();
     let mut current: Option<Section> = None;
+    let mut doc: Option<(String, Executable)> = None;
     let mut rows = Vec::new();
     for raw in log.lines() {
         let line = raw.trim();
@@ -170,36 +244,46 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
                 !seen.contains(&key),
                 "inconsistent inventory: repeated executable {key}"
             );
-            current = Some(Section {
-                key,
-                exe,
-                announced: None,
-                rows: vec![],
-                failures: FailureOutput::None,
-            });
-        } else if line.starts_with("running ")
-            && (line.ends_with(" tests") || line.ends_with(" test"))
-        {
-            let s = current
-                .as_mut()
-                .context("inconsistent inventory: running without executable")?;
-            ensure!(
-                s.announced.is_none(),
-                "inconsistent inventory: nested running count"
-            );
-            s.announced = Some(
-                line.split_whitespace()
-                    .nth(1)
-                    .context("running count")?
-                    .parse()?,
-            );
+            doc = (exe.kind == "doc").then(|| (key.clone(), exe.clone()));
+            current = Some(Section::new(key, exe));
+        } else if let Some(running) = line.strip_prefix("running ") {
+            let count: usize = running
+                .strip_suffix(" tests")
+                .or_else(|| running.strip_suffix(" test"))
+                .context("inconsistent inventory: running count")?
+                .parse()?;
+            ensure!(count <= MAX_TESTS, "inventory count budget");
+            if current.is_none() {
+                let (key, exe) = doc
+                    .as_ref()
+                    .context("inconsistent inventory: running without executable")?;
+                current = Some(Section::new(key.clone(), exe.clone()));
+            }
+            let s = current.as_mut().context("inventory section")?;
+            if s.announced.is_some() {
+                ensure!(
+                    s.exe.kind != "doc" && count == 1,
+                    "inconsistent inventory: unsupported nested running count"
+                );
+                s.pending_helpers.push_back(s.rows.len());
+                ensure!(
+                    s.pending_helpers.len() + s.helpers.len() <= MAX_TESTS,
+                    "inventory count budget"
+                );
+            } else {
+                s.announced = Some(count);
+            }
         } else if line == "failures:" {
             if let Some(s) = current.as_mut() {
+                ensure!(
+                    s.pending_helpers.is_empty(),
+                    "inconsistent inventory: nested failures"
+                );
                 s.failures = FailureOutput::Captured;
             }
         } else if let Some(result) = line.strip_prefix("test result: ") {
             let s = current
-                .take()
+                .as_mut()
                 .context("inconsistent inventory: result without executable")?;
             if let FailureOutput::Names(names) = &s.failures {
                 ensure!(
@@ -214,7 +298,9 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
             }
             let words: Vec<_> = result.split_whitespace().collect();
             ensure!(
-                words.len() >= 11 && ["ok.", "FAILED."].contains(&words[0]),
+                words.len() == 15
+                    && ["ok.", "FAILED."].contains(&words[0])
+                    && words[11..14] == ["out;", "finished", "in"],
                 "inconsistent inventory: malformed result"
             );
             let mut counts = [0usize; 5];
@@ -228,6 +314,31 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
                 );
                 counts[i] = words[1 + 2 * i].parse()?;
             }
+            let seconds: f64 = words[14]
+                .strip_suffix('s')
+                .context("inconsistent inventory: result duration")?
+                .parse()?;
+            ensure!(
+                seconds.is_finite() && seconds >= 0.0,
+                "inconsistent inventory: result duration"
+            );
+            if counts[4] != 0 {
+                ensure!(
+                    s.exe.kind != "doc"
+                        && matches!(s.failures, FailureOutput::None)
+                        && words[0] == "ok."
+                        && counts[..4] == [1, 0, 0, 0]
+                        && counts[4].checked_add(1) == s.announced,
+                    "inconsistent inventory: unsupported nested summary"
+                );
+                let start = s
+                    .pending_helpers
+                    .pop_front()
+                    .context("inconsistent inventory: nested summary without announcement")?;
+                s.helpers.push((start, s.rows.len()));
+                continue;
+            }
+            s.reconcile_helpers()?;
             let count = |status: &str| s.rows.iter().filter(|r| r.status == status).count();
             ensure!(
                 counts[0] == count("ok")
@@ -243,12 +354,22 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
                 (words[0] == "ok.") == (counts[1] == 0),
                 "inconsistent inventory: result status"
             );
+            let s = current.take().context("inventory section")?;
             seen.insert(s.key);
             rows.extend(s.rows);
         } else if let Some(test) = line.strip_prefix("test ") {
             let s = current
                 .as_mut()
                 .context("inconsistent inventory: test without executable")?;
+            if let Some(name) = test.strip_suffix(" has been running for over 60 seconds") {
+                ensure!(
+                    s.announced.is_some()
+                        && !s.rows.iter().any(|r| r.test == name)
+                        && s.notices.insert(field(name)?.to_owned()),
+                    "inconsistent inventory: nonterminal running notice"
+                );
+                continue;
+            }
             let (name, status) = test
                 .rsplit_once(" ... ")
                 .context("inconsistent inventory: malformed test line")?;
@@ -378,5 +499,112 @@ mod tests {
                 .contains("no test executed")
         );
         assert!(parse(log(), &format!("{}\n{}", map(), map()), 0).is_err());
+    }
+
+    fn result(passed: usize, ignored: usize, filtered: usize) -> String {
+        format!(
+            "test result: ok. {passed} passed; 0 failed; {ignored} ignored; 0 measured; {filtered} filtered out; finished in 0.00s\n"
+        )
+    }
+
+    fn nested() -> String {
+        "Running unittests src/lib.rs (/fixture/target/test)\nrunning 3 tests\nrunning 1 test\nrunning 1 test\ntest one ... ok\n".to_owned()
+            + &result(1, 0, 2)
+            + "test one ... ok\ntest two ... ok\n"
+            + &result(1, 0, 2)
+            + "test two ... ok\ntest three ... ignored\n"
+            + &result(2, 1, 0)
+    }
+
+    #[test]
+    fn standard_running_notice_requires_its_later_terminal_row() {
+        let notice = "test one has been running for over 60 seconds\n";
+        let good = log().replace("test one ... ok", &(notice.to_owned() + "test one ... ok"));
+        assert_eq!(
+            parse(&good, &map(), 0).unwrap(),
+            parse(log(), &map(), 0).unwrap()
+        );
+        for bad in [
+            good.replace("test one ... ok\n", ""),
+            good.replace("one has been", "unknown has been"),
+            good.replace("60 seconds", "sixty seconds"),
+            good.replace(notice, &(notice.to_owned() + notice)),
+            good.replace(
+                &(notice.to_owned() + "test one ... ok"),
+                &("test one ... ok\n".to_owned() + notice),
+            ),
+        ] {
+            assert!(parse(&bad, &map(), 0).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn concurrent_filtered_helpers_reconcile_only_redundant_observations() {
+        let rows = parse(&nested(), &map(), 0).unwrap();
+        assert_eq!(
+            tsv(&rows),
+            "lib\tfixture\tfixture\tone\tok\nlib\tfixture\tfixture\tthree\tignored\nlib\tfixture\tfixture\ttwo\tok\n"
+        );
+        // The outer row can precede the helper's announcement (orch-infra).
+        let earlier = "Running unittests src/lib.rs (/fixture/target/test)\nrunning 2 tests\ntest one ... ok\nrunning 1 test\ntest one ... ok\n".to_owned()
+            + &result(1, 0, 1) + "test two ... ignored\n" + &result(1, 1, 0);
+        assert_eq!(
+            parse(&earlier, &map(), 0).unwrap(),
+            parse(log(), &map(), 0).unwrap()
+        );
+        for bad in [
+            nested().replacen("running 1 test\n", "", 1),
+            nested().replacen(&result(1, 0, 2), "", 1),
+            nested().replacen("test one ... ok\n", "", 1),
+            nested().replacen("test one ... ok\n", "test forged ... ok\n", 1),
+            nested().replacen("test one ... ok\n", "test one ... FAILED\n", 1),
+            nested().replacen("test one ... ok\n", "test one ... ok\ntest one ... ok\n", 1),
+            nested().replacen(&result(1, 0, 2), &result(1, 0, 1), 1),
+            nested().replacen("running 1 test\n", "running 2 tests\n", 1),
+            nested().replacen("test one ... ok\n", "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\ntest one ... ok\n", 1),
+        ] {
+            assert!(parse(&bad, &map(), 0).is_err(), "{bad}");
+        }
+        assert!(parse(&nested(), &map(), 101).is_err());
+    }
+
+    #[test]
+    fn doc_target_keeps_multiple_complete_disjoint_groups() {
+        let good = log().to_owned()
+            + "running 1 test\ntest src/lib.rs - (line 1) ... ok\n"
+            + &result(1, 0, 0)
+            + "running 1 test\ntest src/lib.rs - (line 2) - compile fail ... ok\n"
+            + &result(1, 0, 0);
+        let rows = parse(&good, &map(), 0).unwrap();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.iter().filter(|r| r.kind == "doc").count(), 2);
+        for bad in [
+            good.replace(
+                "src/lib.rs - (line 2) - compile fail",
+                "src/lib.rs - (line 1)",
+            ),
+            good.rsplit_once("test result:").unwrap().0.to_owned(),
+            good.replace(
+                "running 1 test\ntest src/lib.rs - (line 2)",
+                "running 2 tests\ntest src/lib.rs - (line 2)",
+            ),
+            good.replace(
+                "running 1 test\ntest src/lib.rs - (line 2)",
+                "Doc-tests fixture\nrunning 1 test\ntest src/lib.rs - (line 2)",
+            ),
+        ] {
+            assert!(parse(&bad, &map(), 0).is_err(), "{bad}");
+        }
+        let failed = good.replace("(line 1) ... ok", "(line 1) ... FAILED")
+            .replacen(&result(1, 0, 0), "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n", 1);
+        assert_eq!(
+            parse(&failed, &map(), 101)
+                .unwrap()
+                .iter()
+                .filter(|r| r.status == "failed")
+                .count(),
+            1
+        );
+        assert!(parse(&failed, &map(), 0).is_err());
     }
 }
