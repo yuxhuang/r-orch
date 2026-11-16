@@ -1412,6 +1412,17 @@ One heavy build or measurement per host at a time. Measurement windows hold the 
 
 ## Test plan
 
+Observer HOME repair (2026-11-15): first add a startup HOME record and assertion
+to the existing native Python probe and show that it rejects the original Rust
+launchers. Then give both qualification and propagation commands a private
+observer home before exec; retain ordinary Python cache behavior and all native
+assertions. Run the scratch and worktree qualification controls and propagation
+under separate fresh outer homes, retaining recursive before/after inventories,
+startup records and native cases. Run focused affected tests, build, scoped
+clippy, fmt and crate graph at the frozen bytes. Integration fixtures stay
+unchanged. The independent performance task consumes the resulting artifact for
+the corrected folded measurement; no broad workspace measurement belongs here.
+
 The spec's acceptance checks; the vectors above; the CI set on every pull request. `./xtask/gate.sh full` on macOS and on native Linux for PR 1 and at the end, because the work changes process handling and the gate itself. PR 1 also runs the gate of the base commit once at the same tree, for the comparison of R4. Both runs of that comparison hold the exclusive lease on an otherwise idle host. One run on each side cannot tell a failure caused by the fold from an intermittent one, so every test whose result differs is then run by itself in both environments. The report lists every difference with what those runs showed, including the ones that did not repeat; an intermittent one is triaged under R7. None of this is a rerun to obtain a pass. Timing and qualification runs hold the exclusive lease on an otherwise idle host. Reviewers use bounded disposable probes; no probe uses a real home or a real agent CLI. No user interface changes, so no tmux end-to-end test is added.
 
 Reviews: each pull request gets independent code, security and resilience reviews of what it touches, at a frozen commit. Security covers subprocesses, paths, the untrusted diff and CI; resilience covers failure, interruption, cleanup, the lease, kept diagnostics and rollback. A fact check covers timings, inventories and public claims. One red-team pass challenges the fold (task E). A blocking finding is fixed and reviewed again or goes to the owner; it is not overruled.

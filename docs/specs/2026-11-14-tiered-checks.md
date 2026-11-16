@@ -494,6 +494,16 @@ The commands and test paths below are the acceptance interface that the plan bui
 
 ## Non-goals
 
+Fixture isolation amendment (2026-11-15): the native qualification and
+propagation observers must receive a fixture-owned `HOME` in the Rust command
+before Python starts. Interpreter startup and child cache writes remain enabled
+inside that private home. Both launch paths retain a startup HOME assertion and
+record; fresh outer homes must remain recursively empty on the scratch and
+worktree qualification runs and the propagation run. This repairs the fixture
+boundary for R3 without exempting `Library`, removing sentinel entries or
+changing the native lifecycle, recovery and accepted-risk assertions. Scoped
+verification does not establish whole-gate or platform acceptance.
+
 Deleting or weakening tests; raising timeouts to hide slowness; product changes beyond an injectable clock seam that already exists or is trivial; a remote build cache or a paid CI tier; Windows; changing what the crate-graph check enforces; any on-disk format or protocol. No release and no automatic merge.
 
 ## Constraints

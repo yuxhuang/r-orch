@@ -2,6 +2,7 @@
 //! These finite controls do not establish arbitrary-descendant protection.
 use super::*;
 use std::os::fd::AsFd;
+use std::os::unix::fs::DirBuilderExt;
 use std::process::Command;
 
 #[test]
@@ -114,9 +115,12 @@ fn qualification(parent: &Path) {
             .unwrap()
             .as_nanos()
     ));
-    fs::create_dir(&root).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let home = root.join("observer-home");
+    fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
     let output = Command::new("/usr/bin/python3")
         .args(["-c", PROBE])
+        .env("HOME", &home)
         .env(
             "RC18_WORKTREE",
             Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap(),
@@ -160,9 +164,12 @@ fn production_native_build_script_test_and_child_descriptor_propagation() {
             .unwrap()
             .as_nanos()
     ));
-    fs::create_dir(&root).unwrap();
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let home = root.join("observer-home");
+    fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
     let output = Command::new("/usr/bin/python3")
         .args(["-c", PROBE])
+        .env("HOME", &home)
         .env("RC18_PROPAGATION_ONLY", "1")
         .env(
             "RC18_WORKTREE",
@@ -184,6 +191,11 @@ fn production_native_build_script_test_and_child_descriptor_propagation() {
 const PROBE: &str = r###"
 import os,sys,pathlib,subprocess,fcntl,json,time,select,shutil,hashlib
 root=pathlib.Path(sys.argv[1]);exe=sys.argv[2]
+# Python imports can write caches before this probe runs. Check the Rust exec
+# boundary, not only the private environment supplied to later native children.
+startup=dict(home=os.environ.get('HOME'),expected_home=str(root/'observer-home'),pid=os.getpid(),executable=sys.executable,pycache_prefix=sys.pycache_prefix,dont_write_bytecode=sys.dont_write_bytecode)
+(root/'observer-startup.json').write_text(json.dumps(startup,indent=2)+'\n')
+assert startup['home']==startup['expected_home'],('observer HOME must be private before Python startup',startup)
 fixture='gate::target::qualification::production_holder_fixture'
 # Resource-only views; no host settings, credentials, Git configuration or home
 # are passed into any qualification command, even outside the task recorder.
