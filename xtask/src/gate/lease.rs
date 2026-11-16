@@ -754,6 +754,40 @@ mod tests {
     }
 
     #[test]
+    fn shared_admission_busy_turnstile_is_distinct_from_busy_lease() {
+        if !super::super::steps::tests::isolated_description_owner(
+            "gate::lease::tests::shared_admission_busy_turnstile_is_distinct_from_busy_lease",
+        ) {
+            return;
+        }
+        let s = Scratch::new();
+        let one = Owned::acquire(&s.0, s.owner(), Mode::Shared, Duration::ZERO).unwrap();
+        let turnstile_path = s.0.join("r-orch-gate.turnstile");
+        let turnstile = open(&turnstile_path, s.owner()).unwrap();
+        turnstile.try_lock().unwrap();
+        // A known separate holder reproduces the second shared admission's
+        // exact error while another shared lock on the lease itself is granted.
+        // This is a stage discriminator, not attribution of a historical holder.
+        let error = Owned::acquire(&s.0, s.owner(), Mode::Shared, Duration::ZERO)
+            .err()
+            .unwrap();
+        assert!(error.is::<Contended>());
+        let probe = open(&one.held.path, s.owner()).unwrap();
+        probe.try_lock_shared().unwrap();
+        assert!(matches!(probe.try_lock(), Err(TryLockError::WouldBlock)));
+        let before = turnstile.metadata().unwrap();
+        drop(probe);
+        drop(turnstile);
+        let two = Owned::acquire(&s.0, s.owner(), Mode::Shared, Duration::ZERO).unwrap();
+        assert!(same(&before, &fs::metadata(turnstile_path).unwrap()));
+        assert!(
+            Owned::acquire(&s.0, s.owner(), Mode::Exclusive, Duration::ZERO)
+                .unwrap_err_is_contention()
+        );
+        drop((one, two));
+    }
+
+    #[test]
     fn inherited_actual_holder_death_is_not_replaced_by_live_client_or_stale_record() {
         let s = Scratch::new();
         let sockets = Scratch::temporary();
