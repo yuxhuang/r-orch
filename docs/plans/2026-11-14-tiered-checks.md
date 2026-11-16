@@ -1,5 +1,43 @@
 # Tiered verification checks — plan
 
+## Consolidated diagnostic and isolation completion (2026-11-16)
+
+This authorized completion addresses the remaining narrow integration defects.
+The previous integration snapshot and its failures remain historical evidence;
+no scoped result supplies PR acceptance or closes independent security findings.
+
+- Busy-lease diagnostics use a fallible stderr write and preserve exit 75 even
+  when stderr is closed. The remaining lease last-close unit scenario receives
+  the existing process ownership boundary, with all immediate inode and lock
+  assertions retained and normal parallel test execution unchanged.
+- Capture the daemon diagnostic subscriber unit scenario through the existing
+  test-only capture mechanism, also when the testing feature is disabled.
+  Production diagnostics and Cargo manifests remain unchanged.
+- Both test capture helpers label every child diagnostic line before reporting
+  failure. Child libtest headings remain diagnostic data; the unchanged product
+  inventory must name the failed outer test and the suite must still fail.
+  Retain complete child output, actual status, and all twelve existing inventory
+  regression bodies; verify real red/fixed streams and reverted-render mutants.
+- Audit the capture helper's private HOME before cleanup. Any entry or audit
+  error fails with the child diagnostics retained. Planted HOME writers and AI
+  blocker invocations must fail; no newly discovered writer is exempted.
+- Record and compare the actual child.wait status exactly in the interrupted
+  output-holder fixture. A nonzero status containing zero must be rejected.
+  Only a retained-inode last-close lock grant authorizes subsequent target reuse;
+  neither PID absence nor output EOF establishes cessation.
+
+Verification requires exact-source complete xtask package checks on native Mac
+and Linux, all thirteen affected CLI/daemon binaries and their outer streams,
+feature-off daemon units, meaningful red/fixed/mutant controls, fmt, relevant
+all-target clippy and crate graph checks. Use canonical private scratch and
+normal workload umask under the existing turnstile then cooperative lease.
+No full workspace suite runs in this completion. Final native measurements and
+independent security disposition remain assigned acceptance work. The owner’s
+option3 overlap is accepted, not fixed; FS1, interim D45 and manual-removal risks
+remain separate. RC18 is not reinstated as a precondition. Existing rules and
+owner-only merges stand; no release or PR authority is added.
+
+
 ## Whole-gate repair integration (2026-11-16)
 
 This operative correction carries S1/M1/M2/L3 from the whole-gate assessment;

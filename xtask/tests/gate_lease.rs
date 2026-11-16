@@ -1529,6 +1529,41 @@ fn retain_native_control(
     }
 }
 
+fn require_successful_worker_wait(observed: &str) {
+    assert_eq!(
+        observed, "Some(0)",
+        "actual child.wait status must be success"
+    );
+}
+
+#[test]
+fn output_holder_wait_status_rejects_nonzero_containing_zero() {
+    let actual_success = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap()
+        .wait()
+        .unwrap();
+    require_successful_worker_wait(&format!("{:?}", actual_success.code()));
+    let actual_failure = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 101"])
+        .spawn()
+        .unwrap()
+        .wait()
+        .unwrap();
+    let observed = format!("{:?}", actual_failure.code());
+    assert!(observed.contains('0'));
+    assert!(std::panic::catch_unwind(|| require_successful_worker_wait(&observed)).is_err());
+    let signal = std::process::ExitStatus::from_raw(15);
+    assert!(
+        std::panic::catch_unwind(|| require_successful_worker_wait(&format!(
+            "{:?}",
+            signal.code()
+        )))
+        .is_err()
+    );
+}
+
 fn interrupted_output_holder(tier: &str) {
     use witness::fixture::rust_literal;
     let sandbox = Sandbox::new();
@@ -1544,7 +1579,7 @@ fn controlled_output_holder() {{
     let mut child = std::process::Command::new("/usr/bin/python3")
         .args([{payload}, "holder", {socket}]).spawn().unwrap();
     let status = child.wait().unwrap();
-    std::fs::write({waited}, format!("{{status}}")).unwrap();
+    std::fs::write({waited}, format!("{{:?}}", status.code())).unwrap();
     assert!(status.success());
 }}
 "#,
@@ -1595,7 +1630,7 @@ fn controlled_output_holder() {{
     worker.alive();
     worker.release();
     wait_for(&waited, HANDSHAKE_BUDGET);
-    assert!(fs::read_to_string(waited).unwrap().contains("0"));
+    require_successful_worker_wait(&fs::read_to_string(waited).unwrap());
     require_process_gone(&sandbox, worker.ready["pid"].as_u64().unwrap());
     // Blocking acquisition observes the actual last close. Neither PID absence
     // nor EOF authorizes the reset; no retry of a failed nonblocking assertion.

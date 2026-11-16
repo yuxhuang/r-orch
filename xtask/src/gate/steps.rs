@@ -772,11 +772,66 @@ pub(super) mod tests {
             .unwrap();
         assert!(
             output.status.success(),
-            "isolated description owner failed: {}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "isolated description owner {name} failed ({}):\n{}{}",
+            output.status,
+            labelled_description_output("stdout", &output.stdout),
+            labelled_description_output("stderr", &output.stderr)
         );
         false
+    }
+
+    fn labelled_description_output(stream: &str, bytes: &[u8]) -> String {
+        let text = match std::str::from_utf8(bytes) {
+            Ok(text) => std::borrow::Cow::Borrowed(text),
+            Err(_) => std::borrow::Cow::Owned(format!("{bytes:?}")),
+        };
+        text.split('\n')
+            .map(|line| format!("child {stream} | {line}\n"))
+            .collect()
+    }
+
+    #[test]
+    fn description_owner_failure_fixture() {
+        let name = "gate::steps::tests::description_owner_failure_fixture";
+        if std::env::var("XTASK_DESCRIPTION_NEGATIVE").as_deref() != Ok(name)
+            && std::env::var("XTASK_DESCRIPTION_OWNER").as_deref() != Ok(name)
+        {
+            return;
+        }
+        if !isolated_description_owner(name) {
+            return;
+        }
+        use std::io::Write as _;
+        std::io::stdout()
+            .lock()
+            .write_all(b"DESCRIPTION_STDOUT_DETAIL\n")
+            .unwrap();
+        std::io::stderr()
+            .lock()
+            .write_all(b"DESCRIPTION_STDERR_DETAIL\n")
+            .unwrap();
+        panic!("DESCRIPTION_ASSERTION_DETAIL");
+    }
+
+    #[test]
+    fn description_owner_failure_keeps_child_framing_labelled() {
+        let name = "gate::steps::tests::description_owner_failure_fixture";
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name])
+            .env("XTASK_DESCRIPTION_NEGATIVE", name)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(101), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for detail in [
+            "DESCRIPTION_STDOUT_DETAIL",
+            "DESCRIPTION_STDERR_DETAIL",
+            "DESCRIPTION_ASSERTION_DETAIL",
+        ] {
+            assert!(stdout.contains(detail), "{stdout}");
+        }
+        assert!(stdout.contains("child stdout | failures:"), "{stdout}");
+        assert!(stdout.contains("child stderr | "), "{stdout}");
     }
 
     #[test]

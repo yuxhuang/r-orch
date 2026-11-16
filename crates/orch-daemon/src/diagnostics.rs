@@ -72,6 +72,11 @@ fn effort_warning(error: &str) -> Option<String> {
     None
 }
 
+// The unit scenario also needs capture when the public testing feature is off.
+#[cfg(all(test, not(feature = "testing")))]
+#[path = "testing/output.rs"]
+mod test_output;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +119,15 @@ mod tests {
 
     #[test]
     fn stderr_subscriber_leaves_the_original_event_for_logs_follow() {
+        #[cfg(not(feature = "testing"))]
+        use super::test_output::capture_test_output;
+        #[cfg(feature = "testing")]
+        use crate::testing::capture_test_output;
+        if capture_test_output(
+            "diagnostics::tests::stderr_subscriber_leaves_the_original_event_for_logs_follow",
+        ) {
+            return;
+        }
         let events = EventBus::new();
         let mut follow = events.subscribe();
         attach(&events);

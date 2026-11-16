@@ -427,7 +427,7 @@ pub(super) fn exec_purpose(
     use std::os::unix::process::ExitStatusExt;
     let lease = match Lease::configured(false, Mode::Exclusive, wait) {
         Err(e) if e.is::<Contended>() => {
-            eprintln!("{e}");
+            let _ = writeln!(io::stderr(), "{e}");
             return Ok(75);
         }
         other => other?,
@@ -605,6 +605,11 @@ mod tests {
 
     #[test]
     fn live_contention_and_close_release_preserve_lock_inode() {
+        if !super::super::steps::tests::isolated_description_owner(
+            "gate::lease::tests::live_contention_and_close_release_preserve_lock_inode",
+        ) {
+            return;
+        }
         let s = Scratch::new();
         let lease = Owned::acquire(&s.0, s.owner(), Mode::Exclusive, Duration::ZERO).unwrap();
         let before = fs::metadata(s.0.join("r-orch-gate.lease")).unwrap();
