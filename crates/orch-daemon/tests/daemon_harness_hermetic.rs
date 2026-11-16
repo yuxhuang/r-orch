@@ -742,7 +742,7 @@ fn capture_fixture_output(name: &str) -> std::process::Output {
     if !output.status.success() {
         // The hostile helper retains its failed fixture beneath this TMPDIR.
         // Keep the enclosing fixture too, so this control cannot erase it.
-        root.keep();
+        let _ = root.keep();
     }
     output
 }
