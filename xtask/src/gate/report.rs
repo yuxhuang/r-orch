@@ -197,7 +197,7 @@ impl Redactor {
         // Alternate JSON encodings or a colliding replacement must fail before
         // publication, never produce a decodable credential in an export.
         for line in text.lines() {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(value) = Self::decoded_json(line)? {
                 self.check_json(&value, 0)?;
             }
         }
@@ -210,6 +210,22 @@ impl Redactor {
                 .iter()
                 .any(|(from, to)| *to == "<REDACTED>" && text.contains(from))
     }
+    fn decoded_json(text: &str) -> Result<Option<serde_json::Value>> {
+        match serde_json::from_str(text) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => {
+                // serde_json reports its recursion budget as a syntax error.
+                // Treating that valid but unsupported JSON as plain text can
+                // conceal another encoded string. The pinned parser's error
+                // prefix is covered by an actual over-budget export control.
+                ensure!(
+                    !error.to_string().starts_with("recursion limit exceeded"),
+                    "evidence redaction refused: JSON decoding depth budget"
+                );
+                Ok(None)
+            }
+        }
+    }
     fn check_json_string(&self, text: &str, depth: usize) -> Result<()> {
         ensure!(
             !self.contains_sensitive(text),
@@ -217,11 +233,11 @@ impl Redactor {
         );
         // Tools can print JSON which the build-log wrapper encodes again.
         // Inspect decoded JSON text as well, with a bounded total nesting depth.
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        if let Some(value) = Self::decoded_json(text)? {
             self.check_json(&value, depth + 1)?;
         } else {
             for line in text.lines().filter(|line| *line != text) {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                if let Some(value) = Self::decoded_json(line)? {
                     self.check_json(&value, depth + 1)?;
                 }
             }

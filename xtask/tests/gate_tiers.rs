@@ -447,12 +447,15 @@ exec '{}' "$@"
         .arg(&export)
         .args(["--host-label", secret])
         .env("SYNTHETIC_API_KEY", secret);
-    if secret.starts_with("nested-") {
-        command.env(
-            "SYNTHETIC_ENCODED_VALUE",
-            serde_json::json!({"nested": serde_json::json!({"value": secret}).to_string()})
-                .to_string(),
-        );
+    if secret.starts_with("nested-") || secret.starts_with("deep-") {
+        let json = serde_json::json!({"nested": serde_json::json!({"value": secret}).to_string()})
+            .to_string();
+        let json = if secret.starts_with("deep-") {
+            format!("{}{json}{}", "[".repeat(130), "]".repeat(130))
+        } else {
+            json
+        };
+        command.env("SYNTHETIC_ENCODED_VALUE", json);
     }
     command.env("XTASK_GATE_JUDGE_ID", &expected_judge);
     let output = sandbox.run(&mut command);
@@ -720,4 +723,9 @@ fn retain_export_case(
 #[test]
 fn nested_json_known_secret_refuses_without_partial_export() {
     sensitive_export_case("nested-\"secret\\canary", false, true);
+}
+
+#[test]
+fn json_decode_budget_cannot_hide_a_known_secret_in_export() {
+    sensitive_export_case("deep-\"secret\\canary", false, true);
 }
