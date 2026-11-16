@@ -322,6 +322,11 @@ async fn listener(daemon: &DaemonHarness) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_handshakes_use_the_ready_daemon_before_any_dispatch_tick() {
+    if orch_daemon::testing::capture_test_output(
+        "peer_handshakes_use_the_ready_daemon_before_any_dispatch_tick",
+    ) {
+        return;
+    }
     use orch_peer::codec::read_frame;
     use orch_peer::protocol::Frame;
     use tokio::io::{AsyncWriteExt, BufReader};

@@ -7,6 +7,20 @@ use orch_domain::OrchestratorEvent;
 use orch_engine::container::commit::{CommitSource, CommitStore};
 use orch_proto::ops::args::{DispatchSetArgs, DispatchSwitch};
 
+// Paused-clock lock assertions need to own their filesystem descriptions.
+// Another test's in-flight fork can otherwise retain an index lock until exec;
+// a storage retry then sleeps on the clock that this rig deliberately holds.
+#[cfg(not(feature = "testing"))]
+#[path = "../testing/output.rs"]
+mod test_output;
+
+fn capture_wake_test(name: &str) -> bool {
+    #[cfg(feature = "testing")]
+    return crate::testing::capture_test_output(name);
+    #[cfg(not(feature = "testing"))]
+    test_output::capture_test_output(name)
+}
+
 struct Rig {
     _temp: tempfile::TempDir,
     handler: ServiceHandler,
@@ -335,6 +349,11 @@ async fn empty_context_maintenance_does_not_wake() {
 
 #[tokio::test(start_paused = true)]
 async fn eligible_task_launches_at_500ms_not_the_60s_periodic_deadline() {
+    if capture_wake_test(
+        "dispatch::wake_tests::eligible_task_launches_at_500ms_not_the_60s_periodic_deadline",
+    ) {
+        return;
+    }
     let rig = Rig::new(true).await;
     let task = rig.task(vec![]).await;
     advance(499).await;
@@ -464,6 +483,11 @@ impl Processes {
 
 #[tokio::test(start_paused = true)]
 async fn commits_during_a_tick_schedule_exactly_one_followup() {
+    if capture_wake_test(
+        "dispatch::wake_tests::commits_during_a_tick_schedule_exactly_one_followup",
+    ) {
+        return;
+    }
     let mut rig = Rig::new(true).await;
     rig.task_with(vec![], true, None).await;
     advance(500).await;

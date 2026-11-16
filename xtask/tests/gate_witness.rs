@@ -53,7 +53,7 @@ fn gate_environment_witness() {
 pub mod fixture {
     use std::ffi::{OsStr, OsString};
     use std::fs;
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
     use std::path::{Path, PathBuf};
@@ -587,11 +587,9 @@ def cargo_subcommand(args):
                 } else {
                     "unresolved child lifecycle"
                 };
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "fixture retained: {reason} at {}",
-                    self.temporary.display()
-                );
+                let _ = std::panic::catch_unwind(|| {
+                    eprintln!("fixture retained: {reason} at {}", self.temporary.display());
+                });
                 return;
             }
             let _ = fs::remove_dir_all(&self.temporary);
@@ -970,5 +968,53 @@ fn installed_pin_is_discovered_without_a_private_resource_variable() {
         !output.status.success(),
         "empty Rustup home was bypassed: {}",
         output.text()
+    );
+}
+
+#[test]
+fn fixture_retention_is_captured_with_its_reason_and_path() {
+    let module = module_path!().split_once("::").map(|(_, suffix)| suffix);
+    for (case, reason) in [
+        (
+            "filesystem_sandbox_retains_diagnostics_while_unwinding",
+            "test unwinding",
+        ),
+        (
+            "filesystem_sandbox_retains_diagnostics_when_cleanup_is_unresolved",
+            "unresolved child lifecycle",
+        ),
+    ] {
+        let name = module.map_or_else(|| case.to_owned(), |prefix| format!("{prefix}::{case}"));
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--show-output"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(
+            output.stderr.is_empty(),
+            "uncaptured fixture diagnostic: {output:?}"
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout.contains(&format!("fixture retained: {reason} at /")),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
+fn fixture_retention_failure_fixture() {
+    if std::env::var("XTASK_RETENTION_NEGATIVE").as_deref() != Ok("1") {
+        return;
+    }
+    let sandbox = fixture::Sandbox::filesystem_only();
+    std::fs::write(
+        sandbox.temporary.join("diagnostic"),
+        "retained failure evidence\n",
+    )
+    .unwrap();
+    panic!(
+        "RETENTION_ASSERTION_DETAIL at {}",
+        sandbox.temporary.display()
     );
 }

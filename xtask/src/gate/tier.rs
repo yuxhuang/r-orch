@@ -4,6 +4,7 @@ use super::{
 };
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeMap;
+#[cfg(not(test))]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -606,6 +607,14 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
     let redactor = report::Redactor::new(&repo, &home, &std::env::temp_dir(), hostname.as_deref());
     // Report persistence and teardown do not depend on a terminal reader.
     // In particular, EPIPE must not replace an already observed signal status.
+    #[cfg(test)]
+    let terminal_error = {
+        // Unit callers share libtest's result stream. Native gate subprocesses
+        // still exercise the fallible OS write, including the EPIPE controls.
+        println!("{}", redactor.apply(text.as_bytes())?);
+        None::<std::io::Error>
+    };
+    #[cfg(not(test))]
     let mut terminal_error = writeln!(
         std::io::stdout().lock(),
         "{}",
@@ -619,6 +628,9 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
                 "hostname unavailable; evidence export refused"
             );
             let digest = report::export(&repo, destination, &entries, &redactor)?;
+            #[cfg(test)]
+            println!("evidence manifest: {digest}; qualifying: {qualifying}");
+            #[cfg(not(test))]
             if let Err(error) = writeln!(
                 std::io::stdout().lock(),
                 "evidence manifest: {digest}; qualifying: {qualifying}"
@@ -665,6 +677,28 @@ fn terminal_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unit_tier_report_uses_libtest_capture() {
+        let name = "gate::tests::no_lease_refuses_without_entering_target_lifecycle";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--show-output"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line == format!("test {name} ... ok")),
+            "{stdout}"
+        );
+        let (_, captured) = stdout
+            .split_once(&format!("---- {name} stdout ----\n"))
+            .expect("report captured by libtest");
+        assert!(captured.contains("verdict: REFUSED"), "{stdout}");
+    }
 
     #[test]
     fn terminal_failure_preserves_signal_but_fails_an_ordinary_run() {

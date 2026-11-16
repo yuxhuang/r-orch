@@ -1,5 +1,55 @@
 # 0015. A use of a gate target is finished when the processes the gate started have exited under the cooperative lease
 
+## Bounded Linux test completion (2026-11-16)
+
+The preceding consolidated snapshot is incomplete: native Linux feature-off
+units reported one failed wake case and one unfinished follow-up case before
+owned-child cancellation, three daemon warnings escaped capture, and the xtask
+stream contained 460 complete rows against 465 summary passes. Five unrecognised
+rows are not five failed tests. The wake root cause is initially unestablished;
+no flake or scheduler diagnosis is inferred from those observations.
+
+A bounded native probe reproduced the in-flight stall at a context write.
+A second diagnostic observed its index lock already free while the write stayed
+pending; advancing only one millisecond let the write finish. This identifies
+a paused-clock storage-retry dependency. Cross-test fork inheritance is the
+source-based explanation for transient lock contention, not a directly observed
+historical holder. The earlier eligible-launch assertion text was lost and its
+exact cause remains unestablished. The two lock-sensitive wake scenarios receive
+the existing private-process boundary; original timing and event assertions stay
+unchanged. No diagnostic clock step is retained in their corrected bodies.
+
+This continuation changes tests and test helpers only. Diagnose the wake rig's
+clock, events and await ordering with bounded causal probes before correction.
+Retain the 499/500 ms launch boundary, 60 s fallback distinction, attempt count,
+in-flight tick, exactly one follow-up and no third tick. Use existing safe seams;
+no longer wait, sleep, serialisation, ignored test or production scheduler change.
+Attribute the legacy warning to its actual body before adding capture, and add
+the existing capture to the Linux-only foreign-reservation body. Preserve child
+status, cleanup and full diagnostics, including the private-HOME audit.
+
+Route intentional fixture-retention diagnostics and unit-tier output through
+libtest capture or a private test process. Retain unresolved and panicking scratch
+with its complete reason and path. Never delete an unresolved target or suppress
+production diagnostics. The inventory implementation and integration regression
+file remain byte-identical, including all twelve framing cases. Original raw
+negative/reverted controls must still name the actual failed outer test while
+all complete outer rows reconcile; no transcript rewriting or parser expansion.
+
+After correction freeze source and run one complete native xtask package on each
+host, all thirteen affected CLI/daemon binaries, complete feature-off daemon
+units, original-stream product-inventory audits, fmt, relevant all-target clippy,
+crate graph and advisories. Arrange absolute executable-map/header paths before
+Linux execution. Preserve the five prior correction controls, cumulative body,
+helper and minor ledgers, exact commands/status/source identities and failures.
+No full workspace acceptance suite runs here. A new defect is diagnosed and
+reported without an unchanged package retry. Readiness requires every scoped
+obligation; independent security and final native acceptance remain outstanding.
+
+Option3 recovery overlap remains accepted, not fixed. FS1, interim D45 and manual
+marker removal remain separate; RC18 is not a precondition. Existing check/test
+rules, owner-only merges and all R4/R11/timing/nextest/PR2–6 obligations stand.
+
 ## Consolidated diagnostic and isolation completion (2026-11-16)
 
 This authorized completion addresses the remaining narrow integration defects.

@@ -334,5 +334,10 @@ async fn collector_retry_and_pause_complete_while_foreign_launch_admission_is_he
 #[cfg(target_os = "linux")]
 #[tokio::test(start_paused = true)]
 async fn linux_foreign_launch_reservation_does_not_serialize_fake_daemon_wakes() {
+    if orch_daemon::testing::capture_test_output(
+        "linux_foreign_launch_reservation_does_not_serialize_fake_daemon_wakes",
+    ) {
+        return;
+    }
     coordinate().await;
 }
