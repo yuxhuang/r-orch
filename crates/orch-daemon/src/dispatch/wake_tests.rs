@@ -10,15 +10,11 @@ use orch_proto::ops::args::{DispatchSetArgs, DispatchSwitch};
 // Paused-clock lock assertions need to own their filesystem descriptions.
 // Another test's in-flight fork can otherwise retain an index lock until exec;
 // a storage retry then sleeps on the clock that this rig deliberately holds.
-#[cfg(not(feature = "testing"))]
-#[path = "../testing/output.rs"]
-mod test_output;
-
 fn capture_wake_test(name: &str) -> bool {
     #[cfg(feature = "testing")]
     return crate::testing::capture_test_output(name);
     #[cfg(not(feature = "testing"))]
-    test_output::capture_test_output(name)
+    crate::test_output::capture_test_output(name)
 }
 
 struct Rig {
