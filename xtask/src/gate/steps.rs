@@ -770,8 +770,16 @@ pub(super) mod tests {
             .env("XTASK_DESCRIPTION_OWNER", name)
             .output()
             .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            output.status.success(),
+            output.status.success()
+                && stdout
+                    .lines()
+                    .rev()
+                    .find(|line| line.starts_with("test result:"))
+                    .is_some_and(|line| {
+                        line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                    }),
             "isolated description owner {name} failed ({}):\n{}{}",
             output.status,
             labelled_description_output("stdout", &output.stdout),
@@ -832,6 +840,20 @@ pub(super) mod tests {
         }
         assert!(stdout.contains("child stdout | failures:"), "{stdout}");
         assert!(stdout.contains("child stderr | "), "{stdout}");
+    }
+
+    #[test]
+    fn description_owner_zero_matches_fail_despite_successful_exit() {
+        let failure = std::panic::catch_unwind(|| {
+            isolated_description_owner("gate::steps::tests::missing_exact_description_owner")
+        })
+        .expect_err("zero matching tests must not skip the lock assertions");
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(message.contains("exit status: 0"), "{message}");
+        assert!(
+            message.contains("child stdout | test result: ok. 0 passed;"),
+            "{message}"
+        );
     }
 
     #[test]

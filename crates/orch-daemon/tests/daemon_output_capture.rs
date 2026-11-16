@@ -196,3 +196,17 @@ fn ai_blocker_invocation_fails_capture_even_if_body_accepts_127() {
         "{output:?}"
     );
 }
+
+#[test]
+fn capture_zero_matches_fail_despite_successful_child_exit() {
+    let failure = std::panic::catch_unwind(|| {
+        orch_daemon::testing::capture_test_output("missing_exact_capture_test")
+    })
+    .expect_err("zero matching tests must not skip the scenario");
+    let message = failure.downcast_ref::<String>().unwrap();
+    assert!(message.contains("exit status: 0"), "{message}");
+    assert!(
+        message.contains("child stdout | test result: ok. 0 passed;"),
+        "{message}"
+    );
+}

@@ -37,6 +37,9 @@ mod listener;
 pub mod ops;
 mod peer;
 mod session;
+#[cfg(all(test, not(feature = "testing")))]
+#[path = "testing/output.rs"]
+mod test_output;
 #[cfg(feature = "testing")]
 pub mod testing;
 
