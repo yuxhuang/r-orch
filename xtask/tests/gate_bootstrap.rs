@@ -4,7 +4,7 @@
 mod witness;
 
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use witness::fixture::{
     CARGO_SUBCOMMAND_PY, COMMAND_BUDGET, Capture, HANDSHAKE_BUDGET, Sandbox, backdate, wait_for,
 };
@@ -502,4 +502,116 @@ fn require_parked_worker_exit(sandbox: &Sandbox) {
     let mut command = sandbox.command("/usr/bin/python3");
     command.args(["-c", "import fcntl,os,sys; fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NOFOLLOW); fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)"]).arg(sandbox.root.join("target/.gate-xtask.lock"));
     sandbox.run(&mut command).code(0);
+}
+
+// This forwards to ordinary pinned Cargo and observes its actual output before
+// the wrapper publishes it. No synthetic compiler supplies the positive.
+fn observe_cargo_output(sandbox: &Sandbox) {
+    let forwarder = sandbox.cargo_forwarder();
+    sandbox.script(
+        &sandbox.temporary.join("bin/cargo"),
+        &format!(
+            r#"#!/usr/bin/python3
+import json, os, pathlib, subprocess, sys
+{parser}
+status = subprocess.run([{forwarder:?}] + sys.argv[1:]).returncode
+if status == 0 and cargo_subcommand(sys.argv[1:]) == "build":
+    executable = pathlib.Path(os.environ['CARGO_TARGET_DIR'])/'debug/xtask'
+    m = executable.lstat()
+    aliases = [str(p) for p in (executable.parent/'deps').iterdir() if p.is_file() and (p.stat().st_dev,p.stat().st_ino)==(m.st_dev,m.st_ino)]
+    pathlib.Path({receipt:?}).write_text(json.dumps(dict(links=m.st_nlink,device=m.st_dev,inode=m.st_ino,aliases=aliases)))
+sys.exit(status)
+"#,
+            parser = CARGO_SUBCOMMAND_PY,
+            forwarder = forwarder.to_str().unwrap(),
+            receipt = sandbox.temporary.join("cargo-output.json").to_str().unwrap(),
+        ),
+    );
+}
+
+#[test]
+fn cargo_output_is_published_as_private_single_link_before_completed_stamp() {
+    let sandbox = bootstrap();
+    observe_cargo_output(&sandbox);
+    require_first(&sandbox);
+    let observed: serde_json::Value =
+        serde_json::from_slice(&fs::read(sandbox.temporary.join("cargo-output.json")).unwrap())
+            .unwrap();
+    let path = sandbox.root.join("target/gate-xtask/debug/xtask");
+    let executable = fs::symlink_metadata(&path).unwrap();
+    assert!(executable.is_file());
+    assert_eq!(
+        executable.nlink(),
+        1,
+        "Cargo alias reached the stamped path"
+    );
+    assert_eq!(executable.permissions().mode() & 0o777, 0o700);
+    assert_eq!(fs::symlink_metadata(stamp(&sandbox)).unwrap().nlink(), 1);
+    assert_ne!(executable.ino(), observed["inode"].as_u64().unwrap());
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(
+            observed["links"], 2,
+            "native Cargo hardlink premise changed"
+        );
+        assert!(!observed["aliases"].as_array().unwrap().is_empty());
+    }
+    for alias in observed["aliases"].as_array().unwrap() {
+        assert_eq!(
+            fs::read(alias.as_str().unwrap()).unwrap(),
+            fs::read(&path).unwrap()
+        );
+    }
+}
+
+#[test]
+fn hardlinked_completed_stamp_refuses_and_preserves_its_alias() {
+    let sandbox = bootstrap();
+    require_first(&sandbox);
+    let alias = sandbox.temporary.join("stamp-alias");
+    fs::hard_link(stamp(&sandbox), &alias).unwrap();
+    let original = fs::read(&alias).unwrap();
+    let output = run(&sandbox);
+    output.code(1);
+    output.contains("path link/owner/type refused");
+    assert!(!output.stdout.contains("source_marker=FIRST"));
+    assert_eq!(fs::read(&alias).unwrap(), original);
+    assert_eq!(fs::symlink_metadata(&alias).unwrap().nlink(), 2);
+}
+
+#[test]
+fn special_post_compile_executable_cannot_receive_completed_stamp() {
+    let sandbox = bootstrap();
+    require_first(&sandbox);
+    let real = sandbox.cargo_forwarder();
+    sandbox.script(
+        &sandbox.temporary.join("bin/cargo"),
+        &format!(
+            r#"#!/usr/bin/python3
+import os, pathlib, subprocess, sys
+status = subprocess.run([{real:?}] + sys.argv[1:]).returncode
+if status == 0:
+    path = pathlib.Path(os.environ['CARGO_TARGET_DIR'])/'debug/xtask'
+    path.unlink()
+    os.mkfifo(path, 0o600)
+sys.exit(status)
+"#,
+            real = real.to_str().unwrap()
+        ),
+    );
+    let output = run(&sandbox);
+    output.code(1);
+    output.contains("bootstrap executable owner/type/mode refused");
+    assert!(!stamp(&sandbox).exists());
+}
+
+#[test]
+fn direct_unstamped_judge_run_remains_nonqualifying() {
+    let sandbox = Sandbox::new();
+    sandbox.mini("#[test] fn sample() { assert_eq!(2 + 2, 4); }\n", true);
+    sandbox.suite().code(0);
+    let record = sandbox.result();
+    assert!(witness::fixture::field(&record, "qualifying").starts_with("no"));
+    assert!(record.contains("judge executable is not content-stamped bootstrap output"));
+    assert!(!stamp(&sandbox).exists());
 }

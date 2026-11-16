@@ -47,6 +47,44 @@ def read(path, limit=16*1024*1024):
         b = f.read(limit+1)
     if len(b)>limit: raise RuntimeError('source budget')
     return b
+def publish_executable(expected):
+    # Cargo legitimately hardlinks debug/xtask to debug/deps on Linux. Only
+    # this post-success build output may have aliases; published judge/stamp
+    # and every source input still require single-link regular owned files.
+    executable = boot/'debug/xtask'
+    temporary = boot/'debug/.xtask.publish.tmp'
+    check(executable.parent, 'dir')
+    def candidate():
+        m = executable.lstat()
+        if not stat.S_ISREG(m.st_mode) or m.st_uid != uid or not m.st_mode & stat.S_IXUSR:
+            raise RuntimeError('bootstrap executable owner/type/mode refused')
+        return m
+    def signature(m):
+        return (m.st_dev,m.st_ino,m.st_mode,m.st_uid,m.st_nlink,m.st_size,m.st_mtime_ns,m.st_ctime_ns)
+    before = candidate()
+    fd = os.open(executable,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(fd,'rb') as source:
+        if signature(os.fstat(source.fileno())) != signature(before): raise RuntimeError('bootstrap executable changed')
+        output_fd = os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o700)
+        with os.fdopen(output_fd,'wb') as output:
+            remaining = before.st_size
+            while remaining:
+                chunk = source.read(min(1024*1024,remaining))
+                if not chunk: raise RuntimeError('bootstrap executable truncated')
+                output.write(chunk);remaining -= len(chunk)
+            if source.read(1) or signature(os.fstat(source.fileno())) != signature(before): raise RuntimeError('bootstrap executable changed')
+            output.flush();os.fsync(output.fileno())
+    validate_locks()
+    if signature(candidate()) != signature(before): raise RuntimeError('bootstrap executable replaced')
+    if identity()!=expected: raise RuntimeError('judge-source-id changed during publication')
+    if interrupted: raise RuntimeError('INTERRUPTED before executable publication')
+    check(temporary,'file')
+    os.rename(temporary,executable) # D45 checked-path/by-name interim risk.
+    check(executable,'file')
+    fd=os.open(executable.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
 def git(*args, data=None):
     r = subprocess.run(['git', '-C', str(repo), *args], input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if r.returncode: raise RuntimeError('git input failed: ' + r.stderr.decode(errors='replace'))
@@ -69,7 +107,7 @@ def identity():
             if parent == repo or repo in parent.parents: check(parent,'dir')
         blob=git('hash-object','--stdin',data=read(path)).strip()
         records.append(blob+b' '+encode(p)+b'\n')
-    if not records: raise RuntimeError('empty judge source set')
+    if not {b'xtask/gate.sh',b'Cargo.lock'}.issubset(set(paths)): raise RuntimeError('incomplete judge source set')
     return git('hash-object','--stdin',data=b''.join(records)).strip()
 def lock(path, deadline, code=75):
     if os.path.lexists(path):
@@ -195,6 +233,9 @@ try:
     if interrupted: sys.exit(128+interrupted)
     if status: sys.exit(status if status>0 else 128-status)
     if identity()!=before: raise RuntimeError('judge-source-id changed during bootstrap')
+    publish_executable(before)
+    validate_locks()
+    if identity()!=before: raise RuntimeError('judge-source-id changed after executable publication')
     if interrupted: sys.exit(128+interrupted)
     tmp=boot/'judge-id.tmp'
     fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)

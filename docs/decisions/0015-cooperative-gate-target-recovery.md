@@ -1,5 +1,68 @@
 # 0015. A use of a gate target is finished when the processes the gate started have exited under the cooperative lease
 
+## Whole-gate repair integration (2026-11-16)
+
+This operative correction carries S1/M1/M2/L3 from the whole-gate assessment;
+older implementation results below remain dated historical evidence. It grants
+no PR clearance and changes no requirement or stage in PR2–6. Existing check/test
+requirements and owner-only merges and rule application stand.
+
+- M1: cancellation does not discard an earlier capture/reap failure. The real
+  native finish path applies the same 250ms post-reap EOF deadline after a handled
+  signal. An unresolved collector retains marker and target and cannot publish
+  a record or remove a cold target. Clean cancellation before command creation
+  starts no work. Native last-close fixtures isolate the marker-owning scenario
+  in its own process while keeping original wait, exclusion and reset assertions;
+  unrelated concurrent spawns can otherwise inherit a description before exec.
+- S1: known nonempty sensitive values are redacted in literal, JSON-string and
+  diagnostic-escaped output before export hashing. Recursively decoded JSON
+  keys/values, including JSON text inside another log wrapper, must contain no
+  surviving value. Shorter-than-four-byte or non-UTF8 sensitive values, decoding
+  or nesting budget exhaustion, and unredactable manifest collisions explicitly
+  refuse before export creation. No partial shareable bundle is left. Private
+  local records remain unredacted; unknown secrets are outside this protection.
+- m7: the witness checks the unchanged names-only removal record and every
+  actually removed environment name. Required deliberately restored values are
+  not marked removed. This detects Cargo-home/cwd-ancestor `[env]` reintroduction;
+  arbitrary runners and separately reconfigured descendants remain unqualified.
+  Repository-cwd static-step exposure and ambient Git identity inputs remain
+  distinct disclosed conditions.
+- M2: test-only process capture isolates permitted direct OS diagnostic writers
+  before outer libtest framing, preserving the scenario, real exit/assertions and
+  failure streams. The inventory parser stays fail-closed with all twelve
+  ordinary-framing regression identities. The remaining uncaptured daemon
+  diagnostics unit test is an implementation blocker, not an accepted rate.
+- L3: after successful native Cargo reap and tooling-source recheck, the wrapper
+  copies its owned regular executable through a no-follow descriptor into an
+  exclusive private single-link executable, flushes/synchronizes it, rechecks
+  source/locks/input identity, and publishes it before the completed stamp.
+  Cargo's legitimate executable/deps aliases remain untouched. The judge's
+  strict single-link, owner, path and matching-stamp predicates stay unchanged;
+  arbitrary linked stamps/executables and direct unstamped runs do not qualify.
+  Namespace publication retains the interim D45 checked-path/by-name race.
+
+Implementation remains INCOMPLETE while busy-lease closed-stderr handling, the
+remaining lease last-close fixture and the direct daemon diagnostic unit writer
+need their existing owners' scope disposition. Scoped checks do not supply
+changed-head full-workspace Mac/Linux acceptance. All failures remain retained;
+no test is removed or weakened and no retry-to-green is authorized.
+
+RC18's matrix is replaced **as a precondition** by the owner's option3 decision,
+not universally proved. Any earlier instruction below to keep production recovery
+Unsupported until RC18, or to give commands marker stdin, describes superseded
+implementation history. Current commands get the extra descriptor and preserve
+normal stdin; free same-inode marker recovery under the configured lease is
+implemented. Finite native propagation/reset/last-close and mutation evidence
+remains required. Option3 direct-writer/legacy-use overlap is accepted **not
+fixed**; FS1 escaped/indirect descendants, D45 interim mutation races (revisit
+with the storage backend), and manual marker/cargo-clean removal are separate.
+Never remove an unresolved target to obtain a passing run.
+
+R4 literal-base legacy comparison, actual R11 by-name/doc reconciliation,
+changed-head green Linux and Mac acceptance, idle targets, nextest qualification
+or approved sequential fallback, later slow-test work and PR2–6 remain due.
+
+
 ## Owner-authorized inherited-descriptor recovery (2026-11-15)
 
 The owner chose escalation option 3: “3. i'll accept the risk.” This section
@@ -215,9 +278,8 @@ session values and unknown gate-control values remain redacted.
 
 D45 remains owner-accepted interim checked-path/by-name mutation risk, to revisit
 when storage changes; it is not resolved. FS1 escaped descendants and manual
-cargo-clean/marker removal remain separate residuals. Existing-marker production
-recovery stays unsupported until the complete RC18 command/platform/filesystem
-qualification. Historical launch findings remain owner-set-aside preconditions.
+cargo-clean/marker removal remain separate residuals. Existing-marker production recovery uses the owner-authorized free same-inode
+marker policy above; RC18 is replaced as a precondition, not universally proved. Historical launch findings remain owner-set-aside preconditions.
 The unchanged seven C files are independent reproducers; fixture/contract
 mismatches must be named for their owner, never silently edited here. Whole-gate
 reviews, final-head Linux, Mac/Linux timings, R4/R11 names/counts and nextest's
@@ -716,6 +778,9 @@ claim whole-gate or cross-platform qualification.
 
 ### Native capability result (F2 continuation; incomplete)
 
+Historical implementation result; current capability and RC18 supersession are
+defined by the owner-authorized recovery and whole-gate repair sections above.
+
 Read-only inspection now opens the canonical root one component at a time from
 `/`, then opens `target`, the state directory and the constant build directory
 relative to checked descriptors with no-follow/nonblocking flags. State leaves
@@ -819,6 +884,9 @@ wrapper as evidence for the new lifecycle. No full folded gate, native recovery,
 Linux qualification, timing acceptance or release clearance follows from F3 tests.
 
 ## F4/F5 independent implementation (2026-11-15)
+
+Historical implementation result; current capability and RC18 supersession are
+defined by the owner-authorized recovery and whole-gate repair sections above.
 
 The ordinary-development continuation implements independent folded-suite,
 status/time, inventory, witness, hygiene, real-home metadata and evidence helpers.

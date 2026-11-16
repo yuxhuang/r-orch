@@ -1551,3 +1551,31 @@ lets two writers update the same index at once. `orch mcp` never takes the orche
 Treat a server still running 10 s after its client closed stdin or sent SIGTERM as stuck. Send a call that depends
 on an earlier one only after the earlier call's answer arrives
 ([manual](manual/17-mcp-server.md#results-and-errors)).
+
+
+## Tiered gate evidence during PR1 repair
+
+`./xtask/gate.sh full` is the goal/release gate; `pr` becomes the merge condition
+only after the owner applies the reviewed policy transition. Existing check/test
+requirements still apply. `fast` and later CI/parallel-runner stages are separate.
+Use `qualifying: yes` in verified exact-head evidence; an exit0 or a consistent
+inventory alone is insufficient. A direct unstamped executable cannot qualify.
+The wrapper privately publishes a single-link executable after Cargo success and
+source rechecks before stamping; do not manually copy/unlink output for acceptance.
+
+Handled cancellation retains targets on capture/reap failure or unresolved output.
+Do not delete a busy/unfinished marker or run `cargo clean` to force admission.
+Special target entries and inspection-budget refusals remain fail-closed; preserve
+the target and diagnostics for owner disposition rather than removing it while
+writers are unresolved. Explicit marker removal is an unprevented separate risk.
+
+Share only an exporter-produced, verified bundle. Raw local records are private.
+Known sensitive values shorter than four bytes or unsupported encodings refuse
+report/export; recursive JSON and preparation-budget failures leave no shareable
+partial bundle. Unknown secrets are outside known-value redaction.
+
+Option3 direct-writer/legacy-use overlap is accepted, not repaired. FS1 indirect
+writers and interim D45 checked-path/by-name races remain separate. RC18 was
+replaced as a precondition; finite propagation and last-close observations do not
+prove universal writer cessation. PR1 remains incomplete pending the remaining
+diagnostic/lease repairs, exact-head reviews and native acceptance.

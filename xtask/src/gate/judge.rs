@@ -126,6 +126,44 @@ mod bootstrap_tests {
     use super::*;
     use crate::gate::steps::tests::Scratch;
     #[test]
+    fn arbitrary_hardlinked_stamp_or_executable_remains_nonqualifying() {
+        for component in ["judge-id", "debug/xtask"] {
+            let scratch = Scratch::new();
+            let boot = scratch.0.join("target/gate-xtask");
+            std::fs::create_dir_all(boot.join("debug")).unwrap();
+            let executable = boot.join("debug/xtask");
+            files::write(&executable, b"fixture executable bytes").unwrap();
+            let id = "a".repeat(40);
+            files::write(&boot.join("judge-id"), format!("{id}\n").as_bytes()).unwrap();
+            stamped(&scratch.0, &id, &executable).unwrap();
+            let alias = scratch.0.join("outside-alias");
+            std::fs::hard_link(boot.join(component), &alias).unwrap();
+            let before = std::fs::read(&alias).unwrap();
+            let error = stamped(&scratch.0, &id, &executable).unwrap_err();
+            assert!(error.to_string().contains("structure refused"));
+            assert_eq!(std::fs::read(&alias).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn absent_or_special_executable_cannot_qualify_with_a_matching_stamp() {
+        let scratch = Scratch::new();
+        let boot = scratch.0.join("target/gate-xtask");
+        std::fs::create_dir_all(boot.join("debug")).unwrap();
+        let executable = boot.join("debug/xtask");
+        let id = "a".repeat(40);
+        files::write(&boot.join("judge-id"), format!("{id}\n").as_bytes()).unwrap();
+        assert!(stamped(&scratch.0, &id, &executable).is_err());
+        let _socket = std::os::unix::net::UnixListener::bind(&executable).unwrap();
+        assert!(
+            stamped(&scratch.0, &id, &executable)
+                .unwrap_err()
+                .to_string()
+                .contains("structure refused")
+        );
+    }
+
+    #[test]
     fn stamp_requires_matching_identity_and_executable_and_refuses_links() {
         let scratch = Scratch::new();
         let boot = scratch.0.join("target/gate-xtask");
