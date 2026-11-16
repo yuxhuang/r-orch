@@ -68,7 +68,7 @@ fn hostile_process_with_runtime(name: &str, xdg: bool, body: impl AsyncFnOnce(&P
     if xdg {
         command.env("XDG_RUNTIME_DIR", root.path().join("runtime"));
     }
-    let mut child = command
+    command
         .args(["--exact", name, "--nocapture"])
         .env(CHILD_ROOT, root.path())
         .env("HOME", root.path().join("home"))
@@ -77,17 +77,77 @@ fn hostile_process_with_runtime(name: &str, xdg: bool, body: impl AsyncFnOnce(&P
         .env(
             "ORCHESTRY_GLOBAL_CONFIG_PATH",
             root.path().join("home/global.yml"),
-        )
+        );
+    let (output, timed_out, pid) =
+        capture_hostile_child(&mut command, root.path(), Duration::from_secs(60));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let one_passed = stdout
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("test result:"))
+        .is_some_and(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+    if timed_out || !output.status.success() || !one_passed {
+        let retained = root.keep();
+        panic!(
+            "isolated {name} failed ({}); deadline exceeded: {timed_out}; reaped child: {pid}; fixture retained: {}\n{}{}",
+            output.status,
+            retained.display(),
+            labelled_hostile_output("stdout", &output.stdout),
+            labelled_hostile_output("stderr", &output.stderr),
+        );
+    }
+}
+
+// Files avoid pipe-capacity deadlocks without reader threads that could outlive
+// the deadline. Read both complete streams only after the actual child wait.
+fn capture_hostile_child(
+    command: &mut std::process::Command,
+    root: &Path,
+    timeout: Duration,
+) -> (std::process::Output, bool, u32) {
+    let stdout = root.join("child.stdout");
+    let stderr = root.join("child.stderr");
+    let mut child = command
+        .stdout(std::fs::File::create_new(&stdout).unwrap())
+        .stderr(std::fs::File::create_new(&stderr).unwrap())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+    let pid = child.id();
+    let deadline = Instant::now() + timeout;
+    let timed_out = loop {
+        if child.try_wait().unwrap().is_some() {
+            break false;
+        }
+        if Instant::now() >= deadline {
+            // try_wait and kill race only this exclusively owned child. Always
+            // wait below, including when it exited between those operations.
+            if let Err(error) = child.kill() {
+                assert!(child.try_wait().unwrap().is_some(), "kill child: {error}");
+            }
+            break true;
+        }
         std::thread::sleep(Duration::from_millis(10));
-    }
-    if child.try_wait().unwrap().is_none() {
-        child.kill().unwrap();
-    }
-    assert!(child.wait().unwrap().success(), "isolated {name} failed");
+    };
+    let status = child.wait().unwrap();
+    (
+        std::process::Output {
+            status,
+            stdout: std::fs::read(stdout).unwrap(),
+            stderr: std::fs::read(stderr).unwrap(),
+        },
+        timed_out,
+        pid,
+    )
+}
+
+fn labelled_hostile_output(stream: &str, bytes: &[u8]) -> String {
+    let text = match std::str::from_utf8(bytes) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        Err(_) => std::borrow::Cow::Owned(format!("{bytes:?}")),
+    };
+    text.split('\n')
+        .map(|line| format!("child {stream} | {line}\n"))
+        .collect()
 }
 
 fn options(daemon: &DaemonHarness) -> SpawnOptions {
@@ -651,5 +711,187 @@ fn dispatched_claude_prompt_stays_in_harness_scratch() {
         "dispatched_claude_prompt_stays_in_harness_scratch",
         true,
         async |root| prompt_canary(root, true, true).await,
+    );
+}
+
+// Dormant fixture bodies run only when selected by a parent control or by the
+// hostile helper's exact child. No ambient environment is changed in-process.
+fn capture_fixture_enabled(name: &str) -> bool {
+    std::env::var("ORCH_HERMETIC_CAPTURE_FIXTURE").as_deref() == Ok(name)
+        || std::env::var_os(CHILD_ROOT).is_some()
+}
+
+fn capture_fixture_output(name: &str) -> std::process::Output {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("home")).unwrap();
+    std::fs::write(root.path().join("global.yml"), "{}\n").unwrap();
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name])
+        .env_clear()
+        .env("ORCH_HERMETIC_CAPTURE_FIXTURE", name)
+        .env("HOME", root.path().join("home"))
+        .env("TMPDIR", root.path())
+        .env(
+            "ORCHESTRY_GLOBAL_CONFIG_PATH",
+            root.path().join("global.yml"),
+        )
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(root.path())
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn hostile_concurrent_output_fixture() {
+    let name = "hostile_concurrent_output_fixture";
+    if !capture_fixture_enabled(name) {
+        return;
+    }
+    hostile_process(name, async |_| {
+        use std::io::Write as _;
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut out = std::io::stdout().lock();
+                for _ in 0..256 {
+                    out.write_all(&[b'o'; 4096]).unwrap();
+                }
+                out.write_all(b"\nHOSTILE_STDOUT_END\n").unwrap();
+            });
+            scope.spawn(|| {
+                let mut err = std::io::stderr().lock();
+                for _ in 0..256 {
+                    err.write_all(&[b'e'; 4096]).unwrap();
+                }
+                err.write_all(b"\nHOSTILE_STDERR_END\n").unwrap();
+            });
+        });
+    });
+}
+
+#[test]
+fn hostile_failure_fixture() {
+    let name = "hostile_failure_fixture";
+    if !capture_fixture_enabled(name) {
+        return;
+    }
+    hostile_process(name, async |_| {
+        use std::io::Write as _;
+        std::io::stdout()
+            .lock()
+            .write_all(b"HOSTILE_STDOUT_DETAIL\n")
+            .unwrap();
+        std::io::stderr()
+            .lock()
+            .write_all(b"HOSTILE_STDERR_DETAIL\n")
+            .unwrap();
+        panic!("HOSTILE_ASSERTION_DETAIL");
+    });
+}
+
+#[test]
+fn hostile_zero_match_fixture() {
+    if !capture_fixture_enabled("hostile_zero_match_fixture") {
+        return;
+    }
+    hostile_process("missing_exact_hostile_test", async |_| {
+        panic!("a missing exact name must not run this body");
+    });
+}
+
+#[test]
+fn hostile_concurrent_streams_do_not_enter_outer_framing() {
+    let output = capture_fixture_output("hostile_concurrent_output_fixture");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert!(!stdout.contains("HOSTILE_STDOUT_END"), "{stdout}");
+    assert!(!stdout.contains("HOSTILE_STDERR_END"), "{stdout}");
+    assert_eq!(stdout.matches("test result:").count(), 1, "{stdout}");
+    assert!(
+        stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn hostile_failure_retains_complete_labelled_streams() {
+    let output = capture_fixture_output("hostile_failure_fixture");
+    assert_eq!(output.status.code(), Some(101), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for detail in [
+        "HOSTILE_STDOUT_DETAIL",
+        "HOSTILE_STDERR_DETAIL",
+        "HOSTILE_ASSERTION_DETAIL",
+    ] {
+        assert!(stdout.contains(detail), "{stdout}");
+    }
+    assert!(
+        stdout.contains("child stdout | test result: FAILED."),
+        "{stdout}"
+    );
+    assert!(stdout.contains("child stderr | "), "{stdout}");
+    assert_eq!(stdout.matches("\nfailures:\n").count(), 2, "{stdout}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+}
+
+#[test]
+fn hostile_zero_matches_fail_despite_successful_child_exit() {
+    let output = capture_fixture_output("hostile_zero_match_fixture");
+    assert_eq!(output.status.code(), Some(101), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("child stdout | test result: ok. 0 passed;"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn hostile_capture_deadline_kills_and_reaps_the_owned_child() {
+    use nix::errno::Errno;
+    use nix::sys::wait::waitpid;
+    use nix::unistd::Pid;
+    use std::os::unix::process::ExitStatusExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let mut command = std::process::Command::new("/bin/sleep");
+    command.arg("30").env_clear();
+    let started = Instant::now();
+    let (output, timed_out, pid) =
+        capture_hostile_child(&mut command, root.path(), Duration::from_millis(100));
+    assert!(timed_out, "{output:?}");
+    assert_eq!(output.status.signal(), Some(9), "{output:?}");
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        waitpid(Pid::from_raw(pid.try_into().unwrap()), None),
+        Err(Errno::ECHILD)
+    );
+}
+
+#[test]
+fn hostile_capture_retains_every_concurrent_output_byte() {
+    let root = tempfile::tempdir().unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "hostile_concurrent_output_fixture",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env(CHILD_ROOT, root.path());
+    let (output, timed_out, _) =
+        capture_hostile_child(&mut command, root.path(), Duration::from_secs(60));
+    assert!(!timed_out, "{output:?}");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains(&format!("{}\nHOSTILE_STDOUT_END\n", "o".repeat(256 * 4096))));
+    assert_eq!(
+        stderr,
+        format!("{}\nHOSTILE_STDERR_END\n", "e".repeat(256 * 4096))
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+        "{stdout}"
     );
 }
