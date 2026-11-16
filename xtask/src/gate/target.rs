@@ -4105,7 +4105,6 @@ version = "0.0.0"
                     runner.run(&mut f2_command(&f, "touch must-not-start"))?;
                     Ok(())
                 })
-                .ok()
                 .expect("clean pre-command cancellation must finish");
             let error = outcome.result.unwrap_err();
             let value = serde_json::json!({ "error": format!("{error:#}"),
