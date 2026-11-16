@@ -191,36 +191,59 @@ impl Redactor {
     }
     fn check_sensitive(&self, text: &str) -> Result<()> {
         ensure!(
-            !self.sensitive.iter().any(|s| text.contains(s)),
+            !self.contains_sensitive(text),
             "evidence redaction refused: sensitive value remains"
         );
         // Alternate JSON encodings or a colliding replacement must fail before
         // publication, never produce a decodable credential in an export.
         for line in text.lines() {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-                self.check_json(&value)?;
+                self.check_json(&value, 0)?;
             }
         }
         Ok(())
     }
-    fn check_json(&self, value: &serde_json::Value) -> Result<()> {
+    fn contains_sensitive(&self, text: &str) -> bool {
+        self.sensitive.iter().any(|secret| text.contains(secret))
+            || self
+                .replacements
+                .iter()
+                .any(|(from, to)| *to == "<REDACTED>" && text.contains(from))
+    }
+    fn check_json_string(&self, text: &str, depth: usize) -> Result<()> {
+        ensure!(
+            !self.contains_sensitive(text),
+            "evidence redaction refused: decoded sensitive value remains"
+        );
+        // Tools can print JSON which the build-log wrapper encodes again.
+        // Inspect decoded JSON text as well, with a bounded total nesting depth.
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            self.check_json(&value, depth + 1)?;
+        } else {
+            for line in text.lines().filter(|line| *line != text) {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                    self.check_json(&value, depth + 1)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    fn check_json(&self, value: &serde_json::Value, depth: usize) -> Result<()> {
+        ensure!(
+            depth <= 128,
+            "evidence redaction refused: decoded nesting budget"
+        );
         match value {
-            serde_json::Value::String(s) => ensure!(
-                !self.sensitive.iter().any(|secret| s.contains(secret)),
-                "evidence redaction refused: decoded sensitive value remains"
-            ),
+            serde_json::Value::String(s) => self.check_json_string(s, depth)?,
             serde_json::Value::Array(values) => {
                 for value in values {
-                    self.check_json(value)?;
+                    self.check_json(value, depth + 1)?;
                 }
             }
             serde_json::Value::Object(values) => {
                 for (key, value) in values {
-                    ensure!(
-                        !self.sensitive.iter().any(|secret| key.contains(secret)),
-                        "evidence redaction refused: decoded sensitive value remains"
-                    );
-                    self.check_json(value)?;
+                    self.check_json_string(key, depth)?;
+                    self.check_json(value, depth + 1)?;
                 }
             }
             _ => {}

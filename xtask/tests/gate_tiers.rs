@@ -436,7 +436,7 @@ fn sensitive_child_output() {{
     let real = sandbox.cargo_forwarder();
     sandbox.script(&sandbox.temporary.join("bin/cargo"), &format!(r#"#!/bin/sh
 case " $* " in
-  *" build "*) printf 'build stdout: %s\n' "$SYNTHETIC_API_KEY"; printf 'build stderr: %s\n' "$SYNTHETIC_API_KEY" >&2 ;;
+  *" build "*) printf 'build stdout: %s\n' "$SYNTHETIC_API_KEY"; printf 'build stderr: %s\n' "$SYNTHETIC_API_KEY" >&2; printf '%s\n' "$SYNTHETIC_ENCODED_VALUE" >&2 ;;
   *" --no-run "*) printf 'map stderr: %s\n' "$SYNTHETIC_API_KEY" >&2 ;;
 esac
 exec '{}' "$@"
@@ -447,6 +447,13 @@ exec '{}' "$@"
         .arg(&export)
         .args(["--host-label", secret])
         .env("SYNTHETIC_API_KEY", secret);
+    if secret.starts_with("nested-") {
+        command.env(
+            "SYNTHETIC_ENCODED_VALUE",
+            serde_json::json!({"nested": serde_json::json!({"value": secret}).to_string()})
+                .to_string(),
+        );
+    }
     command.env("XTASK_GATE_JUDGE_ID", &expected_judge);
     let output = sandbox.run(&mut command);
     retain_export_case(&sandbox, &command, &output, &export);
@@ -708,4 +715,9 @@ fn retain_export_case(
             fs::copy(file, path).unwrap();
         }
     }
+}
+
+#[test]
+fn nested_json_known_secret_refuses_without_partial_export() {
+    sensitive_export_case("nested-\"secret\\canary", false, true);
 }
