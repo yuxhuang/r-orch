@@ -12,6 +12,7 @@ publish = false
 # anyhow is allowed in xtask and orch-cli only — never in a library signature.
 anyhow.workspace = true
 clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 # Existing resolved Unix wrapper; native boundary uses only safe descriptor APIs.
 nix = { workspace = true, features = ["fs", "dir", "user", "signal", "process", "hostname"] }

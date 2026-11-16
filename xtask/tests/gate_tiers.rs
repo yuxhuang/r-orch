@@ -797,3 +797,49 @@ fn malformed_fragment_work_budget_refuses_without_partial_export() {
         Some("{x".repeat(20_000)),
     );
 }
+
+fn duplicate_member_payload(second_key: &str, nested: bool) -> String {
+    let secret = "known-\"secret\\canary";
+    let mut hidden = serde_json::json!({secret: [secret]})
+        .to_string()
+        .replace("known-", "known\\u002d");
+    if nested {
+        for _ in 0..3 {
+            hidden = serde_json::json!({"nested": hidden}).to_string();
+        }
+    }
+    format!(
+        r#"diagnostic: {{"duplicate":{},{second_key}:"public"}}"#,
+        serde_json::to_string(&hidden).unwrap()
+    )
+}
+
+#[test]
+fn duplicate_member_secret_refuses_without_partial_export() {
+    sensitive_export_payload_case(
+        "known-\"secret\\canary",
+        false,
+        true,
+        Some(duplicate_member_payload(r#""duplicate""#, false)),
+    );
+}
+
+#[test]
+fn unicode_equal_duplicate_member_secret_refuses_without_partial_export() {
+    sensitive_export_payload_case(
+        "known-\"secret\\canary",
+        false,
+        true,
+        Some(duplicate_member_payload(r#""dupli\u0063ate""#, false)),
+    );
+}
+
+#[test]
+fn nested_encoded_duplicate_member_secret_refuses_without_partial_export() {
+    sensitive_export_payload_case(
+        "known-\"secret\\canary",
+        false,
+        true,
+        Some(duplicate_member_payload(r#""dupli\u0063ate""#, true)),
+    );
+}
