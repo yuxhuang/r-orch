@@ -1048,10 +1048,10 @@ mod tests {
     impl Drop for ShutdownChild {
         fn drop(&mut self) {
             self.stop_and_reap();
-            if std::thread::panicking() {
-                if let Some(capture) = self.capture.take() {
-                    let _ = capture.keep();
-                }
+            if std::thread::panicking()
+                && let Some(capture) = self.capture.take()
+            {
+                let _ = capture.keep();
             }
         }
     }
