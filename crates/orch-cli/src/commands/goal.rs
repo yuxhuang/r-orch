@@ -415,6 +415,11 @@ mod rpc_tests {
 
     #[tokio::test]
     async fn goal_commands_round_trip_updates_transitions_and_coordinated_views() {
+        if orch_daemon::testing::capture_test_output(
+            "commands::goal::rpc_tests::goal_commands_round_trip_updates_transitions_and_coordinated_views",
+        ) {
+            return;
+        }
         let (harness, rpc, ctx) = fixture().await;
         let styles = Styles::plain();
         let owner = agent(&rpc, "owner").await;
@@ -662,6 +667,11 @@ mod rpc_tests {
 
     #[tokio::test]
     async fn context_and_status_round_trip_without_local_state_access() {
+        if orch_daemon::testing::capture_test_output(
+            "commands::goal::rpc_tests::context_and_status_round_trip_without_local_state_access",
+        ) {
+            return;
+        }
         let (harness, rpc, ctx) = fixture().await;
         let styles = Styles::plain();
         context::get(&rpc, &ctx, &styles, "missing").await.unwrap();

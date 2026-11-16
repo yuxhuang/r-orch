@@ -16,6 +16,9 @@
 //! at a short path under `/tmp`, is retained until accepted work drains. Nothing
 //! here dials a daemon the harness did not start.
 
+mod output;
+pub use output::capture_test_output;
+
 use crate::DaemonError;
 use crate::lifecycle::{BringUp, DaemonExit, DispatchMode, Running, internal_context};
 use crate::ops::ServiceHandler;

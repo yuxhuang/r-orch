@@ -311,26 +311,50 @@ async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop, owned: bo
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn successful_probe_is_drained_before_owner_release() {
+    if orch_daemon::testing::capture_test_output("successful_probe_is_drained_before_owner_release")
+    {
+        return;
+    }
     delayed_preparation(false, false, Stop::Shutdown, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_probe_after_disconnect_is_drained_before_owner_release() {
+    if orch_daemon::testing::capture_test_output(
+        "failed_probe_after_disconnect_is_drained_before_owner_release",
+    ) {
+        return;
+    }
     delayed_preparation(true, true, Stop::Shutdown, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_harness_retains_owner_until_preparation_ends() {
+    if orch_daemon::testing::capture_test_output(
+        "dropped_harness_retains_owner_until_preparation_ends",
+    ) {
+        return;
+    }
     delayed_preparation(false, true, Stop::Drop, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_shutdown_retains_owner_until_preparation_ends() {
+    if orch_daemon::testing::capture_test_output(
+        "cancelled_shutdown_retains_owner_until_preparation_ends",
+    ) {
+        return;
+    }
     delayed_preparation(true, false, Stop::CancelShutdown, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dropped_owned_project_retains_guard_inode_until_preparation_ends() {
+    if orch_daemon::testing::capture_test_output(
+        "dropped_owned_project_retains_guard_inode_until_preparation_ends",
+    ) {
+        return;
+    }
     delayed_preparation(false, true, Stop::Drop, true).await;
 }
 

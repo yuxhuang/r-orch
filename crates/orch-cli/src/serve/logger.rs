@@ -910,6 +910,11 @@ mod tests {
 
     #[test]
     fn flush_drops_every_sink_but_stdout() {
+        if orch_daemon::testing::capture_test_output(
+            "serve::logger::tests::flush_drops_every_sink_but_stdout",
+        ) {
+            return;
+        }
         let recorder = Recorder::default();
         let logger = StructuredLogger::new(
             LogFormat::Json,
