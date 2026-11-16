@@ -1,0 +1,22 @@
+Running unittests src/lib.rs (/fixture/target/debug/deps/library-abc)
+running 3 tests
+test zeta ... ok
+running 1 test
+running 1 test
+test zeta ... ok
+test alpha has been running for over 60 seconds
+test alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.02s
+test alpha ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.01s
+test skipped ... ignored, platform-specific reason
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 60.01s
+Doc-tests fixture_lib
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 1 test
+test src/lib.rs - example (line 8) ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+running 1 test
+test src/lib.rs - rejected (line 19) - compile fail ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s

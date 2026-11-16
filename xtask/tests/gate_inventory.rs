@@ -248,3 +248,269 @@ fn consistent_failed_inventory_parses_successfully_while_real_folded_suite_stays
     );
     assert!(witness::fixture::field(&sandbox.result(), "verdict").starts_with("FAILED"));
 }
+
+// Independent controls use invented names and literal expected rows. They guard
+// reconciliation, rather than reproducing the retained workspace's identities.
+const INTERLEAVED: &str = include_str!("fixtures/real_inventory/interleaved.log");
+const INTERLEAVED_ROWS: &str = include_str!("fixtures/real_inventory/interleaved.tsv");
+
+fn interleaved_map() -> String {
+    executable(
+        "fixture",
+        "lib",
+        "fixture-lib",
+        "/fixture/target/debug/deps/library-abc",
+    )
+}
+
+fn reject_interleaved(map: &str, log: &str) {
+    let sandbox = Sandbox::new();
+    // Pair every refusal with the complete positive so unrelated setup failures
+    // cannot satisfy a negative. Refused input must not publish an inventory.
+    inventory(&sandbox, &interleaved_map(), INTERLEAVED, Some(0)).code(0);
+    assert_eq!(
+        fs::read_to_string(sandbox.root.join("rows.tsv")).unwrap(),
+        INTERLEAVED_ROWS
+    );
+    inventory(&sandbox, map, log, Some(0)).code(1);
+    assert!(!sandbox.root.join("rows.tsv").exists());
+}
+
+#[test]
+fn interleaved_helpers_progress_and_split_docs_preserve_literal_outer_rows() {
+    let sandbox = Sandbox::new();
+    inventory(&sandbox, &interleaved_map(), INTERLEAVED, Some(0)).code(0);
+    assert_eq!(
+        fs::read_to_string(sandbox.root.join("rows.tsv")).unwrap(),
+        INTERLEAVED_ROWS
+    );
+}
+
+#[test]
+fn nested_helper_without_redundant_identity_is_refused() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replacen("test zeta ... ok", "test stranger ... ok", 1),
+    );
+}
+
+#[test]
+fn nested_helper_with_conflicting_terminal_status_is_refused() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replacen("test zeta ... ok", "test zeta ... FAILED", 1),
+    );
+}
+
+#[test]
+fn duplicate_outer_row_without_matching_helper_is_refused() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replace("test skipped ...", "test zeta ... ok\ntest skipped ..."),
+    );
+}
+
+#[test]
+fn nested_helper_missing_announcement_is_refused() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replacen("running 1 test\n", "", 1),
+    );
+}
+
+#[test]
+fn nested_helper_missing_summary_is_refused() {
+    reject_interleaved(&interleaved_map(), &INTERLEAVED.replace("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.02s\n", ""));
+}
+
+#[test]
+fn nested_helper_filtered_complement_must_match_outer_count() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replacen("2 filtered out", "1 filtered out", 1),
+    );
+}
+
+#[test]
+fn nested_multi_test_announcement_is_refused() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replacen("running 1 test\n", "running 2 tests\n", 1),
+    );
+}
+
+#[test]
+fn nonterminal_notice_without_named_terminal_is_refused() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replace("test alpha has been", "test absent has been"),
+    );
+}
+
+#[test]
+fn repeated_nonterminal_notice_is_refused() {
+    reject_interleaved(&interleaved_map(), &INTERLEAVED.replace("test alpha has been running for over 60 seconds\n", "test alpha has been running for over 60 seconds\ntest alpha has been running for over 60 seconds\n"));
+}
+
+#[test]
+fn arbitrary_text_cannot_replace_standard_nonterminal_notice() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replace(
+            "has been running for over 60 seconds",
+            "is probably still working",
+        ),
+    );
+}
+
+#[test]
+fn notice_after_its_terminal_row_is_refused() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replace(
+            "test alpha has been running for over 60 seconds",
+            "test zeta has been running for over 60 seconds",
+        ),
+    );
+}
+
+#[test]
+fn split_doc_group_cannot_repeat_a_previous_identity() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replace(
+            "src/lib.rs - rejected (line 19) - compile fail",
+            "src/lib.rs - example (line 8)",
+        ),
+    );
+}
+
+#[test]
+fn split_doc_group_requires_its_own_complete_summary() {
+    let truncated = INTERLEAVED.rsplit_once("test result:").unwrap().0;
+    reject_interleaved(&interleaved_map(), truncated);
+}
+
+#[test]
+fn split_doc_group_count_cannot_be_borrowed_from_another_group() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replace(
+            "running 1 test\ntest src/lib.rs - rejected",
+            "running 2 tests\ntest src/lib.rs - rejected",
+        ),
+    );
+}
+
+#[test]
+fn duplicate_doc_header_is_refused_even_for_disjoint_groups() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replace(
+            "running 1 test\ntest src/lib.rs - rejected",
+            "Doc-tests fixture_lib\nrunning 1 test\ntest src/lib.rs - rejected",
+        ),
+    );
+}
+
+#[test]
+fn ambiguous_normalized_doc_target_is_refused() {
+    let map = interleaved_map()
+        + &executable(
+            "other",
+            "lib",
+            "fixture_lib",
+            "/fixture/target/debug/deps/other-def",
+        );
+    let other = section(
+        "unittests src/lib.rs",
+        "/fixture/target/debug/deps/other-def",
+        "test other ... ok",
+        "ok. 1 passed; 0 failed; 0 ignored",
+    );
+    let log = INTERLEAVED.replace("Doc-tests fixture_lib", &(other + "Doc-tests fixture_lib"));
+    reject_interleaved(&map, &log);
+}
+
+#[test]
+fn unknown_executable_cannot_supply_a_completed_group() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replace("library-abc)", "unknown-def)"),
+    );
+}
+
+#[test]
+fn duplicate_executable_map_entry_is_refused() {
+    reject_interleaved(&(interleaved_map() + &interleaved_map()), INTERLEAVED);
+}
+
+#[test]
+fn unknown_executable_kind_is_refused() {
+    let sandbox = Sandbox::new();
+    require_positive(&sandbox);
+    let (_, log) = passing();
+    let map = executable(
+        "fixture",
+        "unknown-kind",
+        "probe",
+        "/fixture/target/debug/deps/probe-123",
+    );
+    inventory(&sandbox, &map, &log, Some(0)).code(1);
+    assert!(!sandbox.root.join("rows.tsv").exists());
+}
+
+#[test]
+fn missing_mapped_zero_test_executable_is_refused() {
+    let map = interleaved_map()
+        + &executable(
+            "other",
+            "test",
+            "empty",
+            "/fixture/target/debug/deps/empty-def",
+        );
+    reject_interleaved(&map, INTERLEAVED);
+}
+
+#[test]
+fn completed_zero_test_executable_does_not_erase_other_named_rows() {
+    let sandbox = Sandbox::new();
+    let map = interleaved_map()
+        + &executable(
+            "other",
+            "test",
+            "empty",
+            "/fixture/target/debug/deps/empty-def",
+        );
+    let log = INTERLEAVED.to_owned()
+        + &section(
+            "tests/empty.rs",
+            "/fixture/target/debug/deps/empty-def",
+            "",
+            "ok. 0 passed; 0 failed; 0 ignored",
+        );
+    inventory(&sandbox, &map, &log, Some(0)).code(0);
+    assert_eq!(
+        fs::read_to_string(sandbox.root.join("rows.tsv")).unwrap(),
+        INTERLEAVED_ROWS
+    );
+}
+
+#[test]
+fn outer_summary_status_cannot_disagree_with_failed_count() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replace("test result: ok. 2 passed", "test result: FAILED. 2 passed"),
+    );
+}
+
+#[test]
+fn result_duration_and_field_labels_require_standard_grammar() {
+    for log in [
+        INTERLEAVED.replace("finished in 60.01s", "finished in NaNs"),
+        INTERLEAVED.replace("2 passed;", "2 successes;"),
+        INTERLEAVED.replace("0 measured;", "1 measured;"),
+    ] {
+        reject_interleaved(&interleaved_map(), &log);
+    }
+}

@@ -1,0 +1,5 @@
+doc	fixture	fixture-lib	src/lib.rs - example (line 8)	ok
+doc	fixture	fixture-lib	src/lib.rs - rejected (line 19) - compile fail	ok
+lib	fixture	fixture-lib	alpha	ok
+lib	fixture	fixture-lib	skipped	ignored
+lib	fixture	fixture-lib	zeta	ok
