@@ -1477,6 +1477,58 @@ fn leaves_an_explicitly_controlled_output_holder() {{
 // Cargo does not forward gate-only TERM to its test process. The test owns and
 // waits for the protocol worker; last-close is observed separately on the inode
 // opened before TERM, even if a broken finish unlinks the marker pathname.
+fn retain_native_control(
+    tag: &str,
+    output: &witness::fixture::Capture,
+    record: Option<&str>,
+    details: serde_json::Value,
+) {
+    let Some(root) = std::env::var_os("XTASK_NATIVE_CONTROL_EVIDENCE") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    assert!(root.is_absolute() && root.is_dir());
+    assert_eq!(
+        fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let serial = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dest = root.join(format!("{tag}-{}-{serial}", std::process::id()));
+    fs::create_dir(&dest).unwrap();
+    fs::set_permissions(&dest, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(dest.join("stdout"), &output.stdout_bytes).unwrap();
+    fs::write(dest.join("stderr"), &output.stderr_bytes).unwrap();
+    fs::write(
+        dest.join("observation.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "status": output.status.code(), "details": details,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    if let Some(record) = record {
+        fs::write(dest.join("result.txt"), record).unwrap();
+        fn copy(from: &Path, to: &Path) {
+            fs::create_dir(to).unwrap();
+            fs::set_permissions(to, fs::Permissions::from_mode(0o700)).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    copy(&entry.path(), &to.join(entry.file_name()));
+                } else {
+                    assert!(kind.is_file());
+                    fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+                }
+            }
+        }
+        copy(Path::new(field(record, "run-dir")), &dest.join("run"));
+    }
+}
+
 fn interrupted_output_holder(tier: &str) {
     use witness::fixture::rust_literal;
     let sandbox = Sandbox::new();
@@ -1522,6 +1574,15 @@ fn controlled_output_holder() {{
         .root
         .join(format!("target/.gate-state/{name}.record"))
         .exists();
+    retain_native_control(
+        &format!("{tier}-interrupted"),
+        &output,
+        Some(&record),
+        serde_json::json!({
+            "marker_kept": marker_kept, "target_kept": target_kept, "no_record": no_record,
+            "marker_inode": retained.metadata().unwrap().ino(), "worker": worker.ready,
+        }),
+    );
     worker.alive();
     assert!(matches!(
         retained.try_lock(),
@@ -1545,12 +1606,25 @@ fn controlled_output_holder() {{
     assert!(field(&record, "target").starts_with("kept ("), "{record}");
     assert_eq!(field(&record, "target-finished"), "no");
     let successor = successor.expect("unfinished marker was removed");
+    retain_native_control(
+        &format!("{tier}-busy"),
+        &successor,
+        None,
+        serde_json::json!({
+            "worker_wait_observed": true, "same_inode_last_close_granted": true,
+        }),
+    );
     successor.code(1);
     successor.contains("marker lock not granted");
     sandbox.write("fixture/src/lib.rs", "#[test]\nfn sample() {}\n");
-    sandbox
-        .run(&mut sandbox.gate(&[tier, "--part", "suite", "--lease-wait", "0"]))
-        .code(0);
+    let reset = sandbox.run(&mut sandbox.gate(&[tier, "--part", "suite", "--lease-wait", "0"]));
+    retain_native_control(
+        &format!("{tier}-reset"),
+        &reset,
+        Some(&sandbox.result()),
+        serde_json::json!({}),
+    );
+    reset.code(0);
     if tier == "pr" {
         assert_eq!(
             field(&sandbox.result(), "target"),

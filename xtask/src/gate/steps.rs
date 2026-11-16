@@ -972,6 +972,11 @@ pub(super) mod tests {
 
     #[test]
     fn rc18_no_handover_and_explicit_unlock_are_distinguished_from_close() {
+        if !isolated_description_owner(
+            "gate::steps::tests::rc18_no_handover_and_explicit_unlock_are_distinguished_from_close",
+        ) {
+            return;
+        }
         for mode in ["no-handover", "explicit-unlock"] {
             let s = Scratch::new();
             let path = s.0.join("marker");
@@ -1061,6 +1066,11 @@ pub(super) mod tests {
 
     #[test]
     fn rc18_real_pinned_cargo_keeps_marker_stdin_while_building_on_native_filesystem() {
+        if !isolated_description_owner(
+            "gate::steps::tests::rc18_real_pinned_cargo_keeps_marker_stdin_while_building_on_native_filesystem",
+        ) {
+            return;
+        }
         let s = Scratch::new();
         let repo = s.0.join("repo");
         fs::create_dir(&repo).unwrap();

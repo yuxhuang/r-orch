@@ -2809,6 +2809,11 @@ mod tests {
 
     #[test]
     fn native_lifecycle_free_same_inode_marker_resets_and_rebuilds_under_lease() {
+        if !super::super::steps::tests::isolated_description_owner(
+            "gate::target::tests::native_lifecycle_free_same_inode_marker_resets_and_rebuilds_under_lease",
+        ) {
+            return;
+        }
         let f = Fixture::new();
         f2_repo(&f);
         let lease = f2_lease(&f);
@@ -2843,6 +2848,11 @@ mod tests {
 
     #[test]
     fn native_lifecycle_inherited_marker_excludes_until_last_close_then_control_recovers() {
+        if !super::super::steps::tests::isolated_description_owner(
+            "gate::target::tests::native_lifecycle_inherited_marker_excludes_until_last_close_then_control_recovers",
+        ) {
+            return;
+        }
         use super::super::steps::tests::{ChildGuard, Scratch, fixture, ready};
         let f = Fixture::new();
         f2_repo(&f);
