@@ -58,6 +58,8 @@ mod suite;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod tier;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -178,7 +180,8 @@ pub fn run(repo: &Path, args: GateArgs) -> Result<i32> {
                     purpose,
                 },
         }) => {
-            eprintln!(
+            let _ = writeln!(
+                std::io::stderr(),
                 "gate lease purpose (unvalidated): {}",
                 report::diagnostic(purpose.as_bytes())
             );

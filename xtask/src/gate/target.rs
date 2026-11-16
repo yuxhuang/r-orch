@@ -167,27 +167,32 @@ impl NativeUse<'_> {
         // use. Real direct-child reap plus retained marker/lease authority permits
         // finish-only source capture. EOF and an elapsed grace never suffice.
         let interrupted = runner.interrupted().is_some();
-        let direct_reaped = runner.child_reaped();
-        let ordinary_finish = runner.finished();
+        let ordinary_finish = if interrupted {
+            runner.finished_interrupted()
+        } else {
+            runner.finished()
+        };
         let mut statuses = runner.statuses().to_vec();
         statuses.extend_from_slice(runner.probe_statuses());
         drop(runner);
         let captured = (|| {
-            if interrupted && direct_reaped {
+            ordinary_finish?;
+            if interrupted {
                 self.marker.finishing_interrupted.set(true);
                 lease.validate_exclusive()?;
                 self.marker.check_identity()?;
-            } else {
-                ordinary_finish?;
             }
             let mut finish_runner = if interrupted {
                 super::steps::Runner::finish_only(lease, &self.marker)?
             } else {
                 super::steps::Runner::new(lease, &self.marker)?
             };
-            let after = Captured::read(&mut finish_runner, &self.marker.files.root)?;
-            finish_runner.finished()?;
+            let after = Captured::read(&mut finish_runner, &self.marker.files.root);
+            let complete = finish_runner.finished();
             statuses.extend(finish_runner.statuses().iter().cloned());
+            statuses.extend(finish_runner.probe_statuses().iter().cloned());
+            let after = after?;
+            complete?;
             anyhow::ensure!(
                 self.before.boot == after.boot && self.before.toolchain == after.toolchain,
                 "toolchain/boot identity changed; keep marker, no publication"
@@ -1551,92 +1556,6 @@ impl StateFiles {
         marker.lease = Some(lease);
         marker.check_identity()?;
         Ok(marker)
-    }
-}
-
-#[derive(Debug)]
-struct UseOutcome {
-    exits: Vec<std::process::ExitStatus>,
-    publication: Publication,
-    end_ns: i128,
-}
-
-impl Marker<'_> {
-    fn use_warm(
-        &mut self,
-        lease: &super::lease::Lease,
-        commands: &mut [std::process::Command],
-    ) -> anyhow::Result<UseOutcome> {
-        // The caller must have completed protect, target decision, invalidate.
-        // The borrow of self by Runner prevents a publication while it has a
-        // live direct command. Capture failures retain the invalidated marker.
-        anyhow::ensure!(
-            self.phase == Phase::Invalidated && self.files.kind == Kind::Warm,
-            "warm commands before protected target decision/invalidation"
-        );
-        self.enable_signals()?;
-        let mut runner = super::steps::Runner::new(lease, self)?;
-        let captures = (|| {
-            let before = Captured::read(&mut runner, &self.files.root)?;
-            for command in commands {
-                if !runner.run(command)?.success() {
-                    break;
-                }
-            }
-            runner.finished()?;
-            let after = Captured::read(&mut runner, &self.files.root)?;
-            runner.finished()?;
-            anyhow::ensure!(
-                before.toolchain == after.toolchain && before.boot == after.boot,
-                "toolchain/boot identity changed; keep marker, no publication"
-            );
-            let end_ns = i128::try_from(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_nanos(),
-            )?;
-            Ok((before, after, end_ns))
-        })();
-        let exits: Vec<_> = runner.statuses().iter().map(|s| s.exit).collect();
-        let statuses = runner.statuses().to_vec();
-        drop(runner);
-        let result = (|| {
-            let (before, after, end_ns) = captures?;
-            // Re-check the inherited live holder at the publication boundary.
-            lease.validate()?;
-            let publication = self.finish_warm(
-                Finished {
-                    direct_reaped: true,
-                    lease_held: true,
-                    inherited_holder_valid: true,
-                },
-                &before.sources,
-                Current {
-                    root: self.files.root.as_os_str().as_bytes(),
-                    toolchain: &after.toolchain,
-                    boot: Some(after.boot),
-                    sources: &after.sources,
-                },
-                end_ns,
-            )?;
-            Ok((publication, end_ns))
-        })();
-        match result {
-            Ok((publication, end_ns)) => Ok(UseOutcome {
-                exits,
-                publication,
-                end_ns,
-            }),
-            Err(source) => {
-                self.phase = Phase::Failed;
-                Err(UseFailure {
-                    exits,
-                    statuses,
-                    source,
-                }
-                .into())
-            }
-        }
     }
 }
 
@@ -3609,24 +3528,43 @@ version = "0.0.0"
         command
     }
 
+    // Exercise the production admission/use path, including its cancellation
+    // policy; no second test-only implementation of finish/publication.
+    fn f2_native_commands(
+        target: &NativeTarget,
+        lease: &super::super::lease::Lease,
+        commands: &mut [std::process::Command],
+    ) -> anyhow::Result<NativeOutcome<()>> {
+        target.begin(lease)?.run(lease, false, |runner, _| {
+            for command in commands {
+                if !runner.run(command)?.success() {
+                    break;
+                }
+            }
+            Ok(())
+        })
+    }
+
     #[test]
     fn f2_real_normal_and_failed_commands_reap_then_publish_with_actual_boot_and_source() {
         for code in [0, 7] {
             let f = Fixture::new();
             f2_repo(&f);
             let lease = f2_lease(&f);
-            let mut marker = f.files.lock_marker_primitive().unwrap();
-            marker.protect().unwrap();
-            marker.invalidate().unwrap();
+            let target = native_admission(&f.files.root, false, &lease).unwrap();
             let start_ns = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos() as i128;
-            let result = marker
-                .use_warm(&lease, &mut [f2_command(&f, &format!("exit {code}"))])
-                .unwrap();
-            assert_eq!(result.publication, Publication::Record);
-            assert!(result.exits.iter().any(|e| e.code() == Some(code)));
+            let result = f2_native_commands(
+                &target,
+                &lease,
+                &mut [f2_command(&f, &format!("exit {code}"))],
+            )
+            .unwrap();
+            result.result.unwrap();
+            assert_eq!(result.publication, "record published");
+            assert!(result.statuses.iter().any(|s| s.exit.code() == Some(code)));
             assert!(result.end_ns >= start_ns);
             assert!(f.files.check_leaf(Leaf::Marker).unwrap().is_none());
             let Stored::Complete(record) = f.files.read_record().unwrap() else {
@@ -3643,13 +3581,15 @@ version = "0.0.0"
         let f = Fixture::new();
         f2_repo(&f);
         let lease = f2_lease(&f);
-        let mut marker = f.files.lock_marker_primitive().unwrap();
-        marker.protect().unwrap();
-        marker.invalidate().unwrap();
-        let result = marker
-            .use_warm(&lease, &mut [f2_command(&f, "printf changed > added.rs")])
-            .unwrap();
-        assert_eq!(result.publication, Publication::SourceChanged);
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let result = f2_native_commands(
+            &target,
+            &lease,
+            &mut [f2_command(&f, "printf changed > added.rs")],
+        )
+        .unwrap();
+        result.result.unwrap();
+        assert_eq!(result.publication, "no record: source changed");
         assert!(matches!(f.files.read_record().unwrap(), Stored::Missing));
         assert!(f.files.check_leaf(Leaf::Marker).unwrap().is_none());
     }
@@ -3659,20 +3599,18 @@ version = "0.0.0"
         let f = Fixture::new();
         f2_repo(&f);
         let lease = f2_lease(&f);
-        let mut marker = f.files.lock_marker_primitive().unwrap();
-        marker.protect().unwrap();
-        marker.invalidate().unwrap();
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
         // Removing the fixture's .git is an actual identity-command failure.
-        let error = marker
-            .use_warm(&lease, &mut [f2_command(&f, "rm -rf .git")])
-            .unwrap_err();
-        let error = error
+        let error = f2_native_commands(&target, &lease, &mut [f2_command(&f, "rm -rf .git")])
+            .err()
+            .unwrap();
+        let failure = error
             .downcast_ref::<UseFailure>()
             .expect("retained failure status");
-        assert!(error.exits.iter().any(|e| !e.success()));
+        assert!(failure.exits.iter().any(|e| !e.success()));
         assert!(f.files.check_leaf(Leaf::Marker).unwrap().is_some());
         assert!(matches!(f.files.read_record().unwrap(), Stored::Missing));
-        assert!(marker.use_warm(&lease, &mut []).is_err());
+        assert!(f2_native_commands(&target, &lease, &mut []).is_err());
     }
 
     #[test]
@@ -3680,16 +3618,14 @@ version = "0.0.0"
         let f = Fixture::new();
         f2_repo(&f);
         let lease = f2_lease(&f);
-        let mut marker = f.files.lock_marker_primitive().unwrap();
-        marker.protect().unwrap();
-        marker.invalidate().unwrap();
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
         let mut command = std::process::Command::new("/bin/mv");
         command
             .arg(f.base.join("r-orch-gate.lease"))
             .arg(f.base.join("replaced-lease"))
             .env_clear()
             .env("HOME", &f.base);
-        assert!(marker.use_warm(&lease, &mut [command]).is_err());
+        assert!(f2_native_commands(&target, &lease, &mut [command]).is_err());
         assert!(f.files.check_leaf(Leaf::Marker).unwrap().is_some());
         assert!(matches!(f.files.read_record().unwrap(), Stored::Missing));
     }
@@ -3703,6 +3639,11 @@ version = "0.0.0"
 
     #[test]
     fn f2_runner_hands_same_locked_description_to_direct_child_and_preserves_failed_status() {
+        if !super::super::steps::tests::isolated_description_owner(
+            "gate::target::tests::f2_runner_hands_same_locked_description_to_direct_child_and_preserves_failed_status",
+        ) {
+            return;
+        }
         let f = Fixture::new();
         let lease = f2_lease(&f);
         let marker = f.files.lock_marker_primitive().unwrap();
@@ -3743,6 +3684,11 @@ version = "0.0.0"
 
     #[test]
     fn f2_runner_spawn_failure_closes_temporary_inherited_description() {
+        if !super::super::steps::tests::isolated_description_owner(
+            "gate::target::tests::f2_runner_spawn_failure_closes_temporary_inherited_description",
+        ) {
+            return;
+        }
         let f = Fixture::new();
         let lease = f2_lease(&f);
         let marker = f.files.lock_marker_primitive().unwrap();
@@ -3814,12 +3760,10 @@ version = "0.0.0"
             // F3 observes loss while this direct child is still live. Do not
             // release it: a terminal SIGTERM status must prove actual teardown.
         });
-        let mut marker = f.files.lock_marker_primitive().unwrap();
-        marker.protect().unwrap();
-        marker.invalidate().unwrap();
-        let error = marker
-            .use_warm(&lease, std::slice::from_mut(&mut direct))
-            .unwrap_err();
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        let error = f2_native_commands(&target, &lease, std::slice::from_mut(&mut direct))
+            .err()
+            .unwrap();
         killer.join().unwrap();
         let failure = error.downcast_ref::<UseFailure>().unwrap();
         use std::os::unix::process::ExitStatusExt;
@@ -4137,10 +4081,44 @@ version = "0.0.0"
         let f = Fixture::new();
         f2_repo(&f);
         let lease = f2_lease(&f);
-        let mut marker = f.files.lock_marker_primitive().unwrap();
-        marker.protect().unwrap();
-        marker.invalidate().unwrap();
+        let target = native_admission(&f.files.root, false, &lease).unwrap();
+        if mode == "capture-then-signal" {
+            let error = target
+                .begin(&lease)
+                .unwrap()
+                .run(&lease, false, |runner, _| -> anyhow::Result<()> {
+                    let error = runner
+                        .capture(&mut f2_command(&f, "printf over-budget"), 2)
+                        .unwrap_err();
+                    assert!(runner.child_reaped());
+                    fs::write(control.join("ready"), b"ready").unwrap();
+                    while runner.interrupted().is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error)
+                })
+                .err()
+                .expect("capture failure cannot finish after a signal");
+            let value = serde_json::json!({ "error": format!("{error:#}"),
+                "marker": f.files.path(Leaf::Marker).exists(),
+                "record_missing": matches!(f.files.read_record().unwrap(), Stored::Missing) });
+            fs::write(
+                control.join("result.json"),
+                serde_json::to_vec(&value).unwrap(),
+            )
+            .unwrap();
+            return;
+        }
+        let mut marker = if mode == "use-warm" || mode == "loss" {
+            None
+        } else {
+            let mut marker = f.files.lock_marker_primitive().unwrap();
+            marker.protect().unwrap();
+            marker.invalidate().unwrap();
+            Some(marker)
+        };
         if mode == "publication" {
+            let marker = marker.as_mut().unwrap();
             marker.enable_signals().unwrap();
             fs::write(control.join("ready"), b"ready").unwrap();
             while !control.join("release").exists() {
@@ -4208,11 +4186,20 @@ while not (root/'release').exists(): time.sleep(.01)
             return;
         }
         let (error, statuses, finished) = if mode == "use-warm" || mode == "loss" {
-            let error = marker.use_warm(&lease, &mut [command]).unwrap_err();
-            let failure = error.downcast_ref::<UseFailure>().unwrap();
-            (error.to_string(), failure.exits.clone(), false)
+            match f2_native_commands(&target, &lease, &mut [command]) {
+                Ok(outcome) => (
+                    outcome.result.unwrap_err().to_string(),
+                    outcome.statuses.iter().map(|s| s.exit).collect(),
+                    true,
+                ),
+                Err(error) => {
+                    let failure = error.downcast_ref::<UseFailure>().unwrap();
+                    (error.to_string(), failure.exits.clone(), false)
+                }
+            }
         } else {
-            let mut runner = super::super::steps::Runner::new(&lease, &marker).unwrap();
+            let mut runner =
+                super::super::steps::Runner::new(&lease, marker.as_ref().unwrap()).unwrap();
             let result = if mode == "ignore" {
                 runner.run(&mut command).map(|_| Vec::new())
             } else {
@@ -4376,9 +4363,25 @@ while not (root/'release').exists(): time.sleep(.01)
                 fs::read_to_string(holder.control.0.join("caught")).unwrap(),
                 (signal as i32).to_string()
             );
-            assert_eq!(result["marker"], true);
-            assert_eq!(result["record_missing"], true);
+            // Historical name retained. Clean handled cancellation now exercises
+            // production's finish policy, also required by gate_lease controls.
+            assert_eq!(result["marker"], false);
+            assert_eq!(result["record_missing"], false);
         }
+    }
+
+    #[test]
+    fn native_capture_failure_stays_sticky_when_signal_arrives_after_reap() {
+        let mut holder = F3Holder::new("capture-then-signal", false);
+        holder.ready();
+        holder.signal(nix::sys::signal::Signal::SIGTERM);
+        let result = holder.result();
+        assert!(
+            result["error"].as_str().unwrap().contains("capture budget"),
+            "{result}"
+        );
+        assert_eq!(result["marker"], true);
+        assert_eq!(result["record_missing"], true);
     }
 
     #[test]

@@ -37,6 +37,7 @@ pub(super) struct Runner<'a, 'm> {
     probe_statuses: Vec<Status>,
     unreaped_probe: bool,
     failed: bool,
+    interrupted_cleanly: bool,
     failure_detail: Option<String>,
     signals: Option<Signals>,
     kill_end: Option<Instant>,
@@ -78,6 +79,7 @@ impl<'a, 'm> Runner<'a, 'm> {
             probe_statuses: Vec::new(),
             unreaped_probe: false,
             failed: false,
+            interrupted_cleanly: false,
             failure_detail: None,
             signals: if marker.is_none() {
                 Some(Signals::new()?)
@@ -273,6 +275,7 @@ impl<'a, 'm> Runner<'a, 'm> {
 
     fn drive(&mut self, mut capture: Option<&mut dyn Drain>) -> Result<ExitStatus> {
         let mut failure: Option<anyhow::Error> = None;
+        let mut cancellation_only = false;
         let mut grace = None;
         let mut exit = None;
         let mut drain_end = None;
@@ -284,11 +287,13 @@ impl<'a, 'm> Runner<'a, 'm> {
             if failure.is_none() {
                 if let Some(number) = interrupted {
                     failure = Some(anyhow::anyhow!("INTERRUPTED by signal {number}"));
+                    cancellation_only = true;
                 } else if let Err(e) = self.validate() {
                     // Validation may itself deliver a signal through the shared
                     // marker listener. Preserve its number before forwarding;
                     // never translate a late HUP/INT into a spurious TERM.
                     interrupted = self.wait_signal(Duration::ZERO);
+                    cancellation_only = interrupted.is_some();
                     failure = Some(if let Some(number) = interrupted {
                         anyhow::anyhow!("INTERRUPTED by signal {number}")
                     } else {
@@ -303,6 +308,7 @@ impl<'a, 'm> Runner<'a, 'm> {
                 }
                 Ok(None) => {}
                 Err(e) => {
+                    cancellation_only = false;
                     if failure.is_none() {
                         failure = Some(e);
                     }
@@ -310,20 +316,25 @@ impl<'a, 'm> Runner<'a, 'm> {
             }
             if let Some(streams) = capture.as_deref_mut()
                 && let Err(e) = streams.drain()
-                && failure.is_none()
             {
-                failure = Some(e);
+                failure = Some(match failure {
+                    Some(error) if cancellation_only => error.context(e),
+                    Some(error) => error,
+                    None => e,
+                });
+                cancellation_only = false;
             }
             if exit.is_some() {
                 if capture.as_ref().is_none_or(|c| c.eof()) {
                     break;
                 }
-                if Instant::now() >= drain_end.unwrap() || failure.is_some() {
-                    if failure.is_none() {
-                        failure = Some(anyhow::anyhow!(
-                            "capture EOF deadline; descendant may hold output; target kept"
-                        ));
-                    }
+                if Instant::now() >= drain_end.unwrap() {
+                    cancellation_only = false;
+                    let detail = "capture EOF deadline; descendant may hold output; target kept";
+                    failure = Some(match failure {
+                        Some(error) => error.context(detail),
+                        None => anyhow::anyhow!(detail),
+                    });
                     break;
                 }
                 // No signaling here: the leader is already reaped.
@@ -332,6 +343,7 @@ impl<'a, 'm> Runner<'a, 'm> {
                 if grace.is_none() {
                     // Teardown never writes a log or waits for an output pipe.
                     if let Err(e) = self.forward(interrupted.unwrap_or(nix::libc::SIGTERM)) {
+                        cancellation_only = false;
                         failure = Some(failure.unwrap().context(e));
                     }
                     grace = Some(Instant::now() + SIGNAL_GRACE);
@@ -359,6 +371,7 @@ impl<'a, 'm> Runner<'a, 'm> {
         }
         if let Some(e) = failure {
             self.failed = true;
+            self.interrupted_cleanly = cancellation_only && self.child_reaped();
             return Err(e);
         }
         self.validate().inspect_err(|_| self.failed = true)?;
@@ -493,6 +506,20 @@ impl<'a, 'm> Runner<'a, 'm> {
                 .unwrap_or("no causal detail available")
         );
         self.validate()
+    }
+
+    /// Cancellation alone may finish after actual reap and the ordinary output
+    /// drain. Any collection, spawn, authority or reap failure stays sticky.
+    /// NativeUse rechecks lease/marker authority before finish-only capture.
+    pub(super) fn finished_interrupted(&self) -> Result<()> {
+        ensure!(
+            self.child_reaped() && (!self.failed || self.interrupted_cleanly),
+            "interrupted command lifecycle unresolved: {}",
+            self.failure_detail
+                .as_deref()
+                .unwrap_or("direct child not reaped")
+        );
+        Ok(())
     }
 
     pub(super) fn interrupted(&mut self) -> Option<i32> {
@@ -706,6 +733,50 @@ pub(super) mod tests {
         }
     }
 
+    // CLOEXEC does not prevent another test thread's in-flight fork from
+    // copying a locked description before exec. Clearing CLOEXEC for a Runner
+    // handover can also let that unrelated command retain it after exec. Tests
+    // asserting the final close need a process that owns only their lifecycle.
+    // They still run in parallel; every original immediate lock assertion runs
+    // unchanged in the child, without an unlock, retry or delayed probe.
+    pub(crate) fn isolated_description_owner(name: &str) -> bool {
+        if std::env::var("XTASK_DESCRIPTION_OWNER").as_deref() == Ok(name) {
+            return true;
+        }
+        let scratch = Scratch::new();
+        fs::write(scratch.0.join("global.yml"), b"{}\n").unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", name, "--nocapture"]).env_clear();
+        for key in [
+            "PATH",
+            "CARGO_HOME",
+            "RUSTUP_HOME",
+            "RUSTUP_TOOLCHAIN",
+            "RUSTUP_AUTO_INSTALL",
+            "CARGO_NET_OFFLINE",
+            "TMPDIR",
+            "XTASK_F1_PRIVATE_ROOT",
+            "XTASK_F2_PRIVATE_ROOT",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        let output = command
+            .env("HOME", &scratch.0)
+            .env("ORCHESTRY_GLOBAL_CONFIG_PATH", scratch.0.join("global.yml"))
+            .env("XTASK_DESCRIPTION_OWNER", name)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated description owner failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
     #[test]
     fn sampler_failure_fixture() {
         let Some(root) = std::env::var_os("XTASK_PROBE_FAILURE_ROOT").map(PathBuf::from) else {
@@ -853,6 +924,11 @@ pub(super) mod tests {
 
     #[test]
     fn rc7_rc8_holder_kill_frees_machine_lease_but_direct_description_blocks_marker() {
+        if !isolated_description_owner(
+            "gate::steps::tests::rc7_rc8_holder_kill_frees_machine_lease_but_direct_description_blocks_marker",
+        ) {
+            return;
+        }
         let s = Scratch::new();
         let path = s.0.join("marker");
         let marker = OpenOptions::new()
