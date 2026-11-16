@@ -10,6 +10,8 @@ use std::time::Duration;
 pub(super) const MAX_FILES: usize = 32;
 pub(super) const MAX_BUNDLE: usize = 64 * 1024 * 1024;
 const MAX_STRUCTURED: usize = 1024 * 1024;
+// Four maximum log lengths shared by candidate parses, decoded bytes and nodes.
+const MAX_REDACTION_WORK: usize = inventory::MAX_LOG * 4;
 pub(super) const STEPS: &[&str] = &[
     "build",
     "test",
@@ -194,15 +196,64 @@ impl Redactor {
             !self.contains_sensitive(text),
             "evidence redaction refused: sensitive value remains"
         );
-        // Alternate JSON encodings or a colliding replacement must fail before
-        // publication, never produce a decodable credential in an export.
+        // Inspect structured fragments even after ordinary diagnostic prefixes.
+        // The budget is shared across every fragment and decoding layer.
+        let mut work = MAX_REDACTION_WORK;
+        self.check_fragments(text, 0, &mut work)
+    }
+    fn check_fragments(&self, text: &str, depth: usize, work: &mut usize) -> Result<()> {
+        ensure!(
+            depth <= 128,
+            "evidence redaction refused: decoded nesting budget"
+        );
+        Self::charge(work, text.len())?;
+        ensure!(
+            !self.contains_sensitive(text),
+            "evidence redaction refused: decoded sensitive value remains"
+        );
         for line in text.lines() {
-            if let Some(value) = Self::decoded_json(line)? {
-                self.check_json(&value, 0)?;
+            let mut offset = 0;
+            while offset < line.len() {
+                let Some(next) = line.as_bytes()[offset..]
+                    .iter()
+                    .position(|b| matches!(b, b'{' | b'[' | b'"'))
+                else {
+                    break;
+                };
+                offset += next;
+                let fragment = &line[offset..];
+                // Charge the complete candidate before parsing, including failed
+                // candidates, so overlapping malformed fragments cannot cost O(n²).
+                Self::charge(work, fragment.len())?;
+                let mut stream =
+                    serde_json::Deserializer::from_str(fragment).into_iter::<serde_json::Value>();
+                match stream.next() {
+                    Some(Ok(value)) => {
+                        offset += stream.byte_offset();
+                        self.check_json(&value, depth + 1, work)?;
+                    }
+                    Some(Err(error)) => {
+                        // serde_json reports its recursion budget as syntax.
+                        // A prefix must not hide an unsupported structured value.
+                        ensure!(
+                            !error.to_string().starts_with("recursion limit exceeded"),
+                            "evidence redaction refused: JSON decoding depth budget"
+                        );
+                        offset += 1;
+                    }
+                    None => break,
+                }
             }
         }
         Ok(())
     }
+    fn charge(work: &mut usize, bytes: usize) -> Result<()> {
+        *work = work
+            .checked_sub(bytes)
+            .context("evidence redaction refused: JSON inspection work budget")?;
+        Ok(())
+    }
+
     fn contains_sensitive(&self, text: &str) -> bool {
         self.sensitive.iter().any(|secret| text.contains(secret))
             || self
@@ -210,56 +261,23 @@ impl Redactor {
                 .iter()
                 .any(|(from, to)| *to == "<REDACTED>" && text.contains(from))
     }
-    fn decoded_json(text: &str) -> Result<Option<serde_json::Value>> {
-        match serde_json::from_str(text) {
-            Ok(value) => Ok(Some(value)),
-            Err(error) => {
-                // serde_json reports its recursion budget as a syntax error.
-                // Treating that valid but unsupported JSON as plain text can
-                // conceal another encoded string. The pinned parser's error
-                // prefix is covered by an actual over-budget export control.
-                ensure!(
-                    !error.to_string().starts_with("recursion limit exceeded"),
-                    "evidence redaction refused: JSON decoding depth budget"
-                );
-                Ok(None)
-            }
-        }
-    }
-    fn check_json_string(&self, text: &str, depth: usize) -> Result<()> {
-        ensure!(
-            !self.contains_sensitive(text),
-            "evidence redaction refused: decoded sensitive value remains"
-        );
-        // Tools can print JSON which the build-log wrapper encodes again.
-        // Inspect decoded JSON text as well, with a bounded total nesting depth.
-        if let Some(value) = Self::decoded_json(text)? {
-            self.check_json(&value, depth + 1)?;
-        } else {
-            for line in text.lines().filter(|line| *line != text) {
-                if let Some(value) = Self::decoded_json(line)? {
-                    self.check_json(&value, depth + 1)?;
-                }
-            }
-        }
-        Ok(())
-    }
-    fn check_json(&self, value: &serde_json::Value, depth: usize) -> Result<()> {
+    fn check_json(&self, value: &serde_json::Value, depth: usize, work: &mut usize) -> Result<()> {
         ensure!(
             depth <= 128,
             "evidence redaction refused: decoded nesting budget"
         );
+        Self::charge(work, 1)?;
         match value {
-            serde_json::Value::String(s) => self.check_json_string(s, depth)?,
+            serde_json::Value::String(s) => self.check_fragments(s, depth, work)?,
             serde_json::Value::Array(values) => {
                 for value in values {
-                    self.check_json(value, depth + 1)?;
+                    self.check_json(value, depth + 1, work)?;
                 }
             }
             serde_json::Value::Object(values) => {
                 for (key, value) in values {
-                    self.check_json_string(key, depth)?;
-                    self.check_json(value, depth + 1)?;
+                    self.check_fragments(key, depth, work)?;
+                    self.check_json(value, depth + 1, work)?;
                 }
             }
             _ => {}
@@ -1143,6 +1161,74 @@ mod tests {
                 .to_string()
                 .contains("sensitive value remains")
         );
+    }
+
+    #[test]
+    fn benign_prefixed_nested_json_remains_exportable() {
+        let scratch = Scratch::new();
+        let redactor = Redactor {
+            replacements: vec![("known-secret".into(), "<REDACTED>")],
+            sensitive: vec!["known-secret".into()],
+            unsupported_sensitive: false,
+        };
+        let nested = serde_json::json!({"nested": "{\"value\":\"public text\"}"});
+        let wrapped = serde_json::json!({"text": format!("diagnostic: {nested}")}).to_string();
+        let entries = BTreeMap::from([("steps/build.log".into(), wrapped.clone().into_bytes())]);
+        let destination = scratch.0.join("export");
+        export(&scratch.0, &destination, &entries, &redactor).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(destination.join("steps/build.log")).unwrap(),
+            wrapped
+        );
+        assert!(destination.join("MANIFEST").is_file());
+    }
+
+    #[test]
+    fn prefixed_nested_json_is_checked_before_export_creation() {
+        let scratch = Scratch::new();
+        let secret = "known-\"secret\\canary";
+        let redactor = Redactor {
+            replacements: vec![],
+            sensitive: vec![secret.into()],
+            unsupported_sensitive: false,
+        };
+        for layers in [2, 3, 6] {
+            let mut payload = serde_json::json!({"value": secret}).to_string();
+            for _ in 1..layers {
+                payload = serde_json::json!({"nested": payload}).to_string();
+            }
+            let payload = format!("arbitrary diagnostic: {payload} trailing text");
+            let wrapped = serde_json::json!({"text": payload}).to_string();
+            let entries = BTreeMap::from([("steps/build.log".into(), wrapped.into_bytes())]);
+            let destination = scratch.0.join(format!("nested-{layers}"));
+            let error = export(&scratch.0, &destination, &entries, &redactor).unwrap_err();
+            assert!(error.to_string().contains("decoded sensitive"), "{error:#}");
+            assert!(!destination.exists());
+        }
+    }
+
+    #[test]
+    fn prefixed_fragments_enforce_work_and_depth_budgets_before_export_creation() {
+        let scratch = Scratch::new();
+        let redactor = Redactor {
+            replacements: vec![],
+            sensitive: vec!["known-secret".into()],
+            unsupported_sensitive: false,
+        };
+        for (name, payload, reason) in [
+            (
+                "depth",
+                format!("prefix {}0{}", "[".repeat(130), "]".repeat(130)),
+                "depth budget",
+            ),
+            ("work", "{x".repeat(20_000), "work budget"),
+        ] {
+            let entries = BTreeMap::from([("steps/build.log".into(), payload.into_bytes())]);
+            let destination = scratch.0.join(name);
+            let error = export(&scratch.0, &destination, &entries, &redactor).unwrap_err();
+            assert!(error.to_string().contains(reason), "{error:#}");
+            assert!(!destination.exists());
+        }
     }
 
     #[test]

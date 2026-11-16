@@ -389,6 +389,15 @@ fn explicitly_kept_cold_export_is_finished_but_cannot_qualify_or_damage_warm_sib
 
 // Actual native Cargo build/map/test output, never a synthetic success bundle.
 fn sensitive_export_case(secret: &str, failed: bool, refused: bool) {
+    sensitive_export_payload_case(secret, failed, refused, None);
+}
+
+fn sensitive_export_payload_case(
+    secret: &str,
+    failed: bool,
+    refused: bool,
+    payload: Option<String>,
+) {
     let sandbox = Sandbox::new();
     let failure = if failed {
         "panic!(\"intentional suite failure\");"
@@ -447,7 +456,9 @@ exec '{}' "$@"
         .arg(&export)
         .args(["--host-label", secret])
         .env("SYNTHETIC_API_KEY", secret);
-    if secret.starts_with("nested-") || secret.starts_with("deep-") {
+    if let Some(payload) = payload {
+        command.env("SYNTHETIC_ENCODED_VALUE", payload);
+    } else if secret.starts_with("nested-") || secret.starts_with("deep-") {
         let json = serde_json::json!({"nested": serde_json::json!({"value": secret}).to_string()})
             .to_string();
         let json = if secret.starts_with("deep-") {
@@ -728,4 +739,61 @@ fn nested_json_known_secret_refuses_without_partial_export() {
 #[test]
 fn json_decode_budget_cannot_hide_a_known_secret_in_export() {
     sensitive_export_case("deep-\"secret\\canary", false, true);
+}
+
+#[test]
+fn prefixed_double_encoded_secret_refuses_without_partial_export() {
+    let secret = "known-\"secret\\canary";
+    let payload = serde_json::json!({"nested": serde_json::json!({"value": secret}).to_string()});
+    sensitive_export_payload_case(
+        secret,
+        false,
+        true,
+        Some(format!("build-script diagnostic: {payload}")),
+    );
+}
+
+#[test]
+fn deeper_prefixed_escaped_keys_and_values_refuse_without_partial_export() {
+    let secret = "known-\"secret\\canary";
+    // Alternate Unicode escaping prevents fixed literal/escape substitutions.
+    let inner = serde_json::json!({secret: [secret]})
+        .to_string()
+        .replace("known-", "known\\u002d");
+    let mut payload = inner;
+    for _ in 0..4 {
+        payload = serde_json::json!({"nested": payload}).to_string();
+    }
+    sensitive_export_payload_case(
+        secret,
+        false,
+        true,
+        Some(format!(
+            "first {{not json}} then {payload} trailing diagnostic"
+        )),
+    );
+}
+
+#[test]
+fn prefixed_json_depth_refuses_without_partial_export() {
+    sensitive_export_payload_case(
+        "known-\"secret\\canary",
+        false,
+        true,
+        Some(format!(
+            "diagnostic: {}0{}",
+            "[".repeat(130),
+            "]".repeat(130)
+        )),
+    );
+}
+
+#[test]
+fn malformed_fragment_work_budget_refuses_without_partial_export() {
+    sensitive_export_payload_case(
+        "known-\"secret\\canary",
+        false,
+        true,
+        Some("{x".repeat(20_000)),
+    );
 }
