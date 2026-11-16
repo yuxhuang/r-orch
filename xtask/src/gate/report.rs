@@ -114,6 +114,8 @@ pub(super) fn kept(marker: &Path, why: &str) -> String {
 
 pub(super) struct Redactor {
     replacements: Vec<(String, &'static str)>,
+    sensitive: Vec<String>,
+    unsupported_sensitive: bool,
 }
 impl Redactor {
     pub(super) fn new(repo: &Path, home: &Path, temporary: &Path, hostname: Option<&str>) -> Self {
@@ -125,22 +127,48 @@ impl Redactor {
         if let Some(name) = hostname.filter(|s| !s.is_empty()) {
             replacements.push((name.to_owned(), "<HOST>"));
         }
+        let mut sensitive = Vec::new();
+        let mut unsupported_sensitive = false;
         for (name, value) in std::env::vars_os() {
             let name = name.to_string_lossy().to_ascii_uppercase();
-            if (["TOKEN", "SECRET", "PASSWORD", "API_KEY"]
+            if ["TOKEN", "SECRET", "PASSWORD", "API_KEY"]
                 .iter()
                 .any(|part| name.contains(part))
                 || super::hermetic::SESSION.contains(&name.as_str())
-                || (name.starts_with("XTASK_GATE_") && name != "XTASK_GATE_JUDGE_ID"))
-                && let Some(value) = value.to_str().filter(|s| s.len() >= 4)
+                || (name.starts_with("XTASK_GATE_") && name != "XTASK_GATE_JUDGE_ID")
             {
-                replacements.push((value.to_owned(), "<REDACTED>"));
+                match value.to_str() {
+                    Some("") => {}
+                    // Replacing very short values can corrupt identities and
+                    // verdict syntax. Refuse rather than silently omit them.
+                    Some(value) if value.len() < 4 => unsupported_sensitive = true,
+                    Some(value) => {
+                        sensitive.push(value.to_owned());
+                        replacements.push((value.to_owned(), "<REDACTED>"));
+                    }
+                    None => unsupported_sensitive = true,
+                }
             }
         }
+        // Build/map logs are JSON strings; result details use escape_default.
+        // Replace their encoded forms before their literal prefixes/substrings.
+        for (value, to) in replacements.clone() {
+            let json = serde_json::to_string(&value).expect("string serialization");
+            replacements.push((json[1..json.len() - 1].to_owned(), to));
+            replacements.push((value.chars().flat_map(char::escape_default).collect(), to));
+        }
         replacements.sort_by_key(|(s, _)| std::cmp::Reverse(s.len()));
-        Self { replacements }
+        Self {
+            replacements,
+            sensitive,
+            unsupported_sensitive,
+        }
     }
     pub(super) fn apply(&self, bytes: &[u8]) -> Result<String> {
+        ensure!(
+            !self.unsupported_sensitive,
+            "evidence redaction refused: nonempty sensitive value is too short or not UTF-8"
+        );
         let mut text = std::str::from_utf8(bytes)
             .context("evidence is not UTF-8")?
             .to_owned();
@@ -148,7 +176,7 @@ impl Redactor {
             text = text.replace(from, to);
         }
         // Preserve line/tab layout, escape other terminal controls.
-        Ok(text
+        let text: String = text
             .chars()
             .flat_map(|c| {
                 if c.is_control() && !['\n', '\t'].contains(&c) {
@@ -157,7 +185,47 @@ impl Redactor {
                     vec![c]
                 }
             })
-            .collect())
+            .collect();
+        self.check_sensitive(&text)?;
+        Ok(text)
+    }
+    fn check_sensitive(&self, text: &str) -> Result<()> {
+        ensure!(
+            !self.sensitive.iter().any(|s| text.contains(s)),
+            "evidence redaction refused: sensitive value remains"
+        );
+        // Alternate JSON encodings or a colliding replacement must fail before
+        // publication, never produce a decodable credential in an export.
+        for line in text.lines() {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
+                self.check_json(&value)?;
+            }
+        }
+        Ok(())
+    }
+    fn check_json(&self, value: &serde_json::Value) -> Result<()> {
+        match value {
+            serde_json::Value::String(s) => ensure!(
+                !self.sensitive.iter().any(|secret| s.contains(secret)),
+                "evidence redaction refused: decoded sensitive value remains"
+            ),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    self.check_json(value)?;
+                }
+            }
+            serde_json::Value::Object(values) => {
+                for (key, value) in values {
+                    ensure!(
+                        !self.sensitive.iter().any(|secret| key.contains(secret)),
+                        "evidence redaction refused: decoded sensitive value remains"
+                    );
+                    self.check_json(value)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 }
 
@@ -211,6 +279,31 @@ pub(super) fn export(
         entries.keys().all(|s| bundle_name(s)),
         "unexpected evidence file"
     );
+    // Validate the complete copy before creating any externally shareable
+    // directory. A late encoding/redaction failure leaves no partial bundle.
+    let mut redacted = BTreeMap::new();
+    let mut total = 0;
+    for (name, bytes) in entries {
+        let text = redactor.apply(bytes)?;
+        total += text.len();
+        ensure!(
+            text.len() <= inventory::MAX_LOG && total <= MAX_BUNDLE,
+            "redacted evidence budget exceeded"
+        );
+        redacted.insert(name, text);
+    }
+    let mut manifest = String::new();
+    for (name, text) in &redacted {
+        manifest.push_str(&format!("{}  {name}\n", blob(repo, text.as_bytes())?));
+    }
+    let digest = blob(repo, manifest.as_bytes())?;
+    // Manifest names and digests are structural: redact neither. A collision
+    // with sensitive material must refuse the whole export before any write.
+    for structural in [&manifest, &digest, "MANIFEST\nsteps\n"] {
+        redactor
+            .check_sensitive(structural)
+            .context("evidence redaction refused: manifest collision")?;
+    }
     let parent = destination
         .parent()
         .context("evidence parent")?
@@ -224,19 +317,12 @@ pub(super) fn export(
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o700))?;
     std::fs::create_dir(destination.join("steps"))?;
-    let mut manifest = String::new();
-    for (name, bytes) in entries {
-        let text = redactor.apply(bytes)?;
-        ensure!(
-            text.len() <= inventory::MAX_LOG,
-            "redacted evidence budget exceeded"
-        );
+    for (name, text) in redacted {
         files::write(&destination.join(name), text.as_bytes())?;
-        manifest.push_str(&format!("{}  {name}\n", blob(repo, text.as_bytes())?));
     }
     files::write(&destination.join("MANIFEST"), manifest.as_bytes())?;
     files::sync(destination)?;
-    blob(repo, manifest.as_bytes())
+    Ok(digest)
 }
 
 pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<()> {
@@ -945,6 +1031,81 @@ mod tests {
             kept(Path::new("/fixture/marker"), "lease lost").contains("target: kept (lease lost)")
         );
     }
+    #[test]
+    fn export_validates_all_entries_before_creating_a_bundle() {
+        let scratch = Scratch::new();
+        let entries = BTreeMap::from([
+            ("environment.txt".into(), b"safe first entry\n".to_vec()),
+            ("tools.txt".into(), vec![0xff]),
+        ]);
+        let redactor = Redactor {
+            replacements: vec![],
+            sensitive: vec![],
+            unsupported_sensitive: false,
+        };
+        let destination = scratch.0.join("export");
+        assert!(
+            export(&scratch.0, &destination, &entries, &redactor)
+                .unwrap_err()
+                .to_string()
+                .contains("UTF-8")
+        );
+        assert!(!destination.exists(), "late refusal left partial files");
+    }
+
+    #[test]
+    fn sensitive_manifest_names_refuse_without_a_partial_bundle() {
+        let scratch = Scratch::new();
+        let entries = BTreeMap::from([("result.txt".into(), b"safe contents\n".to_vec())]);
+        let redactor = Redactor {
+            replacements: vec![("result.txt".into(), "<REDACTED>")],
+            sensitive: vec!["result.txt".into()],
+            unsupported_sensitive: false,
+        };
+        let destination = scratch.0.join("export");
+        assert!(
+            export(&scratch.0, &destination, &entries, &redactor)
+                .unwrap_err()
+                .to_string()
+                .contains("manifest collision")
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn decoded_json_secret_and_replacement_collision_refuse() {
+        let redactor = Redactor {
+            replacements: vec![("known-secret".into(), "<REDACTED>")],
+            sensitive: vec!["known-secret".into()],
+            unsupported_sensitive: false,
+        };
+        // A valid alternate JSON encoding is checked after literal replacement.
+        for input in [
+            br#"{"nested":[{"text":"known\u002dsecret"}]}"#.as_slice(),
+            br#"{"known\u002dsecret":true}"#.as_slice(),
+        ] {
+            assert!(
+                redactor
+                    .apply(input)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("decoded sensitive")
+            );
+        }
+        let collision = Redactor {
+            replacements: vec![("REDACTED".into(), "<REDACTED>")],
+            sensitive: vec!["REDACTED".into()],
+            unsupported_sensitive: false,
+        };
+        assert!(
+            collision
+                .apply(b"REDACTED")
+                .unwrap_err()
+                .to_string()
+                .contains("sensitive value remains")
+        );
+    }
+
     #[test]
     fn evidence_redacts_paths_and_has_budgets() {
         let r = Redactor::new(

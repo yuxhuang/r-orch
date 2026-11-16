@@ -18,11 +18,17 @@ fn gate_environment_witness() {
         },
         first.display()
     );
+    let removed = std::fs::read_to_string(std::path::Path::new(&directory).join("environment.txt"))
+        .expect("gate supplies environment names");
     let mut names: Vec<_> = std::env::vars_os()
         .map(|(name, _)| name)
         .filter(|name| {
             let bytes = std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str());
-            bytes.starts_with(b"ORCH_") || bytes.starts_with(b"ORCHESTRY_")
+            bytes.starts_with(b"ORCH_")
+                || bytes.starts_with(b"ORCHESTRY_")
+                || removed
+                    .lines()
+                    .any(|line| line.strip_prefix("removed ").map(str::as_bytes) == Some(bytes))
         })
         .collect();
     names.sort();
@@ -851,6 +857,12 @@ fn filesystem_sandbox_retains_diagnostics_when_cleanup_is_unresolved() {
 fn supplied_witness_directory_records_home_redirect_path_and_names_without_values() {
     let sandbox = fixture::Sandbox::new();
     let directory = sandbox.temporary.join("witness-record");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(
+        directory.join("environment.txt"),
+        "removed XDG_CONFIG_HOME\n",
+    )
+    .unwrap();
     let module = module_path!().split_once("::").map(|(_, suffix)| suffix);
     let test = module.map_or_else(
         || "gate_environment_witness".to_owned(),
@@ -860,12 +872,13 @@ fn supplied_witness_directory_records_home_redirect_path_and_names_without_value
     command
         .args(["--exact", &test, "--test-threads=1"])
         .env("XTASK_GATE_WITNESS_DIR", &directory)
+        .env("XDG_CONFIG_HOME", "SECRET_private_xdg")
         .env("ORCH_WEB_PASSWORD", "SECRET_private_password");
     sandbox.run(&mut command).code(0);
     assert_eq!(
         std::fs::read_to_string(directory.join("witness.txt")).unwrap(),
         format!(
-            "schema=1\nhome={}\nglobal_config_redirect=set\npath_first={}\norch_var=ORCHESTRY_GLOBAL_CONFIG_PATH\norch_var=ORCH_WEB_PASSWORD\n",
+            "schema=1\nhome={}\nglobal_config_redirect=set\npath_first={}\norch_var=ORCHESTRY_GLOBAL_CONFIG_PATH\norch_var=ORCH_WEB_PASSWORD\norch_var=XDG_CONFIG_HOME\n",
             sandbox.temporary.join("home").display(),
             sandbox.temporary.join("bin").display()
         )

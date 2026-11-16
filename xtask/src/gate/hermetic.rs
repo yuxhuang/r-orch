@@ -218,7 +218,7 @@ impl Hermetic {
             files::write(&path, script)?;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
         }
-        Ok(Self {
+        let hermetic = Self {
             root,
             home,
             cwd,
@@ -227,7 +227,14 @@ impl Hermetic {
             removed,
             pin: channel.to_owned(),
             env,
-        })
+        };
+        // Reuse the existing names-only record as witness input. Cargo may
+        // reintroduce removed names from its home or cwd-ancestor config.
+        files::write(
+            &hermetic.witness.join("environment.txt"),
+            hermetic.environment().as_bytes(),
+        )?;
+        Ok(hermetic)
     }
     pub(super) fn command(&self, repo: &Path) -> Command {
         let mut command = self.program("cargo");
@@ -259,13 +266,17 @@ impl Hermetic {
         if !path.try_exists()? {
             bail!("witness missing");
         }
+        ensure!(
+            files::text(&self.witness.join("environment.txt"), 64 * 1024)? == self.environment(),
+            "witness mismatch: environment names changed"
+        );
         let text = files::text(&path, 16 * 1024)?;
         let mut fields = BTreeMap::new();
         for line in text.lines() {
             let (key, value) = line.split_once('=').context("witness mismatch: field")?;
             ensure!(
                 key != "orch_var",
-                "witness mismatch: inherited orch variable"
+                "witness mismatch: removed or inherited product variable"
             );
             ensure!(
                 fields.insert(key, value).is_none(),
@@ -317,7 +328,14 @@ impl Hermetic {
     pub(super) fn environment(&self) -> String {
         SET.iter()
             .map(|s| format!("set {s}\n"))
-            .chain(self.removed.iter().map(|s| format!("removed {s}\n")))
+            .chain(
+                self.removed
+                    .iter()
+                    // Required values intentionally restored by this gate are
+                    // set, not removed. No name exception is granted to Cargo.
+                    .filter(|s| !self.env.contains_key(std::ffi::OsStr::new(s.as_str())))
+                    .map(|s| format!("removed {s}\n")),
+            )
             .collect()
     }
     // No Drop deletion: the caller may have an unresolved directly started child.
@@ -345,11 +363,17 @@ mod tests {
             "schema=1\nhome={home}\nglobal_config_redirect={redirect}\npath_first={}\n",
             path.display()
         );
+        let removed = files::text(&Path::new(&directory).join("environment.txt"), 64 * 1024)
+            .expect("gate supplies environment names");
         let mut names: Vec<_> = std::env::vars_os()
             .map(|(k, _)| k)
             .filter(|k| {
                 let s = k.to_string_lossy();
-                s.starts_with("ORCH_") || s.starts_with("ORCHESTRY_")
+                s.starts_with("ORCH_")
+                    || s.starts_with("ORCHESTRY_")
+                    || removed
+                        .lines()
+                        .any(|line| line.strip_prefix("removed ") == Some(s.as_ref()))
             })
             .collect();
         names.sort();
