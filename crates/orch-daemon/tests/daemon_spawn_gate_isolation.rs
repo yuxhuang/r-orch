@@ -323,6 +323,11 @@ async fn coordinate() {
 #[cfg(target_os = "macos")]
 #[tokio::test(start_paused = true)]
 async fn collector_retry_and_pause_complete_while_foreign_launch_admission_is_held() {
+    if orch_daemon::testing::capture_test_output(
+        "collector_retry_and_pause_complete_while_foreign_launch_admission_is_held",
+    ) {
+        return;
+    }
     coordinate().await;
 }
 

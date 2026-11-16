@@ -229,6 +229,11 @@ async fn unknown_message_ack_bursts_do_not_publish() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn read_only_and_conditionally_write_free_bursts_stay_silent_then_real_and_partial_writes_publish()
  {
+    if orch_daemon::testing::capture_test_output(
+        "read_only_and_conditionally_write_free_bursts_stay_silent_then_real_and_partial_writes_publish",
+    ) {
+        return;
+    }
     let (daemon, mut peer) = fixture().await;
     let task = daemon
         .engine()

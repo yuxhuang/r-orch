@@ -244,6 +244,11 @@ async fn link_daemon() -> DaemonHarness {
 /// the commit sequence unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_inbound_peer_message_on_a_link_waits_for_the_held_operation() {
+    if orch_daemon::testing::capture_test_output(
+        "an_inbound_peer_message_on_a_link_waits_for_the_held_operation",
+    ) {
+        return;
+    }
     let daemon = link_daemon().await;
     let mut peer = linked_worker(&daemon).await;
 
@@ -284,6 +289,11 @@ async fn an_inbound_peer_message_on_a_link_waits_for_the_held_operation() {
 /// is free, as its own commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_acknowledgement_on_a_link_waits_for_the_held_operation() {
+    if orch_daemon::testing::capture_test_output(
+        "a_peer_acknowledgement_on_a_link_waits_for_the_held_operation",
+    ) {
+        return;
+    }
     let daemon = link_daemon().await;
     let mut peer = linked_worker(&daemon).await;
     queue(&daemon, "msg_link_out", "agent@probe").await;

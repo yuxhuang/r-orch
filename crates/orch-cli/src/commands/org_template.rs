@@ -749,6 +749,11 @@ mod rpc_tests {
 
     #[tokio::test]
     async fn config_values_and_global_validation_use_the_daemon() {
+        if orch_daemon::testing::capture_test_output(
+            "commands::org_template::rpc_tests::config_values_and_global_validation_use_the_daemon",
+        ) {
+            return;
+        }
         let (harness, rpc) = fixture().await;
         for (raw, expected) in [
             ("5000", json!(5000)),
@@ -1015,6 +1020,11 @@ mod rpc_tests {
 
     #[tokio::test]
     async fn remote_registry_and_preferences_round_trip_via_rpc() {
+        if orch_daemon::testing::capture_test_output(
+            "commands::org_template::rpc_tests::remote_registry_and_preferences_round_trip_via_rpc",
+        ) {
+            return;
+        }
         let (harness, rpc) = fixture().await;
         let ctx = CliContext::new(
             harness.project_root().to_path_buf(),
