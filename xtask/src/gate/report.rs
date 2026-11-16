@@ -1,6 +1,7 @@
 //! Real verdicts/statuses, fixed lifecycle diagnostics, bounded evidence.
 use super::{files, inventory};
 use anyhow::{Context, Result, ensure};
+use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -112,6 +113,78 @@ pub(super) fn kept(marker: &Path, why: &str) -> String {
         "target: kept ({why})\nqualifying: no: {why}\n{}",
         marker_detail(marker, None)
     )
+}
+
+// serde_json::Value collapses equal decoded object keys. Retain every member
+// until inspection has checked it, including members hidden by later duplicates.
+enum InspectedJson {
+    Scalar,
+    String(String),
+    Array(Vec<Self>),
+    Object(Vec<(String, Self)>),
+}
+impl<'de> Deserialize<'de> for InspectedJson {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct InspectVisitor;
+        impl<'de> Visitor<'de> for InspectVisitor {
+            type Value = InspectedJson;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON value")
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> {
+                Ok(InspectedJson::Scalar)
+            }
+            fn visit_bool<E: serde::de::Error>(
+                self,
+                _: bool,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(InspectedJson::Scalar)
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> std::result::Result<Self::Value, E> {
+                Ok(InspectedJson::Scalar)
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> std::result::Result<Self::Value, E> {
+                Ok(InspectedJson::Scalar)
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> std::result::Result<Self::Value, E> {
+                Ok(InspectedJson::Scalar)
+            }
+            fn visit_str<E: serde::de::Error>(
+                self,
+                value: &str,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(InspectedJson::String(value.to_owned()))
+            }
+            fn visit_string<E: serde::de::Error>(
+                self,
+                value: String,
+            ) -> std::result::Result<Self::Value, E> {
+                Ok(InspectedJson::String(value))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element()? {
+                    values.push(value);
+                }
+                Ok(InspectedJson::Array(values))
+            }
+            fn visit_map<A: MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut members = Vec::new();
+                while let Some(member) = map.next_entry()? {
+                    members.push(member);
+                }
+                Ok(InspectedJson::Object(members))
+            }
+        }
+        deserializer.deserialize_any(InspectVisitor)
+    }
 }
 
 pub(super) struct Redactor {
@@ -226,7 +299,7 @@ impl Redactor {
                 // candidates, so overlapping malformed fragments cannot cost O(n²).
                 Self::charge(work, fragment.len())?;
                 let mut stream =
-                    serde_json::Deserializer::from_str(fragment).into_iter::<serde_json::Value>();
+                    serde_json::Deserializer::from_str(fragment).into_iter::<InspectedJson>();
                 match stream.next() {
                     Some(Ok(value)) => {
                         offset += stream.byte_offset();
@@ -261,20 +334,20 @@ impl Redactor {
                 .iter()
                 .any(|(from, to)| *to == "<REDACTED>" && text.contains(from))
     }
-    fn check_json(&self, value: &serde_json::Value, depth: usize, work: &mut usize) -> Result<()> {
+    fn check_json(&self, value: &InspectedJson, depth: usize, work: &mut usize) -> Result<()> {
         ensure!(
             depth <= 128,
             "evidence redaction refused: decoded nesting budget"
         );
         Self::charge(work, 1)?;
         match value {
-            serde_json::Value::String(s) => self.check_fragments(s, depth, work)?,
-            serde_json::Value::Array(values) => {
+            InspectedJson::String(s) => self.check_fragments(s, depth, work)?,
+            InspectedJson::Array(values) => {
                 for value in values {
                     self.check_json(value, depth + 1, work)?;
                 }
             }
-            serde_json::Value::Object(values) => {
+            InspectedJson::Object(values) => {
                 for (key, value) in values {
                     self.check_fragments(key, depth, work)?;
                     self.check_json(value, depth + 1, work)?;
@@ -1205,6 +1278,45 @@ mod tests {
             assert!(error.to_string().contains("decoded sensitive"), "{error:#}");
             assert!(!destination.exists());
         }
+    }
+
+    fn duplicate_member_export_case(second_key: &str, nested: bool) {
+        let scratch = Scratch::new();
+        let redactor = Redactor {
+            replacements: vec![],
+            sensitive: vec!["known-secret".into()],
+            unsupported_sensitive: false,
+        };
+        let hidden = if nested {
+            serde_json::to_string(r#"{"known\u002dsecret":"known\u002dsecret"}"#).unwrap()
+        } else {
+            r#""known\u002dsecret""#.into()
+        };
+        let payload = format!(r#"diagnostic: {{"duplicate":{hidden},{second_key}:"public"}}"#);
+        let wrapped = serde_json::json!({"text": payload}).to_string();
+        let entries = BTreeMap::from([
+            ("environment.txt".into(), b"safe first entry\n".to_vec()),
+            ("steps/build.log".into(), wrapped.into_bytes()),
+        ]);
+        let destination = scratch.0.join("export");
+        let error = export(&scratch.0, &destination, &entries, &redactor).unwrap_err();
+        assert!(error.to_string().contains("decoded sensitive"), "{error:#}");
+        assert!(!destination.exists(), "duplicate member left partial files");
+    }
+
+    #[test]
+    fn duplicate_members_are_checked_before_export_creation() {
+        duplicate_member_export_case(r#""duplicate""#, false);
+    }
+
+    #[test]
+    fn unicode_equal_duplicate_members_are_checked_before_export_creation() {
+        duplicate_member_export_case(r#""dupli\u0063ate""#, false);
+    }
+
+    #[test]
+    fn nested_encoded_duplicate_members_are_checked_before_export_creation() {
+        duplicate_member_export_case(r#""dupli\u0063ate""#, true);
     }
 
     #[test]
