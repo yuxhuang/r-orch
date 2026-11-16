@@ -514,3 +514,19 @@ fn result_duration_and_field_labels_require_standard_grammar() {
         reject_interleaved(&interleaved_map(), &log);
     }
 }
+
+#[test]
+fn unknown_terminal_status_cannot_be_treated_as_success() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replace(" ... ok", " ... success"),
+    );
+}
+
+#[test]
+fn noninteger_announced_count_cannot_be_normalized_into_an_integer() {
+    reject_interleaved(
+        &interleaved_map(),
+        &INTERLEAVED.replace("running 3 tests", "running 3.0 tests"),
+    );
+}
