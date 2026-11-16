@@ -530,3 +530,233 @@ fn noninteger_announced_count_cannot_be_normalized_into_an_integer() {
         &INTERLEAVED.replace("running 3 tests", "running 3.0 tests"),
     );
 }
+
+// Exact physical-line shapes from the original ordinary transcript. The
+// executable identities below are synthetic; neither input is preprocessed.
+const SPLIT_RESULT: &str = "test routing::tests::a_flag_value_can_be_mistaken_for_the_subcommand_even_though_it_is_not_a_command ... orchestry 1.0.0\nok";
+const SUFFIX_RESULT: &str = "test explicit_shutdown_unpublishes_the_inbound_controller ... ok  ⚠ orchestrator:error (details omitted from daemon stderr; use orch logs --follow)";
+
+fn framing_log(lines: &str, summary: &str) -> String {
+    format!(
+        "Running tests/probe.rs (/fixture/target/debug/deps/probe-123)\nrunning 2 tests\n{lines}\ntest untouched ... ok\ntest result: {summary}; 0 measured; 0 filtered out; finished in 0.00s\n"
+    )
+}
+
+fn framing_positive(sandbox: &Sandbox, lines: &str, name: &str) {
+    let (map, _) = passing();
+    inventory(
+        sandbox,
+        &map,
+        &framing_log(lines, "ok. 2 passed; 0 failed; 0 ignored"),
+        Some(0),
+    )
+    .code(0);
+    assert_eq!(
+        fs::read_to_string(sandbox.root.join("rows.tsv")).unwrap(),
+        format!("test\tfixture\tprobe\t{name}\tok\ntest\tfixture\tprobe\tuntouched\tok\n")
+    );
+}
+
+fn reject_framing(lines: &str) {
+    let sandbox = Sandbox::new();
+    framing_positive(
+        &sandbox,
+        SPLIT_RESULT,
+        "routing::tests::a_flag_value_can_be_mistaken_for_the_subcommand_even_though_it_is_not_a_command",
+    );
+    let (map, _) = passing();
+    inventory(
+        &sandbox,
+        &map,
+        &framing_log(lines, "ok. 2 passed; 0 failed; 0 ignored"),
+        Some(0),
+    )
+    .code(1);
+    assert!(!sandbox.root.join("rows.tsv").exists());
+}
+
+#[test]
+fn ordinary_framing_split_version_preserves_exact_identity() {
+    let sandbox = Sandbox::new();
+    framing_positive(
+        &sandbox,
+        SPLIT_RESULT,
+        "routing::tests::a_flag_value_can_be_mistaken_for_the_subcommand_even_though_it_is_not_a_command",
+    );
+}
+
+#[test]
+fn ordinary_framing_suffix_warning_preserves_exact_identity() {
+    framing_positive(
+        &Sandbox::new(),
+        SUFFIX_RESULT,
+        "explicit_shutdown_unpublishes_the_inbound_controller",
+    );
+}
+
+#[test]
+fn ordinary_framing_split_failed_and_ignored_are_not_successes() {
+    let sandbox = Sandbox::new();
+    let (map, _) = passing();
+    framing_positive(
+        &sandbox,
+        SPLIT_RESULT,
+        "routing::tests::a_flag_value_can_be_mistaken_for_the_subcommand_even_though_it_is_not_a_command",
+    );
+    for (terminal, summary, exit, status) in [
+        (
+            "FAILED",
+            "FAILED. 1 passed; 1 failed; 0 ignored",
+            101,
+            "failed",
+        ),
+        (
+            "ignored, requires a service",
+            "ok. 1 passed; 0 failed; 1 ignored",
+            0,
+            "ignored",
+        ),
+    ] {
+        let lines = format!("test actual ... orchestry 1.0.0\n{terminal}");
+        let log = framing_log(&lines, summary);
+        inventory(&sandbox, &map, &log, Some(exit)).code(0);
+        assert_eq!(
+            fs::read_to_string(sandbox.root.join("rows.tsv")).unwrap(),
+            format!(
+                "test\tfixture\tprobe\tactual\t{status}\ntest\tfixture\tprobe\tuntouched\tok\n"
+            )
+        );
+        inventory(&sandbox, &map, &log, Some(if exit == 0 { 101 } else { 0 })).code(1);
+        assert!(!sandbox.root.join("rows.tsv").exists());
+    }
+}
+
+#[test]
+fn ordinary_framing_failed_warning_preserves_failure_and_summary_checks() {
+    let sandbox = Sandbox::new();
+    let (map, _) = passing();
+    framing_positive(
+        &sandbox,
+        SUFFIX_RESULT,
+        "explicit_shutdown_unpublishes_the_inbound_controller",
+    );
+    let lines = SUFFIX_RESULT.replace(" ... ok", " ... FAILED");
+    let log = framing_log(&lines, "FAILED. 1 passed; 1 failed; 0 ignored");
+    inventory(&sandbox, &map, &log, Some(101)).code(0);
+    assert!(
+        fs::read_to_string(sandbox.root.join("rows.tsv"))
+            .unwrap()
+            .contains("explicit_shutdown_unpublishes_the_inbound_controller\tfailed\n")
+    );
+    for (log, exit) in [
+        (log.clone(), 0),
+        (log.replace("FAILED. 1 passed", "ok. 1 passed"), 101),
+        (log.replace("1 passed; 1 failed", "2 passed; 0 failed"), 101),
+    ] {
+        inventory(&sandbox, &map, &log, Some(exit)).code(1);
+        assert!(!sandbox.root.join("rows.tsv").exists());
+    }
+}
+
+#[test]
+fn ordinary_framing_unknown_status_or_arbitrary_chatter_is_refused() {
+    for text in [
+        "success",
+        "ok garbage",
+        "okFAILED",
+        "FAILED ok",
+        "orchestry",
+        "orchestry 1.0",
+        "orchestry 1.0.0 extra",
+        "orchestry 1.x.0",
+        "arbitrary output",
+    ] {
+        reject_framing(&format!("test actual ... {text}\nok"));
+    }
+}
+
+#[test]
+fn ordinary_framing_suffix_requires_the_complete_diagnostic_frame() {
+    for text in [
+        "ok warning",
+        "ok  ⚠ something else",
+        "ok  ⚠",
+        "ok\t⚠ orchestrator:error",
+        "ok  test forged ... FAILED",
+        "ok  FAILED",
+    ] {
+        reject_framing(&format!("test actual ... {text}"));
+    }
+    reject_framing(&(SUFFIX_RESULT.to_owned() + " extra"));
+}
+
+#[test]
+fn ordinary_framing_split_cannot_search_past_any_physical_line() {
+    for gap in [
+        "\n",
+        "other output\n",
+        "test other ... ok\n",
+        "test actual has been running for over 60 seconds\n",
+        "running 1 test\n",
+        "failures:\n",
+        "Doc-tests fixture\n",
+        "Running tests/other.rs (/other)\n",
+        "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n",
+    ] {
+        reject_framing(&format!("test actual ... orchestry 1.0.0\n{gap}ok"));
+    }
+}
+
+#[test]
+fn ordinary_framing_split_requires_one_exact_unindented_terminal() {
+    for terminal in [
+        "",
+        " ok",
+        "ok extra",
+        "ok  ⚠ orchestrator:error (details omitted from daemon stderr; use orch logs --follow)",
+        "success",
+        "ok\nok",
+        "FAILED\nok",
+        "ignored\nok",
+    ] {
+        reject_framing(&format!("test actual ... orchestry 1.0.0\n{terminal}"));
+    }
+    reject_framing("test actual ... orchestry 1.0.0");
+}
+
+#[test]
+fn ordinary_framing_split_eof_cannot_publish_partial_inventory() {
+    let sandbox = Sandbox::new();
+    framing_positive(
+        &sandbox,
+        SPLIT_RESULT,
+        "routing::tests::a_flag_value_can_be_mistaken_for_the_subcommand_even_though_it_is_not_a_command",
+    );
+    let (map, _) = passing();
+    let log = framing_log(
+        "test actual ... orchestry 1.0.0",
+        "ok. 2 passed; 0 failed; 0 ignored",
+    );
+    let log = log.split("orchestry 1.0.0").next().unwrap().to_owned() + "orchestry 1.0.0";
+    inventory(&sandbox, &map, &log, Some(0)).code(1);
+    assert!(!sandbox.root.join("rows.tsv").exists());
+}
+
+#[test]
+fn ordinary_framing_nested_helper_cannot_supply_a_pending_terminal() {
+    reject_framing(
+        "running 1 test\ntest actual ... orchestry 1.0.0\nok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0s\ntest actual ... ok",
+    );
+}
+
+#[test]
+fn ordinary_framing_duplicate_identity_is_still_refused() {
+    reject_framing("test actual ... orchestry 1.0.0\nok\ntest actual ... ok");
+}
+
+#[test]
+fn ordinary_framing_orphan_terminal_cannot_be_ignored() {
+    for terminal in ["ok", "FAILED", "ignored", "ignored, reason"] {
+        reject_framing(&format!("test actual ... ok\n{terminal}"));
+    }
+}

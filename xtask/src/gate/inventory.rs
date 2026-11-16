@@ -32,6 +32,39 @@ fn field(s: &str) -> Result<&str> {
     Ok(s)
 }
 
+fn terminal(text: &str) -> Option<&'static str> {
+    match text {
+        "ok" => Some("ok"),
+        "FAILED" => Some("failed"),
+        s if s == "ignored" || s.starts_with("ignored,") => Some("ignored"),
+        _ => None,
+    }
+}
+
+fn version_output(text: &str) -> bool {
+    let Some(version) = text.strip_prefix("orchestry ") else {
+        return false;
+    };
+    let parts: Vec<_> = version.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn framed_terminal(text: &str) -> Option<&'static str> {
+    // This is the complete existing daemon diagnostic, not an arbitrary suffix
+    // after a status prefix. Unknown chatter remains an inventory error.
+    let status = text.strip_suffix(
+        "  ⚠ orchestrator:error (details omitted from daemon stderr; use orch logs --follow)",
+    )?;
+    match status {
+        "ok" => Some("ok"),
+        "FAILED" => Some("failed"),
+        _ => None,
+    }
+}
+
 fn package(id: &str) -> Result<String> {
     let (location, fragment) = id
         .rsplit_once('#')
@@ -99,6 +132,7 @@ struct Section {
     notices: BTreeSet<String>,
     pending_helpers: VecDeque<usize>,
     helpers: Vec<(usize, usize)>,
+    pending_result: Option<String>,
 }
 
 impl Section {
@@ -112,7 +146,19 @@ impl Section {
             notices: BTreeSet::new(),
             pending_helpers: VecDeque::new(),
             helpers: vec![],
+            pending_result: None,
         }
+    }
+
+    fn push_result(&mut self, name: &str, status: &str) -> Result<()> {
+        self.rows.push(Row {
+            kind: self.exe.kind.clone(),
+            package: self.exe.package.clone(),
+            target: self.exe.target.clone(),
+            test: field(name)?.into(),
+            status: status.into(),
+        });
+        Ok(())
     }
 
     fn reconcile_helpers(&mut self) -> Result<()> {
@@ -180,6 +226,24 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
     for raw in log.lines() {
         let line = raw.trim();
+        if let Some(s) = current.as_mut()
+            && let Some(name) = s.pending_result.take()
+        {
+            // Only the immediately adjacent physical line can close the frame.
+            // Check before all section/failure/helper handling so no boundary,
+            // captured stdout or later test can supply a missing terminal.
+            ensure!(
+                raw == line,
+                "inconsistent inventory: split terminal framing"
+            );
+            let status = terminal(line).context("inconsistent inventory: split terminal")?;
+            s.push_result(&name, status)?;
+            ensure!(
+                rows.len() + s.rows.len() <= MAX_TESTS,
+                "inventory count budget"
+            );
+            continue;
+        }
         // Libtest prints captured stdout between two `failures:` headers, then
         // the failed-name list and its outer summary. Treat every result-like
         // line in captured output as data, including cargo/running headers.
@@ -373,23 +437,21 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
             let (name, status) = test
                 .rsplit_once(" ... ")
                 .context("inconsistent inventory: malformed test line")?;
-            let status = match status {
-                "ok" => "ok",
-                "FAILED" => "failed",
-                s if s == "ignored" || s.starts_with("ignored,") => "ignored",
-                _ => bail!("inconsistent inventory: test status"),
-            };
             ensure!(
                 s.announced.is_some(),
                 "inconsistent inventory: test before running count"
             );
-            s.rows.push(Row {
-                kind: s.exe.kind.clone(),
-                package: s.exe.package.clone(),
-                target: s.exe.target.clone(),
-                test: field(name)?.into(),
-                status: status.into(),
-            });
+            if let Some(status) = terminal(status).or_else(|| framed_terminal(status)) {
+                s.push_result(name, status)?;
+            } else {
+                ensure!(
+                    version_output(status) && s.pending_helpers.is_empty(),
+                    "inconsistent inventory: test status"
+                );
+                s.pending_result = Some(field(name)?.into());
+            }
+        } else if terminal(line).is_some() {
+            bail!("inconsistent inventory: orphan terminal");
         }
         ensure!(
             rows.len() + current.as_ref().map_or(0, |s| s.rows.len()) <= MAX_TESTS,

@@ -1,5 +1,32 @@
 # Tiered verification checks — plan
 
+## Ordinary result framing repair (2026-11-15)
+
+Recognize two bounded application-output frames in the original merged stream:
+a numeric `orchestry X.Y.Z` version announcement occupying the status position,
+followed by an exact, unindented terminal on the immediately next physical line;
+and a terminal followed by the complete indented daemon stderr omission warning.
+These are syntax rules, independent of test names, not arbitrary status prefixes
+or a search for a later `ok`. Unknown status/chatter shapes still refuse.
+
+Keep at most one pending named result, only outside nested helper intervals.
+Its next line must be a complete terminal, without appended chatter; any blank,
+other test, notice, helper, failure/header/summary boundary or EOF refuses.
+Orphan standalone terminals refuse. Preserve FAILED and ignored statuses/reasons,
+all existing complete grammars, summary/count/exit reconciliation, exact mapped
+identities, duplicate/zero/filter/nested protections and failed-suite judgment.
+Captured failure output remains data and cannot complete a pending result.
+This parser cannot authenticate deliberately forged stdout; unsupported framing
+fails conservatively. No input rewriting, schema, tool allowlist or test change
+outside parser regression coverage is authorized.
+
+Acceptance: regressions copied from both original raw shapes fail with the old
+parser; focused positive/adversarial controls and prior inventory/evidence tests
+pass. Replay both unmodified 7318-identity transcripts and historical 7278/1/7
+using original executable maps; compare every named status and doc identity.
+Preserve original ordinary helper1 and historical Cargo101/gate failure.
+Replay is not final-head real-suite or whole-gate/platform acceptance.
+
 ## Real libtest inventory repair (2026-11-15)
 
 Standard `test NAME has been running for over 60 seconds` is nonterminal:
@@ -588,7 +615,7 @@ The run itself, sequential runner (PR 1). Both commands run from the outside `cw
 
 `home-hygiene` then lists the sentinel (anything but `.cargo` and `.rustup` fails), `no-real-cli` reads the shim log, and both report “not evaluated” as a failure when the witness is absent (D11). Neither sees a child that a test starts with a cleared environment and a `PATH` or `HOME` of its own (D29).
 
-The parser reads one log. A line that a test's child process writes into it, or one that splits a result line, makes the counts disagree; the step then fails as “inconsistent inventory”. That is a false failure to diagnose, never a pass, and it is not rerun away.
+The parser reads one original log. Unsupported child-output framing or unreconciled counts fail as “inconsistent inventory”; the ordinary-framing amendment above defines the two additionally supported bounded frames. False failures are diagnosed, never rerun away.
 
 For a selected run (`fast`), the witness target is run first by itself in the same environment, because a package selection may not include `xtask`.
 
