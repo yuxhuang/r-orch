@@ -1,5 +1,62 @@
 # Tiered verification checks — plan
 
+## Duplicate-member export and message-capture integration (2026-11-16)
+
+This bounded amendment integrates the delivered exporter and M2-message leaves.
+It supersedes the older storage/message exclusion below only for the shutdown
+helper described here. Original failed evidence remains immutable. Implementation
+readiness is distinct from independent S1/M2 review and native acceptance; ADR
+0015 remains proposed.
+
+- S1 inspection must visit every decoded object member, including duplicate
+  plain names and Unicode-equal names, before any lossy map conversion. The
+  existing serde public visitor retains an ordered vector of member pairs.
+  Strings, keys, arrays and every member value reach recursive inspection;
+  scalar leaves need no further decoding. Semantic inspection refusal propagates
+  outside malformed-candidate handling, so a valid but unsafe fragment cannot be
+  skipped as malformed. Benign duplicates remain exportable.
+- Depth remains 128 and the shared per-input budget remains 128 MiB of charged
+  candidate/decoded bytes and nodes, with candidate suffixes charged before parse.
+  These are finite inspection budgets, not aggregate OS memory or wall bounds.
+  Prepare and inspect every entry and structural string before creating the
+  destination. Preserve short/non-UTF8 refusal, failed-suite status, nonqualification,
+  public judge, manifest and source predicates; unknown secrets remain out of scope.
+- Dependency wiring is only `serde.workspace = true` in xtask plus its matching
+  existing serde lock edge. No package, library version, checksum or feature
+  policy changes. The six added export regressions and two test-only helpers
+  change no existing test body or assertion.
+- M2-message captures both shutdown-test child streams to exclusive private
+  regular files before spawn. Success emits nothing; failure retains complete
+  labelled streams after actual reap, including unexpected-panic retention.
+  Keep the external lock from before spawn through observed child exit, the
+  readiness marker, SIGTERM, successful status, exactly-one-test summary and
+  original 5-second readiness / 1-second shutdown deadlines. Capture/framing,
+  real failure, live-child kill/reap and cleanup controls remain required.
+- NM1 is unresolved: historical lock stage, holder and mechanism are
+  UNESTABLISHED. The known-turnstile discriminator proves an alternative error
+  mechanism, not historical attribution. Production lease code and the original
+  shared-coexistence test remain byte-identical. A scoped green cannot diagnose
+  or close the original Cargo101. NM3 closes invocation setup only. Historical
+  C-N1 cause remains UNESTABLISHED; current isolation is mitigation only.
+
+Combined verification runs the locked full xtask package once, orch-infra lib
+and spawn_gate once, an explicit xtask build, affected all-target clippy, fmt and
+crate graph. Collect maps before suites, raw JSON stdout separate from stderr,
+from a private external Cargo cwd with canonical absolute manifest/target/Running
+identities. Use unchanged product inventory on original live scoped logs; parsing
+success never overrides Cargo failure. No full native acceptance run is authorized.
+Retain cumulative107/21/later exact body/helper/minor ledgers and all original
+failures. The actual union must enumerate added/changed bodies without removals,
+weaker assertions, longer timeouts, suite serialization or retry-to-green.
+
+Independent original S1 and M2/NM1 assessments consume the frozen combined source.
+Other writers, M2-b/M2-c, n10–n13 and inherited minors remain disclosed, not closed.
+Option3 is ACCEPTED NOT FIXED; FS1, interim D45 (revisit with storage changes) and
+manual marker/cargo-clean removal stay distinct. RC18 is not a prerequisite.
+R4 literal-base, complete R11, idle timing, nextest qualification or explicitly
+approved fallback, slow tests and PR2–6 remain due. Both check/test and owner-only
+merges/rules stand. No new risk acceptance or native/PR/goal clearance follows.
+
 ## Bounded native-test and export correction integration (2026-11-16)
 
 This amendment carries the authorized MN1/LN1, MN3, C-N1-S, n7 and S1
