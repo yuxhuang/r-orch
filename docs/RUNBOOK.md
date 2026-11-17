@@ -1553,12 +1553,18 @@ on an earlier one only after the earlier call's answer arrives
 ([manual](manual/17-mcp-server.md#results-and-errors)).
 
 
-## Tiered gate evidence during PR1 repair
+## Tiered gate
 
-`./xtask/gate.sh full` is the goal/release gate; `pr` becomes the merge condition
-only after the owner applies the reviewed policy transition. Existing check/test
-requirements still apply. PR2 adds the local `fast` path; later CI/parallel-runner
-stages remain separate.
+What each tier is for, who runs it and what it does not prove is in
+[AGENTS.md](../AGENTS.md#verification-tiers). This section is the operator's side:
+reading results, evidence, refusals and recovery. `./xtask/gate.sh full` is the
+goal/release gate. `pr` is the merge-condition tier by approved policy, but the
+live GitHub rules still require both `check` and `test` until the owner applies the
+reviewed change. `fast` is local iteration. PR 4 is deferred and cargo-nextest is
+not adopted (owner decision of 2026-11-17 after its dependency audit: 23 advisories,
+10 licence items outside the allow-list): test binaries run sequentially, and its
+qualification and speedup were not delivered. No tier's wall time is measured
+against its target.
 Use `qualifying: yes` in verified exact-head evidence; an exit0 or a consistent
 inventory alone is insufficient. A direct unstamped executable cannot qualify.
 The wrapper privately publishes a single-link executable after Cargo success and
@@ -1585,9 +1591,8 @@ partial bundle. Unknown secrets are outside known-value redaction.
 Option3 direct-writer/legacy-use overlap is accepted, not repaired. FS1 indirect
 writers and interim D45 checked-path/by-name races remain separate. RC18 was
 replaced as a precondition; finite propagation and last-close observations do not
-prove universal writer cessation. PR2 still requires independent frozen reviews,
-native acceptance and measured timing evidence before its PR. No timing target or
-nextest qualification is implied by scoped implementation checks.
+prove universal writer cessation. No timing target or nextest qualification is
+implied by scoped implementation checks.
 
 ### Local fast checks
 
@@ -1596,6 +1601,11 @@ nextest qualification is implied by scoped implementation checks.
 ./xtask/gate.sh fast --plan
 cargo xtask gate select --base origin/main --format json
 ```
+
+`gate select` builds no workspace crate and runs no test, but `cargo xtask` is a
+`cargo run` of the `xtask` package, so cargo compiles `xtask` and its dependencies
+first when they are out of date. `fast --plan` through the wrapper runs no step but
+takes the shared lease and may build and stamp the judge in `target/gate-xtask`.
 
 The default base is `origin/main`; the selector compares its merge base, staged,
 working-tree and untracked paths, and Cargo workspace reverse dependencies.
@@ -1636,6 +1646,61 @@ reads every crate's source without a Cargo edge. The orch-infra guards
 `spawn_gate` and `synthetic_spawn_domain_guard` also scan crates; D39 covers them
 incidentally while every crate reaches orch-cli. This adds no coupling policy.
 Fast is an iteration signal; the full PR check remains the merge check.
+
+### Reading a result and common refusals
+
+A run that reaches the judge prints its summary table (status, step, wall seconds,
+exit, detail) and writes the same text to `target/gate-result.txt`; the reserved
+per-run directory is `target/gate-runs/run-*`. The file first reads
+`verdict: IN PROGRESS`, so a killed run leaves that. A wrapper refusal (exit 75 lease
+busy, bootstrap exit 1), a usage error (exit 2) and `--plan` write no result:
+`target/gate-result.txt` may be an older run's and may say `qualifying: yes` for
+another commit, so read its `commit` line. Exit status: 0 passed, 1 a step failed or the run was
+refused, 2 bad arguments, 3 nothing failed but a step was `ENV-LIMITED`,
+`--evidence` found the run non-qualifying or `--receipt` found the receipt
+unsuccessful, 75 the lease was busy and nothing ran,
+128 plus the signal after an interrupt.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Exit 75, `REFUSED: bootstrap cooperative lease busy` with `stage=lease-exclusive`, `lease-shared` or `admission-turnstile` | Another gate, or `gate lease exec`, holds the host-wide lease, or a queued exclusive requester is ahead of you | Wait or raise `--lease-wait` (minutes). `cargo xtask gate lease status` observes it. Do not delete the lease file or signal the holder: its text is unvalidated and gives no authority. |
+| `gate: --warm is only valid for full` (exit 2) | `--warm` is a developer option of the cold tier | Drop it, or run `full --warm`. |
+| `gate: --part is only valid for pr/full` (exit 2) | `fast` has no partial runs | Drop `--part`, or use `pr`/`full`. |
+| `REFUSED: inherited variable: <names>; unset the variable or run the opt-in test directly with cargo` | An opt-in `ORCH_*`/`ORCHESTRY_*` test variable is set; opt-in tests are not part of a gate | Unset it, or run that test directly with cargo. |
+| `REFUSED: configured lease required before target admission` | `--no-lease` was given; a gate must hold the configured lease | Remove `--no-lease`. |
+| `cold gate requires 12 GiB free; only <n> KiB available` | `full` needs room for a cold target | Free disk space. |
+| Exit 3, `advisories` is `ENV-LIMITED`: `cargo-deny not installed` | The advisories, licences, bans and sources check was not evaluated | `cargo install cargo-deny --locked`, then rerun. `ENV-LIMITED` is not a pass. |
+| `fast` selects `all` and you expected one crate | A `global`, `unknown` or `error` row in the printed reasons (shared input, unclassified path, unreadable base, empty change set) | Read the row; this is the fail-closed design, not a fault. Use `--base` for the right base. |
+| `REFUSED` with `marker:` and `target in use` / `an earlier use did not finish` | A target use marker is held or left by an unfinished use | Do not remove the marker, `target/` or run `cargo clean`. Inspect read-only with `lsof` on the marker; preserve the target and diagnostics for the owner. |
+| CI `check` fails at `Require valid classification` (`invalid classification mode`) | The `changes` job did not produce `docs-only`, `packages` or `all` | Read the `changes` job log. Do not re-run it away; a missing or unresolvable base already selects `all`. |
+| A documentation-only PR shows `test` as skipped | By design: the `test` job's condition excludes `docs-only` | Nothing. A conditionally skipped job satisfies the required check; a skipped whole workflow would not. |
+
+### Judging a PR's evidence
+
+Status: approved policy (the owner's Q1 and Q2 answers and the unavailable-host
+answer); the live rules are unchanged.
+
+1. Take the PR's final head commit. Evidence at an earlier head does not carry over.
+2. GitHub CI at that head is the default evidence: `changes` and `check` succeeded
+   and, for a code change, `test` succeeded with its diagnostic receipt; for a
+   proven documentation-only change `test` is skipped. Both required jobs are
+   still required by the live ruleset.
+3. A native Linux run may stand in for the suite evidence only with a record of a
+   clean tree at that exact head before and after, the pinned tools and
+   configuration, a warm target unique to the worktree, the lease, complete logs,
+   per-step exit status and the named test and doc-test inventory, linked from the
+   PR. Check a bundle with
+   `cargo xtask gate evidence verify <dir> --commit <sha>` (prints
+   `evidence verified`, exit 0; `evidence rejected: ...`, exit 1). It does not
+   satisfy the live required `test` job.
+4. If that host or the Mac is unavailable, GitHub's CI is the evidence for an
+   ordinary PR; say which local check did not run. This does not waive the cold
+   `full` run a goal or release needs on its platform.
+5. A reviewer may cite any evidence that names its commit, for the claim it
+   supports and with its scope stated (a fix round's `fast`, a `--part` run, a
+   receipt, a builder's report). A `fast` result, `qualifying: no`, a `--part` run
+   or receipt alone, a `--warm` or dirty-tree run never counts as merge evidence.
+   Do not rerun a failed job to obtain a pass: keep the failed run and diagnose it.
 
 ### PR3 CI suite receipts and required-check transition
 
