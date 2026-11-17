@@ -792,13 +792,32 @@ mod tests {
         assert_eq!(envs, ["HOME=/home/dev", "USER=dev", "LANG=C.UTF-8"]);
     }
 
-    /// Share the actual static/ambient commands while keeping the emulator
-    /// contract explicit. The hosted folded gate intentionally is not mirrored.
+    /// Share the actual static/ambient commands in both directions while keeping
+    /// the emulator contract explicit. Hosted folded execution is not mirrored.
     #[test]
     fn the_ci_steps_cover_the_ci_workflow() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let ci = std::fs::read_to_string(repo.join(".github/workflows/ci.yml")).unwrap();
+        assert_ci_mirror(&ci);
+    }
+
+    fn assert_ci_mirror(ci: &str) {
         let script = container_script(&LinuxCommand::Ci).0;
+        let mut checked = 0;
+        for line in ci.lines().map(str::trim) {
+            let Some(run) = line.strip_prefix("- run: ") else {
+                continue;
+            };
+            if run.starts_with("rustup ") || run.contains("apt-get") {
+                continue;
+            }
+            assert!(
+                script.contains(run),
+                "ci.yml runs `{run}`, which cargo xtask linux does not"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 4, "found only {checked} cargo steps in ci.yml");
         for command in &CI_STEPS[1..] {
             assert!(ci.contains(&format!("run: {command}")), "CI lost {command}");
             assert!(script.contains(command), "Docker lost {command}");
@@ -816,6 +835,21 @@ mod tests {
         for quirk in Quirk::ALL {
             assert!(script.contains(quirk.probe()));
         }
+    }
+
+    #[test]
+    fn ci_only_command_is_rejected_by_the_mirror() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let ci = std::fs::read_to_string(repo.join(".github/workflows/ci.yml")).unwrap();
+        let mutant = format!("{ci}\n      - run: cargo xtask ci-only-regression\n");
+        let failure = std::panic::catch_unwind(|| assert_ci_mirror(&mutant))
+            .expect_err("CI-only command escaped the forward mirror");
+        let message = failure
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| failure.downcast_ref::<&str>().copied())
+            .unwrap();
+        assert!(message.contains("ci.yml runs `cargo xtask ci-only-regression`"));
     }
 
     #[test]

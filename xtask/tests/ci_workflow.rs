@@ -69,6 +69,10 @@ fn contract(ci: &str) {
     assert!(ambient.contains("- run: cargo test --workspace --no-fail-fast"));
     assert!(!ambient.contains("./xtask/gate.sh"));
     let suite = step(test, "Folded suite");
+    assert!(
+        script(suite).lines().any(|line| line == "exec ./xtask/gate.sh pr --part suite --receipt \"$RUNNER_TEMP/pr3-suite-receipt\" --lease-wait 5 --host-label github-hosted-linux"),
+        "folded producer must replace the step shell with unchanged argv"
+    );
     assert!(suite.contains("--lease-wait 5 --host-label github-hosted-linux"));
     assert!(!ci.contains("--no-lease"));
     assert!(!ci.contains("XTASK_GATE_LEASE_DIR"));
@@ -266,6 +270,7 @@ fn workflow_mutants_are_discriminated() {
             "- name: Removed guard",
         ),
         ("--part suite", ""),
+        ("exec ./xtask/gate.sh", "./xtask/gate.sh"),
         ("cache-targets: false", "cache-targets: true"),
         ("cache-bin: false", "cache-bin: true"),
         ("if-no-files-found: error", "if-no-files-found: warn"),
