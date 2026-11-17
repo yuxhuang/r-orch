@@ -213,4 +213,12 @@ jobs:
       # The TUI end-to-end tests drive the real binary in tmux and fail when
       # it is missing (AGENTS.md, "TUI end-to-end tests").
       - run: sudo apt-get update && sudo apt-get install -y tmux
+      # orch-infra's concurrent_index tests execute debug/orch from this same
+      # CARGO_TARGET_DIR; cargo test alone does not supply that binary.
+      # A failed build stops the job before the ordinary full workspace suite.
+      - name: Build ambient CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p orch-cli
       - run: cargo test --workspace --no-fail-fast

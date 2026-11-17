@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const CI: &str = include_str!("../../.github/workflows/ci.yml");
 const TEST_IF: &str = "github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all')";
 const AMBIENT_IF: &str = "github.event_name == 'push' && github.ref == 'refs/heads/main'";
+const AMBIENT_BUILD: &str = "      - name: Build ambient CLI\n        shell: bash\n        run: |\n          set -euo pipefail\n          cargo build -p orch-cli\n";
 
 // This extracts only this file's fixed indentation, not arbitrary YAML. Shape
 // changes require deliberate updates; do not silently accept an unknown form.
@@ -362,4 +363,116 @@ fn pr_base_is_passed_as_data_not_shell() {
     ));
     assert!(!Path::new(&f.0.join("injected")).exists());
     assert_eq!(fs::read_to_string(output).unwrap(), "mode=all\npackages=\n");
+}
+
+// Execute only the ambient cargo run steps, using their real order, shell and
+// job target. Setup actions/rustup/apt are outside this bounded shell control;
+// actual compilation and concurrent_index are separate native checks.
+fn ambient_execution(ci: &str, build_status: &str, stale: bool) -> (bool, String) {
+    let ambient = job(ci, "ambient");
+    let target = ambient
+        .lines()
+        .find_map(|line| line.strip_prefix("      CARGO_TARGET_DIR: "))
+        .expect("ambient job target");
+    let f = Fixture::new();
+    f.executable(
+        "bin/cargo",
+        r#"#!/bin/sh
+set -eu
+printf '%s|%s\n' "$CARGO_TARGET_DIR" "$*" >> trace
+case "$*" in
+  'build -p orch-cli')
+    [ "$BUILD_STATUS" = 0 ] || exit "$BUILD_STATUS"
+    mkdir -p "$CARGO_TARGET_DIR/debug"
+    : > "$CARGO_TARGET_DIR/debug/orch"
+    ;;
+  'test --workspace --no-fail-fast') test -f "$CARGO_TARGET_DIR/debug/orch" ;;
+  *) exit 98 ;;
+esac
+"#,
+    );
+    if stale {
+        fs::create_dir_all(f.0.join(target).join("debug")).unwrap();
+        fs::write(f.0.join(target).join("debug/orch"), b"stale").unwrap();
+    }
+    let mut success = true;
+    let mut bodies = Vec::new();
+    for line in ambient.lines() {
+        if line == "      - name: Build ambient CLI" {
+            let build = step(ambient, "Build ambient CLI");
+            assert!(build.contains("        shell: bash\n"));
+            assert!(!build.contains("        if:"));
+            bodies.push(script(build));
+        } else if let Some(body) = line.strip_prefix("      - run: ")
+            && body.contains("cargo ")
+        {
+            bodies.push(body.to_owned());
+        }
+    }
+    for body in bodies {
+        // Each Actions bash step fails on its own producer error, and later
+        // ordinary steps run only after success. The trace catches an omitted
+        // suite as well as a build failure hidden by shell status masking.
+        if !f.run(
+            &format!("set -euo pipefail\n{body}\n"),
+            &[("CARGO_TARGET_DIR", target), ("BUILD_STATUS", build_status)],
+        ) {
+            success = false;
+            break;
+        }
+    }
+    (success, fs::read_to_string(f.0.join("trace")).unwrap())
+}
+
+fn assert_ambient_build_contract(ci: &str) {
+    let build = "target/ci-ambient|build -p orch-cli\n";
+    let suite = "target/ci-ambient|test --workspace --no-fail-fast\n";
+    assert_eq!(
+        ambient_execution(ci, "0", false),
+        (true, format!("{build}{suite}")),
+        "an absent binary requires a successful same-target build before the suite"
+    );
+    for status in ["1", "42", "75", "143"] {
+        assert_eq!(
+            ambient_execution(ci, status, true),
+            (false, build.to_owned()),
+            "failed build {status} must stop before the suite, even with a stale binary"
+        );
+    }
+}
+
+#[test]
+fn ambient_build_executes_before_suite_in_same_target_and_fails_closed() {
+    assert_ambient_build_contract(CI);
+}
+
+#[test]
+fn ambient_build_fault_controls_are_discriminated() {
+    let build = AMBIENT_BUILD;
+    let suite = "      - run: cargo test --workspace --no-fail-fast\n";
+    for (name, old, new) in [
+        ("original missing build", build.to_owned(), String::new()),
+        (
+            "reordered build",
+            format!("{build}{suite}"),
+            format!("{suite}{build}"),
+        ),
+        (
+            "wrong target",
+            build.to_owned(),
+            build.replace("cargo build", "CARGO_TARGET_DIR=target/wrong cargo build"),
+        ),
+        (
+            "masked build failure",
+            build.to_owned(),
+            build.replace("cargo build -p orch-cli", "cargo build -p orch-cli || true"),
+        ),
+    ] {
+        let mutant = CI.replacen(&old, &new, 1);
+        assert_ne!(mutant, CI, "control must change the workflow: {name}");
+        assert!(
+            std::panic::catch_unwind(|| assert_ambient_build_contract(&mutant)).is_err(),
+            "survived {name}"
+        );
+    }
 }
