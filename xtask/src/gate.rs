@@ -44,6 +44,8 @@ mod judge;
 )]
 mod real_home;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+mod receipt;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(
     dead_code,
     reason = "Private verifier/retention fixture controls retain independent coverage"
@@ -83,8 +85,11 @@ pub struct GateArgs {
     pub part: Option<Part>,
     #[arg(long)]
     pub base: Option<String>,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "receipt")]
     pub evidence: Option<PathBuf>,
+    /// Redacted diagnostic receipt; only pr --part suite, never full evidence.
+    #[arg(long)]
+    pub receipt: Option<PathBuf>,
     #[arg(long)]
     pub host_label: Option<String>,
     #[arg(long, default_value_t = 30)]
@@ -139,6 +144,12 @@ pub struct InventoryArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum EvidenceCommand {
+    /// Verify diagnostic integrity/outcome; exit 0 does not mean suite success.
+    VerifyReceipt {
+        dir: PathBuf,
+        #[arg(long)]
+        commit: String,
+    },
     Verify {
         dir: PathBuf,
         #[arg(long)]
@@ -168,6 +179,12 @@ pub fn run(repo: &Path, args: GateArgs) -> Result<i32> {
     }
     if args.command.is_none() && args.tier == Tier::Fast && args.part.is_some() {
         eprintln!("gate: --part is only valid for pr/full");
+        return Ok(2);
+    }
+    if args.receipt.is_some()
+        && (args.command.is_some() || args.tier != Tier::Pr || args.part != Some(Part::Suite))
+    {
+        eprintln!("gate: --receipt is only valid for pr --part suite");
         return Ok(2);
     }
     match args.command {
@@ -223,6 +240,22 @@ pub fn run(repo: &Path, args: GateArgs) -> Result<i32> {
                 }
             }
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        Some(GateCommand::Evidence {
+            command: EvidenceCommand::VerifyReceipt { dir, commit },
+        }) => match receipt::verify(repo, &dir, &commit) {
+            Ok(summary) => {
+                println!("{}", summary.text());
+                Ok(0)
+            }
+            Err(e) => {
+                eprintln!(
+                    "receipt rejected: {}",
+                    report::diagnostic(format!("{e:#}").as_bytes())
+                );
+                Ok(1)
+            }
+        },
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         Some(GateCommand::Evidence {
             command: EvidenceCommand::Verify { dir, commit },

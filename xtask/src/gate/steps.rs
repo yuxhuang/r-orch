@@ -26,6 +26,7 @@ pub(super) struct Status {
 }
 
 pub(super) struct Runner<'a, 'm> {
+    pub(super) receipt_progress: bool,
     lease: &'a Lease,
     marker: Option<&'m Marker<'m>>,
     child: Option<Child>,
@@ -68,6 +69,7 @@ impl<'a, 'm> Runner<'a, 'm> {
     fn with_marker(lease: &'a Lease, marker: Option<&'m Marker<'m>>) -> Result<Self> {
         lease.validate()?;
         Ok(Self {
+            receipt_progress: false,
             lease,
             marker,
             child: None,

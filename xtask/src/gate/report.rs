@@ -466,11 +466,8 @@ pub(super) fn export(
     Ok(digest)
 }
 
-pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<()> {
-    ensure!(
-        [40, 64].contains(&commit.len()) && commit.bytes().all(|b| b.is_ascii_hexdigit()),
-        "expected commit must be a full object id"
-    );
+// Shared structural reader only. Qualification remains in verify below.
+pub(super) fn load_bundle(repo: &Path, directory: &Path) -> Result<BTreeMap<String, String>> {
     // Canonicalization first would erase a linked bundle root. Check every
     // component before resolving it or reading any evidence through it.
     let directory = std::path::absolute(directory)?;
@@ -534,6 +531,15 @@ pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<()> 
             );
         }
     }
+    Ok(entries)
+}
+
+pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<()> {
+    ensure!(
+        [40, 64].contains(&commit.len()) && commit.bytes().all(|b| b.is_ascii_hexdigit()),
+        "expected commit must be a full object id"
+    );
+    let entries = load_bundle(repo, directory)?;
     let mut tool_fields = BTreeMap::new();
     for line in entries["tools.txt"].lines() {
         let (name, value) = line.split_once(':').context("tools.txt field")?;
