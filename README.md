@@ -820,6 +820,47 @@ cargo xtask crate-graph           # asserts the inter-crate dependency edges
 See [ARCHITECTURE.md §8](docs/ARCHITECTURE.md) for the test strategy and
 [§9](docs/ARCHITECTURE.md) for how the work is split across crates.
 
+### Tiered checks
+
+`./xtask/gate.sh` runs one of three tiers. The rules for who runs which tier, and what each one does and does not
+prove, are in [AGENTS.md](AGENTS.md#verification-tiers); the evidence and failure procedures are in the
+[runbook](docs/RUNBOOK.md#tiered-gate).
+
+| Tier | Command | Use |
+|---|---|---|
+| `fast` | `./xtask/gate.sh fast --base origin/main` | Local iteration after each commit. Runs fmt, clippy and the crate graph, then builds and tests only the changed crates and the crates that depend on them. A documentation-only change builds and runs no tests. Never merge or release evidence. |
+| `pr` | `./xtask/gate.sh pr` | The merge-condition tier: one whole-workspace suite run plus the static checks, on a content-checked warm target. CI runs its suite steps as `pr --part suite`. |
+| `full` (default) | `./xtask/gate.sh` | The goal and release gate: the same steps on a cold target. |
+
+`fast` prints every changed path, what it selects and why, and selects the whole workspace for shared inputs
+(`Cargo.lock`, `rust-toolchain.toml`, `.cargo/`, `xtask/`, `.github/`, shared test support), for an unknown path and for
+an empty change set. For a tree whose only change is an edit to `README.md`:
+
+```
+$ cargo xtask gate select --base origin/main
+mode: docs-only
+packages: []
+"README.md" [doc] selects none: documentation-only input
+```
+
+Check a plan without running anything with `./xtask/gate.sh pr --plan`. Exit status 0 alone is not evidence: read the
+summary table (verdict, wall seconds and exit status per step) in `target/gate-result.txt` and look for
+`qualifying: yes`. Gating runs take a cooperative host-wide lease under `/tmp`; a busy lease exits 75 and runs nothing.
+
+What is and is not true today:
+
+- **Implemented:** the three tiers, change-based selection, the folded suite, the lease, and the CI jobs `changes`,
+  `check`, `test` and, on `main` only, `ambient` (the ordinary `cargo test --workspace`).
+- **Policy:** one green Linux CI execution at the PR's final head is the merge evidence, and `full` runs once per goal or
+  release rather than per PR. The pre-PR check in [AGENTS.md](AGENTS.md#pre-pr-check) still applies.
+- **Not yet in force:** the owner's change to the GitHub ruleset. Both `check` and `test` remain required on `main` and
+  `release/**` until the owner applies and verifies it. A documentation-only PR skips its `test` job by condition,
+  which satisfies the requirement.
+- **Not claimed:** no tier's wall time has been measured against its target, and no parallel test runner is adopted.
+
+CI's suite step uploads a verified, redacted **diagnostic receipt**. It records what a suite run did; it is not a full
+qualifying gate bundle.
+
 ---
 
 ## License
@@ -833,28 +874,3 @@ library skills are ORCH's adaptations of [`garrytan/gstack`](https://github.com/
 `orch web` serves a vendored xterm.js (MIT). That material keeps its MIT licence;
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) lists each component with its full licence text, and says what to
 ship with a built binary or package.
-
-
-### Tiered verification work
-
-Run `./xtask/gate.sh fast --base origin/main` for local iteration. It prints the
-selected packages and reasons, checks content before warm reuse, and runs fmt,
-workspace clippy, crate graph and the selected tests. Documentation-only changes
-run build/lints/crate graph with zero suite tests. Unknown or empty changes select
-the whole workspace. `fast` is never merge or release evidence.
-
-`./xtask/gate.sh full` remains the default goal/release check. `pr` is the proposed
-merge tier after the owner applies the reviewed policy transition; the required
-check/test jobs and existing pre-PR rules still stand. Exit 0 alone is not
-qualifying evidence. The wrapper stamps its private judge output; direct unstamped
-invocations remain development checks. Preserve unfinished markers/targets and
-share only verified redacted exports. See the
-[gate runbook](docs/RUNBOOK.md#tiered-gate-evidence-during-pr1-repair) for protections,
-accepted risks and the remaining native/timing qualification work.
-
-PR3 CI classifies PR paths: docs-only runs build/static checks, code runs static
-checks plus one folded suite. Main also runs ordinary ambient workspace tests;
-weekly schedule runs static checks only. Suite artifacts are verified redacted
-**diagnostic receipts**, not full qualifying gate evidence. Suite failure and a
-missing verified receipt independently fail the job. Real-event/native acceptance
-and the owner-only required-rule transition remain pending; existing policy stands.
