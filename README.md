@@ -828,8 +828,8 @@ prove, are in [AGENTS.md](AGENTS.md#verification-tiers); the evidence and failur
 
 | Tier | Command | Use |
 |---|---|---|
-| `fast` | `./xtask/gate.sh fast --base origin/main` | Local iteration after each commit. Runs fmt, clippy and the crate graph, then builds and tests only the changed crates and the crates that depend on them. A documentation-only change builds and runs no tests. Never merge or release evidence. |
-| `pr` | `./xtask/gate.sh pr` | The merge-condition tier: one whole-workspace suite run plus the static checks, on a content-checked warm target. CI runs its suite steps as `pr --part suite`. |
+| `fast` | `./xtask/gate.sh fast --base origin/main` | Local iteration after each commit. Runs fmt, clippy and the crate graph, then builds and tests only the changed crates and the crates that depend on them, with the `home-hygiene`, `no-real-cli` and `real-home` checks. A documentation-only change runs a workspace build and no tests. Never merge or release evidence. |
+| `pr` | `./xtask/gate.sh pr` | The merge-condition tier by approved policy: one whole-workspace suite run plus the static checks, on a content-checked warm target. CI runs its suite steps as `pr --part suite` and its static checks as the equivalent direct commands. |
 | `full` (default) | `./xtask/gate.sh` | The goal and release gate: the same steps on a cold target. |
 
 `fast` prints every changed path, what it selects and why, and selects the whole workspace for shared inputs
@@ -843,20 +843,29 @@ packages: []
 "README.md" [doc] selects none: documentation-only input
 ```
 
-Check a plan without running anything with `./xtask/gate.sh pr --plan`. Exit status 0 alone is not evidence: read the
-summary table (verdict, wall seconds and exit status per step) in `target/gate-result.txt` and look for
-`qualifying: yes`. Gating runs take a cooperative host-wide lease under `/tmp`; a busy lease exits 75 and runs nothing.
+`cargo xtask gate select` only runs `git` and `cargo metadata`: no test runs and no workspace crate is built, but cargo
+compiles `xtask` itself when it is out of date. `./xtask/gate.sh pr --plan` runs no step, yet the wrapper still takes the
+host lease (exclusive for `pr`, so it waits behind a running gate) and builds or stamps the `xtask` judge first.
+Exit status 0 alone is not evidence: a run that reaches the judge prints a summary table (verdict, wall seconds and exit
+status per step) and writes it to `target/gate-result.txt`; look for `qualifying: yes`. A wrapper refusal, a usage error
+and `--plan` write no result, so that file may be an older run's: check its `commit` line. Gating runs take a
+cooperative host-wide lease under `/tmp`; a busy lease exits 75 and runs nothing.
 
 What is and is not true today:
 
 - **Implemented:** the three tiers, change-based selection, the folded suite, the lease, and the CI jobs `changes`,
   `check`, `test` and, on `main` only, `ambient` (the ordinary `cargo test --workspace`).
-- **Policy:** one green Linux CI execution at the PR's final head is the merge evidence, and `full` runs once per goal or
-  release rather than per PR. The pre-PR check in [AGENTS.md](AGENTS.md#pre-pr-check) still applies.
+- **Approved policy, not enforced by code:** one green Linux CI execution at the PR's final head is the merge evidence,
+  and `full` runs once per goal or release rather than per PR. The pre-PR check in
+  [AGENTS.md](AGENTS.md#pre-pr-check) still applies.
 - **Not yet in force:** the owner's change to the GitHub ruleset. Both `check` and `test` remain required on `main` and
   `release/**` until the owner applies and verifies it. A documentation-only PR skips its `test` job by condition,
   which satisfies the requirement.
-- **Not claimed:** no tier's wall time has been measured against its target, and no parallel test runner is adopted.
+- **Deferred:** PR 4 and `cargo-nextest`. The owner deferred them on 2026-11-17 after the tool's dependency audit found
+  23 advisories and 10 licence items outside the repository's allow-list. Test binaries run sequentially in every tier;
+  the 20-run qualification on each platform and the at-least-2x nextest speedup were not delivered, and no exception is
+  authorized.
+- **Not claimed:** no tier's wall time has been measured against its target.
 
 CI's suite step uploads a verified, redacted **diagnostic receipt**. It records what a suite run did; it is not a full
 qualifying gate bundle.

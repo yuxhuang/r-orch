@@ -125,32 +125,52 @@ in the sections after the table, each marked with its status (see "Status of eac
 
 | Tier | Command | What it runs | Target and lease | Use |
 |---|---|---|---|---|
-| `fast` | `./xtask/gate.sh fast --base origin/main` | `fmt`, workspace `clippy -D warnings`, `crate-graph`; then the selected packages' build and tests, or for a documentation-only change a workspace build and no tests | `target/gate-warm`; shared lease | Local iteration, every commit and fix round. Never merge or release evidence: its result always says `qualifying: no: local iteration; never merge evidence`. |
-| `pr` | `./xtask/gate.sh pr` | All nine steps in one run: `build`, `test`, `clippy`, `fmt`, `advisories`, `crate-graph`, `home-hygiene`, `no-real-cli`, `real-home`. The `test` step is one whole-workspace suite run under a sentinel `HOME` and recording agent shims, judged for failures, zero tests and nonzero named inventory | `target/gate-warm`, reused only after a content check; exclusive lease | The merge-condition tier. CI runs its suite steps as `pr --part suite`, and its static steps in the separate `check` job. |
+| `fast` | `./xtask/gate.sh fast --base origin/main` | `fmt`, workspace `clippy -D warnings`, `crate-graph`; then, for a code change, `build`, `test`, `home-hygiene`, `no-real-cli` and `real-home` on the selected packages (plus `environment-witness` when the selection is a package list without `xtask`); for a documentation-only change, a workspace `build` and no tests | `target/gate-warm`; shared lease | Local iteration, every commit and fix round. Never merge or release evidence: its result always says `qualifying: no: local iteration; never merge evidence`. |
+| `pr` | `./xtask/gate.sh pr` | All nine steps in one run: `build`, `test`, `clippy`, `fmt`, `advisories`, `crate-graph`, `home-hygiene`, `no-real-cli`, `real-home`. The `test` step is one whole-workspace suite run under a sentinel `HOME` and recording agent shims, judged for failures, zero tests and nonzero named inventory | `target/gate-warm`, reused only after a content check; exclusive lease | The merge-condition tier. CI runs its suite steps as `pr --part suite`; its separate `check` job runs the equivalent static commands (`cargo fmt`, `clippy`, `cargo xtask crate-graph`, cargo-deny) directly, not `pr --part static`. |
 | `full` (the default) | `./xtask/gate.sh` | The same nine steps as `pr` | Cold `target/gate`, removed afterwards unless `--keep`; needs 12 GiB free; exclusive lease | The goal and release gate, once per goal or release, not per PR. |
 
-`pr --plan` and `full --plan` print the tier, target, lease and steps without running anything. Every run prints a
-summary table with each step's verdict, wall time in seconds and exit status, and writes the same text to
-`target/gate-result.txt`. Exit status: 0 all steps passed, 1 a step failed or the run was refused, 2 bad arguments, 3 nothing failed but a step
-was `ENV-LIMITED` (for example `cargo-deny` is missing, so `advisories` was not evaluated) or `--evidence` found the run
-non-qualifying, 75 the cooperative lease was busy and nothing ran, 128 plus the signal after an interrupt. Exit 0 alone
-is not qualifying evidence: look for `qualifying: yes` in the result, which is printed only for a complete,
-clean-tree run of the whole tier that the wrapper started. Options: `--base <rev>` (fast; default `origin/main`), `--part suite|static` (pr and full
-only), `--evidence <dir>`, `--receipt <dir>` (`pr --part suite` only), `--lease-wait <minutes>` (default 30),
-`--host-label`, `--keep`, `--plan`, and `--warm` (full only: reuses your `target/`, developer-only, never a gate).
-`--no-lease` is refused: a gate must hold the lease.
+`--plan` runs no step: it prints the tier, target, lease and steps. Through `./xtask/gate.sh` it is not free of side
+effects, because the wrapper acts before any argument reaches the judge: it takes the host lease (or inherits one from
+`gate lease exec`) as `fast` or `pr`/`full` would, so `pr --plan` waits up to `--lease-wait` minutes behind a running
+gate and exits 75 if the lease stays busy; it takes the use lock `target/.gate-xtask.lock` (exit 1 if busy); and it
+builds the `xtask` judge into `target/gate-xtask` when that is missing or stale, then stamps it.
+
+A run that reaches the judge prints a summary table with each step's verdict, wall time in seconds and exit status. It
+replaces `target/gate-result.txt` with `verdict: IN PROGRESS` as soon as it starts and with the same text as the table
+when it ends, so a killed run leaves `IN PROGRESS`. A wrapper refusal (exit 75 lease busy, or a bootstrap failure with
+exit 1), a usage error (exit 2) and `--plan` write no result: `target/gate-result.txt` may then be an older run's, and
+may even say `qualifying: yes` for another commit. Check its `commit` line before you trust it.
+
+Exit status: 0 all steps passed, 1 a step failed or the run was refused, 2 bad arguments, 3 nothing failed but a step
+was `ENV-LIMITED` (for example `cargo-deny` is missing, so `advisories` was not evaluated), or `--evidence` found the run
+non-qualifying, or `--receipt` found the receipt unsuccessful, 75 the cooperative lease was busy and nothing ran, 128
+plus the signal after an interrupt. Exit 0 alone is not qualifying evidence: look for `qualifying: yes` in the result.
+It is printed only for a complete, clean-tree run of the whole tier that the wrapper started, at an unchanged head, with
+the default lease directory, the pinned toolchain, a held lease and a finished target use. `fast` is never qualifying, and
+`--part`, `--warm` and `--keep` each disqualify a run (`--keep` keeps the cold target of `full`).
+Any other disqualifier is named after `qualifying: no:` in the result.
+Options: `--base <rev>` (fast; default `origin/main`), `--part suite|static` (pr and full only), `--evidence <dir>`,
+`--receipt <dir>` (`pr --part suite` only), `--lease-wait <minutes>` (default 30), `--host-label`, `--keep`, `--plan`,
+and `--warm` (full only: reuses your `target/`, developer-only, never a gate). `--no-lease` is refused: a gate must hold
+the lease.
 
 Time **targets** (spec R12), not measurements: `fast` at most 5 minutes for a single-crate change and under 1 minute
-for documentation only; `pr` at most 20 minutes; `full` at most 25 minutes. None has been measured at this commit, and
-no parallel test runner is adopted: the suite's test binaries still run one after another.
+for documentation only; `pr` at most 20 minutes; `full` at most 25 minutes. None has been measured at this commit.
+
+**Parallel test binaries: PR 4 is deferred and `cargo-nextest` is not adopted.** On 2026-11-17 the owner deferred the
+goal's PR 4 after the dependency audit of the tool (version 0.9.152) found 23 advisories and 10 licence items outside
+the repository's allow-list (the owner's record of the audit). Every tier still runs the suite's test binaries one after
+another, and nextest is not available in any command or workflow here. The 20 consecutive green runs on each platform
+and the at-least-2x nextest speedup that the goal's plan asked for were **not delivered**, and no licence allowance,
+advisory ignore or tool change is authorized. Do not describe nextest as available, add it or work toward it without a
+new owner decision. The time targets above rest on sequential binaries, and a green tier is not a speed result.
 
 #### Status of each rule
 
 - **Implemented** means the command or check exists in `xtask/` and `.github/workflows/ci.yml` as described.
-- **Approved policy** means the owner approved it (the goal's questions Q1 to Q5 and the final plan approval) but no code
-  or GitHub setting enforces it; people and agents follow it.
-- **Draft policy** means this text derives a rule from those approvals (for example the reviewer limits) and the owner
-  has not yet confirmed the exact wording.
+- **Approved policy** means the owner approved it (the goal's questions Q1 to Q5, the unavailable-host answer and the
+  final plan approval) but no code or GitHub setting enforces it; people and agents follow it. Approved policy is
+  stated as approved: it is not held back for new owner wording.
 - **Awaiting the owner** means a GitHub ruleset change only the owner applies. Until the owner has applied it and it
   has been read back, the existing rules stand: both `check` and `test` are required on `main` and `release/**`.
 
@@ -163,7 +183,7 @@ each changed path with its class, what it selects and why. **Implemented.**
   `orch-cli` also selects `orch-infra`, because `concurrent_index` starts the selected `orch-cli` binary by path.
 - Documentation (`docs/`, top-level `*.md`, `LICENSE`, `NOTICE`) selects no tests. `docs/ARCHITECTURE.md` is the
   exception: it selects `xtask`, whose tests read it.
-- Any `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `clippy.toml`, `deny.toml`, `.gitignore`, `.gitattributes`,
+- Any `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml` or `rust-toolchain`, `clippy.toml`, `deny.toml`, `.gitignore`, `.gitattributes`,
   and everything under `.cargo/`, `xtask/`, `.github/`, `.config/`, `fixtures/`, `skills/`, `examples/` or shared test
   support selects everything.
 - It fails closed: an unknown path, an empty change set, an unreadable base or any parse error selects everything.
@@ -173,8 +193,11 @@ each changed path with its class, what it selects and why. **Implemented.**
 
 ```
 ./xtask/gate.sh fast --base origin/main          # not run for this document
-cargo xtask gate select --base origin/main --format json   # selection only; nothing is built or tested
+cargo xtask gate select --base origin/main --format json   # selection only: no test runs and no workspace crate is built
 ```
+
+`cargo xtask` is the alias `cargo run --package xtask --`, so cargo compiles `xtask` and its dependencies when they are
+out of date, into your cargo target directory (by default `target/`). The selector itself only runs `git` and `cargo metadata`.
 
 #### Builders (status: `fast` implemented; per-round use approved policy)
 
@@ -186,35 +209,46 @@ cargo xtask gate select --base origin/main --format json   # selection only; not
    and for a release or the once-per-goal run. Do not run it per PR.
 4. In the PR, name the tier or command, the platform, the commit, and what that tier did not run.
 
-#### Reviewers (status: draft policy, derived from Q1 and Q2)
+#### Reviewers (status: approved policy, from Q1, Q2 and the unavailable-host answer)
 
-A reviewer may rely on:
+A reviewer reads evidence and does not merge. Two questions need different evidence.
+
+**What a reviewer may cite.** Any evidence that names its commit, for the claim it supports and with its scope stated:
+a fix round's `fast` result, a `--part` run, a diagnostic receipt, a builder's commit-stamped report, and commands the
+reviewer ran itself with their output. A `fast` result shows that the selected crates passed; it does not show that the
+merge condition is met.
+
+**What counts toward the merge condition** (the evidence the owner merges on). Only:
 
 - the PR's CI run **at its final head** (`check` and, for a code change, `test`), with the commit it ran at;
 - a verified evidence bundle from a `pr` or `full` run (`cargo xtask gate evidence verify <dir> --commit <sha>`)
-  that says `qualifying: yes`;
-- commands the reviewer ran itself, with their output.
+  that says `qualifying: yes`, where the section on native Linux below allows it.
 
-A reviewer may **not** treat as merge evidence: any `fast` result; exit 0 without `qualifying: yes`; a run at an
-earlier head (a push after a green run needs a new green run); a `--warm` or dirty-tree run; a `--part` run or a
-diagnostic receipt standing alone (a receipt shows what a suite run did, not that the whole gate passed); a CI job
-that was skipped without the documentation-only classification; or a builder's report with no commit. A reviewer
-states what was checked and what was not, as in Roles.
+These do not count toward it, however useful they are as review evidence: any `fast` result; exit 0 without
+`qualifying: yes`; a run at an earlier head (a push after a green run needs a new green run); a `--warm` or dirty-tree
+run; a `--part` run or a diagnostic receipt standing alone (a receipt shows what a suite run did, not that the whole
+gate passed; CI's own `test` job is a `--part suite` run with a receipt, and counts as part of the PR's CI run, not by
+itself); a CI job that was skipped without the documentation-only classification; or a builder's report with no commit.
+A reviewer states what was checked and what was not, as in Roles.
 
-#### What gates a merge (status: Q1 approved; live rules unchanged)
+#### What gates a merge (status: Q1 approved policy; live rules unchanged)
 
 - **Approved policy.** One green Linux execution at the PR's final head is the CI evidence a merge needs. A failed run
   is kept and diagnosed, never re-run until it passes; a flaky test is fixed or named, not retried. This replaces the
-  earlier team rule of three complete CI executions per PR; the team's own rule files are updated separately and are not
-  part of this repository. Independent review remains.
+  earlier rule of three complete green CI executions per PR, which the repository records for the daemon-owned-state
+  goal in [its spec](docs/specs/2026-11-09-daemon-owned-state.md) and [plan](docs/plans/2026-11-09-daemon-owned-state.md); both
+  already carry the owner's amendment of 2026-11-13 that one green execution is enough. Independent review remains.
 - **Live rules today (Awaiting the owner).** The ruleset requires the `check` and `test` jobs on `main` and
-  `release/**`. The owner's approved change removes only `test` on `main`; it is not applied, and no agent applies it.
+  `release/**`; the last read-only capture (2026-11-17) found them unchanged, and a capture is a record, not a live
+  query. The owner's approved change removes only `test` on `main`; it is not applied, and no agent applies it.
   A `<linux-host>` run (below) therefore does not satisfy the required `test` job on a code PR; wait for GitHub's.
 - **Documentation-only PRs. Implemented.** The `changes` job classifies the PR with `gate select`; for `docs-only`
   the `test` job is skipped by its `if` condition while `check` still builds and runs fmt, clippy, `crate-graph` and
   cargo-deny. GitHub treats a conditionally skipped job as satisfying a required check
   ([docs](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-jobs-with-conditions)).
-  A skipped whole workflow would not, so the workflow has no path filters. A natural documentation-only PR under the
+  A whole workflow skipped by path or branch filtering leaves its checks pending and blocks the merge
+  ([docs](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/collaborating-on-repositories-with-code-quality-features/troubleshooting-required-status-checks)),
+  so the workflow has no path filters. A natural documentation-only PR under the
   live rules has not yet been observed (acceptance is owed); report what you see.
 - **After the merge.** A push to `main` forces `all` and also runs the `ambient` job: the ordinary
   `cargo test --workspace --no-fail-fast` with the repository's `.cargo/config.toml` `[env]`. No tier run before the
@@ -244,8 +278,9 @@ What no tier proves, and what is accepted rather than fixed:
 - `home-hygiene` and `no-real-cli` do not see a child process a test starts with its own `HOME` or `PATH`.
 - A process that a test or build script left behind, and that the gate did not start, can write into a target that a
   later run trusts, and no tier detects it (the owner's accepted risk, ADR 0015 decision 41). Never remove `target/`,
-  by `cargo clean` or by hand, and never delete a gate marker while a command of a killed gate may still run: the
-  refusal text says the same.
+  by `cargo clean` or by hand, and never delete a gate marker while a command of a killed gate may still run. The
+  refusal text says not to remove `target/` while a process of an earlier use is alive, and to inspect the marker
+  read-only with `lsof`. Never deleting a marker is this file's rule.
 - Passing proves nothing about timing, and a green `fast`, `pr` or `full` is not a performance result.
 
 #### Native Linux and the unavailable-host fallback (status: Q2 approved policy)

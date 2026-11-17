@@ -1560,8 +1560,11 @@ What each tier is for, who runs it and what it does not prove is in
 reading results, evidence, refusals and recovery. `./xtask/gate.sh full` is the
 goal/release gate. `pr` is the merge-condition tier by approved policy, but the
 live GitHub rules still require both `check` and `test` until the owner applies the
-reviewed change. `fast` is local iteration. No parallel test runner is adopted and
-no tier's wall time is measured against its target.
+reviewed change. `fast` is local iteration. PR 4 is deferred and cargo-nextest is
+not adopted (owner decision of 2026-11-17 after its dependency audit: 23 advisories,
+10 licence items outside the allow-list): test binaries run sequentially, and its
+qualification and speedup were not delivered. No tier's wall time is measured
+against its target.
 Use `qualifying: yes` in verified exact-head evidence; an exit0 or a consistent
 inventory alone is insufficient. A direct unstamped executable cannot qualify.
 The wrapper privately publishes a single-link executable after Cargo success and
@@ -1598,6 +1601,11 @@ implied by scoped implementation checks.
 ./xtask/gate.sh fast --plan
 cargo xtask gate select --base origin/main --format json
 ```
+
+`gate select` builds no workspace crate and runs no test, but `cargo xtask` is a
+`cargo run` of the `xtask` package, so cargo compiles `xtask` and its dependencies
+first when they are out of date. `fast --plan` through the wrapper runs no step but
+takes the shared lease and may build and stamp the judge in `target/gate-xtask`.
 
 The default base is `origin/main`; the selector compares its merge base, staged,
 working-tree and untracked paths, and Cargo workspace reverse dependencies.
@@ -1641,11 +1649,16 @@ Fast is an iteration signal; the full PR check remains the merge check.
 
 ### Reading a result and common refusals
 
-A run prints its summary table (status, step, wall seconds, exit, detail) and writes
-the same text to `target/gate-result.txt`; the reserved per-run directory is
-`target/gate-runs/run-*`. Exit status: 0 passed, 1 a step failed or the run was
-refused, 2 bad arguments, 3 nothing failed but a step was `ENV-LIMITED` or
-`--evidence` found the run non-qualifying, 75 the lease was busy and nothing ran,
+A run that reaches the judge prints its summary table (status, step, wall seconds,
+exit, detail) and writes the same text to `target/gate-result.txt`; the reserved
+per-run directory is `target/gate-runs/run-*`. The file first reads
+`verdict: IN PROGRESS`, so a killed run leaves that. A wrapper refusal (exit 75 lease
+busy, bootstrap exit 1), a usage error (exit 2) and `--plan` write no result:
+`target/gate-result.txt` may be an older run's and may say `qualifying: yes` for
+another commit, so read its `commit` line. Exit status: 0 passed, 1 a step failed or the run was
+refused, 2 bad arguments, 3 nothing failed but a step was `ENV-LIMITED`,
+`--evidence` found the run non-qualifying or `--receipt` found the receipt
+unsuccessful, 75 the lease was busy and nothing ran,
 128 plus the signal after an interrupt.
 
 | Symptom | Cause | Fix |
@@ -1664,8 +1677,8 @@ refused, 2 bad arguments, 3 nothing failed but a step was `ENV-LIMITED` or
 
 ### Judging a PR's evidence
 
-Status: draft policy from the owner's Q1 and Q2 answers; the live rules are
-unchanged.
+Status: approved policy (the owner's Q1 and Q2 answers and the unavailable-host
+answer); the live rules are unchanged.
 
 1. Take the PR's final head commit. Evidence at an earlier head does not carry over.
 2. GitHub CI at that head is the default evidence: `changes` and `check` succeeded
@@ -1683,9 +1696,11 @@ unchanged.
 4. If that host or the Mac is unavailable, GitHub's CI is the evidence for an
    ordinary PR; say which local check did not run. This does not waive the cold
    `full` run a goal or release needs on its platform.
-5. A `fast` result, `qualifying: no`, a `--part` run or receipt alone, a `--warm`
-   or dirty-tree run never counts. Do not rerun a failed job to obtain a pass:
-   keep the failed run and diagnose it.
+5. A reviewer may cite any evidence that names its commit, for the claim it
+   supports and with its scope stated (a fix round's `fast`, a `--part` run, a
+   receipt, a builder's report). A `fast` result, `qualifying: no`, a `--part` run
+   or receipt alone, a `--warm` or dirty-tree run never counts as merge evidence.
+   Do not rerun a failed job to obtain a pass: keep the failed run and diagnose it.
 
 ### PR3 CI suite receipts and required-check transition
 
