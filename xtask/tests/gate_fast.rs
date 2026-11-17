@@ -61,10 +61,20 @@ fn current_cli() {
 fn assert_private_tree(path: &Path) {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::symlink_metadata(path).unwrap();
-    assert_eq!(meta.mode() & 0o777, if meta.is_dir() { 0o700 } else { 0o600 }, "{}", path.display());
+    assert_eq!(
+        meta.mode() & 0o777,
+        if meta.is_dir() { 0o700 } else { 0o600 },
+        "{}",
+        path.display()
+    );
     if meta.is_dir() {
-        for entry in fs::read_dir(path).unwrap() { assert_private_tree(&entry.unwrap().path()); }
-    } else { assert!(meta.is_file()); assert_eq!(meta.nlink(), 1); }
+        for entry in fs::read_dir(path).unwrap() {
+            assert_private_tree(&entry.unwrap().path());
+        }
+    } else {
+        assert!(meta.is_file());
+        assert_eq!(meta.nlink(), 1);
+    }
 }
 fn fast(s: &Sandbox, base: &str) -> witness::fixture::Capture {
     s.run(&mut s.gate(&["fast", "--base", base, "--lease-wait", "0"]))
@@ -144,8 +154,19 @@ fn selected_fast_builds_current_cli_on_empty_and_changed_warm_target_d40() {
         let run = Path::new(field(&record, "run-dir"));
         let inventory = fs::read_to_string(run.join("inventory.tsv")).unwrap();
         assert!(inventory.contains("current_cli\tok"), "{inventory}");
-        for name in ["gate_environment_witness", "witness_target_extra_a", "witness_target_extra_b"] {
-            assert_eq!(inventory.lines().filter(|l| l.ends_with(&format!("\t{name}\tok"))).count(), 1, "{inventory}");
+        for name in [
+            "gate_environment_witness",
+            "witness_target_extra_a",
+            "witness_target_extra_b",
+        ] {
+            assert_eq!(
+                inventory
+                    .lines()
+                    .filter(|l| l.ends_with(&format!("\t{name}\tok")))
+                    .count(),
+                1,
+                "{inventory}"
+            );
         }
         assert!(!inventory.contains("must_not_run"));
         assert!(!record.contains("step-advisories-status"));
@@ -177,7 +198,14 @@ fn docs_only_fast_builds_and_lints_without_running_tests() {
     }
     let run = Path::new(field(&record, "run-dir"));
     use std::os::unix::fs::PermissionsExt;
-    assert_eq!(fs::metadata(run.join("steps")).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(
+        fs::metadata(run.join("steps"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
     assert_private_tree(run);
     assert_private_tree(&s.root.join("target/.gate-state"));
     assert_private_tree(&s.root.join("target/gate-result.txt"));
@@ -299,7 +327,10 @@ fn fast_export_remains_nonqualifying_and_verifier_rejects_it() {
     out.contains("never merge evidence");
     use std::os::unix::fs::PermissionsExt;
     for path in [&destination, &destination.join("steps")] {
-        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
     assert_private_tree(&destination);
     s.run(&mut s.gate(&[
@@ -320,7 +351,10 @@ fn metadata_boundary_save(case: &str) {
     if case == "docs" {
         s.write("README.md", "documentation only\n");
     } else {
-        s.write("crates/orch-cli/src/main.rs", "fn main() {\n    println!(\"first\"); // selected\n}\n");
+        s.write(
+            "crates/orch-cli/src/main.rs",
+            "fn main() {\n    println!(\"first\"); // selected\n}\n",
+        );
     }
     let real = s.cargo_forwarder();
     let changed = s.root.join("crates/unselected/src/lib.rs");
@@ -334,7 +368,7 @@ import os, pathlib, subprocess, sys
 args=sys.argv[1:]
 result=subprocess.run(['/usr/bin/git']+args, stdout=subprocess.PIPE)
 if args[-4:] == ['ls-files','--others','--exclude-standard','-z'] and '--no-optional-locks' in args and result.returncode == 0:
-    pathlib.Path({armed:?}).write_text('selection paths complete\n')
+    with os.fdopen(os.open({armed:?}, os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW, 0o600), 'w') as f: f.write('selection paths complete\n')
 sys.stdout.buffer.write(result.stdout)
 sys.exit(result.returncode)
 "#, armed=armed.to_str().unwrap()));
@@ -347,33 +381,67 @@ if sys.argv[1:2] == ['metadata']:
     trigger=exact and armed and result.returncode == 0 and not pathlib.Path({saved:?}).exists()
     if trigger:
         pathlib.Path({changed:?}).write_text('#[test]\nfn introduced_failure() {{\n    panic!("metadata save must not pass narrow selection");\n}}\n')
-        pathlib.Path({saved:?}).write_text('saved at explicit selection metadata boundary\n')
-    with pathlib.Path({trace:?}).open('a') as f: f.write(json.dumps(dict(argv=sys.argv[1:],armed=armed,trigger=trigger,status=result.returncode))+'\n')
+        with os.fdopen(os.open({saved:?}, os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW, 0o600), 'w') as f: f.write('saved at explicit selection metadata boundary\n')
+    with os.fdopen(os.open({trace:?}, os.O_WRONLY|os.O_CREAT|os.O_APPEND|os.O_NOFOLLOW, 0o600), 'a') as f: f.write(json.dumps(dict(argv=sys.argv[1:],armed=armed,trigger=trigger,status=result.returncode))+'\n')
     sys.stdout.buffer.write(result.stdout)
     sys.exit(result.returncode)
 os.execv({real:?}, [{real:?}] + sys.argv[1:])
 "#, real=real.to_str().unwrap(), changed=changed.to_str().unwrap(), saved=saved.to_str().unwrap(), trace=trace.to_str().unwrap(), armed=armed.to_str().unwrap()));
     let out = fast(&s, &base);
     assert!(saved.is_file(), "metadata save boundary was not reached");
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(fs::metadata(&s.temporary).unwrap().mode() & 0o777, 0o700);
+    for path in [&trace, &saved, &armed] {
+        assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o600);
+    }
     let calls = fs::read_to_string(&trace).unwrap();
-    let calls: Vec<serde_json::Value> = calls.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let calls: Vec<serde_json::Value> = calls
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
     assert_eq!(calls.iter().filter(|c| c["trigger"] == true).count(), 1);
-    assert!(calls.iter().any(|c| c["trigger"] == true && c["armed"] == true));
-    println!("METADATA_BOUNDARY case={case} calls={calls:?} actual-fast-exit={:?}\n{}", out.status.code(), out.text());
+    assert!(
+        calls
+            .iter()
+            .any(|c| c["trigger"] == true && c["armed"] == true)
+    );
+    println!(
+        "METADATA_BOUNDARY case={case} calls={calls:?} actual-fast-exit={:?}\n{}",
+        out.status.code(),
+        out.text()
+    );
     out.code(1);
     out.contains("source changed during fast selection");
     let record = s.result();
     assert!(!record.contains("PASSED"), "{record}");
-    assert!(!record.contains("publication: record published"), "{record}");
+    assert!(
+        !record.contains("publication: record published"),
+        "{record}"
+    );
     assert!(!record.contains("step-build-status"), "{record}");
-    assert!(fs::read_to_string(&changed).unwrap().contains("introduced_failure"));
+    assert!(
+        fs::read_to_string(&changed)
+            .unwrap()
+            .contains("introduced_failure")
+    );
     assert_ne!(field(&record, "judge-source-id"), "absent");
-    assert!(!record.contains("source/head changed"), "judge must stay stable: {record}");
-    let independent = s.run(s.command("cargo").args(["test", "-p", "unselected", "--lib"]));
+    assert!(
+        !record.contains("source/head changed"),
+        "judge must stay stable: {record}"
+    );
+    let independent = s.run(
+        s.command("cargo")
+            .args(["test", "-p", "unselected", "--lib"]),
+    );
     independent.code(101);
     independent.contains("introduced_failure ... FAILED");
-    println!("INDEPENDENT_OMITTED_PACKAGE case={case} actual-exit={:?}\n{}", independent.status.code(), independent.text());
-    s.run(&mut s.gate(&["lease", "exec", "--lease-wait", "0", "--", "/usr/bin/true"])).code(0);
+    println!(
+        "INDEPENDENT_OMITTED_PACKAGE case={case} actual-exit={:?}\n{}",
+        independent.status.code(),
+        independent.text()
+    );
+    s.run(&mut s.gate(&["lease", "exec", "--lease-wait", "0", "--", "/usr/bin/true"]))
+        .code(0);
 }
 
 #[test]

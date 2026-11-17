@@ -1926,3 +1926,26 @@ reads every crate's source without a Cargo edge. The orch-infra guards
 `spawn_gate` and `synthetic_spawn_domain_guard` also scan crates; D39 covers them
 incidentally while every crate reaches orch-cli. This adds no coupling policy.
 Fast is an iteration signal; the full PR check remains the merge check.
+
+## PR2 draft completion: corrected subcommand argv and diagnostic creation
+
+The retained fa7530ff draft failed before rustfmt: Cargo rejected a global
+manifest option. Continue on that clean branch with subcommand-first commands:
+`cargo fmt --manifest-path <absolute Cargo.toml> --all`, then final `--check`.
+Before compile, audit build/test/clippy/metadata/fmt help under the private
+installed 1.99.1 recipe; do not install anything. Complete metadata call trace,
+armed/saved boundary markers and cleanup diagnostics with explicit0600 creation
+under existing immediate0700 parents. Source mutation inputs remain fixture
+source, not capture evidence. Preserve normal child022 and finish/reap before
+mode assertions. Add diagnostic creation mode assertions using actual APIs.
+
+Accept all original S-PR2-1, SRE F-1/F-2, P-L1/P-L2, code F-1/F-2/F-3 and
+SRE F-4 dispositions in the prior correction plan. No closure from drafted code:
+require fixed/reverted boundary controls, independent omitted-package failure,
+real unfiltered witness/map/inventory and extra-test filter negative, default
+file/directory negatives, direct shared-authority pr/full/cold negatives,
+unchanged TV61/TV62/RS1 Linux-container fixed/mutant evidence, scoped build,
+fmt/clippy/crate-graph and complete exact-head xtask pre-map/raw/inventory.
+SRE F-3 bootstrap lifetime remains carried minor; no redesign is authorized.
+Stop on first unexpected failure, retaining immutable channels/status/source.
+FS1/D45/option3 remain accepted, not fixed; native acceptance remains held.

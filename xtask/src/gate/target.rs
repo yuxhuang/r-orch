@@ -125,7 +125,8 @@ impl Captured {
     pub(super) fn require_same(&self, other: &Self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.sources.identities() == other.sources.identities()
-                && self.toolchain == other.toolchain && self.boot == other.boot,
+                && self.toolchain == other.toolchain
+                && self.boot == other.boot,
             "source changed during fast selection; refusing stale selection"
         );
         Ok(())
@@ -1610,7 +1611,10 @@ pub(super) struct Captured {
 }
 
 impl Captured {
-    pub(super) fn read(runner: &mut super::steps::Runner<'_, '_>, root: &Path) -> anyhow::Result<Self> {
+    pub(super) fn read(
+        runner: &mut super::steps::Runner<'_, '_>,
+        root: &Path,
+    ) -> anyhow::Result<Self> {
         use std::ffi::OsStr;
         use std::process::Command;
         fn inventory(
@@ -3032,9 +3036,19 @@ mod tests {
         let use_ = target.begin(&exclusive).unwrap();
         let directory = f.base.join("other-lease");
         fs::create_dir(&directory).unwrap();
-        let shared = super::super::lease::Lease::Owned(super::super::lease::Owned::acquire(
-            &directory, f.files.owner, super::super::lease::Mode::Shared, std::time::Duration::ZERO).unwrap());
-        let error = use_.run::<()>(&shared, false, |_, _| panic!("cold work must not start")).err().unwrap();
+        let shared = super::super::lease::Lease::Owned(
+            super::super::lease::Owned::acquire(
+                &directory,
+                f.files.owner,
+                super::super::lease::Mode::Shared,
+                std::time::Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        let error = use_
+            .run::<()>(&shared, false, |_, _| panic!("cold work must not start"))
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("exclusive"), "{error}");
         assert!(!f.files.path(Leaf::Record).exists());
         f.canary_unchanged();

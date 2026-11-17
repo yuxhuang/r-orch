@@ -15,7 +15,12 @@ use serde_json::{Value, json};
 
 fn private_capture(path: &Path) -> File {
     use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).unwrap()
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap()
 }
 
 const BASE: &str = "selector-fixture-base";
@@ -164,7 +169,10 @@ impl Fixture {
             "logs",
             "git-template",
         ] {
-            fs::DirBuilder::new().mode(0o700).create(fixture.temporary.join(path)).unwrap();
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(fixture.temporary.join(path))
+                .unwrap();
         }
         fs::write(fixture.temporary.join("gitconfig"), "").unwrap();
         fixture

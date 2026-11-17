@@ -491,12 +491,7 @@ pub(super) fn run_fast(
                 command
                     .args(["test", "--locked", "--manifest-path"])
                     .arg(repo.join("Cargo.toml"))
-                    .args([
-                        "-p",
-                        "xtask",
-                        "--test",
-                        "gate_witness",
-                    ]);
+                    .args(["-p", "xtask", "--test", "gate_witness"]);
                 let log = runner.logged(&mut command, inventory::MAX_LOG)?;
                 child_exit = Some(report::code(log.exit));
                 bytes = log.bytes;
@@ -509,7 +504,11 @@ pub(super) fn run_fast(
                 ensure!(
                     log.exit.success()
                         && rows.iter().all(|r| r.status == "ok")
-                        && rows.iter().filter(|r| r.test == "gate_environment_witness").count() == 1,
+                        && rows
+                            .iter()
+                            .filter(|r| r.test == "gate_environment_witness")
+                            .count()
+                            == 1,
                     "environment witness did not pass exactly once"
                 );
                 h.witness()?;

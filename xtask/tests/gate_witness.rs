@@ -39,8 +39,21 @@ fn gate_environment_witness() {
         record.push('\n');
     }
     let directory = std::path::Path::new(&directory);
-    std::fs::create_dir_all(directory).unwrap();
-    std::fs::write(directory.join("witness.txt"), record).unwrap();
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join("witness.txt"))
+        .unwrap()
+        .write_all(record.as_bytes())
+        .unwrap();
 }
 
 // FIXTURE SUPPORT: not planted in miniature workspaces.
@@ -133,7 +146,26 @@ def cargo_subcommand(args):
 
     fn private_capture(path: &Path) -> fs::File {
         use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).unwrap()
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+    }
+
+    // These are diagnostic captures, unlike source/configuration fixture inputs.
+    // The existing Sandbox owner creates their immediate parent0700.
+    pub fn private_diagnostic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+            .write_all(bytes)
     }
 
     pub struct Sandbox {
@@ -187,7 +219,10 @@ def cargo_subcommand(args):
                 "lease",
                 "capture",
             ] {
-                fs::DirBuilder::new().mode(0o700).create(result.temporary.join(name)).unwrap();
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(result.temporary.join(name))
+                    .unwrap();
             }
             fs::write(result.temporary.join("home/global.yml"), "{}\n").unwrap();
             fs::write(result.temporary.join("fallback-settings.toml"), "").unwrap();
@@ -738,14 +773,18 @@ def cargo_subcommand(args):
             // underneath an unresolved writer. This is containment of files,
             // not a claim that escaped descendants have been stopped (FS2/I3).
             let root = self.stdout.parent().unwrap().parent().unwrap();
-            let _ = fs::write(
-                root.join("cleanup-unresolved"),
+            let _ = private_diagnostic(
+                &root.join("cleanup-unresolved"),
                 b"abnormal direct-child completion; descendant authority unresolved\n",
             );
             if matches!(self.child.try_wait(), Ok(None)) {
                 let group_signalled = self.signal_owned("KILL", true);
                 if !group_signalled {
-                    fs::write(root.join("cleanup-failed"), b"owned group signal failed; scratch retained\n").expect("retain cleanup failure");
+                    private_diagnostic(
+                        &root.join("cleanup-failed"),
+                        b"owned group signal failed; scratch retained\n",
+                    )
+                    .expect("retain cleanup failure");
                 }
                 let _ = self.child.kill();
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -765,7 +804,10 @@ def cargo_subcommand(args):
                 }
             }
             if root.join("cleanup-failed").exists() && !std::thread::panicking() {
-                panic!("fixture cleanup failed; scratch retained at {}", root.display());
+                panic!(
+                    "fixture cleanup failed; scratch retained at {}",
+                    root.display()
+                );
             }
             // A reaped leader supplies no authority over survivors. No numeric
             // PID/PGID signal follows that branch; independent seam still due.
@@ -920,6 +962,15 @@ fn fixture_captures_are_private_at_creation() {
     let sandbox = fixture::Sandbox::filesystem_only();
     let child = sandbox.spawn(&mut sandbox.command("/usr/bin/true"));
     child.finish(fixture::COMMAND_BUDGET).code(0);
+    for name in ["cleanup-unresolved", "cleanup-failed"] {
+        let path = sandbox.temporary.join(name);
+        fixture::private_diagnostic(&path, b"mode oracle\n").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+    assert_eq!(
+        std::fs::metadata(&sandbox.temporary).unwrap().mode() & 0o777,
+        0o700
+    );
     let directory = sandbox.temporary.join("capture");
     assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
     let files: Vec<_> = std::fs::read_dir(directory).unwrap().collect();

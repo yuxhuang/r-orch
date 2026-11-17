@@ -455,7 +455,9 @@ pub(super) fn export(
     );
     use std::os::unix::fs::DirBuilderExt;
     std::fs::DirBuilder::new().mode(0o700).create(destination)?;
-    std::fs::DirBuilder::new().mode(0o700).create(destination.join("steps"))?;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(destination.join("steps"))?;
     for (name, text) in redacted {
         files::write(&destination.join(name), text.as_bytes())?;
     }
@@ -769,7 +771,9 @@ impl Run {
     ) -> Result<()> {
         files::real_directories(&self.path)?;
         use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(self.path.join("steps"))?;
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(self.path.join("steps"))?;
         for (name, bytes) in entries {
             ensure!(bundle_name(name), "run entry name");
             if name == "result.txt" {

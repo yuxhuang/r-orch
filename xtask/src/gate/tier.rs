@@ -86,7 +86,11 @@ fn dirty(repo: &Path) -> Result<bool> {
 }
 
 fn validate_tier_lease(tier: Tier, held: &lease::Lease) -> Result<()> {
-    if tier == Tier::Fast { held.validate() } else { held.validate_exclusive() }
+    if tier == Tier::Fast {
+        held.validate()
+    } else {
+        held.validate_exclusive()
+    }
 }
 
 #[cfg(test)]
@@ -95,10 +99,23 @@ mod correction_tests {
     #[test]
     fn pr_and_full_refuse_shared_authority_fast_accepts_it() {
         let s = super::super::steps::tests::Scratch::new();
-        let held = lease::Lease::Owned(lease::Owned::acquire(&s.0, nix::unistd::geteuid().as_raw(), lease::Mode::Shared, Duration::ZERO).unwrap());
+        let held = lease::Lease::Owned(
+            lease::Owned::acquire(
+                &s.0,
+                nix::unistd::geteuid().as_raw(),
+                lease::Mode::Shared,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
         validate_tier_lease(Tier::Fast, &held).unwrap();
         for tier in [Tier::Pr, Tier::Full] {
-            assert!(validate_tier_lease(tier, &held).unwrap_err().to_string().contains("exclusive"));
+            assert!(
+                validate_tier_lease(tier, &held)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exclusive")
+            );
         }
     }
 }
