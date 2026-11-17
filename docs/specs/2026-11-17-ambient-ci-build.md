@@ -1,4 +1,4 @@
-# Ambient CI binary prerequisite
+# Ambient CI target resolution
 
 status: approved
 owner: release engineer
@@ -7,32 +7,34 @@ plan: [implementation plan](../plans/2026-11-17-ambient-ci-build.md)
 
 ## Source
 
-Bounded fix-forward authorized by the main-red decision for task tsk_ueqfAgR, under the owner's standing instruction:
+Bounded correction authorized by the main-red adjudication for task tsk_zME8pYy, under the owner's standing instruction:
 
 1. “merge and continue next prs. repeat the loop; push the pr, wait for the ci run, merge the pr until all steps are done”.
-2. Task repair scope: “Make ambient build required orch binary in SAME CARGO_TARGET_DIR before suite (cargo build -p orch-cli or justified minimal equivalent), preserve ambient event/coverage/failure semantics and isolation.”
+2. Adjudicated repair: “CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci-ambient”; “Remove the redundant newly added build step”; replace the wrong-model regression with an absolute workspace-rooted target oracle and a relative-target negative control, including package-cwd resolution.
 
-This supplements the [PR3 spec](2026-11-17-pr3-ci.md). Run 44051962151 on main failed: all three concurrent_index tests required an absent target/ci-ambient/debug/orch. The tests derive their binary from CARGO_TARGET_DIR and deliberately refuse stale/foreign fallback.
+This supplements the [PR3 spec](2026-11-17-pr3-ci.md). Main run 44051962151 remains failed. The earlier missing-build diagnosis is withdrawn: workspace tests already provision debug/orch through orch-cli integration-test targets. The failure is relative path resolution: concurrent_index uses CARGO_TARGET_DIR verbatim from its package cwd, while Cargo writes the binary relative to the workspace root. The original author proof used an absolute target and is retained only as an absolute-target control; historical reports remain unchanged.
 
 ## Requirements
 
 | Id | Requirement | Source | Priority | Acceptance |
 |---|---|---|---|---|
-| R1 | Ambient shall build orch-cli in its job's target before running ordinary workspace tests; build failure shall stop execution. | item 2 | must | Executed workflow-shell regression with absent artifact, missing/reordered/wrong-target/masked-failure controls; macOS and Linux CI. |
-| R2 | Ambient shall retain its main-push event predicate, target isolation, full workspace/no-fail-fast test argv and ordinary failure semantics. Other jobs remain unchanged. | item 2 | must | Existing ci_workflow contract plus actual shell execution; diff review. |
-| R3 | The actual build shall provide the required binary to all three unchanged concurrent_index tests from an initially absent task-private target. | item 2 | must | `cargo build -p orch-cli`, then `cargo test -p orch-infra --test concurrent_index`; macOS now, main ambient Linux after reviewed publication. |
+| R1 | Ambient shall set its isolated target to the literal workspace-rooted expression in item 2, resolving to the same binary from the workspace and package cwd; remove the redundant explicit build. | item 2; F1/F3, SR-A1 | must | ci_workflow exact-expression/shape oracle and real filesystem lookup from package cwd; macOS and Linux CI. |
+| R2 | Retain the main-push predicate, full ordinary workspace/no-fail-fast suite and producer failure status, caches, pins, permissions, timeout and every other job/target. | item 2 | must | Existing ci_workflow and Linux mirror checks; diff review. |
+| R3 | Reject the original relative value for the actual package-cwd reason, and pass all three unchanged concurrent_index tests using the evaluated literal corrected CI target. | item 2; F2, SR-A2/A3 | must | Regression red on original workflow at 6802e79b and relative mutant; native relative negative then absolute positive on macOS, actual hosted main ambient after reviewed publication. |
 
 ## Constraints and security
 
-Only workflow, ci_workflow regression and this spec/plan change. No product/test-oracle weakening, remote-tools repair, retry, cache, action, permission, policy, release or runtime-config change. Pure CI needs no changelog. Existing main-red evidence remains failed. One heavy workload per host uses the configured cooperative lease, private HOME/global.yml, first-PATH AI blockers and umask 022; raw evidence starts as directories 0700/files 0600. Regression children clear their environment and execute only fixture cargo in a private directory. No event text is interpolated into shell.
+Only workflow, ci_workflow regression and this spec/plan change. No concurrent_index body, remote fixture, gate.sh, linux.rs, cache, action, permission, policy or deployment change. Audit other runtime target readers read-only. The regression uses a private artifact marker and an actual shell filesystem lookup from the package cwd, without fake Cargo or a claim to simulate compilation. Native proof separately provisions the binary using Cargo test compilation; no preceding cargo build is required by workspace testing. No event data is interpolated into shell source.
 
-## Verification environment
+One heavy workload per host takes configured turnstile then lease, with private HOME/global.yml and first-PATH17 AI blockers; workload umask022, raw evidence directories0700/files0600 at creation. Preserve SEC-AMBIENT-1's historical0644 exposure and the security reviewer's optional setup failure; neither is retroactively fixed. FS1/D45/option3 remain accepted-not-fixed.
 
-Native macOS author checks: focused ci_workflow, actual cold-target build plus three concurrent_index tests, fmt and applicable clippy. Full pre-PR suite is explicitly deferred to the post-review publication continuation. Hosted Linux full ambient green requires a later main event; focused success cannot establish it. No human question is required within this approved scope. Spec stays approved until acceptance completes.
+## Verification environment and hold
+
+Focused native macOS: ci_workflow, mirror, fmt, applicable xtask clippy, Cargo-test binary provisioning and unchanged concurrent_index negative/positive controls. Full native/pre-PR verification is deferred until combined final-head reviews. Hosted Linux main acceptance requires a later natural main event, including all three concurrent_index names; PR green alone cannot establish ambient. No performance, whole-suite or readiness claim follows from focused checks. Spec stays approved until acceptance completes.
 
 ## Verification
 
 | Id | Result | Commit | Platform |
 |---|---|---|---|
-| R1–R2 | pass: eight focused workflow tests including four fault controls; downstream review/event acceptance pending | frozen author SHA in task handoff | macOS; Linux GitHub Actions pending |
-| R3 | pass: absent-binary build plus all three unchanged concurrent_index tests; full ambient acceptance pending | frozen author SHA in task handoff | macOS; Linux GitHub Actions pending |
+| R1–R2 | pass locally: ci_workflow 8/8, both mirror checks, fmt and applicable clippy; independent delta review pending | corrected SHA and checked-source hashes in task handoff | macOS; Linux GitHub Actions pending |
+| R3 | pass locally: original workflow regression red at package lookup; native relative 0/3, evaluated-literal absolute 3/3 with unchanged binary provisioned by Cargo test compilation | corrected SHA and checked-source hashes in task handoff | macOS; hosted main pending |

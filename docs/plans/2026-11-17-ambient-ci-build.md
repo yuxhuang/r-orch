@@ -1,39 +1,42 @@
-# Ambient CI binary prerequisite — implementation plan
+# Ambient CI target resolution — implementation plan
 
 status: active
 owner: release engineer
 date: 2026-11-17
 spec: [requirements](../specs/2026-11-17-ambient-ci-build.md)
 
-## Design
+## Design and correction
 
-Add a named Bash build step running `cargo build -p orch-cli` immediately before the existing ambient workspace-test step. Both inherit the same job-level CARGO_TARGET_DIR. Separate ordinary Actions steps stop on build failure; no shell status mapping, conditional build, cache dependency or suite weakening. The runtime dependency is already explicit in concurrent_index.rs. The existing single-line CI/Docker mirror continues to check the shared static and suite commands; the named build prerequisite has its own executed-shell regression and is not added to Docker's CI_STEPS in this scope.
+Accept code F1/F2/F3 and SRE SR-A1/A2/A3. The previous build-first model was wrong: cargo test --workspace provisions debug/orch, and the relative target is read from crates/orch-infra at runtime. Historical author reports remain immutable; their absolute-target passes do not prove the failing CI configuration.
 
-Extend the existing fixed-indentation workflow test utilities to execute the actual ambient cargo run steps in order with Bash's Actions failure options and the job target. A fixture cargo creates the required artifact only for the expected build argv, refuses tests without that artifact, records exact argv/target, and can fail the build. Controls delete/reorder the build, redirect its target, or mask its failure. Assertions require both status and trace, so a skipped suite or ignored failed build cannot pass. Keep this fixture within the existing ci_workflow test; no new runner/controller.
+Set ambient's job env to CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci-ambient. Remove Build ambient CLI and its incorrect comment. Keep the ordinary full workspace suite, event, failure, cache, permission, action, timeout and other target semantics. This removes the extra build cost raised by F3, without claiming measured hosted headroom.
+
+Replace the two build-model tests and helpers. Pin the exact job expression and single target declaration, forbid ambient working-directory overrides and extra Cargo steps, and preserve the existing suite command. A private fixture places the artifact where Cargo provisions it under the workspace target and checks that same env-derived path using actual shell lookup from crates/orch-infra. The corrected expression resolves absolutely; the old relative value fails with the workspace artifact still present. No fake Cargo, build-order or missing-build premise remains. Native checks separately exercise actual Cargo and the unchanged tests.
 
 ## Tasks
 
 | Id | Task | Covers | Scope | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|
-| T1 | Write regression and observe old-workflow failure | R1–R2 | xtask/tests/ci_workflow.rs | — | focused ci_workflow regression | fix-forward |
-| T2 | Add same-target build prerequisite | R1–R2 | .github/workflows/ci.yml | T1 | all ci_workflow tests, mutation controls | same |
-| T3 | Validate actual missing-binary target and freeze | R3 | this spec/plan; no product changes | T2 | orch-cli build, three concurrent_index tests, fmt, applicable clippy | same |
+| T1 | Correct this spec/plan before source | R1–R3 | this pair | adjudication | review accepted findings and retained holds | fix-forward |
+| T2 | Replace wrong-model regression; show old workflow red | R1–R3 | xtask/tests/ci_workflow.rs | T1 | new regression against original 6802e79b workflow; planned negative | same |
+| T3 | Correct target and remove redundant build | R1–R2 | .github/workflows/ci.yml | T2 | all ci_workflow, relative/override mutants, mirror, fmt, applicable clippy | same |
+| T4 | Validate evaluated literal and freeze clean SHA | R3 | private evidence; this pair result text | T3 | Cargo test compilation provisions orch; native unchanged concurrent_index relative negative then literal absolute positive | same |
 
-## Test plan and review focus
+## Verification and stop conditions
 
-- Missing/reordered build must fail before a successful suite; target override cannot satisfy the runtime dependency.
-- Build exit statuses remain failures and prevent the suite, including a masked failure that would otherwise consume a stale artifact.
-- Success must execute the full existing workspace argv once; event/target/cache isolation stays pinned by the existing contract.
-- Real build begins with no debug/orch; focused tests keep their original bodies and expectations.
-- Full pre-PR suite and Linux main-event acceptance remain deferred to reviewed publication; remote-tools diagnosis stays separate.
+- Red-on-original and relative-target controls are planned failures, labelled separately from unexpected failures. No unchanged retry-to-green; first unexpected failure stops and preserves evidence.
+- Provision debug/orch using cargo test -p orch-cli --test daemon_cmd_control --no-run, under the evaluated literal corrected target, initially without that binary. This narrow compilation is setup for the infra-only run, not a claim that the full workspace suite needs a preceding build.
+- Run unchanged concurrent_index with old relative target/ci-ambient: require exactly three missing-path failures despite the workspace binary. Then run with the corrected expression evaluated against the actual worktree root: require all three names passing.
+- Audit remaining runtime CARGO_TARGET_DIR readers read-only; do not repair other jobs without evidence/scope.
+- Original reviewers close only their own findings on the later combined head. Full native/pre-PR checks, natural hosted PR CI and actual main ambient acceptance remain held. No publication in this task.
 
 ## Status
 
-T1 and T2 verified on macOS: the original workflow failed the new regression, the repaired workflow passed all eight ci_workflow tests, and all four build fault controls were rejected. T3's local build and three unchanged concurrent_index tests passed from an absent-binary private target; fmt and xtask all-targets clippy passed. Immutable commit identity and raw author evidence travel in the task handoff. Full pre-PR and hosted main acceptance remain pending; this plan stays active. Approval is supplied by the explicit repair scope; no additional design approval is requested.
+T1–T4 focused author checks passed on macOS: original workflow regression failed at the package lookup; corrected ci_workflow 8/8, mirror controls, fmt and xtask all-targets clippy passed. Cargo test compilation provisioned the initially absent binary; native unchanged concurrent_index failed 0/3 under the planned old-relative control and passed 3/3 under the evaluated literal corrected value, with the same binary. Exact checked-source hashes, argv, statuses and frozen SHA are in the corrected task handoff. Earlier missing-build regression and absolute-only author proof are superseded as acceptance evidence, not erased. Combined-head reviews and deferred full native/pre-PR checks remain due. Main44051962151 remains failed; main/rules/PR3 acceptance and all inherited findings remain held.
 
 ## Rollback / compatibility
 
-No data/protocol change. Revert the fix-forward commit through a reviewed PR if needed; that restores the known missing-binary failure. Do not revert main, delete tags or retry unchanged CI. No deployment action in this authoring task.
+No data/protocol change. No rollback is executed or authorized here. If later withdrawal is authorized, a reviewed revert of the correction commit restores the known relative-target defect; prefer an established-cause fix-forward. Never rewrite history or delete a tag.
 
 ## Docs
 

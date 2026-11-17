@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const CI: &str = include_str!("../../.github/workflows/ci.yml");
 const TEST_IF: &str = "github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all')";
 const AMBIENT_IF: &str = "github.event_name == 'push' && github.ref == 'refs/heads/main'";
-const AMBIENT_BUILD: &str = "      - name: Build ambient CLI\n        shell: bash\n        run: |\n          set -euo pipefail\n          cargo build -p orch-cli\n";
+const AMBIENT_TARGET: &str = "${{ github.workspace }}/target/ci-ambient";
 
 // This extracts only this file's fixed indentation, not arbitrary YAML. Shape
 // changes require deliberate updates; do not silently accept an unknown form.
@@ -67,7 +67,7 @@ fn contract(ci: &str) {
     );
     assert!(!check.contains("cargo test"));
     assert!(!changes.contains("cargo test"));
-    assert!(ambient.contains("- run: cargo test --workspace --no-fail-fast"));
+    assert_ambient_target_contract(ci);
     assert!(!ambient.contains("./xtask/gate.sh"));
     let suite = step(test, "Folded suite");
     assert!(
@@ -365,114 +365,107 @@ fn pr_base_is_passed_as_data_not_shell() {
     assert_eq!(fs::read_to_string(output).unwrap(), "mode=all\npackages=\n");
 }
 
-// Execute only the ambient cargo run steps, using their real order, shell and
-// job target. Setup actions/rustup/apt are outside this bounded shell control;
-// actual compilation and concurrent_index are separate native checks.
-fn ambient_execution(ci: &str, build_status: &str, stale: bool) -> (bool, String) {
-    let ambient = job(ci, "ambient");
-    let target = ambient
+// Evaluate only the committed job-env workspace expression, not arbitrary
+// Actions syntax. Relative values stay relative so the package-cwd negative
+// control exercises the same filesystem resolution as concurrent_index.
+fn ambient_target_value(ci: &str) -> &str {
+    job(ci, "ambient")
         .lines()
         .find_map(|line| line.strip_prefix("      CARGO_TARGET_DIR: "))
-        .expect("ambient job target");
-    let f = Fixture::new();
-    f.executable(
-        "bin/cargo",
-        r#"#!/bin/sh
-set -eu
-printf '%s|%s\n' "$CARGO_TARGET_DIR" "$*" >> trace
-case "$*" in
-  'build -p orch-cli')
-    [ "$BUILD_STATUS" = 0 ] || exit "$BUILD_STATUS"
-    mkdir -p "$CARGO_TARGET_DIR/debug"
-    : > "$CARGO_TARGET_DIR/debug/orch"
-    ;;
-  'test --workspace --no-fail-fast') test -f "$CARGO_TARGET_DIR/debug/orch" ;;
-  *) exit 98 ;;
-esac
-"#,
-    );
-    if stale {
-        fs::create_dir_all(f.0.join(target).join("debug")).unwrap();
-        fs::write(f.0.join(target).join("debug/orch"), b"stale").unwrap();
-    }
-    let mut success = true;
-    let mut bodies = Vec::new();
-    for line in ambient.lines() {
-        if line == "      - name: Build ambient CLI" {
-            let build = step(ambient, "Build ambient CLI");
-            assert!(build.contains("        shell: bash\n"));
-            assert!(!build.contains("        if:"));
-            bodies.push(script(build));
-        } else if let Some(body) = line.strip_prefix("      - run: ")
-            && body.contains("cargo ")
-        {
-            bodies.push(body.to_owned());
-        }
-    }
-    for body in bodies {
-        // Each Actions bash step fails on its own producer error, and later
-        // ordinary steps run only after success. The trace catches an omitted
-        // suite as well as a build failure hidden by shell status masking.
-        if !f.run(
-            &format!("set -euo pipefail\n{body}\n"),
-            &[("CARGO_TARGET_DIR", target), ("BUILD_STATUS", build_status)],
-        ) {
-            success = false;
-            break;
-        }
-    }
-    (success, fs::read_to_string(f.0.join("trace")).unwrap())
+        .expect("ambient job target")
 }
 
-fn assert_ambient_build_contract(ci: &str) {
-    let build = "target/ci-ambient|build -p orch-cli\n";
-    let suite = "target/ci-ambient|test --workspace --no-fail-fast\n";
+fn assert_ambient_target_contract(ci: &str) {
+    let ambient = job(ci, "ambient");
+    assert_eq!(ambient_target_value(ci), AMBIENT_TARGET);
+    assert_eq!(ambient.matches("CARGO_TARGET_DIR:").count(), 1);
+    assert!(!ambient.contains("working-directory:"));
+    // The single ordinary suite provisions the CLI through orch-cli's test
+    // targets. No separate build or step-level target/cwd override is needed.
+    let cargo_steps: Vec<_> = ambient
+        .lines()
+        .filter(|line| line.contains("cargo "))
+        .collect();
     assert_eq!(
-        ambient_execution(ci, "0", false),
-        (true, format!("{build}{suite}")),
-        "an absent binary requires a successful same-target build before the suite"
+        cargo_steps,
+        ["      - run: cargo test --workspace --no-fail-fast"]
     );
-    for status in ["1", "42", "75", "143"] {
-        assert_eq!(
-            ambient_execution(ci, status, true),
-            (false, build.to_owned()),
-            "failed build {status} must stop before the suite, even with a stale binary"
-        );
+    assert!(!ambient.contains("Build ambient CLI"));
+}
+
+fn ambient_target_resolves_from_package(ci: &str) -> bool {
+    let f = Fixture::new();
+    for relative in [
+        "crates",
+        "crates/orch-infra",
+        "target/ci-ambient",
+        "target/ci-ambient/debug",
+    ] {
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(f.0.join(relative))
+            .unwrap();
     }
+    // Marker for Cargo's workspace artifact, not a fake Cargo executable or
+    // an emulation of binary provisioning. Native Cargo proof is separate.
+    let artifact = f.0.join("target/ci-ambient/debug/orch");
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&artifact)
+        .unwrap();
+    let raw = ambient_target_value(ci);
+    let target = match raw.strip_prefix("${{ github.workspace }}/") {
+        Some(suffix) => f.0.join(suffix),
+        None => PathBuf::from(raw),
+    };
+    assert!(artifact.is_file(), "workspace artifact must exist");
+    assert!(f.run("test -f target/ci-ambient/debug/orch\n", &[],));
+    // Cargo runs this integration test from its package root. Shell test uses
+    // actual OS path resolution from that cwd, including the relative failure.
+    f.run(
+        "set -eu\ncd crates/orch-infra\ntest -f \"$CARGO_TARGET_DIR/debug/orch\"\n",
+        &[("CARGO_TARGET_DIR", target.to_str().unwrap())],
+    )
 }
 
 #[test]
-fn ambient_build_executes_before_suite_in_same_target_and_fails_closed() {
-    assert_ambient_build_contract(CI);
+fn ambient_workspace_target_resolves_from_package_cwd() {
+    assert!(
+        ambient_target_resolves_from_package(CI),
+        "concurrent_index must find the workspace artifact from its package cwd"
+    );
+    assert_ambient_target_contract(CI);
 }
 
 #[test]
-fn ambient_build_fault_controls_are_discriminated() {
-    let build = AMBIENT_BUILD;
-    let suite = "      - run: cargo test --workspace --no-fail-fast\n";
-    for (name, old, new) in [
-        ("original missing build", build.to_owned(), String::new()),
-        (
-            "reordered build",
-            format!("{build}{suite}"),
-            format!("{suite}{build}"),
+fn ambient_relative_target_and_override_controls_are_discriminated() {
+    let relative = CI.replacen(AMBIENT_TARGET, "target/ci-ambient", 1);
+    assert_ne!(relative, CI);
+    assert!(
+        !ambient_target_resolves_from_package(&relative),
+        "the original relative target must fail despite the workspace artifact"
+    );
+    let suite = "      - run: cargo test --workspace --no-fail-fast";
+    for mutant in [
+        relative,
+        CI.replacen(AMBIENT_TARGET, "${{ github.workspace }}/target/wrong", 1),
+        CI.replacen(
+            suite,
+            &format!("{suite}\n        env:\n          CARGO_TARGET_DIR: target/wrong"),
+            1,
         ),
-        (
-            "wrong target",
-            build.to_owned(),
-            build.replace("cargo build", "CARGO_TARGET_DIR=target/wrong cargo build"),
-        ),
-        (
-            "masked build failure",
-            build.to_owned(),
-            build.replace("cargo build -p orch-cli", "cargo build -p orch-cli || true"),
+        CI.replacen(
+            suite,
+            &format!("{suite}\n        working-directory: crates/orch-infra"),
+            1,
         ),
     ] {
-        let mutant = CI.replacen(&old, &new, 1);
-        assert_ne!(mutant, CI, "control must change the workflow: {name}");
+        assert_ne!(mutant, CI);
         assert!(
-            std::panic::catch_unwind(|| assert_ambient_build_contract(&mutant)).is_err(),
-            "survived {name}"
+            std::panic::catch_unwind(|| assert_ambient_target_contract(&mutant)).is_err(),
+            "target/cwd mutation must be rejected"
         );
     }
 }

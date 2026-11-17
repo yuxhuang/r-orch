@@ -196,7 +196,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      CARGO_TARGET_DIR: target/ci-ambient
+      # concurrent_index reads this from its package cwd, so keep it absolute.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci-ambient
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -213,12 +214,4 @@ jobs:
       # The TUI end-to-end tests drive the real binary in tmux and fail when
       # it is missing (AGENTS.md, "TUI end-to-end tests").
       - run: sudo apt-get update && sudo apt-get install -y tmux
-      # orch-infra's concurrent_index tests execute debug/orch from this same
-      # CARGO_TARGET_DIR; cargo test alone does not supply that binary.
-      # A failed build stops the job before the ordinary full workspace suite.
-      - name: Build ambient CLI
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo build -p orch-cli
       - run: cargo test --workspace --no-fail-fast
