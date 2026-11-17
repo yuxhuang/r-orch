@@ -1,6 +1,6 @@
 //! Whole-run ownership: the lease outlives target finish and retained reporting.
 use super::{
-    GateArgs, Part, Tier, files, hermetic, lease, report, signals::Signals, suite, target,
+    GateArgs, Part, Tier, files, hermetic, lease, receipt, report, signals::Signals, suite, target,
 };
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeMap;
@@ -136,6 +136,9 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
         .and_then(|s| s.into_string().ok())
         .filter(|s| !s.is_empty());
     let run = report::Run::begin(&repo)?;
+    if args.receipt.is_some() {
+        receipt::progress(receipt::Phase::Started);
+    }
     let head = git(&repo, &["rev-parse", "HEAD"]).unwrap_or_else(|_| "unknown".into());
     let tree = git(&repo, &["rev-parse", "HEAD^{tree}"]).unwrap_or_else(|_| "unknown".into());
     let dirty_start = dirty(&repo).unwrap_or(true);
@@ -215,6 +218,7 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
                 .context("HOME missing")?,
         );
         let mut work = |runner: &mut super::steps::Runner<'_, '_>, path: &Path| -> Result<()> {
+            runner.receipt_progress = args.receipt.is_some();
             let h = hermetic::Hermetic::new(&repo, path, &std::env::temp_dir(), env.clone())?;
             scratch = Some(h.root.clone());
             environment = h.environment();
@@ -260,6 +264,9 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
                     p => suite::run_selected(&repo, &home, &h, runner, p),
                 }
             });
+            if args.receipt.is_some() {
+                receipt::progress(receipt::Phase::SuiteReturned);
+            }
             let observation = runner.observation();
             observations.borrow_mut().record(observation);
             Ok(())
@@ -367,6 +374,9 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
         }
         suite = Some(unstarted);
     }
+    if args.receipt.is_some() {
+        receipt::progress(receipt::Phase::TargetReturned);
+    }
     let interrupted = signals.wait(Duration::ZERO);
     if admitted_use && !target_finished && outcome != "not admitted (unchanged)" {
         outcome = format!(
@@ -439,13 +449,24 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
         reasons.push(publication);
     }
     let expected_fast = selection.as_ref().map(suite::fast_steps);
-    let expected_steps = expected_fast.as_deref().unwrap_or(report::STEPS);
+    let expected_steps = if args.receipt.is_some() {
+        receipt::STEPS
+    } else {
+        expected_fast.as_deref().unwrap_or(report::STEPS)
+    };
     if steps.len() != expected_steps.len()
         || steps
             .iter()
             .any(|s| s.verdict != report::Verdict::Pass || !expected_steps.contains(&s.name))
     {
         reasons.push("checks incomplete or failed");
+    }
+    if args.receipt.is_some()
+        && suite
+            .as_ref()
+            .is_none_or(|suite| suite.inventory.is_empty())
+    {
+        reasons.push("inventory missing");
     }
     if result.is_err() {
         reasons.push("run error");
@@ -466,7 +487,13 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
         reasons.push("hostname unavailable for evidence redaction");
     }
     let qualifying = reasons.is_empty();
-    let base_code = report::exit(steps, args.evidence.is_some() && !qualifying);
+    let receipt_success = suite
+        .as_ref()
+        .is_some_and(|suite| receipt::successful(steps, &reasons, &suite.inventory));
+    let base_code = report::exit(
+        steps,
+        (args.evidence.is_some() && !qualifying) || (args.receipt.is_some() && !receipt_success),
+    );
     let code = if let Some(sig) = interrupted {
         128 + sig
     } else if result.as_ref().is_err_and(|e| e.is::<lease::Contended>()) {
@@ -621,6 +648,9 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
         ),
         ("run-wall-ms", start.elapsed().as_millis().to_string()),
     ];
+    if args.receipt.is_some() {
+        fields.push(("receipt", "diagnostic".into()));
+    }
     let mut text = String::new();
     for (key, value) in fields.drain(..) {
         text.push_str(&format!("{key}: {value}\n"));
@@ -725,19 +755,27 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
         redactor.apply(text.as_bytes())?
     )
     .err();
+    let export_kind = if args.receipt.is_some() {
+        "receipt"
+    } else {
+        "evidence"
+    };
     let exported = (|| -> Result<()> {
-        if let Some(destination) = &args.evidence {
+        if let Some(destination) = args.evidence.as_ref().or(args.receipt.as_ref()) {
             ensure!(
                 hostname.is_some(),
                 "hostname unavailable; evidence export refused"
             );
             let digest = report::export(&repo, destination, &entries, &redactor)?;
+            if args.receipt.is_some() {
+                receipt::progress(receipt::Phase::Exported);
+            }
             #[cfg(test)]
-            println!("evidence manifest: {digest}; qualifying: {qualifying}");
+            println!("{export_kind} manifest: {digest}; qualifying: {qualifying}");
             #[cfg(not(test))]
             if let Err(error) = writeln!(
                 std::io::stdout().lock(),
-                "evidence manifest: {digest}; qualifying: {qualifying}"
+                "{export_kind} manifest: {digest}; qualifying: {qualifying}"
             ) {
                 terminal_error.get_or_insert(error);
             }
@@ -760,6 +798,14 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
         files::sync(&run.path)?;
     }
     drop(held);
+    if args.receipt.is_some() && (interrupted.is_some() || code == 75) {
+        // Preserve signal/contended status even when late export or cleanup
+        // fails. The retained report/progress cannot invent a final artifact.
+        if exported.is_err() {
+            receipt::progress(receipt::Phase::ExportFailed);
+        }
+        return terminal_status(code, interrupted, terminal_error);
+    }
     exported?;
     cleanup?;
     terminal_status(code, interrupted, terminal_error)

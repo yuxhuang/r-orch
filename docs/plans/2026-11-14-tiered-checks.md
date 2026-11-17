@@ -1,5 +1,23 @@
 # Tiered verification checks — plan
 
+## PR3 configured hosted lease amendment — 2026-11-17 (before code)
+
+The lead's approved node J start resolves open item 19(b) for CI: replace the
+historical section 7 command using `--no-lease` with the normal configured
+exclusive lease, bounded `--lease-wait 5` and `--host-label github-hosted-linux`.
+The existing lifecycle refuses `--no-lease`; there is no target/marker bypass.
+The [PR3 supplement](2026-11-17-pr3-ci.md) records the implementation sequence,
+separate-runner and partial-evidence limits. The PR3 assessment resolves retention
+with the additive receipt interface in ADR0016, locally integrated before CI
+implementation. Producer success and receipt integrity remain separate; only
+verified redacted exports are uploaded. Cache registry/git dependencies only,
+never targets/state/raw/export/cold paths. Keep the existing 30-minute suite
+ceiling provisionally; headroom and TV50–55/cache/native evidence remain pending.
+The monitor must validate latest exact-head PR attempt and prior main suite plus
+ambient before stacked merges; the private owner procedure includes these guards.
+Historical amendment text below is retained; no goal acceptance or policy-rule
+transition is marked complete. Owner alone applies the reviewed rules split.
+
 ## PR85 witness correction — 2026-11-17 (before code)
 
 Follow [the narrow correction plan](2026-11-17-pr85-witness-correction.md).

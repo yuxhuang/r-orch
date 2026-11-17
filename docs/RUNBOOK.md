@@ -1636,3 +1636,39 @@ reads every crate's source without a Cargo edge. The orch-infra guards
 `spawn_gate` and `synthetic_spawn_domain_guard` also scan crates; D39 covers them
 incidentally while every crate reaches orch-cli. This adds no coupling policy.
 Fast is an iteration signal; the full PR check remains the merge check.
+
+### PR3 CI suite receipts and required-check transition
+
+The hosted `test` job runs exactly one
+`./xtask/gate.sh pr --part suite --receipt <new-dir> --lease-wait 5 --host-label github-hosted-linux`
+under the normal configured lease. It does not override the lease directory or
+bypass target lifecycle. Registry/git dependencies are cached; all build targets,
+state, raw records, exported receipts and cold paths are excluded. Hosted boot
+identity invalidates restored warm targets; do not weaken freshness checks.
+
+`cargo xtask gate evidence verify-receipt <dir> --commit <tested-checkout-sha>`
+verifies diagnostic integrity and reports completeness/outcome/safety separately.
+Verifier zero can describe a failed or interrupted suite: preserve the original
+producer command/job failure. Only this verified redacted export is uploaded.
+Missing final receipt/inventory fails retention acceptance; bounded static phase
+progress after timeout/cancel/runner loss cannot replace it. No arbitrary loss
+can guarantee log delivery. The existing 30-minute job ceiling is provisional,
+with unmeasured headroom; the <=20-minute PR target remains. Record real durations
+in TV51/53 before proposing changes. Do not rerun failures away.
+
+PR code executes static plus one suite; docs-only executes build/static without
+tests. Main forces all and retains a separate unwrapped ordinary ambient suite.
+Schedule deliberately skips classification and runs static checks alone. `check`
+runs with `always()` and refuses every invalid classifier status/mode; only the
+schedule's intentional skipped/empty classifier is exempt. Docker Linux checks
+remain ordinary/probed-platform checks, never equivalent to the hosted fold.
+
+Both existing required checks remain until the owner applies the independently
+reviewed split. After transition, the monitor requires the latest correct PR
+workflow attempt at exact current head: successful classification with proven
+mode, successful check, and successful test with final receipt for code; a skipped
+test is allowed only for proven docs-only mode. Missing, cancelled, timed-out,
+neutral, failed or unexplained skipped jobs block merge. Record tested merge
+SHA/tree separately from PR head. Before the next stacked merge, require previous
+main-push test and ambient success at that merge commit. Rule readback and rollback
+are owner-only operations; no agent applies them. TV50–55/cache/native remain due.

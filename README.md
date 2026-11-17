@@ -851,3 +851,10 @@ invocations remain development checks. Preserve unfinished markers/targets and
 share only verified redacted exports. See the
 [gate runbook](docs/RUNBOOK.md#tiered-gate-evidence-during-pr1-repair) for protections,
 accepted risks and the remaining native/timing qualification work.
+
+PR3 CI classifies PR paths: docs-only runs build/static checks, code runs static
+checks plus one folded suite. Main also runs ordinary ambient workspace tests;
+weekly schedule runs static checks only. Suite artifacts are verified redacted
+**diagnostic receipts**, not full qualifying gate evidence. Suite failure and a
+missing verified receipt independently fail the job. Real-event/native acceptance
+and the owner-only required-rule transition remain pending; existing policy stands.

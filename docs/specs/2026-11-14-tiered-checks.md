@@ -1,5 +1,17 @@
 # Tiered verification checks
 
+## PR3 implementation clarification — 2026-11-17
+
+The approved [PR3 supplement](2026-11-17-pr3-ci.md) implements R6/R7 and prepares
+R15. GitHub failure retention/by-name acceptance follows section 7/R7 and the
+goal acceptance text; R14 does not require every GitHub job to be a qualifying
+standalone external-evidence bundle. The suite job uses the additive diagnostic
+receipt interface (ADR0016), retaining producer failure independently of integrity
+verification/upload. Lost final artifact means incomplete acceptance. Separate
+static and suite jobs do not create a qualifying full gate bundle. Registry-only
+cache excludes all targets and evidence. TV50–55, cache measurements, native
+acceptance and owner-only rule transition remain pending; goal status unchanged.
+
 ## PR85 shared witness correction — 2026-11-17 (before code)
 
 The authorized narrow correction preserves the failed published head and its

@@ -714,3 +714,131 @@ fn unfinished_target_cannot_qualify_even_when_qualifying_yes() {
     evidence.key("target-finished", "no");
     evidence.reject("target-finished");
 }
+
+// Partial diagnostics deliberately reuse the independent historical synthetic
+// fixture, not a claim that this source/stamped judge executed a native gate.
+impl Evidence {
+    fn partial_receipt() -> Self {
+        let e = Self::new();
+        e.key("part", "suite");
+        e.key("verdict", "PASSED (part suite)");
+        e.key("qualifying", "no: partial run");
+        let p = e.sandbox.root.join("bundle/result.txt");
+        let original = fs::read_to_string(&p).unwrap();
+        fs::write(p, format!("receipt: diagnostic\n{original}")).unwrap();
+        e.rehash();
+        e
+    }
+    fn verify_receipt(&self, commit: &str) -> Capture {
+        self.sandbox.run(&mut self.sandbox.gate(&[
+            "evidence",
+            "verify-receipt",
+            "bundle",
+            "--commit",
+            commit,
+        ]))
+    }
+}
+
+#[test]
+fn partial_receipt_integrity_is_diagnostic_and_strict_verifier_stays_strict() {
+    let e = Evidence::partial_receipt();
+    let out = e.verify_receipt(&e.commit);
+    out.code(0);
+    out.contains("completeness=complete; outcome=passed");
+    out.contains("qualifying=no; acceptance=not-granted");
+    // Missing bootstrap/publication is honestly reported by this historical
+    // fixture, even though its inventory and executed steps are consistent.
+    out.contains("safety=failed-or-unestablished");
+    e.verify().code(1);
+    e.key("qualifying", "yes");
+    e.rehash();
+    e.verify().code(1); // part still refuses, even if qualification is forged.
+    e.verify_receipt(&e.commit).code(1);
+}
+
+#[test]
+fn partial_receipt_rejects_identity_tamper_missing_and_unsafe_artifacts() {
+    let e = Evidence::partial_receipt();
+    e.verify_receipt(&"f".repeat(40)).code(1);
+    for (field, bad, original) in [
+        ("judge-source-id", "bad-id", e.judge.as_str()),
+        (
+            "tree-start",
+            "bad-tree",
+            e.sandbox.git(&["rev-parse", "HEAD^{tree}"]).as_str(),
+        ),
+    ] {
+        e.key(field, bad);
+        e.rehash();
+        e.verify_receipt(&e.commit).code(1);
+        e.key(field, original);
+        e.rehash();
+        e.verify_receipt(&e.commit).code(0);
+    }
+    let p = e.sandbox.root.join("bundle/steps/test.log");
+    let original = fs::read(&p).unwrap();
+    fs::write(&p, b"tampered\n").unwrap();
+    e.verify_receipt(&e.commit).code(1);
+    fs::write(&p, &original).unwrap();
+    fs::remove_file(&p).unwrap();
+    e.verify_receipt(&e.commit).code(1);
+    let outside = e.sandbox.temporary.join("outside-log");
+    fs::write(&outside, &original).unwrap();
+    symlink(&outside, &p).unwrap();
+    e.verify_receipt(&e.commit).code(1);
+    fs::remove_file(&p).unwrap();
+    fs::write(&p, original).unwrap();
+    e.verify_receipt(&e.commit).code(0);
+    let inventory = e.sandbox.root.join("bundle/inventory.tsv");
+    let original_inventory = fs::read(&inventory).unwrap();
+    fs::remove_file(&inventory).unwrap();
+    e.verify_receipt(&e.commit).code(1);
+    fs::write(inventory, original_inventory).unwrap();
+    e.verify_receipt(&e.commit).code(0);
+    // Rehashed mismatching inventory cannot borrow valid log integrity.
+    e.sandbox.write(
+        "bundle/inventory.tsv",
+        "lib\tfixture\tfixture\tforged\tok\n",
+    );
+    e.rehash();
+    e.verify_receipt(&e.commit).code(1);
+}
+
+#[test]
+fn failed_and_interrupted_receipts_do_not_become_passing_evidence() {
+    let e = Evidence::partial_receipt();
+    e.key("verdict", "FAILED (part suite)");
+    e.step("test", 1, "FAIL");
+    e.step("test", 2, "101");
+    let p = e.sandbox.root.join("bundle/steps/test.log");
+    let log = fs::read_to_string(&p)
+        .unwrap()
+        .replace("test sample ... ok", "test sample ... FAILED")
+        .replace(
+            "test result: ok. 1 passed; 0 failed",
+            "test result: FAILED. 0 passed; 1 failed",
+        );
+    fs::write(p, log).unwrap();
+    e.sandbox.write(
+        "bundle/inventory.tsv",
+        "lib\tfixture\tfixture\tsample\tfailed\n",
+    );
+    e.rehash();
+    let out = e.verify_receipt(&e.commit);
+    out.code(0);
+    out.contains("completeness=complete; outcome=failed");
+    out.contains("acceptance=not-granted");
+    e.verify().code(1);
+    e.key("verdict", "INTERRUPTED (part suite)");
+    e.step("test", 2, "unknown");
+    e.sandbox.write("bundle/inventory.tsv", "");
+    e.rehash();
+    let out = e.verify_receipt(&e.commit);
+    out.code(0);
+    out.contains("completeness=incomplete; outcome=interrupted");
+    e.verify().code(1);
+    e.key("verdict", "PASSED (part suite)");
+    e.rehash();
+    e.verify_receipt(&e.commit).code(1);
+}

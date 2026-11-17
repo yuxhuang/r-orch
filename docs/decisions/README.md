@@ -62,4 +62,6 @@ What gets easier, what gets harder, what must change as a result.
 | [0014](0014-gate-target-recovery-and-selection-coupling.md) | Gate targets change only after their writers have ceased; a selected `orch-cli` couples `orch-infra` | accepted; a partial successor of 0013: supersedes only named clauses of its decisions 30 and 31 and qualifies its decisions 14, 15, 17 and 21. The clauses of its decisions 32–38 that demand independently established cessation are overridden by the owner's decision recorded in 0015 (decision 41) |
 | [0015](0015-cooperative-gate-target-recovery.md) | A use of a gate target is finished when the processes the gate started have exited under the cooperative lease | proposed. Decision 41 records the owner's decision of 2026-11-15 and is binding; decisions 42–47, the implementation contract, are proposed and would supersede named clauses of 0014 decisions 32–36 and 38 |
 
+| [0016](0016-partial-gate-receipts.md) | Partial gate receipts verify diagnostics separately from qualification | proposed |
+
 `docs/reviews/` holds historical gate reviews from the early port-era work; new material does not go there.

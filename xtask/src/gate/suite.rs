@@ -1,5 +1,6 @@
 //! Independent folded-suite engine. Production tiers call this only after a
 //! supported native target admission; fixtures exercise the identical judgments.
+use super::receipt::progress as report_progress;
 use super::{
     hermetic::Hermetic,
     inventory,
@@ -65,6 +66,9 @@ fn run_scoped(
         logs: BTreeMap::new(),
         inventory: String::new(),
     };
+    if runner.receipt_progress {
+        report_progress(super::receipt::Phase::BuildStarted);
+    }
     let start = Instant::now();
     // Explicitly finish the workspace's public binaries before any test can
     // exec one by path. A pre-existing target/debug/orch is never that proof.
@@ -150,6 +154,10 @@ fn run_scoped(
         elapsed: start.elapsed(),
         detail,
     });
+    if runner.receipt_progress {
+        report_progress(super::receipt::Phase::BuildReturned);
+        report_progress(super::receipt::Phase::TestStarted);
+    }
     let start = Instant::now();
     let mut command = hermetic.command(repo);
     command
@@ -176,6 +184,9 @@ fn run_scoped(
             (exit, bytes, Err(e))
         }
     };
+    if runner.receipt_progress {
+        report_progress(super::receipt::Phase::TestReturned);
+    }
     out.logs.insert("steps/test.log".into(), bytes.clone());
     let judged = (|| -> Result<String> {
         collection?;
