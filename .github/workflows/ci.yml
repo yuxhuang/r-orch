@@ -1,19 +1,15 @@
-# Lean CI: Linux only, the cheap hermetic steps of xtask/gate.sh (plus an
-# unconditional cargo-deny, which gate.sh skips when not installed). Not run here:
-# the cold-target, no-real-cli and home-hygiene gate steps (see gate.sh for those).
+# PR code: static checks plus one folded suite; docs: static/build only.
+# Main retains folded plus independent ambient coverage. Separate jobs/receipts
+# are a workflow result, never a qualifying standalone full gate bundle.
 name: ci
 
 on:
   pull_request:
   push:
     branches: [main]
-  # Weekly: a new RUSTSEC advisory should surface on a quiet week too, not
-  # only on the next PR. Runs the check job alone (see its `if`).
   schedule:
     - cron: '17 6 * * 1'
 
-# One run per ref. A newer PR push makes the older run irrelevant; on main a
-# push and the weekly schedule share the ref, so there we let both finish.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -23,60 +19,166 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # .cargo/config.toml points ORCHESTRY_GLOBAL_CONFIG_PATH into target/, so
-  # tests never touch ~/.orchestry on the runner. No override needed here.
 
 jobs:
-  # Fast signals first: nothing here needs a full test build.
-  check:
+  changes:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      mode: ${{ steps.select.outputs.mode }}
+    env:
+      CARGO_TARGET_DIR: target/ci-select
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Nothing here pushes; keep the token out of .git/config, which
-          # build scripts and the cargo-deny container can read.
           persist-credentials: false
-      # terminfo (WTFPL only, not OSI) arrives with termwiz, which ratatui's
-      # `underline-color` default locks even though no backend activates it.
-      # cargo-deny below only sees the activated Linux graph, so it would pass
-      # with terminfo back in Cargo.lock. See the ratatui entry in Cargo.toml.
-      # The `test` stops a missing lockfile reading as a pass (grep exit 2).
+          fetch-depth: 0
+      - run: rustup toolchain install
+      # Registry/git dependencies only. All targets (gate-warm, gate-xtask,
+      # cold gate, state/markers, gate-runs) and raw/export paths are excluded.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-targets: false
+          cache-bin: false
+      - name: Classify changes
+        id: select
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == push && "$REF" == refs/heads/main ]]; then
+            printf 'mode=all\n' >> "$GITHUB_OUTPUT"
+            echo 'selection: main forces all'
+          elif [[ "$EVENT" == pull_request ]]; then
+            # Empty/unresolvable base conservatively selects all in the selector.
+            cargo run --locked -p xtask -- gate select --base "$PR_BASE" --format github > "$RUNNER_TEMP/selection.txt"
+            cat "$RUNNER_TEMP/selection.txt" >> "$GITHUB_OUTPUT"
+            cat "$RUNNER_TEMP/selection.txt"
+          else
+            echo 'unsupported classification event' >&2
+            exit 1
+          fi
+          git rev-parse HEAD 'HEAD^{tree}'
+
+  check:
+    needs: changes
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target/ci-check
+    steps:
+      - name: Require valid classification
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          MODE: ${{ needs.changes.outputs.mode }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == schedule ]]; then
+            [[ "$CHANGES_RESULT" == skipped && -z "$MODE" ]] || exit 1
+          else
+            [[ "$CHANGES_RESULT" == success ]] || exit 1
+            case "$MODE" in
+              docs-only|packages|all) ;;
+              *) echo 'invalid classification mode' >&2; exit 1 ;;
+            esac
+            if [[ "$EVENT" == pull_request ]]; then
+              :
+            elif [[ "$EVENT" == push && "$REF" == refs/heads/main && "$MODE" == all ]]; then
+              :
+            else
+              echo 'invalid classification event' >&2
+              exit 1
+            fi
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Lock guard also rejects a missing lockfile. Activated-graph deny alone
+      # would miss termwiz/terminfo (WTFPL), see the ratatui manifest comment.
       - name: Cargo.lock has no termwiz/terminfo
         run: |
           test -s Cargo.lock
           ! grep -qE '^name = "(terminfo|termwiz)"$' Cargo.lock
-      # dtolnay/rust-toolchain ignores rust-toolchain.toml (it requires an
-      # explicit version), so let rustup read the file: one pin, not two.
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-targets: false
+          cache-bin: false
+      - name: Documentation build
+        if: needs.changes.outputs.mode == 'docs-only'
+        run: cargo build --workspace
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo xtask crate-graph
-      # Runs in its own container; checks deny.toml (advisories, licences,
-      # bans, sources). Advisories are fetched live, so a new RUSTSEC entry can
-      # redden an unchanged tree. That is intended.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
           arguments: --all-features
 
   test:
-    if: github.event_name != 'schedule'
+    needs: changes
+    if: github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all')
     runs-on: ubuntu-latest
+    # Existing provisional ceiling; folded-job headroom is UNMEASURED.
+    # TV51/53 measure duration; <=20-minute PR target still stands. No retry.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Nothing here pushes; keep the token out of .git/config, which
-          # build scripts and the cargo-deny container can read.
           persist-credentials: false
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      # The TUI end-to-end tests drive the real binary in tmux and fail when
-      # it is missing (AGENTS.md, "TUI end-to-end tests").
+        with:
+          cache-targets: false
+          cache-bin: false
       - run: sudo apt-get update && sudo apt-get install -y tmux
-      # Build and run in one step; --no-fail-fast reports every failing binary,
-      # as gate.sh does. Some orch-cli tests need python3 (preinstalled) and
-      # open their own pty/localhost sockets, which work without a TTY.
+      - name: Folded suite
+        id: suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./xtask/gate.sh pr --part suite --receipt "$RUNNER_TEMP/pr3-suite-receipt" --lease-wait 5 --host-label github-hosted-linux
+      # No continue-on-error/status mapping: producer failure independently
+      # fails the job. Integrity can pass for FAILED/INCOMPLETE diagnostics.
+      - name: Verify diagnostic receipt
+        id: receipt
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          target/gate-xtask/debug/xtask gate evidence verify-receipt "$RUNNER_TEMP/pr3-suite-receipt" --commit "$(git rev-parse HEAD)"
+      - name: Retain verified redacted receipt
+        if: always() && steps.receipt.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pr3-suite-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pr3-suite-receipt
+          if-no-files-found: error
+          include-hidden-files: false
+          retention-days: 30
+
+  ambient:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_TARGET_DIR: target/ci-ambient
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          cache-targets: false
+          cache-bin: false
+      - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: cargo test --workspace --no-fail-fast

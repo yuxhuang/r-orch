@@ -35,7 +35,7 @@ pub(crate) struct LinuxArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 enum LinuxCommand {
-    /// The CI set (the default): Cargo.lock check, fmt, clippy, test, crate-graph.
+    /// Ordinary Linux checks (default), with exact probed emulator skips.
     Ci,
     /// Run one command in the container, e.g. `run cargo test -p orch-infra`.
     Run {
@@ -51,8 +51,9 @@ enum LinuxCommand {
     },
 }
 
-/// The checks `cargo xtask linux` runs by default, in CI's order
-/// (`.github/workflows/ci.yml`). cargo-deny is not here: deny.toml's
+/// Ordinary checks shared with CI static/ambient jobs, not folded gate parity.
+/// Emulated HOME writes require the exact platform skips below. cargo-deny is
+/// not here: deny.toml's
 /// `[graph] targets` already selects the Linux target, so the host run sees
 /// the Linux graph, and CI always runs it.
 const CI_STEPS: &[&str] = &[
@@ -791,36 +792,29 @@ mod tests {
         assert_eq!(envs, ["HOME=/home/dev", "USER=dev", "LANG=C.UTF-8"]);
     }
 
-    /// The default run must keep up with CI: every command CI runs, other than
-    /// toolchain setup, tmux install and cargo-deny, is one of the steps here.
+    /// Share the actual static/ambient commands while keeping the emulator
+    /// contract explicit. The hosted folded gate intentionally is not mirrored.
     #[test]
     fn the_ci_steps_cover_the_ci_workflow() {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let ci = std::fs::read_to_string(repo.join(".github/workflows/ci.yml")).unwrap();
         let script = container_script(&LinuxCommand::Ci).0;
-        let mut checked = 0;
-        for line in ci.lines().map(str::trim) {
-            let Some(run) = line.strip_prefix("- run: ") else {
-                continue;
-            };
-            if run.starts_with("rustup ") || run.contains("apt-get") {
-                continue;
-            }
-            assert!(
-                script.contains(run),
-                "ci.yml runs `{run}`, which cargo xtask linux does not"
-            );
-            checked += 1;
+        for command in &CI_STEPS[1..] {
+            assert!(ci.contains(&format!("run: {command}")), "CI lost {command}");
+            assert!(script.contains(command), "Docker lost {command}");
         }
-        assert!(checked >= 4, "found only {checked} cargo steps in ci.yml");
         for line in [
             "test -s Cargo.lock",
             "! grep -qE '^name = \"(terminfo|termwiz)\"$' Cargo.lock",
         ] {
-            assert!(
-                ci.contains(line),
-                "ci.yml no longer has `{line}`; update CI_STEPS"
-            );
+            assert!(ci.contains(line), "CI lost lock guard {line}");
+            assert!(script.contains(line), "Docker lost lock guard {line}");
+        }
+        assert!(ci.contains("./xtask/gate.sh pr --part suite --receipt"));
+        assert!(!script.contains("./xtask/gate.sh"));
+        assert!(script.contains("cargo test --workspace --no-fail-fast $skips"));
+        for quirk in Quirk::ALL {
+            assert!(script.contains(quirk.probe()));
         }
     }
 
