@@ -440,8 +440,17 @@ os.execv({real:?}, [{real:?}] + sys.argv[1:])
         independent.status.code(),
         independent.text()
     );
-    s.run(&mut s.gate(&["lease", "exec", "--lease-wait", "0", "--", "/usr/bin/true"]))
-        .code(0);
+    s.run(&mut s.gate(&[
+        "lease",
+        "exec",
+        "--purpose",
+        "selection-mismatch-close-check",
+        "--lease-wait",
+        "0",
+        "--",
+        "/usr/bin/true",
+    ]))
+    .code(0);
 }
 
 #[test]

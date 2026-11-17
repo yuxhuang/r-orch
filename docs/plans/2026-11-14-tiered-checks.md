@@ -1,5 +1,26 @@
 # Tiered verification checks — plan
 
+## PR2 lease-probe continuation — 2026-11-16 (before source)
+
+Preserve 756bfe90 and every earlier failed receipt. The metadata-boundary
+regressions reach their intended refusal but their final lease-exec probe omits
+the required purpose. Add only a fixed inert `selection-mismatch-close-check`
+purpose; keep zero wait, `/usr/bin/true`, exit0 and all existing assertions.
+Audit newly added xtask invocations against definitions and installed help before
+workloads. This usage2 defect is not contention or historical NM1 recurrence.
+
+Complete the outstanding bounded correction receipts at committed source: build,
+pre-map, focused fixed controls and deliberate reverted mutants, real unfiltered
+witness/product inventory, creation-mode controls under022, direct pr/full and
+cold negatives, existing Linux-container TV61/TV62/RS1 discriminator, final
+fmt-check/clippy/crate-graph and complete xtask execution/inventory. No parser,
+policy, lifecycle, timeout or assertion relaxation. All17 first-PATH blockers,
+private creation APIs, existing host turnstile/lease close-only and child reap
+requirements remain. Stop on the first unexpected failure and retain its actual
+channels/status/source; never retry unchanged. Prior build/map do not qualify
+this head. Original independent reviewers and lead admission retain authority;
+native acceptance remains held. FS1/D45/option3 remain accepted, not fixed.
+
 ## PR2 correction continuation — 2026-11-16 (before implementation)
 
 Continue the retained reproduction commit; no history rewrite. Accept original
