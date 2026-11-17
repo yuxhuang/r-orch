@@ -110,18 +110,13 @@ impl Tmux {
 
     /// Poll the screen until `ready` holds, with a bounded deadline.
     fn wait_for(&self, what: &str, ready: impl Fn(&str) -> bool) -> String {
-        let deadline = Instant::now() + DEADLINE;
-        loop {
-            let screen = self.screen();
-            if ready(&screen) {
-                return screen;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for {what}; screen:\n{screen}"
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
+        wait_for_screen(
+            what,
+            ready,
+            || self.screen(),
+            Instant::now,
+            || std::thread::sleep(Duration::from_millis(100)),
+        )
     }
 
     fn keys(&self, keys: &[&str]) {
@@ -140,6 +135,46 @@ impl Tmux {
             self.run(&args);
         }
     }
+}
+
+/// The real polling loop, with only capture and time injected for deterministic
+/// readiness controls. Capture errors still propagate without a retry.
+fn wait_for_screen(
+    what: &str,
+    ready: impl Fn(&str) -> bool,
+    mut capture: impl FnMut() -> String,
+    mut now: impl FnMut() -> Instant,
+    mut poll: impl FnMut(),
+) -> String {
+    let deadline = now() + DEADLINE;
+    loop {
+        let screen = capture();
+        if ready(&screen) {
+            return screen;
+        }
+        assert!(
+            now() < deadline,
+            "timed out waiting for {what}; screen:\n{screen}"
+        );
+        poll();
+    }
+}
+
+// Keep every existing footer assertion at both terminal sizes. The title
+// alone does not establish that the disclosure is present in this capture.
+const HELP_LINES: [&str; 8] = [
+    "Elapsed*: start to now; terminal rows end at last update (edits change it).",
+    "Includes waiting/retries. Elapsed order updates on refresh or",
+    "list-control changes; displayed time is live.",
+    "Agents: b/B change the grouping. Caps: grouped by first capability; use",
+    "the filter to find every agent with a capability. UPDATED: which agent's",
+    "run or assignment record changed most recently. R: run; T: assigned task",
+    "record updated; may be an administrative change, not proof the agent ran.",
+    "Press any key to dismiss",
+];
+
+fn help_ready(screen: &str) -> bool {
+    screen.contains("KEYBOARD SHORTCUTS") && HELP_LINES.iter().all(|line| screen.contains(line))
 }
 
 impl Drop for Tmux {
@@ -391,7 +426,7 @@ fn tables_headers_sort_and_elapsed_in_tmux() {
 
     // `?` carries the Elapsed* disclosure, which is what the asterisk means.
     tmux.keys(&["?"]);
-    let screen = tmux.wait_for("the help overlay", |s| s.contains("KEYBOARD SHORTCUTS"));
+    let screen = tmux.wait_for("the help overlay", help_ready);
     assert!(
         screen.contains(
             "Elapsed*: start to now; terminal rows end at last update (edits change it)."
@@ -405,18 +440,8 @@ fn tables_headers_sort_and_elapsed_in_tmux() {
     // area under the header, and the disclosure must still be on screen.
     tmux.run(&["resize-window", "-t", "dash", "-x", "80", "-y", "24"]);
     tmux.keys(&["?"]);
-    let help = [
-        "Elapsed*: start to now; terminal rows end at last update (edits change it).",
-        "Includes waiting/retries. Elapsed order updates on refresh or",
-        "list-control changes; displayed time is live.",
-        "Agents: b/B change the grouping. Caps: grouped by first capability; use",
-        "the filter to find every agent with a capability. UPDATED: which agent's",
-        "run or assignment record changed most recently. R: run; T: assigned task",
-        "record updated; may be an administrative change, not proof the agent ran.",
-        "Press any key to dismiss",
-    ];
     let screen = tmux.wait_for("the help overlay at 80x24", |s| {
-        s.lines().all(|line| line.chars().count() <= 80) && help.iter().all(|line| s.contains(line))
+        s.lines().all(|line| line.chars().count() <= 80) && help_ready(s)
     });
     assert!(screen.contains("KEYBOARD SHORTCUTS"), "{screen}");
     tmux.keys(&["Escape"]);
@@ -684,4 +709,146 @@ fn keyword_finds_a_match_behind_the_ten_row_cap() {
     assert!(!screen.contains("Zulu shipit"), "{screen}");
 
     tmux.keys(&["q"]);
+}
+
+/// Synthetic captures exercise the same polling loop as tmux; they establish
+/// readiness semantics, not the cause of a particular terminal transport race.
+#[cfg(test)]
+mod help_readiness_tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    // Literal fixture, independent of HELP_LINES so dropping a required line
+    // from the readiness predicate cannot silently remove a negative case.
+    const COMPLETE: &str = "KEYBOARD SHORTCUTS\n\
+Elapsed*: start to now; terminal rows end at last update (edits change it).\n\
+Includes waiting/retries. Elapsed order updates on refresh or\n\
+list-control changes; displayed time is live.\n\
+Agents: b/B change the grouping. Caps: grouped by first capability; use\n\
+the filter to find every agent with a capability. UPDATED: which agent's\n\
+run or assignment record changed most recently. R: run; T: assigned task\n\
+record updated; may be an administrative change, not proof the agent ran.\n\
+Press any key to dismiss";
+    // The significant prefix of the retained CI capture: title and headings,
+    // with a stale task-body fragment where shortcut rows should be.
+    const PREFIX: &str = "KEYBOARD SHORTCUTS\n\
+NAVIGATION              ACTIONS                COMMANDS\n\
+d more tasks to keep agents busy.  N new task";
+
+    fn wait(screens: &[&str], elapsed: &Cell<Duration>) -> String {
+        let start = Instant::now();
+        let mut captures = screens.iter();
+        let mut last = *screens.first().expect("at least one scripted screen");
+        wait_for_screen(
+            "the help overlay",
+            help_ready,
+            || {
+                if let Some(screen) = captures.next() {
+                    last = screen;
+                }
+                last.to_owned()
+            },
+            || start + elapsed.get(),
+            || elapsed.set(elapsed.get() + Duration::from_millis(100)),
+        )
+    }
+
+    #[track_caller]
+    fn assert_times_out(screens: &[&str]) {
+        let elapsed = Cell::new(Duration::ZERO);
+        let failure = catch_unwind(AssertUnwindSafe(|| wait(screens, &elapsed)))
+            .expect_err("incomplete help must time out");
+        let message = failure.downcast_ref::<String>().expect("timeout message");
+        assert_eq!(
+            (elapsed.get(), message.as_str()),
+            (
+                Duration::from_secs(20),
+                format!(
+                    "timed out waiting for the help overlay; screen:\n{}",
+                    screens.last().expect("last scripted screen")
+                )
+                .as_str()
+            ),
+            "deadline and final capture must be retained"
+        );
+    }
+
+    #[test]
+    fn help_readiness_complete_screen_returns_without_polling() {
+        let elapsed = Cell::new(Duration::ZERO);
+        assert_eq!(
+            (wait(&[COMPLETE], &elapsed), elapsed.get()),
+            (COMPLETE.to_owned(), Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn help_readiness_prefix_then_complete_returns_complete_screen() {
+        let elapsed = Cell::new(Duration::ZERO);
+        assert_eq!(wait(&[PREFIX, COMPLETE], &elapsed), COMPLETE);
+    }
+
+    #[test]
+    fn help_readiness_permanent_title_only_times_out() {
+        assert_times_out(&["KEYBOARD SHORTCUTS"]);
+    }
+
+    #[test]
+    fn help_readiness_each_missing_footer_line_times_out() {
+        for missing in COMPLETE.lines().skip(1) {
+            let screen = COMPLETE
+                .lines()
+                .filter(|line| *line != missing)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_times_out(&[&screen]);
+        }
+    }
+
+    #[test]
+    fn help_readiness_each_missing_disclosure_sentence_times_out() {
+        for missing in [
+            "Elapsed*: start to now; terminal rows end at last update (edits change it).",
+            "Includes waiting/retries.",
+            "Elapsed order updates on refresh or\nlist-control changes; displayed time is live.",
+            "Agents: b/B change the grouping.",
+            "Caps: grouped by first capability; use\nthe filter to find every agent with a capability.",
+            "UPDATED: which agent's\nrun or assignment record changed most recently.",
+            "R: run; T: assigned task\nrecord updated; may be an administrative change, not proof the agent ran.",
+        ] {
+            let screen = COMPLETE.replace(missing, "");
+            assert_times_out(&[&screen]);
+        }
+    }
+
+    #[test]
+    fn help_readiness_missing_title_times_out() {
+        let screen = COMPLETE.strip_prefix("KEYBOARD SHORTCUTS\n").unwrap();
+        assert_times_out(&[screen]);
+    }
+
+    #[test]
+    fn help_readiness_fragments_in_separate_captures_do_not_combine() {
+        let without_disclosure = COMPLETE
+            .lines()
+            .filter(|line| !line.starts_with("Elapsed*:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let disclosure_only =
+            "Elapsed*: start to now; terminal rows end at last update (edits change it).";
+        assert_times_out(&[&without_disclosure, disclosure_only]);
+    }
+
+    #[test]
+    #[should_panic(expected = "capture failed")]
+    fn help_readiness_capture_failure_propagates_without_polling() {
+        wait_for_screen(
+            "the help overlay",
+            help_ready,
+            || panic!("capture failed"),
+            Instant::now,
+            || panic!("must not poll after a capture failure"),
+        );
+    }
 }
