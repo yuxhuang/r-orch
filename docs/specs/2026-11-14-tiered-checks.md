@@ -1,5 +1,51 @@
 # Tiered verification checks
 
+## PR85 shared witness correction — 2026-11-17 (before code)
+
+The authorized narrow correction preserves the failed published head and its
+consumed native run. It fixes writer ownership only; it does not qualify PR85.
+
+| Requirement | Acceptance on macOS (portable test code for Linux CI) |
+|---|---|
+| W1: the real xtask unit-suite witness exclusively creates the suite record; imported and standalone helpers in that suite cannot create, overwrite or repair it | `gate::suite::tests::shared_witness_has_one_unit_writer_and_nonwriting_helpers` uses the actual unit test and both compiled std-only helper forms, with shared environment; missing and malformed records stay rejected |
+| W2: the unselected-xtask fast path explicitly designates its standalone writer; planted non-xtask fixtures retain their witness | Same regression plus `gate_fast` tests: all witness-target rows ok, exactly one named witness, independently nonzero selected suite |
+| W3: duplicate designated writes fail; witness bytes, schema, names-only recording and private creation remain enforced | Regression checks duplicate failure, inode/bytes unchanged, 0600 record / 0700 immediate directory, names-only existing test; fast missing/zero negatives retained |
+
+No tests are deleted, ignored or filtered out of production gates. FS1, D45,
+option3 and historical/deferred receipts remain accepted-not-fixed or outstanding
+as previously recorded. This scoped regression is not fresh native acceptance.
+
+## PR2 integration — 2026-11-16 (acceptance pending)
+
+The approved PR2 continuation starts at main `1603c67a3160901ce857f5877a03d227b980e6d9`.
+It consumes the separately committed selector and SR-P1 fixture correction, then
+implements fast and the local documentation-only path. CI, AGENTS/rules, versions,
+dependencies and PR3–6 policy remain unchanged. Fast never supplies merge evidence.
+
+- Fast uses shared machine admission in both Python bootstrap and Rust runner;
+  the existing exclusive warm-target marker still excludes a second writer in
+  one worktree. Queued exclusive admission blocks later shared requesters.
+- Print selection/base/packages and quoted reasons. Keep global-first, fail-closed
+  classification, reverse closure and D39 coupling. Empty changes select all.
+- Run fmt/workspace clippy/crate graph first. Package/all paths explicitly build
+  current selected targets before mapping/running tests (D40). Preserve sentinel,
+  shims, witness, failed-suite status, independently nonzero selected inventory,
+  warm-source checks and retained logs. When xtask is outside the selection, run
+  its unfiltered witness target with its own map/inventory (all rows ok; named witness once) before the
+  selected suite. The witness cannot rescue a zero-test selected suite.
+- Docs-only runs build/lints/crate graph and no suite or witness tests, as approved.
+  No advisories in fast, no new docs checker. Fast exports remain nonqualifying.
+- TV72 now requires usable fast plans/runtime and invalid-option refusals. Existing
+  full/pr/usage controls remain. TV61/62 and shared-fast RS1 use deterministic real
+  requesters, including wrapper admission; no sleep is proof of ordering.
+
+Implementation controls on macOS are distinct from acceptance. Native Linux D40,
+shared controls and selector tables, isolated actual concurrent_index, independent
+code/security/SRE review, native/pre-PR full checks/inventories and idle timing
+remain outstanding. All historical option3 ACCEPTED NOT FIXED, FS1, interim D45,
+manual cargo-clean/marker removal, M2 and other named limitations retain scope.
+ADR 0015 remains PROPOSED. No acceptance requirement or risk is silently waived.
+
 ## NM1 prospective isolation, stage diagnostics and capture modes (2026-11-16)
 
 The bounded C3/C1/DMS-1 correction follows independent review of the preceding
@@ -899,3 +945,10 @@ Filled in by the PR that completes the work. Requirement completion remains pend
 
 Defects found outside the requirements:
 - `scratch_outlives_late_spawn_and_drop` in `crates/orch-daemon/tests/daemon_harness_hermetic.rs` was reported to fail intermittently with “conflict: diagnostic cancelled”. The root cause is unknown. The original failure is kept and is under investigation; it is not rerun away.
+
+Fast has a known source-scanner gap: the orch-engine guard
+`token_eco_preparation::dispatch_is_the_only_production_caller_of_adapter_execute_and_awaits_preparation_first`
+reads every crate's source without a Cargo edge. The orch-infra guards
+`spawn_gate` and `synthetic_spawn_domain_guard` also scan crates; D39 covers them
+incidentally while every crate reaches orch-cli. This adds no coupling policy.
+Fast is an iteration signal; the full PR check remains the merge check.

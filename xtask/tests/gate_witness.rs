@@ -5,6 +5,16 @@ fn gate_environment_witness() {
     let Some(directory) = std::env::var_os("XTASK_GATE_WITNESS_DIR") else {
         return;
     };
+    // The real suite's unit test owns its one record. These copies retain
+    // their test identities but must not create, overwrite or repair that file.
+    // A planted non-xtask fixture has no xtask unit binary; its helper owns it.
+    if env!("CARGO_PKG_NAME") == "xtask" {
+        match std::env::var("XTASK_GATE_WITNESS_WRITER").as_deref() {
+            Ok("unit") => return,
+            Ok("standalone") => {}
+            _ => panic!("gate supplies a supported witness writer"),
+        }
+    }
     let home = std::env::var_os("HOME").expect("gate supplies HOME");
     let path = std::env::var_os("PATH").expect("gate supplies PATH");
     let first = std::env::split_paths(&path).next().expect("nonempty PATH");
@@ -39,8 +49,21 @@ fn gate_environment_witness() {
         record.push('\n');
     }
     let directory = std::path::Path::new(&directory);
-    std::fs::create_dir_all(directory).unwrap();
-    std::fs::write(directory.join("witness.txt"), record).unwrap();
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(directory)
+        .unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(directory.join("witness.txt"))
+        .unwrap()
+        .write_all(record.as_bytes())
+        .unwrap();
 }
 
 // FIXTURE SUPPORT: not planted in miniature workspaces.
@@ -131,6 +154,30 @@ def cargo_subcommand(args):
         "ORCH_REMOTE_ENV_PASSTHROUGH",
     ];
 
+    fn private_capture(path: &Path) -> fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap()
+    }
+
+    // These are diagnostic captures, unlike source/configuration fixture inputs.
+    // The existing Sandbox owner creates their immediate parent0700.
+    pub fn private_diagnostic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?
+            .write_all(bytes)
+    }
+
     pub struct Sandbox {
         pub temporary: PathBuf,
         pub root: PathBuf,
@@ -182,7 +229,10 @@ def cargo_subcommand(args):
                 "lease",
                 "capture",
             ] {
-                fs::create_dir(result.temporary.join(name)).unwrap();
+                fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(result.temporary.join(name))
+                    .unwrap();
             }
             fs::write(result.temporary.join("home/global.yml"), "{}\n").unwrap();
             fs::write(result.temporary.join("fallback-settings.toml"), "").unwrap();
@@ -289,8 +339,8 @@ def cargo_subcommand(args):
             let stderr = self.temporary.join(format!("capture/{serial}.err"));
             command
                 .stdin(input.map(Stdio::from).unwrap_or_else(Stdio::null))
-                .stdout(fs::File::create(&stdout).unwrap())
-                .stderr(fs::File::create(&stderr).unwrap())
+                .stdout(private_capture(&stdout))
+                .stderr(private_capture(&stderr))
                 .process_group(0);
             if closed {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -733,12 +783,19 @@ def cargo_subcommand(args):
             // underneath an unresolved writer. This is containment of files,
             // not a claim that escaped descendants have been stopped (FS2/I3).
             let root = self.stdout.parent().unwrap().parent().unwrap();
-            let _ = fs::write(
-                root.join("cleanup-unresolved"),
+            let _ = private_diagnostic(
+                &root.join("cleanup-unresolved"),
                 b"abnormal direct-child completion; descendant authority unresolved\n",
             );
             if matches!(self.child.try_wait(), Ok(None)) {
-                let _ = self.signal_owned("KILL", true);
+                let group_signalled = self.signal_owned("KILL", true);
+                if !group_signalled {
+                    private_diagnostic(
+                        &root.join("cleanup-failed"),
+                        b"owned group signal failed; scratch retained\n",
+                    )
+                    .expect("retain cleanup failure");
+                }
                 let _ = self.child.kill();
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
@@ -755,6 +812,12 @@ def cargo_subcommand(args):
                         }
                     }
                 }
+            }
+            if root.join("cleanup-failed").exists() && !std::thread::panicking() {
+                panic!(
+                    "fixture cleanup failed; scratch retained at {}",
+                    root.display()
+                );
             }
             // A reaped leader supplies no authority over survivors. No numeric
             // PID/PGID signal follows that branch; independent seam still due.
@@ -855,7 +918,11 @@ fn filesystem_sandbox_retains_diagnostics_when_cleanup_is_unresolved() {
 fn supplied_witness_directory_records_home_redirect_path_and_names_without_values() {
     let sandbox = fixture::Sandbox::new();
     let directory = sandbox.temporary.join("witness-record");
-    std::fs::create_dir(&directory).unwrap();
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .unwrap();
     std::fs::write(
         directory.join("environment.txt"),
         "removed XDG_CONFIG_HOME\n",
@@ -870,9 +937,18 @@ fn supplied_witness_directory_records_home_redirect_path_and_names_without_value
     command
         .args(["--exact", &test, "--test-threads=1"])
         .env("XTASK_GATE_WITNESS_DIR", &directory)
+        .env("XTASK_GATE_WITNESS_WRITER", "standalone")
         .env("XDG_CONFIG_HOME", "SECRET_private_xdg")
         .env("ORCH_WEB_PASSWORD", "SECRET_private_password");
     sandbox.run(&mut command).code(0);
+    assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+    assert_eq!(
+        std::fs::metadata(directory.join("witness.txt"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600
+    );
     assert_eq!(
         std::fs::read_to_string(directory.join("witness.txt")).unwrap(),
         format!(
@@ -901,6 +977,33 @@ fn capture_preserves_non_utf8_output_bytes_and_prints_lossy_diagnostics() {
         (b"out\xff".as_slice(), b"err\xfe".as_slice())
     );
     assert!(output.text().contains('\u{fffd}'));
+}
+
+#[test]
+fn fixture_captures_are_private_at_creation() {
+    use std::os::unix::fs::MetadataExt;
+    let sandbox = fixture::Sandbox::filesystem_only();
+    let child = sandbox.spawn(&mut sandbox.command("/usr/bin/true"));
+    child.finish(fixture::COMMAND_BUDGET).code(0);
+    for name in ["cleanup-unresolved", "cleanup-failed"] {
+        let path = sandbox.temporary.join(name);
+        fixture::private_diagnostic(&path, b"mode oracle\n").unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+    assert_eq!(
+        std::fs::metadata(&sandbox.temporary).unwrap().mode() & 0o777,
+        0o700
+    );
+    let directory = sandbox.temporary.join("capture");
+    assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+    let files: Vec<_> = std::fs::read_dir(directory).unwrap().collect();
+    assert_eq!(files.len(), 2);
+    for file in files {
+        let m = file.unwrap().metadata().unwrap();
+        assert!(m.is_file());
+        assert_eq!(m.nlink(), 1);
+        assert_eq!(m.mode() & 0o777, 0o600);
+    }
 }
 
 #[test]

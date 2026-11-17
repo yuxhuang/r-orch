@@ -7,6 +7,13 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Development tooling
 
+- Give the folded suite one exclusive environment-witness writer and designate the separate fast witness explicitly.
+
+- Add local `gate fast` with fail-closed change selection, printed reasons, content-checked warm targets and a documentation-only build/lint path.
+- Allow fast checks in separate worktrees to share host admission while retaining per-target exclusion and exclusive-waiter ordering.
+- Build current selected CLI targets before path-executing tests; retain sentinel, shim, witness and nonzero-inventory checks.
+- Publish the bootstrap fixture PID atomically so incomplete writes cannot be mistaken for readiness.
+
 - Label cooperative gate contention by admission or requested lease mode.
 - Isolate the immediate shared-lease fixture and create message-test capture directories with explicit private permissions.
 - Retain interrupted gate targets when capture or EOF collection remains unresolved.
@@ -14,8 +21,8 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - Capture noisy test diagnostics in test processes while preserving failure output.
 - Publish private single-link bootstrap executables before source stamps, preserving strict judge checks.
 
-These PR1 repairs remain incomplete pending native/diagnostic conditions and final-head acceptance;
-existing required checks and later tier stages are unchanged.
+PR2 implementation is pending independent frozen reviews and native/pre-PR acceptance;
+existing required check/test jobs and pre-PR rules remain unchanged. Fast never supplies merge evidence.
 
 
 ## [1.0.0] - 2026-11-14

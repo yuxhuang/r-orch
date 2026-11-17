@@ -39,6 +39,7 @@ pub(super) const SET: &[&str] = &[
     "RUSTUP_TOOLCHAIN",
     "CARGO_TARGET_DIR",
     "XTASK_GATE_WITNESS_DIR",
+    "XTASK_GATE_WITNESS_WRITER",
 ];
 
 // No TOML dependency is authorized in this slice. This is a fail-closed reader
@@ -149,9 +150,11 @@ impl Hermetic {
         let cwd = root.join("cwd");
         let shims = root.join("shims");
         let witness = root.join("witness");
-        for path in [&home, &cwd, &shims, &witness] {
+        for path in [&home, &cwd, &shims] {
             std::fs::create_dir(path)?;
         }
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&witness)?;
         let real_home = inherited
             .get(std::ffi::OsStr::new("HOME"))
             .context("HOME required before sentinel setup")?;
@@ -199,6 +202,8 @@ impl Hermetic {
             ("RUSTUP_TOOLCHAIN", channel.into()),
             ("CARGO_TARGET_DIR", target.into()),
             ("XTASK_GATE_WITNESS_DIR", witness.clone().into_os_string()),
+            // Fixed command routing, never trust an inherited designation.
+            ("XTASK_GATE_WITNESS_WRITER", "unit".into()),
         ] {
             env.insert(key.into(), value);
         }
@@ -380,7 +385,7 @@ mod tests {
         for name in names {
             text.push_str(&format!("orch_var={}\n", name.to_string_lossy()));
         }
-        std::fs::write(std::path::Path::new(&directory).join("witness.txt"), text).unwrap();
+        files::write(&Path::new(&directory).join("witness.txt"), text.as_bytes()).unwrap();
     }
     #[test]
     fn unknown_opt_in_refuses_names_without_values() {

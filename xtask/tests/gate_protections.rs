@@ -484,7 +484,7 @@ fn observes_no_product_or_gate_control_variables() {
     for (name, _) in std::env::vars_os() {
         let name = name.to_string_lossy();
         assert!(!name.starts_with("ORCH_") && !name.starts_with("ORCHESTRY_"));
-        assert!(!name.starts_with("XTASK_GATE_") || name == "XTASK_GATE_WITNESS_DIR");
+        assert!(!name.starts_with("XTASK_GATE_") || matches!(name.as_ref(), "XTASK_GATE_WITNESS_DIR" | "XTASK_GATE_WITNESS_WRITER"));
     }
 }
 "#,

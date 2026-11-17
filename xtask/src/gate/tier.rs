@@ -37,25 +37,38 @@ pub(super) fn plan(repo: &Path, args: &GateArgs) -> Result<i32> {
         "--warm is only valid for full"
     );
     println!(
-        "tier: {}\npurpose: {}\ntarget: {}\nlease: exclusive\npart: {}\nsteps: {}\nnative-lifecycle: checked cooperative paths; plan only, nothing ran",
+        "tier: {}\npurpose: {}\ntarget: {}\nlease: {}\npart: {}\nsteps: {}\nnative-lifecycle: checked cooperative paths; plan only, nothing ran",
         name(args.tier),
-        if args.tier == Tier::Pr {
-            "merge condition (after policy transition)"
-        } else {
-            "goal and release gate"
+        match args.tier {
+            Tier::Pr => "merge condition (after policy transition)",
+            Tier::Full => "goal and release gate",
+            Tier::Fast => "local iteration; never merge evidence",
         },
         target_path(repo, args).display(),
+        if args.tier == Tier::Fast {
+            "shared"
+        } else {
+            "exclusive"
+        },
         part(args.part),
-        report::STEPS
-            .iter()
-            .filter(|s| match args.part {
-                Some(Part::Static) => ["clippy", "fmt", "advisories", "crate-graph"].contains(s),
-                Some(Part::Suite) => !["clippy", "fmt", "advisories", "crate-graph"].contains(s),
-                None => true,
-            })
-            .copied()
-            .collect::<Vec<_>>()
-            .join(", ")
+        if args.tier == Tier::Fast {
+            "fmt, clippy, crate-graph; docs-only: build; packages/all: environment-witness (when xtask unselected), build, test, home-hygiene, no-real-cli, real-home".to_owned()
+        } else {
+            report::STEPS
+                .iter()
+                .filter(|s| match args.part {
+                    Some(Part::Static) => {
+                        ["clippy", "fmt", "advisories", "crate-graph"].contains(s)
+                    }
+                    Some(Part::Suite) => {
+                        !["clippy", "fmt", "advisories", "crate-graph"].contains(s)
+                    }
+                    None => true,
+                })
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
     );
     Ok(0)
 }
@@ -72,11 +85,42 @@ fn dirty(repo: &Path) -> Result<bool> {
     Ok(!git(repo, &["status", "--porcelain", "--untracked-files=all"])?.is_empty())
 }
 
-pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
-    if args.tier == Tier::Fast {
-        eprintln!("gate: not available yet: fast belongs to PR2; nothing ran");
-        return Ok(2);
+fn validate_tier_lease(tier: Tier, held: &lease::Lease) -> Result<()> {
+    if tier == Tier::Fast {
+        held.validate()
+    } else {
+        held.validate_exclusive()
     }
+}
+
+#[cfg(test)]
+mod correction_tests {
+    use super::*;
+    #[test]
+    fn pr_and_full_refuse_shared_authority_fast_accepts_it() {
+        let s = super::super::steps::tests::Scratch::new();
+        let held = lease::Lease::Owned(
+            lease::Owned::acquire(
+                &s.0,
+                nix::unistd::geteuid().as_raw(),
+                lease::Mode::Shared,
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        validate_tier_lease(Tier::Fast, &held).unwrap();
+        for tier in [Tier::Pr, Tier::Full] {
+            assert!(
+                validate_tier_lease(tier, &held)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("exclusive")
+            );
+        }
+    }
+}
+
+pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
     if args.plan {
         return plan(repo, args);
     }
@@ -104,6 +148,8 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
     let mut target_finished = false;
     let mut admitted_use = false;
     let mut suite = None;
+    let mut selection = None;
+    let mut selection_source = None;
     let mut environment = String::new();
     let mut tools = String::new();
     let mut pinned_toolchain = false;
@@ -120,16 +166,25 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
             .lease_wait
             .checked_mul(60)
             .context("lease wait overflow")?;
-        let lease =
-            lease::Lease::configured(false, lease::Mode::Exclusive, Duration::from_secs(wait))?;
+        let mode = if args.tier == Tier::Fast {
+            lease::Mode::Shared
+        } else {
+            lease::Mode::Exclusive
+        };
+        let lease = lease::Lease::configured(false, mode, Duration::from_secs(wait))?;
         lease_state = if matches!(&lease, lease::Lease::Inherited(_)) {
             "inherited"
+        } else if args.tier == Tier::Fast {
+            "shared"
         } else {
             "exclusive"
         };
         held = Some(lease);
         let lease = held.as_ref().unwrap();
-        if let lease::Lease::Owned(owned) = lease {
+        validate_tier_lease(args.tier, lease)?;
+        if args.tier != Tier::Fast
+            && let lease::Lease::Owned(owned) = lease
+        {
             owned.purpose(&format!("gate {} {}", name(args.tier), part(args.part)))?;
         }
         ensure!(
@@ -142,6 +197,18 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
                 expected.to_str() == Some(current),
                 "judge-source-id changed during bootstrap"
             );
+        }
+        if args.tier == Tier::Fast {
+            let mut runner = super::steps::Runner::without_marker(lease)?;
+            let before = target::Captured::read(&mut runner, &repo)?;
+            selection = Some(crate::gate_selection::select_from_git(
+                &repo,
+                args.base.as_deref().unwrap_or("origin/main"),
+            ));
+            let after = target::Captured::read(&mut runner, &repo)?;
+            runner.finished()?;
+            before.require_same(&after)?;
+            selection_source = Some(before);
         }
         let home = PathBuf::from(
             env.get(std::ffi::OsStr::new("HOME"))
@@ -185,9 +252,13 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
                     &files::read(&repo.join("Cargo.lock"), 16 * 1024 * 1024)?
                 )?
             ));
-            suite = Some(match args.part {
-                None => suite::run_all(&repo, &home, &h, runner),
-                p => suite::run_selected(&repo, &home, &h, runner, p),
+            suite = Some(if let Some(selection) = &selection {
+                suite::run_fast(&repo, &home, &h, runner, selection)
+            } else {
+                match args.part {
+                    None => suite::run_all(&repo, &home, &h, runner),
+                    p => suite::run_selected(&repo, &home, &h, runner, p),
+                }
             });
             let observation = runner.observation();
             observations.borrow_mut().record(observation);
@@ -222,6 +293,9 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
             let admitted = target::native_admission(&repo, cold, lease)?;
             admitted_use = true;
             let use_ = admitted.begin(lease)?;
+            if let Some(source) = &selection_source {
+                use_.require_selection(source)?;
+            }
             outcome = match use_.decision() {
                 "reset: source content changed" => {
                     "reset: content changed without a newer modification time"
@@ -330,6 +404,9 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
             }
         });
     let mut reasons = vec![];
+    if args.tier == Tier::Fast {
+        reasons.push("local iteration; never merge evidence");
+    }
     if args.part.is_some() {
         reasons.push("partial run");
     }
@@ -361,8 +438,12 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
     if !["record published", "cold target removed"].contains(&publication) {
         reasons.push(publication);
     }
-    if steps.len() != report::STEPS.len()
-        || steps.iter().any(|s| s.verdict != report::Verdict::Pass)
+    let expected_fast = selection.as_ref().map(suite::fast_steps);
+    let expected_steps = expected_fast.as_deref().unwrap_or(report::STEPS);
+    if steps.len() != expected_steps.len()
+        || steps
+            .iter()
+            .any(|s| s.verdict != report::Verdict::Pass || !expected_steps.contains(&s.name))
     {
         reasons.push("checks incomplete or failed");
     }
@@ -483,6 +564,8 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
                 "live-exclusive-holder"
             } else if lease_state == "exclusive" {
                 "kernel-exclusive"
+            } else if lease_state == "shared" {
+                "kernel-shared"
             } else {
                 "none"
             }
@@ -591,6 +674,27 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
             target::marker_diagnostics(&repo, args.tier == Tier::Full).as_deref(),
             &why,
         ));
+    }
+    if let Some(selection) = &selection {
+        text.push_str(&format!(
+            "selection: {}\nselection-base: {}\npackages: {}\n",
+            match selection.mode {
+                crate::gate_selection::Mode::DocsOnly => "docs-only",
+                crate::gate_selection::Mode::Packages => "packages",
+                crate::gate_selection::Mode::All => "all",
+            },
+            serde_json::json!(selection.base),
+            serde_json::json!(selection.packages)
+        ));
+        for r in &selection.reasons {
+            text.push_str(&format!(
+                "{} [{}] selects {}: {}\n",
+                serde_json::json!(r.path),
+                r.class.as_str(),
+                serde_json::json!(r.selects),
+                serde_json::json!(r.why)
+            ));
+        }
     }
     text.push_str(&environment);
     let inventory = suite

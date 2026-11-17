@@ -1,5 +1,141 @@
 # Tiered verification checks — plan
 
+## PR85 witness correction — 2026-11-17 (before code)
+
+Follow [the narrow correction plan](2026-11-17-pr85-witness-correction.md).
+Preserve the failed published head and native artifacts; no acceptance retry.
+
+## PR2 lease-probe continuation — 2026-11-16 (before source)
+
+Preserve 756bfe90 and every earlier failed receipt. The metadata-boundary
+regressions reach their intended refusal but their final lease-exec probe omits
+the required purpose. Add only a fixed inert `selection-mismatch-close-check`
+purpose; keep zero wait, `/usr/bin/true`, exit0 and all existing assertions.
+Audit newly added xtask invocations against definitions and installed help before
+workloads. This usage2 defect is not contention or historical NM1 recurrence.
+
+Complete the outstanding bounded correction receipts at committed source: build,
+pre-map, focused fixed controls and deliberate reverted mutants, real unfiltered
+witness/product inventory, creation-mode controls under022, direct pr/full and
+cold negatives, existing Linux-container TV61/TV62/RS1 discriminator, final
+fmt-check/clippy/crate-graph and complete xtask execution/inventory. No parser,
+policy, lifecycle, timeout or assertion relaxation. All17 first-PATH blockers,
+private creation APIs, existing host turnstile/lease close-only and child reap
+requirements remain. Stop on the first unexpected failure and retain its actual
+channels/status/source; never retry unchanged. Prior build/map do not qualify
+this head. Original independent reviewers and lead admission retain authority;
+native acceptance remains held. FS1/D45/option3 remain accepted, not fixed.
+
+## PR2 correction continuation — 2026-11-16 (before implementation)
+
+Continue the retained reproduction commit; no history rewrite. Accept original
+S-PR2-1, F-1/F-2 and P-L1/P-L2; no prior receipt is reclassified. Bind the
+existing bounded content snapshot before selection, after metadata and against
+the admitted use before any workload. Refuse changes loudly without publication.
+Use an explicit selection-metadata trigger/call trace and unchanged judge input;
+the omitted-package discriminator must fail independently of witness handling.
+Run the witness target unfiltered; require all rows ok and the named witness once,
+separately from nonzero selected tests. Retain an extra-test/filter mutant.
+Publish fixture executables by atomic rename, avoiding replacement of identical
+bytes; TV61/TV62/RS1 assertions and bounds stay unchanged.
+
+Accept draft observations: create private captures with creation APIs under022,
+cover run/export/steps/record/inventory plus named helpers, and retain default-mode
+mutants. Reap the mode-test child before assertions. Accept SRE O-1: surface failed
+owned cleanup in the result without changing signal authority or lifecycle policy.
+Document the engine/infra source-scanner gap (no new coupling), correct the step
+matrix and add direct pr exclusivity/cold shared-lease negatives. SRE bootstrap
+mutation F-3 stays a carried minor. FS1/D45/option3 stay accepted, not fixed.
+
+Verification is bounded: exact17 first-PATH blockers verified by set and resolution
+before each workload; private resource-only pin1.99.1, host turnstile/lease close-only,
+short distinct socket preflight, explicit0700/0600 and normal child022. Predeclare
+fixed and reverted mutants separately. Real unfiltered witness/product inventory,
+focused controls, build/fmt/clippy/crate-graph and complete scoped xtask map/run/
+inventory only; bounded existing Linux container discriminator is not native
+acceptance. No full selected workspace fast/native suite or timing. Unexpected
+failure stops; preserve actual source maps, merged bytes and statuses. Independent
+reviews and native acceptance remain held at the next immutable freeze.
+
+## PR2 reviewed corrections — 2026-11-16 (bounded implementation plan)
+
+Start at reviewed `45577c9d0466eb94e0219eb075d8c7fe7f90a327`, preserving that
+freeze. This amendment precedes code. Native acceptance and push remain held.
+
+1. S-PR2-1: reuse bounded native content capture before and after selection,
+   require equality, then require the admitted use baseline to match before any
+   suite command. Deterministic metadata-return saves in docs-only and omitted
+   package fixtures must refuse; reverted identity checks must fail the controls.
+2. SRE F-1: run the existing witness target unfiltered; require all rows ok and
+   exactly one named environment witness. Keep selected-suite nonzero independent.
+   Plant extra witness-target tests; restored-filter mutant must fail. Retain an
+   actual real-target map/run/product-inventory check without parser changes.
+3. SRE F-2: avoid identical executable replacement in the bootstrap shim and
+   otherwise publish a complete private temporary executable by rename. Preserve
+   TV61/TV62/RS1 refusal and ordering assertions; use the existing bounded Linux
+   container discriminator (never native acceptance).
+4. P-L1/P-L2: create report/export directories and named fixture capture parents
+   0700, capture streams 0600, explicitly at creation under workload umask022.
+   Add mode assertions and reverted/default-mode controls; no global077 or
+   workload/reap/deadline changes, and no retrospective privacy closure.
+5. Code F-1: disclose orch-engine and infra source scanners as hidden coupling
+   limitations; no new selection policy. Code F-2: correct build/witness matrix.
+   Code F-3/SRE F-4: pin Rust pr/exclusive refusal and direct cold shared-lease
+   boundary negatives without weakening existing checks. SRE F-3 bootstrap state
+   mutation remains a carried minor, not permission to redesign lifetime.
+6. Retain distinct intentional old/mutant failures and exact source/body ledgers.
+   Freeze committed source, then fmt, clippy, crate-graph, explicit xtask build,
+   actual pre-map, complete scoped xtask package and unchanged product inventory.
+   No full workspace suite/timing. Stop unexpected failures; diagnose and report
+   before any changed-input continuation. Original reviewers decide closure.
+
+## PR2 execution — 2026-11-16 (implementation, acceptance pending)
+
+Pinned base `1603c67a3160901ce857f5877a03d227b980e6d9`. Consume only selector
+`a2b388062aaaea38c4b5ae7ca78b65dc532d9811` and bootstrap
+`dcb3364201f8a49937524d69df81ce79d9518fa7` unchanged. This section precedes runner
+code and controls this integration; older dated statuses remain historical.
+
+1. Add black-box fast plans/usage, actual selected/docs-only miniatures and D40
+   empty/changed-marker controls before implementing dispatch. Keep full/pr commands.
+2. Reuse the delivered selector interface. Retain and print its mode, base, sorted
+   packages and each quoted reason. Fast uses shared host admission and the existing
+   exclusive warm marker; cold admission still requires exclusive host authority.
+3. Bootstrap fast (including options before the tier, skipping option values)
+   also requests shared admission, releases its turnstile after
+   admission, and keeps the separate per-worktree bootstrap marker exclusive.
+   External live exclusive inheritance remains valid. Never unlock a shared OFD.
+4. Fast runs fmt, workspace clippy and crate graph first; then selected build/map/
+   tests under the existing sentinel/shims/witness/inventory. The preparatory build
+   is explicit (D40), including current CLI before infra path execution. Docs-only
+   runs fmt/clippy/crate graph/build and zero suite tests. No advisories in fast.
+5. Add deterministic real-fast TV61/62 and same-target RS1 controls. Observe owned
+   shared holder, exclusive turnstile ownership and later shared requester; do not
+   infer ordering from sleeps. Extend shared warm lifecycle controls; preserve cold
+   exclusive refusal. Replace only the stage-specific fast-unavailable assertion.
+6. Run targeted red/green controls then complete xtask, fmt, workspace clippy and
+   crate graph with private homes/targets under a single host lease. Keep exact
+   failures, source/body ledgers and commands. No full workspace suite/gate/timing.
+7. Update developer docs/spec/changelog, freeze a clean local commit and hand off
+   for independent reviews and later native/pre-PR acceptance; no push or PR here.
+
+The selected-package path explicitly runs only xtask's std-only environment
+witness when xtask is outside the selection. Its separate map/inventory must
+contain exactly that one passed test; the selected suite must independently be
+nonzero. The selector package list is unchanged. Docs-only has neither witness
+nor suite tests. This closes the otherwise missing witness for CLI/infra closure.
+
+Fast never qualifies as merge/release evidence (even with --evidence). Partial fast
+parts are refused; --warm remains full-only. Full/pr behavior, CI and rules do not
+transition. Historical option3 ACCEPTED NOT FIXED, FS1, D45, manual cargo-clean,
+M2 and other limitations remain. Native Linux D40/shared controls, isolated real
+concurrent_index, full acceptance/inventory and idle timings remain later work.
+
+The assembled PR exceeds the 3000-line guideline because the delivered fail-closed
+selector and its independently authored adversarial tables are inseparable from
+the first usable fast runner; its two leaf commits remain separately reviewable.
+No source unrelated to that boundary is imported.
+
 ## NM1 prospective isolation, stage diagnostics and capture modes (2026-11-16)
 
 The bounded C3/C1/DMS-1 correction follows independent review of the preceding
@@ -844,7 +980,7 @@ Findings that shape the design. Each was read in the code at the base commit unl
 - F13. `std::fs::File` locking is available on the pinned toolchain (checked with a throwaway program on macOS). Unverified: the same on Linux, expected from the standard library's documentation.
 - F14. Some tests read opt-in variables from the environment. `crates/orch-cli/tests/token_eco_support/mod.rs` skips the old-reader half when `ORCH_T1_OLD_BIN` is unset and fails instead when `ORCH_T1_REQUIRE_OLD` is set; `fixtures/token-eco/matrix/run-matrix.sh` exports both. Removing every `ORCH_*` variable would remove the guard together with the opt-in (D26).
 - F15. `xtask` depends on `anyhow`, `clap` and `serde_json` only: no workspace crate and no hash crate. Content identities are therefore git blob ids from `git hash-object`, which the gate needs git for anyway.
-- F16. `crates/orch-infra/tests/concurrent_index.rs` starts the `orch` binary from `$CARGO_TARGET_DIR/debug/`. `orch-infra` does not depend on `orch-cli`, so the dependency graph alone does not select that test for an `orch-cli` change (D31). No other test outside `orch-cli` does this.
+- F16. `crates/orch-infra/tests/concurrent_index.rs` starts the `orch` binary from `$CARGO_TARGET_DIR/debug/`. `orch-infra` does not depend on `orch-cli`, so the dependency graph alone does not select that test for an `orch-cli` change (D31). This binary-path coupling does not inventory source-scanning guards; see the known gap below.
 
 ## Design
 
@@ -876,7 +1012,8 @@ Steps, in order. `full` and `pr` keep today's order and names so that results st
 
 | Step | Group | `full` | `pr` | `fast`, packages or all | `fast`, documentation only |
 |---|---|---|---|---|---|
-| `build` | suite | yes | yes | — | yes |
+| `build` | suite | yes | yes | selected all-targets, before map/test | yes |
+| `environment-witness` | suite | in test | in test | unfiltered xtask witness target, only when xtask unselected; before build | — |
 | `test` | suite | whole workspace | whole workspace | selected packages | — |
 | `doc-test` (from PR 4, if nextest is adopted) | suite | yes | yes | selected packages | — |
 | `clippy` | static | yes | yes | yes | yes |
@@ -1808,3 +1945,33 @@ For the lead; none blocks the design challenge.
 21. Eighth amendment: the fixed text and exit status of the refusal for a marker whose lock is not granted, for the cold target as well, and of a kept target, are F's interface obligation (P7), reviewed before C asserts them. Ninth amendment: the content floor of the marker's refusal is decided (D46); the strings and the exit status are still F's.
 22. Ninth amendment: the frozen single-writer test of C starts its runs with `--no-lease`, which D42 as proposed refuses (edit C10). The protection it checks stands. How its runs hold a configured lease is for the owner of C and the reviewers, before C′.
 23. Ninth amendment: `cargo clean` under a command that a killed gate left running is a disclosed residual (RC14, D43). Keeping the marker outside `target/` would close it for `cargo clean` and was not adopted (ADR 0015, alternative A40). It is the stronger remedy if the lead or the owner later want that case covered.
+
+Fast has a known source-scanner gap: the orch-engine guard
+`token_eco_preparation::dispatch_is_the_only_production_caller_of_adapter_execute_and_awaits_preparation_first`
+reads every crate's source without a Cargo edge. The orch-infra guards
+`spawn_gate` and `synthetic_spawn_domain_guard` also scan crates; D39 covers them
+incidentally while every crate reaches orch-cli. This adds no coupling policy.
+Fast is an iteration signal; the full PR check remains the merge check.
+
+## PR2 draft completion: corrected subcommand argv and diagnostic creation
+
+The retained fa7530ff draft failed before rustfmt: Cargo rejected a global
+manifest option. Continue on that clean branch with subcommand-first commands:
+`cargo fmt --manifest-path <absolute Cargo.toml> --all`, then final `--check`.
+Before compile, audit build/test/clippy/metadata/fmt help under the private
+installed 1.99.1 recipe; do not install anything. Complete metadata call trace,
+armed/saved boundary markers and cleanup diagnostics with explicit0600 creation
+under existing immediate0700 parents. Source mutation inputs remain fixture
+source, not capture evidence. Preserve normal child022 and finish/reap before
+mode assertions. Add diagnostic creation mode assertions using actual APIs.
+
+Accept all original S-PR2-1, SRE F-1/F-2, P-L1/P-L2, code F-1/F-2/F-3 and
+SRE F-4 dispositions in the prior correction plan. No closure from drafted code:
+require fixed/reverted boundary controls, independent omitted-package failure,
+real unfiltered witness/map/inventory and extra-test filter negative, default
+file/directory negatives, direct shared-authority pr/full/cold negatives,
+unchanged TV61/TV62/RS1 Linux-container fixed/mutant evidence, scoped build,
+fmt/clippy/crate-graph and complete exact-head xtask pre-map/raw/inventory.
+SRE F-3 bootstrap lifetime remains carried minor; no redesign is authorized.
+Stop on first unexpected failure, retaining immutable channels/status/source.
+FS1/D45/option3 remain accepted, not fixed; native acceptance remains held.

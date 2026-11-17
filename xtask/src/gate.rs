@@ -70,7 +70,7 @@ use crate::gate_selection::{self, SelectArgs};
 #[derive(Debug, Args)]
 #[command(
     about = "Tiered verification: full (default), pr (merge condition), fast (iteration)",
-    after_help = "full is the goal and release gate; pr is the merge condition after the policy transition. full uses a cold target; pr allows content-checked warm reuse. --warm is developer-only and not a gate. fast is PR2 work."
+    after_help = "full is the goal and release gate; pr is the merge condition after the policy transition. full uses a cold target; pr allows content-checked warm reuse. --warm is developer-only and not a gate. fast is for local iteration, never merge evidence."
 )]
 pub struct GateArgs {
     #[command(subcommand)]
@@ -164,6 +164,10 @@ pub fn run(repo: &Path, args: GateArgs) -> Result<i32> {
     // including --plan. The legacy warm mode belongs to full only.
     if args.command.is_none() && args.warm && args.tier != Tier::Full {
         eprintln!("gate: --warm is only valid for full");
+        return Ok(2);
+    }
+    if args.command.is_none() && args.tier == Tier::Fast && args.part.is_some() {
+        eprintln!("gate: --part is only valid for pr/full");
         return Ok(2);
     }
     match args.command {

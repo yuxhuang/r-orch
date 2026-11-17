@@ -166,7 +166,7 @@ impl Evidence {
             "bundle/inventory.tsv",
             "lib\tfixture\tfixture\tsample\tok\n",
         );
-        sandbox.write("bundle/environment.txt", "removed ORCHESTRY_GLOBAL_CONFIG_PATH\nset CARGO_HOME\nset CARGO_TARGET_DIR\nset HOME\nset PATH\nset RUSTUP_HOME\nset RUSTUP_TOOLCHAIN\nset XTASK_GATE_WITNESS_DIR\n");
+        sandbox.write("bundle/environment.txt", "removed ORCHESTRY_GLOBAL_CONFIG_PATH\nset CARGO_HOME\nset CARGO_TARGET_DIR\nset HOME\nset PATH\nset RUSTUP_HOME\nset RUSTUP_TOOLCHAIN\nset XTASK_GATE_WITNESS_DIR\nset XTASK_GATE_WITNESS_WRITER\n");
         let tools = BTreeMap::from([
             ("schema", "1"),
             ("object-format", "sha1"),

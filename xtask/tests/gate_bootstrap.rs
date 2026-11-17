@@ -350,12 +350,21 @@ fn park_cargo(sandbox: &Sandbox) {
     let real = sandbox.cargo_forwarder();
     let ready = sandbox.temporary.join("build-ready");
     let release = sandbox.temporary.join("build-release");
-    // A self-bounded process boundary, with file handshakes rather than sleeps.
-    // No grandchild starts until released; process-group cleanup covers this worker.
     sandbox.script(
         &cargo,
-        &format!(
-            r#"#!/usr/bin/python3
+        &parked_cargo_script(
+            real.to_str().unwrap(),
+            ready.to_str().unwrap(),
+            release.to_str().unwrap(),
+        ),
+    );
+}
+
+fn parked_cargo_script(real: &str, ready: &str, release: &str) -> String {
+    // A self-bounded process boundary, with file handshakes rather than sleeps.
+    // No grandchild starts until released; process-group cleanup covers this worker.
+    format!(
+        r#"#!/usr/bin/python3
 import os, sys, time
 from pathlib import Path
 {parser}
@@ -363,7 +372,10 @@ if cargo_subcommand(sys.argv[1:]) != "build":
     os.execv({real:?}, [{real:?}] + sys.argv[1:])
 ready = Path({ready:?})
 release = Path({release:?})
-ready.write_text(str(os.getpid()))
+# Existence is readiness: publish only the closed, complete PID.
+pending = ready.with_name(ready.name + '.tmp')
+pending.write_text(str(os.getpid()))
+pending.replace(ready)
 deadline = time.monotonic() + 30
 while not release.exists():
     if time.monotonic() > deadline:
@@ -372,13 +384,103 @@ while not release.exists():
     time.sleep(0.01)
 os.execv({real:?}, [{real:?}] + sys.argv[1:])
 "#,
-            parser = CARGO_SUBCOMMAND_PY,
-            ready = ready.to_str().unwrap(),
-            release = release.to_str().unwrap(),
-            real = real.to_str().unwrap()
-        ),
-    );
+        parser = CARGO_SUBCOMMAND_PY,
+    )
 }
+
+#[test]
+fn parked_cargo_publishes_pid_only_after_complete_write() {
+    pid_publication_probe("complete");
+}
+
+#[test]
+fn failed_parked_cargo_publication_never_publishes_readiness() {
+    for failure in ["empty", "numeric-prefix", "before-rename"] {
+        pid_publication_probe(failure);
+    }
+}
+
+fn pid_publication_probe(failure: &str) {
+    let sandbox = Sandbox::new();
+    let script = parked_cargo_script(
+        "/must-not-exec-cargo",
+        sandbox.temporary.join("build-ready").to_str().unwrap(),
+        sandbox.temporary.join("build-release").to_str().unwrap(),
+    );
+    let output = sandbox.run(
+        sandbox
+            .command("/usr/bin/python3")
+            .args(["-c", PID_PUBLICATION_PROBE])
+            .arg(&sandbox.temporary)
+            .arg(script)
+            .arg(failure),
+    );
+    eprintln!("{}", output.text());
+    output.code(0);
+}
+
+// The shim itself runs with event-controlled file IO and an intercepted exec
+// boundary. No Cargo, real lock holder or child process is launched by Python.
+// Observing both writes and the real rename rejects a copy-to-final regression.
+const PID_PUBLICATION_PROBE: &str = r###"
+import os,sys,pathlib,threading,queue,json
+root=pathlib.Path(sys.argv[1]);code=sys.argv[2];failure=sys.argv[3]
+ready=root/'build-ready';release=root/'build-release';pending=root/'build-ready.tmp'
+release.touch()
+stages=queue.Queue();advance=[threading.Event(),threading.Event()]
+errors=[];visible=[];forwarded=[];renames=[]
+class PublicationFailure(Exception): pass
+def paused_write(path,text):
+ assert path in (ready,pending),path
+ assert text.isdecimal() and len(text)>1,text
+ with path.open('w') as stream:
+  for index,part in enumerate(['',text[:1]]):
+   stream.write(part);stream.flush();stages.put((index,text))
+   assert advance[index].wait(5),'write-pause release timeout'
+   if failure==['empty','numeric-prefix'][index]:raise PublicationFailure(failure)
+  stream.write(text[1:])
+ return len(text)
+original_replace=pathlib.Path.replace
+def observed_replace(path,target):
+ assert path==pending and pathlib.Path(target)==ready,(path,target)
+ assert path.parent==ready.parent
+ assert not ready.exists(),'readiness visible before rename'
+ assert path.read_text()==str(os.getpid()),'rename before complete closed write'
+ renames.append((str(path),str(target)))
+ if failure=='before-rename':raise PublicationFailure(failure)
+ return original_replace(path,target)
+pathlib.Path.write_text=paused_write
+pathlib.Path.replace=observed_replace
+os.execv=lambda path,args:forwarded.append((path,args))
+sys.argv=['cargo','build']
+def run():
+ try:exec(code,{})
+ except BaseException as error:errors.append(error)
+thread=threading.Thread(target=run)
+thread.start()
+try:
+ for expected in range(1 if failure=='empty' else 2):
+  index,complete=stages.get(timeout=5)
+  assert index==expected,(index,expected)
+  if ready.exists():visible.append((index,ready.read_text()))
+  advance[index].set()
+finally:
+ for event in advance:event.set()
+ thread.join(timeout=5)
+assert not thread.is_alive(),'parked shim did not finish'
+print(json.dumps(dict(failure=failure,complete_pid=complete,visible_before_completion=visible,renames=renames)),flush=True)
+assert not visible,('incomplete PID visible before publication',visible)
+if failure=='complete':
+ assert not errors,[repr(error) for error in errors]
+ assert ready.read_text()==complete,(ready.read_text(),complete)
+ assert len(renames)==1 and not pending.exists(),renames
+ assert forwarded==[('/must-not-exec-cargo',['/must-not-exec-cargo','build'])],forwarded
+else:
+ assert len(errors)==1 and isinstance(errors[0],PublicationFailure),[repr(error) for error in errors]
+ assert not ready.exists(),'failed write published readiness'
+ assert pending.exists(),'failed publication evidence missing'
+ assert not forwarded,forwarded
+"###;
 
 #[test]
 fn source_mutation_during_bootstrap_cannot_publish_a_trusted_stamp() {

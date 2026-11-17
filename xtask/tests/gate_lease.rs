@@ -871,8 +871,7 @@ fn warm_and_cold_orphan_writers_are_not_reset_under_after_direct_holder_kill() {
     }
 }
 
-// Required PR2 obligations: TV61/62 and shared-fast RS1, once fast is real.
-// No fake --shared requester or permanent ignore is introduced here.
+// PR2 TV61/62 and shared-fast RS1 controls below use the real fast requester.
 // Remaining atomic-fault RS3, RS8/9/10 and attribution/foreign-owner seams are listed in the
 // handoff, together with why current public entry points cannot safely plant them.
 
@@ -1744,4 +1743,239 @@ fn lease_exec_closed_stderr_keeps_signal_exit_and_reaps_resistant_direct_child()
             "/usr/bin/true",
         ]))
         .code(0);
+}
+
+// PR2 public requesters. Only bootstrap compilation is replaced by copying the
+// already-built judge; the actual wrapper, host admission, target lifecycle and
+// every miniature suite command run unchanged. No production workload runs.
+fn fast_sandbox() -> Sandbox {
+    let s = Sandbox::new();
+    s.mini("#[test] fn sample() {}\n", true);
+    s.write(
+        "Cargo.toml",
+        "[workspace]\nresolver=\"3\"\nmembers=[\"fixture\",\"xtask\"]\n",
+    );
+    s.write(
+        "xtask/Cargo.toml",
+        "[package]\nname=\"xtask\"\nversion=\"0.0.0\"\nedition=\"2024\"\n",
+    );
+    s.write("xtask/src/main.rs", "fn main() {}\n");
+    s.write("xtask/gate.sh", include_str!("../gate.sh"));
+    s.run(s.command("cargo").args(["generate-lockfile", "--offline"]))
+        .code(0);
+    s.run(s.command("cargo").args(["fmt", "--all"])).code(0);
+    s.commit();
+    s
+}
+fn fast_parked_forwarder(s: &Sandbox, boundary: &Boundary) {
+    let real = s.cargo_forwarder();
+    s.script(&s.temporary.join("bin/cargo"), &format!(r#"#!/usr/bin/python3 -B
+import os, pathlib, shutil, subprocess, sys
+{parser}
+target = pathlib.Path(os.environ.get('CARGO_TARGET_DIR', ''))
+sub = cargo_subcommand(sys.argv[1:])
+if sub == 'build' and target.name == 'gate-xtask':
+    destination=target/'debug/xtask'
+    destination.parent.mkdir(parents=True,exist_ok=True)
+    source=pathlib.Path({judge:?})
+    if not destination.exists() or destination.read_bytes() != source.read_bytes():
+        temporary=destination.with_name('xtask.'+str(os.getpid())+'.tmp')
+        with temporary.open('xb') as output:
+            output.write(source.read_bytes())
+        temporary.chmod(0o700)
+        temporary.replace(destination)
+    sys.exit(0)
+if sub == 'build' and target.name == 'gate-warm':
+    try: pathlib.Path({once:?}).mkdir()
+    except FileExistsError: pass
+    else:
+        result=subprocess.run(['/usr/bin/python3','-B',{payload:?},'holder',{socket:?}],close_fds=False)
+        if result.returncode: sys.exit(result.returncode)
+os.execv({real:?},[{real:?}]+sys.argv[1:])
+"#, parser=CARGO_SUBCOMMAND_PY, judge=env!("CARGO_BIN_EXE_xtask"), once=s.temporary.join("fast-build-entered").to_str().unwrap(), payload=s.temporary.join("payload.py").to_str().unwrap(), socket=boundary.path.to_str().unwrap(), real=real.to_str().unwrap()));
+}
+fn wrapped_fast(s: &Sandbox, lease: &Path, wait: &str) -> std::process::Command {
+    let mut cmd = s.command("/bin/bash");
+    cmd.arg(s.root.join("xtask/gate.sh"))
+        .args(["fast", "--base", "HEAD", "--lease-wait", wait])
+        .env("XTASK_GATE_LEASE_DIR", lease);
+    cmd
+}
+#[test]
+fn real_wrapped_fast_shared_holders_coexist_and_same_target_refuses_tv61_rs1() {
+    let a = fast_sandbox();
+    let b = fast_sandbox();
+    let ba = Boundary::new(&a);
+    let bb = Boundary::new(&b);
+    fast_parked_forwarder(&a, &ba);
+    fast_parked_forwarder(&b, &bb);
+    let lease = a.temporary.join("lease");
+    let mut first = a.spawn(&mut wrapped_fast(&a, &lease, "0"));
+    let mut p = ba.accept(&mut first);
+    // Clap accepts global options before the tier, too. That spelling must not
+    // silently restore an exclusive bootstrap in front of a shared fast run.
+    let mut options_first = b.command("/bin/bash");
+    options_first
+        .arg(b.root.join("xtask/gate.sh"))
+        .args([
+            "--lease-wait",
+            "0",
+            "--host-label",
+            "fast",
+            "--base",
+            "HEAD",
+            "--",
+            "fast",
+        ])
+        .env("XTASK_GATE_LEASE_DIR", &lease);
+    let mut second = b.spawn(&mut options_first);
+    let admitted =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bb.accept(&mut second)));
+    let mut q = match admitted {
+        Ok(peer) => peer, // Must arrive while first is held, not afterwards.
+        Err(error) => {
+            p.release();
+            first.finish(COMMAND_BUDGET).code(0);
+            drop(second);
+            std::panic::resume_unwind(error);
+        }
+    };
+    p.alive();
+    q.alive();
+    let mut labelled_pr = b.command("/bin/bash");
+    labelled_pr
+        .arg(b.root.join("xtask/gate.sh"))
+        .args(["--host-label", "fast", "--lease-wait", "0", "pr"])
+        .env("XTASK_GATE_LEASE_DIR", &lease);
+    let exclusive = b.run(&mut labelled_pr);
+    exclusive.code(75);
+    exclusive.contains("bootstrap cooperative lease busy");
+    let refused = a.run(&mut wrapped_fast(&a, &lease, "0"));
+    refused.code(1);
+    refused.contains("warm target in use");
+    assert!(a.root.join("target/.gate-state/warm.use").is_file());
+    p.alive();
+    q.alive();
+    p.release();
+    q.release();
+    first.finish(COMMAND_BUDGET).code(0);
+    second.finish(COMMAND_BUDGET).code(0);
+    for s in [&a, &b] {
+        let record = s.result();
+        // A refused same-target request can complete before the first request;
+        // the first's completed result is now the latest.
+        assert_eq!(field(&record, "lease"), "shared");
+        assert_eq!(field(&record, "target-finished"), "yes");
+        assert!(!s.root.join("target/.gate-state/warm.use").exists());
+    }
+}
+#[test]
+fn real_fast_newcomer_queues_behind_observed_exclusive_waiter_tv62() {
+    use std::fs::TryLockError;
+    let a = fast_sandbox();
+    let b = fast_sandbox();
+    let ex = Sandbox::new();
+    let ba = Boundary::new(&a);
+    let bb = Boundary::new(&b);
+    let be = Boundary::new(&ex);
+    fast_parked_forwarder(&a, &ba);
+    fast_parked_forwarder(&b, &bb);
+    let lease = a.temporary.join("lease");
+    let mut first = a.spawn(&mut wrapped_fast(&a, &lease, "0"));
+    let mut p = ba.accept(&mut first);
+    let turnstile = fs::File::open(lease.join("r-orch-gate.turnstile")).unwrap();
+    turnstile.try_lock().unwrap();
+    drop(turnstile); // Free before exclusive request.
+    let mut cmd = ex.gate(&[
+        "lease",
+        "exec",
+        "--purpose",
+        "queued-exclusive",
+        "--lease-wait",
+        "1",
+        "--",
+        "/usr/bin/python3",
+    ]);
+    cmd.arg(ex.temporary.join("payload.py"))
+        .arg("holder")
+        .arg(&be.path)
+        .env("XTASK_GATE_LEASE_DIR", &lease);
+    let mut exclusive = ex.spawn(&mut cmd);
+    let turnstile = fs::File::open(lease.join("r-orch-gate.turnstile")).unwrap();
+    let deadline = Instant::now() + HANDSHAKE_BUDGET;
+    loop {
+        assert!(
+            exclusive.child.try_wait().unwrap().is_none(),
+            "{}",
+            exclusive.diagnostic()
+        );
+        match turnstile.try_lock() {
+            Err(TryLockError::WouldBlock) => break,
+            Ok(()) => {
+                turnstile.unlock().unwrap();
+            }
+            Err(e) => panic!("turnstile observation: {e:?}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "exclusive waiter did not acquire turnstile"
+        );
+        std::thread::park_timeout(POLL_INTERVAL);
+    }
+    // A real fast request now reaches and refuses at the held turnstile.
+    let probe = b.run(
+        b.gate(&["fast", "--lease-wait", "0"])
+            .env("XTASK_GATE_LEASE_DIR", &lease),
+    );
+    probe.code(75);
+    probe.contains("stage=admission-turnstile");
+    let mut newcomer = b.spawn(&mut wrapped_fast(&b, &lease, "1"));
+    // This same request acknowledges an actual EWOULDBLOCK before the first
+    // shared holder is released; mere process liveness would not prove arrival.
+    wait_bootstrap_stage(&mut newcomer, "admission-turnstile");
+    p.alive();
+    assert!(exclusive.child.try_wait().unwrap().is_none());
+    assert!(newcomer.child.try_wait().unwrap().is_none());
+    p.release();
+    first.finish(COMMAND_BUDGET).code(0);
+    let mut e = be.accept(&mut exclusive); // Actual exclusive payload owns the lease.
+    e.alive();
+    wait_bootstrap_stage(&mut newcomer, "lease-shared");
+    assert!(newcomer.child.try_wait().unwrap().is_none());
+    let file = fs::File::open(lease.join("r-orch-gate.lease")).unwrap();
+    assert!(matches!(
+        file.try_lock_shared(),
+        Err(TryLockError::WouldBlock)
+    ));
+    assert!(
+        matches!(bb.listener.accept(),Err(e) if e.kind()==std::io::ErrorKind::WouldBlock),
+        "new shared payload overtook exclusive holder"
+    );
+    e.release();
+    exclusive.finish(COMMAND_BUDGET).code(0);
+    let mut q = bb.accept(&mut newcomer);
+    q.alive();
+    q.release();
+    newcomer.finish(COMMAND_BUDGET).code(0);
+}
+
+fn wait_bootstrap_stage(child: &mut OwnedChild, stage: &str) {
+    let deadline = Instant::now() + HANDSHAKE_BUDGET;
+    let message = format!("bootstrap: waiting stage={stage}");
+    loop {
+        assert!(
+            child.child.try_wait().unwrap().is_none(),
+            "{}",
+            child.diagnostic()
+        );
+        if child.diagnostic().contains(&message) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing real wait handshake {message}: {}",
+            child.diagnostic()
+        );
+        std::thread::park_timeout(POLL_INTERVAL);
+    }
 }

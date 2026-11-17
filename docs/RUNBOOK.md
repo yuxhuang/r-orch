@@ -1557,7 +1557,8 @@ on an earlier one only after the earlier call's answer arrives
 
 `./xtask/gate.sh full` is the goal/release gate; `pr` becomes the merge condition
 only after the owner applies the reviewed policy transition. Existing check/test
-requirements still apply. `fast` and later CI/parallel-runner stages are separate.
+requirements still apply. PR2 adds the local `fast` path; later CI/parallel-runner
+stages remain separate.
 Use `qualifying: yes` in verified exact-head evidence; an exit0 or a consistent
 inventory alone is insufficient. A direct unstamped executable cannot qualify.
 The wrapper privately publishes a single-link executable after Cargo success and
@@ -1584,5 +1585,54 @@ partial bundle. Unknown secrets are outside known-value redaction.
 Option3 direct-writer/legacy-use overlap is accepted, not repaired. FS1 indirect
 writers and interim D45 checked-path/by-name races remain separate. RC18 was
 replaced as a precondition; finite propagation and last-close observations do not
-prove universal writer cessation. PR1 remains incomplete pending the remaining
-diagnostic/lease repairs, exact-head reviews and native acceptance.
+prove universal writer cessation. PR2 still requires independent frozen reviews,
+native acceptance and measured timing evidence before its PR. No timing target or
+nextest qualification is implied by scoped implementation checks.
+
+### Local fast checks
+
+```
+./xtask/gate.sh fast --base origin/main
+./xtask/gate.sh fast --plan
+cargo xtask gate select --base origin/main --format json
+```
+
+The default base is `origin/main`; the selector compares its merge base, staged,
+working-tree and untracked paths, and Cargo workspace reverse dependencies.
+Unknown/error/global paths and an empty change set select everything. Pure docs
+select no suite tests; `docs/ARCHITECTURE.md` is coupled to xtask. A selection that
+contains orch-cli also adds orch-infra without adding its other dependents.
+Every selected package and quoted classification/reason appears in the result.
+
+Fast runs fmt, workspace all-target clippy and crate graph first, without
+advisories. Package/all paths then explicitly build current selected targets,
+compile the executable map, and run the selected suite from outside the workspace
+under sentinel HOME and agent shims. The build completes before any selected
+path-executing test starts, even on a warm target. When xtask is unselected, only
+its exact environment witness test runs first, with a separate map/inventory.
+The selected suite must independently execute nonzero tests. The HOME, shim and
+real-home checks judge that run. Documentation-only runs fmt/clippy/crate graph
+and a workspace all-target build, with no witness or suite tests. No new link
+checker or documentation tool is installed.
+
+The wrapper and fast runner request the shared machine lease. Fast runs in
+different worktrees can coexist; one warm target still has an exclusive use
+marker. A queued exclusive requester holds the turnstile, so new fast requests
+wait behind it. The separate bootstrap marker still excludes simultaneous judge
+builds in the same worktree. `--lease-wait` is in minutes (default 30; 0 tries
+once). An external live exclusive `gate lease exec` holder can lend its authority;
+that deliberately prevents unrelated concurrent gates until it finishes.
+
+Fast always says `qualifying: no: local iteration; never merge evidence`.
+`--evidence` can export diagnostics but returns 3 on otherwise passing fast
+checks; the verifier rejects that bundle. `--part` is pr/full-only and `--warm`
+is full-only. Warm ownership/content checks, retained failure logs, signal/reap
+rules and the accepted option3/FS1/D45/manual-removal risks above still apply.
+No rule/CI transition or native performance claim follows from fast passing.
+
+Fast has a known source-scanner gap: the orch-engine guard
+`token_eco_preparation::dispatch_is_the_only_production_caller_of_adapter_execute_and_awaits_preparation_first`
+reads every crate's source without a Cargo edge. The orch-infra guards
+`spawn_gate` and `synthetic_spawn_domain_guard` also scan crates; D39 covers them
+incidentally while every crate reaches orch-cli. This adds no coupling policy.
+Fast is an iteration signal; the full PR check remains the merge check.

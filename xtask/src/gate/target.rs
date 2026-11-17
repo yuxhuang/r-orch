@@ -26,11 +26,21 @@ pub(super) fn native_admission(
     cold: bool,
     lease: &super::lease::Lease,
 ) -> anyhow::Result<NativeTarget> {
-    lease.validate_exclusive()?;
+    validate_target_lease(lease, cold)?;
     let owner = nix::unistd::geteuid().as_raw();
     let files = StateFiles::inspect(root, owner, if cold { Kind::Cold } else { Kind::Warm })?;
     native::Boundary::state(&files)?;
     Ok(NativeTarget { files })
+}
+
+fn validate_target_lease(lease: &super::lease::Lease, cold: bool) -> anyhow::Result<()> {
+    // Shared fast holders mutate only their own warm target while holding its
+    // exclusive marker. Full cold uses still require exclusive host admission.
+    if cold {
+        lease.validate_exclusive()
+    } else {
+        lease.validate()
+    }
 }
 
 pub(super) struct NativeTarget {
@@ -112,6 +122,15 @@ impl NativeTarget {
 }
 
 impl Captured {
+    pub(super) fn require_same(&self, other: &Self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.sources.identities() == other.sources.identities()
+                && self.toolchain == other.toolchain
+                && self.boot == other.boot,
+            "source changed during fast selection; refusing stale selection"
+        );
+        Ok(())
+    }
     fn current<'a>(&'a self, root: &'a Path) -> Current<'a> {
         Current {
             root: root.as_os_str().as_bytes(),
@@ -135,6 +154,10 @@ pub(super) struct NativeOutcome<T> {
 }
 
 impl NativeUse<'_> {
+    pub(super) fn require_selection(&self, selection: &Captured) -> anyhow::Result<()> {
+        selection.require_same(&self.before)
+    }
+
     pub(super) fn target(&self) -> PathBuf {
         self.marker.files.build_path()
     }
@@ -160,6 +183,7 @@ impl NativeUse<'_> {
         keep: bool,
         work: impl FnOnce(&mut super::steps::Runner<'_, '_>, &Path) -> anyhow::Result<T>,
     ) -> anyhow::Result<NativeOutcome<T>> {
+        validate_target_lease(lease, self.marker.files.kind == Kind::Cold)?;
         let target = self.target();
         native::Boundary::inspect(self.marker.files)?;
         let mut runner = super::steps::Runner::new(lease, &self.marker)?;
@@ -180,7 +204,7 @@ impl NativeUse<'_> {
             ordinary_finish?;
             if interrupted {
                 self.marker.finishing_interrupted.set(true);
-                lease.validate_exclusive()?;
+                validate_target_lease(lease, self.marker.files.kind == Kind::Cold)?;
                 self.marker.check_identity()?;
             }
             let mut finish_runner = if interrupted {
@@ -1184,8 +1208,7 @@ impl Marker<'_> {
 
     pub(super) fn check_identity(&self) -> Result<()> {
         if let Some(lease) = self.lease {
-            lease
-                .validate_exclusive()
+            validate_target_lease(lease, self.files.kind == Kind::Cold)
                 .map_err(|_| Fault::Unavailable("configured lease lost; keep marker and target"))?;
         }
         if self.signal_wait(std::time::Duration::ZERO).is_some()
@@ -1552,7 +1575,7 @@ impl StateFiles {
         let lease = lease.ok_or_else(|| {
             anyhow::anyhow!("REFUSED: configured lease required; --no-lease cannot admit a target")
         })?;
-        lease.validate_exclusive()?;
+        validate_target_lease(lease, self.kind == Kind::Cold)?;
         let mut marker = self.admit(true)?;
         marker.lease = Some(lease);
         marker.check_identity()?;
@@ -1581,14 +1604,17 @@ impl std::error::Error for UseFailure {
     }
 }
 
-struct Captured {
+pub(super) struct Captured {
     sources: Sources,
     toolchain: String,
     boot: BootId,
 }
 
 impl Captured {
-    fn read(runner: &mut super::steps::Runner<'_, '_>, root: &Path) -> anyhow::Result<Self> {
+    pub(super) fn read(
+        runner: &mut super::steps::Runner<'_, '_>,
+        root: &Path,
+    ) -> anyhow::Result<Self> {
         use std::ffi::OsStr;
         use std::process::Command;
         fn inventory(
@@ -2995,11 +3021,36 @@ mod tests {
             .unwrap(),
         );
         fs::remove_dir_all(f.files.root.join("target")).unwrap();
-        let error = native_admission(&f.files.root, false, &lease)
+        let error = native_admission(&f.files.root, true, &lease).err().unwrap();
+        assert!(error.to_string().contains("exclusive"), "{error}");
+        assert!(!f.files.root.join("target").exists());
+        f.canary_unchanged();
+    }
+
+    #[test]
+    fn cold_run_refuses_shared_lease_before_work_or_publication() {
+        let f = Fixture::new();
+        f2_repo(&f);
+        let exclusive = f2_lease(&f);
+        let target = native_admission(&f.files.root, true, &exclusive).unwrap();
+        let use_ = target.begin(&exclusive).unwrap();
+        let directory = f.base.join("other-lease");
+        fs::create_dir(&directory).unwrap();
+        let shared = super::super::lease::Lease::Owned(
+            super::super::lease::Owned::acquire(
+                &directory,
+                f.files.owner,
+                super::super::lease::Mode::Shared,
+                std::time::Duration::ZERO,
+            )
+            .unwrap(),
+        );
+        let error = use_
+            .run::<()>(&shared, false, |_, _| panic!("cold work must not start"))
             .err()
             .unwrap();
         assert!(error.to_string().contains("exclusive"), "{error}");
-        assert!(!f.files.root.join("target").exists());
+        assert!(!f.files.path(Leaf::Record).exists());
         f.canary_unchanged();
     }
 
