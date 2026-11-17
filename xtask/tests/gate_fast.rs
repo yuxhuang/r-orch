@@ -36,10 +36,10 @@ fn miniature() -> Sandbox {
     );
     s.write(
         "xtask/tests/gate_witness.rs",
-        include_str!("gate_witness.rs")
+        format!("{}\n#[test] fn witness_target_extra_a() {{}}\n#[test] fn witness_target_extra_b() {{}}\n", include_str!("gate_witness.rs")
             .split("// FIXTURE SUPPORT:")
             .next()
-            .unwrap(),
+            .unwrap()),
     );
     s.write("crates/orch-infra/tests/path_exec.rs", r#"#[test]
 fn current_cli() {
@@ -135,6 +135,9 @@ fn selected_fast_builds_current_cli_on_empty_and_changed_warm_target_d40() {
         let run = Path::new(field(&record, "run-dir"));
         let inventory = fs::read_to_string(run.join("inventory.tsv")).unwrap();
         assert!(inventory.contains("current_cli\tok"), "{inventory}");
+        for name in ["gate_environment_witness", "witness_target_extra_a", "witness_target_extra_b"] {
+            assert_eq!(inventory.lines().filter(|l| l.ends_with(&format!("\t{name}\tok"))).count(), 1, "{inventory}");
+        }
         assert!(!inventory.contains("must_not_run"));
         assert!(!record.contains("step-advisories-status"));
         assert_eq!(row(&record, "home-hygiene")[1], "pass");
@@ -164,6 +167,8 @@ fn docs_only_fast_builds_and_lints_without_running_tests() {
         assert!(!record.contains(&format!("step-{name}-status")), "{record}");
     }
     let run = Path::new(field(&record, "run-dir"));
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(fs::metadata(run.join("steps")).unwrap().permissions().mode() & 0o777, 0o700);
     assert!(fs::read(run.join("inventory.tsv")).unwrap().is_empty());
     assert!(field(&record, "qualifying").contains("never merge evidence"));
 }
@@ -280,6 +285,10 @@ fn fast_export_remains_nonqualifying_and_verifier_rejects_it() {
     ]));
     out.code(3);
     out.contains("never merge evidence");
+    use std::os::unix::fs::PermissionsExt;
+    for path in [&destination, &destination.join("steps")] {
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
+    }
     s.run(&mut s.gate(&[
         "evidence",
         "verify",
@@ -288,6 +297,51 @@ fn fast_export_remains_nonqualifying_and_verifier_rejects_it() {
         &base,
     ]))
     .code(1);
+}
+
+// A real metadata result is saved first; only then does the ordinary editor save
+// happen. Git's changed-path queries are already complete at this boundary.
+fn metadata_boundary_save(case: &str) {
+    let s = miniature();
+    let base = s.git(&["rev-parse", "HEAD"]);
+    if case == "docs" {
+        s.write("README.md", "documentation only\n");
+    } else {
+        s.write("crates/orch-cli/src/main.rs", "fn main() {\n    println!(\"first\"); // selected\n}\n");
+    }
+    let real = s.cargo_forwarder();
+    let changed = s.root.join("crates/unselected/src/lib.rs");
+    let saved = s.temporary.join("metadata-save");
+    s.script(&s.temporary.join("bin/cargo"), &format!(r#"#!/usr/bin/python3 -B
+import os, pathlib, subprocess, sys
+if sys.argv[1:2] == ['metadata']:
+    result = subprocess.run([{real:?}] + sys.argv[1:], stdout=subprocess.PIPE)
+    if result.returncode == 0:
+        pathlib.Path({changed:?}).write_text('#[test]\nfn introduced_failure() {{\n    panic!("metadata save must not pass narrow selection");\n}}\n')
+        pathlib.Path({saved:?}).write_text('saved\n')
+    sys.stdout.buffer.write(result.stdout)
+    sys.exit(result.returncode)
+os.execv({real:?}, [{real:?}] + sys.argv[1:])
+"#, real=real.to_str().unwrap(), changed=changed.to_str().unwrap(), saved=saved.to_str().unwrap()));
+    let out = fast(&s, &base);
+    assert!(saved.is_file(), "metadata save boundary was not reached");
+    out.code(1);
+    out.contains("source changed during fast selection");
+    let record = s.result();
+    assert!(!record.contains("PASSED"), "{record}");
+    assert!(!record.contains("publication: record published"), "{record}");
+    assert!(!record.contains("step-build-status"), "{record}");
+    assert!(fs::read_to_string(changed).unwrap().contains("introduced_failure"));
+}
+
+#[test]
+fn metadata_boundary_save_cannot_pass_docs_only() {
+    metadata_boundary_save("docs");
+}
+
+#[test]
+fn metadata_boundary_save_cannot_omit_another_package() {
+    metadata_boundary_save("package");
 }
 #[test]
 fn fast_linked_warm_target_refuses_without_touching_outside_canary() {

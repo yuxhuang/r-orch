@@ -904,6 +904,24 @@ fn capture_preserves_non_utf8_output_bytes_and_prints_lossy_diagnostics() {
 }
 
 #[test]
+fn fixture_captures_are_private_at_creation() {
+    use std::os::unix::fs::MetadataExt;
+    let sandbox = fixture::Sandbox::filesystem_only();
+    let child = sandbox.spawn(&mut sandbox.command("/usr/bin/true"));
+    let directory = sandbox.temporary.join("capture");
+    assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+    let files: Vec<_> = std::fs::read_dir(directory).unwrap().collect();
+    assert_eq!(files.len(), 2);
+    for file in files {
+        let m = file.unwrap().metadata().unwrap();
+        assert!(m.is_file());
+        assert_eq!(m.nlink(), 1);
+        assert_eq!(m.mode() & 0o777, 0o600);
+    }
+    child.finish(fixture::COMMAND_BUDGET).code(0);
+}
+
+#[test]
 fn cargo_boundary_recognizes_subcommands_after_global_options_but_not_option_values() {
     let sandbox = fixture::Sandbox::new();
     let cases = [

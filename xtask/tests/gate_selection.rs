@@ -51,6 +51,24 @@ struct Fixture {
     next: AtomicU64,
 }
 
+#[test]
+fn selector_captures_are_private_at_creation() {
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new();
+    let out = f.run(f.command("/usr/bin/true"), Duration::from_secs(5));
+    assert!(out.status.success());
+    let logs = f.temporary.join("logs");
+    assert_eq!(fs::metadata(&logs).unwrap().mode() & 0o777, 0o700);
+    let files: Vec<_> = fs::read_dir(logs).unwrap().collect();
+    assert_eq!(files.len(), 2);
+    for file in files {
+        let m = file.unwrap().metadata().unwrap();
+        assert!(m.is_file());
+        assert_eq!(m.nlink(), 1);
+        assert_eq!(m.mode() & 0o777, 0o600);
+    }
+}
+
 // Subprocess deadlines are failure bounds, not synchronization or timing claims.
 // These owned, dependency-free fixtures do not daemonize or detach. Every child
 // gets a separate group; timeout/unwind kills that group before reaping its

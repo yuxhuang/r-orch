@@ -1,5 +1,37 @@
 # Tiered verification checks — plan
 
+## PR2 reviewed corrections — 2026-11-16 (bounded implementation plan)
+
+Start at reviewed `45577c9d0466eb94e0219eb075d8c7fe7f90a327`, preserving that
+freeze. This amendment precedes code. Native acceptance and push remain held.
+
+1. S-PR2-1: reuse bounded native content capture before and after selection,
+   require equality, then require the admitted use baseline to match before any
+   suite command. Deterministic metadata-return saves in docs-only and omitted
+   package fixtures must refuse; reverted identity checks must fail the controls.
+2. SRE F-1: run the existing witness target unfiltered; require all rows ok and
+   exactly one named environment witness. Keep selected-suite nonzero independent.
+   Plant extra witness-target tests; restored-filter mutant must fail. Retain an
+   actual real-target map/run/product-inventory check without parser changes.
+3. SRE F-2: avoid identical executable replacement in the bootstrap shim and
+   otherwise publish a complete private temporary executable by rename. Preserve
+   TV61/TV62/RS1 refusal and ordering assertions; use the existing bounded Linux
+   container discriminator (never native acceptance).
+4. P-L1/P-L2: create report/export directories and named fixture capture parents
+   0700, capture streams 0600, explicitly at creation under workload umask022.
+   Add mode assertions and reverted/default-mode controls; no global077 or
+   workload/reap/deadline changes, and no retrospective privacy closure.
+5. Code F-1: disclose orch-engine and infra source scanners as hidden coupling
+   limitations; no new selection policy. Code F-2: correct build/witness matrix.
+   Code F-3/SRE F-4: pin Rust pr/exclusive refusal and direct cold shared-lease
+   boundary negatives without weakening existing checks. SRE F-3 bootstrap state
+   mutation remains a carried minor, not permission to redesign lifetime.
+6. Retain distinct intentional old/mutant failures and exact source/body ledgers.
+   Freeze committed source, then fmt, clippy, crate-graph, explicit xtask build,
+   actual pre-map, complete scoped xtask package and unchanged product inventory.
+   No full workspace suite/timing. Stop unexpected failures; diagnose and report
+   before any changed-input continuation. Original reviewers decide closure.
+
 ## PR2 execution — 2026-11-16 (implementation, acceptance pending)
 
 Pinned base `1603c67a3160901ce857f5877a03d227b980e6d9`. Consume only selector
