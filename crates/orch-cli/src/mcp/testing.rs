@@ -25,7 +25,16 @@ pub(crate) struct Fixture {
 
 impl Fixture {
     pub(crate) async fn start() -> Fixture {
-        let daemon = DaemonHarness::builder()
+        Self::start_with(DaemonHarness::builder()).await
+    }
+
+    /// Snapshot projections need no competing peer writer after remote seeding.
+    pub(crate) async fn without_peer_runtime() -> Fixture {
+        Self::start_with(DaemonHarness::builder().without_peer_runtime()).await
+    }
+
+    async fn start_with(builder: orch_daemon::testing::HarnessBuilder) -> Fixture {
+        let daemon = builder
             .maintenance_timer(false)
             .start()
             .await

@@ -77,6 +77,7 @@ pub struct HarnessBuilder {
     on_socket: bool,
     listen: Option<String>,
     peer_name: Option<String>,
+    without_peer_runtime: bool,
 }
 
 /// The duplex buffer per direction: comfortably above one 1 MiB frame so a
@@ -95,6 +96,14 @@ impl HarnessBuilder {
     /// [`DaemonHarness::step_expiry`] or `maintenance.expire_context`.
     pub fn maintenance_timer(mut self, enabled: bool) -> Self {
         self.maintenance_timer = Some(enabled);
+        self
+    }
+
+    /// Drain peer writers before returning a snapshot-only fixture. Use on a
+    /// fresh project before seeding remotes; normal startup recovery still runs.
+    /// Incompatible with an explicit peer listener. Live peers remain the default.
+    pub fn without_peer_runtime(mut self) -> Self {
+        self.without_peer_runtime = true;
         self
     }
 
@@ -206,6 +215,11 @@ impl HarnessBuilder {
         root: PathBuf,
         project: Option<tempfile::TempDir>,
     ) -> Result<DaemonHarness, DaemonError> {
+        if self.without_peer_runtime && self.listen.is_some() {
+            return Err(DaemonError::InvalidArguments(
+                "a harness without the peer runtime cannot listen".into(),
+            ));
+        }
         if self.isolated_fake_spawns && self.processes.is_none() {
             return Err(DaemonError::InvalidArguments(
                 "isolated fake spawns require a supplied process manager".into(),
@@ -279,6 +293,9 @@ impl HarnessBuilder {
         running.test_directories.push(Arc::clone(&scratch));
         if let Some(project) = &project {
             running.test_directories.push(Arc::clone(project));
+        }
+        if self.without_peer_runtime {
+            running.quiesce_peer_for_testing().await?;
         }
         Ok(DaemonHarness {
             project_root: root,
@@ -571,6 +588,54 @@ mod tests {
         line.clear();
         stream.read_line(&mut line).await.unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    #[tokio::test]
+    async fn peer_runtime_is_owned_by_default_and_opt_out_drains_before_return() {
+        for without_peer in [false, true] {
+            let builder = DaemonHarness::builder().maintenance_timer(false);
+            let builder = if without_peer {
+                builder.without_peer_runtime()
+            } else {
+                builder
+            };
+            let harness = builder.start().await.unwrap();
+            {
+                let slot = harness.lifecycle.as_ref().unwrap().running.lock().unwrap();
+                assert_eq!(slot.as_ref().unwrap().has_peer_runtime(), !without_peer);
+            }
+            assert_eq!(roundtrip(&harness).await["id"], 1);
+            let root = harness.project_root().to_path_buf();
+            let held = harness.project.clone();
+            harness.shutdown().await.unwrap();
+            assert!(!root.join(".orchestry/orchestry.lock").exists());
+            let successor = DaemonHarness::builder().start_in(&root).await.unwrap();
+            successor.shutdown().await.unwrap();
+            drop(held);
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_runtime_opt_out_rejects_an_explicit_listener_in_either_order() {
+        for builder in [
+            DaemonHarness::builder()
+                .without_peer_runtime()
+                .listen("127.0.0.1:0"),
+            DaemonHarness::builder()
+                .listen("127.0.0.1:0")
+                .without_peer_runtime(),
+        ] {
+            let error = builder
+                .start()
+                .await
+                .err()
+                .expect("contradictory peer options");
+            assert!(
+                matches!(error, DaemonError::InvalidArguments(ref message)
+                if message == "a harness without the peer runtime cannot listen"),
+                "{error:?}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
