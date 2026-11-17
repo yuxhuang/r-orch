@@ -1,5 +1,36 @@
 # Tiered verification checks — plan
 
+## PR2 correction continuation — 2026-11-16 (before implementation)
+
+Continue the retained reproduction commit; no history rewrite. Accept original
+S-PR2-1, F-1/F-2 and P-L1/P-L2; no prior receipt is reclassified. Bind the
+existing bounded content snapshot before selection, after metadata and against
+the admitted use before any workload. Refuse changes loudly without publication.
+Use an explicit selection-metadata trigger/call trace and unchanged judge input;
+the omitted-package discriminator must fail independently of witness handling.
+Run the witness target unfiltered; require all rows ok and the named witness once,
+separately from nonzero selected tests. Retain an extra-test/filter mutant.
+Publish fixture executables by atomic rename, avoiding replacement of identical
+bytes; TV61/TV62/RS1 assertions and bounds stay unchanged.
+
+Accept draft observations: create private captures with creation APIs under022,
+cover run/export/steps/record/inventory plus named helpers, and retain default-mode
+mutants. Reap the mode-test child before assertions. Accept SRE O-1: surface failed
+owned cleanup in the result without changing signal authority or lifecycle policy.
+Document the engine/infra source-scanner gap (no new coupling), correct the step
+matrix and add direct pr exclusivity/cold shared-lease negatives. SRE bootstrap
+mutation F-3 stays a carried minor. FS1/D45/option3 stay accepted, not fixed.
+
+Verification is bounded: exact17 first-PATH blockers verified by set and resolution
+before each workload; private resource-only pin1.99.1, host turnstile/lease close-only,
+short distinct socket preflight, explicit0700/0600 and normal child022. Predeclare
+fixed and reverted mutants separately. Real unfiltered witness/product inventory,
+focused controls, build/fmt/clippy/crate-graph and complete scoped xtask map/run/
+inventory only; bounded existing Linux container discriminator is not native
+acceptance. No full selected workspace fast/native suite or timing. Unexpected
+failure stops; preserve actual source maps, merged bytes and statuses. Independent
+reviews and native acceptance remain held at the next immutable freeze.
+
 ## PR2 reviewed corrections — 2026-11-16 (bounded implementation plan)
 
 Start at reviewed `45577c9d0466eb94e0219eb075d8c7fe7f90a327`, preserving that
@@ -923,7 +954,7 @@ Findings that shape the design. Each was read in the code at the base commit unl
 - F13. `std::fs::File` locking is available on the pinned toolchain (checked with a throwaway program on macOS). Unverified: the same on Linux, expected from the standard library's documentation.
 - F14. Some tests read opt-in variables from the environment. `crates/orch-cli/tests/token_eco_support/mod.rs` skips the old-reader half when `ORCH_T1_OLD_BIN` is unset and fails instead when `ORCH_T1_REQUIRE_OLD` is set; `fixtures/token-eco/matrix/run-matrix.sh` exports both. Removing every `ORCH_*` variable would remove the guard together with the opt-in (D26).
 - F15. `xtask` depends on `anyhow`, `clap` and `serde_json` only: no workspace crate and no hash crate. Content identities are therefore git blob ids from `git hash-object`, which the gate needs git for anyway.
-- F16. `crates/orch-infra/tests/concurrent_index.rs` starts the `orch` binary from `$CARGO_TARGET_DIR/debug/`. `orch-infra` does not depend on `orch-cli`, so the dependency graph alone does not select that test for an `orch-cli` change (D31). No other test outside `orch-cli` does this.
+- F16. `crates/orch-infra/tests/concurrent_index.rs` starts the `orch` binary from `$CARGO_TARGET_DIR/debug/`. `orch-infra` does not depend on `orch-cli`, so the dependency graph alone does not select that test for an `orch-cli` change (D31). This binary-path coupling does not inventory source-scanning guards; see the known gap below.
 
 ## Design
 
@@ -955,7 +986,8 @@ Steps, in order. `full` and `pr` keep today's order and names so that results st
 
 | Step | Group | `full` | `pr` | `fast`, packages or all | `fast`, documentation only |
 |---|---|---|---|---|---|
-| `build` | suite | yes | yes | — | yes |
+| `build` | suite | yes | yes | selected all-targets, before map/test | yes |
+| `environment-witness` | suite | in test | in test | unfiltered xtask witness target, only when xtask unselected; before build | — |
 | `test` | suite | whole workspace | whole workspace | selected packages | — |
 | `doc-test` (from PR 4, if nextest is adopted) | suite | yes | yes | selected packages | — |
 | `clippy` | static | yes | yes | yes | yes |
@@ -1887,3 +1919,10 @@ For the lead; none blocks the design challenge.
 21. Eighth amendment: the fixed text and exit status of the refusal for a marker whose lock is not granted, for the cold target as well, and of a kept target, are F's interface obligation (P7), reviewed before C asserts them. Ninth amendment: the content floor of the marker's refusal is decided (D46); the strings and the exit status are still F's.
 22. Ninth amendment: the frozen single-writer test of C starts its runs with `--no-lease`, which D42 as proposed refuses (edit C10). The protection it checks stands. How its runs hold a configured lease is for the owner of C and the reviewers, before C′.
 23. Ninth amendment: `cargo clean` under a command that a killed gate left running is a disclosed residual (RC14, D43). Keeping the marker outside `target/` would close it for `cargo clean` and was not adopted (ADR 0015, alternative A40). It is the stronger remedy if the lead or the owner later want that case covered.
+
+Fast has a known source-scanner gap: the orch-engine guard
+`token_eco_preparation::dispatch_is_the_only_production_caller_of_adapter_execute_and_awaits_preparation_first`
+reads every crate's source without a Cargo edge. The orch-infra guards
+`spawn_gate` and `synthetic_spawn_domain_guard` also scan crates; D39 covers them
+incidentally while every crate reaches orch-cli. This adds no coupling policy.
+Fast is an iteration signal; the full PR check remains the merge check.

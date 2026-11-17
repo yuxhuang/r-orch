@@ -131,6 +131,11 @@ def cargo_subcommand(args):
         "ORCH_REMOTE_ENV_PASSTHROUGH",
     ];
 
+    fn private_capture(path: &Path) -> fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).unwrap()
+    }
+
     pub struct Sandbox {
         pub temporary: PathBuf,
         pub root: PathBuf,
@@ -182,7 +187,7 @@ def cargo_subcommand(args):
                 "lease",
                 "capture",
             ] {
-                fs::create_dir(result.temporary.join(name)).unwrap();
+                fs::DirBuilder::new().mode(0o700).create(result.temporary.join(name)).unwrap();
             }
             fs::write(result.temporary.join("home/global.yml"), "{}\n").unwrap();
             fs::write(result.temporary.join("fallback-settings.toml"), "").unwrap();
@@ -289,8 +294,8 @@ def cargo_subcommand(args):
             let stderr = self.temporary.join(format!("capture/{serial}.err"));
             command
                 .stdin(input.map(Stdio::from).unwrap_or_else(Stdio::null))
-                .stdout(fs::File::create(&stdout).unwrap())
-                .stderr(fs::File::create(&stderr).unwrap())
+                .stdout(private_capture(&stdout))
+                .stderr(private_capture(&stderr))
                 .process_group(0);
             if closed {
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -738,7 +743,10 @@ def cargo_subcommand(args):
                 b"abnormal direct-child completion; descendant authority unresolved\n",
             );
             if matches!(self.child.try_wait(), Ok(None)) {
-                let _ = self.signal_owned("KILL", true);
+                let group_signalled = self.signal_owned("KILL", true);
+                if !group_signalled {
+                    fs::write(root.join("cleanup-failed"), b"owned group signal failed; scratch retained\n").expect("retain cleanup failure");
+                }
                 let _ = self.child.kill();
                 let deadline = Instant::now() + Duration::from_secs(2);
                 loop {
@@ -755,6 +763,9 @@ def cargo_subcommand(args):
                         }
                     }
                 }
+            }
+            if root.join("cleanup-failed").exists() && !std::thread::panicking() {
+                panic!("fixture cleanup failed; scratch retained at {}", root.display());
             }
             // A reaped leader supplies no authority over survivors. No numeric
             // PID/PGID signal follows that branch; independent seam still due.
@@ -908,6 +919,7 @@ fn fixture_captures_are_private_at_creation() {
     use std::os::unix::fs::MetadataExt;
     let sandbox = fixture::Sandbox::filesystem_only();
     let child = sandbox.spawn(&mut sandbox.command("/usr/bin/true"));
+    child.finish(fixture::COMMAND_BUDGET).code(0);
     let directory = sandbox.temporary.join("capture");
     assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
     let files: Vec<_> = std::fs::read_dir(directory).unwrap().collect();
@@ -918,7 +930,6 @@ fn fixture_captures_are_private_at_creation() {
         assert_eq!(m.nlink(), 1);
         assert_eq!(m.mode() & 0o777, 0o600);
     }
-    child.finish(fixture::COMMAND_BUDGET).code(0);
 }
 
 #[test]

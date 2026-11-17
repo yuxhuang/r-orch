@@ -16,7 +16,7 @@ dependencies and PR3–6 policy remain unchanged. Fast never supplies merge evid
   current selected targets before mapping/running tests (D40). Preserve sentinel,
   shims, witness, failed-suite status, independently nonzero selected inventory,
   warm-source checks and retained logs. When xtask is outside the selection, run
-  only its exact environment witness with its own map/inventory before the
+  its unfiltered witness target with its own map/inventory (all rows ok; named witness once) before the
   selected suite. The witness cannot rescue a zero-test selected suite.
 - Docs-only runs build/lints/crate graph and no suite or witness tests, as approved.
   No advisories in fast, no new docs checker. Fast exports remain nonqualifying.
@@ -930,3 +930,10 @@ Filled in by the PR that completes the work. Requirement completion remains pend
 
 Defects found outside the requirements:
 - `scratch_outlives_late_spawn_and_drop` in `crates/orch-daemon/tests/daemon_harness_hermetic.rs` was reported to fail intermittently with “conflict: diagnostic cancelled”. The root cause is unknown. The original failure is kept and is under investigation; it is not rerun away.
+
+Fast has a known source-scanner gap: the orch-engine guard
+`token_eco_preparation::dispatch_is_the_only_production_caller_of_adapter_execute_and_awaits_preparation_first`
+reads every crate's source without a Cargo edge. The orch-infra guards
+`spawn_gate` and `synthetic_spawn_domain_guard` also scan crates; D39 covers them
+incidentally while every crate reaches orch-cli. This adds no coupling policy.
+Fast is an iteration signal; the full PR check remains the merge check.

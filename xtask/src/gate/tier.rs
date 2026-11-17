@@ -85,6 +85,24 @@ fn dirty(repo: &Path) -> Result<bool> {
     Ok(!git(repo, &["status", "--porcelain", "--untracked-files=all"])?.is_empty())
 }
 
+fn validate_tier_lease(tier: Tier, held: &lease::Lease) -> Result<()> {
+    if tier == Tier::Fast { held.validate() } else { held.validate_exclusive() }
+}
+
+#[cfg(test)]
+mod correction_tests {
+    use super::*;
+    #[test]
+    fn pr_and_full_refuse_shared_authority_fast_accepts_it() {
+        let s = super::super::steps::tests::Scratch::new();
+        let held = lease::Lease::Owned(lease::Owned::acquire(&s.0, nix::unistd::geteuid().as_raw(), lease::Mode::Shared, Duration::ZERO).unwrap());
+        validate_tier_lease(Tier::Fast, &held).unwrap();
+        for tier in [Tier::Pr, Tier::Full] {
+            assert!(validate_tier_lease(tier, &held).unwrap_err().to_string().contains("exclusive"));
+        }
+    }
+}
+
 pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
     if args.plan {
         return plan(repo, args);
@@ -114,6 +132,7 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
     let mut admitted_use = false;
     let mut suite = None;
     let mut selection = None;
+    let mut selection_source = None;
     let mut environment = String::new();
     let mut tools = String::new();
     let mut pinned_toolchain = false;
@@ -145,6 +164,7 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
         };
         held = Some(lease);
         let lease = held.as_ref().unwrap();
+        validate_tier_lease(args.tier, lease)?;
         if args.tier != Tier::Fast
             && let lease::Lease::Owned(owned) = lease
         {
@@ -162,10 +182,16 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
             );
         }
         if args.tier == Tier::Fast {
+            let mut runner = super::steps::Runner::without_marker(lease)?;
+            let before = target::Captured::read(&mut runner, &repo)?;
             selection = Some(crate::gate_selection::select_from_git(
                 &repo,
                 args.base.as_deref().unwrap_or("origin/main"),
             ));
+            let after = target::Captured::read(&mut runner, &repo)?;
+            runner.finished()?;
+            before.require_same(&after)?;
+            selection_source = Some(before);
         }
         let home = PathBuf::from(
             env.get(std::ffi::OsStr::new("HOME"))
@@ -250,6 +276,9 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
             let admitted = target::native_admission(&repo, cold, lease)?;
             admitted_use = true;
             let use_ = admitted.begin(lease)?;
+            if let Some(source) = &selection_source {
+                use_.require_selection(source)?;
+            }
             outcome = match use_.decision() {
                 "reset: source content changed" => {
                     "reset: content changed without a newer modification time"

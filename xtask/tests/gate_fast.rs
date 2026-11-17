@@ -26,6 +26,7 @@ fn miniature() -> Sandbox {
         "crates/unselected/src/lib.rs",
         "#[test] fn must_not_run() { panic!(\"unselected ran\"); }\n",
     );
+    s.write("xtask/gate.sh", include_str!("../gate.sh"));
     s.write(
         "xtask/Cargo.toml",
         "[package]\nname=\"xtask\"\nversion=\"0.0.0\"\nedition=\"2024\"\n",
@@ -56,6 +57,14 @@ fn current_cli() {
     s.run(s.command("cargo").args(["fmt", "--all"])).code(0);
     s.commit();
     s
+}
+fn assert_private_tree(path: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path).unwrap();
+    assert_eq!(meta.mode() & 0o777, if meta.is_dir() { 0o700 } else { 0o600 }, "{}", path.display());
+    if meta.is_dir() {
+        for entry in fs::read_dir(path).unwrap() { assert_private_tree(&entry.unwrap().path()); }
+    } else { assert!(meta.is_file()); assert_eq!(meta.nlink(), 1); }
 }
 fn fast(s: &Sandbox, base: &str) -> witness::fixture::Capture {
     s.run(&mut s.gate(&["fast", "--base", base, "--lease-wait", "0"]))
@@ -169,6 +178,9 @@ fn docs_only_fast_builds_and_lints_without_running_tests() {
     let run = Path::new(field(&record, "run-dir"));
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(fs::metadata(run.join("steps")).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_private_tree(run);
+    assert_private_tree(&s.root.join("target/.gate-state"));
+    assert_private_tree(&s.root.join("target/gate-result.txt"));
     assert!(fs::read(run.join("inventory.tsv")).unwrap().is_empty());
     assert!(field(&record, "qualifying").contains("never merge evidence"));
 }
@@ -289,6 +301,7 @@ fn fast_export_remains_nonqualifying_and_verifier_rejects_it() {
     for path in [&destination, &destination.join("steps")] {
         assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
     }
+    assert_private_tree(&destination);
     s.run(&mut s.gate(&[
         "evidence",
         "verify",
@@ -312,26 +325,55 @@ fn metadata_boundary_save(case: &str) {
     let real = s.cargo_forwarder();
     let changed = s.root.join("crates/unselected/src/lib.rs");
     let saved = s.temporary.join("metadata-save");
-    s.script(&s.temporary.join("bin/cargo"), &format!(r#"#!/usr/bin/python3 -B
+    let trace = s.temporary.join("metadata-calls.jsonl");
+    let armed = s.temporary.join("selection-paths-complete");
+    // Only this exact selector Git command arms the save, after its real result
+    // is returned. Earlier admission/source inventories cannot arm it.
+    s.script(&s.temporary.join("bin/git"), &format!(r#"#!/usr/bin/python3 -B
 import os, pathlib, subprocess, sys
+args=sys.argv[1:]
+result=subprocess.run(['/usr/bin/git']+args, stdout=subprocess.PIPE)
+if args[-4:] == ['ls-files','--others','--exclude-standard','-z'] and '--no-optional-locks' in args and result.returncode == 0:
+    pathlib.Path({armed:?}).write_text('selection paths complete\n')
+sys.stdout.buffer.write(result.stdout)
+sys.exit(result.returncode)
+"#, armed=armed.to_str().unwrap()));
+    s.script(&s.temporary.join("bin/cargo"), &format!(r#"#!/usr/bin/python3 -B
+import json, os, pathlib, subprocess, sys
 if sys.argv[1:2] == ['metadata']:
-    result = subprocess.run([{real:?}] + sys.argv[1:], stdout=subprocess.PIPE)
-    if result.returncode == 0:
+    exact=sys.argv[1:] == ['metadata','--no-deps','--format-version','1','--offline']
+    armed=pathlib.Path({armed:?}).is_file()
+    result=subprocess.run([{real:?}]+sys.argv[1:], stdout=subprocess.PIPE)
+    trigger=exact and armed and result.returncode == 0 and not pathlib.Path({saved:?}).exists()
+    if trigger:
         pathlib.Path({changed:?}).write_text('#[test]\nfn introduced_failure() {{\n    panic!("metadata save must not pass narrow selection");\n}}\n')
-        pathlib.Path({saved:?}).write_text('saved\n')
+        pathlib.Path({saved:?}).write_text('saved at explicit selection metadata boundary\n')
+    with pathlib.Path({trace:?}).open('a') as f: f.write(json.dumps(dict(argv=sys.argv[1:],armed=armed,trigger=trigger,status=result.returncode))+'\n')
     sys.stdout.buffer.write(result.stdout)
     sys.exit(result.returncode)
 os.execv({real:?}, [{real:?}] + sys.argv[1:])
-"#, real=real.to_str().unwrap(), changed=changed.to_str().unwrap(), saved=saved.to_str().unwrap()));
+"#, real=real.to_str().unwrap(), changed=changed.to_str().unwrap(), saved=saved.to_str().unwrap(), trace=trace.to_str().unwrap(), armed=armed.to_str().unwrap()));
     let out = fast(&s, &base);
     assert!(saved.is_file(), "metadata save boundary was not reached");
+    let calls = fs::read_to_string(&trace).unwrap();
+    let calls: Vec<serde_json::Value> = calls.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(calls.iter().filter(|c| c["trigger"] == true).count(), 1);
+    assert!(calls.iter().any(|c| c["trigger"] == true && c["armed"] == true));
+    println!("METADATA_BOUNDARY case={case} calls={calls:?} actual-fast-exit={:?}\n{}", out.status.code(), out.text());
     out.code(1);
     out.contains("source changed during fast selection");
     let record = s.result();
     assert!(!record.contains("PASSED"), "{record}");
     assert!(!record.contains("publication: record published"), "{record}");
     assert!(!record.contains("step-build-status"), "{record}");
-    assert!(fs::read_to_string(changed).unwrap().contains("introduced_failure"));
+    assert!(fs::read_to_string(&changed).unwrap().contains("introduced_failure"));
+    assert_ne!(field(&record, "judge-source-id"), "absent");
+    assert!(!record.contains("source/head changed"), "judge must stay stable: {record}");
+    let independent = s.run(s.command("cargo").args(["test", "-p", "unselected", "--lib"]));
+    independent.code(101);
+    independent.contains("introduced_failure ... FAILED");
+    println!("INDEPENDENT_OMITTED_PACKAGE case={case} actual-exit={:?}\n{}", independent.status.code(), independent.text());
+    s.run(&mut s.gate(&["lease", "exec", "--lease-wait", "0", "--", "/usr/bin/true"])).code(0);
 }
 
 #[test]

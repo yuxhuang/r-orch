@@ -1629,3 +1629,10 @@ checks; the verifier rejects that bundle. `--part` is pr/full-only and `--warm`
 is full-only. Warm ownership/content checks, retained failure logs, signal/reap
 rules and the accepted option3/FS1/D45/manual-removal risks above still apply.
 No rule/CI transition or native performance claim follows from fast passing.
+
+Fast has a known source-scanner gap: the orch-engine guard
+`token_eco_preparation::dispatch_is_the_only_production_caller_of_adapter_execute_and_awaits_preparation_first`
+reads every crate's source without a Cargo edge. The orch-infra guards
+`spawn_gate` and `synthetic_spawn_domain_guard` also scan crates; D39 covers them
+incidentally while every crate reaches orch-cli. This adds no coupling policy.
+Fast is an iteration signal; the full PR check remains the merge check.

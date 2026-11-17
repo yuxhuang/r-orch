@@ -1777,8 +1777,13 @@ sub = cargo_subcommand(sys.argv[1:])
 if sub == 'build' and target.name == 'gate-xtask':
     destination=target/'debug/xtask'
     destination.parent.mkdir(parents=True,exist_ok=True)
-    shutil.copyfile({judge:?},destination)
-    destination.chmod(0o700)
+    source=pathlib.Path({judge:?})
+    if not destination.exists() or destination.read_bytes() != source.read_bytes():
+        temporary=destination.with_name('xtask.'+str(os.getpid())+'.tmp')
+        with temporary.open('xb') as output:
+            output.write(source.read_bytes())
+        temporary.chmod(0o700)
+        temporary.replace(destination)
     sys.exit(0)
 if sub == 'build' and target.name == 'gate-warm':
     try: pathlib.Path({once:?}).mkdir()

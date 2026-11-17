@@ -457,8 +457,8 @@ pub(super) fn run_fast(
             runner.statuses().get(index).map(|s| report::code(s.exit));
         out.logs.insert("steps/build.log".into(), bytes);
     } else {
-        // Most package closures exclude xtask. Run just its std-only witness,
-        // not its package suite. Its independent inventory cannot turn an empty
+        // Most package closures exclude xtask. Run its witness target unfiltered,
+        // including fixture-support tests, but not its entire package suite. Its independent inventory cannot turn an empty
         // selected suite into a nonzero successful one.
         if needs_witness(selection) {
             let start = Instant::now();
@@ -496,9 +496,6 @@ pub(super) fn run_fast(
                         "xtask",
                         "--test",
                         "gate_witness",
-                        "gate_environment_witness",
-                        "--",
-                        "--exact",
                     ]);
                 let log = runner.logged(&mut command, inventory::MAX_LOG)?;
                 child_exit = Some(report::code(log.exit));
@@ -511,9 +508,8 @@ pub(super) fn run_fast(
                 out.inventory = inventory::tsv(&rows);
                 ensure!(
                     log.exit.success()
-                        && rows.len() == 1
-                        && rows[0].test == "gate_environment_witness"
-                        && rows[0].status == "ok",
+                        && rows.iter().all(|r| r.status == "ok")
+                        && rows.iter().filter(|r| r.test == "gate_environment_witness").count() == 1,
                     "environment witness did not pass exactly once"
                 );
                 h.witness()?;

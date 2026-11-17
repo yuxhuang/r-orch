@@ -13,6 +13,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+fn private_capture(path: &Path) -> File {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).unwrap()
+}
+
 const BASE: &str = "selector-fixture-base";
 const LEAF: &[&str] = &["orch-leaf"];
 const MID: &[&str] = &["orch-build-user", "orch-dev-user", "orch-mid"];
@@ -159,7 +164,7 @@ impl Fixture {
             "logs",
             "git-template",
         ] {
-            fs::create_dir(fixture.temporary.join(path)).unwrap();
+            fs::DirBuilder::new().mode(0o700).create(fixture.temporary.join(path)).unwrap();
         }
         fs::write(fixture.temporary.join("gitconfig"), "").unwrap();
         fixture
@@ -225,8 +230,8 @@ impl Fixture {
         let stderr = self.temporary.join(format!("logs/{n}.stderr"));
         command
             .stdin(Stdio::null())
-            .stdout(File::create(&stdout).unwrap())
-            .stderr(File::create(&stderr).unwrap())
+            .stdout(private_capture(&stdout))
+            .stderr(private_capture(&stderr))
             .process_group(0);
         let mut running = Running {
             child: command.spawn().expect("spawn fixture command"),

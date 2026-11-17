@@ -453,10 +453,9 @@ pub(super) fn export(
         !destination.try_exists()?,
         "evidence destination already exists"
     );
-    std::fs::DirBuilder::new().create(destination)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o700))?;
-    std::fs::create_dir(destination.join("steps"))?;
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(destination)?;
+    std::fs::DirBuilder::new().mode(0o700).create(destination.join("steps"))?;
     for (name, text) in redacted {
         files::write(&destination.join(name), text.as_bytes())?;
     }
@@ -769,7 +768,8 @@ impl Run {
         commands: &str,
     ) -> Result<()> {
         files::real_directories(&self.path)?;
-        std::fs::create_dir(self.path.join("steps"))?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(self.path.join("steps"))?;
         for (name, bytes) in entries {
             ensure!(bundle_name(name), "run entry name");
             if name == "result.txt" {
