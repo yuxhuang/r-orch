@@ -15,7 +15,7 @@ Add HarnessBuilder::without_peer_runtime, default false, rejecting an explicit l
 
 Add Fixture::without_peer_runtime using a shared private builder-start helper; ordinary Fixture::start stays live. Only remote_tests' fixture chooses the opt-out, before seeding. Keep the original fallback assertions and add absent-store checks before/after status. Then persist a deliberate offline Backoff with last_error, next_retry_at and attempts, demand that exact projection, and recheck list.
 
-Use a held existing operation boundary and a one-poll handshake to prove the drain cannot finish early, plus a cancellation case proving the retained handle/guard. Harness ownership checks distinguish default live peer versus opted-out empty slot without timing. No replacement peer runtime, controller or snapshot handler change.
+Use a held existing operation boundary, an initial Pending poll, 16 scheduling yields and a second Pending poll before releasing the boundary, plus a cancellation case proving the retained handle/guard. The first poll alone cannot prove a join: a newly spawned handle is Pending before it runs. The second poll must reject a drain that yields then detaches without joining. Harness ownership checks distinguish default live peer versus opted-out empty slot without timing. Document that quiesce is not retryable after cancellation; callers must drop Running so the retained drain remains owned. No replacement peer runtime, controller or snapshot handler change.
 
 ## Tasks
 
@@ -30,9 +30,11 @@ Use a held existing operation boundary and a one-poll handshake to prove the dra
 
 One focused pass of affected modules plus feature-disabled/enabled crate checks, fmt and applicable all-target clippy under the configured turnstile then lease. Plan negative controls explicitly: remove builder opt-out branch; remove await from the peer drain; change fallback Connecting to Backoff; discard stored snapshots in the RPC. The latter two are temporary uncommitted negative-control edits only, restored immediately and byte-checked, never part of the frozen repair. Each must fail its named assertion; a build error or unrelated failure is not discrimination. No unchanged retry-to-green. First unexpected failure stops workloads and preserves all evidence for the lead.
 
+The bounded R-1/SR-C1 continuation preserves the original controls and failure evidence without repeating them. Reuse the original reviewer's probe-a survivor only after checking its source and mutation identity: it spawns/pushes shutdown, yields once, then pops the unjoined handle. Run that same planned mutant against the strengthened test and require the named second-poll assertion to fail; restore lifecycle.rs and compare hashes. Preflight the existing launcher path, syntax, argv, private resources and pin before any workload. At the corrected head run lifecycle, harness and remote modules once, plus cargo check -p orch-daemon --lib --features testing; cargo check -p orch-cli --lib; cargo fmt --all --check; and cargo clippy -p orch-daemon -p orch-cli --all-targets --features orch-daemon/testing -- -D warnings. Feature-off evidence may be reused only after establishing the covered implementation is byte-identical. No full/pre-PR run in this continuation.
+
 ## Status
 
-T1 recorded before Rust edits. T2–T4 pending. Full native/pre-PR and natural hosted acceptance are deferred to the existing review/checkpoint chain, not waived.
+T1–T3 implemented; original focused author tests and four planned mutants passed their intended oracles. T4 stopped on a launcher entry error before feature-on/CLI checks, fmt-check and clippy; that original handoff remains blocked. The authorized R-1/SR-C1 continuation updates this pair before Rust, strengthens one test and adds one cancellation documentation line, then supplies corrected-head source receipts and the yield-detach discriminator. The continuation handoff records their actual results; this plan does not infer success. Independent combined-head review and full native/pre-PR and natural hosted acceptance remain deferred to the existing review/checkpoint chain, not waived; status stays active.
 
 ## Rollback / compatibility and docs
 

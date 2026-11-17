@@ -626,6 +626,7 @@ impl Running {
 
     /// Stop peer writers before a snapshot-only harness seeds its remotes.
     /// Keep the drain owned by Running across cancellation, as shutdown does.
+    /// Not retryable after cancellation; drop Running to retain drain ownership.
     #[cfg(feature = "testing")]
     pub(crate) async fn quiesce_peer_for_testing(&mut self) -> Result<(), DaemonError> {
         if let Some(peer) = self.peer.take() {
@@ -970,6 +971,17 @@ mod tests {
                 std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx)))
                     .await
                     .is_pending()
+            );
+            // Allow the spawned shutdown to run before checking the held
+            // boundary again; the first poll alone cannot prove a join.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx)))
+                    .await
+                    .is_pending(),
+                "drain completed while the peer shutdown was still blocked"
             );
             release.send(()).unwrap();
             blocked.await;
