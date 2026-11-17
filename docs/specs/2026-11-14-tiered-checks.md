@@ -1,5 +1,20 @@
 # Tiered verification checks
 
+## PR85 shared witness correction — 2026-11-17 (before code)
+
+The authorized narrow correction preserves the failed published head and its
+consumed native run. It fixes writer ownership only; it does not qualify PR85.
+
+| Requirement | Acceptance on macOS (portable test code for Linux CI) |
+|---|---|
+| W1: the real xtask unit-suite witness exclusively creates the suite record; imported and standalone helpers in that suite cannot create, overwrite or repair it | `gate::suite::tests::shared_witness_has_one_unit_writer_and_nonwriting_helpers` uses the actual unit test and both compiled std-only helper forms, with shared environment; missing and malformed records stay rejected |
+| W2: the unselected-xtask fast path explicitly designates its standalone writer; planted non-xtask fixtures retain their witness | Same regression plus `gate_fast` tests: all witness-target rows ok, exactly one named witness, independently nonzero selected suite |
+| W3: duplicate designated writes fail; witness bytes, schema, names-only recording and private creation remain enforced | Regression checks duplicate failure, inode/bytes unchanged, 0600 record / 0700 immediate directory, names-only existing test; fast missing/zero negatives retained |
+
+No tests are deleted, ignored or filtered out of production gates. FS1, D45,
+option3 and historical/deferred receipts remain accepted-not-fixed or outstanding
+as previously recorded. This scoped regression is not fresh native acceptance.
+
 ## PR2 integration — 2026-11-16 (acceptance pending)
 
 The approved PR2 continuation starts at main `1603c67a3160901ce857f5877a03d227b980e6d9`.

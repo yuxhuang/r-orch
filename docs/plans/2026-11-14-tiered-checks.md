@@ -1,5 +1,10 @@
 # Tiered verification checks — plan
 
+## PR85 witness correction — 2026-11-17 (before code)
+
+Follow [the narrow correction plan](2026-11-17-pr85-witness-correction.md).
+Preserve the failed published head and native artifacts; no acceptance retry.
+
 ## PR2 lease-probe continuation — 2026-11-16 (before source)
 
 Preserve 756bfe90 and every earlier failed receipt. The metadata-boundary

@@ -491,7 +491,9 @@ pub(super) fn run_fast(
                 command
                     .args(["test", "--locked", "--manifest-path"])
                     .arg(repo.join("Cargo.toml"))
-                    .args(["-p", "xtask", "--test", "gate_witness"]);
+                    .args(["-p", "xtask", "--test", "gate_witness"])
+                    // Only this command owns the record when xtask is unselected.
+                    .env("XTASK_GATE_WITNESS_WRITER", "standalone");
                 let log = runner.logged(&mut command, inventory::MAX_LOG)?;
                 child_exit = Some(report::code(log.exit));
                 bytes = log.bytes;
@@ -672,6 +674,176 @@ mod tests {
         );
         (repo, target, h, lease)
     }
+    #[test]
+    fn shared_witness_has_one_unit_writer_and_nonwriting_helpers() {
+        use super::super::steps::tests::ChildGuard;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        // Regular private captures avoid pipe/EOF dependencies. Each direct
+        // compiler/test child has a deadline and is reaped before assertions.
+        fn child(h: &Hermetic, label: &str, command: &mut Command, success: bool) {
+            let out = h.root.join(format!("{label}.out"));
+            let err = h.root.join(format!("{label}.err"));
+            files::write(&out, b"").unwrap();
+            files::write(&err, b"").unwrap();
+            let mut child = ChildGuard(
+                command
+                    .stdin(Stdio::null())
+                    .stdout(std::fs::OpenOptions::new().write(true).open(&out).unwrap())
+                    .stderr(std::fs::OpenOptions::new().write(true).open(&err).unwrap())
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let status = loop {
+                if let Some(status) = child.0.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    child.0.kill().unwrap();
+                    child.0.wait().unwrap();
+                    panic!("{label}: direct child deadline");
+                }
+                std::thread::park_timeout(Duration::from_millis(10));
+            };
+            let text = format!(
+                "{}{}",
+                files::text(&out, 64 * 1024).unwrap(),
+                files::text(&err, 64 * 1024).unwrap()
+            );
+            println!("{label}: {status}\n{text}");
+            assert_eq!(status.success(), success, "{label}: {text}");
+            if success && !label.starts_with("compile-") {
+                assert!(text.contains("1 passed; 0 failed"), "{label}: {text}");
+            }
+        }
+
+        let root = Scratch::new();
+        let (_repo, _target, h, _lease) = fixture(&root.0, "ownership");
+        let helper = h.root.join("gate_witness.rs");
+        files::write(
+            &helper,
+            include_str!("../../tests/gate_witness.rs")
+                .split("// FIXTURE SUPPORT:")
+                .next()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        let imported = h.root.join("imported.rs");
+        files::write(&imported, b"#[path = \"gate_witness.rs\"] mod witness;\n").unwrap();
+        for (label, source, package) in [
+            ("standalone", &helper, "xtask"),
+            ("imported", &imported, "xtask"),
+            ("planted", &helper, "fixture"),
+        ] {
+            child(
+                &h,
+                &format!("compile-{label}"),
+                h.program("rustc")
+                    .env("CARGO_PKG_NAME", package)
+                    .args(["--edition=2024", "--test", "--crate-name", label])
+                    .arg(source)
+                    .arg("-o")
+                    .arg(h.root.join(label)),
+                true,
+            );
+        }
+        let record = h.witness.join("witness.txt");
+        let helpers = [
+            ("standalone", "gate_environment_witness"),
+            ("imported", "witness::gate_environment_witness"),
+        ];
+        let exe = std::env::current_exe().unwrap();
+        let unit = "gate::hermetic::tests::suite_environment_witness";
+        child(
+            &h,
+            "unit",
+            h.program(exe.to_str().unwrap()).args(["--exact", unit]),
+            true,
+        );
+        h.witness().unwrap();
+        let text = files::read(&record, 16 * 1024).unwrap();
+        let metadata = std::fs::metadata(&record).unwrap();
+        for (label, test) in helpers {
+            child(
+                &h,
+                label,
+                h.program(h.root.join(label).to_str().unwrap())
+                    .args(["--exact", test]),
+                true,
+            );
+            assert_eq!(files::read(&record, 16 * 1024).unwrap(), text);
+            assert_eq!(std::fs::metadata(&record).unwrap().ino(), metadata.ino());
+        }
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(&h.witness).unwrap().mode() & 0o777, 0o700);
+        child(
+            &h,
+            "duplicate-unit",
+            h.program(exe.to_str().unwrap()).args(["--exact", unit]),
+            false,
+        );
+        assert_eq!(files::read(&record, 16 * 1024).unwrap(), text);
+        h.witness().unwrap();
+        std::fs::remove_file(&record).unwrap();
+        // A helper must not rescue a missing actual unit witness.
+        for (label, test) in helpers {
+            child(
+                &h,
+                &format!("missing-{label}"),
+                h.program(h.root.join(label).to_str().unwrap())
+                    .args(["--exact", test]),
+                true,
+            );
+            assert!(!record.exists());
+            assert!(h.witness().unwrap_err().to_string().contains("missing"));
+        }
+        // Mismatched evidence remains mismatched; helpers cannot repair it.
+        files::write(&record, b"schema=bad\n").unwrap();
+        for (label, test) in helpers {
+            child(
+                &h,
+                &format!("bad-{label}"),
+                h.program(h.root.join(label).to_str().unwrap())
+                    .args(["--exact", test]),
+                true,
+            );
+            assert_eq!(files::read(&record, 16 * 1024).unwrap(), b"schema=bad\n");
+            assert!(h.witness().is_err());
+        }
+        std::fs::remove_file(&record).unwrap();
+        child(
+            &h,
+            "designated-standalone",
+            h.program(h.root.join("standalone").to_str().unwrap())
+                .env("XTASK_GATE_WITNESS_WRITER", "standalone")
+                .args(["--exact", "gate_environment_witness"]),
+            true,
+        );
+        h.witness().unwrap();
+        child(
+            &h,
+            "duplicate-standalone",
+            h.program(h.root.join("standalone").to_str().unwrap())
+                .env("XTASK_GATE_WITNESS_WRITER", "standalone")
+                .args(["--exact", "gate_environment_witness"]),
+            false,
+        );
+        h.witness().unwrap();
+        std::fs::remove_file(&record).unwrap();
+        child(
+            &h,
+            "planted",
+            h.program(h.root.join("planted").to_str().unwrap())
+                .args(["--exact", "gate_environment_witness"]),
+            true,
+        );
+        h.witness().unwrap();
+        std::fs::remove_dir_all(&h.root).unwrap();
+    }
+
     #[test]
     fn actual_folded_suite_judges_failures_and_both_hygiene_checks() {
         let root = Scratch::new();

@@ -7,6 +7,8 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Development tooling
 
+- Give the folded suite one exclusive environment-witness writer and designate the separate fast witness explicitly.
+
 - Add local `gate fast` with fail-closed change selection, printed reasons, content-checked warm targets and a documentation-only build/lint path.
 - Allow fast checks in separate worktrees to share host admission while retaining per-target exclusion and exclusive-waiter ordering.
 - Build current selected CLI targets before path-executing tests; retain sentinel, shim, witness and nonzero-inventory checks.

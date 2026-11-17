@@ -5,6 +5,16 @@ fn gate_environment_witness() {
     let Some(directory) = std::env::var_os("XTASK_GATE_WITNESS_DIR") else {
         return;
     };
+    // The real suite's unit test owns its one record. These copies retain
+    // their test identities but must not create, overwrite or repair that file.
+    // A planted non-xtask fixture has no xtask unit binary; its helper owns it.
+    if env!("CARGO_PKG_NAME") == "xtask" {
+        match std::env::var("XTASK_GATE_WITNESS_WRITER").as_deref() {
+            Ok("unit") => return,
+            Ok("standalone") => {}
+            _ => panic!("gate supplies a supported witness writer"),
+        }
+    }
     let home = std::env::var_os("HOME").expect("gate supplies HOME");
     let path = std::env::var_os("PATH").expect("gate supplies PATH");
     let first = std::env::split_paths(&path).next().expect("nonempty PATH");
@@ -908,7 +918,11 @@ fn filesystem_sandbox_retains_diagnostics_when_cleanup_is_unresolved() {
 fn supplied_witness_directory_records_home_redirect_path_and_names_without_values() {
     let sandbox = fixture::Sandbox::new();
     let directory = sandbox.temporary.join("witness-record");
-    std::fs::create_dir(&directory).unwrap();
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&directory)
+        .unwrap();
     std::fs::write(
         directory.join("environment.txt"),
         "removed XDG_CONFIG_HOME\n",
@@ -923,9 +937,18 @@ fn supplied_witness_directory_records_home_redirect_path_and_names_without_value
     command
         .args(["--exact", &test, "--test-threads=1"])
         .env("XTASK_GATE_WITNESS_DIR", &directory)
+        .env("XTASK_GATE_WITNESS_WRITER", "standalone")
         .env("XDG_CONFIG_HOME", "SECRET_private_xdg")
         .env("ORCH_WEB_PASSWORD", "SECRET_private_password");
     sandbox.run(&mut command).code(0);
+    assert_eq!(std::fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+    assert_eq!(
+        std::fs::metadata(directory.join("witness.txt"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600
+    );
     assert_eq!(
         std::fs::read_to_string(directory.join("witness.txt")).unwrap(),
         format!(
