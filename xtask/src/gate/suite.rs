@@ -35,6 +35,31 @@ impl Suite {
 }
 
 pub(super) fn run(repo: &Path, hermetic: &Hermetic, runner: &mut Runner<'_, '_>) -> Suite {
+    run_scoped(repo, hermetic, runner, None)
+}
+
+fn scope(
+    command: &mut std::process::Command,
+    selection: Option<&crate::gate_selection::Selection>,
+) {
+    match selection {
+        Some(s) if s.mode == crate::gate_selection::Mode::Packages => {
+            for package in &s.packages {
+                command.arg("-p").arg(package);
+            }
+        }
+        _ => {
+            command.arg("--workspace");
+        }
+    }
+}
+
+fn run_scoped(
+    repo: &Path,
+    hermetic: &Hermetic,
+    runner: &mut Runner<'_, '_>,
+    selection: Option<&crate::gate_selection::Selection>,
+) -> Suite {
     let mut out = Suite {
         steps: vec![],
         logs: BTreeMap::new(),
@@ -47,14 +72,16 @@ pub(super) fn run(repo: &Path, hermetic: &Hermetic, runner: &mut Runner<'_, '_>)
     workspace
         .args(["build", "--locked", "--manifest-path"])
         .arg(repo.join("Cargo.toml"))
-        .args(["--workspace", "--all-targets"]);
+        .arg("--all-targets");
+    scope(&mut workspace, selection);
     let workspace_start = runner.statuses().len();
     let workspace_status = runner.logged(&mut workspace, inventory::MAX_LOG);
     let mut build = hermetic.command(repo);
     build
         .args(["test", "--quiet", "--locked", "--manifest-path"])
         .arg(repo.join("Cargo.toml"))
-        .args(["--workspace", "--no-run", "--message-format=json"]);
+        .args(["--no-run", "--message-format=json"]);
+    scope(&mut build, selection);
     let map_start = runner.statuses().len();
     let mapped = match &workspace_status {
         Ok(log) if log.exit.success() => runner.capture_raw(&mut build, inventory::MAX_LOG),
@@ -128,7 +155,8 @@ pub(super) fn run(repo: &Path, hermetic: &Hermetic, runner: &mut Runner<'_, '_>)
     command
         .args(["test", "--locked", "--manifest-path"])
         .arg(repo.join("Cargo.toml"))
-        .args(["--workspace", "--no-fail-fast"]);
+        .arg("--no-fail-fast");
+    scope(&mut command, selection);
     let status_start = runner.statuses().len();
     let result = if built.is_ok() {
         runner.logged(&mut command, inventory::MAX_LOG)
@@ -233,10 +261,40 @@ pub(super) fn run_selected(
         run(repo, hermetic, runner)
     };
     suite.steps.truncate(2); // Re-evaluate hygiene after the static commands.
-    for name in ["clippy", "fmt", "advisories", "crate-graph"]
-        .into_iter()
-        .filter(|_| part != Some(super::Part::Suite))
-    {
+    if part != Some(super::Part::Suite) {
+        static_steps(repo, hermetic, runner, &mut suite, false);
+    }
+    if part == Some(super::Part::Static) {
+        return suite;
+    }
+    let start = Instant::now();
+    suite.checked("home-hygiene", start, hermetic.hygiene());
+    let start = Instant::now();
+    suite.checked("no-real-cli", start, hermetic.cli());
+    let start = Instant::now();
+    suite.checked(
+        "real-home",
+        start,
+        super::real_home::snapshot(real_home)
+            .and_then(|after| super::real_home::compare(&before.unwrap(), &after))
+            .map(|(text, _)| text),
+    );
+    suite
+}
+
+fn static_steps(
+    repo: &Path,
+    hermetic: &Hermetic,
+    runner: &mut Runner<'_, '_>,
+    suite: &mut Suite,
+    fast: bool,
+) {
+    let names: &[&str] = if fast {
+        &["fmt", "clippy", "crate-graph"]
+    } else {
+        &["clippy", "fmt", "advisories", "crate-graph"]
+    };
+    for &name in names {
         let start = Instant::now();
         if name == "advisories" && !hermetic.available("cargo-deny") {
             let detail="cargo-deny not installed; required advisories/licenses/bans/sources were not evaluated; cargo install cargo-deny --locked".to_owned();
@@ -329,22 +387,167 @@ pub(super) fn run_selected(
             detail,
         });
     }
-    if part == Some(super::Part::Static) {
-        return suite;
+}
+
+/// Local iteration uses the same native target, folded suite and judgments.
+/// Documentation-only deliberately has no test or witness: it cannot qualify.
+pub(super) fn fast_steps(selection: &crate::gate_selection::Selection) -> Vec<&'static str> {
+    let mut steps = vec!["fmt", "clippy", "crate-graph"];
+    if selection.mode == crate::gate_selection::Mode::DocsOnly {
+        steps.push("build");
+    } else {
+        if needs_witness(selection) {
+            steps.push("environment-witness");
+        }
+        steps.extend(["build", "test", "home-hygiene", "no-real-cli", "real-home"]);
     }
-    let start = Instant::now();
-    suite.checked("home-hygiene", start, hermetic.hygiene());
-    let start = Instant::now();
-    suite.checked("no-real-cli", start, hermetic.cli());
-    let start = Instant::now();
-    suite.checked(
-        "real-home",
-        start,
-        super::real_home::snapshot(real_home)
-            .and_then(|after| super::real_home::compare(&before.unwrap(), &after))
-            .map(|(text, _)| text),
-    );
-    suite
+    steps
+}
+fn needs_witness(s: &crate::gate_selection::Selection) -> bool {
+    s.mode == crate::gate_selection::Mode::Packages && !s.packages.iter().any(|p| p == "xtask")
+}
+pub(super) fn run_fast(
+    repo: &Path,
+    real_home: &Path,
+    h: &Hermetic,
+    runner: &mut Runner<'_, '_>,
+    selection: &crate::gate_selection::Selection,
+) -> Suite {
+    let mut out = Suite {
+        steps: vec![],
+        logs: BTreeMap::new(),
+        inventory: String::new(),
+    };
+    let before = super::real_home::snapshot(real_home);
+    if let Err(e) = &before {
+        out.checked(
+            "real-home",
+            Instant::now(),
+            Err(anyhow::anyhow!("initial real-home snapshot: {e:#}")),
+        );
+        return out;
+    }
+    static_steps(repo, h, runner, &mut out, true);
+    if selection.mode == crate::gate_selection::Mode::DocsOnly {
+        let start = Instant::now();
+        let mut command = h.command(repo);
+        command
+            .args(["build", "--locked", "--manifest-path"])
+            .arg(repo.join("Cargo.toml"))
+            .args(["--workspace", "--all-targets"]);
+        let index = runner.statuses().len();
+        let result = runner.logged(&mut command, inventory::MAX_LOG);
+        let (bytes, judged) = match result {
+            Ok(log) => (
+                log.bytes,
+                if log.exit.success() {
+                    Ok("documentation-only build; zero suite tests".to_owned())
+                } else {
+                    Err(anyhow::anyhow!("build exited {}", report::code(log.exit)))
+                },
+            ),
+            Err(e) => (
+                e.downcast_ref::<LogFailure>()
+                    .map_or_else(Vec::new, |f| f.bytes.clone()),
+                Err(e),
+            ),
+        };
+        out.checked("build", start, judged);
+        out.steps.last_mut().unwrap().exit =
+            runner.statuses().get(index).map(|s| report::code(s.exit));
+        out.logs.insert("steps/build.log".into(), bytes);
+    } else {
+        // Most package closures exclude xtask. Run just its std-only witness,
+        // not its package suite. Its independent inventory cannot turn an empty
+        // selected suite into a nonzero successful one.
+        if needs_witness(selection) {
+            let start = Instant::now();
+            let mut map = h.command(repo);
+            map.args(["test", "--quiet", "--locked", "--manifest-path"])
+                .arg(repo.join("Cargo.toml"))
+                .args([
+                    "-p",
+                    "xtask",
+                    "--test",
+                    "gate_witness",
+                    "--no-run",
+                    "--message-format=json",
+                ]);
+            let mut bytes = Vec::new();
+            let mut child_exit = None;
+            let result = (|| -> Result<String> {
+                let compiled = runner.capture_raw(&mut map, inventory::MAX_LOG)?;
+                child_exit = Some(report::code(compiled.exit));
+                out.logs
+                    .insert("steps/witness-map.jsonl".into(), compiled.stdout.clone());
+                out.logs
+                    .insert("steps/witness-map-stderr.log".into(), compiled.stderr);
+                ensure!(
+                    compiled.exit.success(),
+                    "environment witness compilation exited {}",
+                    report::code(compiled.exit)
+                );
+                let mut command = h.command(repo);
+                command
+                    .args(["test", "--locked", "--manifest-path"])
+                    .arg(repo.join("Cargo.toml"))
+                    .args([
+                        "-p",
+                        "xtask",
+                        "--test",
+                        "gate_witness",
+                        "gate_environment_witness",
+                        "--",
+                        "--exact",
+                    ]);
+                let log = runner.logged(&mut command, inventory::MAX_LOG)?;
+                child_exit = Some(report::code(log.exit));
+                bytes = log.bytes;
+                let rows = inventory::parse(
+                    std::str::from_utf8(&bytes)?,
+                    std::str::from_utf8(&compiled.stdout)?,
+                    report::code(log.exit),
+                )?;
+                out.inventory = inventory::tsv(&rows);
+                ensure!(
+                    log.exit.success()
+                        && rows.len() == 1
+                        && rows[0].test == "gate_environment_witness"
+                        && rows[0].status == "ok",
+                    "environment witness did not pass exactly once"
+                );
+                h.witness()?;
+                Ok("one independently inventoried environment witness passed".into())
+            })();
+            if let Err(e) = &result
+                && let Some(f) = e.downcast_ref::<LogFailure>()
+            {
+                bytes = f.bytes.clone();
+            }
+            out.checked("environment-witness", start, result);
+            out.steps.last_mut().unwrap().exit = child_exit;
+            out.logs
+                .insert("steps/environment-witness.log".into(), bytes);
+            if out.steps.last().unwrap().verdict != Verdict::Pass {
+                return out;
+            }
+        }
+        let mut selected = run_scoped(repo, h, runner, Some(selection));
+        selected.steps.truncate(2); // Hygiene is judged after all selected commands.
+        out.steps.extend(selected.steps);
+        out.logs.extend(selected.logs);
+        out.inventory.push_str(&selected.inventory);
+        out.checked("home-hygiene", Instant::now(), h.hygiene());
+        out.checked("no-real-cli", Instant::now(), h.cli());
+        out.checked(
+            "real-home",
+            Instant::now(),
+            super::real_home::snapshot(real_home)
+                .and_then(|after| super::real_home::compare(&before.unwrap(), &after))
+                .map(|(text, _)| text),
+        );
+    }
+    out
 }
 
 #[cfg(test)]

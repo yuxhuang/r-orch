@@ -1,5 +1,36 @@
 # Tiered verification checks
 
+## PR2 integration — 2026-11-16 (acceptance pending)
+
+The approved PR2 continuation starts at main `1603c67a3160901ce857f5877a03d227b980e6d9`.
+It consumes the separately committed selector and SR-P1 fixture correction, then
+implements fast and the local documentation-only path. CI, AGENTS/rules, versions,
+dependencies and PR3–6 policy remain unchanged. Fast never supplies merge evidence.
+
+- Fast uses shared machine admission in both Python bootstrap and Rust runner;
+  the existing exclusive warm-target marker still excludes a second writer in
+  one worktree. Queued exclusive admission blocks later shared requesters.
+- Print selection/base/packages and quoted reasons. Keep global-first, fail-closed
+  classification, reverse closure and D39 coupling. Empty changes select all.
+- Run fmt/workspace clippy/crate graph first. Package/all paths explicitly build
+  current selected targets before mapping/running tests (D40). Preserve sentinel,
+  shims, witness, failed-suite status, independently nonzero selected inventory,
+  warm-source checks and retained logs. When xtask is outside the selection, run
+  only its exact environment witness with its own map/inventory before the
+  selected suite. The witness cannot rescue a zero-test selected suite.
+- Docs-only runs build/lints/crate graph and no suite or witness tests, as approved.
+  No advisories in fast, no new docs checker. Fast exports remain nonqualifying.
+- TV72 now requires usable fast plans/runtime and invalid-option refusals. Existing
+  full/pr/usage controls remain. TV61/62 and shared-fast RS1 use deterministic real
+  requesters, including wrapper admission; no sleep is proof of ordering.
+
+Implementation controls on macOS are distinct from acceptance. Native Linux D40,
+shared controls and selector tables, isolated actual concurrent_index, independent
+code/security/SRE review, native/pre-PR full checks/inventories and idle timing
+remain outstanding. All historical option3 ACCEPTED NOT FIXED, FS1, interim D45,
+manual cargo-clean/marker removal, M2 and other named limitations retain scope.
+ADR 0015 remains PROPOSED. No acceptance requirement or risk is silently waived.
+
 ## NM1 prospective isolation, stage diagnostics and capture modes (2026-11-16)
 
 The bounded C3/C1/DMS-1 correction follows independent review of the preceding

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # full (default) is the goal/release gate; pr is the merge condition after the
-# policy transition. fast is PR2. Incident protections I1-I24 live in Rust:
+# policy transition. fast is local iteration, never merge evidence. Incident protections I1-I24 live in Rust:
 # content freshness, isolated targets, sentinel HOME/shims outside the workspace,
 # named nonzero inventory, actual suite status, metadata-only real-home check,
 # timed retained logs and ENV-LIMITED advisories. --warm is developer-only.
@@ -109,7 +109,7 @@ def identity():
         records.append(blob+b' '+encode(p)+b'\n')
     if not {b'xtask/gate.sh',b'Cargo.lock'}.issubset(set(paths)): raise RuntimeError('incomplete judge source set')
     return git('hash-object','--stdin',data=b''.join(records)).strip()
-def lock(path, deadline, code=75):
+def lock(path, deadline, code=75, shared=False):
     if os.path.lexists(path):
         m=check(path,'file')
         if m.st_mode & 0o7077: raise RuntimeError('lock mode')
@@ -117,11 +117,17 @@ def lock(path, deadline, code=75):
     locks.append((fd,path))
     held=os.fstat(fd); now=check(path,'file')
     if (held.st_dev,held.st_ino)!=(now.st_dev,now.st_ino): raise RuntimeError('lock replaced')
+    announced=False
     while True:
         if interrupted: raise RuntimeError('INTERRUPTED waiting for bootstrap lock')
-        try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); break
+        try: fcntl.flock(fd,(fcntl.LOCK_SH if shared else fcntl.LOCK_EX)|fcntl.LOCK_NB); break
         except BlockingIOError:
             if time.monotonic()>=deadline: raise BootstrapBusy('bootstrap cooperative lease busy' if code==75 else 'bootstrap target in use',code)
+            if not announced:
+                stage='admission-turnstile' if path.name=='r-orch-gate.turnstile' else 'lease-shared' if shared else 'lease-exclusive'
+                try: print('bootstrap: waiting stage='+stage,file=sys.stderr,flush=True)
+                except OSError: pass # A closed terminal cannot change lock/cleanup authority.
+                announced=True
             time.sleep(.01)
     return fd
 def holder_record(cap):
@@ -193,8 +199,11 @@ try:
     deadline=time.monotonic()+wait*60 # one admission deadline, CLI minutes
     inherited=inherited_capability(lease_dir)
     if inherited is None:
-        lock(lease_dir/'r-orch-gate.turnstile',deadline)
-        lock(lease_dir/'r-orch-gate.lease',deadline)
+        turnstile=lock(lease_dir/'r-orch-gate.turnstile',deadline)
+        # Only an unambiguous top-level fast invocation requests shared. Other
+        # shapes stay exclusive; Rust still owns complete argument validation.
+        lock(lease_dir/'r-orch-gate.lease',deadline,shared=bool(args and args[0]=='fast'))
+        os.close(turnstile);locks.remove((turnstile,lease_dir/'r-orch-gate.turnstile'))
     if interrupted: sys.exit(128+interrupted)
     directory(target)
     marker=lock(target/'.gate-xtask.lock',time.monotonic(),1)

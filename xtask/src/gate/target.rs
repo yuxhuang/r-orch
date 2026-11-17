@@ -26,11 +26,21 @@ pub(super) fn native_admission(
     cold: bool,
     lease: &super::lease::Lease,
 ) -> anyhow::Result<NativeTarget> {
-    lease.validate_exclusive()?;
+    validate_target_lease(lease, cold)?;
     let owner = nix::unistd::geteuid().as_raw();
     let files = StateFiles::inspect(root, owner, if cold { Kind::Cold } else { Kind::Warm })?;
     native::Boundary::state(&files)?;
     Ok(NativeTarget { files })
+}
+
+fn validate_target_lease(lease: &super::lease::Lease, cold: bool) -> anyhow::Result<()> {
+    // Shared fast holders mutate only their own warm target while holding its
+    // exclusive marker. Full cold uses still require exclusive host admission.
+    if cold {
+        lease.validate_exclusive()
+    } else {
+        lease.validate()
+    }
 }
 
 pub(super) struct NativeTarget {
@@ -180,7 +190,7 @@ impl NativeUse<'_> {
             ordinary_finish?;
             if interrupted {
                 self.marker.finishing_interrupted.set(true);
-                lease.validate_exclusive()?;
+                validate_target_lease(lease, self.marker.files.kind == Kind::Cold)?;
                 self.marker.check_identity()?;
             }
             let mut finish_runner = if interrupted {
@@ -1184,8 +1194,7 @@ impl Marker<'_> {
 
     pub(super) fn check_identity(&self) -> Result<()> {
         if let Some(lease) = self.lease {
-            lease
-                .validate_exclusive()
+            validate_target_lease(lease, self.files.kind == Kind::Cold)
                 .map_err(|_| Fault::Unavailable("configured lease lost; keep marker and target"))?;
         }
         if self.signal_wait(std::time::Duration::ZERO).is_some()
@@ -1552,7 +1561,7 @@ impl StateFiles {
         let lease = lease.ok_or_else(|| {
             anyhow::anyhow!("REFUSED: configured lease required; --no-lease cannot admit a target")
         })?;
-        lease.validate_exclusive()?;
+        validate_target_lease(lease, self.kind == Kind::Cold)?;
         let mut marker = self.admit(true)?;
         marker.lease = Some(lease);
         marker.check_identity()?;
@@ -2995,9 +3004,7 @@ mod tests {
             .unwrap(),
         );
         fs::remove_dir_all(f.files.root.join("target")).unwrap();
-        let error = native_admission(&f.files.root, false, &lease)
-            .err()
-            .unwrap();
+        let error = native_admission(&f.files.root, true, &lease).err().unwrap();
         assert!(error.to_string().contains("exclusive"), "{error}");
         assert!(!f.files.root.join("target").exists());
         f.canary_unchanged();

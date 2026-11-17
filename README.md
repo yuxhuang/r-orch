@@ -837,12 +837,17 @@ ship with a built binary or package.
 
 ### Tiered verification work
 
-The PR1 folded gate is under repair: `./xtask/gate.sh full` is the goal/release
-check, and `pr` is the proposed merge tier after the owner applies the policy
-transition. Existing required check/test jobs still stand. Exit0 alone is not
-qualifying evidence; verify the exact-head bundle's `qualifying: yes` field.
-The wrapper publishes private single-link Cargo output before its source stamp;
-direct unstamped invocations remain development checks. Preserve unfinished
-markers/targets, and share only verified redacted exports. See the
-[gate runbook](docs/RUNBOOK.md#tiered-gate-evidence-during-pr1-repair) for current
-limits and [the plan](docs/plans/2026-11-14-tiered-checks.md) for PR2–6.
+Run `./xtask/gate.sh fast --base origin/main` for local iteration. It prints the
+selected packages and reasons, checks content before warm reuse, and runs fmt,
+workspace clippy, crate graph and the selected tests. Documentation-only changes
+run build/lints/crate graph with zero suite tests. Unknown or empty changes select
+the whole workspace. `fast` is never merge or release evidence.
+
+`./xtask/gate.sh full` remains the default goal/release check. `pr` is the proposed
+merge tier after the owner applies the reviewed policy transition; the required
+check/test jobs and existing pre-PR rules still stand. Exit 0 alone is not
+qualifying evidence. The wrapper stamps its private judge output; direct unstamped
+invocations remain development checks. Preserve unfinished markers/targets and
+share only verified redacted exports. See the
+[gate runbook](docs/RUNBOOK.md#tiered-gate-evidence-during-pr1-repair) for protections,
+accepted risks and the remaining native/timing qualification work.

@@ -1,5 +1,51 @@
 # Tiered verification checks — plan
 
+## PR2 execution — 2026-11-16 (implementation, acceptance pending)
+
+Pinned base `1603c67a3160901ce857f5877a03d227b980e6d9`. Consume only selector
+`a2b388062aaaea38c4b5ae7ca78b65dc532d9811` and bootstrap
+`dcb3364201f8a49937524d69df81ce79d9518fa7` unchanged. This section precedes runner
+code and controls this integration; older dated statuses remain historical.
+
+1. Add black-box fast plans/usage, actual selected/docs-only miniatures and D40
+   empty/changed-marker controls before implementing dispatch. Keep full/pr commands.
+2. Reuse the delivered selector interface. Retain and print its mode, base, sorted
+   packages and each quoted reason. Fast uses shared host admission and the existing
+   exclusive warm marker; cold admission still requires exclusive host authority.
+3. Bootstrap fast also requests shared admission, releases its turnstile after
+   admission, and keeps the separate per-worktree bootstrap marker exclusive.
+   External live exclusive inheritance remains valid. Never unlock a shared OFD.
+4. Fast runs fmt, workspace clippy and crate graph first; then selected build/map/
+   tests under the existing sentinel/shims/witness/inventory. The preparatory build
+   is explicit (D40), including current CLI before infra path execution. Docs-only
+   runs fmt/clippy/crate graph/build and zero suite tests. No advisories in fast.
+5. Add deterministic real-fast TV61/62 and same-target RS1 controls. Observe owned
+   shared holder, exclusive turnstile ownership and later shared requester; do not
+   infer ordering from sleeps. Extend shared warm lifecycle controls; preserve cold
+   exclusive refusal. Replace only the stage-specific fast-unavailable assertion.
+6. Run targeted red/green controls then complete xtask, fmt, workspace clippy and
+   crate graph with private homes/targets under a single host lease. Keep exact
+   failures, source/body ledgers and commands. No full workspace suite/gate/timing.
+7. Update developer docs/spec/changelog, freeze a clean local commit and hand off
+   for independent reviews and later native/pre-PR acceptance; no push or PR here.
+
+The selected-package path explicitly runs only xtask's std-only environment
+witness when xtask is outside the selection. Its separate map/inventory must
+contain exactly that one passed test; the selected suite must independently be
+nonzero. The selector package list is unchanged. Docs-only has neither witness
+nor suite tests. This closes the otherwise missing witness for CLI/infra closure.
+
+Fast never qualifies as merge/release evidence (even with --evidence). Partial fast
+parts are refused; --warm remains full-only. Full/pr behavior, CI and rules do not
+transition. Historical option3 ACCEPTED NOT FIXED, FS1, D45, manual cargo-clean,
+M2 and other limitations remain. Native Linux D40/shared controls, isolated real
+concurrent_index, full acceptance/inventory and idle timings remain later work.
+
+The assembled PR exceeds the 3000-line guideline because the delivered fail-closed
+selector and its independently authored adversarial tables are inseparable from
+the first usable fast runner; its two leaf commits remain separately reviewable.
+No source unrelated to that boundary is imported.
+
 ## NM1 prospective isolation, stage diagnostics and capture modes (2026-11-16)
 
 The bounded C3/C1/DMS-1 correction follows independent review of the preceding

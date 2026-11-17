@@ -382,6 +382,16 @@ pub(super) fn blob(repo: &Path, bytes: &[u8]) -> Result<String> {
 }
 
 fn bundle_name(name: &str) -> bool {
+    // Fixed fast-only witness records. They grant no extra qualifying tier.
+    if [
+        "steps/environment-witness.log",
+        "steps/witness-map.jsonl",
+        "steps/witness-map-stderr.log",
+    ]
+    .contains(&name)
+    {
+        return true;
+    }
     [
         "result.txt",
         "inventory.tsv",
