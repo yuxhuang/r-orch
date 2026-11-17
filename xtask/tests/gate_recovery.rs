@@ -79,6 +79,7 @@ fn qualification(parent: &Path) {
     let output = Command::new("/usr/bin/python3")
         .args(["-c", PROBE])
         .arg(root.join("probe"))
+        .arg(HOLDER_CODE)
         .env_clear()
         .env("HOME", root.join("home"))
         .env("CARGO_HOME", root.join("cargo"))
@@ -127,6 +128,89 @@ fn actual_commands_retain_marker_on_scratch_filesystem_and_discriminators_detect
     qualification(&std::env::temp_dir());
 }
 
+#[test]
+fn holder_publishes_pid_only_after_complete_write() {
+    let root = std::env::temp_dir().join(format!(
+        "gate-recovery-pid-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", PID_PUBLICATION_PROBE])
+        .arg(&root)
+        .arg(HOLDER_CODE)
+        .env_clear()
+        .env("HOME", &root)
+        .env("TMPDIR", &root)
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    eprintln!("{}", String::from_utf8_lossy(&output.stdout));
+    assert!(
+        output.status.success(),
+        "PID publication fixture retained at {}: {}",
+        root.display(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+const PID_PUBLICATION_PROBE: &str = r###"
+import os,sys,pathlib,subprocess,json,threading,queue
+root=pathlib.Path(sys.argv[1]);holder_code=sys.argv[2]
+pidfile=root/'child.pid';marker=root/'marker.use'
+stages=queue.Queue();advance=[threading.Event(),threading.Event()]
+errors=[];state={};visible=[]
+def paused_write(path,text):
+ assert text.isdecimal() and len(text)>1,text
+ with path.open('w') as stream:
+  for index,part in enumerate(['',text[:1]]):
+   stream.write(part);stream.flush()
+   stages.put((index,text))
+   assert advance[index].wait(5),'write-pause release timeout'
+  stream.write(text[1:])
+ return len(text)
+pathlib.Path.write_text=paused_write
+writer=os.open(os.devnull,os.O_WRONLY)
+sys.argv=['holder',str(marker),str(pidfile),str(writer),json.dumps([sys.executable,'-c','pass']),'none']
+def run_holder():
+ try:exec(holder_code,state)
+ except BaseException as error:errors.append(error)
+thread=threading.Thread(target=run_holder)
+thread.start()
+try:
+ for expected in range(2):
+  index,complete=stages.get(timeout=5)
+  assert index==expected,(index,expected)
+  if pidfile.exists():visible.append((index,pidfile.read_text()))
+  advance[index].set()
+finally:
+ for event in advance:event.set()
+ thread.join(timeout=5)
+ os.close(writer)
+assert not thread.is_alive(),'holder did not finish'
+if 'fd' in state:os.close(state['fd'])
+assert not errors,errors
+assert pidfile.read_text()==complete,(pidfile.read_text(),complete)
+print(json.dumps({'paused_stages':['empty','numeric-prefix'],'complete_pid':complete,'visible_before_completion':visible}),flush=True)
+assert not visible,('incomplete PID visible before publication',visible)
+"###;
+
+const HOLDER_CODE: &str = r###"import os,sys,json,fcntl,subprocess,pathlib,time
+marker,pidfile,writer,argv,mutant=sys.argv[1:];fd=os.open(marker,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);fcntl.flock(fd,fcntl.LOCK_EX)
+os.set_inheritable(fd,True)
+child=subprocess.Popen(json.loads(argv),stdin=subprocess.DEVNULL,pass_fds=() if mutant=='no-inherit' else (fd,),stdout=int(writer),stderr=int(writer))
+if mutant=='unlock': fcntl.flock(fd,fcntl.LOCK_UN)
+# Publish only a closed, complete PID; existence must never expose a prefix.
+pending=pathlib.Path(pidfile+'.tmp');pending.write_text(str(child.pid));pending.replace(pidfile)
+child.wait()
+"###;
+
 const PROBE: &str = r###"
 import os,sys,pathlib,subprocess,fcntl,json,time,select,shutil
 root=pathlib.Path(sys.argv[1]);root.mkdir(mode=0o700)
@@ -158,13 +242,7 @@ if sys.platform=='darwin': cases += [('load',['sysctl','-n','vm.loadavg']),('boo
 missing=[(label,argv) for label,argv in cases if not shutil.which(argv[0])]
 cases=[(label,argv) for label,argv in cases if shutil.which(argv[0])]
 print(json.dumps({'unmeasured_missing_tools':missing}),flush=True)
-holder_code='''import os,sys,json,fcntl,subprocess,pathlib,time
-marker,pidfile,writer,argv,mutant=sys.argv[1:];fd=os.open(marker,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);fcntl.flock(fd,fcntl.LOCK_EX)
-os.set_inheritable(fd,True)
-child=subprocess.Popen(json.loads(argv),stdin=subprocess.DEVNULL,pass_fds=() if mutant=='no-inherit' else (fd,),stdout=int(writer),stderr=int(writer))
-if mutant=='unlock': fcntl.flock(fd,fcntl.LOCK_UN)
-pathlib.Path(pidfile).write_text(str(child.pid));child.wait()
-'''
+holder_code=sys.argv[2]
 def exists(pid):
  p=subprocess.run(['/bin/ps','-p',str(pid),'-o','stat='],capture_output=True,text=True)
  return p.returncode==0 and p.stdout.strip() and not p.stdout.strip().startswith('Z')
