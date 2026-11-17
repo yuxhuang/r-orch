@@ -670,8 +670,23 @@ fn retain_export_case(
     let Some(root) = std::env::var_os("XTASK_F2_PRIVATE_ROOT") else {
         return;
     };
-    let destination = PathBuf::from(root).join(sandbox.temporary.file_name().unwrap());
-    fs::create_dir(&destination).unwrap();
+    retain_export_case_at(Path::new(&root), sandbox, command, output, export);
+}
+
+fn retain_export_case_at(
+    root: &Path,
+    sandbox: &Sandbox,
+    command: &std::process::Command,
+    output: &Capture,
+    export: &Path,
+) -> PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    use witness::fixture::private_diagnostic;
+    let destination = root.join(sandbox.temporary.file_name().unwrap());
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&destination)
+        .unwrap();
     let environment: std::collections::BTreeMap<_, _> = command
         .get_envs()
         .map(|(key, value)| (key.to_string_lossy(), value.map(|s| s.to_string_lossy())))
@@ -682,13 +697,13 @@ fn retain_export_case(
         "cwd": command.get_current_dir().unwrap(), "environment": environment,
         "status": output.status.code(), "synthetic_secrets_only": true,
     });
-    fs::write(
-        destination.join("invocation.json"),
-        serde_json::to_vec_pretty(&invocation).unwrap(),
+    private_diagnostic(
+        &destination.join("invocation.json"),
+        &serde_json::to_vec_pretty(&invocation).unwrap(),
     )
     .unwrap();
-    fs::write(destination.join("stdout"), &output.stdout_bytes).unwrap();
-    fs::write(destination.join("stderr"), &output.stderr_bytes).unwrap();
+    private_diagnostic(&destination.join("stdout"), &output.stdout_bytes).unwrap();
+    private_diagnostic(&destination.join("stderr"), &output.stderr_bytes).unwrap();
     for (name, path) in [
         (
             "source-config.toml",
@@ -708,7 +723,7 @@ fn retain_export_case(
         ),
     ] {
         if path.is_file() {
-            fs::copy(path, destination.join(name)).unwrap();
+            private_diagnostic(&destination.join(name), &fs::read(path).unwrap()).unwrap();
         }
     }
     let record = sandbox.result();
@@ -717,18 +732,27 @@ fn retain_export_case(
         let path = destination
             .join("run")
             .join(file.strip_prefix(run).unwrap());
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::copy(file, path).unwrap();
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path.parent().unwrap())
+            .unwrap();
+        private_diagnostic(&path, &fs::read(file).unwrap()).unwrap();
     }
     if export.exists() {
         for file in exported_files(export) {
             let path = destination
                 .join("export")
                 .join(file.strip_prefix(export).unwrap());
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::copy(file, path).unwrap();
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(path.parent().unwrap())
+                .unwrap();
+            private_diagnostic(&path, &fs::read(file).unwrap()).unwrap();
         }
     }
+    destination
 }
 
 #[test]
@@ -842,4 +866,59 @@ fn nested_encoded_duplicate_member_secret_refuses_without_partial_export() {
         true,
         Some(duplicate_member_payload(r#""dupli\u0063ate""#, true)),
     );
+}
+
+#[test]
+fn optional_export_recorder_creates_private_records_under_normal_umask() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use witness::fixture::private_diagnostic;
+    let sandbox = Sandbox::filesystem_only();
+    let originals = sandbox.temporary.join("originals");
+    let run = originals.join("run");
+    let export = originals.join("export");
+    let recorded = sandbox.temporary.join("recorded");
+    for path in [
+        &originals,
+        &run,
+        &run.join("steps"),
+        &export,
+        &recorded,
+        &sandbox.root.join("target"),
+    ] {
+        fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+    }
+    private_diagnostic(
+        &sandbox.root.join("target/gate-result.txt"),
+        format!("run-dir: {}\n", run.display()).as_bytes(),
+    )
+    .unwrap();
+    private_diagnostic(&run.join("steps/test.log"), b"synthetic original output\n").unwrap();
+    private_diagnostic(&export.join("result.txt"), b"synthetic export\n").unwrap();
+    sandbox.write(".cargo/config.toml", "# synthetic configuration source\n");
+    let mut command = sandbox.command("/bin/sh");
+    command.args(["-c", "printf output; printf error >&2"]);
+    let output = sandbox.run(&mut command);
+    output.code(0);
+    let destination = retain_export_case_at(&recorded, &sandbox, &command, &output, &export);
+    for path in [
+        &destination,
+        &destination.join("run"),
+        &destination.join("run/steps"),
+        &destination.join("export"),
+    ] {
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "{}",
+            path.display()
+        );
+    }
+    for path in exported_files(&destination) {
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "{}",
+            path.display()
+        );
+    }
 }

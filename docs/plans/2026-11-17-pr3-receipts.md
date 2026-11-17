@@ -32,3 +32,7 @@ T1 implemented: original unsupported interface failed, then passed on the new so
 ## Rollback / compatibility and docs
 
 Revert this scoped commit through normal review. No user persisted state or existing evidence format changes. Update only this supplement, ADR and decision index in this wave; CI owner carries procedure/integration docs. Existing approved goal spec/plan remain incomplete. No new approval, publication or live rules action.
+
+## Capture correction discovered during author verification
+
+The optional `gate_tiers` recorder used ordinary directory/file creation beneath a private root. Author audit found permissive inner modes under workload022; those original records remain retained as failed capture evidence. The helper now reuses explicit0700 directory creation and the existing0600 diagnostic writer, with a filesystem-only regression that fails on the original helper. No assertion, export/redaction budget or production capture mechanism is weakened. This narrow test-recorder correction stays in the assigned gate_tiers scope; prospective focused evidence and original independent security review judge current closure, not retroactive chmod.

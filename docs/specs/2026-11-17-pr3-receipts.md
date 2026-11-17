@@ -57,3 +57,5 @@ None for this bounded implementation; original independent reviewers judge the c
 | R5 | pass: direct inert worker TERM and pre-admission abrupt loss; real GitHub cancellation remains pending | author source; commit binding in handoff | macOS arm64 |
 
 Implementation checks are scoped author evidence only. The success policy is tested deterministically; miniature production commands retain exit3 for private lease override and unstamped direct judge. A real configured/stamped positive and combined CI/native acceptance remain downstream. The once-run package passed before the final late-contention export-priority delta; that bounded delta and all receipt/evidence/tier controls passed a subsequent focused wave. No timing/equivalence claim is made.
+
+Defect outside the runtime receipt requirements: the existing optional tier fixture recorder created permissive inner records under022 despite a private root. Originals are preserved; explicit private creation and an original-fails/new-passes filesystem control supply prospective correction. This does not rewrite the earlier failed capture evidence.
