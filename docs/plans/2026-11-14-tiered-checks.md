@@ -12,7 +12,8 @@ code and controls this integration; older dated statuses remain historical.
 2. Reuse the delivered selector interface. Retain and print its mode, base, sorted
    packages and each quoted reason. Fast uses shared host admission and the existing
    exclusive warm marker; cold admission still requires exclusive host authority.
-3. Bootstrap fast also requests shared admission, releases its turnstile after
+3. Bootstrap fast (including options before the tier, skipping option values)
+   also requests shared admission, releases its turnstile after
    admission, and keeps the separate per-worktree bootstrap marker exclusive.
    External live exclusive inheritance remains valid. Never unlock a shared OFD.
 4. Fast runs fmt, workspace clippy and crate graph first; then selected build/map/

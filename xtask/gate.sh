@@ -199,10 +199,23 @@ try:
     deadline=time.monotonic()+wait*60 # one admission deadline, CLI minutes
     inherited=inherited_capability(lease_dir)
     if inherited is None:
+        # Admission classification only, not another CLI parser. Skip known
+        # global option values so a label/base named "fast" is not a tier, and
+        # honor clap's options-before-tier spelling. Unknown shapes stay
+        # exclusive; Rust remains responsible for complete usage validation.
+        def requests_fast(args):
+            values={'--part','--base','--evidence','--host-label','--lease-wait','--no-lease'}
+            flags={'--plan','--keep','--warm','--help','-h','--version','-V'}
+            index=0
+            while index<len(args):
+                arg=args[index]
+                if arg in values: index+=2;continue
+                if any(arg.startswith(option+'=') for option in values) or arg in flags:
+                    index+=1;continue
+                return arg=='fast'
+            return False
         turnstile=lock(lease_dir/'r-orch-gate.turnstile',deadline)
-        # Only an unambiguous top-level fast invocation requests shared. Other
-        # shapes stay exclusive; Rust still owns complete argument validation.
-        lock(lease_dir/'r-orch-gate.lease',deadline,shared=bool(args and args[0]=='fast'))
+        lock(lease_dir/'r-orch-gate.lease',deadline,shared=requests_fast(args))
         os.close(turnstile);locks.remove((turnstile,lease_dir/'r-orch-gate.turnstile'))
     if interrupted: sys.exit(128+interrupted)
     directory(target)

@@ -1807,7 +1807,22 @@ fn real_wrapped_fast_shared_holders_coexist_and_same_target_refuses_tv61_rs1() {
     let lease = a.temporary.join("lease");
     let mut first = a.spawn(&mut wrapped_fast(&a, &lease, "0"));
     let mut p = ba.accept(&mut first);
-    let mut second = b.spawn(&mut wrapped_fast(&b, &lease, "0"));
+    // Clap accepts global options before the tier, too. That spelling must not
+    // silently restore an exclusive bootstrap in front of a shared fast run.
+    let mut options_first = b.command("/bin/bash");
+    options_first
+        .arg(b.root.join("xtask/gate.sh"))
+        .args([
+            "--lease-wait",
+            "0",
+            "--host-label",
+            "fast",
+            "fast",
+            "--base",
+            "HEAD",
+        ])
+        .env("XTASK_GATE_LEASE_DIR", &lease);
+    let mut second = b.spawn(&mut options_first);
     let admitted =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bb.accept(&mut second)));
     let mut q = match admitted {
@@ -1821,6 +1836,14 @@ fn real_wrapped_fast_shared_holders_coexist_and_same_target_refuses_tv61_rs1() {
     };
     p.alive();
     q.alive();
+    let mut labelled_pr = b.command("/bin/bash");
+    labelled_pr
+        .arg(b.root.join("xtask/gate.sh"))
+        .args(["--host-label", "fast", "--lease-wait", "0", "pr"])
+        .env("XTASK_GATE_LEASE_DIR", &lease);
+    let exclusive = b.run(&mut labelled_pr);
+    exclusive.code(75);
+    exclusive.contains("bootstrap cooperative lease busy");
     let refused = a.run(&mut wrapped_fast(&a, &lease, "0"));
     refused.code(1);
     refused.contains("warm target in use");
