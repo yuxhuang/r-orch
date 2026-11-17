@@ -624,6 +624,34 @@ impl Running {
         }
     }
 
+    /// Stop peer writers before a snapshot-only harness seeds its remotes.
+    /// Keep the drain owned by Running across cancellation, as shutdown does.
+    /// Not retryable after cancellation; drop Running to retain drain ownership.
+    #[cfg(feature = "testing")]
+    pub(crate) async fn quiesce_peer_for_testing(&mut self) -> Result<(), DaemonError> {
+        if let Some(peer) = self.peer.take() {
+            self.loops.push(self.runtime.spawn(peer.shutdown()));
+            let result = self
+                .loops
+                .last_mut()
+                .expect("the peer drain was just added")
+                .await;
+            self.loops.pop();
+            result.map_err(|source| {
+                discovery::io_error(
+                    "drain the harness peer runtime",
+                    std::io::Error::other(source),
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(all(test, feature = "testing"))]
+    pub(crate) fn has_peer_runtime(&self) -> bool {
+        self.peer.is_some()
+    }
+
     /// The one clean path for every stop trigger (R14). Returns a failure
     /// exit when agent cleanup was incomplete, never a false clean stop.
     pub(crate) async fn shutdown(mut self) -> DaemonExit {
@@ -898,6 +926,8 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::{project, scratch, spec};
     use super::*;
+    #[cfg(feature = "testing")]
+    use std::future::Future;
     use std::os::unix::fs::MetadataExt;
 
     #[test]
@@ -917,6 +947,100 @@ mod tests {
             String::from_utf8(stderr).unwrap(),
             "  ⚠ ownership lost: the project PID lock is missing or names another process; dispatch is off and this daemon is still running\n"
         );
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn peer_quiescence_joins_the_owned_drain_before_returning() {
+        let mut daemon = super::test_support::start(false, None).await;
+        assert!(daemon.running.peer.is_some());
+        let loops = daemon.running.loops.len();
+        let boundary = daemon.running.engine.operation_boundary();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut blocked = std::pin::pin!(boundary.run(true, async { released.await.unwrap() }));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(blocked.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        // A real peer shutdown must acquire this held boundary for its final
+        // listener-state cleanup. Taking/dropping the peer is not a drain.
+        {
+            let mut drain = std::pin::pin!(daemon.running.quiesce_peer_for_testing());
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            // Allow the spawned shutdown to run before checking the held
+            // boundary again; the first poll alone cannot prove a join.
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx)))
+                    .await
+                    .is_pending(),
+                "drain completed while the peer shutdown was still blocked"
+            );
+            release.send(()).unwrap();
+            blocked.await;
+            tokio::time::timeout(std::time::Duration::from_secs(20), drain)
+                .await
+                .expect("peer drain completes after the boundary is released")
+                .unwrap();
+        }
+        assert!(daemon.running.peer.is_none());
+        assert_eq!(daemon.running.loops.len(), loops);
+        assert_eq!(daemon.running.shutdown().await, DaemonExit::CLEAN);
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn cancelled_peer_quiescence_retains_drain_and_project_ownership() {
+        let mut daemon = super::test_support::start(false, None).await;
+        let root = daemon.root();
+        let loops = daemon.running.loops.len();
+        let boundary = daemon.running.engine.operation_boundary();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut blocked = std::pin::pin!(boundary.run(true, async { released.await.unwrap() }));
+        assert!(
+            std::future::poll_fn(|cx| std::task::Poll::Ready(blocked.as_mut().poll(cx)))
+                .await
+                .is_pending()
+        );
+        {
+            let mut drain = std::pin::pin!(daemon.running.quiesce_peer_for_testing());
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(drain.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+        }
+        assert!(daemon.running.peer.is_none());
+        assert_eq!(daemon.running.loops.len(), loops + 1);
+        drop(daemon.running);
+        // Running::Drop transfers the still-pending drain and guard together.
+        let next = scratch();
+        let error = Running::bring_up(spec(&root, next.path(), false, None))
+            .await
+            .err()
+            .expect("pending peer drain retains ownership");
+        assert!(matches!(error, DaemonError::AlreadyRunning(_)), "{error:?}");
+        release.send(()).unwrap();
+        blocked.await;
+        let successor = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match Running::bring_up(spec(&root, next.path(), false, None)).await {
+                    Ok(running) => break running,
+                    Err(DaemonError::AlreadyRunning(_)) => tokio::task::yield_now().await,
+                    Err(error) => panic!("successor start failed: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("ownership releases after the peer drain");
+        assert_eq!(successor.shutdown().await, DaemonExit::CLEAN);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

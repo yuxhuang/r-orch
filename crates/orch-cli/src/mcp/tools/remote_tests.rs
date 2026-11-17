@@ -9,7 +9,7 @@ fn args<A: serde::de::DeserializeOwned + ToolArgs>(value: Value) -> A {
     args
 }
 async fn fixture() -> (crate::mcp::testing::Fixture, Arc<CallContext>) {
-    let fx = crate::mcp::testing::Fixture::start().await;
+    let fx = crate::mcp::testing::Fixture::without_peer_runtime().await;
     let cx = fx.context(Some("cli"), Mode::AllowDestructive);
     (fx, cx)
 }
@@ -36,7 +36,9 @@ async fn both_remote_tools_are_snapshot_projections_with_offline_fallbacks() {
         .set("peer.listen", json!("127.0.0.1:0"))
         .await
         .unwrap();
+    assert!(store.read_status("peer").await.unwrap().is_none());
     let snapshot = status(cx.clone(), args(json!({}))).await.unwrap();
+    assert!(store.read_status("peer").await.unwrap().is_none());
     assert_eq!(snapshot["listen"], Value::Null);
     assert_eq!(snapshot["listen_configured"], "127.0.0.1:0");
     assert_eq!(snapshot["controller"], Value::Null);
@@ -44,6 +46,46 @@ async fn both_remote_tools_are_snapshot_projections_with_offline_fallbacks() {
     assert_eq!(snapshot["remotes"][0]["online"], false);
     assert_eq!(snapshot["remotes"][0]["link_state"], "connecting");
     assert_eq!(snapshot.as_object().unwrap().len(), 6);
+    assert_eq!(list(cx.clone(), args(json!({}))).await.unwrap(), listed);
+
+    let saved = orch_domain::RemoteStatus {
+        alias: "peer".into(),
+        addr: "127.0.0.1:9".into(),
+        online: false,
+        last_seen: None,
+        last_error: Some("controlled connection failure".into()),
+        peer_name: None,
+        instance_id: None,
+        os: None,
+        agents: Vec::new(),
+        peer_version: None,
+        link_state: orch_domain::LinkState::Backoff,
+        next_retry_at: Some("2030-01-01T00:00:00Z".into()),
+        attempts: 3,
+    };
+    store.write_status(&saved).await.unwrap();
+    let snapshot = status(cx.clone(), args(json!({}))).await.unwrap();
+    assert_eq!(
+        snapshot["remotes"][0],
+        serde_json::to_value(&saved).unwrap()
+    );
+    assert_eq!(snapshot["remotes"][0]["link_state"], "backoff");
+    assert_eq!(
+        snapshot["remotes"][0]["last_error"],
+        "controlled connection failure"
+    );
+    assert_eq!(
+        snapshot["remotes"][0]["next_retry_at"],
+        "2030-01-01T00:00:00Z"
+    );
+    assert_eq!(snapshot["remotes"][0]["attempts"], 3);
+    assert_eq!(snapshot["remotes"][0]["online"], false);
+    assert_eq!(snapshot["listen"], Value::Null);
+    assert_eq!(snapshot["listen_configured"], "127.0.0.1:0");
+    assert_eq!(snapshot["controller"], Value::Null);
+    assert_eq!(snapshot["last_session_error"], Value::Null);
+    assert_eq!(snapshot.as_object().unwrap().len(), 6);
+    assert_eq!(store.read_status("peer").await.unwrap(), Some(saved));
     assert_eq!(list(cx, args(json!({}))).await.unwrap(), listed);
 }
 #[test]

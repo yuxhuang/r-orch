@@ -59,6 +59,18 @@ ignore = [
   # liquid-core -> anymap2. Unmaintained with no successor. Reached only by the
   # skill/prompt template renderer, over template text we ship ourselves.
   { id = "RUSTSEC-2026-0319", reason = "anymap2 via liquid-core; no alternative exists, and input is first-party template text" },
+
+  # Owner sign-off: 2026-11-17, RUSTSEC-2026-0543 only (INFO unmaintained,
+  # all versions, no patched release). chrono 0.4.45 is required by rmcp 3.9.0
+  # and schemars 1.2.3's chrono04 support; jiff/time are not drop-in replacements
+  # for their chrono APIs, so removal needs an upstream change or patch/replacement.
+  # In this build, rmcp's chrono calls read UTC time, format RFC3339 output or
+  # display timeout durations; inbound lastModified is String, not DateTime.
+  # schemars' chrono support emits static schemas, not date parsing. No chrono
+  # date parser is called by these inspected paths; MCP input is still untrusted.
+  # This accepts maintenance risk, not proof of no vulnerabilities. Remove this
+  # exception when upstream rmcp/schemars permit dropping chrono.
+  { id = "RUSTSEC-2026-0543", reason = "owner approved 2026-11-17: chrono unmaintained via rmcp/schemars; no drop-in jiff/time swap without upstream changes; inspected uses are UTC/output/duration formatting and static schemas, not external-date parsing; track upstream removal" },
 ]
 
 [licenses]
