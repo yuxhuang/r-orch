@@ -161,9 +161,12 @@ fn hold_index_lock(dir: &std::path::Path) -> std::fs::File {
 
 #[tokio::test]
 async fn every_index_writer_times_out_under_external_contention_without_publishing() {
+    use futures::FutureExt;
+    use std::panic::AssertUnwindSafe;
+
     use orch_core::error::Error;
     use orch_infra::storage::index::{IndexManager, ItemFormat};
-    for operation in ["update", "write", "rebuild"] {
+    async fn case(operation: &str) {
         let temp = tempfile::tempdir().unwrap();
         let index = IndexManager::<serde_json::Value>::new(temp.path().into(), ItemFormat::Json);
         std::fs::write(index.index_path(), "[]\n").unwrap();
@@ -207,6 +210,19 @@ async fn every_index_writer_times_out_under_external_contention_without_publishi
             index.read_index().await.unwrap(),
             vec![serde_json::json!({"id": "after"})]
         );
+    }
+
+    // Each case owns its fixture. Collect panics so a failed assertion cannot
+    // cancel siblings before their lock waits and post-release checks finish.
+    let (update, write, rebuild) = tokio::join!(
+        AssertUnwindSafe(case("update")).catch_unwind(),
+        AssertUnwindSafe(case("write")).catch_unwind(),
+        AssertUnwindSafe(case("rebuild")).catch_unwind(),
+    );
+    for outcome in [update, write, rebuild] {
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 }
 
