@@ -3380,7 +3380,10 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
+ "nix 0.31.3",
+ "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

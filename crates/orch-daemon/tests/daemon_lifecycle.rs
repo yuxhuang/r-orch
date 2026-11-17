@@ -180,6 +180,11 @@ async fn legacy_acquire_cannot_steal_idle_owner() {
 /// daemon never silently recreates it (R37).
 #[tokio::test(start_paused = true)]
 async fn ownership_lost_disables_dispatch_and_is_never_silently_recreated() {
+    if orch_daemon::testing::capture_test_output(
+        "ownership_lost_disables_dispatch_and_is_never_silently_recreated",
+    ) {
+        return;
+    }
     let daemon = DaemonHarness::start().await.unwrap();
     let root = daemon.project_root().to_path_buf();
     let mut raw = Raw::session(&daemon, "cli", "normal").await;

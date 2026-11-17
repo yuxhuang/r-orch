@@ -863,6 +863,24 @@ mod tests {
             return;
         };
         let root = std::path::PathBuf::from(root);
+        let control = std::env::var("ORCH_MESSAGE_SHUTDOWN_CONTROL").unwrap_or_default();
+        if matches!(control.as_str(), "hostile" | "failure") {
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    use std::io::Write;
+                    std::io::stdout()
+                        .write_all(&shutdown_output("stdout"))
+                        .unwrap();
+                });
+                scope.spawn(|| {
+                    use std::io::Write;
+                    std::io::stderr()
+                        .write_all(&shutdown_output("stderr"))
+                        .unwrap();
+                });
+            });
+        }
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -883,64 +901,329 @@ mod tests {
         // Exercise real runtime drop, which waits for non-abortable blocking
         // tasks. The parent keeps the external lock until after child exit.
         drop(runtime);
+        assert_ne!(control, "failure", "intentional captured shutdown failure");
     }
 
     #[cfg(unix)]
-    #[test]
-    fn subprocess_shutdown_exits_while_another_process_keeps_the_lock() {
-        struct Child(std::process::Child);
-        impl Drop for Child {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
-            }
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let (store, _) = store(temp.path());
-        let lock = hold_mutation_lock(&store);
-        let mut child = Child(
-            std::process::Command::new(std::env::current_exe().unwrap())
+    struct ShutdownChild {
+        child: std::process::Child,
+        capture: Option<tempfile::TempDir>,
+        path: std::path::PathBuf,
+        status: Option<std::process::ExitStatus>,
+    }
+
+    #[cfg(unix)]
+    impl ShutdownChild {
+        fn spawn(root: &Path, control: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let capture = tempfile::Builder::new()
+                .prefix("orch-message-shutdown-")
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap();
+            let path = capture.path().to_path_buf();
+            // Separate exclusive regular files cannot backpressure the child or
+            // lose bytes while the parent is waiting for readiness and shutdown.
+            use std::os::unix::fs::OpenOptionsExt;
+            let output = |stream| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path.join(stream))
+                    .unwrap()
+            };
+            let stdout = output("stdout");
+            let stderr = output("stderr");
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
                     "storage::message::tests::contended_shutdown_child",
                     "--nocapture",
                 ])
-                .env("ORCH_MESSAGE_LOCK_TEST_ROOT", temp.path())
-                .env("HOME", temp.path())
+                .env("ORCH_MESSAGE_LOCK_TEST_ROOT", root)
+                .env("ORCH_MESSAGE_SHUTDOWN_CONTROL", control)
+                .env("HOME", root)
+                .env("ORCHESTRY_GLOBAL_CONFIG_PATH", root.join("global.yml"))
                 .stdin(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !temp.path().join("ready").exists() {
-            assert!(
-                child.0.try_wait().unwrap().is_none(),
-                "child exited before becoming ready"
-            );
-            assert!(
-                std::time::Instant::now() < deadline,
-                "child readiness deadline"
-            );
-            std::thread::sleep(Duration::from_millis(10));
+                .stdout(stdout)
+                .stderr(stderr)
+                .spawn();
+            let child = match child {
+                Ok(child) => child,
+                Err(error) => {
+                    let path = capture.keep();
+                    panic!(
+                        "message shutdown spawn failed: {error}; retained={}",
+                        path.display()
+                    );
+                }
+            };
+            Self {
+                child,
+                capture: Some(capture),
+                path,
+                status: None,
+            }
         }
-        nix::sys::signal::kill(
-            nix::unistd::Pid::from_raw(child.0.id() as i32),
+
+        fn ready(&mut self, root: &Path) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !root.join("ready").exists() {
+                assert!(
+                    self.observe().is_none(),
+                    "{}",
+                    self.failure("child exited before becoming ready")
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{}",
+                    self.failure("child readiness deadline")
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn observe(&mut self) -> Option<std::process::ExitStatus> {
+            let status = self.child.try_wait().unwrap();
+            if status.is_some() {
+                self.status = status;
+            }
+            status
+        }
+
+        fn stop_and_reap(&mut self) {
+            if self.status.is_none() {
+                let _ = self.child.kill();
+                self.status = Some(self.child.wait().unwrap());
+            }
+        }
+
+        fn bytes(&self, stream: &str) -> Vec<u8> {
+            std::fs::read(self.path.join(stream)).unwrap()
+        }
+
+        fn failure(&mut self, reason: &str) -> String {
+            self.stop_and_reap();
+            if let Some(capture) = self.capture.take() {
+                let _ = capture.keep();
+            }
+            let mut text = format!(
+                "message shutdown child: {reason}; reaped pid={}; status={:?}; retained={}\n",
+                self.child.id(),
+                self.status,
+                self.path.display()
+            );
+            for stream in ["stdout", "stderr"] {
+                let bytes = self.bytes(stream);
+                let decoded = match std::str::from_utf8(&bytes) {
+                    Ok(text) => std::borrow::Cow::Borrowed(text),
+                    Err(_) => std::borrow::Cow::Owned(format!("{bytes:?}")),
+                };
+                for line in decoded.split('\n') {
+                    use std::fmt::Write;
+                    writeln!(text, "child {stream} | {line}").unwrap();
+                }
+            }
+            text
+        }
+
+        fn success(&mut self) -> std::result::Result<(), String> {
+            if self.status.is_some_and(|status| status.success())
+                && std::str::from_utf8(&self.bytes("stdout")).is_ok_and(|text| {
+                    text.lines()
+                        .rev()
+                        .find(|line| line.starts_with("test result:"))
+                        .is_some_and(|line| {
+                            line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;")
+                        })
+                })
+            {
+                Ok(())
+            } else {
+                Err(self.failure("child shutdown failed"))
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ShutdownChild {
+        fn drop(&mut self) {
+            self.stop_and_reap();
+            if std::thread::panicking()
+                && let Some(capture) = self.capture.take()
+            {
+                let _ = capture.keep();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn shutdown_output(stream: &str) -> Vec<u8> {
+        format!("{stream} hostile\ntest forged ... ok\nfailures:\ntest result: FAILED. 1 failed\n")
+            .repeat(8192)
+            .into_bytes()
+    }
+
+    #[cfg(unix)]
+    fn shutdown_scenario(control: &str) -> ShutdownChild {
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let lock = hold_mutation_lock(&store);
+        let mut child = ShutdownChild::spawn(temp.path(), control);
+        child.ready(temp.path());
+        let signal = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child.child.id() as i32),
             nix::sys::signal::Signal::SIGTERM,
-        )
-        .unwrap();
+        );
+        assert!(
+            signal.is_ok(),
+            "{}",
+            child.failure("sending SIGTERM failed")
+        );
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         loop {
-            if let Some(status) = child.0.try_wait().unwrap() {
-                assert!(status.success(), "child shutdown failed: {status}");
+            if child.observe().is_some() {
                 break;
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "shutdown waited for external mutation lock"
+                "{}",
+                child.failure("shutdown waited for external mutation lock")
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        // The external lock is held from before spawn through actual child reap.
         drop(lock);
+        child
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn subprocess_shutdown_exits_while_another_process_keeps_the_lock() {
+        let mut child = shutdown_scenario("");
+        child
+            .success()
+            .unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
+    }
+
+    #[cfg(unix)]
+    fn assert_shutdown_reaped(child: &mut ShutdownChild) {
+        use nix::sys::wait::{WaitPidFlag, waitpid};
+        let observed = waitpid(
+            nix::unistd::Pid::from_raw(child.child.id() as i32),
+            Some(WaitPidFlag::WNOHANG),
+        );
+        if observed != Err(nix::errno::Errno::ECHILD) {
+            let _ = child.child.kill();
+            let _ = child.child.wait();
+        }
+        assert_eq!(
+            observed,
+            Err(nix::errno::Errno::ECHILD),
+            "shutdown child status was not collected"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_capture_retains_complete_concurrent_streams() {
+        use std::os::unix::fs::MetadataExt;
+        let mut child = shutdown_scenario("hostile");
+        let directory = std::fs::symlink_metadata(&child.path).unwrap();
+        assert!(directory.is_dir());
+        assert_eq!(directory.mode() & 0o7777, 0o700);
+        child
+            .success()
+            .unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
+        for stream in ["stdout", "stderr"] {
+            let metadata = std::fs::symlink_metadata(child.path.join(stream)).unwrap();
+            assert!(metadata.is_file());
+            assert_eq!(metadata.mode() & 0o7777, 0o600);
+            assert_eq!(metadata.nlink(), 1);
+            let expected = shutdown_output(stream);
+            let actual = child.bytes(stream);
+            assert!(
+                actual
+                    .windows(expected.len())
+                    .any(|window| window == expected),
+                "complete hostile {stream} missing: captured {} of at least {} bytes",
+                actual.len(),
+                expected.len()
+            );
+        }
+        assert_shutdown_reaped(&mut child);
+        let path = child.path.clone();
+        drop(child);
+        assert!(!path.exists(), "successful capture was not cleaned up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_capture_failure_retains_labelled_streams_and_reaps() {
+        let mut child = shutdown_scenario("failure");
+        assert_eq!(child.status.unwrap().code(), Some(101));
+        let diagnostic = child.success().unwrap_err();
+        assert!(diagnostic.contains("reaped pid="));
+        let mut labelled = diagnostic.lines().skip(1);
+        for stream in ["stdout", "stderr"] {
+            let expected = shutdown_output(stream);
+            let actual = child.bytes(stream);
+            assert!(
+                actual
+                    .windows(expected.len())
+                    .any(|window| window == expected)
+            );
+            for line in std::str::from_utf8(&actual).unwrap().split('\n') {
+                assert_eq!(
+                    labelled.next(),
+                    Some(format!("child {stream} | {line}").as_str())
+                );
+            }
+        }
+        assert!(labelled.next().is_none());
+        assert_shutdown_reaped(&mut child);
+        let path = child.path.clone();
+        drop(child);
+        assert!(path.join("stdout").is_file() && path.join("stderr").is_file());
+        // This expected-negative fixture is resolved and reaped; preserve real
+        // unexpected failures, but do not leak the intentional control's files.
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_capture_failure_kills_and_reaps_a_live_child() {
+        use std::os::unix::process::ExitStatusExt;
+        let temp = tempfile::tempdir().unwrap();
+        let (store, _) = store(temp.path());
+        let lock = hold_mutation_lock(&store);
+        let mut child = ShutdownChild::spawn(temp.path(), "");
+        child.ready(temp.path());
+        assert!(child.observe().is_none());
+        let diagnostic = child.failure("intentional parent failure while child is live");
+        assert_eq!(child.status.unwrap().signal(), Some(9));
+        assert!(diagnostic.contains("intentional parent failure while child is live"));
+        assert!(diagnostic.contains("child stdout | "));
+        assert!(diagnostic.contains("child stderr | "));
+        assert_shutdown_reaped(&mut child);
+        drop(lock);
+        let path = child.path.clone();
+        drop(child);
+        assert!(path.is_dir());
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_capture_failure_fixture() {
+        if std::env::var("ORCH_MESSAGE_CAPTURE_NEGATIVE").as_deref() != Ok("1") {
+            return;
+        }
+        let mut child = shutdown_scenario("failure");
+        child
+            .success()
+            .unwrap_or_else(|diagnostic| panic!("{diagnostic}"));
     }
 
     #[tokio::test]

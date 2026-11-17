@@ -49,8 +49,9 @@ pub(crate) mod test_locks {
     ///
     /// A test cannot expect `try_lock` to succeed the instant a lock is
     /// released: a child that another test in the same binary is spawning
-    /// holds a copy of every open descriptor between `fork` and `exec`, and a
-    /// `flock` stays held while any copy is open. The window is short, so poll.
+    /// can retain an open descriptor during `posix_spawn` or between `fork` and
+    /// `exec`; a `flock` stays held while any copy is open. The window is short,
+    /// so poll.
     pub(crate) fn lock_when_free(file: &File) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {

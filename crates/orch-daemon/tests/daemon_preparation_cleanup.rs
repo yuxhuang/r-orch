@@ -38,6 +38,11 @@ async fn candidate(raw: &mut Raw, daemon: &DaemonHarness) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn storage_recovery_releases_the_claim_without_repeating_the_attempt() {
+    if orch_daemon::testing::capture_test_output(
+        "storage_recovery_releases_the_claim_without_repeating_the_attempt",
+    ) {
+        return;
+    }
     let clock = TestClock::new();
     let daemon = DaemonHarness::builder()
         .clock(clock.clone())
@@ -81,6 +86,11 @@ async fn storage_recovery_releases_the_claim_without_repeating_the_attempt() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maintenance_releases_pending_preparation_with_dispatch_off() {
+    if orch_daemon::testing::capture_test_output(
+        "maintenance_releases_pending_preparation_with_dispatch_off",
+    ) {
+        return;
+    }
     let clock = TestClock::new();
     let daemon = DaemonHarness::builder()
         .clock(clock.clone())

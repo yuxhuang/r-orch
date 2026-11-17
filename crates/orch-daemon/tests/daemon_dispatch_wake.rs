@@ -550,6 +550,10 @@ async fn a_pause_decided_before_the_wake_keeps_the_task_unlaunched_and_resume_wa
 /// wake: however many commits wake the scheduler, the injected clock decides.
 #[tokio::test(start_paused = true)]
 async fn wakes_do_not_evade_the_pre_launch_retry_backoff() {
+    if orch_daemon::testing::capture_test_output("wakes_do_not_evade_the_pre_launch_retry_backoff")
+    {
+        return;
+    }
     let mut fx = fixture(
         DispatchMode::On,
         Scripted {
@@ -664,6 +668,11 @@ async fn a_collector_completion_spawned_by_a_tick_wakes_the_scheduler() {
 /// have completed, separating the collector's independently eligible commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writes_during_the_wake_tick_cause_at_most_one_follow_up_tick() {
+    if orch_daemon::testing::capture_test_output(
+        "writes_during_the_wake_tick_cause_at_most_one_follow_up_tick",
+    ) {
+        return;
+    }
     // Unlike Fx::next_tick, do not drain already queued tick events: opening
     // the probe may complete the in-flight tick before this future is polled.
     async fn completed_tick(fx: &mut Fx, why: &str) -> Instant {

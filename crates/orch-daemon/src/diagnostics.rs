@@ -114,6 +114,15 @@ mod tests {
 
     #[test]
     fn stderr_subscriber_leaves_the_original_event_for_logs_follow() {
+        #[cfg(not(feature = "testing"))]
+        use crate::test_output::capture_test_output;
+        #[cfg(feature = "testing")]
+        use crate::testing::capture_test_output;
+        if capture_test_output(
+            "diagnostics::tests::stderr_subscriber_leaves_the_original_event_for_logs_follow",
+        ) {
+            return;
+        }
         let events = EventBus::new();
         let mut follow = events.subscribe();
         attach(&events);

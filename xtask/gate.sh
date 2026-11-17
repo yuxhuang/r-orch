@@ -1,398 +1,264 @@
 #!/usr/bin/env bash
-#
-# From-scratch verification, for the review gate.
-#
-# Everything here is runnable piecemeal during development; the point of this
-# script is that it runs against a **cold target directory**, so nothing passes
-# because of a stale artifact. That matters more than usual in this repo: the
-# work packages shared one `CARGO_TARGET_DIR` across git worktrees for a while,
-# and artifacts from two trees hash identically, so a run could end up
-# exercising a different branch's binaries with entirely plausible results.
-#
-#   ./xtask/gate.sh              # the full gate
-#   ./xtask/gate.sh --warm       # reuse the normal target dir (fast, not a gate)
-#   ./xtask/gate.sh --keep       # leave target/gate behind to inspect
-#
-# Exit status is 0 only if every step passed. The summary table is printed
-# whatever happens, including on an early failure, because "which step failed"
-# is the first thing anyone asks.
-set -uo pipefail
-
+# full (default) is the goal/release gate; pr is the merge condition after the
+# policy transition. fast is PR2. Incident protections I1-I24 live in Rust:
+# content freshness, isolated targets, sentinel HOME/shims outside the workspace,
+# named nonzero inventory, actual suite status, metadata-only real-home check,
+# timed retained logs and ENV-LIMITED advisories. --warm is developer-only.
+# No EXIT or signal trap deletes a target. Bootstrap owns/reaps its direct cargo
+# child; its kernel lock is inherited through stdin and never explicitly unlocked.
+# D45 uses checked paths then by-name operations under the cooperative lease.
+# A same-account racing replacement can redirect a mutation (accepted interim
+# risk). FS1 escaped descendants and manual cargo-clean remain separate risks.
+set -euo pipefail
 cd "$(dirname "$0")/.."
-REPO=$(pwd)
+exec /usr/bin/python3 - "$@" <<'PYTHON'
+import fcntl, json, os, pathlib, re, signal, socket, stat, subprocess, sys, time
+repo = pathlib.Path.cwd()
+target = repo / 'target'
+boot = target / 'gate-xtask'
+stamp = boot / 'judge-id'
+uid = os.geteuid()
+child = None
+interrupted = None
+locks = []
+inherited = None
+class BootstrapBusy(RuntimeError):
+    def __init__(self, message, code): super().__init__(message); self.code=code
+def receive(number, frame):
+    global interrupted
+    if interrupted is None: interrupted = number
+    if child is not None and child.poll() is None:
+        child.send_signal(number)
+for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP): signal.signal(number, receive)
+def check(path, kind):
+    m = path.lstat()
+    if m.st_uid != uid or (kind == 'dir' and not stat.S_ISDIR(m.st_mode)) or (kind == 'file' and (not stat.S_ISREG(m.st_mode) or m.st_nlink != 1)):
+        raise RuntimeError('path link/owner/type refused: ' + str(path))
+    return m
+def directory(path):
+    if not os.path.lexists(path): path.mkdir(mode=0o700)
+    check(path, 'dir')
+def read(path, limit=16*1024*1024):
+    before = check(path, 'file')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as f:
+        now = os.fstat(f.fileno())
+        if (before.st_dev,before.st_ino) != (now.st_dev,now.st_ino): raise RuntimeError('file changed')
+        b = f.read(limit+1)
+    if len(b)>limit: raise RuntimeError('source budget')
+    return b
+def publish_executable(expected):
+    # Cargo legitimately hardlinks debug/xtask to debug/deps on Linux. Only
+    # this post-success build output may have aliases; published judge/stamp
+    # and every source input still require single-link regular owned files.
+    executable = boot/'debug/xtask'
+    temporary = boot/'debug/.xtask.publish.tmp'
+    check(executable.parent, 'dir')
+    def candidate():
+        m = executable.lstat()
+        if not stat.S_ISREG(m.st_mode) or m.st_uid != uid or not m.st_mode & stat.S_IXUSR:
+            raise RuntimeError('bootstrap executable owner/type/mode refused')
+        return m
+    def signature(m):
+        return (m.st_dev,m.st_ino,m.st_mode,m.st_uid,m.st_nlink,m.st_size,m.st_mtime_ns,m.st_ctime_ns)
+    before = candidate()
+    fd = os.open(executable,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    with os.fdopen(fd,'rb') as source:
+        if signature(os.fstat(source.fileno())) != signature(before): raise RuntimeError('bootstrap executable changed')
+        output_fd = os.open(temporary,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o700)
+        with os.fdopen(output_fd,'wb') as output:
+            remaining = before.st_size
+            while remaining:
+                chunk = source.read(min(1024*1024,remaining))
+                if not chunk: raise RuntimeError('bootstrap executable truncated')
+                output.write(chunk);remaining -= len(chunk)
+            if source.read(1) or signature(os.fstat(source.fileno())) != signature(before): raise RuntimeError('bootstrap executable changed')
+            output.flush();os.fsync(output.fileno())
+    validate_locks()
+    if signature(candidate()) != signature(before): raise RuntimeError('bootstrap executable replaced')
+    if identity()!=expected: raise RuntimeError('judge-source-id changed during publication')
+    if interrupted: raise RuntimeError('INTERRUPTED before executable publication')
+    check(temporary,'file')
+    os.rename(temporary,executable) # D45 checked-path/by-name interim risk.
+    check(executable,'file')
+    fd=os.open(executable.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try: os.fsync(fd)
+    finally: os.close(fd)
 
-WARM=0
-KEEP=0
-for arg in "$@"; do
-  case "$arg" in
-    --warm) WARM=1 ;;
-    --keep) KEEP=1 ;;
-    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \?//'; exit 0 ;;
-    *) echo "unknown option: $arg" >&2; exit 2 ;;
-  esac
-done
+def git(*args, data=None):
+    r = subprocess.run(['git', '-C', str(repo), *args], input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if r.returncode: raise RuntimeError('git input failed: ' + r.stderr.decode(errors='replace'))
+    return r.stdout
+def encode(p):
+    if all(0x21<=b<=0x7e and b not in b'"\\' for b in p): return p
+    out=b'"'
+    for b in p:
+        out += {34:b'\\"',92:b'\\\\',9:b'\\t',10:b'\\n',13:b'\\r'}.get(b,bytes([b]) if 0x20<=b<=0x7e else ('\\%03o'%b).encode())
+    return out+b'"'
+def identity():
+    paths=git('ls-files','-z','--cached','--others','--exclude-standard','--','xtask','Cargo.toml','Cargo.lock','rust-toolchain.toml','.cargo/config.toml').split(b'\0')
+    if len(paths)>4096: raise RuntimeError('judge source count budget')
+    records=[]
+    for p in sorted(set(filter(None,paths))):
+        name=os.fsdecode(p)
+        if any(x in ('','..','.') for x in name.split('/')): raise RuntimeError('source path')
+        path=repo/name
+        for parent in reversed(path.parents):
+            if parent == repo or repo in parent.parents: check(parent,'dir')
+        blob=git('hash-object','--stdin',data=read(path)).strip()
+        records.append(blob+b' '+encode(p)+b'\n')
+    if not {b'xtask/gate.sh',b'Cargo.lock'}.issubset(set(paths)): raise RuntimeError('incomplete judge source set')
+    return git('hash-object','--stdin',data=b''.join(records)).strip()
+def lock(path, deadline, code=75):
+    if os.path.lexists(path):
+        m=check(path,'file')
+        if m.st_mode & 0o7077: raise RuntimeError('lock mode')
+    fd=os.open(path,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK,0o600)
+    locks.append((fd,path))
+    held=os.fstat(fd); now=check(path,'file')
+    if (held.st_dev,held.st_ino)!=(now.st_dev,now.st_ino): raise RuntimeError('lock replaced')
+    while True:
+        if interrupted: raise RuntimeError('INTERRUPTED waiting for bootstrap lock')
+        try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB); break
+        except BlockingIOError:
+            if time.monotonic()>=deadline: raise BootstrapBusy('bootstrap cooperative lease busy' if code==75 else 'bootstrap target in use',code)
+            time.sleep(.01)
+    return fd
+def holder_record(cap):
+    path=cap['lease']
+    before=check(path,'file')
+    if before.st_mode & 0o7077: raise RuntimeError('inherited lease mode')
+    fd=os.open(path,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        held=os.fstat(fd);now=check(path,'file')
+        identity=(held.st_dev,held.st_ino)
+        if identity!=(before.st_dev,before.st_ino) or identity!=(now.st_dev,now.st_ino): raise RuntimeError('inherited lease identity changed')
+        if cap.get('identity') is not None and identity!=cap['identity']: raise RuntimeError('inherited lease path replaced')
+        try: fcntl.flock(fd,fcntl.LOCK_SH|fcntl.LOCK_NB)
+        except BlockingIOError: pass
+        else: raise RuntimeError('inherited holder is not kernel-exclusive')
+        data=os.read(fd,4097)
+        if len(data)>4096: raise RuntimeError('inherited holder record budget')
+        record=json.loads(data)
+        if not isinstance(record,dict): raise RuntimeError('inherited holder record is not an object')
+        if record.get('socket')!=cap['socket'] or record.get('token')!=cap['token'].hex(): raise RuntimeError('inherited capability mismatch')
+        return identity
+    finally: os.close(fd) # close only, never unlock another description
 
-# A cold build of this workspace with --all-targets is a few GB. Refuse rather
-# than filling the disk and failing halfway through something unrelated.
-if [ "$WARM" -eq 0 ]; then
-  # POSIX `df -Pk` (1 KiB blocks, fixed columns) works with both GNU and BSD df.
-  FREE_GB=$(df -Pk "$REPO" | awk 'NR == 2 { print int($4 / 1048576) }')
-  if [ "${FREE_GB:-0}" -lt 12 ]; then
-    echo "refusing to run a cold gate: only ${FREE_GB}G free, and a fresh" >&2
-    echo "target directory needs roughly 8-10G. Free some space, or use" >&2
-    echo "--warm to reuse the existing target dir (faster, but not a gate)." >&2
-    exit 1
-  fi
-  export CARGO_TARGET_DIR="$REPO/target/gate"
-  # Inside the repo's own target/ on purpose: it is already gitignored, it is
-  # on the same filesystem, and nothing else in the project may create a
-  # second top-level target directory.
-  rm -rf "$CARGO_TARGET_DIR"
-  mkdir -p "$CARGO_TARGET_DIR"
-  cleanup() {
-    if [ "$KEEP" -eq 1 ]; then
-      echo "leaving $CARGO_TARGET_DIR in place (--keep)"
-    else
-      rm -rf "$CARGO_TARGET_DIR"
-    fi
-  }
-  # Removed even when the gate fails or is interrupted — an abandoned cold
-  # target dir is several GB of surprise.
-  trap cleanup EXIT INT TERM
-  MODE="cold ($CARGO_TARGET_DIR)"
-else
-  MODE="warm (reusing $REPO/target)"
-fi
+def validate_inherited(cap):
+    before=holder_record(cap)
+    with socket.socket(socket.AF_UNIX,socket.SOCK_STREAM) as stream:
+        stream.settimeout(1)
+        stream.connect(cap['socket']);stream.sendall(cap['token'])
+        if stream.recv(1)!=b'\x01': raise RuntimeError('inherited holder challenge refused')
+    if holder_record(cap)!=before: raise RuntimeError('inherited holder changed during challenge')
+    return before
 
-declare -a NAMES=() RESULTS=() DETAILS=()
-FAILED=0
-# Logs of failing steps land here. Inside target/, so it is gitignored and a
-# cold run's cleanup does not take it: the point is to survive the run.
-LOG_KEEP="$REPO/target/gate-logs"
-rm -rf "$LOG_KEEP"
+def inherited_capability(directory):
+    name=os.environ.get('XTASK_GATE_LEASE_SOCKET');token=os.environ.get('XTASK_GATE_LEASE_TOKEN')
+    if name is None or token is None or len(token)!=64 or any(c not in '0123456789abcdefABCDEF' for c in token): return None
+    try:
+        name.encode('utf-8')
+        cap=dict(lease=directory/'r-orch-gate.lease',socket=name,token=bytes.fromhex(token))
+        cap['identity']=validate_inherited(cap)
+        return cap
+    except (OSError,ValueError,RuntimeError,TypeError): return None
 
-# The durable verdict. Also inside target/ and outside `target/gate`, so a cold
-# run's cleanup leaves it behind.
-RESULT_FILE="$REPO/target/gate-result.txt"
-
-# write_result <verdict> — stamp the result file.
-#
-# Called once at startup with IN PROGRESS and again at the end with the real
-# verdict, so the file distinguishes three states a reader otherwise cannot
-# tell apart: never run (no file), running or died mid-run (IN PROGRESS, with
-# a start time to compare against the clock), and finished (PASSED/FAILED with
-# the table). The commit is recorded because a verdict without the hash it
-# applies to is close to useless — history gets rewritten, branches move, and
-# "the gate passed" then means nothing in particular.
-write_result() {
-  local verdict="$1" now_commit
-  now_commit=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
-  mkdir -p "$(dirname "$RESULT_FILE")"
-  {
-    printf 'verdict:   %s\n' "$verdict"
-    printf 'commit:    %s\n' "$START_COMMIT"
-    printf 'tree:      %s\n' "$START_TREE"
-    printf 'dirty:     %s\n' \
-      "$(if [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null | grep -v '^??')" ]; then
-           echo "yes — tracked files differ from the commit above"
-         else echo no; fi)"
-    # HEAD can move while a 40-minute gate runs — another session landing a
-    # commit, or a history rewrite. Observed: the architect committed docs
-    # mid-run. Recording HEAD at *completion* would then file the verdict
-    # against a commit most of the run never saw, so the commit above is the
-    # one the run started on and any move is called out rather than hidden.
-    if [ "$now_commit" != "$START_COMMIT" ]; then
-      printf 'moved:     HEAD moved to %s during the run; the verdict applies to the commit above\n' \
-        "$now_commit"
-    fi
-    printf 'mode:      %s\n' "$MODE"
-    printf 'started:   %s\n' "$STARTED_AT"
-    printf 'finished:  %s\n' \
-      "$(if [ "$verdict" = "IN PROGRESS" ]; then echo "-"; else date -u +%Y-%m-%dT%H:%M:%SZ; fi)"
-    if [ "${#NAMES[@]}" -gt 0 ]; then
-      printf '\n'
-      for i in "${!NAMES[@]}"; do
-        printf '%-9s %-16s %s\n' "${RESULTS[$i]}" "${NAMES[$i]}" "${DETAILS[$i]}"
-      done
-    fi
-  } > "$RESULT_FILE"
-}
-
-STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-START_COMMIT=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo unknown)
-START_TREE=$(git -C "$REPO" rev-parse HEAD^{tree} 2>/dev/null || echo unknown)
-write_result "IN PROGRESS"
-
-# step <name> <command…> — run it, record pass/fail and a one-line detail.
-#
-# The detail is pulled out of the step's own output by `summarize`, so the
-# table says "1559 passed" rather than just "ok" and the summary is worth
-# reading on its own.
-step() {
-  local name="$1"; shift
-  printf '\n════ %s\n' "$name"
-  local log; log=$(mktemp "${TMPDIR:-/tmp}/gate-XXXXXX")
-  local rc=0
-  if "$@" >"$log" 2>&1; then rc=0; else rc=$?; fi
-  tail -40 "$log"
-  NAMES+=("$name")
-  DETAILS+=("$(summarize "$name" "$log")")
-  if [ "$rc" -eq 0 ]; then
-    RESULTS+=("pass")
-    rm -f "$log"
-  else
-    RESULTS+=("FAIL ($rc)")
-    FAILED=$((FAILED + 1))
-    # Keep the log. A failing step's output is the only evidence of *why*, and
-    # deleting it has already cost two investigations: an intermittent test
-    # failed under the cold gate's I/O load, and by the time anyone looked
-    # there was nothing but "1 failed" to go on. Cheap insurance.
-    mkdir -p "$LOG_KEEP"
-    cp "$log" "$LOG_KEEP/$name.log"
-    rm -f "$log"
-    printf '  (log kept at %s/%s.log)\n' "$LOG_KEEP" "$name"
-  fi
-}
-
-summarize() {
-  local name="$1" log="$2"
-  case "$name" in
-    advisories)
-      if grep -q "skipping" "$log"; then
-        echo "cargo-deny not installed (step skipped)"
-      else
-        # cargo-deny prints all four verdicts on one line
-        # ("advisories ok, bans ok, licenses ok, sources ok"), so count the
-        # verdicts in it rather than the lines — `grep -c` would say 1 of 4
-        # and read like three checks had silently vanished.
-        local verdicts
-        verdicts=$(grep -oE "(advisories|licenses|bans|sources) (ok|FAILED)" "$log" | sort -u)
-        printf '%s' "$(printf '%s' "$verdicts" | tr '\n' ' ')"
-      fi
-      ;;
-    test)
-      # Name the failures as well as counting them. A cold gate run is the
-      # only place a timing-sensitive test has shown up here, and "1 failed"
-      # with the log already deleted is not enough to chase it.
-      local counts failures
-      counts=$(awk '/^test result:/ { p += $4; f += $6 } END { printf "%d passed, %d failed", p, f }' "$log")
-      failures=$(sed -n 's/^test \(.*\) \.\.\. FAILED$/\1/p' "$log" | sort -u | paste -sd' ' -)
-      if [ -n "$failures" ]; then
-        printf '%s — %s' "$counts" "$failures"
-      else
-        printf '%s' "$counts"
-      fi
-      ;;
-    no-real-cli)
-      grep -oE "no test exec'd an agent CLI|a test exec'd a real agent CLI:" "$log" | tail -1
-      ;;
-    real-home)
-      grep -oE 'still does not exist|existed before this run.*|was created during this gate run.*' "$log" | tail -1
-      ;;
-    home-hygiene)
-      grep -oE 'a sentinel HOME is still empty.*|the suite wrote into a sentinel HOME:' "$log" | tail -1
-      ;;
-    crate-graph)
-      grep -oE 'layering matches [^ ]+ .*|[0-9]+ layering problem\(s\)' "$log" | tail -1
-      ;;
-    fmt)
-      # `cargo fmt --check` prints a diff, not diagnostics, so count the
-      # files it would rewrite rather than error lines.
-      local n; n=$(grep -cE '^Diff in ' "$log")
-      printf '%d file(s) need reformatting' "$n"
-      ;;
-    clippy|build)
-      local n; n=$(grep -cE '^(error|warning)' "$log")
-      printf '%d error/warning line(s)' "$n"
-      ;;
-    *) printf -- '-' ;;
-  esac
-}
-
-# Run the suite with HOME pointed at an empty directory and fail if **anything**
-# appears in it.
-#
-# Originally this only looked for `.orchestry`, which let the rest through: the
-# adapter and FTUE tests spawned the real `cursor` and `opencode`, which wrote
-# `.cursor/cli-config.json`, `.cache/opencode`, `.config/opencode` and
-# `.local/share/opencode`. Same standard as ORCH data — no test may write into
-# a developer's home — so the check is now "the directory is still empty".
-#
-# `.cargo` and `.rustup` are the one exception, and only because *cargo itself*
-# recreates them when HOME moves: they are the build tool's own state, created
-# before any test code runs. Everything else is a finding.
-#
-# Runs from **outside** the workspace. An earlier version ran with the cwd in
-# the repo and passed while a bug was live, because cargo only loads
-# `.cargo/config.toml` — and its `[env]` — from inside the workspace, so the
-# redirect that was hiding the writer was still in effect. CARGO_HOME and
-# RUSTUP_HOME are set explicitly because a moved HOME otherwise hides the
-# toolchain, and the suite then runs **zero tests** while this reports clean.
-sentinel_home_check() {
-  local sentinel cwd unexpected status
-  sentinel=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-sentinel-home-XXXXXX")
-  cwd=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-sentinel-cwd-XXXXXX")
-
-  (
-    cd "$cwd" || exit 1
-    HOME="$sentinel" \
-    CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}" \
-    RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}" \
-    RUSTUP_TOOLCHAIN="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO/rust-toolchain.toml")" \
-    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}" \
-      cargo test --manifest-path "$REPO/Cargo.toml" --workspace --no-fail-fast
-  ) >/dev/null 2>&1
-
-  unexpected=$(find "$sentinel" -mindepth 1 -maxdepth 1 2>/dev/null \
-               | grep -vE '/\.(cargo|rustup)$' || true)
-  status=0
-  if [ -n "$unexpected" ]; then
-    echo "the suite wrote into a sentinel HOME:"
-    printf '%s\n' "$unexpected" | sed "s|$sentinel|<HOME>|" | head -12
-    status=1
-  else
-    echo "a sentinel HOME is still empty after the suite"
-  fi
-  rm -rf "$sentinel" "$cwd"
-  return "$status"
-}
-
-# Run the suite with the AI CLIs replaced by shims that record being called,
-# and report anything that execs one.
-#
-# `cargo test` should never exec a real agent CLI: the adapter tests drive a
-# scripted `FakeProcessManager`, and the fixtures under fixtures/fake-agents
-# are for the process-level tests. One test did anyway — it ran `claude --help`,
-# `cursor-agent --list-models` and read the real `~/.codex` — which is both a
-# hermeticity hole (results depend on what is installed) and a privacy one.
-#
-# A shim rather than an empty PATH, because an absent binary is indistinguishable
-# from one that was never wanted: the shim names the caller. The suite's own
-# result is ignored here — a test that expected a working CLI may now fail, and
-# that is not what this step is asking. Pass/fail of the suite is the `test`
-# step's job.
-no_real_cli_check() {
-  # `name` is declared local here on purpose: bash scopes dynamically, so the
-  # loop below would otherwise overwrite `step`'s own `local name` and the
-  # summary table would label this row `agy` — which it did.
-  local shims log name status others sentinel cwd
-  shims=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-shims-XXXXXX")
-  log="$shims/calls.log"
-  : > "$log"
-
-  for name in claude codex cursor cursor-agent agent opencode pi grok agy; do
-    cat > "$shims/$name" <<SHIM
-#!/bin/sh
-printf '%s %s\n' "$name" "\$*" >> "$log"
-exit 127
-SHIM
-    chmod +x "$shims/$name"
-  done
-
-  sentinel=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-shim-home-XXXXXX")
-  cwd=$(mktemp -d "${TMPDIR:-/tmp}/r-orch-shim-cwd-XXXXXX")
-  (
-    cd "$cwd" || exit 1
-    HOME="$sentinel" \
-    PATH="$shims:$PATH" \
-    CARGO_HOME="${CARGO_HOME:-$REAL_HOME/.cargo}" \
-    RUSTUP_HOME="${RUSTUP_HOME:-$REAL_HOME/.rustup}" \
-    RUSTUP_TOOLCHAIN="$(sed -n 's/^channel *= *"\(.*\)"/\1/p' "$REPO/rust-toolchain.toml")" \
-    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$REPO/target}" \
-      cargo test --manifest-path "$REPO/Cargo.toml" --workspace --no-fail-fast
-  ) >/dev/null 2>&1
-
-  status=0
-  if [ -s "$log" ]; then
-    echo "a test exec'd a real agent CLI:"
-    sort "$log" | uniq -c | sort -rn | head -10
-    status=1
-  else
-    echo "no test exec'd an agent CLI"
-  fi
-  rm -rf "$shims" "$sentinel" "$cwd"
-  return "$status"
-}
-
-# The real home must be exactly as we found it.
-#
-# The sentinel checks above prove the suite is hermetic under a *moved* HOME;
-# this proves nothing slipped past them into the actual one. Cheap, and it is
-# the property the user actually cares about.
-# Captured before anything moves HOME.
-REAL_HOME="${HOME:-/nonexistent}"
-REAL_ORCHESTRY="$REAL_HOME/.orchestry"
-REAL_ORCHESTRY_EXISTED=0
-[ -e "$REAL_ORCHESTRY" ] && REAL_ORCHESTRY_EXISTED=1
-
-real_home_untouched_check() {
-  if [ "$REAL_ORCHESTRY_EXISTED" -eq 0 ] && [ -e "$REAL_ORCHESTRY" ]; then
-    echo "$REAL_ORCHESTRY was created during this gate run:"
-    find "$REAL_ORCHESTRY" 2>/dev/null | head -20
-    return 1
-  fi
-  if [ "$REAL_ORCHESTRY_EXISTED" -eq 1 ]; then
-    echo "$REAL_ORCHESTRY existed before this run; left alone"
-    return 0
-  fi
-  echo "$REAL_ORCHESTRY still does not exist"
-}
-
-printf 'r-orch gate — %s\n' "$MODE"
-printf 'commit %s\n' "$(git rev-parse --short HEAD)"
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  printf 'WARNING: the working tree is dirty; this gates the tree, not the commit\n'
-fi
-
-# cargo-deny over advisories, licences, bans and sources (deny.toml).
-#
-# Skipped with a clear line rather than failing when cargo-deny is absent: it
-# is an extra tool the developer installs, and a gate that cannot run on a
-# fresh clone teaches people to bypass it. The CI story is to install it.
-advisories_check() {
-  local deny
-  deny=$(command -v cargo-deny || echo "$HOME/.cargo/bin/cargo-deny")
-  if [ ! -x "$deny" ]; then
-    echo "cargo-deny not installed; skipping (cargo install cargo-deny --locked)"
-    return 0
-  fi
-  "$deny" --version
-  "$deny" --manifest-path "$REPO/Cargo.toml" check advisories licenses bans sources
-}
-
-step build          cargo build --workspace --all-targets
-step test           cargo test --workspace --no-fail-fast
-step clippy         cargo clippy --workspace --all-targets -- -D warnings
-step fmt            cargo fmt --all --check
-step advisories     advisories_check
-step crate-graph    cargo xtask crate-graph
-step home-hygiene   sentinel_home_check
-step no-real-cli    no_real_cli_check
-# Last, so it covers every step above it.
-step real-home      real_home_untouched_check
-
-printf '\n'
-printf '════════════════════════════════════════════════════════════════════\n'
-printf ' r-orch gate — %s\n' "$MODE"
-printf '════════════════════════════════════════════════════════════════════\n'
-for i in "${!NAMES[@]}"; do
-  printf ' %-9s %-16s %s\n' "${RESULTS[$i]}" "${NAMES[$i]}" "${DETAILS[$i]}"
-done
-printf '════════════════════════════════════════════════════════════════════\n'
-
-# Record the verdict where it outlives the run. A cold gate deletes its own
-# `target/gate` on the way out, so a finished run leaves no process and no
-# build directory — meaning "passed forty minutes ago" and "never started"
-# look identical to anyone checking afterwards. That ambiguity cost three
-# rounds of "is a gate actually running?" on one release candidate, so the
-# answer now lives in a file: `target/gate-result.txt` is stamped IN PROGRESS
-# at the start of the run and overwritten with the table at the end.
-write_result "$(if [ "$FAILED" -gt 0 ]; then echo "FAILED"; else echo "PASSED"; fi)"
-
-if [ "$FAILED" -gt 0 ]; then
-  printf ' %d of %d step(s) FAILED\n' "$FAILED" "${#NAMES[@]}"
-  printf ' verdict recorded in %s\n' "${RESULT_FILE#"$REPO"/}"
-  exit 1
-fi
-printf ' all %d step(s) passed\n' "${#NAMES[@]}"
-printf ' verdict recorded in %s\n' "${RESULT_FILE#"$REPO"/}"
+def validate_locks():
+    if inherited is not None: validate_inherited(inherited)
+    for fd,path in locks:
+        held=os.fstat(fd);now=check(path,'file')
+        if now.st_mode & 0o7077 or (held.st_dev,held.st_ino)!=(now.st_dev,now.st_ino): raise RuntimeError('bootstrap lease/marker lost: '+str(path))
+def remove(path, budget):
+    validate_locks()
+    m=path.lstat();budget[0]+=1
+    if budget[0]>1000000: raise RuntimeError('bootstrap removal budget')
+    if m.st_uid!=uid: raise RuntimeError('bootstrap entry owner')
+    if stat.S_ISDIR(m.st_mode):
+        for p in path.iterdir(): remove(p,budget)
+        check(path,'dir');path.rmdir()
+    elif stat.S_ISREG(m.st_mode) or stat.S_ISLNK(m.st_mode): path.unlink()
+    else: raise RuntimeError('bootstrap special entry')
+try:
+    lease_dir=pathlib.Path(os.environ.get('XTASK_GATE_LEASE_DIR','/tmp')).resolve(strict=True)
+    wait=30
+    args=sys.argv[1:]
+    for index,arg in enumerate(args):
+        if arg=='--': break
+        raw=args[index+1] if arg=='--lease-wait' and index+1<len(args) else arg.split('=',1)[1] if arg.startswith('--lease-wait=') else None
+        if raw is not None:
+            if not raw.isascii() or not raw.isdigit() or int(raw)>2**64-1: raise RuntimeError('invalid --lease-wait')
+            wait=int(raw)
+    if wait>(2**64-1)//60: raise RuntimeError('lease wait overflow')
+    deadline=time.monotonic()+wait*60 # one admission deadline, CLI minutes
+    inherited=inherited_capability(lease_dir)
+    if inherited is None:
+        lock(lease_dir/'r-orch-gate.turnstile',deadline)
+        lock(lease_dir/'r-orch-gate.lease',deadline)
+    if interrupted: sys.exit(128+interrupted)
+    directory(target)
+    marker=lock(target/'.gate-xtask.lock',time.monotonic(),1)
+    validate_locks()
+    if os.path.lexists(boot): check(boot,'dir')
+    if os.path.lexists(stamp):
+        previous=read(stamp,128).strip();stamp.unlink()
+    else: previous=None
+    before=identity()
+    if previous!=before or not (boot/'debug/xtask').is_file():
+        if os.path.lexists(boot): remove(boot,[0])
+        directory(boot)
+    os.environ['CARGO_TARGET_DIR']=str(boot)
+    os.environ['LC_ALL']='C'
+    pin=re.findall(r'^\s*channel\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$',read(repo/'rust-toolchain.toml').decode(),re.M)
+    if len(pin)!=1: raise RuntimeError('numeric pinned toolchain required')
+    os.environ['RUSTUP_TOOLCHAIN']=pin[0]
+    subprocess.run(['rustup','which','cargo'],check=True,stdout=subprocess.DEVNULL)
+    child=subprocess.Popen(['cargo','build','--locked','--quiet','-p','xtask'],stdin=marker)
+    grace=None
+    failure=None
+    kill_end=None
+    while child.poll() is None:
+        if failure is None:
+            try: validate_locks()
+            except Exception as e:
+                failure=str(e);child.terminate();grace=time.monotonic()+2
+        if interrupted and grace is None: grace=time.monotonic()+2
+        if grace is not None and time.monotonic()>=grace:
+            if kill_end is None: child.kill();kill_end=time.monotonic()+3
+            elif time.monotonic()>=kill_end: raise RuntimeError('direct bootstrap child unreaped; target kept; stamp absent')
+        time.sleep(.01)
+    status=child.wait();child=None
+    if failure: raise RuntimeError(failure)
+    validate_locks()
+    if interrupted: sys.exit(128+interrupted)
+    if status: sys.exit(status if status>0 else 128-status)
+    if identity()!=before: raise RuntimeError('judge-source-id changed during bootstrap')
+    publish_executable(before)
+    validate_locks()
+    if identity()!=before: raise RuntimeError('judge-source-id changed after executable publication')
+    if interrupted: sys.exit(128+interrupted)
+    tmp=boot/'judge-id.tmp'
+    fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as f: f.write(before+b'\n');f.flush();os.fsync(f.fileno())
+    if interrupted:
+        tmp.unlink();sys.exit(128+interrupted)
+    validate_locks()
+    os.rename(tmp,stamp)
+    if interrupted:
+        stamp.unlink();sys.exit(128+interrupted)
+    os.environ['XTASK_GATE_JUDGE_ID']=before.decode('ascii')
+    print('bootstrap-lease: '+('inherited' if inherited is not None else 'owned'),flush=True)
+    for fd,path in reversed(locks): os.close(fd)
+    locks=[]
+    os.execv(str(boot/'debug/xtask'),[str(boot/'debug/xtask'),'gate',*sys.argv[1:]])
+except BootstrapBusy as e:
+    detail='unavailable'
+    if e.code==75:
+        try: detail=ascii(read(lease_dir/'r-orch-gate.holder',4096).decode('utf-8',errors='replace'))
+        except Exception: pass
+    print('REFUSED: '+str(e)+'; purpose/holder diagnostics (unvalidated, never signal authority): '+detail,file=sys.stderr)
+    sys.exit(e.code)
+except Exception as e:
+    print('REFUSED: bootstrap: '+str(e),file=sys.stderr)
+    sys.exit(128+interrupted if interrupted else 1)
+PYTHON

@@ -77,6 +77,11 @@ fn written(daemon: &DaemonHarness, task: &str) -> (String, u64, std::time::Syste
 /// starved by it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_workspace_failure_before_spawn_counts_an_attempt_and_backs_off() {
+    if orch_daemon::testing::capture_test_output(
+        "a_workspace_failure_before_spawn_counts_an_attempt_and_backs_off",
+    ) {
+        return;
+    }
     let clock = support::TestClock::new();
     let daemon = DaemonHarness::builder()
         .clock(clock.clone())
@@ -214,6 +219,11 @@ async fn an_agent_file_newer_than_its_index_entry_still_launches() {
 /// tick is the per-candidate cost, independent of the tick's own operations.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_workspace_failure_commits_once_after_its_selection() {
+    if orch_daemon::testing::capture_test_output(
+        "a_workspace_failure_commits_once_after_its_selection",
+    ) {
+        return;
+    }
     let daemon = DaemonHarness::builder()
         .clock(support::TestClock::new())
         .maintenance_timer(false)
@@ -276,6 +286,9 @@ async fn a_workspace_failure_commits_once_after_its_selection() {
 /// that can never finish.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_final_workspace_failure_fails_its_dependents() {
+    if orch_daemon::testing::capture_test_output("a_final_workspace_failure_fails_its_dependents") {
+        return;
+    }
     let daemon = DaemonHarness::builder()
         .clock(support::TestClock::new())
         .maintenance_timer(false)
@@ -491,6 +504,11 @@ impl ProcessManager for Probes {
 /// the boundary across candidates would serve neither until it ended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_read_queued_during_a_failure_batch_is_served_before_the_batch_ends() {
+    if orch_daemon::testing::capture_test_output(
+        "a_read_queued_during_a_failure_batch_is_served_before_the_batch_ends",
+    ) {
+        return;
+    }
     const CANDIDATES: usize = 8;
     const PARK: usize = 3;
     const READ: u64 = 1_000_104;
@@ -766,6 +784,11 @@ async fn assert_backed_off(
 /// It must cost an attempt and back off like any failed preparation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blocked_workspaces_directory_counts_an_attempt_and_backs_off() {
+    if orch_daemon::testing::capture_test_output(
+        "a_blocked_workspaces_directory_counts_an_attempt_and_backs_off",
+    ) {
+        return;
+    }
     let clock = support::TestClock::new();
     let tools = Arc::new(Tools::default());
     let daemon = DaemonHarness::builder()
@@ -829,6 +852,11 @@ async fn a_blocked_workspaces_directory_counts_an_attempt_and_backs_off() {
 /// must cost an attempt and back off; the agent itself never starts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_isolated_rsync_counts_an_attempt_and_backs_off() {
+    if orch_daemon::testing::capture_test_output(
+        "a_failed_isolated_rsync_counts_an_attempt_and_backs_off",
+    ) {
+        return;
+    }
     let clock = support::TestClock::new();
     let tools = Arc::new(Tools::default());
     let daemon = DaemonHarness::builder()

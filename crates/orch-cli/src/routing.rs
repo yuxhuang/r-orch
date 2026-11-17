@@ -288,6 +288,11 @@ mod tests {
 
     #[test]
     fn help_and_version_are_exit_zero() {
+        if orch_daemon::testing::capture_test_output(
+            "routing::tests::help_and_version_are_exit_zero",
+        ) {
+            return;
+        }
         use crate::tree::Cli;
         use clap::Parser;
 

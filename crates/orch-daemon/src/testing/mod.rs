@@ -16,6 +16,15 @@
 //! at a short path under `/tmp`, is retained until accepted work drains. Nothing
 //! here dials a daemon the harness did not start.
 
+mod output;
+/// Capture this exact test in a private process before running its scenario.
+/// Return from the caller when true; false means the isolated child should run
+/// the unchanged body. The parent checks status, framing and private HOME, and
+/// retains both child streams as labelled diagnostics on failure.
+pub fn capture_test_output(name: &str) -> bool {
+    output::capture_test_output(name)
+}
+
 use crate::DaemonError;
 use crate::lifecycle::{BringUp, DaemonExit, DispatchMode, Running, internal_context};
 use crate::ops::ServiceHandler;

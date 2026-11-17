@@ -833,3 +833,16 @@ library skills are ORCH's adaptations of [`garrytan/gstack`](https://github.com/
 `orch web` serves a vendored xterm.js (MIT). That material keeps its MIT licence;
 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) lists each component with its full licence text, and says what to
 ship with a built binary or package.
+
+
+### Tiered verification work
+
+The PR1 folded gate is under repair: `./xtask/gate.sh full` is the goal/release
+check, and `pr` is the proposed merge tier after the owner applies the policy
+transition. Existing required check/test jobs still stand. Exit0 alone is not
+qualifying evidence; verify the exact-head bundle's `qualifying: yes` field.
+The wrapper publishes private single-link Cargo output before its source stamp;
+direct unstamped invocations remain development checks. Preserve unfinished
+markers/targets, and share only verified redacted exports. See the
+[gate runbook](docs/RUNBOOK.md#tiered-gate-evidence-during-pr1-repair) for current
+limits and [the plan](docs/plans/2026-11-14-tiered-checks.md) for PR2–6.

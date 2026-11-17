@@ -5,6 +5,19 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Development tooling
+
+- Label cooperative gate contention by admission or requested lease mode.
+- Isolate the immediate shared-lease fixture and create message-test capture directories with explicit private permissions.
+- Retain interrupted gate targets when capture or EOF collection remains unresolved.
+- Refuse unsafe known-secret exports before publication and witness removed environment names.
+- Capture noisy test diagnostics in test processes while preserving failure output.
+- Publish private single-link bootstrap executables before source stamps, preserving strict judge checks.
+
+These PR1 repairs remain incomplete pending native/diagnostic conditions and final-head acceptance;
+existing required checks and later tier stages are unchanged.
+
+
 ## [1.0.0] - 2026-11-14
 
 ### 1.0.0: explicit project daemons

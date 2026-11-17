@@ -386,6 +386,11 @@ mod tests {
     /// startup warning, with the agent split back out of the bootstrap line.
     #[tokio::test]
     async fn serve_once_logs_one_diagnostic_record_per_startup_warning() {
+        if orch_daemon::testing::capture_test_output(
+            "commands::run::tests::serve_once_logs_one_diagnostic_record_per_startup_warning",
+        ) {
+            return;
+        }
         let mut cursor = agent("agt_cur2", "cur2");
         cursor.adapter = "cursor".into();
         cursor.config.effort = Some(orch_domain::ReasoningEffort::High);

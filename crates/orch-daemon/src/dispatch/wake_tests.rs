@@ -7,6 +7,16 @@ use orch_domain::OrchestratorEvent;
 use orch_engine::container::commit::{CommitSource, CommitStore};
 use orch_proto::ops::args::{DispatchSetArgs, DispatchSwitch};
 
+// Paused-clock lock assertions need to own their filesystem descriptions.
+// Another test's in-flight fork can otherwise retain an index lock until exec;
+// a storage retry then sleeps on the clock that this rig deliberately holds.
+fn capture_wake_test(name: &str) -> bool {
+    #[cfg(feature = "testing")]
+    return crate::testing::capture_test_output(name);
+    #[cfg(not(feature = "testing"))]
+    crate::test_output::capture_test_output(name)
+}
+
 struct Rig {
     _temp: tempfile::TempDir,
     handler: ServiceHandler,
@@ -132,6 +142,9 @@ async fn advance(ms: u64) {
 
 #[tokio::test(start_paused = true)]
 async fn a_peer_origin_commit_wakes_the_scheduler() {
+    if capture_wake_test("dispatch::wake_tests::a_peer_origin_commit_wakes_the_scheduler") {
+        return;
+    }
     let mut rig = Rig::new(true).await;
     rig.commit(CommitSource::Peer).await;
     advance(499).await;
@@ -142,6 +155,11 @@ async fn a_peer_origin_commit_wakes_the_scheduler() {
 
 #[tokio::test(start_paused = true)]
 async fn hundred_commits_coalesce_and_noop_tick_does_not_self_wake() {
+    if capture_wake_test(
+        "dispatch::wake_tests::hundred_commits_coalesce_and_noop_tick_does_not_self_wake",
+    ) {
+        return;
+    }
     let mut rig = Rig::new(true).await;
     for _ in 0..100 {
         rig.commit(CommitSource::Rpc).await;
@@ -277,6 +295,11 @@ async fn until(what: &str, mut done: impl AsyncFnMut() -> bool) {
 
 #[tokio::test(start_paused = true)]
 async fn continuous_traffic_cannot_postpone_first_wake_and_rate_is_bounded() {
+    if capture_wake_test(
+        "dispatch::wake_tests::continuous_traffic_cannot_postpone_first_wake_and_rate_is_bounded",
+    ) {
+        return;
+    }
     let mut rig = Rig::new(true).await;
     let mut ticks = 0;
     for n in 1..=50 {
@@ -298,6 +321,9 @@ async fn continuous_traffic_cannot_postpone_first_wake_and_rate_is_bounded() {
 
 #[tokio::test(start_paused = true)]
 async fn off_commits_do_not_tick_and_on_rearms() {
+    if capture_wake_test("dispatch::wake_tests::off_commits_do_not_tick_and_on_rearms") {
+        return;
+    }
     let mut rig = Rig::new(false).await;
     rig.commit(CommitSource::Rpc).await;
     advance(2000).await;
@@ -317,6 +343,9 @@ async fn off_commits_do_not_tick_and_on_rearms() {
 
 #[tokio::test(start_paused = true)]
 async fn empty_context_maintenance_does_not_wake() {
+    if capture_wake_test("dispatch::wake_tests::empty_context_maintenance_does_not_wake") {
+        return;
+    }
     let mut rig = Rig::new(true).await;
     let before = rig.handler.coordinator.current_commit_seq();
     assert_eq!(rig.handler.expire_context().await.unwrap(), 0);
@@ -335,6 +364,11 @@ async fn empty_context_maintenance_does_not_wake() {
 
 #[tokio::test(start_paused = true)]
 async fn eligible_task_launches_at_500ms_not_the_60s_periodic_deadline() {
+    if capture_wake_test(
+        "dispatch::wake_tests::eligible_task_launches_at_500ms_not_the_60s_periodic_deadline",
+    ) {
+        return;
+    }
     let rig = Rig::new(true).await;
     let task = rig.task(vec![]).await;
     advance(499).await;
@@ -357,6 +391,11 @@ async fn eligible_task_launches_at_500ms_not_the_60s_periodic_deadline() {
 
 #[tokio::test(start_paused = true)]
 async fn a_collector_completion_spawned_by_a_tick_wakes_the_scheduler() {
+    if capture_wake_test(
+        "dispatch::wake_tests::a_collector_completion_spawned_by_a_tick_wakes_the_scheduler",
+    ) {
+        return;
+    }
     let mut rig = Rig::new(true).await;
     let first = rig.task(vec![]).await;
     let dependent = rig.task(vec![first.id.clone()]).await;
@@ -398,6 +437,11 @@ async fn a_collector_completion_spawned_by_a_tick_wakes_the_scheduler() {
 
 #[tokio::test(start_paused = true)]
 async fn prelaunch_failure_preserves_backoff_under_commit_traffic() {
+    if capture_wake_test(
+        "dispatch::wake_tests::prelaunch_failure_preserves_backoff_under_commit_traffic",
+    ) {
+        return;
+    }
     let mut rig = Rig::new(true).await;
     rig.processes
         .fail
@@ -464,6 +508,11 @@ impl Processes {
 
 #[tokio::test(start_paused = true)]
 async fn commits_during_a_tick_schedule_exactly_one_followup() {
+    if capture_wake_test(
+        "dispatch::wake_tests::commits_during_a_tick_schedule_exactly_one_followup",
+    ) {
+        return;
+    }
     let mut rig = Rig::new(true).await;
     rig.task_with(vec![], true, None).await;
     advance(500).await;
@@ -497,6 +546,11 @@ async fn commits_during_a_tick_schedule_exactly_one_followup() {
 
 #[tokio::test(start_paused = true)]
 async fn concurrent_goal_pause_prevents_launch_from_pending_wake() {
+    if capture_wake_test(
+        "dispatch::wake_tests::concurrent_goal_pause_prevents_launch_from_pending_wake",
+    ) {
+        return;
+    }
     use orch_proto::ops::args::{GoalCreateArgs, GoalStatusArgs};
     let mut rig = Rig::new(true).await;
     let ctx = internal_context();
@@ -550,6 +604,11 @@ async fn concurrent_goal_pause_prevents_launch_from_pending_wake() {
 
 #[tokio::test(start_paused = true)]
 async fn stopping_and_lost_ownership_are_rechecked_at_wake_execution() {
+    if capture_wake_test(
+        "dispatch::wake_tests::stopping_and_lost_ownership_are_rechecked_at_wake_execution",
+    ) {
+        return;
+    }
     for lost in [false, true] {
         let mut rig = Rig::new(true).await;
         rig.task(vec![]).await;
@@ -566,6 +625,9 @@ async fn stopping_and_lost_ownership_are_rechecked_at_wake_execution() {
 
 #[tokio::test(start_paused = true)]
 async fn nonempty_context_expiry_still_wakes() {
+    if capture_wake_test("dispatch::wake_tests::nonempty_context_expiry_still_wakes") {
+        return;
+    }
     use orch_proto::ops::args::ContextSetArgs;
     let mut rig = Rig::new(true).await;
     Handler::context_set(
@@ -656,6 +718,10 @@ impl Rig {
 
 #[tokio::test(start_paused = true)]
 async fn all_external_sources_wake_but_manual_tick_does_not() {
+    if capture_wake_test("dispatch::wake_tests::all_external_sources_wake_but_manual_tick_does_not")
+    {
+        return;
+    }
     let mut rig = Rig::new(true).await;
     for source in [
         CommitSource::Rpc,
@@ -914,6 +980,11 @@ async fn linked_idle_peer_wake_ticks_over_ten_seconds() {
 
 #[tokio::test(start_paused = true)]
 async fn peer_wake_preserves_its_commit_without_a_redundant_state_commit() {
+    if capture_wake_test(
+        "dispatch::wake_tests::peer_wake_preserves_its_commit_without_a_redundant_state_commit",
+    ) {
+        return;
+    }
     let mut rig = Rig::new(true).await;
     for _ in 0..2 {
         let before = rig.handler.engine.operation_boundary().current_commit_seq();

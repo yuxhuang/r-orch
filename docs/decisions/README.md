@@ -58,5 +58,8 @@ What gets easier, what gets harder, what must change as a result.
 | [0009](0009-remove-parity-tooling.md) | Remove parity validation and tooling | accepted |
 | [0011](0011-mcp-server.md) | A stdio MCP server in `orch-cli`, built on rmcp | accepted; decision 7 and the concurrent-sessions consequence superseded by 0012 |
 | [0012](0012-daemon-owned-state.md) | One explicit project daemon owns state | accepted |
+| [0013](0013-tiered-verification-gates.md) | Tiered verification gates with one folded suite run | accepted; named clauses of decisions 30 and 31 superseded by 0014, which also qualifies decisions 14, 15, 17 and 21 |
+| [0014](0014-gate-target-recovery-and-selection-coupling.md) | Gate targets change only after their writers have ceased; a selected `orch-cli` couples `orch-infra` | accepted; a partial successor of 0013: supersedes only named clauses of its decisions 30 and 31 and qualifies its decisions 14, 15, 17 and 21. The clauses of its decisions 32–38 that demand independently established cessation are overridden by the owner's decision recorded in 0015 (decision 41) |
+| [0015](0015-cooperative-gate-target-recovery.md) | A use of a gate target is finished when the processes the gate started have exited under the cooperative lease | proposed. Decision 41 records the owner's decision of 2026-11-15 and is binding; decisions 42–47, the implementation contract, are proposed and would supersede named clauses of 0014 decisions 32–36 and 38 |
 
 `docs/reviews/` holds historical gate reviews from the early port-era work; new material does not go there.

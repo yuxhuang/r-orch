@@ -816,6 +816,11 @@ async fn maintenance_reconciles_adopted_death_without_dispatch_or_idle_publicati
 /// removing an expired marker proves a complete owner pass has happened.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn maintenance_errors_are_deduplicated_until_a_successful_pass() {
+    if orch_daemon::testing::capture_test_output(
+        "maintenance_errors_are_deduplicated_until_a_successful_pass",
+    ) {
+        return;
+    }
     async fn pass(daemon: &DaemonHarness, clock: &TestClock) {
         daemon
             .engine()

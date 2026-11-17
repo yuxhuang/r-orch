@@ -257,6 +257,11 @@ async fn live_logs(daemon: &DaemonHarness) -> Raw {
 
 #[tokio::test]
 async fn the_log_stream_delivers_the_whole_burst_in_order_before_cancel() {
+    if orch_daemon::testing::capture_test_output(
+        "the_log_stream_delivers_the_whole_burst_in_order_before_cancel",
+    ) {
+        return;
+    }
     let daemon = daemon().await;
     let mut raw = live_logs(&daemon).await;
     for n in 0..5 {
@@ -317,6 +322,11 @@ async fn listener(daemon: &DaemonHarness) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn peer_handshakes_use_the_ready_daemon_before_any_dispatch_tick() {
+    if orch_daemon::testing::capture_test_output(
+        "peer_handshakes_use_the_ready_daemon_before_any_dispatch_tick",
+    ) {
+        return;
+    }
     use orch_peer::codec::read_frame;
     use orch_peer::protocol::Frame;
     use tokio::io::{AsyncWriteExt, BufReader};
