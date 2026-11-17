@@ -1817,9 +1817,10 @@ fn real_wrapped_fast_shared_holders_coexist_and_same_target_refuses_tv61_rs1() {
             "0",
             "--host-label",
             "fast",
-            "fast",
             "--base",
             "HEAD",
+            "--",
+            "fast",
         ])
         .env("XTASK_GATE_LEASE_DIR", &lease);
     let mut second = b.spawn(&mut options_first);

@@ -209,6 +209,7 @@ try:
             index=0
             while index<len(args):
                 arg=args[index]
+                if arg=='--': return index+1<len(args) and args[index+1]=='fast'
                 if arg in values: index+=2;continue
                 if any(arg.startswith(option+'=') for option in values) or arg in flags:
                     index+=1;continue
