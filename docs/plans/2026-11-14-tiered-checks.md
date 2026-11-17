@@ -1,5 +1,17 @@
 # Tiered verification checks — plan
 
+## PR3 configured hosted lease amendment — 2026-11-17 (before code)
+
+The lead's approved node J start resolves open item 19(b) for CI: replace the
+historical section 7 command using `--no-lease` with the normal configured
+exclusive lease, bounded `--lease-wait 5` and `--host-label github-hosted-linux`.
+The existing lifecycle refuses `--no-lease`; there is no target/marker bypass.
+The [PR3 supplement](2026-11-17-pr3-ci.md) records the implementation sequence,
+separate-runner and partial-evidence limits, and a concrete partial-receipt export
+hold. Workflow implementation has not started while that hold is unresolved.
+Historical amendment text below is retained; no goal acceptance or policy-rule
+transition is marked complete. Owner alone applies the reviewed rules split.
+
 ## PR85 witness correction — 2026-11-17 (before code)
 
 Follow [the narrow correction plan](2026-11-17-pr85-witness-correction.md).
