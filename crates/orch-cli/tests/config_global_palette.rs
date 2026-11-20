@@ -42,6 +42,9 @@ fn orch(root: &Path) -> Command {
     let mut command = Command::cargo_bin("orch").expect("the orch binary");
     command
         .current_dir(root.join("project"))
+        // Keep the client project aligned with its private daemon socket even
+        // when the test runner inherits a different project-root override.
+        .env("ORCH_PROJECT_ROOT", root.join("project"))
         .env("HOME", root.join("home"))
         .env("ORCHESTRY_GLOBAL_CONFIG_PATH", root.join("home/global.yml"))
         .env("NO_COLOR", "1")
