@@ -143,6 +143,8 @@ Read from the code at `fb6a1e1` (v1.0.0) unless marked unverified.
 | F9 | An exclusive `flock` taken through a read-only descriptor conflicts with the 1.0 daemon's lock on macOS and Linux and changes nothing in the file. | unverified; R31's test settles it |
 | F10 | Suspending the machine does not, by itself, end a local agent process or the daemon's supervision of it. | unverified; deliverable E models a suspend as elapsed time, and R42's recorded check settles it on a real machine |
 | F11 | `orch init` writes `templates/default.md`, `workspace-exclude` and `.gitignore` and creates `logs/` under `.orchestry/` (`crates/orch-daemon/src/bootstrap.rs`). The workspace manager reads `workspace-exclude` for every isolated workspace (`crates/orch-infra/src/workspace/manager.rs`). A search of the product sources found no reader of `templates/default.md` and no writer of `logs/`: the prompt comes from the configuration's template strings or the built-in default. | verified by search |
+| F12 | 1.0 reads every YAML document (`tasks/`, `agents/`, `goals/`, `teams/`, `config.yml`) through one guarded reader (`crates/orch-core/src/definition_yaml.rs`, `parse_yaml_bytes`): at most 1,048,576 bytes, at most 64 aliases, at most 200,000 nodes after expansion, counted exactly from the parser's events without expanding anything, and an alias inside its own anchor refused. Only then does `serde_yaml_ng` build the value, and merge keys are resolved (`apply_merge`). It once had a 2 s deadline and removed it, because a deadline cannot stop a parse that is already running. It has no depth rule of its own: `serde_yaml_ng` 0.10.0 accepts 128 nested collections and refuses 129, and `saphyr-parser` 0.2.2 refuses deep flow nesting, each with an error and no stack overflow. A typed field ignores an explicit tag (`id: !custom abc` reads as `abc`, `!!binary YWJj` as the text `YWJj`). Nothing 1.0 writes holds an alias, a merge key or a tag: the types stored as YAML have only unit enums. JSON documents (`runs/*.json`, `messages/`, `context/`, `state.json`, every `_index.json`) are read whole, with no limit on size or node count; `serde_json` 1.0.154 refuses a value nested 128 deep. | verified in the code at `fb6a1e1`; the parser behaviour by a probe outside the repository (the review's 40,001-byte document of depth 20,000 and its 412-byte alias document), macOS |
+| F13 | SQLite 3.54.1, the version decision 19 bundles, on a file it did not write: by default a connection trusts the schema, runs views and triggers and is not in defensive mode. With `SQLITE_LIMIT_LENGTH` lowered, reading a stored value over the limit fails (`string or blob too big`) and reading its length does not. A connection opened `mode=ro&immutable=1` reads the one file: it ignores a journal and a write-ahead log planted beside it and creates no file, and it reads a file in write-ahead-log format without its log, which is a stale answer and not an error. An authorizer that denies by default refuses a generated column, a function, a virtual table, `ATTACH`, a pragma and a read of `sqlite_schema` that it does not list. `PRAGMA quick_check(1)` reports a page that two parents reference, where a plain scan of that table returns rows and no error. `PRAGMA hard_heap_limit` turns a schema too large for it into an out-of-memory error, `SQLITE_LIMIT_SCHEMA` refuses a file with more schema objects than it allows, and a progress handler interrupts `quick_check`. `rusqlite` 0.41.1 offers the limits and the authorizer and progress handler without `unsafe`, under its features `limits` and `hooks`, which add no crate. | verified by a probe outside the repository on SQLite 3.54.1 as another build than the bundled one (macOS), and by reading `rusqlite` 0.41.1 and the bundled build's flags (it does not turn memory statistics off, which the heap limit needs); R113's tests repeat each point on the bundled build |
 
 ## Requirements
 
@@ -187,7 +189,7 @@ their names are forward references.
 | R30 | When a daemon or an offline command is pointed at a data directory that another holds, it shall change nothing, exit 4 and print the holder's kind, pid and start time. | B5, G6 | must | `crates/orch-daemon/tests/daemon_data_dir.rs::second_daemon_refuses_and_names_the_holder`, `crates/orch-cli/tests/db_offline.rs::offline_command_refuses_while_a_daemon_holds_the_directory`; both |
 | R31 | While a 1.1 daemon or `orch import` runs for a project directory, a 1.0 daemon shall not be able to start on it, and a 1.1 daemon shall refuse to start while a 1.0 daemon holds it; neither shall create or write a 1.0 file. Where the 1.0 lock file does not exist (no 1.0 daemon ever ran there), or if F9 proves false, 1.1 shall only refuse while a 1.0 daemon answers, and the manual shall say that the exclusion is then a procedure and not a lock. | B2, F9 | must | `crates/orch-daemon/tests/daemon_legacy_lock.rs::legacy_owner_lock_is_held_without_writing`, `::start_is_refused_while_a_legacy_daemon_holds_the_project`, `::an_absent_legacy_lock_file_is_not_created`; both |
 | R32 | The daemon shall refuse to start when the data directory is on a network filesystem. | B12 | must | `daemon_data_dir::network_filesystem_is_refused` (injected filesystem type); both |
-| R33 | The data directory shall be `ORCH_DATA_DIR` when set (absolute, else exit 2), otherwise the directory that the project's record under `<data home>/projects/` names (R107), which `orch init` and `orch import` write when they create `<data home>/<name>`; the data home is `ORCH_DATA_HOME` or `~/.orchestry/daemons`; the repository's cargo configuration shall set `ORCH_DATA_HOME` inside `target/`. (O1) | B5, DL | must | `daemon_data_dir::default_name_is_derived_from_the_project_directory`, `::the_project_record_names_the_directory`, `::relative_override_is_refused`; `./xtask/gate.sh pr` `real-home` step unchanged; both |
+| R33 | The data directory shall be `ORCH_DATA_DIR` when set (absolute, else exit 2), otherwise the directory that the project's record under `<data home>/projects/` names (R107), which `orch init` and `orch import` write when they create `<data home>/<name>` (an import from an export file writes it when its database is published, R115); the data home is `ORCH_DATA_HOME` or `~/.orchestry/daemons`; the repository's cargo configuration shall set `ORCH_DATA_HOME` inside `target/`. (O1) | B5, DL | must | `daemon_data_dir::default_name_is_derived_from_the_project_directory`, `::the_project_record_names_the_directory`, `::relative_override_is_refused`; `./xtask/gate.sh pr` `real-home` step unchanged; both |
 | R34 | `orch init` and `orch import` shall write `.orch-project` (the project id and a newline) in the project directory; a client shall find the project by `ORCH_SOCKET`, then `ORCH_PROJECT_ROOT`, then the nearest ancestor holding `.orch-project`; a directory with 1.0 state and no `.orch-project` shall get exit 3 and the hint `orch import --dry-run`. When the project directory is not the one the database records, the daemon shall adopt the new path if the recorded one no longer holds that project id (a move) and refuse, naming both paths, if it still does (a copy). (O1) | O1 | must | `crates/orch-cli/tests/project_pointer.rs::client_finds_the_project_by_pointer`, `::unimported_project_gets_the_import_hint`, `::a_moved_project_keeps_its_state`, `::a_copied_project_is_refused_with_both_paths`; both |
 | R35 | Starting a run shall be one transaction: the lease, the epoch, the run row, the task's status and attempts, the removal of its retry row and the intent to start the process. | H | must | `crates/orch-engine/tests/transactions.rs::start_run_is_all_or_nothing` (a stop injected before and after each statement); both |
 | R36 | Finishing a run shall be one transaction: the run's outcome and usage, its result row, the task's next status, its retry row or its `landing_state`, the release of the lease, the agent's totals and position, and the intents to clean up. A finish that names a stale epoch shall change only that run's row. | H | must | `transactions::finish_run_is_all_or_nothing`, `::finish_with_a_stale_epoch_changes_only_the_run`; both |
@@ -219,9 +221,9 @@ their names are forward references.
 | R62 | The `events.prune` job shall delete the events of a run that finished successfully more than `retention.events.success_days` (90) ago or otherwise more than `retention.events.failed_days` (365) ago, shall skip a class set to `never`, shall record `events_pruned_at` and `events_pruned_count` on the run, and shall never delete a run, a result or a blob named by one. | M, B10 | must | `maintenance::events_are_pruned_by_outcome_and_age`, `::never_disables_pruning`, `::results_survive_pruning`, `::an_interrupted_prune_resumes`; both |
 | R63 | The measured throughput shall meet the budget of "Writer lanes", or events shall be stored by the event fallback of "Writer lanes", behind the same port operations. (AP13) | G7, D | must | The record of R5; if the fallback ships, the `storage_conformance` event scenarios pass on it and it is measured against the same budget before its PR merges; macOS and native Linux |
 | R64 | `orch import` shall open every source file read-only and create, change or delete nothing under the source `.orchestry/`. | N, B2 | must | `crates/orch-cli/tests/import.rs::source_tree_is_byte_identical_after_import` (content and metadata snapshot; source made read-only); both |
-| R65 | `orch import --dry-run` shall write nothing anywhere and shall report the counts per entity, every file it cannot read, every unknown key, every dangling reference, every field over 64 KiB, the policy it would turn on, the in-flight state it would close and the space it needs. | N, O7 | must | `import::dry_run_writes_nothing`, `::dry_run_report_lists_every_problem_class` (pathology corpus); both |
-| R66 | `orch import` shall read its source in bounded memory and bounded transactions, refuse a source file over the bounds in "Import rules", and commit an entity and its `import_manifest` row together. | N | must | `import::memory_stays_bounded_on_a_large_project` (generated corpus of the live project's shape), `::oversize_source_file_is_refused_by_name`; both |
-| R67 | When an import was stopped part-way, `orch import --resume` shall continue from the manifest, shall refuse when a source file it already imported has changed, and the daemon shall refuse to start on an unfinished import. | N | must | `import::resume_completes_an_interrupted_import` (stops injected at every batch boundary), `::resume_refuses_a_changed_source`, `daemon_data_dir::unfinished_import_is_refused`; both |
+| R65 | `orch import --dry-run` shall write nothing anywhere and shall report the counts per entity, every file it cannot read, every source entry that a budget of "Import bounds" refuses (with the rule, the limit and what was observed), every unknown key, every dangling reference, every field over 64 KiB, the policy it would turn on, the in-flight state it would close and the space it needs. | N, O7 | must | `import::dry_run_writes_nothing`, `::dry_run_report_lists_every_problem_class` (pathology corpus, with the hostile corpus of "Import bounds"); both |
+| R66 | `orch import` shall read its source in bounded memory and bounded transactions, refuse a source file over the byte bounds in "Import bounds" (R109 has the budgets inside a document, R111 the event lines and the counts), and commit an entity and its `import_manifest` row together. | N; security review S1 | must | `import::memory_stays_bounded_on_a_large_project` (generated corpus of the live project's shape), `::oversize_source_file_is_refused_by_name`; both |
+| R67 | When an import from a 1.0 directory was stopped part-way, `orch import --resume` shall continue from the manifest, shall refuse when a source file it already imported has changed, and the daemon shall refuse to start on an unfinished import. An import from an export file leaves nothing to resume (R115): `--resume` with an export file shall be refused with exit 2. | N; security review S1 | must | `import::resume_completes_an_interrupted_import` (stops injected at every batch boundary), `::resume_refuses_a_changed_source`, `daemon_data_dir::unfinished_import_is_refused`, `crates/orch-cli/tests/db_export_import.rs::resume_is_refused_for_an_export_file`; both |
 | R68 | `orch import` shall refuse, changing nothing, when a 1.0 or 1.1 daemon holds the project or the data directory, when the data directory already holds a finished project, or when free space is under the disk floor plus the estimate. (O3) | N, O3 | must | `import::refuses_while_a_daemon_runs`, `::refuses_a_second_project`, `::refuses_without_space`; both |
 | R69 | An imported project shall keep its ids, its order (`position` from each `_index.json`), its retry queue, its totals and its runs; state that was in flight shall be closed as 1.0's reconcile would close it when its process is gone (R105); every task's next epoch shall be above every epoch given to its imported runs. | N | must | `import::order_and_rotation_survive_import` (the order scenarios run on the imported database), `::in_flight_state_is_closed`, `::epochs_continue_after_import`; both |
 | R70 | A known `config.yml` key shall be imported to its setting; unknown keys shall be stored in the `legacy.config` object, at most 64 KiB, which the daemon never reads; `scheduling.max_concurrent_agents` shall become the project's optional `run_cap`; a project with an agent whose policy is `auto` shall be imported with `preapproval` on. (O7) | N, O7, B14 | must | `import::unknown_config_keys_go_to_the_legacy_object`, `::max_concurrent_agents_becomes_run_cap`, `::auto_policy_turns_preapproval_on`; both |
@@ -234,7 +236,7 @@ their names are forward references.
 | R77 | A restore shall start a new generation; no epoch issued before it, by the replaced state or by the backup, shall be issued after it. | O, G9 | must | `crates/orch-cli/tests/restore_fencing.rs::no_epoch_is_reused_after_restore`, `::generation_grows_even_onto_an_empty_directory`; both |
 | R78 | A restore shall list every identity and token that the backup holds enabled, mark those the replaced state had disabled or revoked, and proceed only on a typed confirmation or `--yes`; without a terminal and without `--yes` it shall exit 2. | O, G9 | must | `restore_fencing::restore_lists_reenabled_identities_and_tokens`, `::restore_without_confirmation_changes_nothing`; both |
 | R79 | `orch db prune` shall run the event pruning now, with `--dry-run` and `--older-than`, and `orch db vacuum` shall rebuild the database with the daemon stopped. | O | must | `db_commands::prune_dry_run_deletes_nothing`, `crates/orch-cli/tests/db_offline.rs::vacuum_runs_offline_and_keeps_every_row`; both |
-| R80 | `orch db export` shall write one file holding one project's rows and blob bytes; `orch import --from <file>` into an empty data directory shall reproduce every exported row and every blob hash. | O, B8, G4 | must | `crates/orch-cli/tests/db_export_import.rs::export_then_import_reproduces_every_row_and_hash`, `::a_truncated_export_is_refused`; both |
+| R80 | `orch db export` shall write one file holding one project's rows and blob bytes, in the export format of "Import bounds"; `orch import --from <file>` into a data directory that holds no database shall reproduce every exported row and every blob hash. The product's own export shall pass every check and limit that R113 and R114 put on an export. | O, B8, G4; security review S1 | must | `crates/orch-cli/tests/db_export_import.rs::export_then_import_reproduces_every_row_and_hash`, `::a_truncated_export_is_refused`, `crates/orch-cli/tests/export_hostile.rs::the_products_own_export_passes_every_limit` (with blobs of 0 bytes, of 1,048,576 bytes and of one byte more); both |
 | R81 | Only the daemon shall write the attention queue; at most one open item shall exist per project, kind and subject; the owner shall be able to list, show and acknowledge items. | P | must | `crates/orch-engine/tests/attention.rs::one_open_item_per_subject`, `crates/orch-cli/tests/attention.rs::owner_lists_and_acknowledges`; both |
 | R82 | While free space is under the floor, a blocking `disk_floor` item shall be open; it shall resolve by itself when free space is back above the floor plus 1 GiB. | P, B11 | must | `attention::disk_floor_opens_and_resolves` (disk probe seam); both |
 | R83 | While dispatch is off and a task that could be dispatched has waited 10 minutes, a warning `dispatch_off_with_work` item shall be open; it shall resolve when dispatch turns on or no such task remains. | P | must | `attention::dispatch_off_with_work_opens_and_resolves` (fake clock); both |
@@ -263,6 +265,14 @@ their names are forward references.
 | R106 | The daemon shall address a task's workspace only as `workspaces/<task id>` below the project's `.orchestry/`, never by a stored path, after checking that the id is one name of `A-Z a-z 0-9 . _ -` other than `.` and `..` and that neither `workspaces` nor that entry is a symbolic link. It shall merge or delete the branch of a task's local run only when the name stored for that run (`runs.branch`) is `orchestry/<task id>/` followed either by 1 to 40 characters of `a-z 0-9 -` or by the task id again, which is 1.0's name when the title gives no slug. Otherwise it shall fail the step with `workspace` and change nothing in the project directory or its repository. (AP14) | security review S2; 1.0 merges and deletes the branch a task document names (`orchestrator/collect.rs`, `workspace/manager.rs`) | must | `crates/orch-infra` workspace tests `a_task_id_that_is_not_one_name_gets_no_workspace`, `a_link_at_the_workspace_name_is_refused` (outside canary), `crates/orch-engine/tests/intents.rs::workspace_remove_takes_a_task_id_never_a_path`, `crates/orch-engine/tests/transactions.rs::a_stored_branch_of_another_shape_is_neither_merged_nor_deleted` (a run whose `branch` is `main`, and one whose branch names another task); both |
 | R107 | `.orch-project` shall be read without following a link and accepted only as a regular file of at most 64 bytes holding one project id of 1 to 63 bytes of `A-Z a-z 0-9 _ -` and a newline; a pointer that exists and is anything else shall get exit 2, naming the file, and only an absent one exit 3 (R34). It shall be written only by an exclusive create that follows no link; an entry already at that name shall be left as it is and shall stop the command unless it is a valid pointer to this project. The record of a project's data directory shall be the file `<data home>/projects/<64 hex digits of the SHA-256 of the project id>`, read without following a link and accepted only as a regular file of at most 4,096 bytes holding one absolute path and a newline, else exit 2 naming the record; the directory it names shall pass R29's checks before anything in it is opened. A project id read from an export shall pass the pointer's check before it is stored. | security review S2 (the pointer file comes with a checkout and an export file from elsewhere, and the project id named the record file) | must | `crates/orch-cli/tests/project_pointer.rs::a_pointer_that_is_not_one_project_id_is_refused_with_exit_2` (a traversal-shaped id, an absolute path, a NUL, a separator, two lines, 65 bytes, a symbolic link), `::a_link_at_the_pointer_name_is_never_written_through` (`orch init` and `orch import` with `.orch-project`, `.orchestry/.gitignore` and `workspace-exclude` planted as links to an outside canary), `crates/orch-daemon/tests/daemon_data_dir.rs::the_project_record_is_named_by_the_hash_of_the_id`, `::a_record_that_is_not_one_absolute_path_is_refused` (a link, a relative path, two lines, 4,097 bytes, a directory open to others), `db_export_import::a_project_id_outside_the_alphabet_is_refused`; both |
 | R108 | `orch db restore` and `orch import --from` shall reach a backup's or an export's contents only by the fixed layout and by hashes they compute. A restore shall list the backup as R102 says and refuse it, before any change, unless the listed names and the manifest's names are the same set and each is a name of the backup layout in "Data directory". An import shall store a blob of an export under the hash of its bytes and refuse a blob whose stated hash differs, and shall refuse a task id that fails R104's check before it stores the row. No name read from a manifest or an export shall be opened as a path. | security review S2 | must | `crates/orch-cli/tests/db_backup_restore.rs::a_manifest_name_outside_the_layout_is_refused_before_any_change` (`../outside-canary`, an absolute name, a name holding a NUL, one file more and one file fewer than the manifest), `::links_and_special_files_in_a_backup_are_refused_before_any_change`, `::event_files_round_trip_under_their_hash_names` (if the fallback ships), `db_export_import::names_in_an_export_are_stored_and_never_opened` (run ids, attachment names and workspace paths that name an outside canary; a blob whose stated hash is `../x`), `::a_task_id_that_is_not_one_name_is_refused` (`..`, `a/b`, one holding a NUL); both |
+| R109 | Before `orch import` builds any value from a 1.0 source document it shall have checked every budget that "Import bounds" gives for the document's kind, in one pass over the document's parse events that expands no alias, builds no tree and recurses on nothing the document controls: the size in bytes, that a YAML stream holds exactly one document, the nesting depth and the node count of the document as expanded, the number of aliases, the bytes of the document as expanded, that no alias stands inside its own anchor, and that no node carries an explicit tag. It shall read at most the byte bound and one byte more of any file, and the check and the deserialisation shall work on the same bytes in memory. A document over a budget shall be refused under that rule's name and never built, in whole or in part. | security review S1 (a byte bound alone lets a 40,001-byte document nest 20,000 deep and a 412-byte document stand for 100,000,000 scalars); F12 | must | `crates/orch-infra/tests/source_budget.rs::each_yaml_budget_passes_at_its_limit_and_refuses_one_over`, `::each_json_budget_passes_at_its_limit_and_refuses_one_over`, `::the_depth_bomb_is_refused_without_recursion` (the review's document, as YAML and as JSON, on a thread with a 256 KiB stack), `::the_alias_bomb_is_refused_without_expansion` (the review's 412-byte document, and 1.0's 84,661-byte document of 60 aliases that expands to 2^30 nodes), `::expanded_depth_counts_through_aliases`, `::an_alias_inside_its_own_anchor_is_refused`, `::an_explicit_tag_of_any_kind_is_refused`, `::a_second_document_is_refused`, `::a_count_that_would_wrap_is_over_budget`, `::an_endless_reader_is_read_no_further_than_the_bound`; both |
+| R110 | A YAML document that holds aliases or merge keys and is inside the budgets shall be imported with the value 1.0 read from it: every alias expanded and every merge key resolved as 1.0's reader resolves them (F12). One budget of expanded nodes and one of expanded bytes shall count every expansion in the document, whether the alias stands as a value or under a merge key. Every document that 1.0 wrote shall pass every budget. Where a budget is stricter than 1.0's reader (the three places "Import bounds" lists), the refusal shall say that 1.0 read the document. (AP15) | security review S1 (do not disable aliases blindly: 1.0 resolves merge keys); B3; F12 | must | `crates/orch-cli/tests/import.rs::a_document_with_merge_keys_imports_as_1_0_read_it` (the merge-key documents of 1.0's own reader tests: one anchor merged twice, a merge of a list of anchors, a key set again after a merge), `::documents_written_by_1_0_pass_every_budget` (the generated corpus of the live project's shape, R90), `source_budget::merge_keys_draw_on_the_same_budget_as_aliases` (a merge-key bomb, and a document whose aliases and merge keys pass 200,000 nodes together and not apart), `::a_refusal_stricter_than_1_0_says_so`; both |
+| R111 | `orch import` shall read a run's event file as a stream that holds at most one line of 65,536 bytes and one byte more. A line that is longer, that nests deeper than 64, or that does not parse shall not be stored; the rest of an over-long line shall be skipped to the next newline without being kept; and lines not stored that follow one another shall be recorded as one gap, so that a file adds at most one gap more than it adds events. A source that lists more than 1,000,000 entries shall be refused before any document is read. Free space shall be checked again at every batch, and an import under the floor shall stop as R112 says for a stop. | security review S1; F4 | must | `crates/orch-cli/tests/import_hostile.rs::a_line_without_a_newline_is_not_kept` (one line of 256 MiB), `::unusable_event_lines_become_one_gap` (over-long, over-deep, not UTF-8 and not JSON lines, in a row and between stored events), `::a_listing_over_the_entry_limit_is_refused_before_any_document_is_read` (the limit injected), `import::free_space_is_checked_at_every_batch` (disk probe seam); both |
+| R112 | `orch import` from a 1.0 directory shall first do everything its dry run does. Where that finds a refusal it shall exit 2 having created and changed nothing below the data home and nothing in the project directory; on a `--resume`, nothing beyond what the stopped import left. A stop after its first write (a source that changed since it was checked, an input or output error, the disk floor, a stopped process) shall exit 1 and leave an unfinished import: the transaction in progress rolled back, no document stored in part, no pointer file, a daemon that refuses to start on it and `--resume` able to continue (R67). The report shall name, for each of at most 1,000 refusals and with a count of the rest, the escaped path, the rule, the limit and what was observed. The source shall be unchanged in every case (R64). | security review S1 | must | `import_hostile::every_hostile_document_is_refused_before_any_write` (each entry of the hostile corpus as a task, an agent, `config.yml`, a run, `state.json` and an index; exit 2, the rule and the path in the `--json` report, no file below the data home, a byte-identical source), `::the_report_of_refusals_is_bounded` (2,000 refused files), `::a_document_changed_after_the_check_stops_the_import_resumably` (a file replaced by a hostile one between the check and the load; exit 1, nothing of that document stored, and `--resume` completes once the file is put back); both |
+| R113 | `orch import --from <file>` shall treat an export file as hostile. Before any SQL runs on it the importer shall have read its first 100 bytes itself and refused a file whose header is not that of an export ("Import bounds"). It shall open the file on a connection of its own, read-only and immutable, never attached to another connection, with defensive mode on, the schema untrusted, triggers and views off, extension loading unavailable, memory mapping off, cell-size checking on, the run-time limits and the heap limit of "Import bounds", an authorizer that allows only the statements listed there, and a progress handler that stops a statement when the import is cancelled or past its step budget. Its first statement on the file's content shall be `PRAGMA quick_check(1)`, and any answer but `ok` shall refuse the file. No statement shall be built from text read from the file, and no file beside it shall be read or created. | security review S1 (an export is an arbitrary SQLite file; its own manifest of hashes shows that it agrees with itself, not that it can be trusted); F13 | must | `crates/orch-cli/tests/export_hostile.rs::a_file_that_is_not_an_export_is_refused_by_its_header`, `::planted_companion_files_are_neither_read_nor_created`, `::a_corrupt_file_is_refused_by_the_integrity_check`, `::the_connection_is_configured_before_the_first_statement` (each setting and limit read back), `::no_function_trigger_view_or_extension_of_the_file_runs` (an outside canary is unchanged), `::a_statement_past_its_step_budget_is_stopped` (the budget injected); `git grep -n 'ATTACH' crates/orch-infra/src/import` prints nothing; both |
+| R114 | An export shall be accepted only when its `sqlite_schema` is, row for row, the set this binary writes for an export of its own schema version: the project tables without `leases`, `intents` and `request_keys`, the manifest and the blob-chunk table, with the automatic indexes of their keys and nothing else. The importer shall create the destination by its own migrations and never from the file's schema, and shall copy rows only by the fixed statements of "Import bounds" and by inserts with bound values, so that every type, check, key and reference is enforced by the destination. It shall refuse a file with a row count other than its manifest states, a row of another project, a value over the row bounds, text that is not UTF-8, a blob chunk outside the chunk rules, blob bytes that do not hash to their name, a blob no row names and a row naming a blob the file lacks. It shall take over no lease, intent, request key, identity, token or daemon-wide setting from a file. | security review S1 | must | `export_hostile::a_schema_that_is_not_the_contract_is_refused` (one table, index, view, trigger or virtual table more; a generated column; a changed check; a missing table; `leases`, `intents` or `request_keys` present; 10,000 tables more), `::a_row_outside_the_contract_is_refused`, `::blob_chunks_outside_the_contract_are_refused`, `::no_runtime_or_daemon_wide_row_is_taken_over`; both |
+| R115 | An import from an export file shall build its database under a scratch name and give it the name `orch.db`, and only then write the project's record and `.orch-project`, after every check of R113 and R114 has passed for every row and every blob. A refusal (exit 2) or a stop (exit 1) at any earlier point shall leave a data directory that holds no database, no record and no pointer; the scratch database shall be removed by the attempt, or by the next import where the attempt was killed; and a blob file already written shall be an unreferenced file named by the hash of its bytes. The data directory shall not be created before the file has passed its header, its integrity check, its schema and its manifest. | security review S1 (no partial publication) | must | `export_hostile::every_hostile_export_is_refused_before_anything_is_published` (each entry of the hostile export corpus; exit 2, the rule in the `--json` report, no `orch.db`, no record, no pointer, a byte-identical export), `::a_refusal_at_the_last_row_leaves_no_database`, `::a_killed_import_leaves_no_database_and_the_next_one_succeeds` (a stop injected at every batch boundary and before the rename), `::an_export_changed_during_the_import_is_refused`; both |
+| R116 | For every entry of the hostile corpora of "Import bounds", an import and a dry run, each in a process of its own, shall end with the stated outcome within 30 s and with at most 512 MiB resident, whatever the entry says about its own sizes, counts, depth or aliases. The work an import does on a source shall be at most linear in the source's size in bytes. | security review S1 (bounded time and memory, shown by tests and not by a deadline) | must | `import_hostile::every_hostile_document_is_refused_before_any_write` and `export_hostile::every_hostile_export_is_refused_before_anything_is_published` measure both for each entry (the child's peak resident memory from its resource usage); `import::memory_stays_bounded_on_a_large_project`, `crates/orch-cli/tests/db_export_import.rs::memory_stays_bounded_on_a_large_export`; both |
 
 ## Storage port v2
 
@@ -484,6 +494,7 @@ workspace, 7 no usable daemon. No exit code is added.
 <data dir>/                      0700   one per daemon
   orch.lock                      0600   exclusive lock; never deleted; holds the holder's record
   orch.db  orch.db-wal  orch.db-shm   0600
+  import-<random hex>.db         0600   only while an import from an export builds its database (R115); renamed to orch.db
   generation                     0600   the highest generation this directory has used; written and synced at every start
   blobs/                         0700
     sha256/ab/cd/<hash>          0600   ab and cd are the first four hex digits of the hash
@@ -542,7 +553,7 @@ the hash below it:
 | Fixed | The layout in "Data directory", a backup's included | The literal names there. |
 | Content hash | `blobs/sha256/ab/cd/<hash>` | 64 lower-case hex digits: the SHA-256 of the file's bytes. A hash column is parsed to this form before every use; another value is a typed error and no file is touched. |
 | Derived hash | `blobs/events/ab/<event file name>`, `<data home>/projects/<record name>` | 64 lower-case hex digits of a SHA-256 the daemon computes over ids, as below. |
-| Generated | `blobs/tmp/`, `backups/<UTC time>-g<generation>/`, `backups/pre-restore-<UTC time>/` | Random hex digits made by the daemon, or a time and a generation it formats itself. A backup directory is created exclusively: a name that exists is an error and is never reused. |
+| Generated | `blobs/tmp/`, `backups/<UTC time>-g<generation>/`, `backups/pre-restore-<UTC time>/`, `import-<random hex>.db` | Random hex digits made by the daemon, or a time and a generation it formats itself. A backup directory is created exclusively: a name that exists is an error and is never reused. |
 
 - **Event file name.** The SHA-256, in lower-case hex, of these bytes in order: the ASCII text
   `orch-event-file-v1`, one zero byte, the length of the project id in bytes as eight bytes big-endian, the
@@ -583,7 +594,8 @@ in an import source, and writes `.orch-project` and the authored files of the pr
   (R58, and each event batch against its row), and a snapshot of the data directory made with hard links
   must not stop the daemon. A backup copies bytes and never makes a hard link.
 - Two exceptions. SQLite opens `orch.db` and its two companion files itself, by their fixed names, and makes
-  and removes the companions as it runs; the socket is bound by its path under 0012's rules. What protects
+  and removes the companions as it runs, and likewise the scratch database of an import from an export
+  (R115), by its generated name; the socket is bound by its path under 0012's rules. What protects
   these is the 0700 directory with its owner check (R29) and the exclusive lock. Before SQLite opens the
   database the daemon also refuses an `orch.db` that is a link or not a regular file, as defence in depth
   and not as a guarantee.
@@ -656,10 +668,16 @@ The new operations are in no MCP allowlist.
 
 - `orch import [--from <project directory or export file>] [--dry-run] [--resume] [--json]`. It runs with both
   daemons stopped, under the data directory's lock and the 1.0 owner lock (R31, R68). It is offline: it does
-  not use the socket (AP7).
-- Bounds (R66): an entity document at most 16 MiB, an event line at most 64 KiB, an attachment at most 64 MiB,
-  at most 1,000 rows per transaction, and memory that does not grow with the project. A file over a bound is
-  reported by its path relative to the project and the import stops; nothing is cut short silently.
+  not use the socket (AP7). The check that comes before every write (R112) holds the 1.0 owner lock only: a
+  data directory that does not exist yet is created and locked at the first write, and one left by a stopped
+  import is locked before the check.
+- Bounds (R66, R109 to R112): "Import bounds" has every limit, inside a document as well as on its bytes,
+  and what each refusal leaves behind. In short: a YAML document at most 1 MiB and a JSON document at most
+  16 MiB, each measured for depth, nodes and expansion before anything is built from it; an event line at
+  most 64 KiB; an attachment at most 64 MiB; at most 1,000 rows per transaction; and memory that does not
+  grow with the project. The import checks the whole source before it writes anything, so a file over a
+  bound is reported by its path relative to the project and nothing is created. Nothing is cut short
+  silently: an event line that cannot be stored is a recorded gap.
 - Source access (R103): the importer opens the source `.orchestry/` once, without following a link, and lists
   the directories of the table below from that descriptor, one level each and two for `attachments/`. It
   opens an entry only by the name the listing gave, as "Filesystem names" says for every file. It never opens
@@ -715,11 +733,255 @@ The new operations are in no MCP allowlist.
   | Anything else | Not imported; named by the dry run and by the import's report | Unused |
 
 - An export file (R80) is a SQLite database of the same schema version holding one project's rows from the
-  project tables, without `leases`, `intents` and `request_keys`, plus a table of blob bytes and a manifest
-  with a hash of every table and blob. The file named by `--from` is opened without following a link and must
-  be a regular file. Its rows are data as a 1.0 source's are (R105, R108): a blob is stored under the hash of
+  project tables, without `leases`, `intents` and `request_keys`, plus a table of blob bytes in chunks and a
+  manifest with a hash of every table. The file named by `--from` is opened without following a link and must
+  be a regular file. It is read as a hostile file: "Import bounds" has its format, how it is opened, what is
+  checked before a row is copied, and that the import publishes a database only when all of it has passed
+  (R113 to R115). Its rows are data as a 1.0 source's are (R105, R108): a blob is stored under the hash of
   its bytes, the project id passes R107's check, a task id passes R104's, and a run it holds unfinished has
   no lease in the new directory and is ended at the first start (R41).
+
+## Import bounds
+
+What its input can make `orch import` do (R109 to R116). The security review's finding S1: the first bounds
+limited a file's bytes and nothing inside it. A document of 40,001 bytes can nest 20,000 deep and one of 412
+bytes can stand for 100,000,000 scalars, both far inside a byte bound; and an export file is an arbitrary
+SQLite database, whose own manifest of hashes shows that it agrees with itself and not that it can be trusted.
+
+**Rule.** A source is measured before anything is built from it. Every limit is checked on the bytes or on
+the parser's events, by code whose memory and stack do not depend on what the input says about itself, and
+only an input inside every limit reaches a deserialiser, a row or a blob. No limit is a clock: a deadline
+cannot stop work it does not control, which is why 1.0 removed its own (F12). A source is the owner's choice
+of a root, but its content is not the owner's word: a 1.0 directory arrives with a checkout and an export
+file from another machine.
+
+### A 1.0 directory
+
+| Source | Bytes, at most | Inside it, at most |
+|---|---|---|
+| A YAML document: `tasks/`, `agents/`, `goals/` and `teams/` `*.yml`, `config.yml` | 1,048,576 | One document in the stream; depth 64; 64 aliases; 200,000 nodes and 4,194,304 bytes as expanded; no alias inside its own anchor; no explicit tag |
+| A JSON document: `runs/run_*.json`, `messages/*.json`, `context/*.json`, `state.json`, each `_index.json` | 16,777,216 | Depth 64; 1,000,000 nodes |
+| One line of `runs/run_*.jsonl`; the file itself has no bound and is read as a stream | 65,536, the newline not counted | Depth 64; its bytes already bound its nodes |
+| An attachment | 67,108,864 | Not parsed |
+| A template | 65,536 | Not parsed |
+| The listing of the source (R103) | — | 1,000,000 entries in all |
+
+How each is counted, so that two implementations agree at the limit:
+
+- **Bytes.** What the importer reads, not what a directory entry or `fstat` reports: a reader stops at the
+  bound and one byte more, and that byte is the refusal.
+- **Depth.** The sequences and mappings (for JSON, arrays and objects) open at one time. A document that is
+  one scalar has depth 0. For YAML it is the depth of the document as expanded: at an alias, the depth at
+  that place plus the height of what its anchor expands to, so a chain of shallow anchors that expands deep
+  is refused.
+- **Nodes.** A scalar is 1; a collection is 1 and its children; a mapping key is a node; an alias is as many
+  nodes as its anchor expands to (1.0's rule, F12). In JSON every value is a node and a member's name is not.
+- **Expanded bytes.** The bytes of every scalar, keys included; an alias counts what its anchor expands to.
+- **Aliases.** Every alias in the stream, whether it stands as a value or under a merge key (`<<`). The node
+  and byte budgets count each of them at its full expansion, so the two uses draw on one budget (R110).
+- **Tag.** A node with an explicit tag of any kind is refused: a custom one (`!x`), a standard one (`!!str`,
+  `!!binary`), the non-specific `!`, on a scalar, a collection or the document's root.
+- Every count is added with a check for overflow and tested at each addition; a count that would wrap is over
+  budget. The pass keeps one frame for each open collection and one count for each anchor, so its memory is
+  bounded by the document's bytes and never by what the document expands to.
+
+Compatibility with 1.0 (R110, AP15). A document inside the budgets is read as 1.0 read it: aliases
+expanded, merge keys resolved. The YAML budgets are 1.0's own reader's where it has one:
+
+| Budget | Limit | 1.0's reader (F12) | A document 1.0 read that the import refuses |
+|---|---|---|---|
+| Bytes | 1,048,576 | The same | None |
+| Documents in the stream | 1 | The same | None |
+| Aliases | 64 | The same | None |
+| Nodes as expanded | 200,000 | The same | None |
+| An alias inside its own anchor | Refused | The same | None |
+| Depth as expanded | 64 | 128, by its parser library and not by a rule of its own | One nested 65 to 128 deep. A task document that 1.0 writes nests three deep |
+| Bytes as expanded | 4,194,304 | No rule; about 65 MiB could be built from one file | One whose aliases repeat its scalars past 4 MiB. Without an alias a document expands to no more than its own bytes |
+| Explicit tag | Refused | Ignored by typed fields | One that a person tagged by hand; the tag never had an effect |
+
+Nothing 1.0 writes holds an alias, a merge key or a tag, so only a document edited by hand can meet the
+last three rows; its refusal names the rule and says that 1.0 read the document. 1.0 has no limit on a JSON
+document; the JSON limits are new, and an index of one million entries is the largest that 16 MiB admits.
+
+Order and outcome (R112):
+
+1. **Check.** The import first does everything its dry run does: it lists the source (R103), reads every
+   document within its byte bound, checks the budgets on the bytes it holds, and only then deserialises those
+   same bytes. It writes nothing meanwhile; the data directory is not created.
+2. **Load.** Only a source with no refusal is loaded. Each file is read and checked again in the same way
+   before its rows are written, so a file that changed after the check cannot bring in unchecked bytes.
+
+| Found | When | Outcome |
+|---|---|---|
+| A document, an attachment or a template over a budget; a listing over the entry limit | The check | Refused: exit 2. Nothing is created or changed below the data home or in the project directory; on a `--resume`, nothing beyond what the stopped import left |
+| An event line over its bound, nested too deep or not parsing | Either step | Not a refusal. The line is not stored, lines like it that follow are one gap with it (`run_event_gaps`), and the dry run and the report count them for each run (R111) |
+| A document over a budget that passed the check (the file changed) | The load | A stop: exit 1. The transaction in progress is rolled back and nothing of the document is stored. The import is unfinished: the daemon refuses to start on it and `--resume` continues (R67) |
+| Free space under the floor, an input or output error, a stopped process | The load | The same stop |
+
+A document that is inside every budget and still does not parse or fit its type is a file the importer
+cannot read (R65); this section does not change how that is handled. The `--json` report lists each refusal
+as `path` (escaped, relative to the project), `rule`, `limit` and `observed`, the first 1,000 of them and a
+count of the rest. `rule` is one of `bytes`, `documents`, `depth`, `aliases`, `alias_cycle`,
+`expanded_nodes`, `expanded_bytes`, `tag`, `nodes`, `entries`, or one of the export rules below. `observed`
+is the value at which the pass stopped, which is the least the document holds, since the pass does not go on
+to measure a document it has refused.
+
+### An export file
+
+The format, which `orch db export` writes and `docs/storage.md` records (R80):
+
+- One SQLite file of 4,096-byte pages in the rollback-journal format, with no companion file. Its header
+  holds the application id 1330791256 (the bytes `ORCX`) and the user version 1, the version of this format.
+- Tables and nothing else: the project tables of the product's schema version with their own definitions,
+  without `leases`, `intents` and `request_keys` and without any daemon-wide table; `export_manifest`; and
+  `export_blob_chunks`. The only indexes are the automatic ones of the tables' keys.
+- `export_manifest` holds the format version, the schema version, the project id, the row count and a
+  SHA-256 of the rows of each table, and the number of blobs and their total bytes, and no other row. It
+  finds damage and truncation. It does not make a file trustworthy, and no check below is left out because
+  the manifest agrees.
+- `export_blob_chunks` holds every blob's bytes as rows of (`sha256`, `chunk_no`, `bytes`), written in
+  ascending order of hash and then of chunk number. A blob's chunks are numbered from 0 without a gap; every
+  chunk but its last is exactly 1,048,576 bytes; the last is 1 to 1,048,576 bytes, or 0 bytes as the only
+  chunk of an empty blob. Blob bytes are therefore read in bounded pieces and never as one value.
+
+How the importer reads one (R113, R114), in this order:
+
+1. **Header.** It opens the file as R102 says and reads the first 100 bytes itself: the 16-byte SQLite magic
+   string, page size 4,096 (offset 16), file-format versions 1 and 1 (offsets 18 and 19; 2 is the
+   write-ahead-log format, which an immutable connection would read without its log, F13), user version 1
+   (offset 60), application id 1330791256 (offset 68), and a file size that is a whole number of pages.
+   Anything else is refused as `export_header` before SQLite sees the file.
+2. **Connection.** A connection of its own, opened read-only with `immutable=1`, so that SQLite reads this
+   one file, takes no lock and looks at no journal or log beside it. It is never attached to the connection
+   that writes the destination. Set through the library before any statement runs: defensive mode on; the
+   schema untrusted (`SQLITE_DBCONFIG_TRUSTED_SCHEMA` off); triggers and views off; the limits of the table
+   below; the authorizer and the progress handler of step 3. The first statements are then the pragmas
+   `hard_heap_limit`, `mmap_size = 0`, `cell_size_check = ON` and a page cache of 8 MiB, none of which reads
+   the file's content. Extension loading is never turned on, and the library's `load_extension` feature
+   stays off (ADR 0017 decision 19).
+3. **Authorizer and progress handler.** The authorizer denies everything but: the four pragmas of step 2
+   and `quick_check`; `SELECT`; a read of the columns `type`, `name`, `tbl_name` and `sql` of
+   `sqlite_schema`; and a read of the named columns of the format's tables. So no function runs, nothing is
+   attached, written or defined, and no other pragma runs. The progress handler is called every 1,000 steps
+   of the virtual machine and inside `quick_check`; it stops a statement when the import is cancelled, and a
+   table scan when it has used more than 200 steps for each row the manifest states for that table, and
+   10,000 more.
+4. **Integrity.** `PRAGMA quick_check(1)` is the first statement that reads the file's content. Any answer
+   but `ok` is `export_integrity`. It is what makes the scans below finite: it finds a page that is
+   referenced twice, which a scan does not (F13).
+5. **Schema.** `SELECT type, name, tbl_name, sql FROM sqlite_schema` must return, row for row, the set this
+   binary holds for the format at its own schema version; one row more, fewer or different is
+   `export_schema`. The file's schema is compared and never adopted: the destination is created by the
+   binary's own migrations.
+6. **Manifest, rows, blobs.** One statement for each table, `SELECT <the named columns> FROM <table> NOT
+   INDEXED`, a plain scan with no join, sort, function or index; no statement is built from text the file
+   holds. Rows go to the destination in transactions of at most 1,000 rows or 8 MiB, by inserts with bound
+   values, so the destination's own types, checks, keys and foreign keys judge them. Before that the
+   importer refuses: a value of a project table over 65,536 bytes (R97 keeps larger text in the blob store,
+   so the product's own export holds none); text that is not UTF-8; a `project_id` other than the
+   manifest's; an id that fails R104 or R107 (R108); a table with a row more or fewer than the manifest
+   states, where the scan stops at the first row too many; and a chunk outside the chunk rules. A blob's
+   chunks are written to `blobs/tmp/` and hashed as they arrive; the file gets its name only when the bytes
+   hash to the stated name and their number is the size its `blobs` row states. Before publication every
+   `blobs` row has its file and every blob the file carried has its row.
+
+| Run-time limit (`sqlite3_limit`) | Value | SQLite's default |
+|---|---|---|
+| `LENGTH`: a string, a blob or a row | 2,097,152 | 1,000,000,000 |
+| `SQL_LENGTH` | 100,000 | 1,000,000,000 |
+| `COLUMN` | 100 | 2,000 |
+| `EXPR_DEPTH` | 20 | 1,000 |
+| `PARSER_DEPTH` | 100 | 2,500 |
+| `COMPOUND_SELECT` | 3 | 500 |
+| `VDBE_OP` | 25,000 | 250,000,000 |
+| `FUNCTION_ARG` | 8 | 127 |
+| `ATTACHED` | 0 | 10 |
+| `LIKE_PATTERN_LENGTH` | 50 | 50,000 |
+| `VARIABLE_NUMBER` | 10 | 999 |
+| `TRIGGER_DEPTH` | 10 | 1,000 |
+| `SCHEMA`: objects in the schema | 128 | 10,000,000 |
+| `WORKER_THREADS` | 0 | 0 |
+| Hard heap limit, for the import's process | 268,435,456 | none |
+
+The values are the "high-security" column of SQLite's guidance for untrusted input, except `LENGTH` (a
+1 MiB chunk and its row must fit), `EXPR_DEPTH` and `SCHEMA` (room for the product's own tables and checks),
+and `WORKER_THREADS`, which that list does not name.
+They bind the product's own export too: R80's test imports one under them, and a limit is raised only by
+editing this table in the same PR. The heap limit is for the whole process, which is why it is set in the
+offline import and nowhere in the daemon.
+
+Publication (R115). An import from an export is all or nothing, and has no resume:
+
+1. Steps 1 to 5 above and the manifest run before the data directory is created or locked. A file refused
+   there leaves nothing anywhere.
+2. The importer then takes the data directory (R30, R68; it must hold no `orch.db`), removes a scratch
+   database that a killed attempt left, and builds the database as `import-<random hex>.db` there, a
+   generated name in the sense of "Filesystem names", which SQLite opens itself like `orch.db`.
+3. When every table, count, hash and reference has passed, it records the import and the export's SHA-256
+   in the database, closes it so that it is one file, renames it to `orch.db` and syncs the directory. Only
+   then does it write the project's record and `.orch-project`.
+4. A refusal (exit 2, an export rule) or a stop (exit 1) before the rename leaves no database, no record and
+   no pointer. The scratch file is removed. A blob already written is an unreferenced file named by the hash
+   of its bytes: it selects nothing, a later import of the same bytes reuses it, and the sweep removes it
+   (R60). A stop after the rename leaves a complete database without its record or pointer; running the
+   same import again finds it by the export's hash, writes the two and changes nothing else.
+
+The export rules of the report: `export_header`, `export_integrity`, `export_schema`, `export_manifest`
+(a count, a hash or a version that differs), `export_row`, `export_blob`, and `export_limit` (a run-time
+limit, the heap limit or a step budget stopped a statement). A dry run of an export does steps 1 to 6
+without a destination, so it reports everything but what only the destination's keys and foreign keys find.
+
+What these rules do not do: they do not make SQLite's own reading of a hostile file a thing this project
+has proved. The settings above are the ones SQLite documents for a file from elsewhere, and the library's
+C code is trusted to keep to them.
+
+### Vectors
+
+Each row must end as it says. A refused row also leaves the source byte-identical and the destination as
+R112 or R115 says, within R116's time and memory. The corpora are made by the tests: documents from a seed
+(R90), export files by altering the bytes of an export the product wrote; none comes from a real project.
+
+| Input | Expected |
+|---|---|
+| The review's document: 20,000 `[`, one `0`, 20,000 `]` (40,001 bytes), as a task, as `config.yml`, as a run and as `state.json` | Refused, `depth`; no more than 65 collections are opened |
+| The review's alias document (412 bytes): `a0: &a0 [x]`, then `a1` to `a8`, each a sequence of ten aliases of the one before | Refused, `expanded_nodes`, at the fiftieth alias |
+| 1.0's document of 84,661 bytes and 60 aliases that expands to 2^30 nodes | Refused, `expanded_nodes` |
+| `a0: &a0 [x]`, then `a1` to `a62`, each one sequence around an alias of the one before (62 aliases; depth 2 as written, 64 as expanded) | Accepted |
+| The same with `a63` | Refused, `depth` |
+| One anchored mapping of 4,000 entries merged by `<<` into 64 mappings | Refused, `expanded_nodes`: a merge key draws on the same budget |
+| `defaults: &d {a: 1, b: 2}`, `one: {<<: *d, b: 3}`, `two: {<<: *d}` | Accepted; `one` is `a: 1, b: 3` and `two` is `a: 1, b: 2`, as 1.0 read them |
+| A YAML document of 1,048,576 bytes; of one byte more | Accepted; refused, `bytes` |
+| 64 aliases of one short scalar; 65 | Accepted; refused, `aliases` |
+| A document that expands to 200,000 nodes; to 200,001 | Accepted; refused, `expanded_nodes` |
+| A document that expands to 4,194,304 bytes; to one more | Accepted; refused, `expanded_bytes` |
+| `a: &a [*a]` | Refused, `alias_cycle` |
+| `id: !custom abc`; `id: !!str abc`; `data: !!binary YWJj`; `id: ! abc`; a tag on a sequence; a tag on the root | Each refused, `tag`, with the note that 1.0 read it |
+| Two documents in one file | Refused, `documents` |
+| A document of anchors that double at each of 70 levels (2^70 nodes as expanded) | Refused, `expanded_nodes`, at the level where the count first passes the budget, long before a count could wrap |
+| An `_index.json` that is one array of 999,999 strings (1,000,000 nodes); of one string more | Accepted; refused, `nodes` |
+| A JSON document nested 64 deep; 65 deep | Accepted; refused, `depth` |
+| A JSON document of 16,777,216 bytes; of one byte more | Accepted; refused, `bytes` |
+| An event line of 65,536 bytes; of one byte more | Stored; a gap |
+| One event line of 256 MiB with no newline | One gap; at most 65,537 bytes of it held at a time |
+| Three lines in a row that are over-long, not UTF-8 and not JSON, between two events | Two events and one gap |
+| A listing of one entry more than the limit | Refused, `entries`; no document read |
+| 2,000 refused documents in one source | Exit 2; 1,000 listed and a count of 1,000 more |
+| A task file replaced by the depth document between the check and the load | Exit 1; nothing of that task stored; `--resume` completes once the file is put back |
+| 4,096 random bytes; a copy of a product `orch.db`; an export with file-format bytes 2 and 2; with pages of 512 bytes; with user version 2 | Each refused, `export_header`; SQLite never opens the file |
+| A valid export with files `-journal`, `-wal` and `-shm` planted beside it | Imported exactly as without them; the three files unread, and no file created beside the export |
+| An export in which one interior page names the same child twice | Refused, `export_integrity` |
+| An export with one table, index, view, trigger or virtual table more; with a generated column; with a changed `CHECK`; with a table missing; with `leases`, `intents` or `request_keys`; with `identity_tokens` | Each refused, `export_schema` |
+| An export with 10,000 tables more | Refused, `export_schema` or `export_limit`; resident memory within R116 |
+| An export whose trigger or view would write an outside canary or call `load_extension` | Refused, `export_schema`; the canary unchanged |
+| An export with a stored value of 3 MiB | Refused, `export_limit` |
+| An export with a text value of 65,537 bytes in a project table; with text that is not UTF-8; with a row of another project | Each refused, `export_row` |
+| An export with one row more, or one row fewer, than its manifest states | Refused, `export_manifest`; at most one row past the stated count is read |
+| A chunk of 1,048,577 bytes; a short chunk that is not the last; chunk numbers 0, 2; hashes out of order; bytes that do not hash to the name; a `sha256` of `../x` | Each refused, `export_blob`; no file gets a name it did not earn |
+| A blob that no `blobs` row names; a `blobs` row with no chunks | Refused, `export_blob` |
+| A row that breaks a key or a foreign key of the destination, as the last row of the file | Refused, `export_row`; no `orch.db`, no record, no pointer |
+| The import killed at each batch boundary and just before the rename | No `orch.db`; the next import of the same file succeeds |
+| The import killed between the rename and the pointer | The same import run again writes the record and the pointer and changes nothing else |
+| The product's own export of the generated project, with blobs of 0, 1,048,576 and 1,048,577 bytes | Accepted under every limit; every row and hash reproduced (G4) |
 
 ## `orch db` commands
 
@@ -730,7 +992,7 @@ The new operations are in no MCP allowlist.
 | `orch db query '<statement>' [--limit n] [--json]` | running | One statement; 1,000 rows by default, 100,000 at most; 5 s. |
 | `orch db backup [--to <directory>]` | running | Default `backups/<UTC time>-g<generation>/`. The blob sweep waits while it runs. |
 | `orch db prune [--older-than <days>] [--dry-run]` | running | R79. |
-| `orch db export --to <file>` | running | The file must not exist; created 0600. |
+| `orch db export --to <file>` | running | The file must not exist; created 0600. Written in the export format of "Import bounds". |
 | `orch db restore <backup> [--yes] [--stop-runs]` | stopped | R76 to R78, R100. The replaced state goes to `backups/pre-restore-<UTC time>/`. |
 | `orch db vacuum` | stopped | Needs free space of the database's size above the floor. |
 
@@ -800,8 +1062,10 @@ Security checklist:
 - Default bind and exposure: the Unix socket in `run/`, 0600 in a 0700 directory, same-uid check as in 1.0.
   Nothing listens on a network. `orch db` and `orch import` have no remote form.
 - Bounds on input size, count and rate: the frame and admission limits of protocol 2 stand. Added: 4 read
-  connections; list limit 1,000; key 128 characters; cursor 512 bytes; kept result 64 KiB; `db.query` 100,000 rows and 5 s; import
-  bounds in "Import rules"; `.orch-project` 64 bytes; `legacy.config` 64 KiB.
+  connections; list limit 1,000; key 128 characters; cursor 512 bytes; kept result 64 KiB; `db.query` 100,000 rows and 5 s; the
+  budgets of "Import bounds" on every 1.0 document (bytes, depth, nodes, aliases, expansion, tags), event
+  line, listing and export file, each checked before anything is built from the input (R109 to R116);
+  `.orch-project` 64 bytes; `legacy.config` 64 KiB.
 - Permissions of files it writes: the data directory 0700 and files 0600; backups and exports 0600;
   `.orch-project` 0644 (it holds an id, no secret).
 - Secrets and environment passed to children: unchanged. `identity_tokens` holds hashes only. `db.query` can
@@ -811,6 +1075,9 @@ Security checklist:
   SQL from the owner only and runs it on a connection that cannot write, attach or load an extension. Source
   files of an import, an export file and a backup's manifest are untrusted input: bounded, never executed,
   and no name, id or path in them selects a file below the data directory ("Filesystem names", R101 to R108).
+  An export file is opened as a hostile SQLite file: read-only and immutable, schema untrusted, no trigger,
+  view, function or extension, its schema compared and never adopted, and nothing published until all of it
+  has passed ("Import bounds", R113 to R115).
   An import signals no process (R105). In the project directory only a checked task id names a workspace and
   only a branch of the derived shape is merged or deleted (R106, AP14). A restore still acts on the process
   records of the backup it is given, by pid and start time, as R100 says: a backup is the owner's own state.
@@ -859,6 +1126,7 @@ Each goal open point with a recommendation, then the points this spec found. The
 | AP12 | What a suspend does to a run in 1.1. The lease prototype measures a holder's deadline on time that counts a suspend, so that a holder that slept past it stops. Its review notes that in 1.1, where the daemon and the agent sleep together, that rule ends every run in flight after any sleep longer than the deadline (90 s in the prototype). | Keep R42: in 1.1 a suspend ends no run. The one daemon is the only grantor and it slept too, so no other holder can exist; on resume it renews what it still supervises before it expires anything. The holder's own deadline arrives with workers in 1.5, where the daemon can stay awake while a worker sleeps. R42's recorded check is a real suspend. | Apply the 1.5 rule now: one rule in every release, and every lid close longer than the deadline loses the runs in flight, which 1.0 does not do. |
 | AP13 | The measurement missed the budget on macOS. As deliverable D reports it: Linux, run in a container on the same machine, met every line; on macOS, 24 runs at ten times the nominal rate gave a 99th percentile of 1.9 s, the nominal rate 53.5 ms with a worst case of 170 ms, and no events 10.9 ms; the slowest event transaction took 592 ms for at most 12 rows, and a claim's own transaction up to 499 ms. | Ship the event fallback, as gate line 7 rules, on both platforms so that there is one event path (R63). Before its PR merges, find the cause of the slow commits on macOS and measure the fallback against the same budget: a claim's own transaction was among the slow ones, so moving events out of the database may not be enough, and no figure says it is. If the fallback also misses, lane 1's 50 ms cannot be promised on macOS as measured, and that comes back to the owner. | Keep events in SQLite and restate the budget from the figures: one storage path and tail reads by an index, and a claim that can wait seconds behind event commits under load on macOS. |
 | AP14 | What an imported value may still select (security review S2). Below the data directory, in a backup and in an export the answer is nothing (R101 to R108). Three points remain for the owner. First, a task's workspace is still `workspaces/<task id>` in the project directory. Second, the import no longer treats in-flight state as 1.0's recovery does. Third, a restore still acts on the processes a backup records (R100). | Keep 1.0's workspace layout, with the id checked as one name, links refused and stored paths never used (R106): workspaces that exist at the import keep working, and nothing an agent CLI saw moves. Close in-flight state in the database only, as if every recorded process were gone, without looking a pid up or signalling it (R105); the dry run lists what it would close, and the manual tells the owner to stop leftover 1.0 agents before the import. Keep R100 as it is: a backup is the owner's own state, a process is matched by pid and start time, and `--stop-runs` is the owner's explicit word; the manual says that a backup from elsewhere must not be restored with it. | Name workspaces by a hash or a generated name: then no id is a path component anywhere, at the cost of a mapping for the workspaces and branches that exist at the import and of new paths for every agent. For in-flight state: refuse the import while a recorded pid answers; it stops a double run in one workspace, but a 1.0 run records no process start time, so a reused pid blocks the import and a source file decides which process is examined. For a restore: never signal from a backup's rows, only refuse and name the processes, and leave stopping them to the owner. |
+| AP15 | What a source may make the importer do (security review S1). The budgets of "Import bounds" are 1.0's own reader's limits where it has them. Four points go beyond 1.0 or beyond the first draft of this spec. First, three rules are stricter than 1.0's reader for a YAML document that a person edited: an explicit tag is refused (1.0 ignored it), the depth as expanded is 64 (1.0's library allowed 128), and the bytes as expanded are 4 MiB (1.0 had no rule). Second, a YAML document is bounded at 1 MiB, which is 1.0's own limit, where the first draft said 16 MiB. Third, the import checks the whole source before it writes, and so reads it twice. Fourth, an import from an export is all or nothing with no resume, and an event line that cannot be stored becomes a gap where the first draft stopped the import. | Approve the numbers and the four points as a set (R109 to R116). Nothing 1.0 writes meets a stricter rule; a refusal names the file and the rule and says that 1.0 read it, and the dry run lists every such file before anything is written. The second read buys that a hostile or damaged source leaves nothing behind. An export import that was interrupted is run again from the start; raw output lost to a gap is the lowest-value data an import carries, and each gap is recorded and counted. | Match 1.0's reader exactly (tags ignored, depth 128, no byte budget): no document that 1.0 read is refused, a tag is dropped silently as 1.0 dropped it, and one file can still expand to about 65 MiB in memory. Or check and load in one pass: one read of the source, and a refusal part-way leaves an unfinished import behind. Or stop the import at an event line that cannot be stored: no silent-looking loss, and one bad line of raw output blocks a migration. |
 
 ## Gate lines
 

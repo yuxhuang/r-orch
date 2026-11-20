@@ -10,7 +10,7 @@
   section of `docs/TRAITS-FROZEN.md` (§2: the ten storage traits and their three rules). Everything else in 0012
   stands: one daemon owns state, no client opens it, nothing starts a daemon on its own, exit 7.
 - Decisions 1 to 6 and 14 restate decisions the owner already took in the goal and are binding. Decisions 7 to 13
-  and 15 to 20 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
+  and 15 to 21 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
   the owner's.
 
 ## Context
@@ -156,8 +156,12 @@ across a crash, lists that do not load everything, and a retried request that ru
     `orch-peer` alone until 2.0. The peer protocol, the `remotes` files and `peer-id` stay as they are.
 
 19. **The SQLite library is `rusqlite`, and `rusqlite_migration` runs the migrations.** `rusqlite` 0.41.1
-    with the features `bundled`, `backup` and `cache` and its default features off, and `rusqlite_migration`
-    2.7.0, both pinned exactly and used from `orch-infra` only. The report of deliverable C
+    with the features `bundled`, `backup`, `cache`, `limits` and `hooks` and its default features off, and
+    `rusqlite_migration` 2.7.0, both pinned exactly and used from `orch-infra` only. `limits` and `hooks`
+    were added after the report, for decision 21: they are the library's safe calls for run-time limits, the
+    authorizer and the progress handler. Both are parts of the crate and bring no other crate (in 0.41.1's
+    manifest `limits = []`, `hooks = ["wal"]`, `wal = []`), so the dependency graph the report checked is
+    unchanged. `load_extension` stays off. The report of deliverable C
     (`docs/sqlite-library.md`) holds the §4.8 check and its evidence: both crates maintained; a declared MSRV
     of 1.89 under the pinned toolchain; MIT and Apache-2.0, inside `deny.toml`'s allow-list; `cargo deny check`
     passing on the whole workspace with the two crates connected and no new exception; the bundled engine
@@ -192,6 +196,29 @@ across a crash, lists that do not load everything, and a retried request that ru
     its `fs` and `dir` features turned on, which adds no crate. The PR that adds the module does the §4.8 check
     on a capability-style crate such as `cap-std` before it settles on `nix`, and the contract is the same
     either way.
+
+21. **Input from outside is measured before anything is built from it.** A 1.0 source file and an export
+    file are content from elsewhere, whatever directory the owner named. Every limit on them is checked on
+    the bytes or on a parser's events, by code whose memory and stack do not depend on what the input says
+    about itself, and no limit is a deadline. For a 1.0 document the limits are bytes, nesting depth, node
+    count, aliases, and the nodes and bytes of the document as expanded, with one budget for every
+    expansion whether an alias stands as a value or under a merge key; an explicit YAML tag is refused. The
+    numbers are those of 1.0's own guarded reader where it has them (1 MiB, 64 aliases, 200,000 expanded
+    nodes), so that a document 1.0 wrote always passes and aliases and merge keys are still resolved as 1.0
+    resolved them; three rules are new and stricter (tags, depth 64, expanded bytes 4 MiB) and the spec's
+    point AP15 puts them to the owner. An import checks its whole source, as its dry run does, before it
+    writes anything. An export is a SQLite file and is read as a hostile one, with the settings SQLite
+    documents for that case: its header is checked before SQLite opens it; the connection is its own,
+    read-only and immutable, in defensive mode, with the schema untrusted, triggers, views and extension
+    loading off, lowered run-time limits, a heap limit, an authorizer that allows only a fixed list of
+    statements and a progress handler; `quick_check` runs first; the file's schema is compared with the one
+    this binary writes and never adopted; rows are copied by fixed statements into a database made by the
+    binary's own migrations, so the destination's constraints judge every row; blob bytes arrive in chunks of
+    at most 1 MiB. That database is built under a scratch name and renamed into place only when everything
+    has passed, so an import from an export is all or nothing. The spec's "Import bounds" is the contract and
+    holds the numbers and the test vectors. This decision answers the security review's finding S1, which
+    showed a 40,001-byte document of depth 20,000 and a 412-byte document standing for 100,000,000 scalars
+    inside the first draft's byte bound.
 
 ## Alternatives considered
 
@@ -228,6 +255,25 @@ across a crash, lists that do not load everything, and a retried request that ru
   second thing for backup and export to keep in step; the derived hash needs none.
 - **Resolve and compare paths (`canonicalize`, then a prefix test).** It races with a link planted between the
   check and the use, and it follows the link it was meant to refuse. Descriptor-relative calls do neither.
+- **Rely on the parser libraries' own limits.** `serde_yaml_ng` stops at 128 nested collections, `serde_json`
+  at 128, and both refuse the review's depth document today. Those are properties of two versions of two
+  crates, not rules of this project, and neither counts what a document expands to.
+- **Refuse every alias and merge key.** The simplest rule, and 1.0 resolves merge keys: a `config.yml` that
+  a person wrote with `<<` would stop its project's import. The expansion is bounded instead.
+- **A time limit on the parse.** 1.0 had one and removed it: it could not stop the work it timed, so a slow
+  failure became one that never ended.
+- **Run the parsers in a child process under operating-system limits.** A second defence worth having some
+  day, and not a portable one: the review could not set a data-size limit on macOS. The budgets hold by
+  construction on both platforms.
+- **An export that is not a SQLite file (rows as JSON lines in an archive).** No SQLite on hostile bytes, at
+  the price of a second serialisation of every table that must keep integers, nulls and blobs exact for gate
+  line 4. SQLite documents how to read a file from elsewhere, and decision 21 follows it.
+- **Trust an export because its manifest's hashes agree.** The file's author wrote the manifest too. It finds
+  damage; it is not a reason to skip a check.
+- **Attach the export to the writer and copy with `INSERT ... SELECT`.** Fast and short, and it puts a
+  hostile schema on the connection that owns the destination.
+- **Load an export into `orch.db` directly, with a resume.** A refusal at the last row would leave a database
+  that is neither a project nor nothing. A scratch name and one rename need no resume.
 
 ## Consequences
 
@@ -253,6 +299,12 @@ across a crash, lists that do not load everything, and a retried request that ru
   by the restore and must be copied again as plain files; a backup never shares files with the live blob
   store by hard links. A hard-link snapshot of the data directory itself does not stop reads, but the daemon
   refuses to append to an event file that has a second link, since the append would change the snapshot.
+- A 1.0 document that a person edited to hold an explicit tag, to nest deeper than 64 or to expand past 4 MiB
+  was readable by 1.0 and stops the import, by name and before anything is written; the owner changes the
+  document or keeps the project on 1.0. An import reads its source twice. An import from an export that is
+  interrupted starts again. An export cannot be read by a build of another schema version, and reading one
+  rests on SQLite's own handling of a hostile file under the settings of decision 21, which this project
+  configures and does not prove.
 - The data directory lives outside the project, so moving a project directory no longer moves its state. The
   pointer file and the record under the data home are what let the daemon find it again instead of offering a
   second import. `<project>/.orchestry/` must stay in place: it is still the handshake's project identity.
