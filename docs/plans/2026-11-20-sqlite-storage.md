@@ -79,6 +79,9 @@ adapter the daemon builds and nothing else.
 - Let each of the blob store, the event files, backup and the importer build its own paths: four places to
   get link and name handling right. One confined-directory module lands in T9, before any of them, and they
   take a directory handle from it and never a path string (spec "Filesystem names", ADR 0017 decision 20).
+- Let the importer find a hostile document while it loads: one read of the source, and a refusal part-way
+  leaves an unfinished import. T21 runs the dry run's checks first, and T23 builds an export's database under
+  a scratch name (spec "Import bounds", ADR 0017 decision 21).
 
 The lasting choices are in ADR 0017. Limits and numbers live in the spec and in the tests it names.
 
@@ -97,7 +100,7 @@ first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`
 | T4 | Measure batched event append against the claim-latency budget, as a standalone experiment on macOS and native Linux | R5, R63 | `docs/sqlite-event-throughput.md`, `docs/experiments/sqlite-events/` | T3 | The report states the budget declared before the run, the figures and a verdict for each platform | 4 |
 | T5 | Prototype "claim with a fenced lease" as a standalone workspace, across a suspend and resume and across a restore; report its result | R6 | `prototypes/fenced-lease/`, `docs/specs/2026-11-20-fenced-lease-prototype.md`, `docs/plans/2026-11-20-fenced-lease-prototype.md`, `docs/decisions/0018-fenced-lease-prototype.md` | T3 | The report states what a suspended machine and a restore do to a lease, and whether ADR 0017 decision 16 holds (spec AP11) | 5 |
 | T6 | Security review of the spec and red-team of the plan (import cutover, single writer); their findings become spec rows or plan edits | all | `docs/specs/`, `docs/plans/`, `docs/decisions/0017-sqlite-storage.md` | T1 | Each finding is answered in PR 6 as accepted, rejected or modified | 6 |
-| T7 | Approval gate: the owner rules on O1 to O10 and AP1 to AP14; spec `approved`, plan `active`, ADR 0017 `accepted` | — | status lines; `docs/decisions/README.md` | T2 to T6 | The owner's approval recorded in PR 6 | 6 |
+| T7 | Approval gate: the owner rules on O1 to O10 and AP1 to AP15; spec `approved`, plan `active`, ADR 0017 `accepted` | — | status lines; `docs/decisions/README.md` | T2 to T6 | The owner's approval recorded in PR 6 | 6 |
 
 ### Product: built on files, then beside files
 
@@ -116,9 +119,9 @@ first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`
 | T18 | Authorization matrix in the dispatcher, with test principals | R52 to R54, R93 | `crates/orch-daemon/src/ops/`, `crates/orch-proto/src/ops/` | T8, T17 | `cargo test -p orch-daemon --test ops_authorization`; `./xtask/gate.sh full` (security-relevant) | 17 |
 | T19 | Attention queue with its two kinds; the disk floor | R81 to R85 | `crates/orch-engine/src/attention*`, `crates/orch-engine/src/disk_floor*`, `crates/orch-cli/` | T15, T17 | `cargo test -p orch-engine --test attention --test disk_floor`; `cargo test -p orch-cli --test attention` | 18 |
 | T20 | Usage for every run, with the model and the agent CLI version | R86, R87 | `crates/orch-engine/src/orchestrator/`, `crates/orch-infra/src/adapters/` | T12 | `cargo test -p orch-engine --test usage` | 19 |
-| T21 | `orch import` from a 1.0 directory: dry run, bounds, resume; the source read by listing through the confined-directory module, the id rule, and nothing done outside the database; the seeded fixture generator and the hand-written hostile-source corpus (links, special files, traversal-shaped ids and names, a live canary process) | R64 to R70, R90, R99, R103 to R105 | `crates/orch-infra/src/import/`, `crates/orch-cli/src/commands/import*`, `xtask/src/fixture_gen.rs`, `fixtures/storage/` | T10, T11, T2 | `cargo test -p orch-cli --test import`; `cargo xtask fixture-gen --check` | 20 |
+| T21 | `orch import` from a 1.0 directory: dry run, bounds, resume; the source read by listing through the confined-directory module, the id rule, and nothing done outside the database; the seeded fixture generator and the hand-written hostile-source corpus (links, special files, traversal-shaped ids and names, a live canary process). The source-budget pass of the spec's "Import bounds": every document measured for bytes, depth, nodes, aliases, expansion and tags before anything is built from it, on 1.0's own guarded reader (`orch_core::definition_yaml`) where that already holds the limit; event lines read as a bounded stream; the check of the whole source before the first write; and the hostile-document corpus (the review's depth and alias documents, merge-key bombs, tags, each limit and one over), run in a child process under a time and a memory ceiling | R64 to R70, R90, R99, R103 to R105, R109 to R112, R116 (a 1.0 source) | `crates/orch-infra/src/import/`, `crates/orch-cli/src/commands/import*`, `xtask/src/fixture_gen.rs`, `fixtures/storage/`, `crates/orch-infra/tests/source_budget.rs`, `crates/orch-cli/tests/import_hostile.rs` | T10, T11, T2 | `cargo test -p orch-cli --test import --test import_hostile`; `cargo test -p orch-infra --test source_budget`; `cargo xtask fixture-gen --check` | 20 |
 | T22 | `orch db` with the daemon running: status, verify, query, prune | R72 to R74, R79 | `crates/orch-daemon/src/ops/`, `crates/orch-cli/src/commands/db*` | T10, T16, T17 | `cargo test -p orch-cli --test db_commands` | 21 |
-| T23 | Backup, restore, vacuum, export, and import from an export file; a backup is written and read through the confined-directory module, its manifest's names are checked against the layout and never opened, and an export's names, ids and paths are stored as data | R75 to R80, R100, R108, R101 and R102 (backups), R105 and R107 (export) | `crates/orch-infra/src/sqlite/backup*`, `crates/orch-cli/src/commands/db*` | T21, T22 | `cargo test -p orch-cli --test db_backup_restore --test db_export_import --test restore_fencing --test db_offline` | 22 |
+| T23 | Backup, restore, vacuum, export, and import from an export file; a backup is written and read through the confined-directory module, its manifest's names are checked against the layout and never opened, and an export's names, ids and paths are stored as data. The export format of the spec's "Import bounds" (blob bytes in chunks, a manifest, tables only) and its hostile reader: the header checked before SQLite opens the file, a read-only immutable connection with the schema untrusted, triggers, views and extensions off, run-time limits, a heap limit, an authorizer and a progress handler, `quick_check` first, the schema compared and never adopted, rows copied by fixed statements into a database built by the product's own migrations under a scratch name and published by a rename; and the hostile-export corpus, made by altering the bytes of an export the product wrote, run in a child process under the same ceilings | R75 to R80, R100, R108, R101 and R102 (backups), R105 and R107 (export), R113 to R115, R116 (an export), R67 (no resume for an export) | `crates/orch-infra/src/sqlite/backup*`, `crates/orch-infra/src/import/export*`, `crates/orch-cli/src/commands/db*`, `crates/orch-infra/Cargo.toml` (the `limits` and `hooks` features of `rusqlite`, ADR 0017 decision 19), `crates/orch-cli/tests/export_hostile.rs` | T21, T22 | `cargo test -p orch-cli --test db_backup_restore --test db_export_import --test export_hostile --test restore_fencing --test db_offline`; `./xtask/gate.sh full` (security-relevant) | 22 |
 
 ### Switch, removal, proof
 
@@ -140,6 +143,7 @@ substance. Findings of the earlier independent review are the spec rows that nam
 | Finding | Answer | Where |
 |---|---|---|
 | Security S2, blocking: an imported run id became the event file's name, and other source-supplied names could select files | Accepted, and widened to every name, id and path from outside the daemon, to the pointer file and the project record, and to process and branch facts read from a source. Modified in two places, both put to the owner as AP14: the 1.0 workspace layout `workspaces/<task id>` is kept, with the id checked and links refused; and a restore still acts on the processes its backup records (R100) | Spec R101 to R108, R41, R99, "Filesystem names", "Import rules", the backup layout in "Data directory", AP14; ADR 0017 decision 20; T9, T11, T12, T13, T16, T21, T23, T24 |
+| Security S1, blocking: the import bounds limited a file's bytes and nothing inside it (depth, alias and merge expansion, tags), and an export file had no validation contract at all | Accepted. Every 1.0 document is measured before anything is built from it, with 1.0's own reader's limits where it has them, so aliases and merge keys keep working; an export is read as a hostile SQLite file and published only when all of it has passed. Modified in one place, put to the owner as AP15: three rules are stricter than 1.0's reader for a document edited by hand (tags refused, depth 64, expanded bytes 4 MiB). Widened in two: the whole source is checked before the first write, and an import from an export is all or nothing | Spec R109 to R116, R65 to R67, R80, facts F12 and F13, "Import bounds" with its vectors, "Import rules", AP15; ADR 0017 decisions 19 and 21; T21, T23 |
 
 ## Status
 
@@ -165,7 +169,12 @@ substance. Findings of the earlier independent review are the spec rows that nam
   appear in no row, blob or report. The vectors of the spec's "Filesystem names" are tested as written, by T9
   for the confined directory, T11 for blobs, T16 for event files, T21 for a 1.0 source and T23 for backups and
   exports.
-- `./xtask/gate.sh full`: T18 and T24 (security-relevant and process handling), and once for the goal in T27,
+- Hostile input (spec R109 to R116): the vectors of the spec's "Import bounds" are tested as written, each
+  limit at its value and at one over. T21 owns the documents of a 1.0 source and T23 the export files. Every
+  entry runs in a child process and must end with its stated refusal within 30 s and 512 MiB resident, with
+  the source byte-identical and the destination as the spec says for that refusal. The product's own export
+  must pass under the same limits that refuse the hostile ones.
+- `./xtask/gate.sh full`: T18, T23 and T24 (security-relevant and process handling), and once for the goal in T27,
   on macOS and on native Linux. Every PR: `fast` after each commit, the pre-PR check before opening, Linux CI
   green at the final head.
 - No dashboard behaviour changes, so no new tmux test; the existing ones must stay green through T17 and T24.
@@ -194,7 +203,7 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
 
 ## Open questions
 
-- The spec's O1 to O10 and AP1 to AP14, each with a recommendation; the owner rules at T7.
+- The spec's O1 to O10 and AP1 to AP15, each with a recommendation; the owner rules at T7.
 - T5 may replace ADR 0017 decision 16 (how a generation and an epoch are formed), decides whether a restore
   lineage is carried beside the epoch (spec AP11), and settles how a process is held until its pid is committed
   (R96). Nothing before T12 depends on any of the three.
