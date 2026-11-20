@@ -2236,7 +2236,18 @@ mod tests {
                 }
                 None => std::env::temp_dir().canonicalize().unwrap(),
             };
-            let base = fresh_case(&parent);
+            Self::under_parent(&parent)
+        }
+
+        fn short_socket_path() -> Self {
+            // Unix socket addresses have a small fixed limit. The gate's private
+            // TMPDIR may include a long checkout path; keep this private case
+            // under the short system temp parent instead.
+            Self::under_parent(&Path::new("/tmp").canonicalize().unwrap())
+        }
+
+        fn under_parent(parent: &Path) -> Self {
+            let base = fresh_case(parent);
             let meta = fs::symlink_metadata(&base).unwrap();
             assert!(meta.is_dir());
             assert_eq!(meta.mode() & 0o7777, 0o700);
@@ -3896,7 +3907,11 @@ version = "0.0.0"
     fn native_all_state_leaf_kinds_are_checked_without_touching_canary() {
         for leaf in [Leaf::Marker, Leaf::Record, Leaf::Temporary] {
             for plant in ["link", "socket", "public", "hardlink"] {
-                let f = Fixture::new();
+                let f = if plant == "socket" {
+                    Fixture::short_socket_path()
+                } else {
+                    Fixture::new()
+                };
                 let path = f.files.path(leaf);
                 let socket = match plant {
                     "link" => {
