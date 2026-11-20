@@ -13,9 +13,12 @@
   and 15 to 21 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
   the owner's.
 - The owner's answers so far (2026-11-20): decision 16 follows the answer to the spec's AP11, decision 17 the
-  answer to O1 and decision 18 the answer to AP1. Every other point of the spec's "Open questions" is pending,
-  and this ADR stays proposed until the owner has answered them. Decisions 22 to 25 answer the security review
-  and the red team; the owner has not seen them.
+  answer to O1 and decision 18 the answer to AP1. Decision 12 follows the owner's direction on AP13, whose
+  numbers are pending. The answers to O3 and D3 agree with decision 22 and with the hard stop of the spec's
+  R123 as far as their words go, and the answer to AP12 with the spec's R42. The spec's "Owner's answers" has
+  a row for every id; every point not answered there is pending, and this ADR stays proposed until the owner
+  has answered them. Decisions 22 to 25 answer the security review and the red team; the owner has not seen
+  them under their own points (AP14 to AP20).
 
 ## Context
 
@@ -114,12 +117,19 @@ across a crash, lists that do not load everything, and a retried request that ru
     run's events from 1 and hands batches to the events lane; the append ignores a sequence number already
     stored, so a repeated batch is harmless. If the measured throughput cannot meet the claim-latency budget
     (deliverable D), events are kept as per-run files in the data directory, each named by a hash (decision 20),
-    behind the same port operations and nothing else in this ADR changes. The measurement has since missed the
-    budget on macOS and met it in a Linux container on the same machine; no figure from native Linux exists
-    yet. Its report does not establish the cause, so the spec's point AP13 asks the owner to let a declared
-    diagnosis run first (automatic checkpointing off, one transaction for all waiting batches) and keeps the
-    fallback as the ruling if that run misses. The path that ships is measured against the same budget before
-    its PR merges.
+    behind the same port operations and nothing else in this ADR changes. The first measurement missed its
+    budget on macOS (50 ms at the 99th percentile and 100 ms at the worst, at 50 claims a second) and met it
+    in a Linux container on the same machine; no figure from native Linux hardware exists yet. That result
+    is kept as it is and is not measured away. On 2026-11-20 the owner chose, at the spec's point AP13, to
+    revise the workload and the budget and to measure anew, in place of a diagnosis at the first budget, and
+    set no numbers. The spec's "Event measurement" states the revised method before it runs: one claim a
+    second, 1 to 24 event streams, a burst cell, 200 ms and 1,000 ms proposed, 660 s repetitions that each
+    hold checkpoints by the production rule of decision 23, the claims around each checkpoint judged apart,
+    and macOS hardware and native Linux hardware. Those numbers are proposed; they and the results return to
+    the owner, and no budget is met until the owner accepts both. A valid miss of the revised budget selects
+    the fallback, which no figure shows to be faster and which is measured as built. The path that ships is
+    measured by the same method before its PR merges. The proposal exceeds two numbers of decision 9, the
+    50 ms for a claim's wait and the 1 s for an event batch; the owner is asked about them with the results.
 
 13. **A retried change runs once.** A request may carry a key. The key, scoped by (identity, project, run,
     epoch, key), is stored with a hash of the request and the result in the same transaction as the change, and
@@ -140,7 +150,9 @@ across a crash, lists that do not load everything, and a retried request that ru
     owner decided this on 2026-11-20 (the spec's AP11) and amended gate line 9 to match. The lineage is a
     random 128-bit id made with the database, replaced by every restore, kept by every other start, stored in
     `daemon_config` and held by every lease beside its epoch. Every lease-bound call carries both and is
-    refused unless both equal the lease's (R77, R132). A task's next epoch comes from `task_epochs` alone. The
+    refused unless both equal the lease's (R77, R132). A call refused for an earlier lineage changes no row:
+    a finish of an earlier lineage does not update even its own run, and a run that a restore brought back
+    is closed by the daemon's recovery under the new lineage (R36). A task's next epoch comes from `task_epochs` alone. The
     generation is a counter of starts, one more than the highest that the database and the file `generation`
     record; it orders the starts of one lineage and promises nothing about numbers. An epoch's number may
     repeat under another lineage, and nothing compares epochs across lineages. The first draft of this
@@ -148,7 +160,10 @@ across a crash, lists that do not load everything, and a retried request that ru
     UTC second) and concluded that a number was never issued twice. That does not hold: a backup restored
     onto a directory with no earlier state, while the clock is behind an earlier start, issues the same
     number again. The floor is withdrawn. The lease prototype (deliverable E) is still to confirm the
-    mechanics. A restore also refuses while a recorded process lives (R100).
+    mechanics. A restore also refuses while a recorded process lives (R100). That refusal is the only ground
+    for sending a restored task out again in 1.1. The prototype's alternative, a waiting period of one lease
+    after the restore, holds only where a holder stops itself at its deadline; 1.1's processes do not (the
+    owner's answer to AP12 keeps R42), so time alone shows nothing here, and the alternative waits for 1.5.
 
 17. **The project is named by a pointer file from 1.1.** `orch init` and `orch import` write `.orch-project`
     in the project directory, holding the project id and nothing else. The daemon's data directory is created as
@@ -198,9 +213,9 @@ across a crash, lists that do not load everything, and a retried request that ru
     directory rely on the hash check instead, so that a hard-link snapshot of the directory does not stop the
     daemon. The importer reads its source the same way, by listing, and opens nothing that a document names. A
     pid, a workspace path or a project directory read from a 1.0 source or an export is never acted on: an
-    import writes no lease and no intent and signals nothing. A restore does not act on a backup's rows either: it refuses while a
-    process that the backup records is alive, and stops, when asked, only the processes that the replaced
-    state of this directory records (R100; AP14 puts that to the owner). The spec's "Filesystem names" is the contract and holds the test vectors. The one id
+    import writes no lease and no intent and signals nothing. A restore does not act on a backup's rows either: a
+    process that the backup records makes it refuse and report, never signal, and it stops, when asked, only
+    the processes that the replaced state of this directory records (R100). The spec's "Filesystem names" is the contract and holds the test vectors. The one id
     that still names a directory is `workspaces/<task id>` in the project directory, 1.0's layout, with 1.0's
     reject-never-rewrite check; the spec's point AP14 puts it to the owner. A check of the id shows that it is
     one name, not that the directory is one task's: the review's second reading found that `tsk_Case` and
@@ -213,7 +228,11 @@ across a crash, lists that do not load everything, and a retried request that ru
     And before every reuse, merge, delete and cleanup a listing must hold the directory, or the branch,
     under exactly the task's name; a new workspace is an exclusive create. A filesystem that folds a name
     keeps the spelling it was created under, so what is reached through another spelling is seen as another
-    name's and is never adopted or removed. This decision answers the security
+    name's and is never adopted or removed. One part of this rule is not decided: whether a backup given to
+    a restore is taken to be this project's own state, so that a directory already at a restored task's
+    exact name is that task's. A name, a device and an inode do not show who wrote a backup. The spec's
+    AP14 puts two options to the owner, trust with a listing in the confirmation or refusal as for an
+    export, and this ADR takes neither until the owner has ruled. This decision answers the security
     review's finding S2, which showed the first layout (`blobs/events/ab/<run id>`) leaving the data directory
     for a run id shaped like a path. The descriptor calls exist, without `unsafe`, in `nix`, which the workspace
     already depends on and already uses this way (`crates/orch-daemon/src/ops/transport.rs`); `orch-infra` needs
@@ -248,7 +267,9 @@ across a crash, lists that do not load everything, and a retried request that ru
     keeps a local entry whose pid is alive and a remote entry whose peer is registered, and a 1.0 stop leaves
     both behind. Closing them would send their tasks out a second time. So the import refuses while a local
     process of a run exists or any remote run is recorded, and names it (R119); it does not trust the peer
-    registry, since removing a peer there stops nothing on the peer. It asks only whether the pid exists and never signals: a 1.0 entry has no
+    registry, since removing a peer there stops nothing on the peer. It asks only whether the pid's process
+    exists and whether its process group still has a member, and never signals: 1.0 makes each agent the
+    leader of its own group, a child can outlive the leader, and a 1.0 entry has no
     start time, so the pid may be another program's. The owner ends the work with the 1.0 daemon or names the
     run as ended. A run the import closed is never attached again (R120). The import keeps the size and hash
     of `state.json` and of each index, and a 1.1 start refuses when they have changed, because a 1.0 daemon
@@ -257,11 +278,19 @@ across a crash, lists that do not load everything, and a retried request that ru
 
 23. **The writer never checkpoints, fails by class, and a finish is on disk before it is queued.** Automatic
     checkpointing is off on the writer's connection, and a second connection runs passive checkpoints, so no
-    commit carries one (R126); a long pooled read is interrupted once the log is large (R127). A failure from
+    commit carries one (R126); a long pooled read is interrupted once the backlog is large (R127). Both rules
+    act on the log's backlog, the frames not yet checkpointed, kept from the writer's commit callback and
+    each checkpoint's result. Neither acts on the length of the log's file, which SQLite does not shorten
+    after a checkpoint. With `synchronous = NORMAL` a commit is not synced and a checkpoint is; the proposal
+    under AP13 is `fullfsync` and `checkpoint_fullfsync` on, so that on macOS a checkpoint's sync is a full
+    flush and is measured as one. A failure from
     outside a transaction's logic is retried with nothing dropped, or fails the writer, which then refuses
-    mutations and reports itself without the database (R128). A run's finish is written to a spool file and
+    mutations and reports itself without the database (R128); an idle writer never fails for having nothing
+    to commit. A run's finish is written to a spool file and
     synced before it waits for the writer, and recovery applies it before it judges the run, so a restart
-    behind a locked or failing database does not turn a finished run into a cancelled one (R129).
+    behind a locked or failing database does not turn a finished run into a cancelled one (R129). When the
+    spool write itself fails, the finish is kept in memory, retried and reported, and is lost only if the
+    daemon is stopped before the file or the commit succeeds; the stop names it.
 
 24. **`orch db query` reads fixed views under an authorizer; a backup stays in the data directory.** The
     command has its own read-only connection, an authorizer that denies by default, and run-time limits; it
@@ -360,6 +389,18 @@ across a crash, lists that do not load everything, and a retried request that ru
   decision of the goal. This ADR keeps one release; the spec's AP20 puts both to the owner.
 - **Automatic checkpointing left on.** SQLite's default, and what the first measurement ran with. The
   checkpoint then runs inside whichever commit crosses the threshold, a claim's included.
+- **Diagnose at the first budget before anything else.** The recommendation until 2026-11-20: run the first
+  experiment again with checkpointing moved off the writer and one event transaction for all runs. The owner
+  chose a revised workload and budget instead. Both changes are in the design in any case (decisions 9 and
+  23), and the revised method measures them with a real checkpoint in every repetition, which a 12 s cell
+  with automatic checkpointing off never held.
+- **Act on the length of the log's file.** One `stat` and no counting. The file keeps its length after every
+  frame has been checkpointed, so a rule on it stays tripped until the daemon closes. Setting
+  `journal_size_limit` would shorten the file when the log starts again; the backlog needs no such setting
+  and is what a checkpoint and a held-back read actually change.
+- **Let an earlier-lineage finish record its outcome on its own run.** It keeps usage for a run that a
+  restore superseded. It is also a write by a caller that decision 16 calls stale, and what it may write
+  would need its own contract. Recovery closes such a run instead.
 - **Results kept in memory until they commit.** No file, and a daemon restarted behind a locked database
   loses the result and cancels the run.
 - **`orch db query` on every table, guarded by reading the SQL.** A filter on text is a parser to keep
