@@ -105,7 +105,8 @@ across a crash, lists that do not load everything, and a retried request that ru
     run's events from 1 and hands batches to the events lane; the append ignores a sequence number already
     stored, so a repeated batch is harmless. If the measured throughput cannot meet the claim-latency budget
     (deliverable D), events are kept as per-run files in the data directory behind the same port operations
-    and nothing else in this ADR changes.
+    and nothing else in this ADR changes. The measurement has since missed the budget on macOS and met it on
+    Linux (the spec's point AP13), so 1.1 is planned on the fallback unless the owner rules otherwise.
 
 13. **A retried change runs once.** A request may carry a key. The key, scoped by (identity, project, run,
     epoch, key), is stored with a hash of the request and the result in the same transaction as the change, and

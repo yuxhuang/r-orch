@@ -94,7 +94,7 @@ first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`
 | T4 | Measure batched event append against the claim-latency budget, as a standalone experiment on macOS and native Linux | R5, R63 | `docs/sqlite-event-throughput.md`, `docs/experiments/sqlite-events/` | T3 | The report states the budget declared before the run, the figures and a verdict for each platform | 4 |
 | T5 | Prototype "claim with a fenced lease" as a standalone workspace, across a suspend and resume and across a restore; report its result | R6 | `prototypes/fenced-lease/`, `docs/specs/2026-11-20-fenced-lease-prototype.md`, `docs/plans/2026-11-20-fenced-lease-prototype.md`, `docs/decisions/0018-fenced-lease-prototype.md` | T3 | The report states what a suspended machine and a restore do to a lease, and whether ADR 0017 decision 16 holds (spec AP11) | 5 |
 | T6 | Security review of the spec and red-team of the plan (import cutover, single writer); their findings become spec rows or plan edits | all | `docs/specs/`, `docs/plans/`, `docs/decisions/0017-sqlite-storage.md` | T1 | Each finding is answered in PR 6 as accepted, rejected or modified | 6 |
-| T7 | Approval gate: the owner rules on O1 to O10 and AP1 to AP11; spec `approved`, plan `active`, ADR 0017 `accepted` | — | status lines; `docs/decisions/README.md` | T2 to T6 | The owner's approval recorded in PR 6 | 6 |
+| T7 | Approval gate: the owner rules on O1 to O10 and AP1 to AP13; spec `approved`, plan `active`, ADR 0017 `accepted` | — | status lines; `docs/decisions/README.md` | T2 to T6 | The owner's approval recorded in PR 6 | 6 |
 
 ### Product: built on files, then beside files
 
@@ -115,7 +115,7 @@ first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`
 | T20 | Usage for every run, with the model and the agent CLI version | R86, R87 | `crates/orch-engine/src/orchestrator/`, `crates/orch-infra/src/adapters/` | T12 | `cargo test -p orch-engine --test usage` | 19 |
 | T21 | `orch import` from a 1.0 directory: dry run, bounds, resume; the seeded fixture generator | R64 to R70, R90, R99 | `crates/orch-infra/src/import/`, `crates/orch-cli/src/commands/import*`, `xtask/src/fixture_gen.rs`, `fixtures/storage/` | T10, T11, T2 | `cargo test -p orch-cli --test import`; `cargo xtask fixture-gen --check` | 20 |
 | T22 | `orch db` with the daemon running: status, verify, query, prune | R72 to R74, R79 | `crates/orch-daemon/src/ops/`, `crates/orch-cli/src/commands/db*` | T10, T16, T17 | `cargo test -p orch-cli --test db_commands` | 21 |
-| T23 | Backup, restore, vacuum, export, and import from an export file | R75 to R80 | `crates/orch-infra/src/sqlite/backup*`, `crates/orch-cli/src/commands/db*` | T21, T22 | `cargo test -p orch-cli --test db_backup_restore --test db_export_import --test restore_fencing --test db_offline` | 22 |
+| T23 | Backup, restore, vacuum, export, and import from an export file | R75 to R80, R100 | `crates/orch-infra/src/sqlite/backup*`, `crates/orch-cli/src/commands/db*` | T21, T22 | `cargo test -p orch-cli --test db_backup_restore --test db_export_import --test restore_fencing --test db_offline` | 22 |
 
 ### Switch, removal, proof
 
@@ -177,10 +177,12 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
 
 ## Open questions
 
-- The spec's O1 to O10 and AP1 to AP11, each with a recommendation; the owner rules at T7.
+- The spec's O1 to O10 and AP1 to AP13, each with a recommendation; the owner rules at T7.
 - T5 may replace ADR 0017 decision 16 (how a generation and an epoch are formed), decides whether a restore
   lineage is carried beside the epoch (spec AP11), and settles how a process is held until its pid is committed
   (R96). Nothing before T12 depends on any of the three.
-- T4 decides whether T16 ships events in SQLite or the file fallback. T16's scope is written for either.
+- T4 decides whether T16 ships events in SQLite or the file fallback. Its result missed the budget on macOS
+  (spec AP13), so T16 is planned on the fallback unless the owner rules otherwise, and the fallback is itself
+  measured against the budget before T16 merges. T16's scope is written for either.
 - T24 and T25 could be one PR if the wiring is small. They are planned as two so that the switch is reviewed
   as behaviour and the removal as a move.
