@@ -104,7 +104,7 @@ first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|
 | T8 | Port v2 in `orch-core`, its fakes, and the v2 file adapter; the suite extended to all of port v2 | R7 to R15, R17, R97 | `crates/orch-core/src/store*`, `crates/orch-infra/src/storage/v2*`, the suite | T7 | Suite (file adapter) | 7 |
-| T9 | Data directory, its lock, the 1.0 owner lock, the network-filesystem check; the confined-directory module and the project record named by hash; schema, migrations, connection settings | R18, R19, R21 to R23, R29 to R33, R102, R107 (the record) | `crates/orch-infra/src/sqlite/`, `crates/orch-infra/src/data_dir/`, `crates/orch-infra/tests/confined_dir.rs`, `crates/orch-daemon/tests/daemon_data_dir.rs`, `.cargo/config.toml` | T7 | `cargo test -p orch-infra --test sqlite_schema --test sqlite_migrations --test sqlite_connection --test confined_dir`; `cargo test -p orch-daemon --test daemon_data_dir --test daemon_legacy_lock` | 8 |
+| T9 | Data directory, its lock, the 1.0 owner lock, the network-filesystem check; the confined-directory module and the project record named by hash; schema, migrations, connection settings | R18, R19, R21 to R23, R29 to R33, R102, R107 (the record) | `crates/orch-infra/src/sqlite/`, `crates/orch-infra/src/data_dir/`, `crates/orch-infra/Cargo.toml` (the `fs` and `dir` features of `nix`), `crates/orch-infra/tests/confined_dir.rs`, `crates/orch-daemon/tests/daemon_data_dir.rs`, `.cargo/config.toml` | T7 | `cargo test -p orch-infra --test sqlite_schema --test sqlite_migrations --test sqlite_connection --test confined_dir`; `cargo test -p orch-daemon --test daemon_data_dir --test daemon_legacy_lock` | 8 |
 | T10 | SQLite adapter of port v2: the writer with lanes, the read pool, intents | R7 to R15, R24 to R28, R98 | `crates/orch-infra/src/sqlite/` | T8, T9 | Suite (SQLite); `cargo test -p orch-infra --test sqlite_writer --test sqlite_crash` | 9 |
 | T11 | Blob store on disk, on the confined-directory module: a blob is reached only by a parsed hash; prompts by hash; attachments as blobs | R58, R59, R101, R102 (blobs) | `crates/orch-core/src/store/blob.rs`, `crates/orch-infra/src/blob/` | T9 | `cargo test -p orch-infra --test blob_store` | 10 |
 | T12 | Engine on port v2, part 1: claims, leases, retries, start and finish a run; the workspace found by task id and the branch by its derived name, never by a stored path; the `orch-peer` facade | R35, R36, R40, R20, R96, R106 | `crates/orch-engine/src/orchestrator/`, `crates/orch-engine/src/peer_facade*`, `crates/orch-infra/src/process/`, `crates/orch-infra/src/workspace/` | T8, T10 | `cargo test -p orch-engine --test transactions --test leases --test retries --test task_statuses`; `cargo test -p orch-infra workspace`; `cargo test -p orch-peer` | 11 |
@@ -132,14 +132,14 @@ first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`
 Docs travel with their change: each product PR adds its CHANGELOG line and the RUNBOOK entry for any new
 message; T26 writes what spans the stack.
 
-### Review findings (T6)
+### Security review and red-team findings (T6)
 
-Each finding of the spec's security review and of the plan's red-team is answered here; the requirement rows
-carry the substance.
+Each finding of T6's two reviews gets a row here when its correction lands; the requirement rows carry the
+substance. Findings of the earlier independent review are the spec rows that name it as their source.
 
 | Finding | Answer | Where |
 |---|---|---|
-| Security S2, blocking: an imported run id became the event file's name, and other source-supplied names could select files | Accepted, and widened to every name, id and path from outside the daemon. Modified in one place: the 1.0 workspace layout `workspaces/<task id>` is kept, with the id checked and links refused, and put to the owner as AP14 | Spec R101 to R108, "Filesystem names", "Import rules", AP14; ADR 0017 decision 20; T9, T11, T12, T13, T16, T21, T23, T24 |
+| Security S2, blocking: an imported run id became the event file's name, and other source-supplied names could select files | Accepted, and widened to every name, id and path from outside the daemon, to the pointer file and the project record, and to process and branch facts read from a source. Modified in two places, both put to the owner as AP14: the 1.0 workspace layout `workspaces/<task id>` is kept, with the id checked and links refused; and a restore still acts on the processes its backup records (R100) | Spec R101 to R108, R41, R99, "Filesystem names", "Import rules", the backup layout in "Data directory", AP14; ADR 0017 decision 20; T9, T11, T12, T13, T16, T21, T23, T24 |
 
 ## Status
 
@@ -160,10 +160,11 @@ carry the substance.
   performance result; the record of T4 is.
 - The importer is tested on generated projects of the live project's shape and on a hand-written corpus of
   damaged input (T21), then once on a copy of the live project (T27).
-- Names and paths (spec R101 to R108): every test that plants a hostile name, link or special file also
-  plants a canary outside its root and asserts that the canary's bytes and metadata are unchanged and that it
-  was not read. The vectors of the spec's "Filesystem names" are tested as written, by T9 for the confined
-  directory, T11 for blobs, T16 for event files, T21 for a 1.0 source and T23 for backups and exports.
+- Names and paths (spec R101 to R108): every test that plants a hostile name, link or special file also plants a
+  canary outside its root and asserts that the canary's bytes and metadata are unchanged and that its contents
+  appear in no row, blob or report. The vectors of the spec's "Filesystem names" are tested as written, by T9
+  for the confined directory, T11 for blobs, T16 for event files, T21 for a 1.0 source and T23 for backups and
+  exports.
 - `./xtask/gate.sh full`: T18 and T24 (security-relevant and process handling), and once for the goal in T27,
   on macOS and on native Linux. Every PR: `fast` after each commit, the pre-PR check before opening, Linux CI
   green at the final head.
