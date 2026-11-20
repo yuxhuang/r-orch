@@ -360,12 +360,13 @@ fn restore_lineage_fences_discarded_future() {
     let discarded = live.claim("p", "t", "b", "r2", 120, None).unwrap();
     let mut restored = Store::connect(&snapshot).unwrap();
     restored
-        .restore("fresh-lineage-2", "restore-session")
+        .restore("fresh-lineage-2", &discarded.session)
         .unwrap();
     let next = restored.claim("p", "t", "b", "r2", 0, None).unwrap();
-    // Same task/run/agent/numeric epoch, but old lineage and session are never accepted.
+    // Reuse session/task/run/agent/numeric epoch: lineage alone must fence the old token.
     assert_eq!(next.epoch, discarded.epoch);
     assert_ne!(next.lineage, discarded.lineage);
+    assert_eq!(next.session, discarded.session);
     for stale in [old_snapshot_token, discarded] {
         refused(restored.renew(&stale, 1), Refusal::Superseded);
         refused(restored.finish(&stale, 1, true), Refusal::Superseded);
@@ -373,6 +374,36 @@ fn restore_lineage_fences_discarded_future() {
     }
     assert_eq!(integer(&restored, "SELECT attempts FROM tasks"), 0);
     restored.finish(&next, 1, true).unwrap();
+}
+
+#[test]
+fn restore_lineage_refuses_old_token_before_new_claim() {
+    let (_dir, mut s) = fixture();
+    let first = token(&mut s);
+    s.restore("fresh-lineage-2", &first.session).unwrap();
+    // Counter still equals the token, but restore removed its lease. Check the
+    // durable fence before looking for a lease, even when the session is reused.
+    assert_eq!(integer(&s, "SELECT epoch FROM task_epochs"), first.epoch);
+    assert_eq!(integer(&s, "SELECT COUNT(*) FROM leases"), 0);
+    refused(s.renew(&first, 0), Refusal::Superseded);
+    refused(s.finish(&first, 0, true), Refusal::Superseded);
+    refused(s.reattach(&first, 0), Refusal::Superseded);
+}
+
+#[test]
+fn stale_copy_cannot_reattach_after_second_restart() {
+    let (_dir, mut s) = fixture();
+    let first = token(&mut s);
+    s.restart("session-2", 0).unwrap();
+    let attached = s.reattach(&first, 1).unwrap();
+    s.restart("session-3", 0).unwrap();
+    refused(s.reattach(&first, 1), Refusal::Session);
+    let current = s.reattach(&attached, 1).unwrap();
+    assert_eq!(current.run, first.run);
+    assert_eq!(current.epoch, first.epoch);
+    assert_eq!(current.session, "session-3");
+    s.finish(&current, 2, true).unwrap();
+    assert_eq!(integer(&s, "SELECT COUNT(*) FROM runs"), 1);
 }
 
 #[test]

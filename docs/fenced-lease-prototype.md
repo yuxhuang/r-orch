@@ -57,8 +57,7 @@ identities are deterministic inputs. This isolates storage semantics from OS ada
 | Fresh restore lineage | Old snapshot and discarded-future tokens cannot renew, finish or reattach, even with equal task/run/agent/numeric epoch | `restore_lineage_fences_discarded_future` |
 
 At code commit `bb44f34`, all 19 tests passed on macOS arm64 and native Linux arm64
-(Docker, rust:1.99.1-bookworm, network disabled), 0 failed on each; the races contribute 64 actual SQLite
-contentions per suite. Standalone fmt and clippy passed. The first test was observed
+(Docker, rust:1.99.1-bookworm, network disabled), 0 failed on each; the races exercise 64 competing SQLite claim pairs per suite. Standalone fmt and clippy passed. The first test was observed
 red against the unimplemented claim scaffold (0 passed, 1 failed), then green.
 A negative control removed the renewal/result authority check: the wake test failed
 with `expected Superseded, got Ok(())`; restoring the checks returned 19/19 green.
@@ -103,7 +102,13 @@ the corrected commands above passed. Real OS suspend is not measured here.
    fresh collision-resistant restore lineage in every fenced identity:
    `(restore_lineage, project, task, epoch)`, plus run/agent and daemon session checks.
    Ordinary restart retains lineage; restore invalidates old leases instead of allowing
-   grace reattachment. Repair counters to max(restored counter, runs, leases), then
+   grace reattachment. Immediate redispatch requires the daemon stopped and every
+   previous holder proven terminated, including holders from the discarded future.
+   Without that proof, quarantine dispatch for at least LEASE (120 s) after restore.
+   The storage-only model enforces neither process termination nor quarantine.
+   Lineage is the durable fence across restarts; session fences liveness/reattachment.
+   Tests reuse a session label across restore to isolate lineage, including before
+   a replacement lease exists. Repair counters to max(restored counter, runs, leases), then
    increment transactionally on claim. The full fence is never reissued although the
    numeric suffix can repeat. If the owner instead requires globally increasing numeric
    epochs across arbitrary rollback, retain a high-water mark outside the restored
@@ -114,6 +119,30 @@ claim transaction before insertion. Expiry is not a time-dependent index predica
 The task counter has no cascading task FK. Each accepted mutation validates authority
 inside the same BEGIN IMMEDIATE transaction as its effects; an out-of-transaction
 preflight is insufficient ([SQLite transaction documentation](https://www.sqlite.org/lang_transaction.html)).
+
+## Independent review corrections
+
+F1: correction 4 and ADR 0018 now state the stopped-daemon/all-holders-terminated
+precondition for immediate redispatch, with a 120 s quarantine alternative.
+F2: `restore_lineage_fences_discarded_future` reuses the session label;
+`restore_lineage_refuses_old_token_before_new_claim` isolates the daemon-lineage
+check before any new lease exists. F3: `stale_copy_cannot_reattach_after_second_restart`
+refuses a session-1 copy while permitting the legitimate session-2 token.
+
+F4, owner decision: applying this model to co-located 1.1 holders would stop every
+holder after a whole-system sleep of at least 90 s. Leases become reapable at 120 s;
+unrecovered runs are lost without charging an attempt. This is a visible change
+from 1.0, not an adopted 1.1 policy. The spec author reports that 1.1 instead keeps
+R42 (suspend ends no run), with holder deadlines deferred to 1.5. The owner must
+approve the product rule. Same-boot recovery with a persisted boot identity is an
+alternative to the model's conservative fresh session/120 s reservation.
+
+F6–F8 limits: a stopped holder must not reattach; this model has no release operation,
+so mistaken reattachment costs liveness until expiry. Finished-run intents remain
+pending because delivery is not modelled; product finish must complete intents in
+its transaction. Product open/restart must be atomic before accepting operations;
+`Store::connect` alone is not that startup boundary. These are not product implementations.
+This standalone workspace is frozen experiment evidence; root CI does not maintain it.
 
 ## Limits and product gate
 
@@ -139,16 +168,16 @@ Repository fast/pr gate evidence and PR delivery status are recorded in the task
 
 ## Repository delivery status
 
-The first `./xtask/gate.sh fast --base origin/main` was blocked at admission on the
-host-wide cooperative lease. No step or target use started. SIGINT did not end its
-admission wait; the author terminated only that waiting gate process (no child
-processes), exit137. Its result remains IN PROGRESS and is not successful evidence.
-No target marker was removed and no other holder was signalled.
+Independent review passed with conditions at code `bb44f34` / docs `a552526`.
+The review corrections add two tests (21 total), reuse the session label in the
+existing restore test, and state restore/sleep limits; product behavior is unchanged.
+The daemon-lineage mutant M1 and stale-session mutant M10 now each fail their named
+new test (0 passed, 1 failed). Removing both lineage checks also fails the reused-session
+discarded-future test with `expected Superseded, got Ok(())`.
 
-Other entry-step evidence also records three macOS fixture failures on base
-`fb6a1e1`; those are owned by separate task `tsk_M3Pl2T_`, not claimed as failures
-observed by this experiment's blocked gate. Independent review is queued as
-`tsk_nE5aU5P`. The final documentation commit receives another fast attempt and
-a pr attempt, each with bounded lease wait; exact results live in the task handoff.
+The original fast attempt ended while waiting for host lease admission (exit 137);
+final fast and pr at `a552526` were refused with exit 75, no steps run. Those are
+not successful evidence. No target marker was removed. Fresh continuation evidence,
+exact final head, gate results and PR status are recorded in the private task handoff.
 No PR is opened while repository verification is incomplete. No product approval,
 merge, tag or version bump is performed.

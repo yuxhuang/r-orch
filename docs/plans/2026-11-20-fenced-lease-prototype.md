@@ -43,6 +43,14 @@ lineage; counters are repaired to at least restored run/lease maxima before new 
   epochs globally unique when only the compound identity is unique.
 - [ ] Commit, run fast, run pr before opening a PR, report every failure and limitation.
 
+## Review correction round
+
+F1 adds the proven-terminated-holder restore precondition, not product enforcement.
+F2/F3 add two tests and reuse the session label across restore; M1 and M10 must fail
+under mutation. F4 exposes the 90 s whole-system-sleep consequence for owner choice.
+Final-head standalone checks and repository fast/pr are required again; delivery
+stays incomplete until fixture prerequisites land and all mandated checks pass.
+
 ## Rollback and documentation
 
 Delete the experiment directory and documents to remove it. Existing data, peers, CLI,

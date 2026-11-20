@@ -1,14 +1,16 @@
-# 0018: Model fenced leases independently of the product
+# 0018. Model fenced leases independently of the product
 
-## Status
+- Status: Proposed
+- Date: 2026-11-20
 
-Proposed. The owner requested a throwaway experiment, not adoption of its corrections.
+ The owner requested a throwaway experiment, not adoption of its corrections.
 Phase 1's owner gate remains required before product code.
 
 ## Context
 
 Task `tsk_jrPTVUS` needs storage evidence before the engine depends on SQLite leases.
-Elapsed clock domains do not survive a daemon restart. Snapshot rollback removes issued
+This model starts a new elapsed-clock domain on each daemon restart; system-wide
+suspend-inclusive clocks can survive a process restart within one boot. Snapshot rollback removes issued
 counter values. An old token must not match a newly issued run after restore.
 
 ## Decision
@@ -25,6 +27,11 @@ late acknowledgement cannot revive a stopped holder. Every resumed holder checks
 current authority before work. Restart invalidates session authority but reserves
 recoverable leases for 120 s. Restore selects a fresh lineage and discards old leases;
 repair task counters from the restored runs/leases/counters before releasing work.
+Immediate redispatch after restore requires the daemon stopped and every previous
+holder proven terminated. Otherwise dispatch must stay quarantined for at least
+LEASE (120 s) after restore; the model does not enforce process termination or quarantine.
+Lineage is the durable fence across restarts; session is the liveness fence for reattachment.
+Reusing a session label across restore must never defeat the lineage fence.
 
 ## Consequences
 

@@ -37,7 +37,7 @@ All test names refer to `prototypes/fenced-lease/src/tests.rs`; command:
 | R3 | Suspended holders fail closed at 90 s, and replaced tokens cannot renew or finish. | 5,7 | must | `wake_after_50_100_200_seconds`, `renewal_send_time_bounds_authority`; macOS |
 | R4 | Wall jumps cannot change authority. | 8 | must | `wall_jumps_do_not_change_lease`, `wall_clock_and_paused_clock_counterexamples`; macOS |
 | R5 | Restart reserves expired leases for 120 s, rejects ordinary calls until explicit reattachment, and loses unrecovered runs without charging attempts. | 5,9 | must | `restart_grace_and_reattach`, `restart_after_grace_loses_without_attempt`; macOS |
-| R6 | Restore demonstrates the snapshot-only counterexample and tests a proposed fresh-lineage correction, including an old live token. | 10,11 | must | `snapshot_maximum_repeats_a_discarded_epoch`, `restore_lineage_fences_discarded_future`; macOS |
+| R6 | Restore demonstrates the snapshot-only counterexample and tests a proposed fresh-lineage correction, including an old live token. | 10,11 | must | `snapshot_maximum_repeats_a_discarded_epoch`, `restore_lineage_fences_discarded_future`, `restore_lineage_refuses_old_token_before_new_claim`; macOS |
 | R7 | Prototype never enters product crates or runs agents, changes live state, or implements workers. | 1,11,12 | must | inspect diff; macOS |
 
 ## Non-goals and constraints
@@ -55,6 +55,10 @@ macOS, pinned Rust toolchain, bundled SQLite. Race tests use actual SQLite conne
 on separate threads and barriers. Sleep, wall jumps, restart and restore use deterministic
 clock injection and real database reopen/backup. Linux/real suspend integration is
 future product acceptance, not a claim made by this experiment.
+
+Restore immediate redispatch assumes all previous holders are proven terminated;
+the model does not enforce this. Two additional review tests isolate lineage with
+reused session labels and stale reattachment after a second restart.
 
 ## Open questions
 

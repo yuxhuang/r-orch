@@ -415,6 +415,8 @@ impl Store {
 
     /// Fresh lineage is an external input, never recovered from this snapshot.
     /// Production must generate a collision-resistant identity before enabling work.
+    /// Immediate redispatch assumes the daemon is stopped and every previous holder
+    /// is proven terminated. This storage-only model does not enforce that precondition.
     pub fn restore(&mut self, lineage: &str, session: &str) -> Result<()> {
         if lineage == self.lineage {
             return refuse(Refusal::Superseded);
