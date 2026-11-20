@@ -64,5 +64,15 @@ snapshot alone. No correction here changes a product contract.
 
 ## Verification
 
-Pending final commit-stamped evidence in the report; status stays approved until all
-checks and PR delivery finish.
+Prototype checks passed at code commit `bb44f34`; status stays approved because
+repository gate validation and PR delivery are incomplete.
+
+| Id | Result | Commit | Platform |
+|---|---|---|---|
+| R1 | pass | bb44f34 | macOS arm64; native Linux arm64 container |
+| R2 | pass | bb44f34 | macOS arm64; native Linux arm64 container |
+| R3 | pass | bb44f34 | macOS arm64; native Linux arm64 container |
+| R4 | pass | bb44f34 | macOS arm64; native Linux arm64 container |
+| R5 | pass | bb44f34 | macOS arm64; native Linux arm64 container |
+| R6 | pass (counterexample demonstrated; proposed correction tested) | bb44f34 | macOS arm64; native Linux arm64 container |
+| R7 | pass (diff inspection) | bb44f34 | macOS |

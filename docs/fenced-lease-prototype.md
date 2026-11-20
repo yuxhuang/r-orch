@@ -56,13 +56,14 @@ identities are deterministic inputs. This isolates storage semantics from OS ada
 | Restore repair | Next counter exceeds each task's restored run, lease and counter maximum, including deleted-task counters | `restored_counters_include_runs_leases_and_tombstones` |
 | Fresh restore lineage | Old snapshot and discarded-future tokens cannot renew, finish or reattach, even with equal task/run/agent/numeric epoch | `restore_lineage_fences_discarded_future` |
 
-All 19 tests passed on macOS arm64, 0 failed; the races contribute 64 actual SQLite
+At code commit `bb44f34`, all 19 tests passed on macOS arm64 and native Linux arm64
+(Docker, rust:1.99.1-bookworm, network disabled), 0 failed on each; the races contribute 64 actual SQLite
 contentions per suite. Standalone fmt and clippy passed. The first test was observed
 red against the unimplemented claim scaffold (0 passed, 1 failed), then green.
 A negative control removed the renewal/result authority check: the wake test failed
 with `expected Superseded, got Ok(())`; restoring the checks returned 19/19 green.
 An initial backup API compile error and a constant-assertion clippy failure were fixed;
-the corrected commands above passed. Linux and real OS suspend are not measured here.
+the corrected commands above passed. Real OS suspend is not measured here.
 
 ## Corrections for the phase 1 spec
 
@@ -135,3 +136,19 @@ The prototype's reaper scans all leases and the test setup API is intentionally 
 neither is a proposed production writer implementation. Root cargo/gate commands do
 not include this standalone workspace: its explicit commands above are required too.
 Repository fast/pr gate evidence and PR delivery status are recorded in the task handoff.
+
+## Repository delivery status
+
+The first `./xtask/gate.sh fast --base origin/main` was blocked at admission on the
+host-wide cooperative lease. No step or target use started. SIGINT did not end its
+admission wait; the author terminated only that waiting gate process (no child
+processes), exit137. Its result remains IN PROGRESS and is not successful evidence.
+No target marker was removed and no other holder was signalled.
+
+Other entry-step evidence also records three macOS fixture failures on base
+`fb6a1e1`; those are owned by separate task `tsk_M3Pl2T_`, not claimed as failures
+observed by this experiment's blocked gate. Independent review is queued as
+`tsk_nE5aU5P`. The final documentation commit receives another fast attempt and
+a pr attempt, each with bounded lease wait; exact results live in the task handoff.
+No PR is opened while repository verification is incomplete. No product approval,
+merge, tag or version bump is performed.
