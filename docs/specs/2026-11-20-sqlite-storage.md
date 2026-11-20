@@ -141,7 +141,8 @@ Read from the code at `fb6a1e1` (v1.0.0) unless marked unverified.
 | F7 | `orch-peer` runs inside the daemon on the engine. It reads `tasks/_index.json` and `messages/_index.json` directly and builds a `FileMessageStore` (`crates/orch-peer/src/worker.rs` near line 805, `crates/orch-peer/src/lib.rs` near lines 299 to 316), reads `state.json` through the state store (`worker.rs` near line 868), and keeps its own files `remotes.yml`, `remotes/` and `peer-id` under `.orchestry/`. | verified |
 | F8 | The 1.0 daemon takes `flock` on `.orchestry/.daemon-owner.lock` and then writes the PID file `.orchestry/orchestry.lock`. Agent workspaces are under `.orchestry/workspaces/`. | verified |
 | F9 | An exclusive `flock` taken through a read-only descriptor conflicts with the 1.0 daemon's lock on macOS and Linux and changes nothing in the file. | unverified; R31's test settles it |
-| F10 | Suspending the machine does not, by itself, end a local agent process or the daemon's supervision of it. | unverified; deliverable E settles it |
+| F10 | Suspending the machine does not, by itself, end a local agent process or the daemon's supervision of it. | unverified; deliverable E models a suspend as elapsed time, and R42's recorded check settles it on a real machine |
+| F11 | `orch init` writes `templates/default.md`, `workspace-exclude` and `.gitignore` and creates `logs/` under `.orchestry/` (`crates/orch-daemon/src/bootstrap.rs`). The workspace manager reads `workspace-exclude` for every isolated workspace (`crates/orch-infra/src/workspace/manager.rs`). A search of the product sources found no reader of `templates/default.md` and no writer of `logs/`: the prompt comes from the configuration's template strings or the built-in default. | verified by search |
 
 ## Requirements
 
@@ -159,7 +160,7 @@ their names are forward references.
 | R3 | The list of every read whose result depends on index order shall be in the repository, each entry naming the file, the function and what the port must keep for it. | B | must | `docs/storage-order-dependent-reads.md` exists, beside the pinned 1.0 contracts in `docs/storage-v1-conformance.md`; the order scenarios of the suite pass, among them `storage_conformance::equal_score_selections_rotate_after_run_lifecycle_saves` and `::lists_return_all_records_beyond_a_future_default_page`; a reviewer checks the list against the store list calls at the audited commit; both |
 | R4 | The SQLite library shall be chosen with the ARCHITECTURE §4.8 check (maintenance, MSRV of the pinned toolchain, licence through `deny.toml`), recorded in ADR 0017 decision 19 from the report `docs/sqlite-library.md`, bundle SQLite 3.37 or later with FTS5 available, and leave `unsafe_code` forbidden in the workspace. | C | must | The report and its probes under `docs/experiments/sqlite-library/`; `cargo deny check` passes on the PR that adds the dependency; `crates/orch-infra/tests/sqlite_build.rs::bundled_sqlite_has_strict_tables_and_fts5`; both |
 | R5 | Batched event throughput shall be measured against the claim-latency budget in "Writer lanes", on macOS and on Linux, with the commit, the hardware class and the raw figures recorded. | D, G7 | must | The report `docs/sqlite-event-throughput.md` and its experiment under `docs/experiments/sqlite-events/`, presented at the approval gate; macOS and native Linux |
-| R6 | A prototype shall show a claim with a fenced lease, including a suspended and resumed machine, and its result shall confirm or replace ADR 0017 decision 16 and R39 before the engine PR starts. | E | must | The prototype's report linked from the approval-gate PR; macOS with a real suspend, Linux |
+| R6 | A prototype shall show a claim with a fenced lease, including a suspended and resumed machine, and its result shall confirm or replace ADR 0017 decision 16 and R39 before the engine PR starts. | E | must | The prototype's report and its tests under `prototypes/fenced-lease/`, presented at the approval gate. The prototype models a suspend as elapsed time that includes it; the real suspend is R42's recorded check; macOS, Linux |
 | R7 | When the work of a unit of work returns an error or the process stops before the commit, the storage shall keep none of its changes. | F, B3 | must | `storage_conformance::unit_of_work_keeps_nothing_after_an_error`, `sqlite_crash::kill_before_commit_keeps_nothing`; both |
 | R8 | Every entity shall carry a revision that is 1 at creation and goes up by one on every update, and an update or delete whose expected revision is not the stored one shall fail with `StaleRevision` and change nothing. | F, B3 | must | `storage_conformance::revision_starts_at_one_and_goes_up_by_one`, `::stale_revision_is_refused_and_changes_nothing`; both |
 | R9 | A list shall return at most 100 rows by default and at most 1,000 on request, shall refuse a larger limit, shall return a cursor while more rows remain, and shall count the matching rows only when asked. | F | must | `storage_conformance::list_defaults_to_100_rows`, `::list_refuses_a_limit_over_1000`, `::count_is_absent_unless_requested`; both |
@@ -252,6 +253,7 @@ their names are forward references.
 | R96 | An agent process shall not run its agent unless the run's pid and start time were committed first: the daemon shall create the process held, commit, then release it, and a held process whose daemon is gone shall exit without running the agent. | review finding (a stop between starting a process and recording it left an untracked agent on a workspace that recovery would hand to a second run) | must | `crates/orch-engine/tests/transactions.rs::a_stop_between_spawn_and_commit_runs_no_agent`, `crates/orch-infra` process test `held_process_exits_when_its_parent_is_gone`; both |
 | R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. | B7; review finding | must | `storage_conformance::text_over_64_kib_round_trips_through_the_blob_store`, `import::text_over_64_kib_becomes_a_blob`; both |
 | R98 | Reads shall be served by a pool of `storage.read_connections` connections (default 4); a read that finds none free shall wait up to the admission deadline and then fail with `overloaded`, never open another connection. | B6; review finding | should | `sqlite_writer::reads_wait_for_a_free_connection_then_fail_overloaded`; both |
+| R99 | `orch import` shall account for every path under the source `.orchestry/`: each is imported, or left in place as "Import rules" lists, or named by the dry run and by the import's report as not imported. Project prompt template files shall become `templates` rows, byte for byte. | N, S2, B2 | must | `import::every_source_path_is_accounted_for` (a corpus with an unknown file and an unknown directory), `::templates_are_imported_byte_for_byte`; both |
 
 ## Storage port v2
 
@@ -469,7 +471,8 @@ workspace, 7 no usable daemon. No exit code is added.
 - The socket follows 0012's rule: `run/orch.sock` when its absolute path is at most 100 bytes, otherwise the
   short path under `$TMPDIR`, recorded in `run/daemon.json`. `ORCH_SOCKET` still overrides.
 - In the project directory 1.1 writes `.orch-project` (0644, at most 64 bytes) and, as 1.0 did,
-  `.orchestry/workspaces/` and orch-peer's own files. It writes no other path under `.orchestry/` (AP6).
+  `.orchestry/workspaces/` and orch-peer's own files; `orch init` also writes the authored files
+  `workspace-exclude` and `.gitignore` there, as 1.0 did. It writes no other path under `.orchestry/` (AP6).
   The directory `.orchestry/` itself must stay: its device and inode are the project identity of the frozen
   handshake. `orch init` creates it for a new project.
 - A data directory that names another project id than `.orch-project` does is refused with both values
@@ -519,6 +522,23 @@ The new operations are in no MCP allowlist.
   run.
 - A finished import writes `.orch-project` and records its time and source in `daemon_config`. orch never
   deletes a 1.0 file. `orch db status` shows that the 1.0 files are still present and how large they are (O3).
+- Every 1.0 path has a rule (R99):
+
+  | Path under `.orchestry/` | At import | After the import |
+  |---|---|---|
+  | `tasks/`, `agents/`, `goals/`, `teams/`, `messages/`, `context/`, each with its `_index.json` where it has one | Rows | Unused |
+  | `runs/run_*.json`, `runs/run_*.jsonl` | Runs, results, events and prompt blobs | Unused |
+  | `state.json` | Retry rows and counters; in-flight entries closed | Unused |
+  | `config.yml` | Settings, and `legacy.config` for unknown keys (R70) | Unused |
+  | `attachments/<task>/` | Blobs and `task_attachments` rows | Unused |
+  | `templates/*.md` | `templates` rows named by the file stem, byte for byte; a file over 64 KiB stops the import by name | Unused. As in 1.0 the engine does not read them (F11); `orch init` stores the `default` row where 1.0 wrote the file |
+  | `workspace-exclude`, `.gitignore` | Not imported | Used in place: authored files of the project directory, which `orch init` still writes |
+  | `workspaces/` | Not imported | Used in place (AP6) |
+  | `remotes.yml`, `remotes/`, `peer-id` | Not imported | orch-peer's own files, used in place |
+  | `orchestry.lock`, `.daemon-owner.lock`, `daemon.json`, the socket | Not imported | The 1.0 daemon's; 1.1 holds the owner lock without writing it (R31) |
+  | `logs/` | Not imported | Unused; 1.0 creates it and nothing was found that writes it (F11) |
+  | Anything else | Not imported; named by the dry run and by the import's report | Unused |
+
 - An export file (R80) is a SQLite database of the same schema version holding one project's rows from the
   project tables, without `leases`, `intents` and `request_keys`, plus a table of blob bytes and a manifest
   with a hash of every table and blob.
@@ -648,7 +668,7 @@ Each goal open point with a recommendation, then the points this spec found. The
 | AP3 | Whether an agent's session becomes a task principal in 1.1 | No: it stays an owner session for the 1.0 catalogue, so no agent workflow changes in the storage release; the new owner-only operations are refused in agent context (R54). The task column becomes real with authentication. | Enforce the task column now: safer on paper, but same-uid makes it advisory, and it changes what agents can do today. |
 | AP4 | CLI lists | Return all rows in the 1.0 shape by default; `--limit` and `--cursor` opt in to one page (R49). Scripts and agent prompts that parse `--json` keep working. | Page by default: honest about cost, breaks every consumer of the current output. |
 | AP5 | `preapproval` for a project created by `orch init` in 1.1 | On, as 1.0's default policy is `auto`; `orch init` prints the trust statement. Revisit in 1.5, when the daemon sets the verdict. | Off: safer default, and every new project stops at `review` until the owner turns it on. |
-| AP6 | What 1.1 writes under `.orchestry/` | Only `workspaces/` and orch-peer's files, as today; never a 1.0 state file. B2 binds the importer; this states the same for the daemon. | Move workspaces into the data directory: `.orchestry/` is then never written, but every agent CLI sees new paths and may ask for trust again. |
+| AP6 | What 1.1 writes under `.orchestry/` | Only `workspaces/`, orch-peer's files and, at `orch init`, the authored files `workspace-exclude` and `.gitignore`, as today; never a 1.0 state file. B2 binds the importer; this states the same for the daemon. | Move workspaces into the data directory: `.orchestry/` is then never written, but every agent CLI sees new paths and may ask for trust again. |
 | AP7 | "Over the local socket only" (B8) for commands that need the daemon stopped | Read it as "owner, local, never remote": import, restore and vacuum run offline under the directory lock; the other `orch db` commands use the socket. | Run all of them through a daemon in a maintenance mode: one path, and a daemon that must swap its own database while serving. |
 | AP8 | An atomic operation larger than 1,000 rows | It runs whole and is counted (R27); lane waits are promised only while that count is zero. Deliverable D reports the largest cascade on the live copy. | Cut cascades into steps: keeps the bound, exposes half-finished cascades to readers. |
 | AP9 | No scheduled backups in 1.1 | Accept; a job is a small follow-up once restore has field use. | Add a daily `db.backup` job with rotation now. |
