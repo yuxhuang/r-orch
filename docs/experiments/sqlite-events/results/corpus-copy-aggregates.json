@@ -1,0 +1,17 @@
+{
+  "tasks": {
+    "files": 3012,
+    "bytes": 31923571,
+    "changed_during_copy": 0,
+    "allocated_copy_bytes": 37826560
+  },
+  "runs": {
+    "files": 2547,
+    "bytes": 168130292,
+    "changed_during_copy": 0
+  },
+  "prompts_over_64k": {
+    "count": 383,
+    "bytes": 90325383
+  }
+}

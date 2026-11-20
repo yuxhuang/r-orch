@@ -1,0 +1,62 @@
+{
+  "macos-matrix": {
+    "exit_code": 0,
+    "wall_seconds": 857.2605644170001,
+    "peak_rss_bytes": 11042816,
+    "sampled_peak_rss_bytes": 11026432,
+    "sampled_rss_limit_bytes": 536870912,
+    "rss_sample_seconds": 0.5,
+    "deadline_seconds": 1800,
+    "stopped_reason": null
+  },
+  "macos-history": {
+    "exit_code": 0,
+    "wall_seconds": 101.180983125,
+    "peak_rss_bytes": 11108352,
+    "sampled_peak_rss_bytes": 11091968,
+    "sampled_rss_limit_bytes": 536870912,
+    "rss_sample_seconds": 0.5,
+    "deadline_seconds": 1800,
+    "stopped_reason": null
+  },
+  "macos-aligned": {
+    "exit_code": 0,
+    "wall_seconds": 39.046416625,
+    "peak_rss_bytes": 10977280,
+    "sampled_peak_rss_bytes": 10960896,
+    "sampled_rss_limit_bytes": 536870912,
+    "rss_sample_seconds": 0.5,
+    "deadline_seconds": 1800,
+    "stopped_reason": null
+  },
+  "linux-matrix": {
+    "exit_code": 0,
+    "wall_seconds": 725.262385913,
+    "peak_rss_bytes": 10924032,
+    "sampled_peak_rss_bytes": 7036928,
+    "sampled_rss_limit_bytes": 536870912,
+    "rss_sample_seconds": 0.5,
+    "deadline_seconds": 1800,
+    "stopped_reason": null
+  },
+  "linux-history": {
+    "exit_code": 0,
+    "wall_seconds": 82.96479791299998,
+    "peak_rss_bytes": 11259904,
+    "sampled_peak_rss_bytes": 6807552,
+    "sampled_rss_limit_bytes": 536870912,
+    "rss_sample_seconds": 0.5,
+    "deadline_seconds": 1800,
+    "stopped_reason": null
+  },
+  "linux-aligned": {
+    "exit_code": 0,
+    "wall_seconds": 37.58178918300007,
+    "peak_rss_bytes": 11395072,
+    "sampled_peak_rss_bytes": 6795264,
+    "sampled_rss_limit_bytes": 536870912,
+    "rss_sample_seconds": 0.5,
+    "deadline_seconds": 1800,
+    "stopped_reason": null
+  }
+}

@@ -1,0 +1,19 @@
+[package]
+name = "sqlite-events-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+# Entry-step experiment, deliberately outside the product workspace.
+[workspace]
+
+[dependencies]
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "backup", "cache"] }
+serde_json = "1.0"
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+chrono = "0.4"
+
+[profile.release]
+strip = true

@@ -1,0 +1,56 @@
+{
+  "macos-matrix": {
+    "completed_cases": 57,
+    "claims": 34200,
+    "events": 36828,
+    "failed_budget_cases": 22,
+    "budget_pass": false,
+    "data_invariants_pass": true,
+    "verifier_exit": 1
+  },
+  "macos-history": {
+    "completed_cases": 3,
+    "claims": 1800,
+    "events": 8640,
+    "failed_budget_cases": 0,
+    "budget_pass": true,
+    "data_invariants_pass": true,
+    "verifier_exit": 0
+  },
+  "macos-aligned": {
+    "completed_cases": 3,
+    "claims": 1800,
+    "events": 8640,
+    "failed_budget_cases": 2,
+    "budget_pass": false,
+    "data_invariants_pass": true,
+    "verifier_exit": 1
+  },
+  "linux-matrix": {
+    "completed_cases": 57,
+    "claims": 34200,
+    "events": 36828,
+    "failed_budget_cases": 0,
+    "budget_pass": true,
+    "data_invariants_pass": true,
+    "verifier_exit": 0
+  },
+  "linux-history": {
+    "completed_cases": 3,
+    "claims": 1800,
+    "events": 8640,
+    "failed_budget_cases": 0,
+    "budget_pass": true,
+    "data_invariants_pass": true,
+    "verifier_exit": 0
+  },
+  "linux-aligned": {
+    "completed_cases": 3,
+    "claims": 1800,
+    "events": 8640,
+    "failed_budget_cases": 0,
+    "budget_pass": true,
+    "data_invariants_pass": true,
+    "verifier_exit": 0
+  }
+}
