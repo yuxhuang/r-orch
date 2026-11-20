@@ -12,6 +12,10 @@
 - Decisions 1 to 6 and 14 restate decisions the owner already took in the goal and are binding. Decisions 7 to 13
   and 15 to 21 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
   the owner's.
+- The owner's answers so far (2026-11-20): decision 16 follows the answer to the spec's AP11, decision 17 the
+  answer to O1 and decision 18 the answer to AP1. Every other point of the spec's "Open questions" is pending,
+  and this ADR stays proposed until the owner has answered them. Decisions 22 to 25 answer the security review
+  and the red team; the owner has not seen them.
 
 ## Context
 
@@ -70,7 +74,9 @@ across a crash, lists that do not load everything, and a retried request that ru
 
 7. **Migrations are numbered, forward-only and run at daemon start.** `schema_migrations` records each one.
    A database whose version is newer than the binary refuses to open and names both versions. There is no down
-   migration; the way back from a failed upgrade is the backup taken before it.
+   migration. Before each pending migration the daemon copies the database, checks the copy and keeps the
+   newest two (the spec's R124); the way back from a failed or a wrong migration is that copy. It is not a
+   scheduled backup, which 1.1 does not have.
 
 8. **1.1 creates 33 of the sketch's 50 tables.** A whole table that only a later phase uses arrives by a
    migration in that phase (17 tables and the FTS5 index). A column whose later addition could not be filled in
@@ -79,11 +85,14 @@ across a crash, lists that do not load everything, and a retried request that ru
    `task_epochs`, `position`, and `project_id` everywhere. The spec lists the tables and every difference from
    the sketch.
 
-9. **The writer serves four lanes: claims first, the rest by deadline.** The lanes and their longest waits are
+9. **The writer serves four lanes: claims first, the rest by deadline.** The lanes and the budgets for their waits are
    claims and lease work 50 ms, entity changes 200 ms, events 1 s, pruning and other maintenance 5 s. A queued
    claim always goes first. Among the other lanes the writer takes the earliest deadline (arrival plus the
    lane's wait), so none of them starves, and a bulk job queues one transaction at a time, so overdue bulk work
    cannot pile up ahead of anything. A claim therefore waits behind at most the one transaction in progress.
+   That is an order and not a time: a running statement and a commit are not cut short, so whether a wait is
+   met is a measured result (decision 12) and never a consequence of the lanes. The waiting event batches of
+   all runs share one transaction, so the event lane puts at most one transaction ahead of an entity change.
    Bulk work (event batches, pruning, expiry, import) is cut into transactions of at most 1,000 rows or 20 ms.
    An operation that must be atomic is never cut; if it exceeds the bound it runs whole and is counted.
 
@@ -106,8 +115,11 @@ across a crash, lists that do not load everything, and a retried request that ru
     stored, so a repeated batch is harmless. If the measured throughput cannot meet the claim-latency budget
     (deliverable D), events are kept as per-run files in the data directory, each named by a hash (decision 20),
     behind the same port operations and nothing else in this ADR changes. The measurement has since missed the
-    budget on macOS and met it on Linux (the spec's point AP13), so 1.1 is planned on the fallback unless the
-    owner rules otherwise.
+    budget on macOS and met it in a Linux container on the same machine; no figure from native Linux exists
+    yet. Its report does not establish the cause, so the spec's point AP13 asks the owner to let a declared
+    diagnosis run first (automatic checkpointing off, one transaction for all waiting batches) and keeps the
+    fallback as the ruling if that run misses. The path that ships is measured against the same budget before
+    its PR merges.
 
 13. **A retried change runs once.** A request may carry a key. The key, scoped by (identity, project, run,
     epoch, key), is stored with a hash of the request and the result in the same transaction as the change, and
@@ -124,18 +136,19 @@ across a crash, lists that do not load everything, and a retried request that ru
     deliverable B). Agent rotation is therefore the same as 1.0 and is now a line of engine code that a test
     names.
 
-16. **A restore starts a new generation, and an epoch is never issued twice.** A start sets the generation to
-    `max(highest known generation + 1, UTC seconds now)` and writes it, synced, to the database and to the
-    file `generation` in the data directory before any epoch is issued. A restore takes "highest known" over
-    the backup, the replaced database when it can be read, and that file. A task's next epoch is
-    `max(task_epochs.next_epoch, generation * 2^20)`; a task that would need more than 2^20 epochs in one
-    generation is refused a claim until the next start. An epoch issued before a restore is therefore smaller
-    than any issued after it, whatever the backup's age. On a directory that has neither the replaced state
-    nor the file (a new machine), the guarantee rests on the clock, and the restore says so. This mechanism is
-    proposed; the lease prototype (deliverable E) confirms or replaces it, and the requirement it serves (gate
-    line 9) does not depend on it. The prototype's first finding is that a restore should also start a new
-    lineage: a random id carried beside the epoch on every lease-bound call, which fences without a clock. The
-    spec's point AP11 puts both to the owner.
+16. **A restore starts a new generation and a new lineage; no pair of lineage and epoch is issued twice.** The
+    owner decided this on 2026-11-20 (the spec's AP11) and amended gate line 9 to match. The lineage is a
+    random 128-bit id made with the database, replaced by every restore, kept by every other start, stored in
+    `daemon_config` and held by every lease beside its epoch. Every lease-bound call carries both and is
+    refused unless both equal the lease's (R77, R132). A task's next epoch comes from `task_epochs` alone. The
+    generation is a counter of starts, one more than the highest that the database and the file `generation`
+    record; it orders the starts of one lineage and promises nothing about numbers. An epoch's number may
+    repeat under another lineage, and nothing compares epochs across lineages. The first draft of this
+    decision took a floor for epochs from the clock (`generation * 2^20`, with the generation at least the
+    UTC second) and concluded that a number was never issued twice. That does not hold: a backup restored
+    onto a directory with no earlier state, while the clock is behind an earlier start, issues the same
+    number again. The floor is withdrawn. The lease prototype (deliverable E) is still to confirm the
+    mechanics. A restore also refuses while a recorded process lives (R100).
 
 17. **The project is named by a pointer file from 1.1.** `orch init` and `orch import` write `.orch-project`
     in the project directory, holding the project id and nothing else. The daemon's data directory is created as
@@ -185,9 +198,9 @@ across a crash, lists that do not load everything, and a retried request that ru
     directory rely on the hash check instead, so that a hard-link snapshot of the directory does not stop the
     daemon. The importer reads its source the same way, by listing, and opens nothing that a document names. A
     pid, a workspace path or a project directory read from a 1.0 source or an export is never acted on: an
-    import writes no lease and no intent and signals nothing. A restore is the stated exception: it acts on the
-    processes its backup records, as the spec's R100 says, because a backup is the owner's own state; AP14 puts
-    that to the owner too. The spec's "Filesystem names" is the contract and holds the test vectors. The one id
+    import writes no lease and no intent and signals nothing. A restore does not act on a backup's rows either: it refuses while a
+    process that the backup records is alive, and stops, when asked, only the processes that the replaced
+    state of this directory records (R100; AP14 puts that to the owner). The spec's "Filesystem names" is the contract and holds the test vectors. The one id
     that still names a directory is `workspaces/<task id>` in the project directory, 1.0's layout, with 1.0's
     reject-never-rewrite check; the spec's point AP14 puts it to the owner. A check of the id shows that it is
     one name, not that the directory is one task's: the review's second reading found that `tsk_Case` and
@@ -230,6 +243,38 @@ across a crash, lists that do not load everything, and a retried request that ru
     holds the numbers and the test vectors. This decision answers the security review's finding S1, which
     showed a 40,001-byte document of depth 20,000 and a 412-byte document standing for 100,000,000 scalars
     inside the first draft's byte bound.
+
+22. **A cutover refuses while 1.0 work may still run, and a 1.0 run after it is detected.** 1.0's own recovery
+    keeps a local entry whose pid is alive and a remote entry whose peer is registered, and a 1.0 stop leaves
+    both behind. Closing them would send their tasks out a second time. So the import refuses while one
+    exists and names it (R119). It asks only whether the pid exists and never signals: a 1.0 entry has no
+    start time, so the pid may be another program's. The owner ends the work with the 1.0 daemon or names the
+    run as ended. A run the import closed is never attached again (R120). The import keeps the size and hash
+    of `state.json` and of each index, and a 1.1 start refuses when they have changed, because a 1.0 daemon
+    ran meanwhile (R121). Where an index and an entity's file differ the file wins, since 1.0 writes it first
+    (R122). The importer still writes nothing under `.orchestry/`.
+
+23. **The writer never checkpoints, fails by class, and a finish is on disk before it is queued.** Automatic
+    checkpointing is off on the writer's connection, and a second connection runs passive checkpoints, so no
+    commit carries one (R126); a long pooled read is interrupted once the log is large (R127). A failure from
+    outside a transaction's logic is retried with nothing dropped, or fails the writer, which then refuses
+    mutations and reports itself without the database (R128). A run's finish is written to a spool file and
+    synced before it waits for the writer, and recovery applies it before it judges the run, so a restart
+    behind a locked or failing database does not turn a finished run into a cancelled one (R129).
+
+24. **`orch db query` reads fixed views under an authorizer; a backup stays in the data directory.** The
+    command has its own read-only connection, an authorizer that denies by default, and run-time limits; it
+    reads views that show no identity, token, stored request result or daemon setting (R74, R130). These are
+    the `hooks` and `limits` features that decision 19 already names. `orch db backup` writes only into a
+    directory it creates below `backups/`, mode 0700 with files 0600 (R75). Before a migration the daemon
+    makes its own copy (decision 7).
+
+25. **Trust is turned on by named paths only, and an attention item holds no outside text.** `preapproval`
+    is turned on by `policy.set`, `orch init`, the import of a 1.0 project whose agents use `auto`, and an
+    import or a restore whose data has it on and whose confirmation names it; none of them in agent context,
+    where `orch init` leaves it off (R133, following the owner's answer to AP5). An attention item's words
+    are fixed for its kind (R131). A request key never applies to a credential operation, and authorization
+    comes before a stored result is looked up (R134).
 
 ## Alternatives considered
 
@@ -299,6 +344,27 @@ across a crash, lists that do not load everything, and a retried request that ru
   hostile schema on the connection that owns the destination.
 - **Load an export into `orch.db` directly, with a resume.** A refusal at the last row would leave a database
   that is neither a project nor nothing. A scratch name and one rename need no resume.
+- **Close in-flight 1.0 state without looking at any process.** The first answer to the security review: no
+  value of a source then chooses a process to examine. A run still at work on this machine or on a peer is
+  then dispatched again, in the same workspace or with a second merge. Refusing costs a blocked import when
+  a pid was reused or a peer is gone for good, which the owner clears by naming the run.
+- **Stop surviving 1.0 processes from the import.** A 1.0 entry holds a pid and no start time, and the file
+  that holds it is input. Nothing shows the process to be the run's.
+- **An epoch floor taken from the clock.** The first draft of decision 16. It needs no new field, and its
+  promise about numbers fails on a fresh directory with the clock set back. The owner chose the lineage.
+- **A release between the engine's move and the switch, or SQLite chosen for each project in 1.1.** The red
+  team's "path not taken". Neither is the two-backends-in-step design rejected above: each project would
+  have one writer of truth. The first separates an engine regression from an import defect at the cost of a
+  release; the second gives field use of the importer and two tiers of guarantees, and changes a binding
+  decision of the goal. This ADR keeps one release; the spec's AP20 puts both to the owner.
+- **Automatic checkpointing left on.** SQLite's default, and what the first measurement ran with. The
+  checkpoint then runs inside whichever commit crosses the threshold, a claim's included.
+- **Results kept in memory until they commit.** No file, and a daemon restarted behind a locked database
+  loses the result and cancels the run.
+- **`orch db query` on every table, guarded by reading the SQL.** A filter on text is a parser to keep
+  correct; the authorizer sees what the statement does.
+- **Skip or set aside a source file the import cannot read.** The import always finishes, and a task can be
+  missing from 1.1 unnoticed. The spec's AP17 puts it to the owner.
 
 ## Consequences
 
