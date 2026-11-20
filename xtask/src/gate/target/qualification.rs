@@ -115,7 +115,9 @@ fn qualification(parent: &Path) {
             .unwrap()
             .as_nanos()
     ));
+    // Admission requires canonical fixture paths, including macOS temp aliases.
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let root = root.canonicalize().unwrap();
     let home = root.join("observer-home");
     fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
     let output = Command::new("/usr/bin/python3")
@@ -164,7 +166,9 @@ fn production_native_build_script_test_and_child_descriptor_propagation() {
             .unwrap()
             .as_nanos()
     ));
+    // Admission requires canonical fixture paths, including macOS temp aliases.
     fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let root = root.canonicalize().unwrap();
     let home = root.join("observer-home");
     fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
     let output = Command::new("/usr/bin/python3")
