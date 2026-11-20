@@ -1,0 +1,22 @@
+{
+  "id": "team_b",
+  "name": "team_b",
+  "status": "active",
+  "members": [
+    {
+      "agent_id": "agt_b",
+      "role": "lead",
+      "joined_at": "2025-01-01T00:00:00.000Z"
+    }
+  ],
+  "task_pool": [
+    "tsk_b"
+  ],
+  "lead_agent_id": "agt_b",
+  "created_at": "2025-01-01T00:00:00.000Z",
+  "updated_at": "2025-01-01T00:00:00.000Z",
+  "config": {
+    "auto_claim": true,
+    "message_ttl_ms": 86400000
+  }
+}

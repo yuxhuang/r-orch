@@ -1,0 +1,11 @@
+project:
+  name: synthetic-merge
+scheduling_defaults: &scheduling_defaults
+  max_concurrent_agents: 3
+  poll_interval_ms: 4321
+scheduling:
+  <<: *scheduling_defaults
+legacy_extension:
+  keep: [alpha, beta]
+  nested:
+    enabled: true

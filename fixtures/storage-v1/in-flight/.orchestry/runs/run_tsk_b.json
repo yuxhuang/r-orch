@@ -1,0 +1,11 @@
+{
+  "id": "run_tsk_b",
+  "task_id": "tsk_b",
+  "agent_id": "agt_b",
+  "attempt": 1,
+  "status": "running",
+  "started_at": "2025-01-01T00:00:00.000Z",
+  "workspace_path": "workspace",
+  "prompt": "Synthetic in-flight prompt",
+  "pid": 42
+}

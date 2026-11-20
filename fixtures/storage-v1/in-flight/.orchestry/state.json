@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "onboardingCompleted": false,
+  "running": {
+    "tsk_b": {
+      "run_id": "run_tsk_b",
+      "agent_id": "agt_b",
+      "task_id": "tsk_b",
+      "pid": 42,
+      "started_at": "2025-01-01T00:00:00.000Z",
+      "last_event_at": "2025-01-01T00:00:00.000Z"
+    },
+    "tsk_a": {
+      "run_id": "run_tsk_a",
+      "agent_id": "agt_a",
+      "task_id": "tsk_a",
+      "pid": 42,
+      "started_at": "2025-01-01T00:00:00.000Z",
+      "last_event_at": "2025-01-01T00:00:00.000Z"
+    }
+  },
+  "claimed": [
+    "tsk_b",
+    "tsk_a",
+    "tsk_claimed"
+  ],
+  "retry_queue": [
+    {
+      "task_id": "tsk_retry_b",
+      "attempt": 2,
+      "due_at": "2025-01-01T00:00:00.000Z",
+      "error": "Synthetic retry"
+    },
+    {
+      "task_id": "tsk_retry_a",
+      "attempt": 2,
+      "due_at": "2025-01-01T00:00:00.000Z",
+      "error": "Synthetic retry"
+    }
+  ],
+  "stats": {
+    "total_runs": 9,
+    "total_tasks_completed": 0,
+    "total_tasks_failed": 0,
+    "total_tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "total": 0,
+      "cache_read": 0,
+      "cache_write": 0
+    },
+    "total_runtime_ms": 0
+  }
+}

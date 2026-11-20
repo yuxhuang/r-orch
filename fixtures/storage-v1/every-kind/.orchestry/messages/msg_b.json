@@ -1,0 +1,10 @@
+{
+  "id": "msg_b",
+  "channel": "direct",
+  "from_agent_id": "cli",
+  "to_agent_id": "agt_b",
+  "subject": "msg_b",
+  "body": "Synthetic message",
+  "created_at": "2025-01-01T00:00:00.000Z",
+  "status": "pending"
+}
