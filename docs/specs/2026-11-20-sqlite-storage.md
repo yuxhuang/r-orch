@@ -135,7 +135,7 @@ Read from the code at `fb6a1e1` (v1.0.0) unless marked unverified.
 | F1 | The catalogue has 111 operations: 47 read, 42 mutate, 10 destructive, 12 control (`crates/orch-proto/src/ops/mod.rs`, the class table in its tests). S2 says 115 (48, 43, 11, 13); each class is one lower in the code. This spec counts from the code; see added point AP2. | verified |
 | F2 | `LOCAL_PROTOCOL` is 2. The wire error codes are `general`, `invalid_arguments`, `not_initialized`, `lock_conflict`, `agent_adapter`, `workspace`, `not_found`, `conflict`, `not_permitted`, `overloaded`, `shutting_down`, `unimplemented`, with exits 1, 2, 3, 4, 5, 6, 1, 1, 2, 7, 7, 1 (`crates/orch-proto/src/error.rs`). | verified |
 | F3 | Five stores keep last-write order in `_index.json` (task, agent, goal, context, message). Agent choice breaks ties by that order (`AgentService::find_best_in`); every agent save, including a status change, moves the agent to the end. Team order is directory enumeration and is not a contract. | verified |
-| F4 | A run event has a timestamp, a type and data, and no sequence number. Event data is cut at 8,192 characters; a stored line is at most 4,096 bytes. A run records tokens, a pid, its workspace path and the rendered prompt inline; it records neither the model nor the agent CLI version. Nothing prunes runs or events. | verified |
+| F4 | A run event has a timestamp, a type and data, and no sequence number. Event data is cut at 8,192 characters and a stored line at about 4 KiB (the cut counts characters, so multi-byte text can exceed it). A run records tokens, a pid, its workspace path and the rendered prompt inline; it records neither the model nor the agent CLI version. Nothing prunes runs or events. | verified |
 | F5 | Dispatch on or off lives only in memory and is off after every start. `orch doctor` exits 0 when its checks fail and a daemon answers. There is no metrics facility. | verified |
 | F6 | The approval policy `auto` (the default) moves a task from `review` to `done` after a successful run without a person. It is not passed to the agent CLI. | verified |
 | F7 | `orch-peer` runs inside the daemon on the engine. It reads `tasks/_index.json` and `messages/_index.json` directly and builds a `FileMessageStore` (`crates/orch-peer/src/worker.rs` near line 805, `crates/orch-peer/src/lib.rs` near lines 299 to 316), reads `state.json` through the state store (`worker.rs` near line 868), and keeps its own files `remotes.yml`, `remotes/` and `peer-id` under `.orchestry/`. | verified |
@@ -168,7 +168,7 @@ and change with the owner's answer.
 | R15 | The port shall be entered only through `Storage::read` and `Storage::write`, each taking a caller (principal and project), and a call shall see and change only rows of the caller's project. | F, B4 | must | `storage_conformance::a_caller_sees_only_its_project`, `::a_write_to_another_project_is_refused`; both |
 | R16 | After the engine PR, `orch-core` shall export no whole-document state store, no merge-key rule and no implicit reorder on save, and `docs/TRAITS-FROZEN.md` §2 shall describe port v2. | B3 | must | `git grep -nE 'trait StateStore\|apply_merge' crates/orch-core crates/orch-engine/src` prints nothing; reviewer check of TRAITS-FROZEN §2 against the port; macOS |
 | R17 | The file backend shall implement port v2, so that the conformance suite runs whole on both backends; after the removal PR it shall live in a crate that only dev-dependencies may name, for one release. Atomicity across a process stop is required of SQLite only. | B1 | must | `cargo xtask crate-graph` fails when a product crate depends on it (`xtask` test `file_reference_is_dev_only`); both |
-| R18 | A new database shall have exactly the tables listed in "Schema for 1.1", all `STRICT`, with `project_id` in the primary key of every table that is not daemon-wide. | G, B4, O2 | must | `crates/orch-infra/tests/sqlite_schema.rs::new_database_matches_the_schema_snapshot`, `::every_project_table_is_keyed_by_project`; both |
+| R18 | A new database shall have exactly the tables listed in "Schema for 1.1", all `STRICT`, with `project_id` on every table outside the daemon-wide group and in the primary key wherever the sketch has it there. | G, B4, O2 | must | `crates/orch-infra/tests/sqlite_schema.rs::new_database_matches_the_schema_snapshot`, `::every_project_table_carries_project_id`; both |
 | R19 | The schema shall contain, from the first migration, every column named in "Columns kept for later phases". | G, O2 | must | `sqlite_schema::kept_columns_are_present`; both |
 | R20 | No 1.1 operation shall put a task in `proposed`, `landing` or `needs_attention`, and every task that becomes `done` shall get `landing_state = 'skipped'`. | B13 | must | `crates/orch-engine/tests/task_statuses.rs::no_operation_enters_a_1_5_status`, `::done_is_recorded_as_skipped`, `sqlite_schema::done_without_landing_state_is_rejected`; both |
 | R21 | Migrations shall be numbered, applied in order inside one transaction each, recorded in `schema_migrations`, and never reversed; a failed migration shall leave the database at the earlier version and stop the start. | G | must | `crates/orch-infra/tests/sqlite_migrations.rs::migrations_apply_in_order_and_are_recorded`, `::failed_migration_leaves_the_earlier_version`; both |
@@ -176,30 +176,30 @@ and change with the owner's answer.
 | R23 | Every connection shall run with WAL journal, `synchronous = NORMAL` unless `storage.synchronous` is `full`, foreign keys on and a busy timeout of 5,000 ms. | B12 | must | `crates/orch-infra/tests/sqlite_connection.rs::connections_have_the_required_settings`, `::synchronous_full_is_a_setting`; both |
 | R24 | Exactly one connection shall write, every write shall start with `BEGIN IMMEDIATE`, and every other connection shall be read-only. | B6, B12 | must | `sqlite_connection::a_read_connection_refuses_writes`, `crates/orch-infra/tests/sqlite_writer.rs::writes_run_one_at_a_time_on_one_connection`; both |
 | R25 | A read shall see one consistent snapshot from its first statement to its last, whatever commits meanwhile. | B6 | must | `sqlite_writer::a_read_snapshot_does_not_see_a_later_commit`; both |
-| R26 | The writer shall take the queued transaction with the earliest deadline, where the deadline is arrival plus 50 ms for claims and lease work, 200 ms for entity changes, 1 s for events and 5 s for maintenance. | G | must | `sqlite_writer::earliest_deadline_runs_first` (fake clock), `::no_lane_starves_under_a_flood_of_another`; both |
+| R26 | The writer shall always take a queued claim or lease transaction first, and otherwise the queued transaction with the earliest deadline, where the deadline is arrival plus 200 ms for entity changes, 1 s for events and 5 s for maintenance; a bulk job shall have at most one transaction queued at a time. A claim shall therefore wait behind at most the one transaction in progress, within its 50 ms. | G | must | `sqlite_writer::a_claim_runs_before_everything_queued` (fake clock), `::earliest_deadline_runs_first_among_the_other_lanes`, `::overdue_maintenance_does_not_delay_a_claim`, `::no_lane_starves_under_a_flood_of_another`; both |
 | R27 | Bulk work (event batches, pruning, expiry, import) shall be cut into transactions of at most 1,000 rows or 20 ms of work; an atomic operation over that bound shall run whole and be counted in `writer_txn_over_bound_total`. (AP8) | G | must | `sqlite_writer::bulk_work_is_cut_at_1000_rows`, `::an_atomic_operation_over_the_bound_runs_whole_and_is_counted`; both |
 | R28 | A side effect outside the database shall be written as an `intents` row in the transaction that decides it, performed after the commit, and marked done; an intent left by a stopped daemon shall be handled at the next start as its kind states in "Transactions and intents". | G, H | must | `crates/orch-engine/tests/intents.rs::intent_is_written_with_its_change`, `::pending_intent_is_handled_after_restart`, `::a_repeated_intent_has_no_second_effect`; both |
 | R29 | The data directory shall have the layout and modes in "Data directory"; the daemon shall create it with those modes and refuse to start when it exists with group or other access or another owner. | B5 | must | `crates/orch-daemon/tests/daemon_data_dir.rs::layout_and_modes_are_as_specified`, `::a_directory_open_to_others_is_refused`; both |
 | R30 | When a daemon or an offline command is pointed at a data directory that another holds, it shall change nothing, exit 4 and print the holder's kind, pid and start time. | B5, G6 | must | `crates/orch-daemon/tests/daemon_data_dir.rs::second_daemon_refuses_and_names_the_holder`, `crates/orch-cli/tests/db_offline.rs::offline_command_refuses_while_a_daemon_holds_the_directory`; both |
-| R31 | While a 1.1 daemon or `orch import` runs for a project directory, a 1.0 daemon shall not be able to start on it, and a 1.1 daemon shall refuse to start while a 1.0 daemon holds it; neither shall write to a 1.0 file. | B2, F9 | must | `crates/orch-daemon/tests/daemon_legacy_lock.rs::legacy_owner_lock_is_held_without_writing`, `::start_is_refused_while_a_legacy_daemon_holds_the_project`; both |
+| R31 | While a 1.1 daemon or `orch import` runs for a project directory, a 1.0 daemon shall not be able to start on it, and a 1.1 daemon shall refuse to start while a 1.0 daemon holds it; neither shall create or write a 1.0 file. Where the 1.0 lock file does not exist (no 1.0 daemon ever ran there), or if F9 proves false, 1.1 shall only refuse while a 1.0 daemon answers, and the manual shall say that the exclusion is then a procedure and not a lock. | B2, F9 | must | `crates/orch-daemon/tests/daemon_legacy_lock.rs::legacy_owner_lock_is_held_without_writing`, `::start_is_refused_while_a_legacy_daemon_holds_the_project`, `::an_absent_legacy_lock_file_is_not_created`; both |
 | R32 | The daemon shall refuse to start when the data directory is on a network filesystem. | B12 | must | `daemon_data_dir::network_filesystem_is_refused` (injected filesystem type); both |
-| R33 | The data directory shall be `ORCH_DATA_DIR` when set (absolute, else exit 2), otherwise `<data home>/<name>`, where the data home is `ORCH_DATA_HOME` or `~/.orchestry/daemons`; the repository's cargo configuration shall set `ORCH_DATA_HOME` inside `target/`. (O1) | B5, DL | must | `daemon_data_dir::default_name_is_derived_from_the_project_directory`, `::relative_override_is_refused`; `./xtask/gate.sh pr` `real-home` step unchanged; both |
-| R34 | `orch init` and `orch import` shall write `.orch-project` (the project id and a newline) in the project directory; a client shall find the project by `ORCH_SOCKET`, then `ORCH_PROJECT_ROOT`, then the nearest ancestor holding `.orch-project`; a directory with 1.0 state and no `.orch-project` shall get exit 3 and the hint `orch import --dry-run`. (O1) | O1 | must | `crates/orch-cli/tests/project_pointer.rs::client_finds_the_project_by_pointer`, `::unimported_project_gets_the_import_hint`, `::a_moved_project_is_not_offered_a_second_import`; both |
+| R33 | The data directory shall be `ORCH_DATA_DIR` when set (absolute, else exit 2), otherwise the directory that `<data home>/projects/<project id>` records, which `orch init` and `orch import` write when they create `<data home>/<name>`; the data home is `ORCH_DATA_HOME` or `~/.orchestry/daemons`; the repository's cargo configuration shall set `ORCH_DATA_HOME` inside `target/`. (O1) | B5, DL | must | `daemon_data_dir::default_name_is_derived_from_the_project_directory`, `::the_project_record_names_the_directory`, `::relative_override_is_refused`; `./xtask/gate.sh pr` `real-home` step unchanged; both |
+| R34 | `orch init` and `orch import` shall write `.orch-project` (the project id and a newline) in the project directory; a client shall find the project by `ORCH_SOCKET`, then `ORCH_PROJECT_ROOT`, then the nearest ancestor holding `.orch-project`; a directory with 1.0 state and no `.orch-project` shall get exit 3 and the hint `orch import --dry-run`. When the project directory is not the one the database records, the daemon shall adopt the new path if the recorded one no longer holds that project id (a move) and refuse, naming both paths, if it still does (a copy). (O1) | O1 | must | `crates/orch-cli/tests/project_pointer.rs::client_finds_the_project_by_pointer`, `::unimported_project_gets_the_import_hint`, `::a_moved_project_keeps_its_state`, `::a_copied_project_is_refused_with_both_paths`; both |
 | R35 | Starting a run shall be one transaction: the lease, the epoch, the run row, the task's status and attempts, the removal of its retry row and the intent to start the process. | H | must | `crates/orch-engine/tests/transactions.rs::start_run_is_all_or_nothing` (a stop injected before and after each statement); both |
 | R36 | Finishing a run shall be one transaction: the run's outcome and usage, its result row, the task's next status, its retry row or its `landing_state`, the release of the lease, the agent's totals and position, and the intents to clean up. A finish that names a stale epoch shall change only that run's row. | H | must | `transactions::finish_run_is_all_or_nothing`, `::finish_with_a_stale_epoch_changes_only_the_run`; both |
 | R37 | Cancelling a task shall be one transaction that also ends its run, releases its lease, removes its retry row and writes the intent to stop its process; the process shall be stopped after the commit and again after a restart if it still runs. | H | must | `transactions::cancel_task_is_all_or_nothing`, `intents::stop_intent_is_repeated_until_the_process_is_gone`; both |
 | R38 | Pausing a goal shall be one transaction with the cancellations it implies, and no claim for a task it cancelled shall commit after it. | H | must | `transactions::pause_goal_is_atomic_with_dispatch` (claims and pause raced 1,000 times); both |
 | R39 | A permanent failure shall be one transaction with its whole cascade. | H | must | `transactions::permanent_failure_and_its_cascade_are_one_transaction`, `::a_cascade_over_1000_rows_is_still_one_transaction`; both |
 | R40 | Leases and the retry table shall replace `state.json`; a retry shall never be dropped for lack of room. (AP10) | H | must | `crates/orch-engine/tests/leases.rs::running_and_claimed_are_leases`, `crates/orch-engine/tests/retries.rs::the_101st_retry_is_kept`; both |
-| R41 | At every start the daemon shall take a new generation, close every run whose lease belongs to an earlier generation as 1.0's reconcile did, and never start a process for an intent of an earlier generation. | H, G9 | must | `leases::start_closes_the_leases_of_an_earlier_generation`, `intents::a_start_intent_of_an_earlier_generation_is_not_performed`; both |
+| R41 | At every start the daemon shall take a new generation and treat every lease of an earlier generation as 1.0's startup recovery treats a running entry (`docs/internal/orchestration.md`, "Startup recovery"): a run whose recorded process is gone is ended and its task handled as 1.0 handles it; a run whose recorded process is alive keeps its lease until the process exits; a run still `preparing` is ended. It shall never start a process for an intent of an earlier generation. | H, G9 | must | `leases::recovery_matches_1_0_for_dead_alive_and_preparing_runs`, `intents::a_start_intent_of_an_earlier_generation_is_not_performed`; both |
 | R42 | A lease shall not be taken from a live local run because the machine was suspended: after a resume the daemon shall renew the leases of processes it still supervises before it expires any. (F10) | E | must | `leases::a_clock_jump_does_not_expire_a_supervised_run` (clock seam); both. A real suspend: recorded check on macOS |
 | R43 | The 1.1 maintenance jobs in "Maintenance jobs" shall run from one timer with a due time per job, stored so that a restart neither skips a due job nor runs every job at once. (O5) | H, O5 | must | `crates/orch-engine/tests/maintenance.rs::each_job_runs_when_due`, `::due_times_survive_a_restart`; both |
 | R44 | The daemon shall start with dispatch as it was when it last stopped, and off after an import, a restore or a start that applied a migration; `--dispatch on\|off` shall override; the start shall print the state and its reason. (O4) | O4 | must | `crates/orch-daemon/tests/daemon_dispatch.rs::dispatch_resumes_as_it_was`, `::dispatch_is_off_after_import_restore_and_migration`; both |
-| R45 | When a mutate or destructive request carries a key already stored for its scope with the same request hash, the daemon shall make no change and return the first result marked as a replay. | I, G8 | must | `crates/orch-daemon/tests/ops_request_keys.rs::a_repeated_change_runs_once`, `::a_reply_lost_before_delivery_is_replayed`; both |
+| R45 | When a mutate or destructive request whose change is a database transaction carries a key already stored for its scope with the same request hash, the daemon shall make no change and return the first result marked as a replay. | I, G8 | must | `crates/orch-daemon/tests/ops_request_keys.rs::a_repeated_change_runs_once`, `::a_reply_lost_before_delivery_is_replayed`; both |
 | R46 | When a request carries a key already stored for its scope with a different request hash, the daemon shall refuse it with `conflict`, execution `not_executed`. | I, G8 | must | `ops_request_keys::same_key_with_a_different_body_is_refused`; both |
 | R47 | A key shall be stored in the same transaction as its change, kept for one hour and then deleted by the `request_keys.expire` job; a result over 64 KiB shall not be kept, and its replay shall say so. | I, O8 | must | `ops_request_keys::key_and_change_commit_together`, `::a_key_expires_after_an_hour`, `::a_result_over_64_kib_is_not_kept`; both |
 | R48 | Every entity returned by the API shall carry its `revision`; a change that names `expected_revision` shall fail with `stale_revision` when it is not the stored one; a change that names none shall apply as in 1.0. | I | must | `crates/orch-daemon/tests/ops_revisions.rs::entities_carry_a_revision`, `::stale_expected_revision_is_refused`, `::a_change_without_one_applies`; both |
-| R49 | Every list operation shall accept `limit`, `cursor`, `sort` and `with_count` with the bounds of R9. CLI list commands shall return all rows in their 1.0 shape by walking the pages unless `--limit` or `--cursor` is given. (AP4) | I | must | `crates/orch-daemon/tests/ops_paging.rs::list_operations_page`, `crates/orch-cli/tests/list_paging.rs::default_output_is_unchanged`, `::limit_returns_one_page_and_a_cursor`; both |
+| R49 | Every list operation shall accept `limit`, `cursor`, `sort` and `with_count` with the bounds of R9. CLI list commands shall return all rows in their 1.0 shape and order unless `--limit` or `--cursor` is given: they walk the pages by the immutable sort `id`, so that every row present throughout the walk is returned exactly once, and order the result as 1.0 did. (AP4) | I | must | `crates/orch-daemon/tests/ops_paging.rs::list_operations_page`, `crates/orch-cli/tests/list_paging.rs::default_output_is_unchanged`, `::a_row_changed_during_the_walk_is_returned_once`, `::limit_returns_one_page_and_a_cursor`; both |
 | R50 | `LOCAL_PROTOCOL` shall be 3, and a client and a daemon of different protocol versions shall refuse each other as in 1.0, with the frozen handshake and the stop intent unchanged. | I | must | `crates/orch-proto` test `protocol_is_3`, `crates/orch-daemon/tests/daemon_wire.rs::protocol_2_client_is_refused_by_a_protocol_3_daemon`, `::stop_intent_crosses_the_skew`; both |
 | R51 | The error codes `stale_revision` and `quota_exceeded` shall be added with exit 1; the twelve existing codes and exits 1 to 7 shall keep their meanings. | I | must | `crates/orch-proto` test `existing_error_codes_and_exits_are_unchanged`, `::new_codes_exit_1`; both |
 | R52 | The dispatcher shall decide whether a principal may run an operation in one function with an exhaustive match and no default arm, before any admission or storage call. | J | must | `crates/orch-daemon/tests/ops_authorization.rs::every_operation_has_a_row_for_every_principal_kind`; a reviewer confirms no other check site; both |
@@ -246,6 +246,9 @@ and change with the owner's answer.
 | R93 | Only an owner session shall set `preapproval`; an agent's own `approval_policy` of `auto` shall have effect only while the project's `preapproval` is on. | B14 | must | `crates/orch-engine/tests/preapproval.rs::auto_needs_the_project_policy`, `ops_authorization::only_the_owner_sets_preapproval`; both |
 | R94 | — | X | won't | Evidence, quarantine, uploads, text search, HTTP, TLS, tokens, enrolment, certificates, workers, the hub, landing, proposals, many projects per daemon, removing orch-peer, Postgres, an indexed scheduler, object storage, token budgets, outbound notification and Windows are out of scope (X). |
 | R95 | — | DL | won't | No tag and no version bump: cutting 1.1.0 is the owner's separate decision. |
+| R96 | An agent process shall not run its agent unless the run's pid and start time were committed first: the daemon shall create the process held, commit, then release it, and a held process whose daemon is gone shall exit without running the agent. | review finding (a stop between starting a process and recording it left an untracked agent on a workspace that recovery would hand to a second run) | must | `crates/orch-engine/tests/transactions.rs::a_stop_between_spawn_and_commit_runs_no_agent`, `crates/orch-infra` process test `held_process_exits_when_its_parent_is_gone`; both |
+| R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. | B7; review finding | must | `storage_conformance::text_over_64_kib_round_trips_through_the_blob_store`, `import::text_over_64_kib_becomes_a_blob`; both |
+| R98 | Reads shall be served by a pool of `storage.read_connections` connections (default 4); a read that finds none free shall wait up to the admission deadline and then fail with `overloaded`, never open another connection. | B6; review finding | should | `sqlite_writer::reads_wait_for_a_free_connection_then_fail_overloaded`; both |
 
 ## Storage port v2
 
@@ -271,7 +274,7 @@ The contract of deliverable F. Rust signatures are fixed by the port PR and reco
 | `open_attention`, `ack_attention`, `resolve_attention` | The attention queue; `open` is a no-op when an open item exists for the subject. |
 
 Each list has a fixed set of sorts. The default sort of a list is its 1.0 order, served by an index, and
-deliverable B confirms each line:
+deliverable B confirms each line. Every list also offers the sort `id`, whose values never change (R49):
 
 | List | Default order | Other sorts |
 |---|---|---|
@@ -303,7 +306,8 @@ milliseconds; the API keeps ISO-8601 strings. Recommendation for O2: 1.1 creates
 | Raw output | `run_events`, `run_event_gaps` |
 | Blobs | `blobs` |
 | Messages and context | `messages`, `context_entries` |
-| Daemon-wide | `daemon_config`, `identities`, `identity_tokens`, `attention`, `counters`, `import_manifest`, `schema_migrations` |
+| Housekeeping, per project | `attention` (its `project_id` is empty for a daemon-wide item), `counters`, `import_manifest` |
+| Daemon-wide | `daemon_config`, `identities`, `identity_tokens`, `schema_migrations` |
 
 | Arrives by migration in | Tables |
 |---|---|
@@ -337,6 +341,7 @@ empty outside tests.
 | 3 | `runs` gains `local TEXT`: a JSON object holding the pid and the workspace path. | 1.0 records both and reconcile needs the pid. They are facts of this daemon's machine, so they stay out of named columns and go when workers own processes. |
 | 4 | `goals` and `messages` gain `position INTEGER NOT NULL`. | Both stores are in last-write order in 1.0 (F3). The order cannot be recovered once the index files are no longer read. |
 | 5 | `runs.status` and `tasks.status` get no `CHECK`. | As in the sketch; the port's types validate them, and 1.5 adds run statuses. |
+| 6 | Constants 1.1 writes into columns that only later phases vary: `leases.worker_id` and `runs.worker_id` are the built-in local worker identity; `leases.state` is `active`; `runs.counted` is 1 with `attempt_no` set; `tasks.created_by_kind` is `owner`, `agent` (a session in agent context; `created_by_run_id` set when that task holds a lease) or `daemon`, and `import` for imported tasks. | The sketch declares these `NOT NULL` or checks them, so 1.1 must say what it stores. `import` is a fourth value of `created_by_kind`: 1.0 did not record who created a task. |
 
 Rows the daemon keeps without a table of their own: the generation and the saved dispatch state in
 `daemon_config`; each maintenance job's times under `maintenance/<job>` in `daemon_config`; 1.0's totals in
@@ -355,7 +360,7 @@ Rows the daemon keeps without a table of their own: the generation and the saved
 
 | Intent kind | Performed | After a restart |
 |---|---|---|
-| `process.start` | Prepare the workspace, store the prompt blob, start the agent process, then set the run to `running` in a second transaction. | Never repeated. The start of a new generation closes the run and queues the task again under a new epoch (R41). |
+| `process.start` | Prepare the workspace, store the prompt blob, create the agent process held, commit the run as `running` with its pid and start time in a second transaction, then release the process (R96). | Never repeated. Startup recovery handles the run as R41 says: `preparing` is ended; `running` is kept while its process lives. |
 | `process.stop` | Stop the process group named in the run's `local` data, checked against its start time. | Repeated until the process is gone or was never this run's. |
 | `workspace.remove` | Remove the task's workspace. | Repeated; a missing workspace is success. |
 | `blob.delete` | Delete a blob file after its `blobs` row is gone. | Repeated; a missing file is success. |
@@ -372,7 +377,9 @@ the resync that protocol 2 already defines. Done intents are deleted after 7 day
 | 3 `Events` | Event batches and gap rows | 1 s |
 | 4 `Maintenance` | Pruning, expiry, sweeps, checkpoints | 5 s |
 
-One transaction is bounded to 1,000 rows or 20 ms of work (R27). A collector hands over a batch when it holds
+Lane 1 always goes first; among lanes 2 to 4 the earliest deadline wins, and a bulk job queues its next
+transaction only when the last has committed (R26). Lane 1 cannot starve the others: its work is bounded by
+the number of tasks and agents. One transaction is bounded to 1,000 rows or 20 ms of work (R27). A collector hands over a batch when it holds
 256 events or the oldest is 250 ms old. Its buffer holds at most 4,096 events or 4 MiB per run; past that it
 drops the oldest raw output and records a gap. Results and usage travel on lane 2 and are never dropped.
 
@@ -392,7 +399,9 @@ suite is not a performance result.
 - A request frame may carry `key`: 16 to 128 characters of `A-Z a-z 0-9 _ -`. The CLI makes one per
   invocation and resends the request once with the same key when the connection drops after sending.
   `--request-key` and `ORCH_REQUEST_KEY` let a script supply its own. Keys apply to mutate and destructive
-  operations; a key on any other class is ignored.
+  operations whose change is a database transaction. A key on any other operation is ignored, and the CLI
+  does not resend those: every read and control operation, and `db.backup`, `db.export` and `db.prune`, whose
+  effect is a file or a bounded series of transactions.
 - Scope: `(identity, project, run, epoch, key)`. The daemon takes run and epoch from the caller's lease, never
   from the request; they are empty and 0 for an owner session.
 - The stored hash is SHA-256 over the operation name and its arguments in canonical JSON (sorted keys, no
@@ -434,6 +443,7 @@ workspace, 7 no usable daemon. No exit code is added.
 <data dir>/                      0700   one per daemon
   orch.lock                      0600   exclusive lock; never deleted; holds the holder's record
   orch.db  orch.db-wal  orch.db-shm   0600
+  generation                     0600   the highest generation this directory has used; written and synced at every start
   blobs/                         0700
     sha256/ab/cd/<hash>          0600   ab and cd are the first four hex digits of the hash
     tmp/                         0700
@@ -446,15 +456,19 @@ workspace, 7 no usable daemon. No exit code is added.
 
 - The lock is taken before anything else is opened. The holder's record is JSON: kind (`daemon`, `import`,
   `restore`, `vacuum`), pid, start time, binary version and executable path. A refusal prints it (R30).
-- Default location: `<data home>/<name>/`, with `<name>` the project directory's base name in lower case,
+- Default location at creation: `<data home>/<name>/`, with `<name>` the project directory's base name in lower case,
   characters outside `a-z 0-9 . _ -` replaced by `-`, cut to 32 bytes, then `-` and the first 12 hex digits of
-  the SHA-256 of the canonical project path. `ORCH_DATA_DIR` names the directory outright.
+  the SHA-256 of the canonical project path. `orch init` and `orch import` record it in
+  `<data home>/projects/<project id>` (0600, one line), and from then on the project is found by its id, so
+  moving the project directory does not lose its state (R34). `ORCH_DATA_DIR` names the directory outright.
 - The socket follows 0012's rule: `run/orch.sock` when its absolute path is at most 100 bytes, otherwise the
   short path under `$TMPDIR`, recorded in `run/daemon.json`. `ORCH_SOCKET` still overrides.
 - In the project directory 1.1 writes `.orch-project` (0644, at most 64 bytes) and, as 1.0 did,
   `.orchestry/workspaces/` and orch-peer's own files. It writes no other path under `.orchestry/` (AP6).
-- A data directory that names another project id than `.orch-project` does, or whose recorded project
-  directory is not the one it was started for, is refused with both values printed.
+  The directory `.orchestry/` itself must stay: its device and inode are the project identity of the frozen
+  handshake. `orch init` creates it for a new project.
+- A data directory that names another project id than `.orch-project` does is refused with both values
+  printed. A project directory other than the recorded one is a move or a copy, handled as R34 says.
 
 ## Authorization matrix
 
@@ -488,15 +502,16 @@ The new operations are in no MCP allowlist.
 - Order: `position` follows each `_index.json`. An entity on disk that its index does not list is appended in
   id order and reported; an index entry with no file is reported and skipped.
 - Runs: `run_no` and `epoch` count from 1 per task in start order; `task_epochs.next_epoch` is one more than
-  the largest. The rendered prompt becomes a blob. Events get `seq` from their line number; a line that does
+  the largest. `attempt_no` is 1.0's attempt number where it is unique within the task; a run that would
+  repeat one is stored uncounted with the 1.0 number in `local`, and the dry run counts such runs. The rendered prompt becomes a blob. Events get `seq` from their line number; a line that does
   not parse becomes a gap. Model and adapter version are empty. Every event is imported; the pruning job
   applies the retention afterwards.
 - `state.json`: the retry queue becomes retry rows; running and claimed entries are closed as 1.0's reconcile
   closes them; totals become counters.
 - Tasks that are `done` get `landing_state = 'skipped'`; 1.0's recorded proof goes to `legacy_proof`.
 - `config.yml`: R70. If the unknown keys exceed 64 KiB the import stops and names them by size.
-- Text over 64 KiB in a description, message or context value is imported whole into its column and listed by
-  the dry run; the 64 KiB rule governs what 1.1 writes afterwards.
+- Text over 64 KiB in a description, message or context value becomes a blob (R97) and is listed by the dry
+  run.
 - A finished import writes `.orch-project` and records its time and source in `daemon_config`. orch never
   deletes a 1.0 file. `orch db status` shows that the 1.0 files are still present and how large they are (O3).
 - An export file (R80) is a SQLite database of the same schema version holding one project's rows from the
@@ -576,12 +591,13 @@ configuration file or to organization templates, which stay files.
 - CLI and `--json` output shapes of 1.0 commands are unchanged apart from the added `revision` field (R48,
   R49). The peer protocol is unchanged.
 - 1.1 is a breaking release for stored state only: one import per project.
+- "64 KB" in B7 is read as 64 KiB (65,536 bytes) everywhere in this spec.
 
 Security checklist:
 - Default bind and exposure: the Unix socket in `run/`, 0600 in a 0700 directory, same-uid check as in 1.0.
   Nothing listens on a network. `orch db` and `orch import` have no remote form.
-- Bounds on input size, count and rate: the frame and admission limits of protocol 2 stand. Added: list limit
-  1,000; key 128 characters; cursor 512 bytes; kept result 64 KiB; `db.query` 100,000 rows and 5 s; import
+- Bounds on input size, count and rate: the frame and admission limits of protocol 2 stand. Added: 4 read
+  connections; list limit 1,000; key 128 characters; cursor 512 bytes; kept result 64 KiB; `db.query` 100,000 rows and 5 s; import
   bounds in "Import rules"; `.orch-project` 64 bytes; `legacy.config` 64 KiB.
 - Permissions of files it writes: the data directory 0700 and files 0600; backups and exports 0600;
   `.orch-project` 0644 (it holds an id, no secret).
@@ -612,9 +628,9 @@ Each goal open point with a recommendation, then the points this spec found. The
 
 | # | Point | Recommendation | Main alternative |
 |---|---|---|---|
-| O1 | How a client finds the daemon and its data directory | Introduce `.orch-project` in 1.1 (R34), keep the 1.0 search order, derive the data directory from the project directory (R33). `--project` and `ORCH_PROJECT` arrive in 1.5, when a project can exist without a directory. Reason: the import is the one moment every project is touched, and without the pointer a moved project directory looks unimported and invites a second import of stale files. | No pointer in 1.1: `.orchestry/` stays the marker and the data directory is found by the derived name alone. Less change now, the move hazard stays, and the pointer arrives in a later breaking step. |
-| O2 | Which tables 1.1 creates | The 33 tables and five differences in "Schema for 1.1". | Create all 50 now: no later table migrations, but 17 untested empty tables and constraints nobody has exercised. |
-| O3 | Import with the daemon stopped; how long 1.0 files are kept | Stopped, both daemons (R68). orch never deletes 1.0 files; the manual advises keeping them until release 1.2 is running and one backup has been restored in a test, and lists the paths that may then be removed by hand. `.orchestry/workspaces/` and the peer files stay in use. | Import into a running 1.1 daemon: no stop, but the import shares the writer with live work and its resume is harder to reason about. |
+| O1 | How a client finds the daemon and its data directory | Introduce `.orch-project` in 1.1 (R34), keep the 1.0 search order, name the data directory from the project directory when it is created and find it by project id afterwards (R33). `--project` and `ORCH_PROJECT` arrive in 1.5, when a project can exist without a directory. Reason: the import is the one moment every project is touched, and without the pointer a moved project directory looks unimported and invites a second import of stale files. | No pointer in 1.1: `.orchestry/` stays the marker and the data directory is found by the derived name alone. Less change now, the move hazard stays, and the pointer arrives in a later breaking step. |
+| O2 | Which tables 1.1 creates | The 33 tables and six differences in "Schema for 1.1". | Create all 50 now: no later table migrations, but 17 untested empty tables and constraints nobody has exercised. |
+| O3 | Import with the daemon stopped; how long 1.0 files are kept | Stopped, both daemons (R68). orch never deletes 1.0 files; the manual advises keeping them until release 1.2 is running and one backup has been restored in a test, and lists the 1.0 state files that may then be removed by hand. The directory `.orchestry/` itself, its `workspaces/` and the peer files stay in use and are never on that list. | Import into a running 1.1 daemon: no stop, but the import shares the writer with live work and its resume is harder to reason about. |
 | O4 | Dispatch at start | As it was when the daemon stopped; off after import, restore and a migrating start; the flag overrides (R44). The `dispatch_off_with_work` item covers a forgotten "off". | Always off, as 1.0: simplest, and every restart needs a second command. |
 | O5 | Maintenance loop | One timer with a due time per job (R43): one place for order, shutdown and the lane, and due times that survive a restart. | One timer per job: independent, but eleven tasks to stop and no shared order. |
 | O6 | Resolved attention items; doctor | Keep 90 days. A blocking item makes `orch doctor` exit 1; a warning does not (R84). Doctor's exit for its existing checks does not change. | Doctor stays exit 0 and only prints: no script breaks, and a blocked daemon looks healthy to one. |

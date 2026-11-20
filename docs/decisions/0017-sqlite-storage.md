@@ -79,20 +79,22 @@ across a crash, lists that do not load everything, and a retried request that ru
    `task_epochs`, `position`, and `project_id` everywhere. The spec lists the tables and every difference from
    the sketch.
 
-9. **The writer serves four lanes by deadline.** Each queued transaction has a deadline of its arrival plus its
-   lane's longest wait: claims and lease work 50 ms, entity changes 200 ms, events 1 s, pruning and other
-   maintenance 5 s. The writer always takes the earliest deadline, so no lane starves and a claim waits behind
-   at most one transaction in progress while the other lanes are inside their budgets. Bulk work (event
-   batches, pruning, expiry, import) is cut into transactions of at most 1,000 rows or 20 ms. An operation that
-   must be atomic is never cut; if it exceeds the bound it runs whole and is counted.
+9. **The writer serves four lanes: claims first, the rest by deadline.** The lanes and their longest waits are
+   claims and lease work 50 ms, entity changes 200 ms, events 1 s, pruning and other maintenance 5 s. A queued
+   claim always goes first. Among the other lanes the writer takes the earliest deadline (arrival plus the
+   lane's wait), so none of them starves, and a bulk job queues one transaction at a time, so overdue bulk work
+   cannot pile up ahead of anything. A claim therefore waits behind at most the one transaction in progress.
+   Bulk work (event batches, pruning, expiry, import) is cut into transactions of at most 1,000 rows or 20 ms.
+   An operation that must be atomic is never cut; if it exceeds the bound it runs whole and is counted.
 
 10. **Each multi-entity operation is one transaction, and its side effects are intent rows.** Starting a run,
     finishing a run, cancelling a task, pausing a goal, and a permanent failure with its cascade each commit
     once or not at all. Anything outside the database (start or stop a process, remove a workspace, delete a
     blob file) is written as a row in `intents` in the same transaction and performed after the commit. A
     stopped daemon finds unfinished intents at the next start. Every intent kind states whether it is repeated
-    (idempotent ones) or resolved by recovery (starting a process, which is never repeated: recovery closes the
-    run and the task is queued again under a new epoch).
+    (idempotent ones) or resolved by recovery. Starting a process is never repeated: the process is created
+    held, its pid is committed, and only then is it released, so startup recovery always knows what exists and
+    treats it as 1.0's startup recovery does.
 
 11. **Bytes are written before the row that names them.** A blob is written to `blobs/tmp/`, synced, renamed to
     `blobs/sha256/ab/cd/<hash>`, and only then referenced in a transaction. A crash leaves at worst an
@@ -120,17 +122,23 @@ across a crash, lists that do not load everything, and a retried request that ru
     deliverable B). Agent rotation is therefore the same as 1.0 and is now a line of engine code that a test
     names.
 
-16. **A restore starts a new generation, and an epoch is never issued twice.** The daemon's generation is
-    `max(stored generation + 1, UTC seconds now)`, set at every start and at every restore. A task's next epoch
-    is `max(task_epochs.next_epoch, generation * 2^20)`. An epoch issued before a restore is therefore smaller
-    than any issued after it, whatever the restored backup's age and even on a new machine. This mechanism is
-    proposed; the lease prototype (deliverable E) confirms or replaces it, and the requirement it serves
-    (gate line 9) does not depend on it.
+16. **A restore starts a new generation, and an epoch is never issued twice.** A start sets the generation to
+    `max(highest known generation + 1, UTC seconds now)` and writes it, synced, to the database and to the
+    file `generation` in the data directory before any epoch is issued. A restore takes "highest known" over
+    the backup, the replaced database when it can be read, and that file. A task's next epoch is
+    `max(task_epochs.next_epoch, generation * 2^20)`; a task that would need more than 2^20 epochs in one
+    generation is refused a claim until the next start. An epoch issued before a restore is therefore smaller
+    than any issued after it, whatever the backup's age. On a directory that has neither the replaced state
+    nor the file (a new machine), the guarantee rests on the clock, and the restore says so. This mechanism is
+    proposed; the lease prototype (deliverable E) confirms or replaces it, and the requirement it serves (gate
+    line 9) does not depend on it.
 
 17. **The project is named by a pointer file from 1.1.** `orch init` and `orch import` write `.orch-project`
-    in the project directory, holding the project id and nothing else. The daemon's data directory defaults to
-    `<data home>/<name derived from the project directory>/`, where the data home is `~/.orchestry/daemons`
-    unless `ORCH_DATA_HOME` says otherwise, and `ORCH_DATA_DIR` names one directory outright. `daemon.json`
+    in the project directory, holding the project id and nothing else. The daemon's data directory is created as
+    `<data home>/<name derived from the project directory>/` and recorded under the project id in
+    `<data home>/projects/`, so a moved project directory still finds its state; the data home is
+    `~/.orchestry/daemons` unless `ORCH_DATA_HOME` says otherwise, and `ORCH_DATA_DIR` names one directory
+    outright. `daemon.json`
     and the socket move into the data directory's `run/`. `--project` and `ORCH_PROJECT`, which name a project
     without a directory, arrive when one daemon serves many projects (1.5). The frozen handshake envelope of
     0012 decision 6 does not change. This is open point 1 of the goal; the owner decides it at the gate.
@@ -187,4 +195,5 @@ across a crash, lists that do not load everything, and a retried request that ru
 - Backups become a product duty: database, blobs and repositories as one restorable point.
 - `orch-peer` is touched at the places decision 18 names, if the owner approves it, and nowhere else.
 - The data directory lives outside the project, so moving a project directory no longer moves its state. The
-  pointer file is what lets the daemon say so instead of offering a second import.
+  pointer file and the record under the data home are what let the daemon find it again instead of offering a
+  second import. `<project>/.orchestry/` must stay in place: it is still the handshake's project identity.

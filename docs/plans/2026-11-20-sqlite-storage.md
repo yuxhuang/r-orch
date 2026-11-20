@@ -100,11 +100,11 @@ first of them. "Suite" is `cargo test -p orch-infra --test storage_conformance`.
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|
-| T8 | Port v2 in `orch-core`, its fakes, and the v2 file adapter; the suite extended to all of port v2 | R7 to R15, R17 | `crates/orch-core/src/store*`, `crates/orch-infra/src/storage/v2*`, the suite | T7 | Suite (file adapter) | 6 |
+| T8 | Port v2 in `orch-core`, its fakes, and the v2 file adapter; the suite extended to all of port v2 | R7 to R15, R17, R97 | `crates/orch-core/src/store*`, `crates/orch-infra/src/storage/v2*`, the suite | T7 | Suite (file adapter) | 6 |
 | T9 | Data directory, its lock, the 1.0 owner lock, the network-filesystem check; schema, migrations, connection settings | R18, R19, R21 to R23, R29 to R33 | `crates/orch-infra/src/sqlite/`, `crates/orch-infra/src/data_dir/`, `crates/orch-daemon/tests/daemon_data_dir.rs`, `.cargo/config.toml` | T7 | `cargo test -p orch-infra --test sqlite_schema --test sqlite_migrations --test sqlite_connection`; `cargo test -p orch-daemon --test daemon_data_dir --test daemon_legacy_lock` | 7 |
-| T10 | SQLite adapter of port v2: the writer with lanes, the read pool, intents | R7 to R15, R24 to R28 | `crates/orch-infra/src/sqlite/` | T8, T9 | Suite (SQLite); `cargo test -p orch-infra --test sqlite_writer --test sqlite_crash` | 8 |
+| T10 | SQLite adapter of port v2: the writer with lanes, the read pool, intents | R7 to R15, R24 to R28, R98 | `crates/orch-infra/src/sqlite/` | T8, T9 | Suite (SQLite); `cargo test -p orch-infra --test sqlite_writer --test sqlite_crash` | 8 |
 | T11 | Blob store on disk; prompts by hash; attachments as blobs | R58, R59 | `crates/orch-core/src/store/blob.rs`, `crates/orch-infra/src/blob/` | T9 | `cargo test -p orch-infra --test blob_store` | 9 |
-| T12 | Engine on port v2, part 1: claims, leases, retries, start and finish a run; the `orch-peer` facade | R35, R36, R40, R20 | `crates/orch-engine/src/orchestrator/`, `crates/orch-engine/src/peer_facade*` | T8, T10 | `cargo test -p orch-engine --test transactions --test leases --test retries --test task_statuses`; `cargo test -p orch-peer` | 10 |
+| T12 | Engine on port v2, part 1: claims, leases, retries, start and finish a run; the `orch-peer` facade | R35, R36, R40, R20, R96 | `crates/orch-engine/src/orchestrator/`, `crates/orch-engine/src/peer_facade*`, `crates/orch-infra/src/process/` | T8, T10 | `cargo test -p orch-engine --test transactions --test leases --test retries --test task_statuses`; `cargo test -p orch-peer` | 10 |
 | T13 | Engine on port v2, part 2: cancel, pause, failure cascade; generations and recovery; the intent performer | R37 to R39, R41, R42, R28 | `crates/orch-engine/src/orchestrator/`, `crates/orch-engine/src/intents*` | T12 | `cargo test -p orch-engine --test transactions --test intents --test leases` | 11 |
 | T14 | Scheduler port with today's scheduler behind it; `metrics.get` with tick time and open tasks | R55 to R57 | `crates/orch-core/src/store/scheduler.rs`, `crates/orch-engine/src/scheduler*`, `crates/orch-daemon/src/ops/` | T12 | `cargo test -p orch-engine --test scheduler --test order_conformance`; `cargo test -p orch-daemon --test ops_metrics` | 12 |
 | T15 | Maintenance loop and its jobs; saved dispatch state | R43, R44, R60 | `crates/orch-engine/src/maintenance*`, `crates/orch-daemon/src/lifecycle.rs` | T13 | `cargo test -p orch-engine --test maintenance`; `cargo test -p orch-daemon --test daemon_dispatch` | 13 |
@@ -121,7 +121,7 @@ first of them. "Suite" is `cargo test -p orch-infra --test storage_conformance`.
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|
-| T24 | The switch: the daemon opens the data directory and SQLite; `orch init` and the pointer file; discovery; the two `orch-peer` changes. The file adapter stays selectable by tests only | R34, R89, R92 | `crates/orch-daemon/src/lifecycle.rs`, `crates/orch-daemon/src/discovery.rs`, `crates/orch-client/src/discovery.rs`, `crates/orch-cli/src/commands/init*`, `crates/orch-peer/src/` | T12 to T23 | `cargo test --workspace`; `./xtask/gate.sh full`; `cargo test -p orch-cli --test project_pointer` | 22 |
+| T24 | The switch: the daemon opens the data directory and SQLite; `orch init` and the pointer file; discovery; the two `orch-peer` changes; the README upgrade notes and the RUNBOOK entries for the switch. The file adapter stays selectable by tests only | R34, R89, R92 | `crates/orch-daemon/src/lifecycle.rs`, `crates/orch-daemon/src/discovery.rs`, `crates/orch-client/src/discovery.rs`, `crates/orch-cli/src/commands/init*`, `crates/orch-peer/src/`, `README.md`, `docs/RUNBOOK.md` | T12 to T23 | `cargo test --workspace`; `./xtask/gate.sh full`; `cargo test -p orch-cli --test project_pointer` | 22 |
 | T25 | Removal: the file backend and the 1.0 traits move to `orch-file-reference`; TRAITS-FROZEN §2 rewritten; the `crate-graph` rule | R16, R17 | `crates/orch-core/src/storage.rs`, `crates/orch-infra/src/storage/`, `crates/orch-file-reference/`, `docs/TRAITS-FROZEN.md`, `xtask/` | T24 | `cargo xtask crate-graph`; suite on both backends; the `git grep` of R16 | 23 |
 | T26 | Documentation: manual, RUNBOOK, ARCHITECTURE, README upgrade notes, CHANGELOG, `docs/storage.md` | R88 | `docs/`, `README.md`, `CHANGELOG.md` | T24 | Fact check against the code at the candidate commit; `cargo test -p xtask` | 24 |
 | T27 | Proof: the importer on a copy of the live project; the peer check on a second host; the cold gate; the spec's Verification table; spec and plan `done` | R71, R89, R91, G1 to G9 | `docs/specs/`, `docs/plans/`; records outside the repository | T25, T26 | `cargo xtask import-verify --source <copy> --record <dir>`; `./xtask/gate.sh full` on macOS and native Linux | 25 |
@@ -178,8 +178,8 @@ format), CHANGELOG, ADR 0017 and the library ADR, `docs/decisions/README.md`.
 ## Open questions
 
 - The spec's O1 to O10 and AP1 to AP10, each with a recommendation; the owner rules at T7.
-- T5 may replace ADR 0017 decision 16 (how a generation and an epoch are formed). Nothing before T12 depends
-  on its form.
+- T5 may replace ADR 0017 decision 16 (how a generation and an epoch are formed) and settles how a process is
+  held until its pid is committed (R96). Nothing before T12 depends on either.
 - T4 decides whether T16 ships events in SQLite or the file fallback. T16's scope is written for either.
 - T24 and T25 could be one PR if the wiring is small. They are planned as two so that the switch is reviewed
   as behaviour and the removal as a move.
