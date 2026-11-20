@@ -104,9 +104,10 @@ across a crash, lists that do not load everything, and a retried request that ru
 12. **Run events go into SQLite, in batches, unless the measurement says otherwise.** A collector numbers its
     run's events from 1 and hands batches to the events lane; the append ignores a sequence number already
     stored, so a repeated batch is harmless. If the measured throughput cannot meet the claim-latency budget
-    (deliverable D), events are kept as per-run files in the data directory, each named by a hash (decision
-    20), behind the same port operations and nothing else in this ADR changes. The measurement has since missed the budget on macOS and met it on
-    Linux (the spec's point AP13), so 1.1 is planned on the fallback unless the owner rules otherwise.
+    (deliverable D), events are kept as per-run files in the data directory, each named by a hash (decision 20),
+    behind the same port operations and nothing else in this ADR changes. The measurement has since missed the
+    budget on macOS and met it on Linux (the spec's point AP13), so 1.1 is planned on the fallback unless the
+    owner rules otherwise.
 
 13. **A retried change runs once.** A request may carry a key. The key, scoped by (identity, project, run,
     epoch, key), is stored with a hash of the request and the result in the same transaction as the change, and
@@ -167,24 +168,30 @@ across a crash, lists that do not load everything, and a retried request that ru
     PR that adds the dependency.
 
 20. **No value from outside the daemon names a file.** An id, a key, a name or a path that came from a request,
-    a 1.0 source, an export file, a backup's manifest or a row of an imported or restored database is data in
-    a column. Below the data directory, in a backup and in the data home's `projects/`, a path component is a
-    fixed name of the layout, 64 hex digits of a SHA-256 the daemon computed, or a name the daemon generated.
-    A run's event file (decision 12) is named by the SHA-256 over a fixed label, the project id and the run
-    id, each id preceded by its length; a project's record by the SHA-256 of its id. One module in
-    `orch-infra` reaches every such file: it opens the root once and then goes through directory descriptors,
-    one name at a time, refusing links, files with more than one hard link and special files, and creating
-    exclusively. The importer reads its source the same way, by listing, and opens nothing that a document
-    names. A pid, a workspace path or a project directory read from a source is never acted on: an import
-    writes no lease and no intent and signals nothing. The spec's "Filesystem names" is the contract and
-    holds the test vectors. The one id that still names a directory is `workspaces/<task id>` in the project
-    directory, 1.0's layout, with 1.0's reject-never-rewrite check; the spec's point AP14 puts it to the
-    owner. This decision answers the security review's finding S2, which showed the first layout
-    (`blobs/events/ab/<run id>`) leaving the data directory for a run id shaped like a path. The descriptor
-    calls exist, without `unsafe`, in `nix`, which the workspace already depends on and already uses this way
-    (`crates/orch-daemon/src/ops/transport.rs`); the PR that adds the module does the §4.8 check on a
-    capability-style crate such as `cap-std` before it settles on `nix`, and the contract is the same either
-    way.
+    a 1.0 source, an export file, a backup's manifest or a row of an imported or restored database is data in a
+    column. Below the data directory, in a backup and in the data home's `projects/`, a path component is a
+    fixed name of the layout, 64 hex digits of a SHA-256 the daemon computed (or its first two, as a shard
+    directory), or a name the daemon generated; an export is one file and holds no path at all. A run's event
+    file (decision 12) is named by the SHA-256 over a fixed label, the project id and the run id, each id
+    preceded by its length; a project's record by the SHA-256 of its id. One module in `orch-infra` reaches
+    every such file, and writes the pointer file in the project directory: it opens the root once and then goes
+    through directory descriptors, one name at a time, refusing links and special files, judging an entry by the
+    descriptor it opened, and creating exclusively. It refuses a file with more than one hard link in a tree
+    from elsewhere (an import source, a backup being restored) and before any append; reads below the data
+    directory rely on the hash check instead, so that a hard-link snapshot of the directory does not stop the
+    daemon. The importer reads its source the same way, by listing, and opens nothing that a document names. A
+    pid, a workspace path or a project directory read from a 1.0 source or an export is never acted on: an
+    import writes no lease and no intent and signals nothing. A restore is the stated exception: it acts on the
+    processes its backup records, as the spec's R100 says, because a backup is the owner's own state; AP14 puts
+    that to the owner too. The spec's "Filesystem names" is the contract and holds the test vectors. The one id
+    that still names a directory is `workspaces/<task id>` in the project directory, 1.0's layout, with 1.0's
+    reject-never-rewrite check; the spec's point AP14 puts it to the owner. This decision answers the security
+    review's finding S2, which showed the first layout (`blobs/events/ab/<run id>`) leaving the data directory
+    for a run id shaped like a path. The descriptor calls exist, without `unsafe`, in `nix`, which the workspace
+    already depends on and already uses this way (`crates/orch-daemon/src/ops/transport.rs`); `orch-infra` needs
+    its `fs` and `dir` features turned on, which adds no crate. The PR that adds the module does the §4.8 check
+    on a capability-style crate such as `cap-std` before it settles on `nix`, and the contract is the same
+    either way.
 
 ## Alternatives considered
 
@@ -242,8 +249,10 @@ across a crash, lists that do not load everything, and a retried request that ru
 - `orch-peer` is touched at the places decision 18 names, if the owner approves it, and nowhere else.
 - Files in the data directory can no longer be found by an id with `ls`: an event file and a project record
   are named by hashes, which the storage reference (`docs/storage.md`) must explain how to compute. A copy
-  of a 1.0 project made with hard links (some snapshot tools) is refused by the importer and must be copied
-  again as plain files, and a backup can never share files with the live blob store by hard links.
+  of a 1.0 project or of a backup made with hard links (some snapshot tools) is refused by the importer and
+  by the restore and must be copied again as plain files; a backup never shares files with the live blob
+  store by hard links. A hard-link snapshot of the data directory itself does not stop reads, but the daemon
+  refuses to append to an event file that has a second link, since the append would change the snapshot.
 - The data directory lives outside the project, so moving a project directory no longer moves its state. The
   pointer file and the record under the data home are what let the daemon find it again instead of offering a
   second import. `<project>/.orchestry/` must stay in place: it is still the handshake's project identity.
