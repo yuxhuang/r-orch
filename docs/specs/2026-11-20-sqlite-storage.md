@@ -153,7 +153,7 @@ and change with the owner's answer.
 |---|---|---|---|---|
 | R1 | The spec, the plan and ADR 0017 shall be in the repository in one documentation-only PR before any product code. | A | must | The three files exist on `main`; `./xtask/gate.sh fast --base origin/main` classifies the PR as documentation only; macOS |
 | R2 | A storage conformance suite shall run every scenario against a backend chosen by the test, and shall pass on the file backend before the SQLite backend exists. | B | must | `cargo test -p orch-infra --test storage_conformance`; both |
-| R3 | The list of every read whose result depends on index order shall be in the repository, each entry naming the function, the order it relies on and the scenario that covers it. | B | must | `docs/internal/order-dependent-reads.md` exists and `crates/orch-engine/tests/order_conformance.rs::every_listed_read_has_a_scenario` passes; both |
+| R3 | The list of every read whose result depends on index order shall be in the repository, each entry naming the function, the order it relies on and the scenario that covers it. | B | must | `docs/storage-order-dependent-reads.md` exists, beside the pinned 1.0 contracts in `docs/storage-v1-conformance.md`, and `crates/orch-engine/tests/order_conformance.rs::every_listed_read_has_a_scenario` passes; both |
 | R4 | The SQLite library shall be chosen with the ARCHITECTURE §4.8 check (maintenance, MSRV of the pinned toolchain, licence through `deny.toml`), recorded in its own ADR, bundle SQLite 3.37 or later with FTS5 available, and leave `unsafe_code` forbidden in the workspace. | C | must | The ADR exists; `cargo deny check` passes on the PR that adds it; `crates/orch-infra/tests/sqlite_build.rs::bundled_sqlite_has_strict_tables_and_fts5`; both |
 | R5 | Batched event throughput shall be measured against the claim-latency budget in "Writer lanes", on macOS and on Linux, with the commit, the hardware class and the raw figures recorded. | D, G7 | must | `cargo xtask storage-bench --record <dir>` and its record linked from the approval-gate PR; macOS and native Linux |
 | R6 | A prototype shall show a claim with a fenced lease, including a suspended and resumed machine, and its result shall confirm or replace ADR 0017 decision 16 and R39 before the engine PR starts. | E | must | The prototype's report linked from the approval-gate PR; macOS with a real suspend, Linux |
@@ -284,7 +284,7 @@ deliverable B confirms each line. Every list also offers the sort `id`, whose va
 | messages | `created_at`, `position` | none |
 | context entries | `key` | none |
 | teams | `created_at`, `id` (1.0's order came from the filesystem and was not a contract) | `name` |
-| runs | `started_at` descending, `id` | per task: `run_no` |
+| runs | `started_at` descending, `id` (1.0 broke equal start times by directory order, which was not a contract) | per task: `run_no` |
 
 The engine calls `move_to_end` only at the call sites deliverable B lists as observable. Until that list
 exists the rule is: wherever 1.0 saved a task, agent, goal or message.
