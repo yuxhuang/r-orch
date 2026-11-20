@@ -910,13 +910,39 @@ fn uninitialized_project_exits_three_with_nothing_on_stdout() {
     );
 }
 
+// Check the child command's environment policy even when the runner has no
+// overrides. An unregistered cwd must explicitly remove each variable: leaving
+// it unspecified would inherit a live endpoint in an ordinary ambient run.
+#[test]
+fn orch_command_without_a_registered_daemon_removes_runner_overrides() {
+    let elsewhere = empty_project();
+    let command = orch_command(elsewhere.path());
+    let envs: std::collections::HashMap<_, _> = command.get_envs().collect();
+
+    for key in ["ORCH_PROJECT_ROOT", "ORCH_SOCKET", "ORCH_TEST_SOCKET_ROOT"] {
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new(key)),
+            Some(&None),
+            "an unregistered fixture must remove {key} from its child environment"
+        );
+    }
+}
+
 #[test]
 fn project_root_serves_that_project_from_an_uninitialized_working_directory() {
     let project = initialized_project_named("served-project");
     let elsewhere = empty_project();
     let root = project.path().to_str().expect("utf-8 path");
 
-    let text = instructions_for(elsewhere.path(), &["--project-root", root], &[]);
+    let (socket, socket_dir) = daemon_env(&project);
+    let text = instructions_for(
+        elsewhere.path(),
+        &["--project-root", root],
+        &[
+            ("ORCH_SOCKET", Some(socket.as_str())),
+            ("ORCH_TEST_SOCKET_ROOT", Some(socket_dir.as_str())),
+        ],
+    );
 
     assert!(text.contains("\"served-project\""), "{text}");
 }
@@ -928,7 +954,15 @@ fn project_root_reports_the_canonical_root_in_the_instructions() {
     let root = project.path().to_str().expect("utf-8 path");
     let canonical = std::fs::canonicalize(project.path()).expect("canonicalize");
 
-    let text = instructions_for(elsewhere.path(), &["--project-root", root], &[]);
+    let (socket, socket_dir) = daemon_env(&project);
+    let text = instructions_for(
+        elsewhere.path(),
+        &["--project-root", root],
+        &[
+            ("ORCH_SOCKET", Some(socket.as_str())),
+            ("ORCH_TEST_SOCKET_ROOT", Some(socket_dir.as_str())),
+        ],
+    );
 
     let quoted = serde_json::to_string(&canonical.display().to_string()).expect("quote");
     assert!(text.contains(&quoted), "{quoted} not in {text}");

@@ -470,6 +470,11 @@ pub fn orch_command(cwd: &Path) -> Command {
         )
         .env("NO_COLOR", "1")
         .env("PATH", "/usr/bin:/bin")
+        // No fixture may inherit the runner's project or live endpoint. A
+        // registered cwd (below), or explicit per-launch envs, supplies its own.
+        .env_remove("ORCH_PROJECT_ROOT")
+        .env_remove("ORCH_SOCKET")
+        .env_remove("ORCH_TEST_SOCKET_ROOT")
         .env_remove("ORCHESTRY_DEBUG")
         .env_remove("ORCH_AGENT_ID");
     daemon::apply_for(cwd, &mut command);
