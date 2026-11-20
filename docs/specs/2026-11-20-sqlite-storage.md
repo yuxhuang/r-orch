@@ -187,7 +187,7 @@ their names are forward references.
 | R30 | When a daemon or an offline command is pointed at a data directory that another holds, it shall change nothing, exit 4 and print the holder's kind, pid and start time. | B5, G6 | must | `crates/orch-daemon/tests/daemon_data_dir.rs::second_daemon_refuses_and_names_the_holder`, `crates/orch-cli/tests/db_offline.rs::offline_command_refuses_while_a_daemon_holds_the_directory`; both |
 | R31 | While a 1.1 daemon or `orch import` runs for a project directory, a 1.0 daemon shall not be able to start on it, and a 1.1 daemon shall refuse to start while a 1.0 daemon holds it; neither shall create or write a 1.0 file. Where the 1.0 lock file does not exist (no 1.0 daemon ever ran there), or if F9 proves false, 1.1 shall only refuse while a 1.0 daemon answers, and the manual shall say that the exclusion is then a procedure and not a lock. | B2, F9 | must | `crates/orch-daemon/tests/daemon_legacy_lock.rs::legacy_owner_lock_is_held_without_writing`, `::start_is_refused_while_a_legacy_daemon_holds_the_project`, `::an_absent_legacy_lock_file_is_not_created`; both |
 | R32 | The daemon shall refuse to start when the data directory is on a network filesystem. | B12 | must | `daemon_data_dir::network_filesystem_is_refused` (injected filesystem type); both |
-| R33 | The data directory shall be `ORCH_DATA_DIR` when set (absolute, else exit 2), otherwise the directory that `<data home>/projects/<project id>` records, which `orch init` and `orch import` write when they create `<data home>/<name>`; the data home is `ORCH_DATA_HOME` or `~/.orchestry/daemons`; the repository's cargo configuration shall set `ORCH_DATA_HOME` inside `target/`. (O1) | B5, DL | must | `daemon_data_dir::default_name_is_derived_from_the_project_directory`, `::the_project_record_names_the_directory`, `::relative_override_is_refused`; `./xtask/gate.sh pr` `real-home` step unchanged; both |
+| R33 | The data directory shall be `ORCH_DATA_DIR` when set (absolute, else exit 2), otherwise the directory that the project's record under `<data home>/projects/` names (R107), which `orch init` and `orch import` write when they create `<data home>/<name>`; the data home is `ORCH_DATA_HOME` or `~/.orchestry/daemons`; the repository's cargo configuration shall set `ORCH_DATA_HOME` inside `target/`. (O1) | B5, DL | must | `daemon_data_dir::default_name_is_derived_from_the_project_directory`, `::the_project_record_names_the_directory`, `::relative_override_is_refused`; `./xtask/gate.sh pr` `real-home` step unchanged; both |
 | R34 | `orch init` and `orch import` shall write `.orch-project` (the project id and a newline) in the project directory; a client shall find the project by `ORCH_SOCKET`, then `ORCH_PROJECT_ROOT`, then the nearest ancestor holding `.orch-project`; a directory with 1.0 state and no `.orch-project` shall get exit 3 and the hint `orch import --dry-run`. When the project directory is not the one the database records, the daemon shall adopt the new path if the recorded one no longer holds that project id (a move) and refuse, naming both paths, if it still does (a copy). (O1) | O1 | must | `crates/orch-cli/tests/project_pointer.rs::client_finds_the_project_by_pointer`, `::unimported_project_gets_the_import_hint`, `::a_moved_project_keeps_its_state`, `::a_copied_project_is_refused_with_both_paths`; both |
 | R35 | Starting a run shall be one transaction: the lease, the epoch, the run row, the task's status and attempts, the removal of its retry row and the intent to start the process. | H | must | `crates/orch-engine/tests/transactions.rs::start_run_is_all_or_nothing` (a stop injected before and after each statement); both |
 | R36 | Finishing a run shall be one transaction: the run's outcome and usage, its result row, the task's next status, its retry row or its `landing_state`, the release of the lease, the agent's totals and position, and the intents to clean up. A finish that names a stale epoch shall change only that run's row. | H | must | `transactions::finish_run_is_all_or_nothing`, `::finish_with_a_stale_epoch_changes_only_the_run`; both |
@@ -223,7 +223,7 @@ their names are forward references.
 | R66 | `orch import` shall read its source in bounded memory and bounded transactions, refuse a source file over the bounds in "Import rules", and commit an entity and its `import_manifest` row together. | N | must | `import::memory_stays_bounded_on_a_large_project` (generated corpus of the live project's shape), `::oversize_source_file_is_refused_by_name`; both |
 | R67 | When an import was stopped part-way, `orch import --resume` shall continue from the manifest, shall refuse when a source file it already imported has changed, and the daemon shall refuse to start on an unfinished import. | N | must | `import::resume_completes_an_interrupted_import` (stops injected at every batch boundary), `::resume_refuses_a_changed_source`, `daemon_data_dir::unfinished_import_is_refused`; both |
 | R68 | `orch import` shall refuse, changing nothing, when a 1.0 or 1.1 daemon holds the project or the data directory, when the data directory already holds a finished project, or when free space is under the disk floor plus the estimate. (O3) | N, O3 | must | `import::refuses_while_a_daemon_runs`, `::refuses_a_second_project`, `::refuses_without_space`; both |
-| R69 | An imported project shall keep its ids, its order (`position` from each `_index.json`), its retry queue, its totals and its runs; state that was in flight shall be closed as 1.0's reconcile would close it; every task's next epoch shall be above every epoch given to its imported runs. | N | must | `import::order_and_rotation_survive_import` (the order scenarios run on the imported database), `::in_flight_state_is_closed`, `::epochs_continue_after_import`; both |
+| R69 | An imported project shall keep its ids, its order (`position` from each `_index.json`), its retry queue, its totals and its runs; state that was in flight shall be closed as 1.0's reconcile would close it when its process is gone (R105); every task's next epoch shall be above every epoch given to its imported runs. | N | must | `import::order_and_rotation_survive_import` (the order scenarios run on the imported database), `::in_flight_state_is_closed`, `::epochs_continue_after_import`; both |
 | R70 | A known `config.yml` key shall be imported to its setting; unknown keys shall be stored in the `legacy.config` object, at most 64 KiB, which the daemon never reads; `scheduling.max_concurrent_agents` shall become the project's optional `run_cap`; a project with an agent whose policy is `auto` shall be imported with `preapproval` on. (O7) | N, O7, B14 | must | `import::unknown_config_keys_go_to_the_legacy_object`, `::max_concurrent_agents_becomes_run_cap`, `::auto_policy_turns_preapproval_on`; both |
 | R71 | The importer shall be verified on a copy of the owner's live project, outside the repository: a dry run, an import stopped and resumed, `orch db verify`, and counts equal to the dry run's; the record shall hold counts, sizes, durations and hashes only. | G2, DL | must | `cargo xtask import-verify --source <copy> --record <dir>`; the owner's machine, with the owner's permission |
 | R72 | `orch db status` shall report the path, sizes, schema version, generation, journal and sync modes, free space and floor, row counts, the last run of each maintenance job and the import record. | O | must | `crates/orch-cli/tests/db_commands.rs::status_reports_the_listed_fields`; both |
@@ -255,6 +255,14 @@ their names are forward references.
 | R98 | Reads shall be served by a pool of `storage.read_connections` connections (default 4); a read that finds none free shall wait up to the admission deadline and then fail with `overloaded`, never open another connection. | B6; review finding | should | `sqlite_writer::reads_wait_for_a_free_connection_then_fail_overloaded`; both |
 | R99 | `orch import` shall account for every path under the source `.orchestry/`: each is imported, or left in place as "Import rules" lists, or named by the dry run and by the import's report as not imported. Project prompt template files shall become `templates` rows, byte for byte. | N, S2, B2 | must | `import::every_source_path_is_accounted_for` (a corpus with an unknown file and an unknown directory), `::templates_are_imported_byte_for_byte`; both |
 | R100 | `orch db restore` shall refuse, changing nothing, while a process that the replaced state or the backup records as a run's is alive (pid and start time), naming each run and pid; with `--stop-runs` it shall stop those process groups first. After a restore no lease of the backup shall be active: each is ended and its run closed as R41 closes a run whose process is gone. | G9; the lease prototype and its review (a restore that frees every task at once lets a holder from the replaced state and a new one work on one task) | must | `crates/orch-cli/tests/restore_fencing.rs::restore_refuses_while_a_recorded_process_is_alive`, `::stop_runs_stops_them_first`, `::restored_leases_are_ended`; both |
+| R101 | No path component below the data directory, in a backup or in an export shall be taken from an id, a key, a name or a path that a request, an import source, a backup's manifest or a database row supplied: each shall be a fixed name, 64 lower-case hex digits of a SHA-256 the daemon computed, or a name the daemon generated, as "Filesystem names" lists them. A run's event file shall be named by the whole hash defined there, and a hash read from a row shall select a file only after it parses as 64 lower-case hex digits. | security review S2 (the layout `blobs/events/ab/<run id>` left the data directory for the run id `../../../../outside-canary`) | must | `crates/orch-infra/tests/event_files.rs::the_file_name_is_the_whole_hash_for_any_run_id` (the vectors of "Filesystem names": traversal-shaped and absolute run ids, one holding a NUL, one holding a separator, and `..`; an outside canary is unchanged), `::read_tail_and_prune_reach_only_the_hashed_file`, `crates/orch-infra/tests/blob_store.rs::a_hash_that_is_not_64_hex_digits_is_refused_and_touches_nothing`; both |
+| R102 | Every create, open, rename and delete that the blob store, the event files, a backup, a restore, an export and the importer perform shall reach its file through directory descriptors opened from a validated root, one name at a time and following no link; shall create a file exclusively with mode 0600 and a directory with 0700; and shall refuse, with a typed error and no change inside or outside the root, a symbolic link, a file with more than one hard link, and an entry that is neither a regular file nor, where the layout expects one, a directory. | security review S2 | must | `crates/orch-infra/tests/confined_dir.rs::a_symlink_at_any_level_is_refused_and_not_followed`, `::a_hard_link_is_refused`, `::a_fifo_and_a_socket_are_refused_without_blocking`, `::rename_and_delete_stay_inside_the_root` (outside canary), `::new_files_are_exclusive_and_0600` (permissive umask), `blob_store::a_planted_link_in_the_blob_tree_is_refused`, `event_files::a_planted_link_is_refused_on_append_read_and_prune`; both |
+| R103 | `orch import` shall find its source files only by listing the directories that "Import rules" names, from a descriptor of the source `.orchestry/`, and shall open an entry only by its listed name, as R102 says. It shall open no path built from a value inside a document (an index entry, an attachment name, a workspace path, a configuration value) and shall look such a value up among the listed names instead. A listed entry that is a symbolic link, has more than one hard link or is not a regular file shall stop the import before any of its bytes is read, named by its escaped path relative to the project, and the dry run shall list each such entry. | security review S2 | must | `crates/orch-cli/tests/import.rs::source_links_and_special_files_are_refused_unopened` (a symbolic link to a file and to a directory, a hard link, a FIFO and a socket, each as a store file, a store directory and an attachment; the canary's bytes reach neither the database nor the blob store, and the test has a time limit), `::names_inside_documents_are_looked_up_and_never_opened` (index entries, attachment names and workspace paths that are traversal-shaped or absolute and name the outside canary), `::unknown_directories_are_named_and_not_entered`; both |
+| R104 | An imported entity's id shall be the stem of the file it was read from. The import shall stop, naming the file, unless the document's own id (for a context entry, its key), where the document carries one, equals that stem byte for byte and the stem holds only `A-Z a-z 0-9 . _ -`, the names the 1.0 store could write; a task whose id is `.` or `..` shall stop it likewise. | security review S2 | must | `import::an_id_that_is_not_its_file_stem_is_refused_by_path` (document ids `../../../../outside-canary` and `/outside-canary`, one holding a NUL, one holding `/`, a stem holding a space, and a task `..`; nothing is committed for the file and the outside canary is unchanged); both |
+| R105 | `orch import`, from a 1.0 directory or from an export file, shall write no lease and no intent, shall signal and look up no process, and shall create, change or remove nothing in the project directory except `.orch-project` and, where it is missing, the empty directory `.orchestry/` that the handshake needs. A pid, a workspace path and a project directory read from a source shall be stored as text or left out, and nothing shall later signal a process or create, open or remove a directory because of them. In-flight 1.0 state shall be closed in the database as if every recorded process were gone, and a run that an export holds unfinished shall be ended at the first start, without reading its pid, as R41 ends a run whose process is gone. (AP14) | security review S2; F8 and `docs/internal/orchestration.md` "Startup recovery" (1.0's recovery kills the process a run document names and keeps a running entry whose pid is alive) | must | `import::source_pids_and_workspace_paths_are_never_acted_on` (a running entry and a run document name the pid of a live canary process and a canary directory outside the project; after the import, the first start and a cancel of the task, the process lives and the directory is unchanged), `::import_writes_no_lease_and_no_intent`, `crates/orch-cli/tests/db_export_import.rs::an_unfinished_run_is_ended_at_the_first_start_without_a_signal`; both |
+| R106 | The daemon shall address a task's workspace only as `workspaces/<task id>` below the project's `.orchestry/`, never by a stored path, after checking that the id is one name of `A-Z a-z 0-9 . _ -` other than `.` and `..` and that neither `workspaces` nor that entry is a symbolic link. It shall merge or delete the branch of a task's local run only when the stored name is `orchestry/<task id>/` followed by 1 to 40 characters of `a-z 0-9 -` or by the task id. Otherwise it shall fail the step with `workspace` and change nothing in the project directory or its repository. (AP14) | security review S2; 1.0 merges and deletes the branch a task document names (`orchestrator/collect.rs`, `workspace/manager.rs`) | must | `crates/orch-infra` workspace tests `a_task_id_that_is_not_one_name_gets_no_workspace`, `a_link_at_the_workspace_name_is_refused` (outside canary), `crates/orch-engine/tests/intents.rs::workspace_remove_takes_a_task_id_never_a_path`, `crates/orch-engine/tests/transactions.rs::a_stored_branch_of_another_shape_is_neither_merged_nor_deleted` (a task whose stored branch is `main`); both |
+| R107 | `.orch-project` shall be read without following a link and accepted only as a regular file of at most 64 bytes holding one project id of 1 to 63 bytes of `A-Z a-z 0-9 _ -` and a newline; anything else shall get exit 3, naming the file. The record of a project's data directory shall be the file `<data home>/projects/<64 hex digits of the SHA-256 of the project id>`, and a project id read from an export shall pass the same check before it is stored. | security review S2 (the pointer file comes with a checkout and an export file from elsewhere, and the project id named the record file) | must | `crates/orch-cli/tests/project_pointer.rs::a_pointer_that_is_not_one_project_id_is_refused` (a traversal-shaped id, an absolute path, a NUL, a separator, two lines, 65 bytes, a symbolic link), `crates/orch-daemon/tests/daemon_data_dir.rs::the_project_record_is_named_by_the_hash_of_the_id`, `db_export_import::a_project_id_outside_the_alphabet_is_refused`; both |
+| R108 | `orch db restore` and `orch import --from` shall reach a backup's or an export's contents only by the fixed layout and by hashes they compute. A restore shall list the backup as R102 says and refuse it, before any change, unless the listed names and the manifest's names are the same set and each has a form of "Filesystem names". An import shall store a blob of an export under the hash of its bytes and refuse a blob whose stated hash differs. No name read from a manifest or an export shall be opened as a path. | security review S2 | must | `crates/orch-cli/tests/db_backup_restore.rs::a_manifest_name_outside_the_layout_is_refused_before_any_change` (`../outside-canary`, an absolute name, a name holding a NUL, one file more and one file fewer than the manifest), `::links_and_special_files_in_a_backup_are_refused_before_any_change`, `::event_files_round_trip_under_their_hash_names` (if the fallback ships), `db_export_import::names_in_an_export_are_stored_and_never_opened` (run ids, attachment names and workspace paths that name an outside canary; a blob whose stated hash is `../x`); both |
 
 ## Storage port v2
 
@@ -371,6 +379,11 @@ Rows the daemon keeps without a table of their own: the generation and the saved
 | `workspace.remove` | Remove the task's workspace. | Repeated; a missing workspace is success. |
 | `blob.delete` | Delete a blob file after its `blobs` row is gone. | Repeated; a missing file is success. |
 
+An intent holds ids and hashes, never a path. `process.stop` names the run, and is written only for the run
+of a lease; an import brings no lease and no intent, so a pid that came from a source is never signalled
+(R105). `workspace.remove` names the task, and the directory is found as R106 says. `blob.delete` holds a blob's
+hash, or the project and run of an event file, and the file name is parsed or computed again (R101).
+
 Change notifications to subscribers are not intents: they stay in memory, and a subscriber that missed one gets
 the resync that protocol 2 already defines. Done intents are deleted after 7 days.
 
@@ -405,17 +418,21 @@ test suite is not a performance result.
 **Event fallback** (R63, AP13). The goal names it: append-only files behind the blob-store adapter, with one
 index row for each batch. The port does not change.
 
-- A batch is appended to the run's file `blobs/events/ab/<run id>` (`ab` is the first two hex digits of the
-  SHA-256 of the run id), and then one row of `run_event_batches` (run, `first_seq`, `last_seq`, `offset`,
-  `length`, `sha256`) is committed on lane 3. Bytes come before the row, as for blobs: a stop leaves at worst
-  an unindexed tail, which the next append to that run cuts off.
+- A batch is appended to the run's file `blobs/events/ab/<event file name>`, and then one row of
+  `run_event_batches` (run, `first_seq`, `last_seq`, `offset`, `length`, `sha256`) is committed on lane 3. The
+  name is 64 hex digits that the daemon computes from the project id and the run id, and `ab` is its first two
+  ("Filesystem names", R101): the run id itself is never part of a path. The file is created exclusively and
+  reached as R102 says. Bytes come before the row, as for blobs: a stop leaves at worst an unindexed tail,
+  which the next append to that run cuts off.
 - The file is not synced for each batch. After a power loss a batch whose bytes are missing or do not hash
   to its row is reported as a gap; results and usage are rows and are not affected.
 - `append_events`, `read_events`, `read_events_tail` and `prune_events` keep their contracts: a repeated
   batch is recognised by its sequence numbers and stores nothing, reads go through the index rows, and
-  pruning deletes the rows and then the file by a `blob.delete` intent.
+  pruning deletes the rows and then the file by a `blob.delete` intent. Each of them finds the file by
+  computing its name again.
 - 1.1 then creates `run_event_batches` in place of `run_events`, still 33 tables. A backup copies each event
-  file up to the length its rows cover, and an export carries the indexed bytes.
+  file, under the same name, up to the length its rows cover, and an export carries the indexed bytes in its
+  blob table, not as files.
 - No figure yet shows that the fallback meets the budget (AP13).
 
 ## Request keys
@@ -470,10 +487,10 @@ workspace, 7 no usable daemon. No exit code is added.
   generation                     0600   the highest generation this directory has used; written and synced at every start
   blobs/                         0700
     sha256/ab/cd/<hash>          0600   ab and cd are the first four hex digits of the hash
-    events/ab/<run id>           0600   only if the event fallback ships (R63)
-    tmp/                         0700
+    events/ab/<event file name>  0600   only if the event fallback ships (R63); 64 hex digits, ab the first two
+    tmp/                         0700   file names generated by the daemon
   repos/                         0700   empty before 1.5
-  backups/                       0700   one directory per backup, files 0600
+  backups/                       0700   one directory per backup, named by the daemon; files 0600
   run/                           0700
     orch.sock                    0600
     daemon.json                  0600
@@ -483,9 +500,10 @@ workspace, 7 no usable daemon. No exit code is added.
   `restore`, `vacuum`), pid, start time, binary version and executable path. A refusal prints it (R30).
 - Default location at creation: `<data home>/<name>/`, with `<name>` the project directory's base name in lower case,
   characters outside `a-z 0-9 . _ -` replaced by `-`, cut to 32 bytes, then `-` and the first 12 hex digits of
-  the SHA-256 of the canonical project path. `orch init` and `orch import` record it in
-  `<data home>/projects/<project id>` (0600, one line), and from then on the project is found by its id, so
-  moving the project directory does not lose its state (R34). `ORCH_DATA_DIR` names the directory outright.
+  the SHA-256 of the canonical project path. `orch init` and `orch import` record it in the project's record
+  under `<data home>/projects/` (0600, one line; the file is named by a hash of the project id, R107), and from
+  then on the project is found by its id, so moving the project directory does not lose its state (R34).
+  `ORCH_DATA_DIR` names the directory outright.
 - The socket follows 0012's rule: `run/orch.sock` when its absolute path is at most 100 bytes, otherwise the
   short path under `$TMPDIR`, recorded in `run/daemon.json`. `ORCH_SOCKET` still overrides.
 - In the project directory 1.1 writes `.orch-project` (0644, at most 64 bytes) and, as 1.0 did,
@@ -494,7 +512,87 @@ workspace, 7 no usable daemon. No exit code is added.
   The directory `.orchestry/` itself must stay: its device and inode are the project identity of the frozen
   handshake. `orch init` creates it for a new project.
 - A data directory that names another project id than `.orch-project` does is refused with both values
-  printed. A project directory other than the recorded one is a move or a copy, handled as R34 says.
+  printed. A project directory other than the recorded one is a move or a copy, handled as R34 says. The
+  recorded project directory is a daemon-wide row (`daemon_config`) that `orch init` and `orch import` write
+  from the directory they ran for, so an export never carries one (R105).
+
+## Filesystem names
+
+Which values may select a file (R101 to R108). The security review's finding S2: the first event-file layout,
+`blobs/events/ab/<run id>`, resolved outside the data directory for the run id `../../../../outside-canary`.
+The wire type `Id` bounds only the length of an id and the domain keeps ids as plain strings (verified at
+`fb6a1e1`: `crates/orch-proto/src/bounded.rs`, `crates/orch-domain/src/run.rs`), so no layout may rest on what
+an id contains.
+
+**Rule.** A value that reaches the daemon from outside is data, and is never a path component. "From outside"
+means a request, a 1.0 source file, an export file, a backup's manifest, and any row of a database that an
+import or a restore brought in. Below the data directory, in a backup and in the data home's `projects/`,
+every path component has one of four forms:
+
+| Form | Where | What it is |
+|---|---|---|
+| Fixed | The layout in "Data directory" | The literal names there. |
+| Content hash | `blobs/sha256/ab/cd/<hash>` | 64 lower-case hex digits: the SHA-256 of the file's bytes. A hash column is parsed to this form before every use; another value is a typed error and no file is touched. |
+| Derived hash | `blobs/events/ab/<event file name>`, `<data home>/projects/<record name>` | 64 lower-case hex digits of a SHA-256 the daemon computes over ids, as below. |
+| Generated | `blobs/tmp/`, `backups/<UTC time>-g<generation>/`, `backups/pre-restore-<UTC time>/` | Random hex digits made by the daemon, or a time and a generation it formats itself. |
+
+- **Event file name.** The SHA-256, in lower-case hex, of these bytes in order: the ASCII text
+  `orch-event-file-v1`, one zero byte, the length of the project id in bytes as eight bytes big-endian, the
+  project id, the length of the run id as eight bytes big-endian, the run id. The lengths make the pair
+  unambiguous whatever bytes an id holds.
+- **Project record name.** The SHA-256, in lower-case hex, of the project id's bytes.
+- An export is one file; inside it, blob bytes are rows keyed by their hash, and nothing is a path (R108).
+- The original name of an attachment, a template's name, a context key, a run's recorded workspace path and
+  the like are columns. They are shown escaped and never opened.
+- Two things are not values from outside in this sense. A path the owner gives on a command line or in the
+  environment (`ORCH_DATA_DIR`, `--from`, `--to`, a backup to restore) is the owner's choice of a root and is
+  used as given. And the default name of a data directory ("Data directory") is made from the project
+  directory's base name by replacing every character outside `a-z 0-9 . _ -` and adding a hash, which makes
+  it one name by construction.
+
+**Access** (R102). The blob store, the event files, a backup, a restore, an export and the importer open
+their root directory once and then reach everything through directory descriptors. The data directory is
+checked as R29 says; the root of a source or of a backup must be a directory and not a link. From there
+each directory and each file is opened by one name relative to its parent's descriptor, refusing a link; a
+rename or a delete names its parent descriptor and one name. A new file is created exclusively, 0600; a new
+directory 0700. Before use an opened file must be a regular file with one hard link, and a directory a
+directory; a file that could be a FIFO is opened without blocking and then checked. A path string of more than
+one component is never built below a root. A backup copies bytes and never makes a hard link, so that every
+file keeps one. SQLite opens `orch.db` and its two companion files itself, by their fixed names; before it
+does, the daemon checks through the descriptor that each is absent or a regular file with one hard link.
+
+**The project directory** (R106, AP14). One id still names a directory:
+`<project>/.orchestry/workspaces/<task id>`, 1.0's layout, which AP6 keeps so that existing workspaces and
+what agent CLIs remember about them stay valid. It is the only place where the daemon's storage or engine
+uses an id as a path component; orch-peer's own files keep their 1.0 rules, which this goal does not change
+(B15). The id must be one name of `A-Z a-z 0-9 . _ -` other than `.` and `..` (1.0's check, which refuses and
+never rewrites), an imported task id has already passed R104, and the directory is reached without following
+a link at `workspaces` or at the entry. A stored workspace path is never used. The branch of a local run is
+merged or deleted only under the name the daemon itself would give it.
+
+**Vectors.** The project id is `prj_test1` unless a row says otherwise. A row that gives a name must produce
+exactly that name, below `blobs/events/` or the data home; every other row must be refused with nothing
+created, changed or removed outside the root.
+
+| Input | Expected |
+|---|---|
+| Run id `run_test1` | `e9/e995144062a58ba0a060bba97a77a3dfe8562cafe55abdcf6aea6a80c0a1f5b2` |
+| Run id `../../../../outside-canary` | `14/145203cc529e79216d2d1848e916dad67b2972dcecabd60172da207064e6a4f0` |
+| Run id `/outside-canary` | `6e/6e13989f0d6780be172792bc54b6c9513304f9e53be8777383474adbf37b9ba2` |
+| Run id `a`, one zero byte, `b` | `44/44a3e7f93016ec1f693dbfe7b41c0c2bcf4e7065afd41be1acbebe6f30cb1fd4` |
+| Run id `a/b` | `71/71aa219cde03650bb527933f5f618fb4035c29e142949542a822485ceb1119e6` |
+| Project id `prj_test`, run id `1run_test1` (the first row's bytes, split elsewhere) | `06/06eeaf803b9df10bdf787a8b27ae39242dd2ea1d492a2e107fdd872008bae0b4` |
+| Project record for `prj_test1` | `projects/9fa0423cd44dfbc56bc5b71dea05c66fb0f1f2f0d884eed107e15cfdbce760c7` |
+| A blob hash column holding `../x`, 63 hex digits, or upper-case hex | Refused; no file touched |
+| A symbolic link at `blobs/events/zz` or at an event file's name, on append, read and prune | Refused; the link's target unchanged |
+| A hard link to an outside file at a blob's or an event file's name | Refused before any byte is read or appended |
+| A FIFO or a socket at a blob's name | Refused, and the caller does not block |
+| A second exclusive create of an existing name | Refused; the first file unchanged |
+| A backup manifest naming `../outside-canary`, an absolute path or a name with a NUL | Backup refused before any change (R108) |
+| A source document whose id is `../../../../outside-canary`, or a task `..` | Import stops and names the file (R104) |
+| A 1.0 index entry or attachment name `../../outside-canary` | Looked up among the listed names, found absent, reported; never opened (R103) |
+| `.orch-project` holding `../../x`, two lines, 65 bytes, or being a symbolic link | Exit 3, naming the file (R107) |
+| A task whose stored branch is `main` | Not merged and not deleted (R106) |
 
 ## Authorization matrix
 
@@ -525,6 +623,22 @@ The new operations are in no MCP allowlist.
 - Bounds (R66): an entity document at most 16 MiB, an event line at most 64 KiB, an attachment at most 64 MiB,
   at most 1,000 rows per transaction, and memory that does not grow with the project. A file over a bound is
   reported by its path relative to the project and the import stops; nothing is cut short silently.
+- Source access (R103): the importer opens the source `.orchestry/` once, without following a link, and lists
+  the directories of the table below from that descriptor, one level each and two for `attachments/`. It
+  opens an entry only by the name the listing gave, as "Filesystem names" says for every file. It never opens
+  a path made from a value inside a document: an index entry, a task's attachment name and the like are
+  looked up among the listed names, byte for byte, and one that is not there is a dangling reference. A
+  listed entry that is a symbolic link, has more than one hard link, or is not a regular file stops the
+  import before it is read. A directory the table does not name is reported and not entered.
+- Ids (R104): an entity's id is the stem of its file. The document's own id or key must equal it, and the stem may
+  hold only `A-Z a-z 0-9 . _ -`; otherwise the import stops and names the file. Ids are kept as they are
+  (R69), as data: no file below the data directory is named by one ("Filesystem names").
+- Nothing outside the database (R105): the import writes rows, blobs and `.orch-project` (and the empty
+  directory `.orchestry/` when an export is imported for a directory that has none). It writes no lease
+  and no intent, signals and looks up no process, and removes no workspace. A recorded pid, a run's
+  `workspace_path`, a task's stored workspace and a project directory path are stored as text (the pid and
+  the workspace path in `runs.local`) or left out. Nothing reads them in order to act: only a lease leads to
+  a signal, and only a task id to a workspace.
 - Order: `position` follows each `_index.json`. An entity on disk that its index does not list is appended in
   id order and reported; an index entry with no file is reported and skipped.
 - Runs: `run_no` and `epoch` count from 1 per task in start order; `task_epochs.next_epoch` is one more than
@@ -532,8 +646,10 @@ The new operations are in no MCP allowlist.
   repeat one is stored uncounted with the 1.0 number in `local`, and the dry run counts such runs. The rendered prompt becomes a blob. Events get `seq` from their line number; a line that does
   not parse becomes a gap. Model and adapter version are empty. Every event is imported; the pruning job
   applies the retention afterwards.
-- `state.json`: the retry queue becomes retry rows; running and claimed entries are closed as 1.0's reconcile
-  closes them; totals become counters.
+- `state.json`: the retry queue becomes retry rows; running and claimed entries are closed as 1.0's startup
+  recovery closes an entry whose process is gone, in the database only: 1.0 would look the recorded pid up
+  and could kill it, and the import does neither (R105, AP14). The dry run lists each entry it would close
+  with its recorded pid, so that the owner can stop a leftover agent first. Totals become counters.
 - Tasks that are `done` get `landing_state = 'skipped'`; 1.0's recorded proof goes to `legacy_proof`.
 - `config.yml`: R70. If the unknown keys exceed 64 KiB the import stops and names them by size.
 - Text over 64 KiB in a description, message or context value becomes a blob (R97) and is listed by the dry
@@ -548,10 +664,10 @@ The new operations are in no MCP allowlist.
   | `runs/run_*.json`, `runs/run_*.jsonl` | Runs, results, events and prompt blobs | Unused |
   | `state.json` | Retry rows and counters; in-flight entries closed | Unused |
   | `config.yml` | Settings, and `legacy.config` for unknown keys (R70) | Unused |
-  | `attachments/<task>/` | Blobs and `task_attachments` rows | Unused |
+  | `attachments/<task>/` | Blobs and `task_attachments` rows; the directory is matched to a task and each file to the task's list by listed name, and the original file name is a column | Unused |
   | `templates/*.md` | `templates` rows named by the file stem, byte for byte; a file over 64 KiB stops the import by name | Unused. As in 1.0 the engine does not read them (F11); `orch init` stores the `default` row where 1.0 wrote the file |
   | `workspace-exclude`, `.gitignore` | Not imported | Used in place: authored files of the project directory, which `orch init` still writes |
-  | `workspaces/` | Not imported | Used in place (AP6) |
+  | `workspaces/` | Not imported, not listed and not entered | Used in place (AP6), found by task id as R106 says |
   | `remotes.yml`, `remotes/`, `peer-id` | Not imported | orch-peer's own files, used in place |
   | `orchestry.lock`, `.daemon-owner.lock`, `daemon.json`, the socket | Not imported | The 1.0 daemon's; 1.1 holds the owner lock without writing it (R31) |
   | `logs/` | Not imported | Unused; 1.0 creates it and nothing was found that writes it (F11) |
@@ -559,7 +675,10 @@ The new operations are in no MCP allowlist.
 
 - An export file (R80) is a SQLite database of the same schema version holding one project's rows from the
   project tables, without `leases`, `intents` and `request_keys`, plus a table of blob bytes and a manifest
-  with a hash of every table and blob.
+  with a hash of every table and blob. The file named by `--from` is opened without following a link and must
+  be a regular file. Its rows are data as a 1.0 source's are (R105, R108): a blob is stored under the hash of
+  its bytes, the project id passes R107's check, and a run it holds unfinished has no lease in the new
+  directory and is ended at the first start.
 
 ## `orch db` commands
 
@@ -649,7 +768,11 @@ Security checklist:
 - Untrusted text rendered to a terminal or passed to a shell: `db.query` output, attention titles that quote
   agent text, the dry-run report and holder records are escaped as 1.0 escapes diagnostics. `db.query` takes
   SQL from the owner only and runs it on a connection that cannot write, attach or load an extension. Source
-  files of an import are untrusted input: bounded, never executed, and paths in them are never followed.
+  files of an import, an export file and a backup's manifest are untrusted input: bounded, never executed,
+  and no name, id or path in them selects a file below the data directory ("Filesystem names", R101 to R108).
+  An import signals no process (R105). In the project directory only a checked task id names a workspace and
+  only a branch of the derived shape is merged or deleted (R106, AP14). A restore still acts on the process
+  records of the backup it is given, by pid and start time, as R100 says: a backup is the owner's own state.
 - Same-uid limit, stated plainly: any process of the owner's user can open the socket or the database file.
   The matrix is not a defence against such a process in 1.1; it becomes one with authentication in 1.4.
 
@@ -694,6 +817,7 @@ Each goal open point with a recommendation, then the points this spec found. The
 | AP11 | What fences a run across a restore. The lease prototype's first finding: a restored snapshot has lost the epochs issued after the backup, so "largest stored epoch plus one" can issue a number twice. | Both mechanisms. The generation floor of ADR 0017 decision 16, so that a numeric epoch is never issued twice, which is gate line 9 as written. And a restore lineage: a random id made with the database and replaced by every restore, kept by a normal restart, carried beside the epoch on every lease-bound call; it needs no clock and nothing outside the restored state. Neither needs a column that 1.1 would lack: the lineage is one `daemon_config` row and a field of the caller. Whatever the fence, a restore ends every restored lease and refuses while a recorded process lives (R100), and dispatch is off after it (R44). Final after the prototype's report (R6). | The lineage alone: a pair of lineage and epoch is never reused, but a number can be, and gate line 9 would be reworded. Or the generation floor alone: one comparable number, which rests on the clock when a backup is restored onto a new machine. |
 | AP12 | What a suspend does to a run in 1.1. The lease prototype measures a holder's deadline on time that counts a suspend, so that a holder that slept past it stops. Its review notes that in 1.1, where the daemon and the agent sleep together, that rule ends every run in flight after any sleep longer than the deadline (90 s in the prototype). | Keep R42: in 1.1 a suspend ends no run. The one daemon is the only grantor and it slept too, so no other holder can exist; on resume it renews what it still supervises before it expires anything. The holder's own deadline arrives with workers in 1.5, where the daemon can stay awake while a worker sleeps. R42's recorded check is a real suspend. | Apply the 1.5 rule now: one rule in every release, and every lid close longer than the deadline loses the runs in flight, which 1.0 does not do. |
 | AP13 | The measurement missed the budget on macOS. As deliverable D reports it: Linux, run in a container on the same machine, met every line; on macOS, 24 runs at ten times the nominal rate gave a 99th percentile of 1.9 s, the nominal rate 53.5 ms with a worst case of 170 ms, and no events 10.9 ms; the slowest event transaction took 592 ms for at most 12 rows, and a claim's own transaction up to 499 ms. | Ship the event fallback, as gate line 7 rules, on both platforms so that there is one event path (R63). Before its PR merges, find the cause of the slow commits on macOS and measure the fallback against the same budget: a claim's own transaction was among the slow ones, so moving events out of the database may not be enough, and no figure says it is. If the fallback also misses, lane 1's 50 ms cannot be promised on macOS as measured, and that comes back to the owner. | Keep events in SQLite and restate the budget from the figures: one storage path and tail reads by an index, and a claim that can wait seconds behind event commits under load on macOS. |
+| AP14 | What an imported value may still select (security review S2). Below the data directory, in a backup and in an export the answer is nothing (R101 to R108). Two points remain for the owner. First, a task's workspace is still `workspaces/<task id>` in the project directory. Second, the import no longer treats in-flight state as 1.0's recovery does. | Keep 1.0's workspace layout, with the id checked as one name, links refused and stored paths never used (R106): workspaces that exist at the import keep working, and nothing an agent CLI saw moves. Close in-flight state in the database only, as if every recorded process were gone, without looking a pid up or signalling it (R105); the dry run lists what it would close, and the manual tells the owner to stop leftover 1.0 agents before the import. | Name workspaces by a hash or a generated name: then no id is a path component anywhere, at the cost of a mapping for the workspaces and branches that exist at the import and of new paths for every agent. For in-flight state: refuse the import while a recorded pid answers; it stops a double run in one workspace, but a 1.0 run records no process start time, so a reused pid blocks the import and a source file decides which process is examined. |
 
 ## Gate lines
 
