@@ -189,7 +189,18 @@ across a crash, lists that do not load everything, and a retried request that ru
     processes its backup records, as the spec's R100 says, because a backup is the owner's own state; AP14 puts
     that to the owner too. The spec's "Filesystem names" is the contract and holds the test vectors. The one id
     that still names a directory is `workspaces/<task id>` in the project directory, 1.0's layout, with 1.0's
-    reject-never-rewrite check; the spec's point AP14 puts it to the owner. This decision answers the security
+    reject-never-rewrite check; the spec's point AP14 puts it to the owner. A check of the id shows that it is
+    one name, not that the directory is one task's: the review's second reading found that `tsk_Case` and
+    `tsk_case` are two rows and, on a filesystem that folds case, one workspace and one branch. So the kept
+    layout comes with an ownership rule. No two tasks of a project have ids that differ only in the case of
+    ASCII letters: one rule on every platform, whatever the filesystem tells apart, kept by a unique index
+    under SQLite's `NOCASE` collation, with the exact id still the key and no id ever lower-cased or
+    rewritten. An import, from a 1.0 directory or from an export, and a restore refuse such a pair before
+    they publish anything, together with a directory in `workspaces/` that the tasks they bring may not own.
+    And before every reuse, merge, delete and cleanup a listing must hold the directory, or the branch,
+    under exactly the task's name; a new workspace is an exclusive create. A filesystem that folds a name
+    keeps the spelling it was created under, so what is reached through another spelling is seen as another
+    name's and is never adopted or removed. This decision answers the security
     review's finding S2, which showed the first layout (`blobs/events/ab/<run id>`) leaving the data directory
     for a run id shaped like a path. The descriptor calls exist, without `unsafe`, in `nix`, which the workspace
     already depends on and already uses this way (`crates/orch-daemon/src/ops/transport.rs`); `orch-infra` needs
@@ -255,6 +266,20 @@ across a crash, lists that do not load everything, and a retried request that ru
   second thing for backup and export to keep in step; the derived hash needs none.
 - **Resolve and compare paths (`canonicalize`, then a prefix test).** It races with a link planted between the
   check and the use, and it follows the link it was meant to refuse. Descriptor-relative calls do neither.
+- **Name workspaces by a hash, with a mapping for the ones that exist.** No id would be a path component, and
+  no project would be refused for two ids that differ only in case. But every agent would see a new path,
+  the branch `orchestry/<task id>/...` would keep the same alias unless it changed too, and each mapped old
+  name would still need the ownership rule that decision 20 now has. The rule alone is the smaller change;
+  the spec's point AP14 keeps this alternative before the owner.
+- **Refuse a pair of ids only where the filesystem folds case.** A project with such a pair would import on
+  Linux, and its database, backup or export would then be refused on macOS: whether stored state is valid
+  would depend on the disk under it, and a moved project directory would meet the alias later.
+- **Lower-case every task id.** It rewrites ids that messages, branches, results and agents' own notes
+  already hold, and two ids would still become one.
+- **Record each workspace's device and inode as its owner.** It binds a task to one object, and breaks when
+  the project directory is copied, restored from a file backup or moved to another disk, which changes every
+  inode and no name. The listing answers the question that matters, under which name the object was made,
+  and survives all three.
 - **Rely on the parser libraries' own limits.** `serde_yaml_ng` stops at 128 nested collections, `serde_json`
   at 128, and both refuse the review's depth document today. Those are properties of two versions of two
   crates, not rules of this project, and neither counts what a document expands to.
@@ -305,6 +330,12 @@ across a crash, lists that do not load everything, and a retried request that ru
   interrupted starts again. An export cannot be read by a build of another schema version, and reading one
   rests on SQLite's own handling of a hostile file under the settings of decision 21, which this project
   configures and does not prove.
+- Two task ids that differ only in the case of ASCII letters cannot live in one project, on any platform. 1.0's
+  generated ids make that about 7 in 100,000 for a project of 3,000 tasks, and only a project kept on a
+  filesystem that tells case apart can hold such a pair; its import is refused, naming both, until the owner
+  removes one task with the 1.0 binary. An export is not imported for a project directory that already holds
+  a workspace under one of its tasks' names. Preparing and cleaning up a workspace list `workspaces/` once
+  each, which is a few thousand names at most.
 - The data directory lives outside the project, so moving a project directory no longer moves its state. The
   pointer file and the record under the data home are what let the daemon find it again instead of offering a
   second import. `<project>/.orchestry/` must stay in place: it is still the handshake's project identity.
