@@ -39,7 +39,7 @@ to execute FTS5 SQL. STRICT requires SQLite 3.37 or later.
 and the same check on a disposable full workspace with both chosen dependencies connected to
 `orch-infra` exited 0: `advisories ok, bans ok, licenses ok, sources ok`.
 The repository's `deny.toml` was unchanged, including its Linux target, all-features setting,
-licence allow-list and two existing owner-approved advisory exceptions. The baseline's 13
+licence allow-list and three existing owner-approved advisory exceptions. The baseline's 13
 duplicate-version warnings remained; the candidate added no warning or exception.
 RustSec database revision: `f291af9b1cc0d21dfcea1709d6b037963cef262b`.
 This checks the resolved Rust dependency graph, not every SQLite C vulnerability. The
@@ -103,7 +103,10 @@ Other agents were active on the host, so timings are indicative.
 Both release builds and executables exited 0 on both platforms. `otool -L` on macOS and `ldd`
 on Linux showed no dynamically linked SQLite. Linux used `rust:1.99.1-trixie`, image
 `sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07`.
-This is native Linux arm64 dependency evidence, not Linux CI or an x86_64 product build.
+The chosen probe additionally built and passed on Linux (Docker linux/amd64, emulated),
+Rust 1.99.1: 59.321 s / 2,517,536 bytes, with no system SQLite linkage. The repository-built
+image was `sha256:9bd963cbaa28a8fe95d96d57da858372d6d82a6c0a8f35a10788d3b97459f885`.
+These are dependency probes, not Linux CI or a product build with the proposed dependencies.
 
 The chosen probe also checks STRICT rejects a wrong type, the partial unique index rejects a
 conflict, rowid access fails, the expression query works, settings are effective, writes through
@@ -114,6 +117,20 @@ one FTS row; malformed inserts are rejected. No real project data was used.
 [Probe sources, exact locks and reproduction commands](experiments/sqlite-library/README.md)
 are separate from the product workspace. The schema, port and readers are unchanged; no migration
 is run against an existing database. No human migration action is needed for this recommendation.
+
+Repository validation is **blocked**, separately from the dependency check above. At
+`d46d4cc`, `fast --base origin/main` passed fmt, clippy, crate-graph, build and hygiene checks,
+but failed three existing `xtask` tests. Each failed again in one exact rerun on base
+`fb6a1e1` (0 passed / 1 failed / exit 101 per rerun):
+
+- `gate::target::qualification::production_holder_commands_and_discriminators_on_scratch_filesystem`
+- `gate::target::qualification::production_native_build_script_test_and_child_descriptor_propagation`
+- `gate::target::tests::native_all_state_leaf_kinds_are_checked_without_touching_canary`
+
+The first two fixture paths fail the canonical-root check on macOS; the third exceeds the
+Unix socket path-length limit. Follow-up `tsk_M3Pl2T_` owns their test-only correction.
+No gate rule, fixture-root override or test skip was used. No PR is opened while this is red;
+the `pr` tier and PR publication remain blocked. The recommendation is posted to the architect.
 
 **What would change the recommendation:** an unfixable advisory/licence issue, loss of a supported
 migration adapter or bundled-engine feature, failure on a supported target with the pinned compiler,

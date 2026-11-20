@@ -41,6 +41,14 @@
       "platform": "Linux (Docker linux/arm64, native)",
       "bytes": 3036256,
       "smoke_exit": 0
+    },
+    {
+      "candidate": "rusqlite",
+      "seconds": 59.321,
+      "exit": 0,
+      "platform": "Linux (Docker linux/amd64, emulated)",
+      "bytes": 2517536,
+      "smoke_exit": 0
     }
   ],
   "probe_sha256": {
