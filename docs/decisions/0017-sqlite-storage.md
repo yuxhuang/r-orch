@@ -246,8 +246,9 @@ across a crash, lists that do not load everything, and a retried request that ru
 
 22. **A cutover refuses while 1.0 work may still run, and a 1.0 run after it is detected.** 1.0's own recovery
     keeps a local entry whose pid is alive and a remote entry whose peer is registered, and a 1.0 stop leaves
-    both behind. Closing them would send their tasks out a second time. So the import refuses while one
-    exists and names it (R119). It asks only whether the pid exists and never signals: a 1.0 entry has no
+    both behind. Closing them would send their tasks out a second time. So the import refuses while a local
+    process of a run exists or any remote run is recorded, and names it (R119); it does not trust the peer
+    registry, since removing a peer there stops nothing on the peer. It asks only whether the pid exists and never signals: a 1.0 entry has no
     start time, so the pid may be another program's. The owner ends the work with the 1.0 daemon or names the
     run as ended. A run the import closed is never attached again (R120). The import keeps the size and hash
     of `state.json` and of each index, and a 1.1 start refuses when they have changed, because a 1.0 daemon
@@ -271,8 +272,8 @@ across a crash, lists that do not load everything, and a retried request that ru
 
 25. **Trust is turned on by named paths only, and an attention item holds no outside text.** `preapproval`
     is turned on by `policy.set`, `orch init`, the import of a 1.0 project whose agents use `auto`, and an
-    import or a restore whose data has it on and whose confirmation names it; none of them in agent context,
-    where `orch init` leaves it off (R133, following the owner's answer to AP5). An attention item's words
+    import or a restore whose data has it on; every import and restore that turns it on names it in what the
+    owner confirms, and none works in agent context, where `orch init` leaves it off (R133, following the owner's answer to AP5). An attention item's words
     are fixed for its kind (R131). A request key never applies to a credential operation, and authorization
     comes before a stored result is looked up (R134).
 
