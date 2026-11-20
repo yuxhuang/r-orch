@@ -10,7 +10,7 @@
   section of `docs/TRAITS-FROZEN.md` (§2: the ten storage traits and their three rules). Everything else in 0012
   stands: one daemon owns state, no client opens it, nothing starts a daemon on its own, exit 7.
 - Decisions 1 to 6 and 14 restate decisions the owner already took in the goal and are binding. Decisions 7 to 13
-  and 15 to 18 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
+  and 15 to 19 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
   the owner's.
 
 ## Context
@@ -131,7 +131,9 @@ across a crash, lists that do not load everything, and a retried request that ru
     than any issued after it, whatever the backup's age. On a directory that has neither the replaced state
     nor the file (a new machine), the guarantee rests on the clock, and the restore says so. This mechanism is
     proposed; the lease prototype (deliverable E) confirms or replaces it, and the requirement it serves (gate
-    line 9) does not depend on it.
+    line 9) does not depend on it. The prototype's first finding is that a restore should also start a new
+    lineage: a random id carried beside the epoch on every lease-bound call, which fences without a clock. The
+    spec's point AP11 puts both to the owner.
 
 17. **The project is named by a pointer file from 1.1.** `orch init` and `orch import` write `.orch-project`
     in the project directory, holding the project id and nothing else. The daemon's data directory is created as
@@ -151,6 +153,18 @@ across a crash, lists that do not load everything, and a retried request that ru
     storage calls keep compiling against a facade with the 1.0 trait shapes, kept in `orch-engine` for
     `orch-peer` alone until 2.0. The peer protocol, the `remotes` files and `peer-id` stay as they are.
 
+19. **The SQLite library is `rusqlite`, and `rusqlite_migration` runs the migrations.** `rusqlite` 0.41.1
+    with the features `bundled`, `backup` and `cache` and its default features off, and `rusqlite_migration`
+    2.7.0, both pinned exactly and used from `orch-infra` only. The report of deliverable C
+    (`docs/sqlite-library.md`) holds the §4.8 check and its evidence: both crates maintained; a declared MSRV
+    of 1.89 under the pinned toolchain; MIT and Apache-2.0, inside `deny.toml`'s allow-list; `cargo deny check`
+    passing on the whole workspace with the two crates connected and no new exception; the bundled engine
+    SQLite 3.54.1 running STRICT tables and FTS5 on macOS and Linux; and a safe online-backup API. 0.41 is not
+    `rusqlite`'s newest line: the maintained migration runners stop at it, and a maintained runner is
+    preferred to a hand-written one (ARCHITECTURE §4.8). Each migration is applied in its own transaction,
+    which also writes its `schema_migrations` row. The versions and the advisories are checked again in the
+    PR that adds the dependency.
+
 ## Alternatives considered
 
 - **Keep files and add indexes, a journal and file locks.** Each 2.0 need (atomic claim, fencing, paging,
@@ -161,6 +175,9 @@ across a crash, lists that do not load everything, and a retried request that ru
   epochs, usage by model); a round trip would be lossy and would have to be tested as a product feature.
 - **An embedded key-value store (redb, sled, LMDB).** No SQL for `orch db query`, no FTS5 for 1.2, and
   secondary indexes and filtered paging written by hand.
+- **SQLx as the library.** Its asynchronous pool does not replace the priority writer orch needs in any
+  case, and the checked driver has no safe wrapper for an online backup: that would take the raw handle and
+  `unsafe`, which the workspace forbids.
 - **Postgres now.** A second process to install, start and back up on a single-machine install that must work
   from one start command. It is listed after 2.0.
 - **Several writer connections relying on the busy timeout.** Writers would wait in an order SQLite chooses,
@@ -186,7 +203,7 @@ across a crash, lists that do not load everything, and a retried request that ru
   the directory, and the RUNBOOK's file procedures are rewritten.
 - A load-bearing dependency arrives: the SQLite library, chosen by deliverable C with the §4.8 check. It must
   bundle SQLite 3.37 or later (STRICT tables; `RETURNING` and `VACUUM INTO` are older) with FTS5 available for 1.2, and must
-  let the workspace keep `unsafe_code` forbidden. That choice is recorded in its own ADR.
+  let the workspace keep `unsafe_code` forbidden. Decision 19 names it.
 - All writes share one thread of work. The budgets of decision 9 are promises that must be measured
   (deliverable D) and watched (`metrics.get`); the fallback of decision 12 exists because the promise might not
   hold for events.

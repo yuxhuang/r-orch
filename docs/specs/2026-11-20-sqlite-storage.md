@@ -147,15 +147,18 @@ Read from the code at `fb6a1e1` (v1.0.0) unless marked unverified.
 
 Test names are the names the implementing PR creates. A PR may choose another name only by editing this table in
 the same PR. "Both" means macOS and Linux CI. Requirements marked "(O*n*)" or "(AP*n*)" depend on that open point
-and change with the owner's answer.
+and change with the owner's answer. The documents of the other entry steps named here
+(`docs/storage-v1-conformance.md`, `docs/storage-order-dependent-reads.md`, `docs/sqlite-library.md`,
+`docs/sqlite-event-throughput.md` and the lease prototype's report) arrive in their own PRs; until those merge,
+their names are forward references.
 
 | Id | Requirement | Source | Priority | Acceptance check (test or command; platform) |
 |---|---|---|---|---|
 | R1 | The spec, the plan and ADR 0017 shall be in the repository in one documentation-only PR before any product code. | A | must | The three files exist on `main`; `./xtask/gate.sh fast --base origin/main` classifies the PR as documentation only; macOS |
-| R2 | A storage conformance suite shall run every scenario against a backend chosen by the test, and shall pass on the file backend before the SQLite backend exists. | B | must | `cargo test -p orch-infra --test storage_conformance`; both |
-| R3 | The list of every read whose result depends on index order shall be in the repository, each entry naming the function, the order it relies on and the scenario that covers it. | B | must | `docs/storage-order-dependent-reads.md` exists, beside the pinned 1.0 contracts in `docs/storage-v1-conformance.md`, and `crates/orch-engine/tests/order_conformance.rs::every_listed_read_has_a_scenario` passes; both |
-| R4 | The SQLite library shall be chosen with the ARCHITECTURE §4.8 check (maintenance, MSRV of the pinned toolchain, licence through `deny.toml`), recorded in its own ADR, bundle SQLite 3.37 or later with FTS5 available, and leave `unsafe_code` forbidden in the workspace. | C | must | The ADR exists; `cargo deny check` passes on the PR that adds it; `crates/orch-infra/tests/sqlite_build.rs::bundled_sqlite_has_strict_tables_and_fts5`; both |
-| R5 | Batched event throughput shall be measured against the claim-latency budget in "Writer lanes", on macOS and on Linux, with the commit, the hardware class and the raw figures recorded. | D, G7 | must | `cargo xtask storage-bench --record <dir>` and its record linked from the approval-gate PR; macOS and native Linux |
+| R2 | A storage conformance suite shall run every scenario against a backend chosen by the test, and shall pass on the file backend before the SQLite backend exists. | B | must | `cargo test -p orch-engine --test storage_conformance`; both |
+| R3 | The list of every read whose result depends on index order shall be in the repository, each entry naming the file, the function and what the port must keep for it. | B | must | `docs/storage-order-dependent-reads.md` exists, beside the pinned 1.0 contracts in `docs/storage-v1-conformance.md`; the order scenarios of the suite pass, among them `storage_conformance::equal_score_selections_rotate_after_run_lifecycle_saves` and `::lists_return_all_records_beyond_a_future_default_page`; a reviewer checks the list against the store list calls at the audited commit; both |
+| R4 | The SQLite library shall be chosen with the ARCHITECTURE §4.8 check (maintenance, MSRV of the pinned toolchain, licence through `deny.toml`), recorded in ADR 0017 decision 19 from the report `docs/sqlite-library.md`, bundle SQLite 3.37 or later with FTS5 available, and leave `unsafe_code` forbidden in the workspace. | C | must | The report and its probes under `docs/experiments/sqlite-library/`; `cargo deny check` passes on the PR that adds the dependency; `crates/orch-infra/tests/sqlite_build.rs::bundled_sqlite_has_strict_tables_and_fts5`; both |
+| R5 | Batched event throughput shall be measured against the claim-latency budget in "Writer lanes", on macOS and on Linux, with the commit, the hardware class and the raw figures recorded. | D, G7 | must | The report `docs/sqlite-event-throughput.md` and its experiment under `docs/experiments/sqlite-events/`, presented at the approval gate; macOS and native Linux |
 | R6 | A prototype shall show a claim with a fenced lease, including a suspended and resumed machine, and its result shall confirm or replace ADR 0017 decision 16 and R39 before the engine PR starts. | E | must | The prototype's report linked from the approval-gate PR; macOS with a real suspend, Linux |
 | R7 | When the work of a unit of work returns an error or the process stops before the commit, the storage shall keep none of its changes. | F, B3 | must | `storage_conformance::unit_of_work_keeps_nothing_after_an_error`, `sqlite_crash::kill_before_commit_keeps_nothing`; both |
 | R8 | Every entity shall carry a revision that is 1 at creation and goes up by one on every update, and an update or delete whose expected revision is not the stored one shall fail with `StaleRevision` and change nothing. | F, B3 | must | `storage_conformance::revision_starts_at_one_and_goes_up_by_one`, `::stale_revision_is_refused_and_changes_nothing`; both |
@@ -383,16 +386,18 @@ the number of tasks and agents. One transaction is bounded to 1,000 rows or 20 m
 256 events or the oldest is 250 ms old. Its buffer holds at most 4,096 events or 4 MiB per run; past that it
 drops the oldest raw output and records a gap. Results and usage travel on lane 2 and are never dropped.
 
-**Claim-latency budget** (deliverable D, gate line 7). Under an event load of the larger of 2,000 events a
-second and ten times the busiest minute found on the copy of the owner's project, with 1 KiB events, for at
-least 10 minutes, with `synchronous = NORMAL`:
+**Claim-latency budget** (deliverable D, gate line 7). The budget is the one the measurement declared before
+it ran (`docs/sqlite-event-throughput.md`); it is a proposal to the owner like the rest of this spec. With 1, 6
+and 24 runs producing events continuously, at the nominal rate and at ten times it, 50 claims a second, and
+`synchronous = NORMAL`:
 
-- a claim's wait in the queue is at most 50 ms at the 99th percentile;
-- a claim commits within 70 ms of being queued at the 99th percentile and within 250 ms at the worst;
-- no event batch waits more than 1 s, and no event is dropped.
+- a claim, from its scheduled arrival to its commit, queue time included, takes at most 50 ms at the 99th
+  percentile and at most 100 ms at the worst;
+- no event batch waits more than 1 s, and every generated event is committed.
 
-If either platform misses a line, the file fallback of R63 ships. The record states the figures; a green test
-suite is not a performance result.
+The nominal rate is one event a second for each run, sized from the aggregate figures of S2; the report states
+its assumptions beside its figures. If either platform misses a line, the file fallback of R63 ships. A green
+test suite is not a performance result.
 
 ## Request keys
 
@@ -637,7 +642,7 @@ Each goal open point with a recommendation, then the points this spec found. The
 | O7 | Unknown config keys; `max_concurrent_agents` | As proposed (R70), with a hard stop over 64 KiB. | Refuse an import with any unknown key: strict, and blocks projects that carry extension keys. |
 | O8 | Request-key expiry | Ships in 1.1 as `request_keys.expire` (R47). | None; the goal requires it. |
 | O9 | Names | Approve the names in this spec as a set: operations in "Protocol 3 and errors", commands in "`orch db` commands" and "Import rules", settings `storage.synchronous`, `retention.events.success_days`, `retention.events.failed_days`, `attention.resolved_retention_days`, `run_cap`, `preapproval`, `legacy.config`; variables `ORCH_DATA_DIR`, `ORCH_DATA_HOME`, `ORCH_REQUEST_KEY`; metrics `scheduler_tick_seconds`, `scheduler_open_tasks`, `writer_wait_seconds`, `writer_txn_seconds`, `writer_txn_over_bound_total`, `writer_busy_timeouts_total`, `events_dropped_total`, `disk_free_bytes`, `disk_floor_bytes`. | Rename any of them at the gate; a rename after the protocol PR costs a protocol bump. |
-| O10 | Fixtures without private data | Generate them (R90): a seeded generator drives the 1.0 file backend through scripted scenarios, so the format is real and the content invented; its sizes follow counts and percentiles taken from the live copy, which are numbers; a hand-written corpus covers damaged input. The live copy is used only for R71 and R5, outside the repository. | Scrub a real project: any scrubber can miss something, and the result cannot be regenerated. |
+| O10 | Fixtures without private data | The conformance corpus (`fixtures/storage-v1/`, entry step B) is small, written by hand and invented. The importer's corpora are generated (R90): a seeded generator drives the 1.0 file backend through scripted scenarios, so the format is real and the content invented; its sizes follow counts and percentiles taken from the live copy, which are numbers; a hand-written corpus covers damaged input. The live copy is used only for R71 and R5, outside the repository. | Scrub a real project: any scrubber can miss something, and the result cannot be regenerated. |
 | AP1 | orch-peer cannot stay byte-for-byte unchanged (F7) | Approve the two source changes in "orch-peer"; the wire protocol and peer files stay. | Turn remote peers off in 1.1 until their removal in 2.0: no change to `orch-peer`, and remote agents stop working for four releases. |
 | AP2 | The catalogue has 111 operations, the goal says 115 (F1) | Treat the catalogue's own class test as the authority; 1.1 adds 12 operations. | The owner names the four operations the goal counted, if they are meant to exist. |
 | AP3 | Whether an agent's session becomes a task principal in 1.1 | No: it stays an owner session for the 1.0 catalogue, so no agent workflow changes in the storage release; the new owner-only operations are refused in agent context (R54). The task column becomes real with authentication. | Enforce the task column now: safer on paper, but same-uid makes it advisory, and it changes what agents can do today. |
@@ -648,18 +653,19 @@ Each goal open point with a recommendation, then the points this spec found. The
 | AP8 | An atomic operation larger than 1,000 rows | It runs whole and is counted (R27); lane waits are promised only while that count is zero. Deliverable D reports the largest cascade on the live copy. | Cut cascades into steps: keeps the bound, exposes half-finished cascades to readers. |
 | AP9 | No scheduled backups in 1.1 | Accept; a job is a small follow-up once restore has field use. | Add a daily `db.backup` job with rotation now. |
 | AP10 | The 100-entry retry cap goes away (R40) | Accept: a table needs no cap, and 1.0's drop silently stranded a task. | Keep the cap for exact parity. |
+| AP11 | What fences a run across a restore. The lease prototype's first finding: a restored snapshot has lost the epochs issued after the backup, so "largest stored epoch plus one" can issue a number twice. | Both mechanisms. The generation floor of ADR 0017 decision 16, so that a numeric epoch is never issued twice, which is gate line 9 as written. And a restore lineage: a random id made with the database and replaced by every restore, kept by a normal restart, carried beside the epoch on every lease-bound call; it needs no clock and nothing outside the restored state. Neither needs a column that 1.1 would lack: the lineage is one `daemon_config` row and a field of the caller. Final after the prototype's report (R6). | The lineage alone: a pair of lineage and epoch is never reused, but a number can be, and gate line 9 would be reworded. Or the generation floor alone: one comparable number, which rests on the clock when a backup is restored onto a new machine. |
 
 ## Gate lines
 
 | Gate line | Proved by |
 |---|---|
-| G1 Conformance on both backends, with order and rotation | R2, R3, R56: `cargo test -p orch-infra --test storage_conformance` and `cargo test -p orch-engine --test order_conformance`, each run for SQLite and for the file reference; both platforms |
+| G1 Conformance on both backends, with order and rotation | R2, R3, R56: `cargo test -p orch-engine --test storage_conformance` and `cargo test -p orch-engine --test order_conformance`, each run for SQLite and for the file reference; both platforms |
 | G2 Importer on a copy of the live project | R71: `cargo xtask import-verify --source <copy> --record <dir>`; recorded check on the owner's machine |
 | G3 Backup then restore as one restorable point | R75, R76: `db_backup_restore::backup_then_restore_round_trips_database_blobs_and_repos` (the repositories directory is empty and still compared) |
 | G4 Export then import reproduces every row and hash | R80: `db_export_import::export_then_import_reproduces_every_row_and_hash` |
 | G5 Worker and task principals are refused | R53: `ops_authorization::worker_is_refused_what_the_matrix_denies`, `::task_is_refused_what_the_matrix_denies` |
 | G6 A second daemon refuses and names the holder | R30: `daemon_data_dir::second_daemon_refuses_and_names_the_holder` |
-| G7 Throughput meets the budget, or the fallback ships | R5, R63: the `cargo xtask storage-bench` record on macOS and native Linux |
+| G7 Throughput meets the budget, or the fallback ships | R5, R63: the report `docs/sqlite-event-throughput.md`, with figures for macOS and native Linux |
 | G8 A repeated change runs once; a changed body is refused | R45, R46: `ops_request_keys::a_repeated_change_runs_once`, `::same_key_with_a_different_body_is_refused` |
 | G9 Restore starts a new generation, reuses no epoch, lists and confirms | R77, R78: `restore_fencing::no_epoch_is_reused_after_restore`, `::restore_lists_reenabled_identities_and_tokens`, `::restore_without_confirmation_changes_nothing` |
 
