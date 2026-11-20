@@ -167,38 +167,44 @@ mod tests {
 
     #[test]
     fn the_root_override_selects_exactly_the_requested_project() {
-        let outer = tempfile::tempdir().unwrap();
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(outer.path().join(".orchestry"))
-            .unwrap();
-        let nested = outer.path().join("child");
-        std::fs::create_dir_all(&nested).unwrap();
-        let canonical_outer = std::fs::canonicalize(outer.path()).unwrap();
+        crate::context::isolated_root_test(
+            "mcp::tests::the_root_override_selects_exactly_the_requested_project",
+            || {
+                let outer = tempfile::tempdir().unwrap();
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(outer.path().join(".orchestry"))
+                    .unwrap();
+                let nested = outer.path().join("child");
+                std::fs::create_dir_all(&nested).unwrap();
+                let canonical_outer = std::fs::canonicalize(outer.path()).unwrap();
 
-        // No override: walk up, as every CLI command does.
-        assert_eq!(root_of(&nested, None).unwrap(), canonical_outer);
-        // Override relative to the cwd, canonicalized.
-        assert_eq!(
-            root_of(&nested, Some(Path::new(".."))).unwrap(),
-            canonical_outer
-        );
-        // A non-project inside a project is refused, not walked up from.
-        let err = root_of(outer.path(), Some(Path::new("child"))).expect_err("not a project");
-        assert_eq!(err.exit_code(), 3);
-        // Missing paths and plain files are not projects either.
-        assert_eq!(
-            root_of(outer.path(), Some(Path::new("nope")))
-                .unwrap_err()
-                .exit_code(),
-            3
-        );
-        std::fs::write(outer.path().join("file"), "").unwrap();
-        assert_eq!(
-            root_of(outer.path(), Some(Path::new("file")))
-                .unwrap_err()
-                .exit_code(),
-            3
+                // No override: walk up, as every CLI command does.
+                assert_eq!(root_of(&nested, None).unwrap(), canonical_outer);
+                // Override relative to the cwd, canonicalized.
+                assert_eq!(
+                    root_of(&nested, Some(Path::new(".."))).unwrap(),
+                    canonical_outer
+                );
+                // A non-project inside a project is refused, not walked up from.
+                let err =
+                    root_of(outer.path(), Some(Path::new("child"))).expect_err("not a project");
+                assert_eq!(err.exit_code(), 3);
+                // Missing paths and plain files are not projects either.
+                assert_eq!(
+                    root_of(outer.path(), Some(Path::new("nope")))
+                        .unwrap_err()
+                        .exit_code(),
+                    3
+                );
+                std::fs::write(outer.path().join("file"), "").unwrap();
+                assert_eq!(
+                    root_of(outer.path(), Some(Path::new("file")))
+                        .unwrap_err()
+                        .exit_code(),
+                    3
+                );
+            },
         );
     }
 

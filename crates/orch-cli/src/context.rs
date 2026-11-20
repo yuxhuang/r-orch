@@ -101,6 +101,40 @@ pub fn project_root(start_dir: &std::path::Path) -> PathBuf {
 }
 
 #[cfg(test)]
+pub(crate) fn isolated_root_test(test_name: &str, check: impl FnOnce()) {
+    const CHILD: &str = "ORCH_ROOT_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(test_name) {
+        check();
+        return;
+    }
+
+    // Root discovery intentionally honours ORCH_PROJECT_ROOT. Re-exec only
+    // this test with an explicit environment rather than racing other tests
+    // by changing the runner's process-global environment.
+    let sandbox = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .env_clear()
+        .env(CHILD, test_name)
+        .env("HOME", sandbox.path())
+        .env("TMPDIR", sandbox.path())
+        .env(
+            "ORCHESTRY_GLOBAL_CONFIG_PATH",
+            sandbox.path().join("global.yml"),
+        )
+        .current_dir(sandbox.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+        "isolated {test_name}: {}\n{stdout}\n{stderr}",
+        output.status
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -157,22 +191,71 @@ mod tests {
 
     #[test]
     fn resolve_walks_up_to_the_project_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("proj");
-        let nested = root.join("a/b");
-        std::fs::create_dir_all(&nested).unwrap();
-        std::fs::create_dir_all(root.join(".orchestry")).unwrap();
+        isolated_root_test(
+            "context::tests::resolve_walks_up_to_the_project_root",
+            || {
+                let temp = tempfile::tempdir().unwrap();
+                let root = temp.path().join("proj");
+                let nested = root.join("a/b");
+                std::fs::create_dir_all(&nested).unwrap();
+                std::fs::create_dir_all(root.join(".orchestry")).unwrap();
 
-        let ctx = CliContext::resolve(
-            &nested,
-            Some(StructuredFormat::Yaml),
-            true,
-            false,
-            false,
-            EnvFlags::default(),
+                let ctx = CliContext::resolve(
+                    &nested,
+                    Some(StructuredFormat::Yaml),
+                    true,
+                    false,
+                    false,
+                    EnvFlags::default(),
+                );
+                assert_eq!(ctx.project_root, root);
+                assert_eq!(ctx.output, Some(StructuredFormat::Yaml));
+                assert!(ctx.quiet);
+            },
         );
-        assert!(ctx.project_root.ends_with("proj"));
-        assert_eq!(ctx.output, Some(StructuredFormat::Yaml));
-        assert!(ctx.quiet);
+    }
+
+    #[test]
+    fn root_discovery_tests_ignore_an_inherited_project_override() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        let sandbox = tempfile::tempdir().unwrap();
+        let ambient = sandbox.path().join("ambient");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(ambient.join(".orchestry"))
+            .unwrap();
+
+        for test_name in [
+            "context::tests::resolve_walks_up_to_the_project_root",
+            "mcp::tests::the_root_override_selects_exactly_the_requested_project",
+        ] {
+            for project_override in [None, Some(&ambient)] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args(["--exact", test_name, "--nocapture"])
+                    .env_clear()
+                    .env("HOME", sandbox.path())
+                    .env("TMPDIR", sandbox.path())
+                    .env(
+                        "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                        sandbox.path().join("global.yml"),
+                    )
+                    .current_dir(sandbox.path());
+                if let Some(root) = project_override {
+                    command.env("ORCH_PROJECT_ROOT", root);
+                }
+                let output = command.output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success()
+                        && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                    "{test_name} with override {project_override:?}: {}\n{stdout}\n{stderr}",
+                    output.status
+                );
+            }
+        }
     }
 }
