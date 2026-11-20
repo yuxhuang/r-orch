@@ -1,0 +1,12 @@
+[package]
+name = "rusqlite-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+[workspace]
+[dependencies]
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "backup", "cache"] }
+rusqlite_migration = { version = "=2.7.0", default-features = false }
+[profile.release]
+strip = true
