@@ -5,10 +5,24 @@ They use only synthetic data in a directory supplied by the caller and refuse an
 See [the recommendation](../../sqlite-library.md) for the recorded results and their limits.
 The code is original project code; crate licences are checked through cargo-deny.
 
-The current rusqlite package uses `bundled,backup,cache,hooks,limits`, defaults off, plus
-`rusqlite_migration` with defaults off. `verification.json` is the unchanged historical three-feature
-record at commit `1c72fef`; its source hashes refer to that commit. The current source and results
-are pinned by `security-features-verification.json`. The SQLx sources/locks are unchanged.
+The standalone rusqlite package uses `bundled,backup,cache,hooks,limits`, defaults off, plus
+`rusqlite_migration` with defaults off. The five features are the proposed product contract;
+[current main's ADR 0017 decision 19 at `d58f9b62`](https://github.com/yuxhuang/r-orch/blob/d58f9b62f707a5741be9c83415e6261b373da2e5/docs/decisions/0017-sqlite-storage.md)
+still records three: `bundled,backup,cache`. Adding `hooks` and `limits` becomes binding only after
+the owner merges the corrected storage spec/plan/ADR. Entry C can be delivered independently, but
+neither this probe nor its report authorizes product installation.
+
+`verification.json` is the unchanged historical three-feature record; its source hashes resolve at
+[rebased source `0bfe8d81`](https://github.com/yuxhuang/r-orch/tree/0bfe8d81518fbc3744c6bd246ea0327d35d74296/docs/experiments/sqlite-library).
+The five-feature sources and locks are byte-identical to
+[rebased audit `78f0f6e1`](https://github.com/yuxhuang/r-orch/tree/78f0f6e1febf098bfd7ded48ab5b2ee7f8344215/docs/experiments/sqlite-library),
+with their digests and historical results pinned by `security-features-verification.json`.
+The SQLx sources/locks are unchanged. Both JSON receipts retain their original embedded SHAs and
+baselines; fields such as `source_parent`, `spec_contract_head`, `historical_record.source_commit`
+and `delivery.status = "BLOCKED"` describe that historical run. They are not fresh qualification
+receipts for this head. The rebased source citations supply equivalent bytes without rewriting
+those records. They are in this branch's ancestry and become remotely reachable when published;
+the eventual owner merge must use a merge commit to retain them, rather than squash or rebase merge.
 
 From the repository root, with the pinned toolchain selected and a fresh synthetic HOME/config/TMPDIR
 and target supplied to the process (never unset `ORCHESTRY_GLOBAL_CONFIG_PATH`; keep `global.yml`):
@@ -71,6 +85,8 @@ advisory revision for both, and retain the resolving metadata/lock. Do not treat
 Pre-PR receipt. No product dependency installation, daemon, socket or real agent CLI is involved.
 
 The direct-main reconciliation changes no probe bytes or historical JSON. In particular, the WAL
-hook/checkpoint APIs required by R126 exist through `hooks`/`wal` but are not exercised here;
-T4b owns their first execution. The full five-feature contract enters the product together at T9,
-not incrementally at T23, and only after the entry approval and that task's own dependency check.
+hook/checkpoint APIs in proposed R126 exist through `hooks`/`wal` but are not exercised here;
+the pending correction assigns first execution to T4b. Under that proposal, the full five-feature
+contract would enter the product together at T9 and T23 would add none. That assignment becomes
+effective only after the owner merges the corrected spec/plan/ADR; installation additionally
+requires entry approval and T9's own dependency check.

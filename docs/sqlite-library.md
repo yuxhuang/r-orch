@@ -5,8 +5,13 @@ Original audit baseline: `fb6a1e1` (after v1.0.0); direct-main preparation basel
 No product dependency or storage format changes here.
 
 **Recommend `rusqlite` 0.41.1 with `bundled`, `backup`, `cache`, `hooks` and `limits`, defaults off, and
-`rusqlite_migration` 2.7.0 for migrations.** Add these to `[workspace.dependencies]` and
-use them from `orch-infra` only after approval. Commit the resolving product lockfile then.
+`rusqlite_migration` 2.7.0 with defaults off for migrations.** This is a proposed five-feature contract.
+[Current main's ADR 0017 decision 19 at `d58f9b62`](https://github.com/yuxhuang/r-orch/blob/d58f9b62f707a5741be9c83415e6261b373da2e5/docs/decisions/0017-sqlite-storage.md)
+still records only `bundled`, `backup` and `cache`. Adding `hooks` and `limits` becomes binding only
+after the owner merges the corrected storage spec/plan/ADR. Entry C may be delivered independently;
+this report does not amend the ADR or authorize product dependencies. The following manifest is the
+proposal for that later installation in `[workspace.dependencies]` and `orch-infra`, after owner
+entry approval and the installation task's dependency check; commit the resolving product lockfile then.
 
 ```toml
 rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "backup", "cache", "hooks", "limits"] }
@@ -23,20 +28,21 @@ a complete qualifying native pr tier, its separate full-SHA verifier, independen
 reviews and final-head Linux CI. Those results must identify the actual delivery commit; the
 historical successes below do not establish qualification of this rebased branch.
 
-The corrected spec/plan/ADR at `4e0dbbf49798bc334e24bd892e2ffcde5f6b36a2` and the spec
-author's reconciliation confirm exactly the five features and versions above, with defaults off
-for both crates. T9 installs all five together in the workspace and `orch-infra`; T23 adds no
-feature. Product installation remains outside this entry. Registry readback on 2026-11-21 still
-lists rusqlite 0.43.0 and rusqlite_migration 2.7.0 as newest, and neither pinned choice is yanked.
+Under the pending corrected spec/plan/ADR, T9 would install all five features together in the
+workspace and `orch-infra`, with defaults off for both crates; T23 would add no feature. These
+assignments become effective only after the owner merges that correction. Product installation
+remains outside this entry. Registry readback on 2026-11-21 still lists rusqlite 0.43.0 and rusqlite_migration 2.7.0 as newest, and neither pinned choice is yanked.
 The older rusqlite line has no assumed maintenance guarantee.
 
-R126/ADR decision 23 additionally require WAL frame accounting through `Connection::wal_hook`
-(`hooks`) and `Connection::wal_checkpoint_v2` (`wal`, enabled by `hooks`). The library source
-provides both; this probe does **not** execute them. The spec assigns the first execution to T4b.
+The proposed R126/ADR decision 23 contract additionally requires WAL frame accounting through
+`Connection::wal_hook` (`hooks`) and `Connection::wal_checkpoint_v2` (`wal`, enabled by `hooks`).
+The library source provides both; this probe does **not** execute them. The pending correction
+assigns first execution to T4b.
 WAL setup, snapshot and backup assertions below do not prove that backlog accounting contract.
 
 The probe manifests, locks, Rust source and both historical verification JSON files are byte-identical
-to `59e6b29`; their recorded source digests were checked again after rebase. The independent Python
+to [the rebased five-feature audit `78f0f6e1`](https://github.com/yuxhuang/r-orch/tree/78f0f6e1febf098bfd7ded48ab5b2ee7f8344215/docs/experiments/sqlite-library);
+their recorded source digests were checked again after rebase. The independent Python
 reader, deny-policy comparison, negative development controls and per-platform receipts are retained
 as evidence for those exact bytes, on their stated baseline and platforms. Rebase does not renew the
 disposable-workspace dependency audit for the new main graph. A fresh candidate/baseline deny audit
@@ -45,11 +51,11 @@ Native Linux hardware and GitHub Linux CI remain unproven by the Docker VM/emula
 
 ## Renewed security-feature audit — 2026-11-20
 
-The five-feature contract above supersedes the original three-feature recommendation. It matches
-ADR 0017 decision 19 and R113/R127/R130 in the revised spec at `04e24be8` (also present at
-`55188964`, the security review's target). The contract was sent to the spec author for reconciliation;
-no reply was required to run these standalone checks. Spec/owner approval and product installation
-remain separate. `rusqlite_migration` also has defaults off.
+The five-feature standalone audit extends the original three-feature recommendation with `hooks`
+and `limits` for the proposed R113/R127/R130 requirements. It supports the pending correction to
+ADR 0017 decision 19; main still records three features, as disclosed above. The audit does not make
+the proposal binding: that requires the owner's merge of the corrected spec/plan/ADR. Product
+installation and owner entry approval remain separate. `rusqlite_migration` also has defaults off.
 
 | Required capability | Feature / safe API | Renewed evidence |
 |---|---|---|
@@ -108,8 +114,18 @@ performance evidence. Linux arm64 is native ISA in a Docker VM on this Mac; amd6
 Neither is independent native Linux hardware or GitHub Linux CI.
 
 [Five-feature evidence and source digests](experiments/sqlite-library/security-features-verification.json)
-supplement the unchanged historical `verification.json` at source `1c72fef`. The original SQLx
-comparison and three-feature costs below remain historical; SQLx was not re-audited here.
+supplement the unchanged historical `verification.json`. Its source hashes resolve at
+[rebased three-feature source `0bfe8d81`](https://github.com/yuxhuang/r-orch/tree/0bfe8d81518fbc3744c6bd246ea0327d35d74296/docs/experiments/sqlite-library).
+The original SQLx comparison and three-feature costs below remain historical; SQLx was not re-audited here.
+
+Both JSON files remain immutable historical receipts. Their embedded SHAs, including
+`source_parent`, `spec_contract_head` and `historical_record.source_commit`, identify the original
+local history; the rebased citations above provide the equivalent source bytes for published readers.
+Their baseline and `delivery.status = "BLOCKED"` describe the original attempts, not a new-head verdict.
+The cited rebased commits are ancestors of this delivery branch and become remotely reachable only
+when it is published. **The eventual owner merge must use a merge commit to retain this evidence
+ancestry; squash or rebase merge would discard the cited commits.** No historical success qualifies
+the new delivery head.
 
 **Historical delivery block — 2026-11-20.** After fetch, `origin/main` is still `fb6a1e1`; PR92/root/MCP fixture corrections
 are not ancestors. Lead convergence `tsk_KPH2_ni` and successor `tsk_T09HVD_` explicitly withhold
@@ -228,10 +244,12 @@ one FTS row; malformed inserts are rejected. No real project data was used.
 are separate from the product workspace. The schema, port and readers are unchanged; no migration
 is run against an existing database. No human migration action is needed for this recommendation.
 
-Historical repository validation was **blocked**, separately from the dependency check above. At
-`d46d4cc`, `fast --base origin/main` passed fmt, clippy, crate-graph, build and hygiene checks,
-but failed three existing `xtask` tests. Each failed again in one exact rerun on base
-`fb6a1e1` (0 passed / 1 failed / exit 101 per rerun):
+Historical repository validation was **blocked**, separately from the dependency check above. The
+historical `fast --base origin/main` run tested the source now reachable as
+[rebased entry `74f91f53`](https://github.com/yuxhuang/r-orch/blob/74f91f53c69a5f48114c7adc2bc7d82e691cce27/docs/sqlite-library.md),
+before rebase, on the original `fb6a1e1` baseline: fmt, clippy, crate-graph, build and hygiene checks
+passed, but three existing `xtask` tests failed. Each failed again in one exact rerun on that base
+(0 passed / 1 failed / exit 101 per rerun):
 
 - `gate::target::qualification::production_holder_commands_and_discriminators_on_scratch_filesystem`
 - `gate::target::qualification::production_native_build_script_test_and_child_descriptor_propagation`
