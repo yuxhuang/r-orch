@@ -10,7 +10,7 @@
   section of `docs/TRAITS-FROZEN.md` (§2: the ten storage traits and their three rules). Everything else in 0012
   stands: one daemon owns state, no client opens it, nothing starts a daemon on its own, exit 7.
 - Decisions 1 to 6 and 14 restate decisions the owner already took in the goal and are binding. Decisions 7 to 13
-  and 15 to 21 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
+  and 15 to 25 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
   the owner's.
 - The owner's answers (2026-11-20 and 2026-11-21): every point of the spec is answered as recommended,
   except AP13, which is answered in its direction; the spec's "Owner's answers" has a row for every id and
@@ -18,7 +18,12 @@
   to AP1, decision 12 the direction on AP13, and decisions 20 to 25 the answers to AP14 to AP19 and D1 to
   D5. Two things are still the owner's: the numbers and results of AP13 (decisions 12 and 23), and the one
   part of decision 20 for which the spec recommended no option. An answer is not the acceptance of this
-  ADR: it stays proposed until the owner merges the spec's PR.
+  ADR: it stays proposed until the owner merges the PR that carries this corrected text.
+- Where this text stands: the first-review text of this ADR (decisions 1 to 19 as first drafted, before the
+  review corrections and the owner's answers) reached `main` on 2026-11-21, when the owner merged the PR
+  that carried it at revision `f5637805`. This text replaces it through a follow-up PR and is pending until
+  that PR merges. The record does not say that the first merge accepts this ADR, and it is read here as not
+  accepting it.
 
 ## Context
 

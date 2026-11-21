@@ -94,7 +94,7 @@ first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|
-| T1 | Spec, plan and ADR 0017 | R1 | `docs/specs/`, `docs/plans/`, `docs/decisions/` | — | `./xtask/gate.sh fast --base origin/main` | 1 |
+| T1 | Spec, plan and ADR 0017 | R1 | `docs/specs/`, `docs/plans/`, `docs/decisions/` | — | `./xtask/gate.sh fast --base origin/main` | 1 (first-review text, merged), then a follow-up PR (the corrected text) |
 | T2 | Conformance suite on the file backend with its synthetic corpus; the pinned 1.0 contracts and the order-dependent reads list | R2, R3 | `crates/orch-engine/tests/storage_conformance.rs`, `crates/orch-engine/tests/storage_contract/`, `fixtures/storage-v1/`, `docs/storage-v1-conformance.md`, `docs/storage-order-dependent-reads.md` | — | Suite | 2 |
 | T3 | Choose the SQLite library and its migration runner: the §4.8 check and the report, with its probes. ADR 0017 decision 19 carries the choice: `rusqlite` 0.41.1 with five features and `rusqlite_migration` 2.7.0. The report is revised for the two features the reviews added (`limits`, `hooks`) with probes of the limits, the authorizer, the progress handler, the interrupt and the heap limit; no dependency enters the product workspace before T9 | R4 | `docs/sqlite-library.md`, `docs/experiments/sqlite-library/` | — | `cargo deny check` on a whole workspace with the candidates connected; the probes on macOS and Linux | 3 |
 | T4 | Measure batched event append against the first claim-latency budget, as a standalone experiment on macOS and native Linux | R5, R63 | `docs/sqlite-event-throughput.md`, `docs/experiments/sqlite-events/` | T3 | The report states the budget declared before the run, the figures and a verdict for each platform | 4 |
@@ -102,7 +102,7 @@ first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`
 | T4c | The number of rows in the largest goal pause and failure cascade on the live copy, counts only (AP8). The owner answered AP8 as recommended; this use of the copy still needs the owner's word, which neither that answer nor the answer D6 gives | R27 | records outside the repository; the count alone in `docs/sqlite-event-throughput.md` | T7 | The count and how it was taken, with no content of the copy | 4 |
 | T5 | Prototype "claim with a fenced lease" as a standalone workspace, across a suspend and resume and across a restore; report its result | R6 | `prototypes/fenced-lease/`, `docs/specs/2026-11-20-fenced-lease-prototype.md`, `docs/plans/2026-11-20-fenced-lease-prototype.md`, `docs/decisions/0018-fenced-lease-prototype.md` | T3 | The report states what a suspended machine and a restore do to a lease, and whether ADR 0017 decision 16 holds (spec AP11) | 5 |
 | T6 | Security review of the spec and red-team of the plan (import cutover, single writer); their findings become spec rows or plan edits | all | `docs/specs/`, `docs/plans/`, `docs/decisions/0017-sqlite-storage.md` | T1 | Each finding is answered in PR 6 as accepted, rejected or modified | 6 |
-| T7 | Approval gate. The owner has answered O1 to O10, AP1 to AP12, AP14 to AP20 and D1 to D8 as recommended, and AP13 in its direction; the spec's "Owner's answers" has a row for each id. Still the owner's: the numbers and results of T4b; the fifth point of AP14; and the merge of the spec's PR, which by the answer D8 follows the validation and the PRs of the entry steps and the reviewers' conditions, and by the answer D1 a re-review at the exact head. Then spec `approved`, plan `active`, ADR 0017 `accepted` | — | status lines; `docs/decisions/README.md` | T2 to T6, T4b | The owner's approval recorded in PR 6 | 6 |
+| T7 | Approval gate. The owner has answered O1 to O10, AP1 to AP12, AP14 to AP20 and D1 to D8 as recommended, and AP13 in its direction; the spec's "Owner's answers" has a row for each id. Still the owner's: the numbers and results of T4b; the fifth point of AP14; and the merge of the follow-up PR that carries the corrected spec, which by the answer D8 follows the validation and the PRs of the entry steps and the reviewers' conditions, and by the answer D1 a re-review at the exact head; the merge of PR 1 on 2026-11-21 carried the first-review text and is not that approval. Then spec `approved`, plan `active`, ADR 0017 `accepted` | — | status lines; `docs/decisions/README.md` | T2 to T6, T4b | The owner's approval recorded in PR 6 | 6 |
 
 ### Product: built on files, then beside files
 
@@ -190,7 +190,7 @@ before the spec is approved, and the conditions above stay open until that revie
 
 | Item | State (implemented / verified on <platform> / pending) |
 |---|---|
-| T1 | implemented in PR 1; `fast` on macOS |
+| T1 | first-review text (`f5637805`) implemented in PR 1, `fast` on macOS, and merged to `main` by the owner on 2026-11-21; this corrected text, with the review corrections and the owner's answers, implemented in a follow-up PR that is pending its reviews and the owner's merge. The spec is not approved by either |
 | T2 to T27 | pending |
 
 ## Test plan
@@ -266,8 +266,15 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   already stands: the row recommended neither option, so the answer chose none, and T23 does not build
   restore's handling of an existing workspace before it is ruled.
 - By the answer D8 the spec is approved only after the validation and the PRs of the entry steps (T2 to
-  T5) and the reviewers' conditions; its PR stays a draft until then. Showing the owner the corrected
-  draft does not wait for them.
+  T5) and the reviewers' conditions, and its PR stays a draft until then. That answer was given while PR 1
+  was an open draft. The owner merged PR 1 on 2026-11-21 at its first-review text (`f5637805`), so `main`
+  holds the spec, this plan and ADR 0017 as they stood before the review corrections and the answers, and
+  this corrected text reaches `main` only through a follow-up PR. The record does not say that the merge
+  approves the spec, changes D8 or releases a product task, and this plan reads it as none of those: the
+  spec stays `draft`, this plan `proposed` and ADR 0017 proposed, D8's conditions are unmet, and D8 is read
+  as standing for the follow-up PR. Whether that PR is opened as a draft, and when it merges, is the
+  owner's to rule; nothing in this plan depends on which. Showing the owner the corrected text does not
+  wait for the entry steps.
 - The owner has answered AP11: a restore lineage is carried beside the epoch (ADR 0017 decision 16, spec R77
   and R132). T5 still has to confirm the mechanics and settles how a process is held until its pid is
   committed (R96). Nothing before T12 depends on either.

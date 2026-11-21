@@ -10,7 +10,16 @@ This spec is longer than the page that [the specs README](README.md) asks for. T
 names, bounds and the schema split before any code, so those are kept here as reference sections after the
 requirements, as the daemon-owned-state spec did for its protocol. The names of operations, commands, settings
 and metrics are those of source item O9, which the owner answered as recommended: approved as a set, and
-fixed by the merge of this spec's PR.
+fixed by the merge of the PR that carries this corrected text.
+
+Where this text stands. The first-review text of this spec, of its plan and of ADR 0017 reached `main` on
+2026-11-21, when the owner merged the PR that carried it at revision `f5637805`. That text is the draft as
+it stood before the reviews: it ends at R100 and AP13, and holds none of the rows added after the security
+review and the red team (R101 to R136, AP14 to AP20) and none of the owner's answers. This text replaces
+it through a follow-up PR and is pending until the owner merges that PR. The record holds no word of the
+owner that the first merge approves this spec, confirms an answer, fixes a name or releases product work,
+and this spec reads it as none of those: the status stays `draft`, ADR 0017 stays proposed, and the
+conditions of the answers D1 and D8 are unchanged.
 
 ## Source
 
@@ -1612,7 +1621,8 @@ the approval request of 2026-11-20; and for AP14 to AP20, which that request did
 recommendation column of this spec's own row. An answer is the owner's word as recorded and no more. It is
 not an approval of this spec, of a number, of a result, or of text beyond the recommendation, and the
 record does not say which revision of a row the owner read. The owner confirms this table, and the text of
-every row, by merging the PR that carries it.
+every row, by merging the PR that carries it. The merge of 2026-11-21 carried the first-review text, which
+has neither this table nor the corrected rows, and confirms none of them.
 
 Counted over the 38 ids: 37 are answered as recommended, and AP13 is answered in its direction only. Two
 things inside those answers are still the owner's: every number and result of AP13, and the fifth point of
@@ -1622,7 +1632,7 @@ delivery that is still due, or a part the owner still holds.
 | Point | Answered | Record | Answer | Not settled by the answer |
 |---|---|---|---|---|
 | O1 | 2026-11-20 | A, D | As recommended: `.orch-project` in 1.1, the 1.0 search order kept, `--project` and `ORCH_PROJECT` in 1.5 | The conditions on copies, worktrees and an interrupted pointer write are R34, R135 and R125 |
-| O2 | 2026-11-21 | D | As recommended: the 33 tables with the columns that later phases need, and the other 17 deferred. The recommendation's condition: the exact schema of this spec, with its foreign keys and integrity rules, is what is approved, and a count of tables is not | The merge confirms the schema as written |
+| O2 | 2026-11-21 | D | As recommended: the 33 tables with the columns that later phases need, and the other 17 deferred. The recommendation's condition: the exact schema of this spec, with its foreign keys and integrity rules, is what is approved, and a count of tables is not | The merge of the PR that carries this corrected text confirms the schema as written |
 | O3 | 2026-11-20 | B, D | As recommended: the import runs with both daemons stopped and is refused while local or remote 1.0 work may survive; orch never deletes 1.0 files, and the manual gives the advice on keeping them |  |
 | O4 | 2026-11-21 | D | As recommended: the saved setting is kept; dispatch is off after an import, a restore and a migrating start; the flag overrides; the `dispatch_off_with_work` item stays |  |
 | O5 | 2026-11-21 | D | As recommended: one timer with a due time for each job that survives a restart, and a bounded shutdown | The writer's failure policy, which the recommendation asked for before the build, is R128 (AP18) |
@@ -1658,7 +1668,7 @@ delivery that is still due, or a part the owner still holds.
 | D5 | 2026-11-21 | D | As recommended: the security review's major conditions, as R74, R75 and R130 to R134 | The library features they need are audited in the revised report of deliverable C, which is not yet delivered (ADR 0017 decision 19) |
 | D6 | 2026-11-20 | B, D | As recommended: a real suspend test on an isolated macOS machine, evidence from native Linux, the peer check on a second host, a copy of the live project outside the repository for R71 later; no private content in the repository or a PR | Every one of those checks is still due, and no native Linux host is named |
 | D7 | 2026-11-20 | B, D | As recommended: one phase 1.1, the ordered PR stack, no release in between |  |
-| D8 | 2026-11-21 | D | As recommended: the validation and the PRs of the entry steps and the reviewers' conditions are finished before the spec is approved, and the spec's PR stays a draft meanwhile | The entry steps B, C, D and E are not yet delivered through their PRs |
+| D8 | 2026-11-21 | D | As recommended: the validation and the PRs of the entry steps and the reviewers' conditions are finished before the spec is approved, and the spec's PR stays a draft meanwhile | The entry steps B, C, D and E are not yet delivered through their PRs. The answer was given while the spec's PR was an open draft. The owner merged that PR on 2026-11-21 at its first-review text, and the record does not say that the merge approves the spec or changes this answer; it is read here as standing for the follow-up PR that carries this corrected text. Whether that PR is opened as a draft, and when it merges, is the owner's to rule |
 
 ## Gate lines
 
