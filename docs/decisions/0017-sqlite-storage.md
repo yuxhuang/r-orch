@@ -12,13 +12,13 @@
 - Decisions 1 to 6 and 14 restate decisions the owner already took in the goal and are binding. Decisions 7 to 13
   and 15 to 21 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
   the owner's.
-- The owner's answers so far (2026-11-20): decision 16 follows the answer to the spec's AP11, decision 17 the
-  answer to O1 and decision 18 the answer to AP1. Decision 12 follows the owner's direction on AP13, whose
-  numbers are pending. The answers to O3 and D3 agree with decision 22 and with the hard stop of the spec's
-  R123 as far as their words go, and the answer to AP12 with the spec's R42. The spec's "Owner's answers" has
-  a row for every id; every point not answered there is pending, and this ADR stays proposed until the owner
-  has answered them. Decisions 22 to 25 answer the security review and the red team; the owner has not seen
-  them under their own points (AP14 to AP20).
+- The owner's answers (2026-11-20 and 2026-11-21): every point of the spec is answered as recommended,
+  except AP13, which is answered in its direction; the spec's "Owner's answers" has a row for every id and
+  its record. Decision 16 follows the answer to AP11, decision 17 the answer to O1, decision 18 the answer
+  to AP1, decision 12 the direction on AP13, and decisions 20 to 25 the answers to AP14 to AP19 and D1 to
+  D5. Two things are still the owner's: the numbers and results of AP13 (decisions 12 and 23), and the one
+  part of decision 20 for which the spec recommended no option. An answer is not the acceptance of this
+  ADR: it stays proposed until the owner merges the spec's PR.
 
 ## Context
 
@@ -128,8 +128,14 @@ across a crash, lists that do not load everything, and a retried request that ru
     and macOS hardware and native Linux hardware. Those numbers are proposed; they and the results return to
     the owner, and no budget is met until the owner accepts both. A valid miss of the revised budget selects
     the fallback, which no figure shows to be faster and which is measured as built. The path that ships is
-    measured by the same method before its PR merges. The proposal exceeds two numbers of decision 9, the
-    50 ms for a claim's wait and the 1 s for an event batch; the owner is asked about them with the results.
+    measured by the same method before its PR merges. Two numbers of decision 9 stand beside the proposal
+    and are not changed by it. The 50 ms is the target for a claim's wait before its transaction starts
+    and gates nothing, where the proposed 200 ms runs from arrival to commit. The 1 s is the deadline
+    that orders an event batch, where the proposed 5,000 ms limits an event's age. The experiment batches
+    events over 50 ms and is no evidence about the shipped collector's 256 events or 250 ms; the run of
+    the path that ships is. The spec's "Event measurement" says what is proposed for each and how each is
+    reported; the owner rules on them with the numbers and the results, and no measured result is read
+    differently on their account.
 
 13. **A retried change runs once.** A request may carry a key. The key, scoped by (identity, project, run,
     epoch, key), is stored with a hash of the request and the result in the same transaction as the change, and
@@ -173,23 +179,33 @@ across a crash, lists that do not load everything, and a retried request that ru
     outright. `daemon.json`
     and the socket move into the data directory's `run/`. `--project` and `ORCH_PROJECT`, which name a project
     without a directory, arrive when one daemon serves many projects (1.5). The frozen handshake envelope of
-    0012 decision 6 does not change. This is open point 1 of the goal; the owner decides it at the gate.
+    0012 decision 6 does not change. This is open point 1 of the goal; the owner answered it as recommended.
 
 18. **orch-peer keeps its wire protocol and its own files, and loses its direct reads of the 1.0 stores.**
     Decision 15 of the goal says orch-peer is not changed, or the spec says exactly what breaks. `orch-peer`
     runs inside the daemon on the engine. It reads `tasks/_index.json` and `messages/_index.json` itself, builds
     a `FileMessageStore`, and reads `state.json` through the state store; none of these survives decision 1.
-    The spec names each place and asks the owner to approve adapting those places and nothing else. Its other
+    The spec names each place, and the owner approved adapting those places and nothing else (AP1), with the
+    proof on a second host still due. Its other
     storage calls keep compiling against a facade with the 1.0 trait shapes, kept in `orch-engine` for
     `orch-peer` alone until 2.0. The peer protocol, the `remotes` files and `peer-id` stay as they are.
 
 19. **The SQLite library is `rusqlite`, and `rusqlite_migration` runs the migrations.** `rusqlite` 0.41.1
     with the features `bundled`, `backup`, `cache`, `limits` and `hooks` and its default features off, and
-    `rusqlite_migration` 2.7.0, both pinned exactly and used from `orch-infra` only. `limits` and `hooks`
-    were added after the report, for decision 21: they are the library's safe calls for run-time limits, the
-    authorizer and the progress handler. Both are parts of the crate and bring no other crate (in 0.41.1's
-    manifest `limits = []`, `hooks = ["wal"]`, `wal = []`), so the dependency graph the report checked is
-    unchanged. `load_extension` stays off. The report of deliverable C
+    `rusqlite_migration` 2.7.0 with its default features off, both pinned exactly and used from `orch-infra`
+    only. `limits` and `hooks` were added after the report's first version, for decisions 21, 23 and 24:
+    they are the library's safe calls for run-time limits, the authorizer, the progress handler and the
+    write-ahead log's commit callback. Both are parts of the crate and bring no other crate (in 0.41.1's
+    manifest `limits = []`, `hooks = ["wal"]`, `wal = []`). The report's revision audits the five
+    together: the features that resolve are `backup`, `bundled`, `cache`, `hashlink`, `hooks`, `limits`,
+    `modern_sqlite` and `wal` and no other; `cargo deny check` on the whole workspace with the pair
+    connected passes under the unchanged policy with no new warning, exception or licence allowance, and
+    with the same packages as the three-feature set; and its probes of the limits, the authorizer, the
+    progress handler, the interrupt, the untrusted-schema settings and the heap limit pass on macOS and in
+    Linux containers of two architectures. No further feature is needed. Two calls that decision 23 uses,
+    `wal_hook` and `wal_checkpoint_v2`, are in those features and were read in the library's source; the
+    revision's probe does not run them. The revision is not yet delivered through its PR or independently
+    reviewed. `load_extension` stays off. The report of deliverable C
     (`docs/sqlite-library.md`) holds the §4.8 check and its evidence: both crates maintained; a declared MSRV
     of 1.89 under the pinned toolchain; MIT and Apache-2.0, inside `deny.toml`'s allow-list; `cargo deny check`
     passing on the whole workspace with the two crates connected and no new exception; the bundled engine
@@ -232,7 +248,9 @@ across a crash, lists that do not load everything, and a retried request that ru
     a restore is taken to be this project's own state, so that a directory already at a restored task's
     exact name is that task's. A name, a device and an inode do not show who wrote a backup. The spec's
     AP14 puts two options to the owner, trust with a listing in the confirmation or refusal as for an
-    export, and this ADR takes neither until the owner has ruled. This decision answers the security
+    export, and this ADR takes neither until the owner has ruled. The owner's answer to AP14, "as
+    recommended", settles the rest of this decision and chooses neither option, because the spec
+    recommended neither. This decision answers the security
     review's finding S2, which showed the first layout (`blobs/events/ab/<run id>`) leaving the data directory
     for a run id shaped like a path. The descriptor calls exist, without `unsafe`, in `nix`, which the workspace
     already depends on and already uses this way (`crates/orch-daemon/src/ops/transport.rs`); `orch-infra` needs
@@ -425,7 +443,7 @@ across a crash, lists that do not load everything, and a retried request that ru
 - `docs/TRAITS-FROZEN.md` §2, ARCHITECTURE §1, §2.1, §5.1 to §5.3 and §6.1, and the RUNBOOK's storage
   procedures change. The stable-sort rule stays: the scheduler still sorts in memory.
 - Backups become a product duty: database, blobs and repositories as one restorable point.
-- `orch-peer` is touched at the places decision 18 names, if the owner approves it, and nowhere else.
+- `orch-peer` is touched at the places decision 18 names, which the owner approved, and nowhere else.
 - Files in the data directory can no longer be found by an id with `ls`: an event file and a project record
   are named by hashes, which the storage reference (`docs/storage.md`) must explain how to compute. A copy
   of a 1.0 project or of a backup made with hard links (some snapshot tools) is refused by the importer and
