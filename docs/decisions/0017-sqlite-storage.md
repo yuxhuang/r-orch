@@ -17,7 +17,8 @@
   its record. Decision 16 follows the answer to AP11, decision 17 the answer to O1, decision 18 the answer
   to AP1, decision 12 the direction on AP13, the owner's ruling of 2026-11-21 on what a miss selects and
   the owner's two answers of the same day on how "one platform alone" is judged and on a further data set
-  after a miss, and decisions 20 to 25 the answers to AP14 to AP19 and D1 to D5. Two things are still the
+  after a miss, with four answers given the same day under the owner's delegation on the list of kinds, on
+  the whole data set and on what counts as further measurement (the spec's record H), and decisions 20 to 25 the answers to AP14 to AP19 and D1 to D5. Two things are still the
   owner's: the
   numbers and results of AP13 (decisions 12 and 23), and the one part of decision 20 for which the spec
   recommended no option. A third lies outside the answers: the owner's word on using the live copy for
@@ -149,12 +150,23 @@ across a crash, lists that do not load everything, and a retried request that ru
     with the case in which the two differ, and on 2026-11-21 the owner chose the kind reading: a miss is
     shown by both platforms only when each missed the same kind of limit in the same population of the
     same cell, so two different kinds of miss in one cell, one on each platform, select no path and go
-    back to the owner. The reading by cell is not adopted. The list of kinds is the spec's and stays a
-    proposal. The owner answered a second question the same day: after a data set in which a mandatory
+    back to the owner. The reading by cell is not adopted. The list of kinds was the spec's proposal
+    when that answer was given. The owner answered a second question the same day: after a data set in which a mandatory
     repetition that is valid or on a host that was not idle has missed, no further data set is started
     without the owner's word, whatever its headline, and a data set that only fixes a defect is no
     exception. Both answers choose a rule; neither accepts a number, a limit, a method or a result.
     Independent reviews first read the text that carries them at revision `d2fe9b0`; the plan names them.
+    Four more answers were given on 2026-11-21 under the owner's delegation; they are not the owner's own
+    words, and the spec's record H gives the delegation. The five kinds are adopted and are operative: the
+    match is made on the cell, the population and the kind together, and kinds named in a report beside a
+    selection made without them do not apply the reading. A miss of the spec's steps 2 to 4 anywhere in a
+    data set keeps it from selecting an event path, while an eligible data set in which every miss is a
+    valid miss in a population that holds events, shown by both platforms in the same cell, population and
+    kind, still selects the fallback. Starting the second platform's block after a mandatory miss on the
+    first, and replacing an invalid set of five, or one on a host that was not idle, while such a miss
+    stands, are each further measurement that needs the owner's word, with the old set and every miss
+    kept. Selecting a path is not permission to measure it and does not qualify it to ship. These answers
+    too choose rules and accept no number, limit, method or result.
     A fallback that is
     selected is measured as built, and no figure shows it to be faster. Each data set gets one verdict from
     four axes reported apart (correctness, validity, coverage, budget), so that a miss on one platform with
@@ -519,6 +531,18 @@ across a crash, lists that do not load everything, and a retried request that ru
   with a defect has the headline of the defect whatever it missed, so a rule that reads the headline
   would let a second campaign follow a miss unasked. Not adopted: the owner answered "ask first" on
   2026-11-21, with no exception for the fix of a defect (decision 12).
+- **Stop at any miss, select nothing, and keep the kinds as names in a report.** One rule in place of four
+  answers: simpler to apply, and it asks the owner every time. It also removes the one case that the owner's
+  ruling of 2026-11-21 decides, the selection of the fallback for a miss attributable to events, and so
+  amends that ruling. Not adopted: the session that answers under the owner's delegation withdrew it for
+  that reason, and the kinds stay operative with the fallback still selected for an eligible data set whose
+  every miss both platforms show in one cell, population and kind (decision 12). The owner can choose it; it
+  would be recorded as an amendment of the ruling.
+- **Finish a frozen data set on both platforms although the first platform missed.** It completes the
+  comparison across platforms in one campaign. Not adopted as the default: "ask first" must not depend on
+  whether two platform blocks are called one data set, so the second block waits for the owner's word, and
+  so does the replacement of a set of five while a mandatory miss stands (decision 12). The cost is that an
+  early miss leaves the data set incomplete until the owner allows the rest.
 - **Let any miss of the revised budget select the fallback.** The direction's first sentence. A miss in a
   cell with no events cannot show that moving events to files would help, and the fallback would then be
   built and miss the same way. The owner amended the sentence on 2026-11-21 (decision 12).

@@ -304,6 +304,31 @@ reviews of `d2fe9b0`, among them the resilience review's that a start does not r
 with no marker after a loss of power, which stays a stated limit; and everything listed as carried or
 left above.
 
+Two independent reviews read the revision that followed, `8954cf6`, on 2026-11-21 (resilience, facts), for
+its changes, and each passed it with conditions. The same day four things that the spec had marked as
+proposals and put to the owner were answered under the owner's delegation, and the same record allows the
+follow-up PR to open as a draft (the spec's record H). The answers are not the owner's own words; the spec's
+record gives the delegation word for word. The revision that carries this paragraph writes those answers
+into the spec, this plan and ADR 0017. It changes no number, limit or eligibility rule, chooses no method,
+permits no measurement and closes no finding.
+
+| Put to the owner as a proposal (the lead's name for it) | Answer under the owner's delegation, 2026-11-21 | Where |
+|---|---|---|
+| The list of kinds by which the kind reading is applied (AP13-KINDS) | Adopted, and operative: the regular claims, the claims of a checkpoint window, the claims of a burst window, an event's age, and a refusal or something still queued. The match is made on the cell, the population and the kind together; kinds named in a report beside a selection made without them do not apply the reading | Spec R63, "What a miss selects" (step 3, the text under the steps, the cases), AP13, record H; ADR decision 12 |
+| That one miss of steps 2 to 4 anywhere returns the whole choice to the owner (AP13-WHOLESET) | Adopted: such a miss anywhere in a data set keeps it from selecting an event path. Not every miss stops every path: an eligible data set in which every miss is a valid miss in a population that holds events, shown by both platforms in the same cell, population and kind, still selects the fallback | Spec R63, "What a miss selects" (the text under the steps, the cases), AP13, record H; ADR decision 12 |
+| Whether the second platform's block, run after a mandatory miss on the first, is a further data set (AP13-BOUNDARY-1) | It is further measurement and needs the owner's word. Until then the data set stands with a platform absent, selects no path, and nothing stands in for the block that was not run | Spec R63, "The verdict" (the paragraph on the two questions, the rows of what may follow a data set), AP13, record H; ADR decision 12 |
+| Whether replacing an `invalid` or `host_not_idle` set of five, in a data set that holds a mandatory miss, starts one (AP13-BOUNDARY-2) | It is further measurement and needs the owner's word. The old set and every miss are kept. A set replaced where no mandatory miss stands is not touched by this answer | The same |
+| Whether the follow-up PR for the corrected text is opened as a draft (the answer D8) | One new PR may be opened as a draft once its checks and its statement of what it does not decide are ready. D8's conditions stand before approval and merge; the merge is the owner's | Spec row D8 of "Owner's answers", record H; this plan ("Open questions") |
+
+Selecting a path, permission to measure and qualification to ship are three things, and the answers give
+only the first its rule: a selected fallback is measured as built only on the owner's word, since the data
+set that selected it holds a mandatory miss, and it ships only when it has passed as built (spec R63). Not
+answered, and still proposals: the numbers and the results, how the lanes and the collector sit beside the
+proposal, the sync settings, the eligibility rule, the reading of "a burst alone", the host and platform
+rules, the fifth point of AP14 and the word on the live copy for T4c. The method challenge's findings on
+attribution and on whether a complete data set can be produced, and the controls it asked for, are findings
+about the method and stay open as their reviews left them; an answer on a rule closes none of them.
+
 Why another round of design review runs. AGENTS.md asks for the reason from the third round on. This text
 has been read at `196f9087` and at `a914e78`, and this revision asks for a further read. The lead's
 reason, from its adjudication of the reviews of `a914e78`, is that the second read produced counterexamples
@@ -338,6 +363,12 @@ is one wrong attribution: the loss of unrecorded event numbers was counted with 
 that is about something else, so that closing that item could have been read as closing the loss. Three
 points of wording are corrected in the same pass. The read is limited to what this revision changed after
 `d2fe9b0`, which is no rule; no test settles an attribution.
+
+A sixth read follows the answers of the spec's record H. The lead's reason is that four rules which were
+proposals are now answered, and the text that states them is new: the selection with its cases for and
+against, the two answers on further measurement with what is kept at a stop, what a draft does and does not
+decide, and whose words each answer is. The read is limited to that. No test settles it before the owner's
+gate; the verifier's cases carry the selection to T4b.
 
 ## Status
 
@@ -395,10 +426,18 @@ points of wording are corrected in the same pass. The read is limited to what th
   spec's table of cases as written, from recorded inputs made for the purpose, the mixed cases included
   (a defect beside a miss, an unknown correctness or a backend not shown beside a miss): a verifier that
   selects any path for them is wrong. So is one that selects a path when the two platforms miss different
-  kinds of limit in one cell (the owner's answer of 2026-11-21). No repetition of the
-  measurement is shortened or run again to make such an input. The three rows of what may follow a data
+  kinds of limit in one cell (the owner's answer of 2026-11-21). The kinds are operative (the spec's
+  record H): the verifier reads the kind of every miss and matches on the cell, the population and the
+  kind together. One that matches by cell alone is wrong; one that names the kinds in its report and
+  selects without them is wrong; one that selects a path while a miss of steps 2 to 4 stands anywhere in
+  the data set is wrong; and one that selects nothing for an eligible data set in which every miss is a
+  valid miss in a population that holds events, shown by both platforms in the same cell, population and
+  kind, is wrong as well: the fallback is selected there. No repetition of the
+  measurement is shortened or run again to make such an input. The rows of what may follow a data
   set are a rule for whoever starts one under the spec's "Event measurement": after a mandatory miss none
-  is started without the owner's recorded word, the fix of a defect included.
+  is started without the owner's recorded word, the fix of a defect included; nor is the second
+  platform's block, nor the replacement of an `invalid` or `host_not_idle` set of five. A selection
+  starts no measurement of the path it selects.
 - The importer is tested on generated projects of the live project's shape and on a hand-written corpus of
   damaged input (T21), then once on a copy of the live project (T27).
 - Names and paths (spec R101 to R108, R117, R118): every test that plants a hostile name, link or special file
@@ -463,9 +502,13 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   this corrected text reaches `main` only through a follow-up PR. The record does not say that the merge
   approves the spec, changes D8 or releases a product task, and this plan reads it as none of those: the
   spec stays `draft`, this plan `proposed` and ADR 0017 proposed, D8's conditions are unmet, and D8 is read
-  as standing for the follow-up PR. Whether that PR is opened as a draft, and when it merges, is the
-  owner's to rule; nothing in this plan depends on which. Showing the owner the corrected text does not
-  wait for the entry steps.
+  as standing for the follow-up PR. By an answer of 2026-11-21 given under the owner's delegation (the
+  spec's record H) one new follow-up PR may be opened as a draft once its checks and its statement of
+  what it does not decide are ready. A draft is not accepted content: D8's conditions stand before the
+  spec is approved and before that PR merges, and merging it chooses no proposal that is still pending,
+  accepts no number or result and releases no product task. When it merges is the owner's to rule;
+  nothing in this plan depends on when. Showing the owner the corrected text does not wait for the entry
+  steps.
 - The owner has answered AP11: a restore lineage is carried beside the epoch (ADR 0017 decision 16, spec R77
   and R132). T5 still has to confirm the mechanics and settles how a process is held until its pid is
   committed (R96). Nothing before T12 depends on either.
@@ -480,7 +523,15 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   platform alone" is judged by kind of limit and population, so two different kinds of miss in one cell,
   one on each platform, select no path; and after a mandatory miss in a `valid` or `host_not_idle`
   repetition no further data set is started without the owner's word, whatever the headline, a data set
-  that only fixes a defect included (the spec's "The verdict"). The path that ships is measured as built
+  that only fixes a defect included (the spec's "The verdict"). By four answers of 2026-11-21 given
+  under the owner's delegation (the spec's record H) the five kinds are operative in that judgment, with
+  the cell and the population kept in the match; a miss of steps 2 to 4 anywhere in a data set keeps it
+  from selecting an event path, while an eligible data set in which every miss is a valid miss in a
+  population that holds events, shown by both platforms in the same cell, population and kind, still
+  selects the fallback; and starting the second platform's block after a mandatory miss on the first, or
+  replacing an `invalid` or `host_not_idle` set of five while such a miss stands, is further measurement
+  that needs the owner's word. Selecting a path is not permission to measure it and does not qualify it
+  to ship. The path that ships is measured as built
   before T16 merges.
   T16's scope is written for either.
 - This revision proposes, and nobody has yet reviewed or approved: the limits for an idle host and the
@@ -491,9 +542,11 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   staged database as a field of that marker; the sync call named for each platform in the spec's
   "What a sync promises"; the names of the verdict's
   axes and values, its headline words and its exits 0, 1, 2 and 3; and, under the spec's "What a miss
-  selects", the eligibility rule, three readings, among them the list of kinds by which the owner's kind
-  reading of "one platform alone" is applied, and the step taken from "The host". The kind reading itself
-  and the rule on a further data set after a miss are no longer among the proposals: the owner chose both.
+  selects", the eligibility rule, the reading of "a burst alone" and the step taken from "The host". The
+  kind reading itself and the rule on a further data set after a miss are no longer among the proposals:
+  the owner chose both. Nor are the list of kinds, the rule for the whole data set and the two questions
+  on what counts as further measurement: they were answered on 2026-11-21 under the owner's delegation
+  (the spec's record H).
   The coverage rule of the measurement is unchanged, and a valid run of the production rule can leave a
   repetition without it; whether the rule changes is a question for a reviewed revision of the method.
   The mandatory cells C24, H32 and B24 may be exposed to that as well as the diagnostic, so whether the
