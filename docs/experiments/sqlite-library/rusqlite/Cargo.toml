@@ -6,7 +6,7 @@ publish = false
 license = "Apache-2.0"
 [workspace]
 [dependencies]
-rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "backup", "cache"] }
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "backup", "cache", "hooks", "limits"] }
 rusqlite_migration = { version = "=2.7.0", default-features = false }
 [profile.release]
 strip = true

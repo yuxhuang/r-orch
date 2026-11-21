@@ -3,16 +3,93 @@
 2026-11-20 · Entry step C of `goal_sMVh4SG`; input to the storage ADR, pending the owner gate.
 Repository baseline: `fb6a1e1` (after v1.0.0). No product dependency or storage format changes here.
 
-**Recommend `rusqlite` 0.41.1 with `bundled`, `backup` and `cache`, defaults off, and
+**Recommend `rusqlite` 0.41.1 with `bundled`, `backup`, `cache`, `hooks` and `limits`, defaults off, and
 `rusqlite_migration` 2.7.0 for migrations.** Add these to `[workspace.dependencies]` and
 use them from `orch-infra` only after approval. Commit the resolving product lockfile then.
 
 ```toml
-rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "backup", "cache"] }
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "backup", "cache", "hooks", "limits"] }
 rusqlite_migration = { version = "=2.7.0", default-features = false }
 ```
 
-## Comparison and library-first check
+## Renewed security-feature audit — 2026-11-20
+
+The five-feature contract above supersedes the original three-feature recommendation. It matches
+ADR 0017 decision 19 and R113/R127/R130 in the revised spec at `04e24be8` (also present at
+`55188964`, the security review's target). The contract was sent to the spec author for reconciliation;
+no reply was required to run these standalone checks. Spec/owner approval and product installation
+remain separate. `rusqlite_migration` also has defaults off.
+
+| Required capability | Feature / safe API | Renewed evidence |
+|---|---|---|
+| Pinned bundled engine, STRICT, FTS5, WAL, indexes, WITHOUT ROWID, immediate transactions | `bundled`; core API | Prior capability assertions rerun on all three platforms below; SQLite 3.54.1 |
+| Stable read snapshot and online backup | `backup`; `backup::Backup` | One live row changes 10 → 11; pinned source and backup retain 10, FTS count stays 1; backup integrity is `ok` |
+| Prepared-statement cache | `cache` | Enabled and resolved to `hashlink`; not a cache-performance measurement |
+| Default-deny query authorization | `hooks` → `wal`; `Connection::authorizer` | Fixed diagnostic view allowed; 11 forbidden preparations refused with a denial callback observed, including direct/protected reads, protected `count(*)`, CTE, schema, function, ATTACH, pragma, DDL, update and extension call; row unchanged |
+| Authorization through execution | `hooks` | Callback kept installed; schema change forces automatic reprepare during stepping and invokes it again |
+| VM budget / cancellation | `hooks`; `progress_handler` | Long recursive statement and `quick_check` return `SQLITE_INTERRUPT`; subsequent query succeeds |
+| Cross-thread read cancellation | Core `get_interrupt_handle` / `InterruptHandle::interrupt` | Executing VM signals readiness; another thread interrupts, joins, and the connection is reusable |
+| Runtime bounds | `limits`; `set_limit` / `limit` | All 14 import-profile limits and 7 query-profile limits read back; 8 over-limit/ATTACH negatives refused |
+| Hostile-source connection primitives | Core `set_db_config`, URI read-only open; SQL pragmas | Defensive on, trusted schema/triggers/views off; immutable source reads 42, `quick_check` is `ok`, mmap off/cell checking on/cache 8 MiB; DB and 3 planted companion canaries byte-identical afterward |
+| Offline import heap ceiling | SQL `PRAGMA hard_heap_limit` | 256 MiB read back; separate process with injected 8 MiB ceiling refuses a 16 MiB allocation with `SQLITE_NOMEM`, then reads successfully |
+| Per-migration transactions | `rusqlite_migration` | Earlier rollback, restart and newer-version assertions rerun; product history/checksum/backup adapter still due |
+
+The standalone crate now forbids unsafe code. It uses no raw handle/FFI and enables neither
+`load_extension` nor the wasm default. The source probe sets and reads back all import limits on the
+actual source connection before its authorizer/first content query. Its synthetic schema and allowlist
+are intentionally small: this does not implement the export-header validator, exact export-schema
+comparison, row/byte/result budgets, production function/view policy, deadline clock or filesystem
+confinement. No malformed-file fuzzing, hostile-file race proof, product restore or snapshot-expiry
+policy is claimed. `immutable=1` requires the caller to ensure the file cannot change.
+
+**Renewed dependency check: PASS for this feature contract.** On disposable copies of `fb6a1e1`,
+`cargo deny --locked check` on the unchanged baseline and `cargo deny --locked --offline check` with
+the five-feature pair connected to `orch-infra` both exit 0: advisories, bans, licences and sources ok.
+The same RustSec revision `f291af9b1cc0d21dfcea1709d6b037963cef262b` and unchanged `deny.toml`
+SHA-256 `70b17eabf01801a94dc17652e5e8c122bcc4809fa3526ebdcd21d04119c454f6` apply.
+Both have the same 13 duplicate-version warning headers, no added warning or exception. A locked
+three-feature control and five-feature candidate resolve identical registry packages and lock bytes;
+only rusqlite's resolved features add `hooks`, `limits`, `wal`. This comparison is independent of the
+old audit. No product manifest/lock was changed.
+
+An independent Python sqlite3 3.54.1 reader opened copies of the live/backup databases: one entity
+row each, sums 11/10 respectively, one FTS row each and `integrity_check = ok`.
+
+Pinned-crate manifests declare MSRV 1.89 for rusqlite/migration and 1.88 for libsqlite3-sys; the
+standalone builds use Rust 1.99.1, not a claim of testing on those minimum versions. Registry readback
+still lists rusqlite 0.43.0 as newest and migration 2.7.0 as newest; both chosen versions are not yanked.
+The bundled `sqlite3.c` SHA3-256 is
+`e2b869d3003b33c942b7dd7063604fbc53553e1b66609570df39b9b7b558ee81`, matching the
+[SQLite 3.54.1 release](https://sqlite.org/releaselog/3_54_1.html). That match, runtime version, feature
+readback and linkage checks identify the bundle; cargo-deny is not a complete SQLite C security audit.
+
+| Platform, Rust 1.99.1 | Cold build | Expanded probe bytes | Main / heap probe |
+|---|---:|---:|---|
+| macOS arm64 | 17.007 s | 2,707,664 | PASS / PASS |
+| Linux (Docker linux/arm64, native ISA VM) | 27.909 s | 2,511,288 | PASS / PASS |
+| Linux (Docker linux/amd64, emulated) | 54.969 s | 2,682,920 | PASS / PASS |
+
+Every listed build, main probe, separate heap probe and linkage command exits 0; no dynamic SQLite
+appears in `otool -L`/`ldd`. Native macOS standalone fmt and clippy `-D warnings` pass. These are fresh
+standalone targets, default release optimization/strip, offline/locked builds; one run each under
+concurrent host load. Costs are whole expanded-probe costs, not incremental product overhead or
+performance evidence. Linux arm64 is native ISA in a Docker VM on this Mac; amd64 is emulated.
+Neither is independent native Linux hardware or GitHub Linux CI.
+
+[Five-feature evidence and source digests](experiments/sqlite-library/security-features-verification.json)
+supplement the unchanged historical `verification.json` at source `1c72fef`. The original SQLx
+comparison and three-feature costs below remain historical; SQLx was not re-audited here.
+
+**Delivery BLOCKED.** After fetch, `origin/main` is still `fb6a1e1`; PR92/root/MCP fixture corrections
+are not ancestors. Lead convergence `tsk_KPH2_ni` and successor `tsk_T09HVD_` explicitly withhold
+root/base acceptance: retained root ordinary 694 passed / 2 failed / 2 ignored and MCP fast
+7543 passed / 1 failed / 7 ignored remain red. A conditional code/security review is not acceptance.
+No authorized new prerequisite permits broad checks or publication. Therefore this continuation did
+not run workspace fast, ordinary Pre-PR checks or pr, push, open a PR, or claim final-head Linux CI.
+The local audit can be reviewed, but entry C is not delivered. Future delivery needs actual accepted
+fixtures/base, all required native checks and final-head PR/CI evidence; the owner merges.
+
+## Historical three-feature comparison and library-first check
 
 | Check | Chosen: rusqlite 0.41.1 | Alternative: SQLx 0.9.1 |
 |---|---|---|
@@ -35,7 +112,7 @@ line is assumed. Recheck releases, the SQLite bundle and advisories before imple
 FTS5 is compiled by libsqlite3-sys's bundled build; no separate rusqlite `vtab` feature is needed
 to execute FTS5 SQL. STRICT requires SQLite 3.37 or later.
 
-**Dependency check: PASS.** With cargo-deny 0.20.2, both `cargo deny check` on the baseline
+**Historical three-feature dependency check: PASS.** With cargo-deny 0.20.2, both `cargo deny check` on the baseline
 and the same check on a disposable full workspace with both chosen dependencies connected to
 `orch-infra` exited 0: `advisories ok, bans ok, licenses ok, sources ok`.
 The repository's `deny.toml` was unchanged, including its Linux target, all-features setting,
@@ -58,9 +135,11 @@ read to establish the snapshot; keep all statements of that operation on that co
 Set WAL on the writer; set foreign keys, synchronous mode and busy timeout as appropriate on
 every connection. Open readers with `SQLITE_OPEN_READ_ONLY`; `query_only` alone is not the boundary.
 
-An async timeout does not stop a running `spawn_blocking` closure. Implement the specified
-30-second read limit with a SQLite interrupt handle and a retained job handle;
-wait for rollback before returning that connection to the pool. Backpressure and shutdown
+An async timeout does not stop a running `spawn_blocking` closure. For R127, interrupt a pooled
+read only when its snapshot is older than 30 seconds and measured uncheckpointed WAL backlog
+exceeds 256 MiB; WAL file length alone is not that backlog. Use a SQLite interrupt handle and
+a retained job handle; wait for rollback before returning that connection to the pool. The separate
+R130 diagnostic-query connection has its own 5-second progress-handler bound. Backpressure and shutdown
 must drain/join the owned work. Scheduling and event/claim latency remain entry step D's measurement.
 
 Run numbered, immutable, forward-only SQL migrations at start, after acquiring the data-directory
@@ -86,7 +165,7 @@ Production backup also needs deadlines/retry bounds and coordination of blobs/re
 alone does not prove the phase's complete restorable-point requirement. Long read snapshots retain
 WAL pages, so bound backup/read duration and monitor WAL growth.
 
-## Measured cost and verification
+## Historical three-feature cost and repository verification
 
 Standalone release probes, fresh targets, dependencies fetched before timing, default release
 optimisation and `strip = true`; one run each, not a benchmark distribution. Both use bundled

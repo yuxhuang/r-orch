@@ -1,7 +1,12 @@
+#![forbid(unsafe_code)]
+mod security;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, backup::Backup};
 use rusqlite_migration::{M, Migrations};
 use std::time::Duration;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--heap-limit") {
+        return security::heap_limit();
+    }
     let root = std::path::PathBuf::from(
         std::env::args_os()
             .nth(1)
@@ -130,6 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(m.prepare("SELECT * FROM undo").is_err());
     m.pragma_update(None, "user_version", 3)?;
     assert!(failing.to_latest(&mut m).is_err());
+    security::check(&root)?;
     println!(
         "PASS SQLite {}: STRICT, FTS5, WAL, IMMEDIATE, indexes, WITHOUT ROWID, read-only snapshot, online backup 10 vs live 11, migration rollback/newer refusal",
         rusqlite::version()
