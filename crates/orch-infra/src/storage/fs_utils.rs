@@ -1118,7 +1118,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn an_owner_only_write_is_never_briefly_world_readable() {
+    async fn an_owner_only_write_creates_a_0600_file() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -1134,10 +1134,25 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "got {mode:o}");
+    }
 
-        // And the default path is left to the umask rather than quietly
-        // tightened: a reader checking `state.json`'s mode should see the
-        // ordinary thing, or this change is wider than it claims to be.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ordinary_write_preserves_normal_file_creation_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Compare under the same inherited umask: normal creation can itself
+        // yield 0600, so that mode alone does not imply explicit tightening.
+        let control = dir.path().join("control.yml");
+        tokio::fs::write(&control, "k: v\n").await.unwrap();
+        let control_mode = tokio::fs::metadata(&control)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+
         let open = dir.path().join("ordinary.yml");
         atomic_write(&open, "k: v\n").await.unwrap();
         let open_mode = tokio::fs::metadata(&open)
@@ -1146,9 +1161,9 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
-        assert_ne!(
-            open_mode, 0o600,
-            "atomic_write should not be setting an owner-only mode of its own accord"
+        assert_eq!(
+            open_mode, control_mode,
+            "atomic_write should preserve normal file creation permissions"
         );
     }
 
