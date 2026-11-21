@@ -15,11 +15,17 @@ fixed by the merge of the PR that carries this corrected text.
 Where this text stands. The first-review text of this spec, of its plan and of ADR 0017 reached `main` on
 2026-11-21, when the owner merged the PR that carried it at revision `f5637805`. That text is the draft as
 it stood before the reviews: it ends at R100 and AP13, and holds none of the rows added after the security
-review and the red team (R101 to R136, AP14 to AP20) and none of the owner's answers. This text replaces
+review and the red team (R101 to R140, AP14 to AP20) and none of the owner's answers. This text replaces
 it through a follow-up PR and is pending until the owner merges that PR. The record holds no word of the
 owner that the first merge approves this spec, confirms an answer, fixes a name or releases product work,
 and this spec reads it as none of those: the status stays `draft`, ADR 0017 stays proposed, and the
 conditions of the answers D1 and D8 are unchanged.
+
+This revision also carries the owner's ruling of 2026-11-21 on what a miss of the revised budget selects
+(AP13, "Event measurement"), and the corrections that the reviews of 2026-11-21 asked for: R137 to R140,
+the verdict, host and platform rules of "Event measurement", and three corrections of fact. The owner
+allowed those corrections to be written in one pass. That word accepts no finding, method, number or
+result, and no review has read them yet.
 
 ## Source
 
@@ -165,7 +171,8 @@ Read from the code at `fb6a1e1` (v1.0.0) unless marked unverified.
 Test names are the names the implementing PR creates. A PR may choose another name only by editing this table in
 the same PR. "Both" means macOS and Linux CI. Requirements marked "(O*n*)" or "(AP*n*)" rest on that point.
 The owner has answered each; "Owner's answers" says what the owner still holds, which is the numbers and
-results of AP13 and the fifth point of AP14. The documents of the other entry steps named here
+results of AP13 and the fifth point of AP14, and names a third thing that lies outside the answers: the
+owner's word on using the live copy for plan task T4c (AP8). The documents of the other entry steps named here
 (`docs/storage-v1-conformance.md`, `docs/storage-order-dependent-reads.md`, `docs/sqlite-library.md`,
 `docs/sqlite-event-throughput.md` and the lease prototype's report) arrive in their own PRs; until those merge,
 their names are forward references.
@@ -234,7 +241,7 @@ their names are forward references.
 | R60 | The `blobs.sweep` job shall delete a blob only when no row has named it for 7 days, and shall remove files in `blobs/tmp/` older than 24 hours. | L | must | `maintenance::unreferenced_blob_is_deleted_after_seven_days`, `::a_referenced_blob_is_never_deleted`; both |
 | R61 | Run events shall be stored with a per-run sequence number from 1, read by range and by tail from an index, and a batch the daemon had to drop shall leave a row in `run_event_gaps`. | M | must | `crates/orch-engine/tests/run_events.rs::events_are_numbered_from_one`, `::tail_read_returns_the_last_n`, `::a_dropped_batch_leaves_a_gap`; both |
 | R62 | The `events.prune` job shall delete the events of a run that finished successfully more than `retention.events.success_days` (90) ago or otherwise more than `retention.events.failed_days` (365) ago, shall skip a class set to `never`, shall record `events_pruned_at` and `events_pruned_count` on the run, and shall never delete a run, a result or a blob named by one. | M, B10 | must | `maintenance::events_are_pruned_by_outcome_and_age`, `::never_disables_pruning`, `::results_survive_pruning`, `::an_interrupted_prune_resumes`; both |
-| R63 | Events shall be stored in SQLite only when the revised measurement of "Event measurement" has passed on macOS and on native Linux hardware and the owner has accepted its budget and its results. A valid miss of a mandatory cell shall select the event fallback of "Writer lanes", behind the same port operations. The first run's budget, samples, figures and FAIL verdict shall be kept as they are: no later figure shall replace them, be pooled with them or be reported without them. Every repetition that counts shall contain completed checkpoints by the production rule (R126) while traffic runs, with the claims around each checkpoint reported apart; a run without them is incomplete and never a pass. Whichever path ships shall itself be measured as built (the port, the writer, the checkpoint job and the shipped collector's settings) by the same method and against the same budget, on macOS and on native Linux hardware, before its PR merges; a path that misses goes back to the owner and is not shipped on a restated budget. No number of the revised budget is accepted until the owner says so. (AP13) | G7, D; the owner's direction on AP13; red team W2, W2-R1 | must | The record of R5, with every figure of the first run kept; the record of the revised measurement and of the path that ships (`docs/sqlite-event-throughput.md`, the method and its cells frozen before the run, each repetition's checkpoints listed); the owner's acceptance of the numbers, recorded in "Owner's answers"; if the fallback ships, the `storage_conformance` event scenarios pass on it; macOS and native Linux hardware |
+| R63 | Events shall be stored in SQLite only when the revised measurement of "Event measurement" has passed on macOS and on native Linux hardware and the owner has accepted its budget and its results. Every miss of the revised budget shall be kept and reported, whatever follows from it. A miss shall select the event fallback of "Writer lanes", behind the same port operations, only when it is attributable to events: a miss in a population that holds no events (cell C0, or the claims of a burst alone) and a miss that only one platform shows shall select no event path and go back to the owner, the second even when its population holds events ("Event measurement", "What a miss selects"). That is the owner's ruling of 2026-11-21, which amends the sentence "If the revised budget also fails, the file fallback applies" of the direction of 2026-11-20. The first run's budget, samples, figures and FAIL verdict shall be kept as they are: no later figure shall replace them, be pooled with them or be reported without them. Every repetition that counts shall contain completed checkpoints by the production rule (R126) while traffic runs, with the claims around each checkpoint reported apart; a run without them is incomplete and never a pass. Each data set shall get its verdict by the one rule of "Event measurement" ("The verdict"), with its axes reported apart, and a repetition measured on a host that was not idle ("The host") shall never count toward a pass and shall never remove a miss. Whichever path ships shall itself be measured as built (the port, the writer, the checkpoint job and the shipped collector's settings) by the same method and against the same budget, on macOS and on native Linux hardware, before its PR merges; a path that misses goes back to the owner and is not shipped on a restated budget. No number of the revised budget is accepted until the owner says so. (AP13) | G7, D; the owner's direction on AP13 and the owner's ruling of 2026-11-21 on what a miss selects; red team W2, W2-R1, O1, O2 and O5; the method challenge MC1 to MC3 and MC8; the resilience review F4 | must | The record of R5, with every figure of the first run kept; the record of the revised measurement and of the path that ships (`docs/sqlite-event-throughput.md`, the method and its cells frozen before the run, each repetition's checkpoint calls with their outcomes, its host record and its verdict axes listed); the owner's acceptance of the numbers, recorded in "Owner's answers"; if the fallback ships, the `storage_conformance` event scenarios pass on it; macOS and native Linux hardware |
 | R64 | `orch import` shall open every source file read-only and create, change or delete nothing under the source `.orchestry/`. | N, B2 | must | `crates/orch-cli/tests/import.rs::source_tree_is_byte_identical_after_import` (content and metadata snapshot; source made read-only); both |
 | R65 | `orch import --dry-run` shall write nothing anywhere and shall report the counts per entity, every file it cannot read, every source entry that a budget of "Import bounds" refuses (with the rule, the limit and what was observed), every task id and workspace name that R117 refuses, every workspace that no task names, every unknown key, every dangling reference, every field over 64 KiB, the policy it would turn on, the in-flight state it would close, every in-flight entry that R119 refuses (`in_flight_live`, `in_flight_remote`), every entity whose index entry differs from its file and every index it cannot use (R122), and the space it needs. For each class it shall say whether the import stops there (R123). | N, O7 | must | `import::dry_run_writes_nothing`, `::dry_run_report_lists_every_problem_class` (pathology corpus, with the hostile corpus of "Import bounds"); both |
 | R66 | `orch import` shall read its source in bounded memory and bounded transactions, refuse a source file over the byte bounds in "Import bounds" (R109 has the budgets inside a document, R111 the event lines and the counts), and commit an entity and its `import_manifest` row together. | N; security review S1 | must | `import::memory_stays_bounded_on_a_large_project` (generated corpus of the live project's shape), `::oversize_source_file_is_refused_by_name`; both |
@@ -308,6 +315,10 @@ their names are forward references.
 | R134 | A request key shall not apply to an operation that issues, rotates or enrols a credential, whatever its class: 1.1 has none, the catalogue's class test shall fail when one is added without this exclusion, a key sent with one shall be refused as `invalid_arguments`, and the client shall not resend it. A principal that is expired, revoked or not allowed the operation shall be refused before any stored result is looked up. A stored result shall be found only by its whole scope (identity, project, run, epoch, key). | Security review S8 | should | `ops_request_keys::a_key_is_not_shared_across_identity_project_run_or_epoch`, `::lease_fields_in_a_request_are_ignored`, `::a_refused_principal_gets_no_replay`, `crates/orch-proto/tests/catalogue.rs::credential_operations_are_excluded_from_request_keys`; both |
 | R135 | When the directory that holds the nearest `.orch-project` lies below `.orchestry/workspaces/` of an ancestor whose own `.orch-project` holds the same id, the client shall take the ancestor as the project: a pointer that a workspace checkout carries is not a copy of the project (R34). | O1 (the owner's answer and its condition on worktrees); red team, out-of-lane item | must | `crates/orch-cli/tests/project_pointer.rs::a_pointer_inside_a_workspace_resolves_to_the_owning_project`, `::a_pointer_inside_a_workspace_of_another_project_is_still_a_copy`; both |
 | R136 | The README upgrade notes and the manual shall say: that the 1.0 binary stays installed until the import has finished, with the exact command that installs 1.0 beside 1.1, which shall have been run as written (where an install method the README offers has no such command, the notes shall say so for that method and give the steps that keep the 1.0 binary before the upgrade, and the red team's finding I4 goes back to the owner); that an untouched copy of `.orchestry/` is taken before a refused source file is repaired, since that directory is the way back; what going back loses (everything done under 1.1) and that this grows with time; that a 1.0 daemon must not be started on an imported project, and what R121 does when one was. The RUNBOOK shall say never to open `orch.db` for writing and to use `orch db query`, that a reader outside the daemon holds the write-ahead log and that its file keeps its length until the daemon's connections close, what `storage_unavailable` means and what to do, and that a backup copied out of the data directory has left its protection. | Red team I2, I4, W3 and condition C3 of its closure; security review S4 | must | Fact check of each document against the code at the candidate commit, as R88; the install command run as written on a machine that has 1.1 installed, after which both binaries report their versions (recorded check); macOS |
+| R137 | Every call of the `wal.checkpoint` job shall be recorded with what started it (`timer`, `size` or `shutdown`) and with one outcome, read from the call's result and its two frame counts, the frames in the log and the frames copied so far, against the counts before the call: `copied_all` (the call succeeded, copied at least one frame, and no frame of the log is left); `copied_part` (it succeeded and copied at least one frame, and frames are left, as when a read holds them back or commits arrived during the call); `nothing_to_copy` (it succeeded and the log held no frame that was not copied); `held_back` (it succeeded, copied none, and frames are left); `busy` (`SQLITE_BUSY` or `SQLITE_LOCKED`); `failed` (any other result). The frames that a call copied are the difference of its own counts within one generation of the log and never a running total; where that difference cannot be told, the outcome shall be recorded as `unknown` and no copy shall be credited. A completed checkpoint, for R126's timer, is a call that succeeded, whatever it copied and whichever rule started it: the 5 minutes count from its end, so a call that the size rule started moves the next timer call. A `busy` or `failed` call is not completed and moves no timer; the job shall try again at a later look, never sooner than 1 s after the call's end. At a look that finds the backlog at 64 MiB or over, the call is a `size` call even when the timer is due as well. No call shall be made to bring about an outcome or to learn the backlog (R126). | The method challenge MC2 (what "completed" means for the timer was not said, and a call that the size rule starts moves the timer); R126 | must | `sqlite_writer::a_checkpoint_call_is_recorded_with_its_trigger_and_outcome` (one case for each outcome, the counts injected), `::a_repeated_running_total_credits_no_second_copy`, `::a_size_call_moves_the_timer`, `::a_busy_or_failed_call_moves_no_timer_and_is_tried_again`, `crates/orch-engine/tests/maintenance.rs::a_due_timer_at_64_mib_is_recorded_as_a_size_call`; both |
+| R138 | `orch db restore` shall change the data directory only by the steps of "`orch db` commands" ("How a restore replaces the state"), in their order: (1) before anything is written, the checks of R76, R78, R100 and R117, and free space of at least the backup's size by its manifest above the disk floor (B11); (2) the whole restored state built under a scratch name in the data directory: the database, copied and checked against the manifest and then given, in one transaction, its new lineage and generation (R77) with every lease of the backup ended and its run closed (R100), and with it the blobs, the repositories, an empty spool and the `generation` file, all of it synced and the database closed with no log left; (3) a marker, `restore-in-progress`, written and synced, that names the scratch directory, the directory for the replaced state and the direction `forward`; (4) the replaced state moved aside and the staged state moved in, by renames inside the data directory in the stated order, with the directory synced after each; (5) the marker removed last. While the marker exists the daemon and every offline command except `orch db restore --continue` and `orch db restore --abandon` shall refuse to start, change nothing, exit 1 and name the marker and both commands. `--continue` shall finish the steps from whatever a stop left and give the state that an uninterrupted restore gives. `--abandon` shall record the direction `back`, synced, before its first rename, put every part of the replaced state back byte for byte, and remove the scratch directory and the marker. Either may itself be stopped and run again. A stop, a failed copy or a full disk before the marker shall leave the live state unchanged; a scratch directory without a marker shall be removed, unread, by the next command or start. At no step shall a database stand at its live name with a backup's leases active, or beside blobs or repositories of the other state, without the marker. R117's clause for a workspace that already stands is not built before the fifth point of AP14 is ruled, and nothing here decides it. | The resilience review F1 (a restore stopped between its replacements left a database beside the other state's blobs with the lock released, and nothing stopped a start); G3, G9 | must | `db_backup_restore::a_restore_killed_at_every_step_leaves_a_refused_or_complete_state` (a child is stopped before and after every copy, sync and rename; afterwards either the live state is unchanged, or the marker stands and a start is refused, or the restore is complete), `::a_continued_restore_equals_an_uninterrupted_one` and `::an_abandoned_restore_leaves_the_replaced_state_byte_identical` (each also stopped at every step of its own), `::restore_refuses_without_space` (free space one byte under the need; nothing is written), `::a_failed_copy_while_staging_changes_nothing`, `::the_staged_database_has_the_new_lineage_and_no_active_lease_before_the_swap`, `crates/orch-daemon/tests/daemon_data_dir.rs::a_start_is_refused_while_a_restore_marker_exists`, `crates/orch-cli/tests/db_offline.rs::offline_commands_refuse_while_a_restore_marker_exists`; both |
+| R139 | `orch daemon stop`, and a signal that asks the daemon to stop, shall end the daemon within a bound and in this order: (1) admission closes: a new request is answered `shutting_down`, no claim is granted, and the maintenance timer starts no job; (2) the transaction in progress commits or rolls back, and a job in progress queues nothing more (R26); (3) the collectors hand over what they hold, and the writer takes what is queued in the order of its lanes until the drain's deadline; (4) at the deadline a transaction that is still being retried (R128) is rolled back and given up: a request is answered and never committed afterwards, a finish stays in its spool (R129), and for every run with events handed over and not committed the first and the last of their numbers are written, synced, to `spool/events-at-stop`, from which the next start writes that run's row of `run_event_gaps` (R61) before the run's events are numbered further; (5) reads still open are interrupted, a checkpoint call in progress is left to return and no other is started; (6) the lock is released last, by the process ending. The file holds the lineage; one of another lineage, or one that fails its check, is removed and counted, as R129 says of a finish file. Events that are neither committed nor recorded there, because that write failed as well, shall be named by run in the stop's report, as R129 names a finish. The stop shall end at its bound whatever is still in progress, and that shall lose nothing that is committed, spooled or recorded. Proposed and not measured: 10 s for the drain, counted from the request; 5 s more for the reads and the checkpoint call; 20 s for the whole stop. This requirement covers a stop that was asked for and changes nothing in what a stop does to a run's process. | The resilience review F2 (the answers to O5 and D4 name a bounded shutdown, and no requirement stated its order, its bound or what becomes of queued events); O5, D4 | must | `crates/orch-daemon/tests/daemon_storage_failure.rs::stop_is_bounded_while_the_writer_retries` (a second connection holds the write lock; fake clock), `::stop_follows_its_order` (each step is recorded), `crates/orch-engine/tests/run_events.rs::events_queued_at_stop_are_committed_or_left_as_a_gap`, `::a_gap_recorded_at_stop_is_written_at_the_next_start_before_new_numbers`, `::events_neither_committed_nor_recorded_are_named_by_the_stop`; both |
+| R140 | The failure policy shall cover every connection that the daemon holds on the live database, by the table of "Writer lanes" ("When another connection fails"). `SQLITE_CORRUPT` or `SQLITE_NOTADB` on any of them (a pooled read, the checkpoint connection, the query connection of R130, the connection a backup or an export reads through) shall fail the writer at once, as R128's fatal class does, with the connection and the result named, and no checkpoint shall be called afterwards. A corrupt backup, export or import file is that command's own refusal and is not this. Any other failed result on those connections shall be returned or recorded where it occurred and counted by kind of connection, the connection shall be opened afresh, and the writer shall not fail for it. `daemon.status`, `orch status` and `orch doctor` (exit 1) shall report, from memory: three checkpoint calls in a row that ended `busy` or `failed` (R137); a backlog that has stayed over R127's 256 MiB for more than 5 minutes, with the backlog, the time, the age of the oldest read and the last call's outcome; three failed reads in a row on the pool; and the last failed backup, export or query with its result. A report shall end when its condition does. The counts and the times are proposals that no measurement backs. | The resilience review F3 (R128 classed the writer's transactions alone: corruption first seen by a checkpoint was a recorded figure while the writer went on committing, and a checkpoint that failed every time showed only when the disk floor tripped); D4 | must | `sqlite_writer::a_corrupt_result_on_the_checkpoint_connection_fails_the_writer`, `::a_corrupt_result_on_a_read_connection_fails_the_writer`, `::a_corrupt_result_on_the_query_or_backup_connection_fails_the_writer` (the result is injected at the connection named), `::other_failures_off_the_writer_are_counted_and_do_not_fail_it`, `crates/orch-daemon/tests/daemon_storage_failure.rs::three_failed_checkpoints_in_a_row_are_reported`, `::a_backlog_over_its_ceiling_for_five_minutes_is_reported` (fake clock), `::a_report_ends_with_its_condition`, `crates/orch-cli/tests/db_backup_restore.rs::a_corrupt_backup_file_fails_the_command_and_not_the_writer`; both |
 
 ## Storage port v2
 
@@ -468,7 +479,9 @@ beside the 50 ms, the 1 s and the collector's 256 events or 250 ms.
 
 **Checkpoints** (R126, R127). The writer never checkpoints in a commit: automatic checkpointing is off on
 its connection. The `wal.checkpoint` job runs passive checkpoints on a connection of its own, which SQLite
-allows beside a writer, 5 minutes after its last completed one or when the backlog reaches 64 MiB.
+allows beside a writer, 5 minutes after its last completed one or when the backlog reaches 64 MiB. A
+completed one is any call that succeeded, whichever rule started it and whatever it copied; R137 names the
+outcomes of a call and says which of them move the timer.
 
 - **The backlog is not the file.** The backlog is the frames in the log that no checkpoint has yet copied
   into the database, times the page size. The `-wal` file is something else: SQLite uses it again from the
@@ -509,6 +522,23 @@ allows beside a writer, 5 minutes after its last completed one or when the backl
 The times are proposals. A logic error (a stale revision, a constraint) is the request's own answer and is
 not in this table.
 
+**When another connection fails** (R140). The writer is not the only connection on the live database: the
+pool reads, the checkpoint job has a connection of its own, `orch db query` has one (R130), and a backup or
+an export reads through one.
+
+| Seen on | Result | What follows |
+|---|---|---|
+| Any of them | `SQLITE_CORRUPT`, `SQLITE_NOTADB` | The writer fails at once, as in the fatal class above, and the report names the connection and the result. No checkpoint is called afterwards |
+| The checkpoint connection | A call ends `busy` or `failed` (R137) | No timer moves, and the call is tried again at a later look. Three in a row are reported until a call succeeds |
+| The checkpoint connection | Calls succeed, and the backlog stays over 256 MiB for more than 5 minutes | Reported with the backlog, the time, the age of the oldest read and the last call's outcome, until the backlog is under the limit |
+| A pooled read | Any other failure | The request gets the error and the connection is opened afresh. Three in a row across the pool are reported until a read succeeds |
+| A backup, an export, `orch db query` | Any other failure | The command fails and says why, and the last such failure is shown |
+
+The reports are made from memory by `daemon.status`, `orch status` and `orch doctor` (exit 1), as the failed
+writer's is. A corrupt backup, export or import file is not the live database and is that command's own
+refusal. The threes, the 5 minutes and the use of R127's 256 MiB here are proposals with no measurement
+behind them. None of these is an attention item: 1.1 has two kinds and adds none (R81).
+
 **Finish spool** (R129). `spool/finish/<name>` holds one finish until its transaction commits. The name is
 the lower-case hex SHA-256 of `orch-finish-file-v1`, a zero byte, and the project id and the run id each
 preceded by its length as eight big-endian bytes, as R101 builds an event file's name; for project
@@ -521,6 +551,18 @@ ends that run as 1.0 does. And the spool write can itself fail, most likely on a
 is retrying for the same reason: the daemon then keeps the finish in memory, keeps trying both the file and
 the commit, grants no claim, and reports the count; if the owner stops the daemon before either succeeds,
 the stop names the run and that result is lost.
+
+**Stopping** (R139). A stop is ordered and bounded. Admission closes first; the transaction in progress
+ends; the writer takes what is queued until the drain's deadline; and what is still uncommitted then is
+left in a form that the next start can use: a finish in its spool (R129), and for events the range of
+their numbers in `spool/events-at-stop`, which the next start turns into a gap row (R61). Reads are then
+interrupted, a checkpoint call in progress is left to return, and the lock goes last. The proposed times
+are 10 s for the drain, 5 s more for the reads and the checkpoint call, and 20 s for the whole stop; none
+is measured. The stop ends at its bound whatever is still running, which is safe because committed work
+is in the log and the next start reads the log again. One more loss is stated: events that are neither
+committed nor recorded, because the file's write failed as well, are named by run in the stop's report.
+R139 covers a stop that was asked for. What the collectors of a killed daemon held is outside it and is
+not changed here.
 
 **Claim-latency budget** (deliverable D, gate line 7, AP13). There are two budgets, and neither replaces
 the other.
@@ -543,9 +585,11 @@ anew, and set no numbers; the answers of 2026-11-21, which settled every other p
 stood. "Event measurement" is the proposal: a workload nearer to real load, 200 ms at the
 99th percentile and 1,000 ms at the worst, and a method in which every repetition contains the production
 checkpoint. Its numbers are proposed and not accepted. The proposal and the results of its run go back to
-the owner together, and until the owner has accepted both, gate line 7 is unproven. A valid miss selects the
-event fallback, which is then measured the same way; whichever path ships is measured as built before its
-PR merges (R63). A green test suite is not a performance result.
+the owner together, and until the owner has accepted both, gate line 7 is unproven. Every miss is kept. A
+miss selects the event fallback only when it is attributable to events, by the owner's ruling of
+2026-11-21; a miss without events, or on one platform alone, selects no event path and goes back to the
+owner ("Event measurement"). A fallback that is selected is then measured the same way, and whichever
+path ships is measured as built before its PR merges (R63). A green test suite is not a performance result.
 
 **Event fallback** (R63, AP13). The goal names it: append-only files behind the blob-store adapter, with one
 index row for each batch. The port does not change.
@@ -577,7 +621,9 @@ runs, as the owner directed (AP13): method `ap13-realistic-v1`, proposed by the 
 with this spec's commit before the first repetition. Where the two differ this section rules, and the run
 does not start. What this section leaves to the file (the bounds of the harness's queues, 512 claims and
 eight event batches; sampling periods; the layout of results) is fixed there before the run and listed in
-the report, and may change no limit, cell or rule stated here.
+the report, and may change no limit, cell or rule stated here. A protocol file written from an earlier
+revision of this section does not stand for this one: a file written from this text is a new file with a
+new digest, and it is challenged before a repetition runs.
 
 **What the numbers rest on.** The measured inputs are the aggregates of S2 (about 700 MB of events for
 2,538 runs) and the first run's report. They hold no interval, no rate, no concurrency and no peak. The
@@ -610,7 +656,7 @@ Nothing is discarded as warm-up, and the slow claims at the start and the end ar
 | C1 | 1, at 1 event a second | 1 a second | 668 MiB | A small workload |
 | C6 | 6, each at 1 event a second | 1 a second | 668 MiB | The assumed usual load |
 | C24 | 24, each at 1 event a second | 1 a second | 668 MiB | The assumed reserve of concurrency |
-| B24 | 24 aligned: 10 events a second each for the first 5 s of every 60 s, then 1 a second | 1 a second, and 24 more at once at 0, 60, ... 600 s | 668 MiB | An assumed burst that meets the timer checkpoints at 300 s and 600 s |
+| B24 | 24 aligned: 10 events a second each for the first 5 s of every 60 s, then 1 a second | 1 a second, and 24 more at once at 0, 60, ... 600 s | 668 MiB | An assumed burst beyond the usual load: 24 claims at once, four times the six runs of C6. Two bursts fall due at 300 s and 600 s, where timer checkpoints are expected; whether a burst meets a checkpoint is counted and never arranged |
 | H32 | as C24 | 1 a second | 32 MiB | Whether the size of the history matters |
 | K64 | as C24 | 1 a second | 668 MiB, and a backlog of 64 to 80 MiB at the start | The checkpoint that the size rule starts |
 
@@ -624,17 +670,38 @@ transactions. The history is synthetic event payload over 2,538 run keys, seeded
 sizes of the database and the log that result are recorded and not promised. Cells run one after another,
 C0 to K64 in odd repetitions and K64 to C0 in even ones, never two at once and never two platforms at once.
 
-**Checkpoints in every repetition.** This replaces the first run's 12 s cells, in which no checkpoint rule
-of this spec could fire, so that they measured no checkpoint at all (red team W2-R1).
+**Checkpoints in every repetition.** This replaces the first run's 12 s cells. Those ran with SQLite's
+automatic checkpointing on (`wal_autocheckpoint = 1000`), so a checkpoint in them ran inside a commit of
+the writer. That is not the rule of this spec (R126), and no checkpoint of R126's job could occur in them.
+A 12 s cell with automatic checkpointing off, as the diagnosis first proposed, would have held no
+checkpoint at all (red team W2-R1).
 
 - The connections are set as R126 says and as B12 says: the writer with automatic checkpointing off, the
   checkpoint job on a connection of its own, passive, 300 s after its last completed checkpoint or at 64 MiB
   of backlog, looked at once a second. The timer starts with the arrivals. Each connection's settings are
   read back and recorded, with the SQLite version and its compile options.
-- In every cell two timer checkpoints are expected, near 300 s and near 600 s. Both must start and finish
-  before 660 s, with traffic running, and each must copy frames. A repetition in which they do not is kept
-  and fails for coverage. The trigger is not shortened, a failed repetition is not extended, and a
-  checkpoint at shutdown or after the seeding never counts.
+- In every cell two timer checkpoints are expected, near 300 s and near 600 s. A timer checkpoint that
+  counts is a call that the timer rule started (R137), that started after the arrivals began and returned
+  before 660 s with traffic running, and whose outcome is `copied_all` or `copied_part`. A call that the
+  size rule started, a call at shutdown or after the seeding, and a call that ended `nothing_to_copy`,
+  `held_back`, `busy`, `failed` or `unknown` never count as one. The trigger is not shortened, no call is
+  made or moved to obtain coverage, and no repetition is extended.
+- A repetition without two such calls has **incomplete coverage**. That is a result of its own, reported
+  apart, with its reason and with every checkpoint call of the repetition (what started it, its start and
+  end, its outcome and both counts). It is never a pass, never a miss of the budget and no evidence about
+  events. The claims and events of that repetition are judged all the same, and a miss among them stays a
+  miss ("The verdict").
+- The production rule can itself leave a repetition without coverage, and such a run is a valid run of
+  the rule and no fault of the harness. Every completed call moves the timer (R137). If the size rule
+  starts calls that complete at 250 s and at 500 s, the timer is next due at 800 s, after the arrivals
+  end, and the repetition holds no timer checkpoint at all. In K64 the call at the start moves the timer
+  by its own length. And in every cell the second timer call is due 300 s after the first one ends and is
+  seen at the next look, so both fit before 660 s only while the two calls and the two looks take under
+  60 s together. These are consequences of the rule, worked out and not measured. Such a repetition is
+  reported as incomplete coverage with one of the reasons `timer_moved_by_size_call`,
+  `timer_call_copied_nothing`, `timer_call_busy_or_failed` and `timer_call_after_arrivals`, and its cell
+  is incomplete. Whether the coverage rule should change is a question for a new revision of this method,
+  reviewed before it runs; the harness does not answer it, and this revision does not change the rule.
 - K64 also begins with a backlog of 64 to 80 MiB, made before the arrivals start and kept apart from the
   measured counts. The size rule must start a checkpoint at once, on its own connection, while the traffic
   of C24 begins, and that checkpoint must copy at least 64 MiB of frames.
@@ -651,6 +718,12 @@ of this spec could fire, so that they measured no checkpoint at all (red team W2
   judges the worst claim. That is stricter on purpose, the owner should know it, and it is not loosened
   after results exist. A checkpoint too short for any claim to cross it has none that cross, and the
   report says so. A burst's window is the 10 s from its due time.
+- **What is reported about overlap.** For each checkpoint call of a repetition the report gives how many
+  claims have a time from due to commit that crosses the call, and in B24 how many of those are claims of
+  a burst. A count of zero is a result and is written as zero, with the sentence that no claim met that
+  checkpoint. Nothing is arranged to make the two meet: the bursts are due on the minute, the timer runs
+  from the last completed call, and a burst at 300 s or 600 s may be committed before the checkpoint
+  starts. A B24 repetition that passes with a count of zero says nothing about a burst during a checkpoint.
 
 **Statistics.** Each claim is kept with its due, queued, started and committed times. Percentiles are by
 nearest rank and never averaged. The report gives every repetition; the least, the middle and the greatest of
@@ -663,32 +736,165 @@ from the transaction and its commit; and the events older than 1,000 ms at their
 seed 1301) and is descriptive: it excuses no observed miss. Five repetitions that pass are evidence for those
 runs and conditions, not a bound on any other.
 
-| What is observed | What follows |
-|---|---|
-| Every mandatory cell and repetition meets every limit on macOS hardware and on native Linux hardware, and the diagnostics are disclosed | The experiment passes for the proposed budget. The numbers and the results go to the owner; nothing is accepted before the owner answers |
-| A valid mandatory repetition misses a claim, window or event-age limit | The experiment fails. All data is kept. The event fallback is selected, and the fallback as built is measured against this same budget (R63) |
-| A cell, a native platform, a checkpoint that copied frames, the timing check, the identity of the backend, a count, an integrity result is missing, or a resource limit stopped a run | Incomplete, and never a pass. What exists is kept, the defect is fixed in a new data set that names the old one, and nothing is run again until it passes |
-| An event lost or stored twice, a wrong claim outcome, corruption, a commit after a refusal, growth without bound | A correctness defect, whatever the percentiles say; it goes to the builder before any performance result is used |
+**The verdict.** One rule gives every data set its verdict. It is applied to each repetition, then to each
+cell, to each platform and to both platforms together, and it reports four axes side by side. No axis hides
+another, and nothing that was observed is dropped to make an axis look better.
 
-A run that was slow because the machine was busy is valid and stays in the data set. A repetition is
-replaced only when its measurement was invalid for a reason written down, such as the wrong backend; the
-invalid one is kept, and the whole set of five is run again.
+| Axis | Values | What decides it |
+|---|---|---|
+| Correctness | `ok`, `defect`, `unknown` | `defect`: an outcome that is known and wrong: an event lost or stored twice, a wrong claim outcome, a commit after a refusal, corruption, an unexpected error from SQLite, growth without bound. `unknown`: the counts or the integrity result that would show it are absent |
+| Validity | `valid`, `host_not_idle`, `invalid` | `host_not_idle`: a measurement of the declared backend on a host that did not meet "The host". `invalid`: not a measurement of the declared thing at all: the wrong backend or one that is not shown, settings that do not read back, a failed timing check, a platform outside its class |
+| Coverage | `complete`, `incomplete` | `incomplete`: something that must exist is absent or does not count: a cell, a repetition, a required platform, a diagnostic, a timer checkpoint that counts (incomplete coverage), K64's size checkpoint, the host record, a receipt, or a run that a resource limit stopped or that has no end record |
+| Budget | `met`, `missed`, `not judged` | `missed`: something observed exceeded a limit of the proposed budget: a claim, a window, a burst, an event's age, or a claim or an event that was refused or was still queued 10 s after the last arrival. `not judged`: the repetition is `invalid`, or nothing was observed |
+
+A recorded outcome that is wrong and a record that is absent are different things and are never exchanged.
+A scheduled claim with a recorded refusal, or one recorded as still queued at the drain's deadline, is an
+observed outcome and a miss of the budget; it is not taken out of the sample and it is not "missing". A
+claim or an event with no record, in a run that was cut short, is absent: the coverage is incomplete and
+nothing is concluded about it. Counts that disagree with the schedule in a run that ended normally are a
+defect. On a host that was not idle a miss is still `missed`, and a budget that was met is `met` and does
+not count toward a pass. What an `invalid` repetition showed over a limit is listed as observed on invalid
+evidence; it is neither a miss nor a pass.
+
+The headline is the first of these that applies, and every axis is printed with it:
+
+1. `CORRECTNESS_DEFECT`: a repetition, mandatory or diagnostic, has a defect. It goes to the builder before
+   any performance result is used.
+2. `FAIL`: a mandatory repetition that is `valid` or `host_not_idle` has `missed`. When the coverage is
+   also incomplete the headline is `FAIL, INCOMPLETE`, and both stand: the miss is a failure that no later
+   data removes, and the data set is not complete.
+3. `INCOMPLETE`: no defect and no miss, and something is `unknown`, `host_not_idle`, `invalid`,
+   `incomplete` or `not judged`. A budget that was met on a host that was not idle ends here.
+4. `PASS`: every mandatory repetition of every cell on both required platforms is `ok`, `valid`,
+   `complete` and `met`, and every diagnostic is present with its coverage and without a defect.
+
+The program that computes the verdict exits 0 for `PASS`, 1 for `FAIL` with or without `INCOMPLETE`, 2 for
+`INCOMPLETE` and 3 for `CORRECTNESS_DEFECT`; any other exit is that program's own failure and is no
+verdict. Its machine-readable result carries the four axes for every repetition, cell and platform and for
+both platforms together, so an exit of 1 never hides what is incomplete and an exit of 3 never hides a
+miss. A diagnostic's latency decides nothing on the budget axis; a diagnostic that is absent or lacks its
+coverage makes the coverage incomplete.
+
+What is incomplete is kept. The defect is fixed in a new data set that names the old one, and nothing is
+run again until it passes. A repetition is replaced only when its measurement was `invalid` or
+`host_not_idle` for a reason of this section, written before the run; the replaced one is kept with
+everything it showed, and the whole set of five is run again. A miss is never replaced: it stays in every
+report beside any later data set, and after a `FAIL` no further data set is started without the owner's
+word.
+
+**What a miss selects.** The owner ruled on this on 2026-11-21, and the ruling amends one sentence of the
+direction of 2026-11-20, "If the revised budget also fails, the file fallback applies". In the ruling's
+terms: every miss is kept and reported; a miss of the revised budget selects the file fallback for run
+events only when it is attributable to events; a miss that occurs without events (claims alone, C0, a
+burst alone) or on one platform alone selects no event path and goes back to the owner for a decision.
+The rule below applies those words and adds no test of cause to them. It does not require that C0 of the
+same block pass, it adds no cell that holds a burst without events, and it does not claim that a miss it
+lets through was caused by events.
+
+A path is selected only from a data set that is complete on both required platforms. Until then none is
+selected, and a miss already observed stays a failure. Then, in this order:
+
+1. The headline is `PASS`: SQLite is the candidate for events. The numbers and the results go to the
+   owner, and nothing is accepted before the owner answers.
+2. A miss in a population that holds no events selects no event path, and the whole result goes back to
+   the owner. Such a population is every limit of C0, and in B24 a repetition in which every claim over a
+   limit was due inside a burst's 10 s window and no event is over its age. A burst's 24 claims are
+   committed one transaction each whether events exist or not, and no cell holds the burst without events,
+   so a miss in the bursts alone is not told apart from a miss of claims alone.
+3. A miss that only one platform shows selects no event path and goes back to the owner, even when its
+   population holds events. A cell's miss is shown by both platforms when each has a valid mandatory
+   repetition of that cell that missed.
+4. A miss on a host that was not idle is kept as a failure and selects no event path: it is not a valid
+   timing sample ("The host"). It goes back to the owner with the host's record.
+5. What is left is a valid miss in a population that holds events, which both platforms show, in a data
+   set that holds no miss of steps 2 to 4. The file fallback is selected, and the fallback as built is
+   measured against this same budget (R63). No figure shows that it is faster.
+
+Three things in those steps are this spec's reading where the ruling's words stop, and each sends more to
+the owner and less to the fallback: what "a burst alone" is in a cell whose bursts come with events; that
+"one platform alone" is judged cell by cell; and that one miss of steps 2 to 4 anywhere in the data set
+returns the whole choice to the owner. The owner confirms or changes them with the rest of this text.
+A diagnostic selects nothing.
+
+Cases that the rule must give, each with every other limit met and every other part complete:
+
+| Case | Headline and exit | Path |
+|---|---|---|
+| macOS is complete and valid and one C24 repetition has a claim at 1,200 ms; Linux has not run | `FAIL, INCOMPLETE`, 1 | None: a platform is absent |
+| C0 has a claim at 240 ms in a small checkpoint window, on both platforms | `FAIL`, 1 | None: no events; to the owner |
+| In B24 one burst claim is at 201 ms in its window of 34 claims, on both platforms | `FAIL`, 1 | None: a burst alone; to the owner |
+| C24 misses on macOS; Linux is complete and met everything | `FAIL`, 1 | None: one platform; to the owner |
+| C24 misses in valid repetitions on both platforms; C0 and the bursts met everything | `FAIL`, 1 | The file fallback |
+| C24 misses on both platforms, and C0 misses on one | `FAIL`, 1 | None: to the owner |
+| Everything met; one repetition's host was not idle | `INCOMPLETE`, 2 | None |
+| C24 misses on both platforms, in repetitions whose host was not idle | `FAIL`, 1 | None: to the owner, with the host's record |
+| The size rule's calls complete at 250 s and 500 s and no timer call occurs; every limit met | `INCOMPLETE`, 2, with the reason `timer_moved_by_size_call` | None |
+| The same, with one claim at 1,200 ms | `FAIL, INCOMPLETE`, 1 | None: the data set is not complete |
+| A scheduled claim has a recorded refusal | `FAIL`, 1 | By steps 2 to 5 |
+| A run is stopped at 512 MiB before its end record, and three claims have no record | `INCOMPLETE`, 2 | None |
+| An event is stored twice | `CORRECTNESS_DEFECT`, 3 | None |
+| A diagnostic of 10 events a second has an event older than 5,000 ms; the mandatory cells pass | `PASS`, 0, with the diagnostic disclosed | SQLite is the candidate |
+
+**The host.** A timing sample is valid only on a host that was idle by a rule written before the run. That
+is decision 22 of ADR 0013; this section follows it and does not amend it. The first run's report says
+that its host was shared with other builds, and nothing here reads that run differently.
+
+- Each repetition and each timing check runs while the harness holds the repository's host lease
+  exclusively, taken in the ordinary way and waited for within its ordinary bound (ADR 0013 decision 21).
+  The lease is cooperative, and holding it does not show that the host is idle, so the host is sampled too.
+- Sampled every 15 s, from before the arrivals start to the end of the drain, as the gate samples: the
+  one-minute load average, and the number of build processes (`cargo`, `rustc`, `rustdoc`,
+  `clippy-driver`, `cargo-nextest`) that do not descend from the harness. Recorded as well, at the start
+  and at the end: the power source, the thermal state where the platform reports one, and the device and
+  the filesystem of the scratch directory.
+- A repetition's host is **idle** when every sample is present, no sample shows a foreign build process,
+  and no sample's load is above half the number of logical CPUs that the process may use. It is **not
+  idle** when a sample breaks either limit, and it is treated as not idle when a sample is absent or the
+  sampler stopped. Proposed and not measured: the 15 s, the half, and the list of process names. ADR 0013
+  leaves the load threshold to the performance engineer, to be declared before the measurement; the half
+  is that declaration as proposed, and the owner has not ruled on it.
+- A repetition on a host that was not idle is kept whole, with its samples. If it met the budget it does
+  not count toward a pass, and its cell is incomplete. If it missed, the miss stands: it is reported as a
+  failure, it is never removed, averaged away or replaced by a later repetition, and it selects no event
+  path ("What a miss selects"). The record gives the greatest load and the greatest count and names no
+  cause: a miss beside a high load is not shown to be caused by the load.
 
 **Diagnostics, which decide nothing.** Three repetitions of 660 s each, with the same checkpoint coverage,
 reported against both budgets: C24 with a batch window of 10 ms and of 200 ms; C24 at 10 events a second
 for each stream; C24 with `synchronous = FULL`; and C24 with one read held open from 295 s to 325 s. None
 can rescue a mandatory miss or add one. A diagnostic that shows starvation, loss, corruption or growth
-without bound goes to the lead and the owner even when the mandatory cells pass.
+without bound goes to the lead and the owner even when the mandatory cells pass. A diagnostic without its
+coverage is reported as incomplete coverage like any repetition. The cell at 10 events a second writes the
+most and is the likeliest to have the size rule move its timer; whether it does is not known before it runs.
 
 **The timing check.** Before each platform's block, a 10 s case with one claim a second holds the writer
 for 1,500 ms at 1 s. The claim it delays must be reported over 1,000 ms and the counts must agree. A
 platform whose check fails is not measured.
 
-**Platforms and limits.** macOS hardware, and Linux hardware that is not the same machine, each on a local
-disk. A Linux container on the macOS machine may be reported as a third result under its own name; it is a
-virtual machine on that hardware and never stands for the Linux host. With no such host the result is
-incomplete, not passed. The build is the pinned toolchain with the library of ADR 0017 decision 19, in
-release mode, and its versions and digests are recorded. The entry experiment is the standalone harness and
+**Platforms and limits.** Two platforms are required. Each is named in the record with the evidence for
+its class, and a platform whose class is not shown is unknown and leaves the result incomplete.
+
+- *macOS hardware*: macOS running directly on Apple hardware and not in a virtual machine, with the
+  scratch directory on the machine's internal storage and on a local filesystem. An external or a network
+  volume does not qualify, and where the repository lies decides nothing about the scratch directory.
+- *Native Linux hardware*: a Linux kernel running directly on a physical machine that is not the macOS
+  machine, with no hypervisor between the kernel and the hardware. A guest of any virtual machine, a
+  container on such a guest and a CI runner do not qualify, whatever they are called; a rented machine
+  qualifies only when it is a whole physical machine. The scratch directory is on a block device attached
+  to that machine and on a local filesystem: not a network, overlay, loop or memory filesystem. The
+  harness runs on that kernel, outside any container that limits its CPUs, its memory or its I/O.
+- *Evidence, recorded before a platform's first repetition*: the kernel or system build, what the system
+  reports about virtualisation, the CPU model and the number of logical CPUs, the memory, any CPU or
+  memory limit on the process, and the device, the filesystem and the mount options of the scratch
+  directory. A name in a list of machines or of agents is not evidence.
+
+These classes are this spec's reading of "macOS hardware" and "native Linux hardware" in R5, R63 and the
+answer D6, and they are proposed with the method. No native Linux host has been named. A Linux container
+on the macOS machine may be reported as a third result under its own name; it is a virtual machine on that
+hardware and never stands for the Linux host. With no such host the result is incomplete, not passed, and
+a miss that macOS has shown stays a failure meanwhile ("The verdict").
+
+The build is the pinned toolchain with the library of ADR 0017 decision 19, in release mode, and its versions and digests are recorded. The entry experiment is the standalone harness and
 names its backend `experiment`; R63's run of the path that ships names it `production` and refuses to start
 on anything else. A repetition is stopped at 1,200 s with its setup, at 512 MiB resident or at 4 GiB of
 scratch; it needs 10 GiB free at its start, and the disk floor of B11 holds throughout. The process runs
@@ -795,6 +1001,9 @@ workspace, 7 no usable daemon. No exit code is added.
     tmp/                         0700   file names generated by the daemon
   repos/                         0700   empty before 1.5
   spool/finish/<name>            0600   a run's finish until its transaction commits (R129); directories 0700
+  spool/events-at-stop           0600   event numbers handed over and not committed when a stop ended (R139)
+  restore-staging-<random hex>/  0700   only while a restore builds the state it will move in (R138)
+  restore-in-progress            0600   only while a restore replaces the state (R138); nothing starts while it exists
   backups/                       0700   one directory per backup, named by the daemon and created exclusively
     <backup>/                    0700
       manifest.json              0600   every file below, by name, size and SHA-256
@@ -1398,7 +1607,8 @@ R112 or R115 says, within R116's time and memory. The corpora are made by the te
 | `orch db backup` | running | Writes `backups/<UTC time>-g<generation>/`, created by the command, and takes no other destination (R75). The blob sweep waits while it runs. |
 | `orch db prune [--older-than <days>] [--dry-run]` | running | R79. |
 | `orch db export --to <file>` | running | The file must not exist; created 0600. Written in the export format of "Import bounds". |
-| `orch db restore <backup> [--yes] [--stop-runs] [--assume-stopped <run id>]...` | stopped | R76 to R78, R100, R117, R132, R133. `--stop-runs` stops only what the replaced state records; a process that only the backup records is named and never signalled. The replaced state goes to `backups/pre-restore-<UTC time>/`. A restore replaces no workspace: the project directory is not part of a backup, and a restored task finds its workspace by R118 or not at all. |
+| `orch db restore <backup> [--yes] [--stop-runs] [--assume-stopped <run id>]...` | stopped | R76 to R78, R100, R117, R132, R133, R138. `--stop-runs` stops only what the replaced state records; a process that only the backup records is named and never signalled. The replaced state goes to `backups/pre-restore-<UTC time>/`. A restore replaces no workspace: the project directory is not part of a backup, and a restored task finds its workspace by R118 or not at all. |
+| `orch db restore --continue` or `--abandon` | stopped | R138. The only commands that run while the marker of an unfinished restore exists: the first finishes it, the second puts the replaced state back. |
 | `orch db vacuum` | stopped | Needs free space of the database's size above the floor. |
 
 Two things are called a backup and they differ (AP9). The copy before a migration is made by the daemon
@@ -1406,6 +1616,60 @@ itself, before every pending migration, checked, and holds the database alone (R
 job that runs `orch db backup` on a timer and rotates the results, is not in 1.1; the manual tells the owner
 to run `orch db backup` when a full restorable point is wanted. A backup that the owner copies out of the data
 directory has left the directory's protection (R136).
+
+**How a restore replaces the state** (R138). A restore holds the directory's lock from its first step to its
+last (kind `restore`), so no daemon and no other command runs beside it. The names below are proposals,
+like every name that was added after the answer to O9.
+
+1. *Checks, with nothing written.* The backup against its manifest (R76); the task ids and the workspaces
+   of R117; the processes of R100; the list and the confirmation of R78 and R133; and free space: at least
+   the size of the backup by its manifest (database, blobs and repositories) above the disk floor of B11,
+   because the replaced state is kept and the backup is copied. A refusal ends here.
+2. *Staging.* `restore-staging-<random hex>/` is created exclusively in the data directory, so that it
+   lies on the filesystem of the live state. The backup's files are copied into it through the
+   confined-directory module (R102), each checked against the manifest as it is written. The staged
+   database is then opened and, in one transaction, given the new lineage and the new generation (R77):
+   one more than the highest generation that the replaced directory's file, its database and the backup
+   record. In the same transaction every lease it holds is ended and its run closed, as R100 says. The
+   database is checked (`quick_check`, `foreign_key_check`), checkpointed and closed, so that no `-wal`
+   or `-shm` file is left. The staged `generation` file and an empty `spool/` are written, and every file
+   and directory is synced.
+3. *Marker.* `restore-in-progress` is created exclusively, 0600, and synced with its directory. It holds
+   a format number, the random part of the staging directory's name, the UTC time that names
+   `backups/pre-restore-<UTC time>/`, the backup's name and the hash of its manifest, the new lineage and
+   generation, the confirmation as it was given, and the direction, `forward`. It is at most 4 KiB. A
+   command that reads it checks every field and opens no path taken from it: the two directory names are
+   built again from the checked random part and time (R101, R102).
+4. *Swap.* The parts are, in this order: the database with its `-wal` and `-shm` files where they exist,
+   `blobs/`, `repos/`, `spool/` and `generation`. First each part of the replaced state is renamed into
+   `backups/pre-restore-<UTC time>/`, in that order; then each staged part is renamed to its live name,
+   in that order. The data directory is synced after every rename. Restoring the copy that R124 makes has
+   one part, the database.
+5. *End.* The empty staging directory is removed, then the marker, and the directory is synced. The
+   restore reports the new generation and lineage, the leases it ended and where the replaced state lies.
+
+| A stop in | Leaves | Then |
+|---|---|---|
+| Step 1 | Nothing new | Nothing to do |
+| Step 2, or a failed copy or a full disk there | The live state untouched, and a staging directory without a marker | The next command or start removes the staging directory, unread, and counts it. The restore is run again from its start |
+| Steps 3 to 5 | The marker | Nothing starts: the daemon and every offline command refuse, exit 1, and name the marker and the two commands below |
+
+`orch db restore --continue` reads the marker and does what is left, part by part in the order of step 4.
+Where a part lies tells what is left: while the staged part is still in the staging directory, anything at
+the live name is the replaced part, which is moved aside before the staged part is moved in; once the
+staged part is no longer there, what stands at the live name is the staged part and is left. It asks
+nothing again, and its result is that of a restore that was never stopped. `orch db restore --abandon`
+first writes the direction `back` into the marker, synced. Then, part by part in the reverse order, it
+moves a staged part that had reached its live name back into the staging directory and the replaced part
+back to its live name, and it ends by removing the staging directory, the emptied `pre-restore` directory
+and the marker. Its result is the replaced state byte for byte, with its lineage, its leases and its
+spool as they were. Once `back` is written `--continue` is refused, so a direction never changes halfway.
+Either command can be stopped and run again, and a rename that fails stops it with the marker in place.
+
+So no start meets a database of one state beside the blobs or the repositories of the other, or a restored
+database whose leases are still active. This staging decides nothing about a workspace that already
+stands at a restored task's name: that is the fifth point of AP14, it is the owner's, and T23 builds no
+handling of it before the ruling.
 
 **Diagnostic views** (R74, R130). `orch db query` reads views named `diag_<table>` and nothing else. There is
 one for each table of "Schema for 1.1" outside these: `identities`, `identity_tokens`, `daemon_config` and
@@ -1446,7 +1710,7 @@ checkpoint, which has a connection of its own and waits in no lane (R126).
 | `attention.evaluate` | 30 s | Disk floor and dispatch-off-with-work. |
 | `request_keys.expire` | 5 min | R47. |
 | `context.expire`, `messages.expire` | as in 1.0 | 1.0's expiry steps, now jobs. |
-| `wal.checkpoint` | 5 min after its last completed checkpoint, or when the log's backlog reaches 64 MiB, looked at once a second | Passive checkpoint on its own connection, never on the writer's (R126); over 256 MiB of backlog it first interrupts pooled reads older than 30 s (R127). The backlog is the frames not yet checkpointed, never the file's length. |
+| `wal.checkpoint` | 5 min after its last completed checkpoint, or when the log's backlog reaches 64 MiB, looked at once a second | Passive checkpoint on its own connection, never on the writer's (R126); over 256 MiB of backlog it first interrupts pooled reads older than 30 s (R127). The backlog is the frames not yet checkpointed, never the file's length. Each call is recorded with what started it and its outcome, and only a call that succeeded moves the timer (R137); calls that keep failing, and a backlog that stays over its ceiling, are reported (R140). At a stop no new call starts (R139). |
 | `events.prune` | 24 h | R62. |
 | `blobs.sweep` | 24 h | R60. |
 | `attention.expire` | 24 h | R84. |
@@ -1572,7 +1836,7 @@ recommended nothing, as the fifth point of AP14 did, the answer chooses nothing 
 | AP10 | The 100-entry retry cap goes away (R40) | **Decided by the owner, 2026-11-21: as recommended.** Accept: a table needs no cap, and 1.0's drop silently stranded a task. | Keep the cap for exact parity. |
 | AP11 | What fences a run across a restore. The lease prototype's first finding: a restored snapshot has lost the epochs issued after the backup, so "largest stored epoch plus one" can issue a number twice. | **Decided by the owner, 2026-11-20:** a random restore lineage beside the epoch counter, and gate line 9 amended to "no lineage and counter pair is reused" (R77, R132). The generation floor that took epochs from a clock is withdrawn: on a directory with no earlier state it could issue a number twice, as the security review's arithmetic showed, so no promise about a number rests on it or on anything else here. A restore still ends every restored lease and refuses while a recorded process lives (R100), and dispatch is off after it (R44). The lease prototype's report (R6) is still to confirm the mechanics. | Not chosen: a high-water mark kept outside the data directory, with the restore refused when it is missing; or the clock-derived floor alone. |
 | AP12 | What a suspend does to a run in 1.1. The lease prototype measures a holder's deadline on time that counts a suspend, so that a holder that slept past it stops. Its review notes that in 1.1, where the daemon and the agent sleep together, that rule ends every run in flight after any sleep longer than the deadline (90 s in the prototype). | **Decided by the owner, 2026-11-20: as recommended.** The proof on a real suspend is still due (R42, D6). Keep R42: in 1.1 a suspend ends no run. The one daemon is the only grantor and it slept too, so no other holder can exist; on resume it renews what it still supervises before it expires anything. The holder's own deadline arrives with workers in 1.5, where the daemon can stay awake while a worker sleeps. R42's recorded check is a real suspend. Not part of the owner's answer, and drawn by this spec from it: since no 1.1 holder stops itself, a waiting period after a restore proves nothing, and R100's refusal while a recorded process lives is the only ground for sending a restored task out again (the review of the prototype's corrections, N1). | Apply the 1.5 rule now: one rule in every release, and every lid close longer than the deadline loses the runs in flight, which 1.0 does not do. |
-| AP13 | The measurement missed the budget on macOS. As deliverable D reports it: in a Linux container on the same machine every line was met; on macOS, 24 runs at ten times the nominal rate gave a 99th percentile of 1.9 s, the nominal rate 53.5 ms with a worst case of 170 ms, and no events 10.9 ms; the slowest event transaction took 592 ms for at most 12 rows, and a claim's own transaction up to 499 ms. No figure from native Linux exists yet, and R5 needs one. | **Direction decided by the owner, 2026-11-20, and kept by the answers of 2026-11-21; every number and every result is still the owner's to accept.** The owner chose to revise the workload and the budget and to measure anew, and not the diagnosis at the first budget that this row recommended until then. The owner approved changing the budget in principle and set no numbers; no relaxed budget is put in place of the first one silently. What follows from the direction: (1) the proposal is "Event measurement", with a claim a second, 1 to 24 event streams, a burst cell, 200 ms at the 99th percentile and 1,000 ms at the worst, and the production checkpoint inside every repetition with its claims reported apart (red team W2-R1); (2) every figure of the first run is kept and its FAIL stands (R5, R63); (3) the measurement runs on macOS and on native Linux hardware, and the proposed numbers come back to the owner with the results; (4) if the revised budget is missed, the fallback applies, and it is measured as built, since no figure shows that it is faster. Held by the owner until the results exist: the numbers of the budget; how lane 1's 50 ms, lane 3's 1 s and the shipped collector's 256 events or 250 ms sit beside the proposal, for each of which "Event measurement" states what this spec proposes; and `fullfsync` and `checkpoint_fullfsync` on as the macOS setting (R126). | Not chosen by the owner: diagnose first at the unchanged budget, with automatic checkpointing off and one event transaction for all runs, which was this row's recommendation and the red team's W2; both changes are now part of the design (R26, R126) and of the revised method. Not chosen: build the fallback now, on the first run alone. Still the owner's to choose, inside the direction: other numbers. The report gives, for every population, how many claims exceeded 50, 100, 200 and 1,000 ms, so a stricter budget than the proposed one can be judged from the same data. |
+| AP13 | The measurement missed the budget on macOS. As deliverable D reports it: in a Linux container on the same machine every line was met; on macOS, 24 runs at ten times the nominal rate gave a 99th percentile of 1.9 s, the nominal rate 53.5 ms with a worst case of 170 ms, and no events 10.9 ms; the slowest event transaction took 592 ms for at most 12 rows, and a claim's own transaction up to 499 ms. No figure from native Linux exists yet, and R5 needs one. | **Direction decided by the owner, 2026-11-20, and kept by the answers of 2026-11-21; every number and every result is still the owner's to accept.** The owner chose to revise the workload and the budget and to measure anew, and not the diagnosis at the first budget that this row recommended until then. The owner approved changing the budget in principle and set no numbers; no relaxed budget is put in place of the first one silently. What follows from the direction: (1) the proposal is "Event measurement", with a claim a second, 1 to 24 event streams, a burst cell, 200 ms at the 99th percentile and 1,000 ms at the worst, and the production checkpoint inside every repetition with its claims reported apart (red team W2-R1); (2) every figure of the first run is kept and its FAIL stands (R5, R63); (3) the measurement runs on macOS and on native Linux hardware, and the proposed numbers come back to the owner with the results; (4) as first directed, if the revised budget is missed the fallback applies. The owner's ruling of 2026-11-21 amends that: every miss is kept; the fallback is selected only for a miss that is attributable to events; a miss without events (claims alone, C0, a burst alone) or on one platform alone selects no event path and goes back to the owner ("Event measurement", "What a miss selects"). A fallback that is selected is measured as built, since no figure shows that it is faster. Held by the owner until the results exist: the numbers of the budget; how lane 1's 50 ms, lane 3's 1 s and the shipped collector's 256 events or 250 ms sit beside the proposal, for each of which "Event measurement" states what this spec proposes; the idle-host limits, the platform classes and the three readings under "What a miss selects", which this revision proposes and the owner has not read; and `fullfsync` and `checkpoint_fullfsync` on as the macOS setting (R126). | Not chosen by the owner: diagnose first at the unchanged budget, with automatic checkpointing off and one event transaction for all runs, which was this row's recommendation and the red team's W2; both changes are now part of the design (R26, R126) and of the revised method. Not chosen: build the fallback now, on the first run alone. Still the owner's to choose, inside the direction: other numbers. The report gives, for every population, how many claims exceeded 50, 100, 200 and 1,000 ms, so a stricter budget than the proposed one can be judged from the same data. |
 | AP14 | What an imported value may still select (security review S2). Below the data directory, in a backup and in an export the answer is nothing (R101 to R108). It has five points. First, a task's workspace is still `workspaces/<task id>` in the project directory. Second, the import no longer treats in-flight state as 1.0's recovery does. Third, what a restore may do about the processes a backup records (R100): as written, refuse and report, and never signal. Fourth, with that layout two task ids that differ only in the case of ASCII letters are one workspace and one branch on a filesystem that folds case (the re-review's finding S2-R1, F14), so something must refuse the pair or the layout must go. Fifth, whether a backup that a restore is given is taken to be this project's own state when a directory already stands at one of its tasks' exact names (the security re-review's condition C2). | **Decided by the owner, 2026-11-21: as recommended, which settles the first four points; the fifth is still the owner's choice, as said below.** Keep 1.0's workspace layout, with the id checked as one name, links refused and stored paths never used (R106): workspaces that exist at the import keep working, and nothing an agent CLI saw moves. Refuse the import while a recorded local process exists or any remote run is recorded, naming each, and never signal one: the check asks only whether the pid's process or its process group exists, and `--assume-stopped <run id>` is the owner's word for a run that has ended (R119, the red team's blocking finding I1). What the import then closes, it closes in the database only (R105). A restore refuses while a process that the backup or the replaced state records is alive, and signals only those the replaced state records, which this daemon wrote here; a backup's rows never cause a signal (R100, the re-review's condition S2-C2). For the fourth point: refuse the pair by one rule on every platform, and show by a listing, before every use, that a directory or a branch is the task's (R117, R118). No id is lower-cased or rewritten. The cost is one refusal: a 1.0 project kept on a filesystem that tells case apart, and holding such a pair, cannot be imported until the owner removes one of the two tasks with the 1.0 binary, or it stays on 1.0. The dry run names both. 1.0's generated ids make a pair about 7 in 100,000 for 3,000 tasks, and a 1.0 project on a folding filesystem cannot hold one. An export is also refused where a directory already stands under one of its tasks' names; the owner moves it aside, since an export brings no workspace and nothing shows the directory to be that task's. **For the fifth point this spec makes no ruling and recommends neither option, so the answer of 2026-11-21 chooses none, and the owner's choice is open.** R117 is drafted for the first of two options and its clause for a backup is provisional; restore's handling of an existing workspace is not built before the owner has ruled. Option one, a backup is this project's own: a directory at a restored task's exact name is that task's workspace. The restore's documentation and its confirmation then say that the backup is trusted as this project's state, the confirmation lists each directory the restored tasks would own, and the residual risk is stated: a backup made elsewhere that names an existing directory gets it entered by the next run of that task and removed by its cleanup. Its test: `db_backup_restore::restore_lists_the_workspaces_it_adopts_and_needs_confirmation`. Option two, a backup is treated as an export is: a restore refuses while a directory stands at any restored task's name, in any spelling, and leaves it as it was. It fails closed and needs no assumption about who wrote the backup; its cost is that a restore on the machine where the project runs is refused for every task whose workspace still stands, which is the usual state of work in flight or in review, until the owner moves each aside, and that task then starts in an empty workspace. Its test: `db_backup_restore::a_directory_at_a_restored_tasks_exact_name_is_refused_and_left_unchanged` (a self-consistent backup made elsewhere, a canary in the directory). The security reviewer names option two as the one that fails closed. The architect's view, which is not a ruling, is option one with the listing, because a backup made elsewhere already decides every task, prompt and policy of the project it is restored into. | Name workspaces by a hash or a generated name: then no id is a path component anywhere, at the cost of a mapping for the workspaces and branches that exist at the import and of new paths for every agent. For in-flight state: close it without looking at any process, as the first correction had it; no source value then chooses a process to examine, and a run still at work on this machine or on a peer is sent out a second time. The refusal's cost is that a reused pid or a peer that never answers again blocks the import until the owner names the run. For a restore: let `--stop-runs` also stop what only the backup records, for a backup the owner trusts; a pid and a start time do not show who wrote a backup, so a crafted one could have a chosen process stopped. For the fourth point: name workspaces by a hash, with a mapping for those that exist at the import; no import is then refused for a pair, at the cost of new paths for every agent, of branches that either keep the id and its alias or change what a person sees in git, and of this same ownership rule for every mapped old name. Or apply the rule only where the destination folds case: a pair then imports on Linux, and the same database is refused by a restore or an export on macOS, so whether a database is valid depends on the disk under it. Or let an export adopt a directory at a task's exact name, as a 1.0 directory does: a re-import on the same machine keeps its workspaces, and a crafted export can name a directory it wants entered or removed. |
 | AP15 | What a source may make the importer do (security review S1). The budgets of "Import bounds" are 1.0's own reader's limits where it has them. Four points go beyond 1.0 or beyond the first draft of this spec. First, three rules are stricter than 1.0's reader for a YAML document that a person edited: an explicit tag is refused (1.0 ignored it), the depth as expanded is 64 (1.0's library allowed 128), and the bytes as expanded are 4 MiB (1.0 had no rule). Second, a YAML document is bounded at 1 MiB, which is 1.0's own limit, where the first draft said 16 MiB. Third, the import checks the whole source before it writes, and so reads it twice. Fourth, an import from an export is all or nothing with no resume, and an event line that cannot be stored becomes a gap where the first draft stopped the import. | **Decided by the owner, 2026-11-21: as recommended.** Approve the numbers and the four points as a set (R109 to R116). Nothing 1.0 writes meets a stricter rule; a refusal names the file and the rule and says that 1.0 read it, and the dry run lists every such file before anything is written. The second read buys that a hostile or damaged source leaves nothing behind. An export import that was interrupted is run again from the start; raw output lost to a gap is the lowest-value data an import carries, and each gap is recorded and counted. | Match 1.0's reader exactly (tags ignored, depth 128, no byte budget): no document that 1.0 read is refused, a tag is dropped silently as 1.0 dropped it, and one file can still expand to about 65 MiB in memory. Or check and load in one pass: one read of the source, and a refusal part-way leaves an unfinished import behind. Or stop the import at an event line that cannot be stored: no silent-looking loss, and one bad line of raw output blocks a migration. |
 | AP16 | A 1.0 daemon started on a project after its import (red team I2). Nothing can stop one while 1.1 is not running, and it would run finished tasks again from the state of import day. | **Decided by the owner, 2026-11-21: as recommended.** Detect it and refuse the next 1.1 start until the owner accepts (R121); say in the upgrade notes what going back loses and how the 1.0 binary is kept (R136). Nothing under `.orchestry/` is written for it. This recommendation rests on F9: while 1.1 runs, the lock keeps 1.0 out. If R31's test shows F9 false on either platform, detection is the only guard while both binaries can run, and the recommendation becomes the 1.0.1 of the next column (red-team condition C4). | Warn and start with dispatch off: no option to learn, and one `/watch` away from running on a forked history. Or a 1.0.1 that refuses to start where `.orch-project` exists: it prevents the fork where this only detects it, and it is a release outside this goal that only the owner can order. |
@@ -1600,7 +1864,7 @@ overlaps. A decision and a point that overlap are still two questions.
 
 ### Owner's answers
 
-One row for each id. The record has four parts, named by a letter in the table:
+One row for each id. The record has five parts, named by a letter in the table:
 
 - **A.** The owner's first answers of 2026-11-20, to six points. Their message could not be read again
   when this table was written. Nothing here quotes it; the six rows are carried from the earlier revision
@@ -1615,6 +1879,13 @@ One row for each id. The record has four parts, named by a letter in the table:
   budget are revised with the numbers to be proposed, measured and then approved by the owner. The
   instruction names one more message, which could not be read either and is not quoted here. D alone is
   the record for every id that has no message of its own.
+- **E.** The owner's ruling of 2026-11-21, about 14:05 UTC, kept word for word in the lead's record. The
+  owner was shown two ways to read a miss of the revised budget and answered "1.": every miss is kept and
+  reported; a miss selects the file fallback only when it is attributable to events; a miss without
+  events, or on one platform alone, selects no event path and goes back to the owner. The record says
+  that the owner knows this amends a sentence of C. About ten minutes later the owner answered "yes" when
+  asked whether the review corrections of this revision may be written in the same pass. That word allows
+  the writing. It answers no id, and it accepts no finding, method, number or result.
 
 "As recommended" means, for O1 to O10, AP1 to AP13 and D1 to D8, the recommendation and its condition in
 the approval request of 2026-11-20; and for AP14 to AP20, which that request did not hold, the
@@ -1626,7 +1897,9 @@ has neither this table nor the corrected rows, and confirms none of them.
 
 Counted over the 38 ids: 37 are answered as recommended, and AP13 is answered in its direction only. Two
 things inside those answers are still the owner's: every number and result of AP13, and the fifth point of
-AP14. No id is pending. The last column says what an answer does not settle: a proof, a review or a
+AP14. A third thing lies outside the answers and is the owner's as well: the word on using the live copy
+for plan task T4c, which neither D6 nor the answer to AP8 gives. No id is pending. The last column says
+what an answer does not settle: a proof, a review or a
 delivery that is still due, or a part the owner still holds.
 
 | Point | Answered | Record | Answer | Not settled by the answer |
@@ -1635,7 +1908,7 @@ delivery that is still due, or a part the owner still holds.
 | O2 | 2026-11-21 | D | As recommended: the 33 tables with the columns that later phases need, and the other 17 deferred. The recommendation's condition: the exact schema of this spec, with its foreign keys and integrity rules, is what is approved, and a count of tables is not | The merge of the PR that carries this corrected text confirms the schema as written |
 | O3 | 2026-11-20 | B, D | As recommended: the import runs with both daemons stopped and is refused while local or remote 1.0 work may survive; orch never deletes 1.0 files, and the manual gives the advice on keeping them |  |
 | O4 | 2026-11-21 | D | As recommended: the saved setting is kept; dispatch is off after an import, a restore and a migrating start; the flag overrides; the `dispatch_off_with_work` item stays |  |
-| O5 | 2026-11-21 | D | As recommended: one timer with a due time for each job that survives a restart, and a bounded shutdown | The writer's failure policy, which the recommendation asked for before the build, is R128 (AP18) |
+| O5 | 2026-11-21 | D | As recommended: one timer with a due time for each job that survives a restart, and a bounded shutdown | The writer's failure policy, which the recommendation asked for before the build, is R128 (AP18). The bounded shutdown is R139, written after the answer from the resilience review; its times are proposals |
 | O6 | 2026-11-21 | D | As recommended: resolved items are kept 90 days; a blocking item makes `orch doctor` exit 1 and a warning does not; doctor's existing exits do not change |  |
 | O7 | 2026-11-21 | D | As recommended: unknown keys are kept as an inert legacy object of at most 64 KiB and listed by the dry run; `max_concurrent_agents` becomes the optional `run_cap`; input over the limit stops the import and the source is not edited |  |
 | O8 | 2026-11-21 | D | As recommended: keys are kept for one hour and the expiry job ships in 1.1 | The recommendation's tests of scope and its exclusion of credential operations are R134 |
@@ -1653,7 +1926,7 @@ delivery that is still due, or a part the owner still holds.
 | AP10 | 2026-11-21 | D | As recommended: the 100-entry cap and its silent drop go; the retry table has no cap |  |
 | AP11 | 2026-11-20 | A, D | A random restore lineage and a counter; gate line 9 amended to "no lineage and counter pair is reused" | The lease prototype's report is still to confirm the mechanics (R6) |
 | AP12 | 2026-11-20 | B, D | As recommended: a suspend ends no co-located, supervised run in 1.1, and a holder's own deadline arrives with workers in 1.5 | The proof on a real suspend is still due (R42) |
-| AP13 | 2026-11-20, the direction only | C, D | Revise the workload and the budget and measure anew, not the diagnosis first. Changing the budget is approved in principle; no number is. If the revised budget is missed the fallback applies | **Still the owner's:** every number of "Event measurement"; how lane 1's 50 ms, lane 3's 1 s and the collector's 256 events or 250 ms sit beside it; the macOS sync settings; and the results on macOS and on native Linux hardware, none of which exists yet. The first run's FAIL against 50 ms and 100 ms is kept |
+| AP13 | 2026-11-20, the direction only; 2026-11-21, what a miss selects | C, D, E | Revise the workload and the budget and measure anew, not the diagnosis first. Changing the budget is approved in principle; no number is. If the revised budget is missed the fallback applies, as amended on 2026-11-21 (E): only for a miss attributable to events; a miss without events or on one platform alone selects no event path and goes back to the owner; every miss is kept | **Still the owner's:** every number of "Event measurement"; how lane 1's 50 ms, lane 3's 1 s and the collector's 256 events or 250 ms sit beside it; the macOS sync settings; and the results on macOS and on native Linux hardware, none of which exists yet. The first run's FAIL against 50 ms and 100 ms is kept. Not read by the owner: the rules that this revision writes around the ruling ("The verdict", "What a miss selects" with its three readings, "The host", the platform classes) and their proposed limits |
 | AP14 | 2026-11-21 | D | As recommended, which settles four points: the 1.0 workspace layout is kept, with the id checked and links refused; the import is refused while a recorded local process or any remote run exists, and nothing is signalled; a restore refuses and reports, and never signals because of a backup's rows; and two ids that differ only in case are refused by one rule on every platform | **The fifth point is still the owner's choice.** The row recommended neither option, so "as recommended" chooses none: a backup trusted as this project's own for a workspace that already stands, with the directories listed in the confirmation; or a restore refused there, as an import from an export is, which the security reviewer names as the option that fails closed. R117's clause for a backup stays provisional, and that part of restore is not built before the ruling |
 | AP15 | 2026-11-21 | D | As recommended: the numbers of "Import bounds" and the four points, as a set |  |
 | AP16 | 2026-11-21 | D | As recommended: a 1.0 state that changed after the import is detected and the next 1.1 start refused until the owner accepts it; the upgrade notes say what going back loses | The recommendation rests on F9. If R31's test shows F9 false, it becomes the 1.0.1 alternative and goes back to the owner |
@@ -1664,7 +1937,7 @@ delivery that is still due, or a part the owner still holds.
 | D1 | 2026-11-21 | D | As recommended: the bounded parsing and export contract, names that only the daemon makes, the import's refusal while work may survive, and a re-review at the exact head; no override and no product start | The re-review at the exact head of this revision is still due |
 | D2 | 2026-11-21 | D | As recommended: a changed 1.0 state is detected without writing to it; an entity's file is taken over a stale index and the difference reported; an interrupted pointer write is recovered; no automatic repair that destroys |  |
 | D3 | 2026-11-20 | B, D | As recommended: a hard stop and a dry-run report by problem class; no skipping and no setting aside |  |
-| D4 | 2026-11-21 | D | As recommended: the policy for a busy, failing, full or corrupt database, bounded retries and shutdown, a finish that survives a restart, and what a failure of that persistence does |  |
+| D4 | 2026-11-21 | D | As recommended: the policy for a busy, failing, full or corrupt database, bounded retries and shutdown, a finish that survives a restart, and what a failure of that persistence does | The order and the bound of a stop (R139) and the policy for the other connections (R140) were written after the answer, from the resilience review; their times and counts are proposals with no measurement behind them |
 | D5 | 2026-11-21 | D | As recommended: the security review's major conditions, as R74, R75 and R130 to R134 | The library features they need are audited in the revised report of deliverable C, which is not yet delivered (ADR 0017 decision 19) |
 | D6 | 2026-11-20 | B, D | As recommended: a real suspend test on an isolated macOS machine, evidence from native Linux, the peer check on a second host, a copy of the live project outside the repository for R71 later; no private content in the repository or a PR | Every one of those checks is still due, and no native Linux host is named |
 | D7 | 2026-11-20 | B, D | As recommended: one phase 1.1, the ordered PR stack, no release in between |  |
@@ -1680,7 +1953,7 @@ delivery that is still due, or a part the owner still holds.
 | G4 Export then import reproduces every row and hash | R80: `db_export_import::export_then_import_reproduces_every_row_and_hash` |
 | G5 Worker and task principals are refused | R53: `ops_authorization::worker_is_refused_what_the_matrix_denies`, `::task_is_refused_what_the_matrix_denies` |
 | G6 A second daemon refuses and names the holder | R30: `daemon_data_dir::second_daemon_refuses_and_names_the_holder` |
-| G7 Throughput meets the budget, or the fallback ships | R5, R63: the report `docs/sqlite-event-throughput.md`, with figures for macOS and native Linux hardware: the first run, kept with its FAIL on macOS against the first budget; the revised measurement; and the path that ships. The budget this line is read against is the one the owner accepts under AP13, and until the owner has accepted the numbers and the results the line is unproven |
+| G7 Throughput meets the budget, or the fallback ships | R5, R63: the report `docs/sqlite-event-throughput.md`, with figures for macOS and native Linux hardware: the first run, kept with its FAIL on macOS against the first budget; the revised measurement; and the path that ships. The budget this line is read against is the one the owner accepts under AP13, and until the owner has accepted the numbers and the results the line is unproven. A miss that selects no event path, by the owner's ruling of 2026-11-21, proves neither half of the line and goes back to the owner |
 | G8 A repeated change runs once; a changed body is refused | R45, R46: `ops_request_keys::a_repeated_change_runs_once`, `::same_key_with_a_different_body_is_refused` |
 | G9 Restore starts a new generation, reuses no pair of lineage and counter, lists and confirms. The owner amended this line on 2026-11-20 (AP11); the goal's text, quoted in Source, said "no epoch is reused" | R77, R78, R132: `restore_fencing::no_lineage_and_epoch_pair_is_reused_after_restore`, `::an_earlier_lineage_is_refused_after_a_restart`, `::restore_lists_reenabled_identities_and_tokens`, `::restore_without_confirmation_changes_nothing` |
 

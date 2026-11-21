@@ -11,13 +11,15 @@
   stands: one daemon owns state, no client opens it, nothing starts a daemon on its own, exit 7.
 - Decisions 1 to 6 and 14 restate decisions the owner already took in the goal and are binding. Decisions 7 to 13
   and 15 to 25 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
-  the owner's.
+  the owner's to rule (the spec's AP13); no record shows that the owner set them.
 - The owner's answers (2026-11-20 and 2026-11-21): every point of the spec is answered as recommended,
   except AP13, which is answered in its direction; the spec's "Owner's answers" has a row for every id and
   its record. Decision 16 follows the answer to AP11, decision 17 the answer to O1, decision 18 the answer
-  to AP1, decision 12 the direction on AP13, and decisions 20 to 25 the answers to AP14 to AP19 and D1 to
-  D5. Two things are still the owner's: the numbers and results of AP13 (decisions 12 and 23), and the one
-  part of decision 20 for which the spec recommended no option. An answer is not the acceptance of this
+  to AP1, decision 12 the direction on AP13 and the owner's ruling of 2026-11-21 on what a miss selects,
+  and decisions 20 to 25 the answers to AP14 to AP19 and D1 to D5. Two things are still the owner's: the
+  numbers and results of AP13 (decisions 12 and 23), and the one part of decision 20 for which the spec
+  recommended no option. A third lies outside the answers: the owner's word on using the live copy for
+  the plan's task T4c. An answer is not the acceptance of this
   ADR: it stays proposed until the owner merges the PR that carries this corrected text.
 - Where this text stands: the first-review text of this ADR (decisions 1 to 19 as first drafted, before the
   review corrections and the owner's answers) reached `main` on 2026-11-21, when the owner merged the PR
@@ -131,8 +133,17 @@ across a crash, lists that do not load everything, and a retried request that ru
     second, 1 to 24 event streams, a burst cell, 200 ms and 1,000 ms proposed, 660 s repetitions that each
     hold checkpoints by the production rule of decision 23, the claims around each checkpoint judged apart,
     and macOS hardware and native Linux hardware. Those numbers are proposed; they and the results return to
-    the owner, and no budget is met until the owner accepts both. A valid miss of the revised budget selects
-    the fallback, which no figure shows to be faster and which is measured as built. The path that ships is
+    the owner, and no budget is met until the owner accepts both. The owner's direction said that a miss of
+    the revised budget selects the fallback. On 2026-11-21 the owner amended that sentence: every miss is
+    kept and reported; a miss selects the fallback only when it is attributable to events; and a miss
+    without events (claims alone, cell C0, a burst alone) or on one platform alone selects no event path and
+    goes back to the owner. The spec applies those words and adds no test of cause. A fallback that is
+    selected is measured as built, and no figure shows it to be faster. Each data set gets one verdict from
+    four axes reported apart (correctness, validity, coverage, budget), so that a miss on one platform with
+    the other not yet run is a failure and incomplete at once. The measurement follows decisions 21 and 22
+    of ADR 0013: it holds the host lease exclusively and samples the host, a budget met on a host that was
+    not idle is no pass, and a miss there stands and selects no path. The limits for an idle host and the
+    classes of the two platforms are proposals. The path that ships is
     measured by the same method before its PR merges. Two numbers of decision 9 stand beside the proposal
     and are not changed by it. The 50 ms is the target for a claim's wait before its transaction starts
     and gates nothing, where the proposed 200 ms runs from arrival to commit. The 1 s is the deadline
@@ -175,6 +186,16 @@ across a crash, lists that do not load everything, and a retried request that ru
     for sending a restored task out again in 1.1. The prototype's alternative, a waiting period of one lease
     after the restore, holds only where a holder stops itself at its deadline; 1.1's processes do not (the
     owner's answer to AP12 keeps R42), so time alone shows nothing here, and the alternative waits for 1.5.
+    A restore replaces the state in steps that a stop cannot leave half done unseen (R138). The whole
+    restored state is first built under a scratch name: the database already carries the new lineage and
+    generation and has every lease of the backup ended, and the spool is empty. A synced marker is then
+    written, the replaced state is moved aside and the staged state moved in by renames in a fixed order,
+    and the marker is removed last. While the marker exists nothing starts; `orch db restore --continue`
+    finishes the restore and `--abandon` puts the replaced state back, byte for byte. A restore needs free
+    space of the backup's size above the disk floor. So a database of one state never serves beside the
+    blobs or the repositories of the other, and a backup's leases are never active at a live name. What a
+    restore does with a workspace that already stands is not part of this and stays the owner's (decision
+    20).
 
 17. **The project is named by a pointer file from 1.1.** `orch init` and `orch import` write `.orch-project`
     in the project directory, holding the project id and nothing else. The daemon's data directory is created as
@@ -313,7 +334,15 @@ across a crash, lists that do not load everything, and a retried request that ru
     synced before it waits for the writer, and recovery applies it before it judges the run, so a restart
     behind a locked or failing database does not turn a finished run into a cancelled one (R129). When the
     spool write itself fails, the finish is kept in memory, retried and reported, and is lost only if the
-    daemon is stopped before the file or the commit succeeds; the stop names it.
+    daemon is stopped before the file or the commit succeeds; the stop names it. Three rules were added
+    after the resilience review and the method challenge, and their times and counts are proposals. Every
+    checkpoint call is recorded with what started it and with its outcome, and any call that succeeded
+    moves the timer, so a call that the size rule started delays the next timer call (R137). A stop is
+    ordered and bounded: admission, the transaction in progress, the queued work until a deadline, then
+    reads and the checkpoint, the lock last; events handed over and not committed are recorded in the
+    spool and become a gap row at the next start (R139). And the classes cover every connection: corruption
+    seen by a read, a checkpoint, a query or a backup fails the writer, other failures there are counted
+    and do not, and checkpoints that keep failing or a backlog that stays are reported (R140).
 
 24. **`orch db query` reads fixed views under an authorizer; a backup stays in the data directory.** The
     command has its own read-only connection, an authorizer that denies by default, and run-time limits; it
@@ -410,6 +439,26 @@ across a crash, lists that do not load everything, and a retried request that ru
   have one writer of truth. The first separates an engine regression from an import defect at the cost of a
   release; the second gives field use of the importer and two tiers of guarantees, and changes a binding
   decision of the goal. This ADR keeps one release; the spec's AP20 puts both to the owner.
+- **Replace the state in place, part by part, with no marker.** What the first text of the restore implied.
+  A stop between two parts leaves a database beside the other state's blobs with the lock released, and
+  the next start cannot tell. Rejected for decision 16's staging and marker.
+- **Keep the whole state in one directory and swap it with one rename.** Fewer renames. It still needs two
+  (the old out, the new in) and so still needs the marker, since a start between them would find no state
+  and make a new one; and it moves the database, which changes the layout that decision 5, the backup and
+  the names of decision 20 all rest on. The marker makes several renames as safe as two.
+- **Let any miss of the revised budget select the fallback.** The direction's first sentence. A miss in a
+  cell with no events cannot show that moving events to files would help, and the fallback would then be
+  built and miss the same way. The owner amended the sentence on 2026-11-21 (decision 12).
+- **Add a test of cause to that ruling**: require that the cell without events passes in the same block, or
+  add a cell with a burst and no events. The red team proposed both. Neither is in the owner's ruling, the
+  first makes the choice depend on cells run hours apart, and the second changes the cells and their count.
+  Not adopted; the spec applies the ruling's words and marks where it reads beyond them.
+- **Count a run on a busy host as valid.** The earlier text of the method. It is realistic, and it lets a
+  colleague's build decide a verdict that cannot be run again. ADR 0013 decision 22 already rules the other
+  way for timing samples, and this ADR follows it without amending it.
+- **Count a size checkpoint toward the two timer checkpoints**, or end the stop only when every queue is
+  empty. The first would report coverage that the run did not have, and whether the coverage rule should
+  change is left to a reviewed revision of the method. The second has no bound while the writer retries.
 - **Automatic checkpointing left on.** SQLite's default, and what the first measurement ran with. The
   checkpoint then runs inside whichever commit crosses the threshold, a claim's included.
 - **Diagnose at the first budget before anything else.** The recommendation until 2026-11-20: run the first
@@ -447,7 +496,12 @@ across a crash, lists that do not load everything, and a retried request that ru
   hold for events.
 - `docs/TRAITS-FROZEN.md` §2, ARCHITECTURE §1, §2.1, §5.1 to §5.3 and §6.1, and the RUNBOOK's storage
   procedures change. The stable-sort rule stays: the scheduler still sorts in memory.
-- Backups become a product duty: database, blobs and repositories as one restorable point.
+- Backups become a product duty: database, blobs and repositories as one restorable point. A restore
+  needs free space of the backup's size, and a restore that was stopped keeps the daemon from starting
+  until it is continued or abandoned; the RUNBOOK must say so.
+- A stop can take up to its bound (20 s is proposed) and can leave a gap in a run's events; a daemon that
+  is killed records none. A checkpoint that keeps failing, a backlog that stays, and corruption seen by
+  any connection are shown by `orch status` and `orch doctor` and are not attention items.
 - `orch-peer` is touched at the places decision 18 names, which the owner approved, and nowhere else.
 - Files in the data directory can no longer be found by an id with `ls`: an event file and a project record
   are named by hashes, which the storage reference (`docs/storage.md`) must explain how to compute. A copy
