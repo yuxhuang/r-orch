@@ -217,7 +217,7 @@ condition above and below stays open until that review closes it.
 | Finding at `a914e78` | Answer | Where |
 |---|---|---|
 | Method MC3 and red team P4, blocking: the ordered steps of "What a miss selects" had no guard for a defect. A diagnostic that stores an event twice, beside valid C24 misses on both platforms in a complete data set, reached the fallback at step 5 although the verdict says that a defect is fixed before any performance result is used | Accepted. A data set must be eligible before any step is read: correctness `ok` everywhere, no required repetition invalid or without its backend, settings, timing check or platform class, and coverage complete. Otherwise no path, with the verdict's headline and exit unchanged and every miss and axis kept. Three mixed cases are in the table of cases. No defect is renamed incomplete and no miss is left out | Spec R63, "The verdict", "What a miss selects"; ADR decision 12; T4b |
-| Method MC1 and red team R1, major: "one platform alone" is judged by cell, so two different misses, one on each platform, select the fallback; and the text said that every reading sends more to the owner, which is false for this one | Accepted as the review's second option. The cell reading stays, as a proposal; the false sentence is removed; the case (a claim at 230 ms in a checkpoint window on macOS, an event over 5,000 ms on Linux) and the limit reading are set beside it for the owner. No reading is chosen for the owner, no cell is added, and no cause is claimed. Technical attribution stays open | Spec "What a miss selects", AP13 |
+| Method MC1 and red team R1, major: "one platform alone" is judged by cell, so two different misses, one on each platform, select the fallback; and the text said that every reading sends more to the owner, which is false for this one | Accepted as the review's second option. At that revision the cell reading stayed as a proposal, the false sentence was removed, and the case (a claim at 230 ms in a checkpoint window on macOS, an event over 5,000 ms on Linux) and the limit reading were set beside it for the owner. The owner has since chosen the limit reading, called the kind reading in the record (2026-11-21; the table after this one), and the cell reading is not adopted. No cell is added, and no cause is claimed. Technical attribution stays open | Spec "What a miss selects", AP13, record F of "Owner's answers" |
 | Facts N1, minor: step 4 of those steps is not a reading of the ruling | Accepted. The text says four things are not the ruling's words and that step 4 comes from "The host" | Spec "What a miss selects" |
 | Method MC2 and red team R2, major: only the diagnostic was named as exposed to a size call that moves the timer, and nothing said what follows an incomplete data set | Accepted for the text. C24, H32 and B24 are named as exposed; an incomplete data set selects no path, and a new one needs the owner's direction or an approved revision of the method, never a repeat of the unchanged method. Not done: no call is forced, no repetition lengthened, no other call credited, no cell or count changed, nothing measured. Whether the method can complete stays open and is the performance engineer's | Spec "Checkpoints in every repetition", "The verdict", "Diagnostics" |
 | Resilience N1, major: the marker was created and rewritten in place, so a stop between its creation and its write, or during the change of direction, left a marker that neither command could read | Accepted. Every version is published whole by a temporary file, a sync, a rename and a directory sync; a temporary file is scratch; a marker that fails its check fails closed with a manual recovery that the RUNBOOK is to give; stops at each step of the publication are tested | Spec R138, "How a restore replaces the state", "Data directory"; ADR decision 16; T23, T26 |
@@ -233,6 +233,26 @@ idle-host rule) and the normative part of MC8; facts F1, F2 and F4; the security
 R101 to R134. Not answered here and still open: the technical question of what shows that a miss is
 attributable to events; whether the method can reach checkpoint coverage; MC4 to MC7, MC9 and the
 harness's part of MC8; and everything listed as carried above.
+
+Five independent reviews read the revision that followed, `3c50293`, on 2026-11-21, and each passed it
+with conditions. Two of the red team's conditions were choices for the owner, and the owner answered both
+on 2026-11-21 (the spec's record F). The revision that carries this paragraph writes those two answers
+into the spec, this plan and ADR 0017, and changes nothing else.
+
+| Put to the owner from the review of `3c50293` | The owner's answer, 2026-11-21 | Where |
+|---|---|---|
+| Red team L1: step 3 judged "one platform alone" by cell, as a proposal, so merging the text would have chosen the cell reading without an answer. The case: on macOS a C24 claim at 230 ms in a checkpoint window, on Linux a C24 event older than 5,000 ms | "kind reading is fine": a miss is shown by both platforms only when each missed the same kind of limit in the same population of the same cell. The case selects no path and goes back to the owner. The cell reading is not adopted | Spec R63, "What a miss selects" (step 3, the text under the steps, two rows of the cases), AP13, record F; ADR decision 12 |
+| Red team D1, major: the rule that stops measurement after a miss was keyed on the headline `FAIL`, so a data set with a defect and a miss, whose headline is `CORRECTNESS_DEFECT`, could be followed by a data set that fixes the defect without the owner's word | "ask first": after a data set in which a mandatory repetition that is `valid` or `host_not_idle` has missed, no further data set is started without the owner's word, whatever the headline, a data set that only fixes a defect included. No exception | Spec R63, "The verdict" (the rule and the three rows of what may follow a data set), AP13, record F; ADR decision 12 |
+
+The two answers choose two rules. They accept no number, limit, proxy for cause, eligibility rule, method
+or result, and they permit no measurement. No independent review has read the text that states them, so
+neither condition is closed, and D1 in particular stays open until its reviewer has read the exact head.
+The other conditions of the reviews of `3c50293` are not answered by this revision and stay open as those
+reviews left them: resilience N8 to N12 (a stop inside the restore's last check, the end of an
+abandonment, on which the security review left a note too, the numbering claim, the order of the gap
+range, the durability of the marker and of the stop record), facts N4 (the attribution in R63) and the
+notes on review status. Whether the same pass may
+correct them was asked of the owner apart and is not part of these two answers.
 
 Why another round of design review runs. AGENTS.md asks for the reason from the third round on. This text
 has been read at `196f9087` and at `a914e78`, and this revision asks for a further read. The lead's
@@ -294,8 +314,11 @@ to T15, T16, T23 and T4b.
 - The verdict (spec "The verdict", "What a miss selects"): the verifier of T4b gives every row of the
   spec's table of cases as written, from recorded inputs made for the purpose, the mixed cases included
   (a defect beside a miss, an unknown correctness or a backend not shown beside a miss): a verifier that
-  selects any path for them is wrong. No repetition of the
-  measurement is shortened or run again to make such an input.
+  selects any path for them is wrong. So is one that selects a path when the two platforms miss different
+  kinds of limit in one cell (the owner's answer of 2026-11-21). No repetition of the
+  measurement is shortened or run again to make such an input. The three rows of what may follow a data
+  set are a rule for whoever starts one under the spec's "Event measurement": after a mandatory miss none
+  is started without the owner's recorded word, the fix of a defect included.
 - The importer is tested on generated projects of the live project's shape and on a hand-written corpus of
   damaged input (T21), then once on a copy of the live project (T27).
 - Names and paths (spec R101 to R108, R117, R118): every test that plants a hostile name, link or special file
@@ -373,7 +396,12 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   lane 3's 1 s, the collector's 256 events or 250 ms), and the owner's ruling chooses T16's path. By the
   owner's ruling of 2026-11-21 every miss is kept, a miss selects the fallback only when it is attributable
   to events, and a miss without events or on one platform alone selects no event path and goes back to the
-  owner (the spec's "What a miss selects"). The path that ships is measured as built before T16 merges.
+  owner (the spec's "What a miss selects"). By the owner's two answers of 2026-11-21 that followed, "one
+  platform alone" is judged by kind of limit and population, so two different kinds of miss in one cell,
+  one on each platform, select no path; and after a mandatory miss in a `valid` or `host_not_idle`
+  repetition no further data set is started without the owner's word, whatever the headline, a data set
+  that only fixes a defect included (the spec's "The verdict"). The path that ships is measured as built
+  before T16 merges.
   T16's scope is written for either.
 - This revision proposes, and nobody has yet reviewed or approved: the limits for an idle host and the
   platform classes; the times of a stop (10 s, 5 s, 20 s); the counts and times of the reports for other
@@ -381,8 +409,9 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   4 KiB bound of the restore's marker; the names `restore-in-progress`, `restore-staging-<random hex>/`,
   `--continue`, `--abandon`, `spool/events-at-stop` and their temporary files; the names of the verdict's
   axes and values, its headline words and its exits 0, 1, 2 and 3; and, under the spec's "What a miss
-  selects", the eligibility rule, three readings, the step taken from "The host" and the cell reading of
-  "one platform alone", beside which the spec sets the limit reading for the owner to choose.
+  selects", the eligibility rule, three readings, among them the list of kinds by which the owner's kind
+  reading of "one platform alone" is applied, and the step taken from "The host". The kind reading itself
+  and the rule on a further data set after a miss are no longer among the proposals: the owner chose both.
   The coverage rule of the measurement is unchanged, and a valid run of the production rule can leave a
   repetition without it; whether the rule changes is a question for a reviewed revision of the method.
   The mandatory cells C24, H32 and B24 may be exposed to that as well as the diagnostic, so whether the

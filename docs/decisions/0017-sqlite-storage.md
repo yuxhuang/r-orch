@@ -15,8 +15,10 @@
 - The owner's answers (2026-11-20 and 2026-11-21): every point of the spec is answered as recommended,
   except AP13, which is answered in its direction; the spec's "Owner's answers" has a row for every id and
   its record. Decision 16 follows the answer to AP11, decision 17 the answer to O1, decision 18 the answer
-  to AP1, decision 12 the direction on AP13 and the owner's ruling of 2026-11-21 on what a miss selects,
-  and decisions 20 to 25 the answers to AP14 to AP19 and D1 to D5. Two things are still the owner's: the
+  to AP1, decision 12 the direction on AP13, the owner's ruling of 2026-11-21 on what a miss selects and
+  the owner's two answers of the same day on how "one platform alone" is judged and on a further data set
+  after a miss, and decisions 20 to 25 the answers to AP14 to AP19 and D1 to D5. Two things are still the
+  owner's: the
   numbers and results of AP13 (decisions 12 and 23), and the one part of decision 20 for which the spec
   recommended no option. A third lies outside the answers: the owner's word on using the live copy for
   the plan's task T4c. An answer is not the acceptance of this
@@ -141,9 +143,17 @@ across a crash, lists that do not load everything, and a retried request that ru
     chosen a data set must be eligible: no defect and no unknown correctness in any repetition, no
     required repetition invalid or without its backend shown, and coverage complete. A data set that is
     not eligible selects no path, keeps its headline and its exit, and keeps every miss on its own axis.
-    Where the ruling's words stop the spec proposes readings and marks them. For "one platform alone" it
-    proposes a reading by cell, sets beside it a reading by kind of limit, which sends more to the owner,
-    with the case in which the two differ, and recommends neither; the owner chooses. A fallback that is
+    Where the ruling's words stop the spec proposes readings and marks them. How "one platform alone" is
+    judged is no longer one of them. The spec set a reading by cell beside a reading by kind of limit,
+    with the case in which the two differ, and on 2026-11-21 the owner chose the kind reading: a miss is
+    shown by both platforms only when each missed the same kind of limit in the same population of the
+    same cell, so two different kinds of miss in one cell, one on each platform, select no path and go
+    back to the owner. The reading by cell is not adopted. The list of kinds is the spec's and stays a
+    proposal. The owner answered a second question the same day: after a data set in which a mandatory
+    repetition that is valid or on a host that was not idle has missed, no further data set is started
+    without the owner's word, whatever its headline, and a data set that only fixes a defect is no
+    exception. Both answers choose a rule; neither accepts a number, a limit, a method or a result, and
+    no independent review has read the text that carries them. A fallback that is
     selected is measured as built, and no figure shows it to be faster. Each data set gets one verdict from
     four axes reported apart (correctness, validity, coverage, budget), so that a miss on one platform with
     the other not yet run is a failure and incomplete at once. The measurement follows decisions 21 and 22
@@ -472,9 +482,14 @@ across a crash, lists that do not load everything, and a retried request that ru
   can take that commit back after the record is gone, and the gap is then lost without a trace. Rejected:
   the record stays until the rows are durable. The same question for a finish file is open (the red
   team's O8).
-- **Read "one platform alone" by kind of limit and not by cell.** Under it two different misses, one on
-  each platform, select no path. Neither adopted nor rejected: the spec states both readings and the case
-  in which they differ, and the choice is the owner's.
+- **Read "one platform alone" by cell and not by kind of limit.** Under it two different misses in one
+  cell, one on each platform, select the fallback, although neither platform shows the other's miss. Not
+  adopted: the owner was shown both readings and the case in which they differ, and chose the reading by
+  kind on 2026-11-21 (decision 12). Neither reading shows a cause.
+- **Let a data set that only fixes a defect start without the owner's word after a miss.** A data set
+  with a defect has the headline of the defect whatever it missed, so a rule that reads the headline
+  would let a second campaign follow a miss unasked. Not adopted: the owner answered "ask first" on
+  2026-11-21, with no exception for the fix of a defect (decision 12).
 - **Let any miss of the revised budget select the fallback.** The direction's first sentence. A miss in a
   cell with no events cannot show that moving events to files would help, and the fallback would then be
   built and miss the same way. The owner amended the sentence on 2026-11-21 (decision 12).
