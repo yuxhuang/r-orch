@@ -64,7 +64,13 @@ Both run `cargo build --release --offline --locked`, the main probe in a fresh d
 had a 10-second parent deadline in Docker and a 180-second parent deadline on macOS. Those
 watchdogs bound the experiment; they are not the product's promised 5-second query deadline.
 
-The dependency-only disposable-workspace audit is authorized while broad repository checks remain
-held. Compare baseline and candidate under unchanged `deny.toml`, freeze the advisory revision for
-both, and retain the resolving metadata/lock. Do not treat this audit as a workspace build/test or
+The historical dependency-only disposable-workspace audit ran while broad repository checks were
+held. Direct-main qualification is now separately authorized; historical receipts are not receipts
+for the new delivery head. Compare baseline and candidate under unchanged `deny.toml`, freeze the
+advisory revision for both, and retain the resolving metadata/lock. Do not treat this audit as a workspace build/test or
 Pre-PR receipt. No product dependency installation, daemon, socket or real agent CLI is involved.
+
+The direct-main reconciliation changes no probe bytes or historical JSON. In particular, the WAL
+hook/checkpoint APIs required by R126 exist through `hooks`/`wal` but are not exercised here;
+T4b owns their first execution. The full five-feature contract enters the product together at T9,
+not incrementally at T23, and only after the entry approval and that task's own dependency check.

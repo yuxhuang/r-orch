@@ -1,7 +1,8 @@
 # SQLite library recommendation for release 1.1
 
 2026-11-20 · Entry step C of `goal_sMVh4SG`; input to the storage ADR, pending the owner gate.
-Repository baseline: `fb6a1e1` (after v1.0.0). No product dependency or storage format changes here.
+Original audit baseline: `fb6a1e1` (after v1.0.0); direct-main preparation baseline: `d58f9b62`.
+No product dependency or storage format changes here.
 
 **Recommend `rusqlite` 0.41.1 with `bundled`, `backup`, `cache`, `hooks` and `limits`, defaults off, and
 `rusqlite_migration` 2.7.0 for migrations.** Add these to `[workspace.dependencies]` and
@@ -11,6 +12,36 @@ use them from `orch-infra` only after approval. Commit the resolving product loc
 rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "backup", "cache", "hooks", "limits"] }
 rusqlite_migration = { version = "=2.7.0", default-features = false }
 ```
+
+## Direct-main reconciliation — 2026-11-21
+
+The library-only slice has been rebased onto fetched main `d58f9b62`. The earlier delivery holds
+below describe their historical attempts. The delegated entry decision now allows this slice to
+qualify independently of the MCP and root-fixture streams; it waives no check or review. Acceptance
+still requires fresh native fast, every ordinary Pre-PR command including `cargo test --workspace`,
+a complete qualifying native pr tier, its separate full-SHA verifier, independent code/security
+reviews and final-head Linux CI. Those results must identify the actual delivery commit; the
+historical successes below do not establish qualification of this rebased branch.
+
+The corrected spec/plan/ADR at `4e0dbbf49798bc334e24bd892e2ffcde5f6b36a2` and the spec
+author's reconciliation confirm exactly the five features and versions above, with defaults off
+for both crates. T9 installs all five together in the workspace and `orch-infra`; T23 adds no
+feature. Product installation remains outside this entry. Registry readback on 2026-11-21 still
+lists rusqlite 0.43.0 and rusqlite_migration 2.7.0 as newest, and neither pinned choice is yanked.
+The older rusqlite line has no assumed maintenance guarantee.
+
+R126/ADR decision 23 additionally require WAL frame accounting through `Connection::wal_hook`
+(`hooks`) and `Connection::wal_checkpoint_v2` (`wal`, enabled by `hooks`). The library source
+provides both; this probe does **not** execute them. The spec assigns the first execution to T4b.
+WAL setup, snapshot and backup assertions below do not prove that backlog accounting contract.
+
+The probe manifests, locks, Rust source and both historical verification JSON files are byte-identical
+to `59e6b29`; their recorded source digests were checked again after rebase. The independent Python
+reader, deny-policy comparison, negative development controls and per-platform receipts are retained
+as evidence for those exact bytes, on their stated baseline and platforms. Rebase does not renew the
+disposable-workspace dependency audit for the new main graph. A fresh candidate/baseline deny audit
+and standalone native checks must be distinguished from the repository's own Pre-PR results.
+Native Linux hardware and GitHub Linux CI remain unproven by the Docker VM/emulation results.
 
 ## Renewed security-feature audit — 2026-11-20
 
@@ -80,7 +111,7 @@ Neither is independent native Linux hardware or GitHub Linux CI.
 supplement the unchanged historical `verification.json` at source `1c72fef`. The original SQLx
 comparison and three-feature costs below remain historical; SQLx was not re-audited here.
 
-**Delivery BLOCKED.** After fetch, `origin/main` is still `fb6a1e1`; PR92/root/MCP fixture corrections
+**Historical delivery block — 2026-11-20.** After fetch, `origin/main` is still `fb6a1e1`; PR92/root/MCP fixture corrections
 are not ancestors. Lead convergence `tsk_KPH2_ni` and successor `tsk_T09HVD_` explicitly withhold
 root/base acceptance: retained root ordinary 694 passed / 2 failed / 2 ignored and MCP fast
 7543 passed / 1 failed / 7 ignored remain red. A conditional code/security review is not acceptance.
@@ -197,7 +228,7 @@ one FTS row; malformed inserts are rejected. No real project data was used.
 are separate from the product workspace. The schema, port and readers are unchanged; no migration
 is run against an existing database. No human migration action is needed for this recommendation.
 
-Repository validation is **blocked**, separately from the dependency check above. At
+Historical repository validation was **blocked**, separately from the dependency check above. At
 `d46d4cc`, `fast --base origin/main` passed fmt, clippy, crate-graph, build and hygiene checks,
 but failed three existing `xtask` tests. Each failed again in one exact rerun on base
 `fb6a1e1` (0 passed / 1 failed / exit 101 per rerun):
