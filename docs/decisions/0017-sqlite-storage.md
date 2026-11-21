@@ -165,10 +165,15 @@ across a crash, lists that do not load everything, and a retried request that ru
     kind, still selects the fallback. Starting the second platform's block after a mandatory miss on the
     first, and replacing an invalid set of five, or one on a host that was not idle, while such a miss
     stands, are each further measurement that needs the owner's word, with the old set and every miss
-    kept. Selecting a path is not permission to measure it and does not qualify it to ship. These answers
+    kept. Neither answer changes a data set's headline or exit: a defect still comes first, with the other
+    axes printed. No answer settles what is done with a block that is already running when a mandatory miss
+    is seen or whether the blocks of two platforms may overlap, and no measurement campaign is started
+    before those two are settled; nor does one settle which data set a block that the owner allows belongs to.
+    Selecting a path is not permission to measure it and does not qualify it to ship. These answers
     too choose rules and accept no number, limit, method or result.
     A fallback that is
-    selected is measured as built, and no figure shows it to be faster. Each data set gets one verdict from
+    selected is measured as built before anything ships on it, and only on the owner's word, and no figure
+    shows it to be faster. Each data set gets one verdict from
     four axes reported apart (correctness, validity, coverage, budget), so that a miss on one platform with
     the other not yet run is a failure and incomplete at once. The measurement follows decisions 21 and 22
     of ADR 0013: it holds the host lease exclusively and samples the host, a budget met on a host that was
@@ -531,7 +536,8 @@ across a crash, lists that do not load everything, and a retried request that ru
   with a defect has the headline of the defect whatever it missed, so a rule that reads the headline
   would let a second campaign follow a miss unasked. Not adopted: the owner answered "ask first" on
   2026-11-21, with no exception for the fix of a defect (decision 12).
-- **Stop at any miss, select nothing, and keep the kinds as names in a report.** One rule in place of four
+- **Stop at any mandatory miss, select nothing, and keep the kinds as names in a report.** One rule in place
+  of four
   answers: simpler to apply, and it asks the owner every time. It also removes the one case that the owner's
   ruling of 2026-11-21 decides, the selection of the fallback for a miss attributable to events, and so
   amends that ruling. Not adopted: the session that answers under the owner's delegation withdrew it for
@@ -542,7 +548,8 @@ across a crash, lists that do not load everything, and a retried request that ru
   comparison across platforms in one campaign. Not adopted as the default: "ask first" must not depend on
   whether two platform blocks are called one data set, so the second block waits for the owner's word, and
   so does the replacement of a set of five while a mandatory miss stands (decision 12). The cost is that an
-  early miss leaves the data set incomplete until the owner allows the rest.
+  early miss leaves the data set incomplete until the owner allows the rest. What is done with a block that
+  is already running when the miss is seen is not decided here (decision 12).
 - **Let any miss of the revised budget select the fallback.** The direction's first sentence. A miss in a
   cell with no events cannot show that moving events to files would help, and the fallback would then be
   built and miss the same way. The owner amended the sentence on 2026-11-21 (decision 12).

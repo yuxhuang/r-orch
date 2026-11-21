@@ -305,20 +305,21 @@ with no marker after a loss of power, which stays a stated limit; and everything
 left above.
 
 Two independent reviews read the revision that followed, `8954cf6`, on 2026-11-21 (resilience, facts), for
-its changes, and each passed it with conditions. The same day four things that the spec had marked as
-proposals and put to the owner were answered under the owner's delegation, and the same record allows the
+its changes, and each passed it with conditions. The same day four things that the spec had put to the
+owner, two as proposals and two as open questions, were answered under the owner's delegation, and the same
+record allows the
 follow-up PR to open as a draft (the spec's record H). The answers are not the owner's own words; the spec's
 record gives the delegation word for word. The revision that carries this paragraph writes those answers
 into the spec, this plan and ADR 0017. It changes no number, limit or eligibility rule, chooses no method,
 permits no measurement and closes no finding.
 
-| Put to the owner as a proposal (the lead's name for it) | Answer under the owner's delegation, 2026-11-21 | Where |
+| Put to the owner (the lead's name for it) | Answer under the owner's delegation, 2026-11-21 | Where |
 |---|---|---|
 | The list of kinds by which the kind reading is applied (AP13-KINDS) | Adopted, and operative: the regular claims, the claims of a checkpoint window, the claims of a burst window, an event's age, and a refusal or something still queued. The match is made on the cell, the population and the kind together; kinds named in a report beside a selection made without them do not apply the reading | Spec R63, "What a miss selects" (step 3, the text under the steps, the cases), AP13, record H; ADR decision 12 |
 | That one miss of steps 2 to 4 anywhere returns the whole choice to the owner (AP13-WHOLESET) | Adopted: such a miss anywhere in a data set keeps it from selecting an event path. Not every miss stops every path: an eligible data set in which every miss is a valid miss in a population that holds events, shown by both platforms in the same cell, population and kind, still selects the fallback | Spec R63, "What a miss selects" (the text under the steps, the cases), AP13, record H; ADR decision 12 |
 | Whether the second platform's block, run after a mandatory miss on the first, is a further data set (AP13-BOUNDARY-1) | It is further measurement and needs the owner's word. Until then the data set stands with a platform absent, selects no path, and nothing stands in for the block that was not run | Spec R63, "The verdict" (the paragraph on the two questions, the rows of what may follow a data set), AP13, record H; ADR decision 12 |
 | Whether replacing an `invalid` or `host_not_idle` set of five, in a data set that holds a mandatory miss, starts one (AP13-BOUNDARY-2) | It is further measurement and needs the owner's word. The old set and every miss are kept. A set replaced where no mandatory miss stands is not touched by this answer | The same |
-| Whether the follow-up PR for the corrected text is opened as a draft (the answer D8) | One new PR may be opened as a draft once its checks and its statement of what it does not decide are ready. D8's conditions stand before approval and merge; the merge is the owner's | Spec row D8 of "Owner's answers", record H; this plan ("Open questions") |
+| Whether the follow-up PR for the corrected text is opened as a draft (the answer D8) | One new PR may be opened as a draft from the reviewed correction once its publication checks and its disclosure package (its statement of what it does not decide) are ready. D8's conditions stand before approval and merge; the merge is the owner's | Spec row D8 of "Owner's answers", record H; this plan ("Open questions") |
 
 Selecting a path, permission to measure and qualification to ship are three things, and the answers give
 only the first its rule: a selected fallback is measured as built only on the owner's word, since the data
@@ -328,6 +329,21 @@ proposal, the sync settings, the eligibility rule, the reading of "a burst alone
 rules, the fifth point of AP14 and the word on the live copy for T4c. The method challenge's findings on
 attribution and on whether a complete data set can be produced, and the controls it asked for, are findings
 about the method and stay open as their reviews left them; an answer on a rule closes none of them.
+
+Four independent reviews read that revision, `ec68890`, on 2026-11-21 (method, red team, facts, resilience):
+one blocked it and three passed it with conditions. The revision that carries this paragraph answers them.
+A row here says what the text does with a finding. It does not close the finding: that is the reviewer's
+to say.
+
+| Finding at `ec68890` | What the text does |
+|---|---|
+| Method DM1 (major, blocking): the text on the two answers about further measurement gave `FAIL, INCOMPLETE` or `INCOMPLETE` to a data set that also has a correctness defect, against the order of the headlines | The headline and the exit are those of the one rule, the defect first, with the coverage and the budget axis kept; two rows trace the mixed cases, each beside its control without a defect (spec "The verdict") |
+| Red team R1 (major): nothing listed as open what is done with a block that is running when a mandatory miss is seen, or whether the platforms' blocks may overlap | Both are named as open with what the owner holds (spec "The verdict", and AP13 in "Open questions" and in "Owner's answers"; this plan's "Open questions"); no campaign is started before they are settled; no rule for stopping, scheduling or tearing down a block is chosen |
+| Facts F-M1 and red team R2: record H gave the second answer as "misses of one kind" | Record H quotes the answer; a case shows two kinds of miss, each matched on both platforms, selecting the fallback; every case that selects nothing is kept |
+| Red team R3: a selection could be read as starting the measurement of the fallback | Step 5, the AP13 row and ADR 0017 decision 12 say that it is started only on the owner's word |
+| Red team R5 and the resilience review's O1: which data set a block that the owner allows belongs to | Not chosen; named as open with the two of R1 |
+| Resilience N17: nothing enforces the two answers at a start, and nothing bounds a stop | Carried as a duty of the method's proposal for a campaign ("Test plan", T4b); not due before one is proposed |
+| Facts m1 to m6 and m9: the count and the time of record H, and five phrases of it and of this section | Five of six answers; no time of day is given; two proposals and two questions; the limits as the record has them, with the spec's reading named as a reading; the reach of the withdrawn rule; the draft's conditions as the record has them; the reason for the sixth read is not given as the lead's words |
 
 Why another round of design review runs. AGENTS.md asks for the reason from the third round on. This text
 has been read at `196f9087` and at `a914e78`, and this revision asks for a further read. The lead's
@@ -364,11 +380,17 @@ that is about something else, so that closing that item could have been read as 
 points of wording are corrected in the same pass. The read is limited to what this revision changed after
 `d2fe9b0`, which is no rule; no test settles an attribution.
 
-A sixth read follows the answers of the spec's record H. The lead's reason is that four rules which were
-proposals are now answered, and the text that states them is new: the selection with its cases for and
+A sixth read follows the answers of the spec's record H. The reason is that four things which were open
+are now answered, that every changed text needs its checks and its review (the spec's record H), and that
+the text which states the answers is new: the selection with its cases for and
 against, the two answers on further measurement with what is kept at a stop, what a draft does and does not
 decide, and whose words each answer is. The read is limited to that. No test settles it before the owner's
 gate; the verifier's cases carry the selection to T4b.
+
+A seventh read follows the correction of that text. The reason is what the sixth read found (the table of
+findings at `ec68890` above): one reader blocked on a headline that had two answers, and the text that
+removes it is new. The read is limited to the changes that the table names, by the four readers of the
+sixth. No test settles it before the owner's gate.
 
 ## Status
 
@@ -432,12 +454,21 @@ gate; the verifier's cases carry the selection to T4b.
   selects without them is wrong; one that selects a path while a miss of steps 2 to 4 stands anywhere in
   the data set is wrong; and one that selects nothing for an eligible data set in which every miss is a
   valid miss in a population that holds events, shown by both platforms in the same cell, population and
-  kind, is wrong as well: the fallback is selected there. No repetition of the
+  kind, is wrong as well: the fallback is selected there, for one such miss and for two kinds of miss that
+  are each matched. The verifier gives the headline and the exit of every row of the spec's table of what
+  may follow a data set as well: one that gives `FAIL, INCOMPLETE` or `INCOMPLETE` where a repetition has
+  a defect, beside an absent platform or an `invalid` set, is wrong. No repetition of the
   measurement is shortened or run again to make such an input. The rows of what may follow a data
   set are a rule for whoever starts one under the spec's "Event measurement": after a mandatory miss none
   is started without the owner's recorded word, the fix of a defect included; nor is the second
   platform's block, nor the replacement of an `invalid` or `host_not_idle` set of five. A selection
-  starts no measurement of the path it selects.
+  starts no measurement of the path it selects. A method that proposes a campaign (T4b) carries, with
+  whatever it proposes for a block that is already running: a check at every start of a second block or
+  of a replacement, which reads the recorded budget axis and the owner's recorded word and refuses with a
+  record; and for any stop a bound within which the processes it owns are ended and the host's lease is
+  given back, an end record is written or the coverage is marked incomplete, and partial output is kept,
+  with a control test (the resilience review of `ec68890`, N17). That is not due before a campaign is
+  proposed, and none is authorised.
 - The importer is tested on generated projects of the live project's shape and on a hand-written corpus of
   damaged input (T21), then once on a copy of the live project (T27).
 - Names and paths (spec R101 to R108, R117, R118): every test that plants a hostile name, link or special file
@@ -503,8 +534,9 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   approves the spec, changes D8 or releases a product task, and this plan reads it as none of those: the
   spec stays `draft`, this plan `proposed` and ADR 0017 proposed, D8's conditions are unmet, and D8 is read
   as standing for the follow-up PR. By an answer of 2026-11-21 given under the owner's delegation (the
-  spec's record H) one new follow-up PR may be opened as a draft once its checks and its statement of
-  what it does not decide are ready. A draft is not accepted content: D8's conditions stand before the
+  spec's record H) one new follow-up PR may be opened as a draft from the reviewed correction once its
+  publication checks and its disclosure package are ready. A draft is not accepted content: D8's conditions
+  stand before the
   spec is approved and before that PR merges, and merging it chooses no proposal that is still pending,
   accepts no number or result and releases no product task. When it merges is the owner's to rule;
   nothing in this plan depends on when. Showing the owner the corrected text does not wait for the entry
@@ -531,7 +563,10 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   selects the fallback; and starting the second platform's block after a mandatory miss on the first, or
   replacing an `invalid` or `host_not_idle` set of five while such a miss stands, is further measurement
   that needs the owner's word. Selecting a path is not permission to measure it and does not qualify it
-  to ship. The path that ships is measured as built
+  to ship. Settled by no answer, and open: what is done with a block that is already running when a
+  mandatory miss is seen, and whether the blocks of two platforms may overlap or be run in turns; no
+  measurement campaign is started before those two are settled. Open as well: which data set a block that
+  the owner allows belongs to. The path that ships is measured as built
   before T16 merges.
   T16's scope is written for either.
 - This revision proposes, and nobody has yet reviewed or approved: the limits for an idle host and the
