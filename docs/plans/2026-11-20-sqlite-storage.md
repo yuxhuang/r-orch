@@ -210,8 +210,8 @@ conditions before publication and before the product; facts F3, which is the pub
 
 Five independent reviews then read revision `a914e78` on 2026-11-21 (method, resilience, security, facts,
 red team). The method review blocked it and the other four passed it with conditions. The table below is
-this revision's answer to each condition. None is closed by it, and no independent review has yet read
-this revision. The answer D1 requires a re-review at the exact head before the spec is approved, and every
+this revision's answer to each condition. None is closed by it. When it was written no independent review had
+read that revision; five have read it since (below). The answer D1 requires a re-review at the exact head before the spec is approved, and every
 condition above and below stays open until that review closes it.
 
 | Finding at `a914e78` | Answer | Where |
@@ -221,8 +221,8 @@ condition above and below stays open until that review closes it.
 | Facts N1, minor: step 4 of those steps is not a reading of the ruling | Accepted. The text says four things are not the ruling's words and that step 4 comes from "The host" | Spec "What a miss selects" |
 | Method MC2 and red team R2, major: only the diagnostic was named as exposed to a size call that moves the timer, and nothing said what follows an incomplete data set | Accepted for the text. C24, H32 and B24 are named as exposed; an incomplete data set selects no path, and a new one needs the owner's direction or an approved revision of the method, never a repeat of the unchanged method. Not done: no call is forced, no repetition lengthened, no other call credited, no cell or count changed, nothing measured. Whether the method can complete stays open and is the performance engineer's | Spec "Checkpoints in every repetition", "The verdict", "Diagnostics" |
 | Resilience N1, major: the marker was created and rewritten in place, so a stop between its creation and its write, or during the change of direction, left a marker that neither command could read | Accepted. Every version is published whole by a temporary file, a sync, a rename and a directory sync; a temporary file is scratch; a marker that fails its check fails closed with a manual recovery that the RUNBOOK is to give; stops at each step of the publication are tested | Spec R138, "How a restore replaces the state", "Data directory"; ADR decision 16; T23, T26 |
-| Resilience N2 and N3, minor: one directory of two was synced after a rename and the `pre-restore` directory was never created; an abandonment after the staging directory was gone had nowhere to put a part | Accepted. The directory is created and synced before the marker and both directories are synced after each rename. Once the staging directory is gone the restore is complete: `--abandon` is refused and `--continue` only checks and removes the marker | Spec R138, "How a restore replaces the state"; T23 |
-| Security S-R1381, medium: a continuation told what was left from where the staged part lay, so with an old `-wal` and no staged one a stop after the database was moved out could end with the new database beside the old log | Accepted. The marker lists, for seven fixed members, which the replaced state holds and which the staged state holds. Every replaced member is moved out before any staged member is moved in, on a continuation too. The absence of a member that was never staged means nothing. The layout, the lineage, the generation and the ended leases are checked before the marker is removed, and a layout the steps cannot have left keeps the marker and is refused. This is a gap in the contract; no shipped code exists and no replay of an old log was shown | Spec R138, "How a restore replaces the state"; ADR decision 16; T23 |
+| Resilience N2 and N3, minor: one directory of two was synced after a rename and the `pre-restore` directory was never created; an abandonment after the staging directory was gone had nowhere to put a part | Accepted. The directory is created and synced before the marker and both directories are synced after each rename. Once the staging directory is gone the restore is complete: `--abandon` is refused and `--continue` only checks and removes the marker. That refusal was later cut down to the direction `forward` (the table for `3c50293` below) | Spec R138, "How a restore replaces the state"; T23 |
+| Security S-R1381, medium: a continuation told what was left from where the staged part lay, so with an old `-wal` and no staged one a stop after the database was moved out could end with the new database beside the old log | Accepted. The marker lists, for seven fixed members, which the replaced state holds and which the staged state holds. Every replaced member is moved out before any staged member is moved in, on a continuation too. The absence of a member that was never staged means nothing. The layout, the lineage, the generation and the ended leases are checked before the marker is removed, and a layout the steps cannot have left keeps the marker and is refused. The last check was later changed to read files only (the table for `3c50293` below). This is a gap in the contract; no shipped code exists and no replay of an old log was shown | Spec R138, "How a restore replaces the state"; ADR decision 16; T23 |
 | Resilience N4 and N5, minor: nothing said that events have numbers before they commit, the stop record could be removed before its gap row was synced, and a second stop could overwrite the first record | Accepted. Events are numbered at handover; a start continues above everything committed and recorded; the record is published whole and merged, and is removed only when its gap rows are durable. The same rule for a finish file is the red team's O8 and stays open | Spec R61, R139, "Stopping", "Data directory"; ADR decision 23; T15, T16 |
 | Resilience N6, a note: a service manager's kill time must exceed the stop's bound | Carried as a duty of the RUNBOOK (T26). No service manager's default is stated, since none was checked, and the RUNBOOK is not edited by this revision | Spec "Stopping"; ADR "Consequences" |
 | Resilience N7 and red team R3, minor: "idle" sees load and build processes only | Accepted as a stated limit. The record says so in words; recording the scratch device's write activity is the performance engineer's to declare. No sample, limit or harness change is made here | Spec "The host" |
@@ -254,6 +254,30 @@ range, the durability of the marker and of the stop record), facts N4 (the attri
 notes on review status. Whether the same pass may
 correct them was asked of the owner apart and is not part of these two answers.
 
+The owner's answer to that came the same day (the spec's record G): corrections for review findings on
+these three documents may be written without a new question each time, and the result still comes to
+the owner as a pull request. It closes no finding. The revision that carries this paragraph is the pass
+it allows. The table is its answer to each condition that the reviews of `3c50293` left open. None is
+closed by it, and no independent review has read this revision or the one before it.
+
+| Finding at `3c50293` | Answer | Where |
+|---|---|---|
+| Resilience N8, major: the restore's last check opened the database, which makes a `-wal` and a `-shm`; a stop inside the check left them at a live name beside the new database, a layout that both commands refuse, so nothing could finish the restore | Accepted, by the review's first option. The check opens no database. The staged database is closed, the staging directory is looked at for anything but staged members, and the file alone is read once more to hold the new lineage, the new generation and no active lease, with its SHA-256 the same before and after; the marker holds that hash, and the last check compares the bytes at the live name with it. Nothing opens the live database while the marker stands, so the check leaves no file and is run again after a stop. The rule that refuses a `-wal` at a live name is unchanged. No way of opening a database without companions is relied on | Spec R138, "How a restore replaces the state" (steps 2, 3 and 5, the table of stops); ADR decision 16; T23 |
+| Resilience N9, major, with the security review's note on the same case: an abandonment stopped after it had removed the staging directory was refused by `--abandon`, with a message that the restore was complete, and by `--continue`; and a part of the staging directory removed did not fit the table of places | Accepted. The refusal for a staging directory that is gone holds under `forward` only. Under `back`, `--abandon` first tests whether the abandonment has reached its end (every replaced member live, no other member live, `pre-restore` empty or absent), before the table of places and before any rule on the staging directory, and then only finishes the cleanup: the rest of the staging directory unread, the `pre-restore` directory, the marker, each skipped when already done | Spec R138, "How a restore replaces the state" (the two commands, the table of stops); ADR decision 16; T23 |
+| Resilience N10, minor: "No number of a run shall be given twice" does not hold for numbers lost with a killed daemon or with the power under `synchronous = NORMAL` | Accepted. The claim is cut down to numbers that are committed or recorded, and the loss is stated. No durable record of the numbers given is added, and nothing is closed: the loss stays open with the red team's O6 | Spec R61, "Stopping" (the table); ADR decision 23 |
+| Resilience N11, a nit: nothing said that the ranges of a stop are taken after the writer's last commit, so a gap row could cover an event that exists | Accepted, both ways the review offered. The ranges are taken once the writer has ended its last transaction and no event is given a number any more; and a start cuts each recorded range to the numbers that no committed event and no gap row holds | Spec R139, "Stopping"; ADR decision 23; T15, T16 |
+| Resilience N12, minor: the marker and the stop record are synced by this program and not by SQLite, and on macOS a plain sync does not empty the drive's cache, so what was said of a stop held for a stop of the process only | Accepted as a stated limit, with the intended call named. The spec now says which promises are for a stop of the process and rest on no sync, and what a sync means on each platform for these files. It proves nothing about a loss of power: no such test exists, whether macOS accepts the full flush for a directory was not checked, and the outcomes after a loss of power are listed, among them one that a start does not recognise. The manual recovery stays a duty of T26 | Spec "What a sync promises", R138, R139; ADR decision 16 |
+| Facts N4, moderate: in R63 the sentence "That is the owner's ruling" stood after the eligibility rule and so named a proposal as the ruling | Accepted. The attribution now follows the two sentences that state the ruling and names the owner's "1."; the eligibility rule is called this spec's proposal, which the owner has not read. The rule itself is unchanged | Spec R63 |
+| Red team D1, major: a data set with a defect and a miss could be followed by another without the owner's word | Accepted by the owner's answer of 2026-11-21, already written by the revision before this one and kept as it was: the rule reads the budget axis, has no exception for the fix of a defect, and has its three rows. Two questions about where a data set ends are named as not settled and are the owner's | Spec "The verdict", R63; ADR decision 12 |
+| Facts' notes: the status of the reviews in these documents was true when written and goes stale; the ADR's short form of the eligibility rule left out three of its terms | Accepted. The status lines say which revision each review read; the ADR names the backend, the settings, the timing check and the platform class | Spec (the text under the title), this plan, ADR decision 12 |
+
+Left for the owner or for a named owner by this revision, and chosen by nothing in it: the two
+questions about where a data set ends (the owner's); whether a start should recognise members moved
+with no marker after a loss of power (the spec states the limit and adds no check); which sync call
+macOS accepts for a directory (the builder's, in T15, T16 and T23, with the spec corrected there);
+a durable record of the numbers given (with the red team's O6); and when a finish file may be removed
+(the red team's O8).
+
 Why another round of design review runs. AGENTS.md asks for the reason from the third round on. This text
 has been read at `196f9087` and at `a914e78`, and this revision asks for a further read. The lead's
 reason, from its adjudication of the reviews of `a914e78`, is that the second read produced counterexamples
@@ -267,6 +291,21 @@ fallback while the text said that this reading sent more to the owner. The round
 conditions and to what their corrections touch. A test cannot settle them yet, because no product code is
 built before the owner's gate; the named tests of R61, R138 and R139 and the verifier's cases carry them
 to T15, T16, T23 and T4b.
+
+A further round follows the reviews of `3c50293`, which makes four reads of this text. The lead's
+reason, from its disposition of those reviews, is of the same kind: counterexamples and one wrong
+attribution that the text did not answer, and no request for a wider design. (1) A restore stopped inside
+its last check, which opened the database, left a `-wal` at a live name that both commands refused, so
+nothing could finish it. (2) An abandonment stopped after it had removed the staging directory was
+refused by `--abandon`, with a message that the restore was complete, and by `--continue`. (3) "No number
+of a run shall be given twice" did not hold for numbers lost with a killed daemon or with the power.
+(4) Nothing said that the ranges of a stop are taken after the writer's last commit, so a gap row could
+cover an event that exists. (5) The marker and the stop record are synced by this program, and on macOS
+a plain sync does not empty the drive's cache, so what was said of a stop held for a stop of the process
+only. (6) R63 called the proposed eligibility rule the owner's ruling. (7) A data set with a defect and a
+miss could be followed by another without the owner's word, which the owner has since answered. The
+round is limited to those seven and to what their corrections touch. A test still cannot settle them
+before the owner's gate; the named tests of R61, R138 and R139 carry them to T15, T16 and T23.
 
 ## Status
 
@@ -300,13 +339,22 @@ to T15, T16, T23 and T4b.
   for `forward` and for the change to `back`, and each rename of `orch.db`, `orch.db-wal` and
   `orch.db-shm` where the replaced state has the two companions and the staged state has none. Each
   command is also run a second time. A layout that the steps cannot leave, a marker that fails its check
-  and an abandonment after the staging directory is gone are each refused with the marker kept.
+  and, while the direction is `forward`, an abandonment after the staging directory is gone are each
+  refused with the marker kept. The stops also include each read of the last check, which opens no
+  database, and each removal of an abandonment's cleanup: a part of the staging directory gone, all of
+  it gone, and the `pre-restore` directory gone as well. After each of those the test asserts more than
+  a refusal: `--continue`, or under `back` `--abandon`, runs to its end, and a state that both commands
+  refuse fails the test unless the spec's table of stops calls it unexpected. No `-wal` or `-shm` may
+  appear at a live name while the marker exists. These are stops of the process. No test cuts the
+  power, and the spec's "What a sync promises" says what is therefore not proved.
 - A stop (spec R139): with a second connection holding the write lock and a fake clock, the stop ends at
   its bound; each step is recorded in order; events handed over and not committed are a gap row after the
   next start, or are named by the stop when their record could not be written. An event has its number
   at handover; a start continues above the committed and the recorded numbers; a second stop keeps the
   first record's ranges; the record is removed only after its gap rows are durable (a fake reports the
-  commit as not yet synced); a start that is killed and run again writes each gap once.
+  commit as not yet synced); a start that is killed and run again writes each gap once. The ranges are taken after the writer's
+  last transaction, and a start writes no gap row over a committed event (a record with such a range
+  is planted).
 - Other connections (spec R137, R140): a result is injected at the checkpoint, read, query and backup
   connections in turn. Corruption fails the writer from each; other failures are counted and reported at
   their thresholds and do not fail it; each outcome of a checkpoint call is produced from injected counts,
@@ -407,7 +455,9 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   platform classes; the times of a stop (10 s, 5 s, 20 s); the counts and times of the reports for other
   connections (three in a row, 5 minutes); the 1 s before a failed checkpoint call is tried again; the
   4 KiB bound of the restore's marker; the names `restore-in-progress`, `restore-staging-<random hex>/`,
-  `--continue`, `--abandon`, `spool/events-at-stop` and their temporary files; the names of the verdict's
+  `--continue`, `--abandon`, `spool/events-at-stop` and their temporary files; the SHA-256 of the
+  staged database as a field of that marker; the sync call named for each platform in the spec's
+  "What a sync promises"; the names of the verdict's
   axes and values, its headline words and its exits 0, 1, 2 and 3; and, under the spec's "What a miss
   selects", the eligibility rule, three readings, among them the list of kinds by which the owner's kind
   reading of "one platform alone" is applied, and the step taken from "The host". The kind reading itself

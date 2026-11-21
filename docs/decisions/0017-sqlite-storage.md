@@ -141,7 +141,8 @@ across a crash, lists that do not load everything, and a retried request that ru
     without events (claims alone, cell C0, a burst alone) or on one platform alone selects no event path and
     goes back to the owner. The spec applies those words and adds no test of cause. Before any path is
     chosen a data set must be eligible: no defect and no unknown correctness in any repetition, no
-    required repetition invalid or without its backend shown, and coverage complete. A data set that is
+    required repetition invalid or without its backend, its settings, its timing check or its platform
+    class shown, and coverage complete. That rule is the spec's proposal and not the owner's ruling. A data set that is
     not eligible selects no path, keeps its headline and its exit, and keeps every miss on its own axis.
     Where the ruling's words stop the spec proposes readings and marks them. How "one platform alone" is
     judged is no longer one of them. The spec set a reading by cell beside a reading by kind of limit,
@@ -212,10 +213,20 @@ across a crash, lists that do not load everything, and a retried request that ru
     the replaced state holds and which the staged state holds, the database's `-wal` and `-shm` among
     them. Every replaced member is moved out before any staged member is moved in, a continuation
     included, and a member that was never staged is never taken as moved in by its absence. Both
-    directories of a rename are synced. Before the marker is removed the layout, the lineage, the
-    generation and the ended leases are checked, and a layout that the steps cannot have left keeps the
-    marker and is refused. While the marker exists nothing starts; `orch db restore --continue`
-    finishes the restore and `--abandon` puts the replaced state back, byte for byte. A restore needs free
+    directories of a rename are synced. The staged database is closed and its file is read once more,
+    with no log beside it, to hold the new lineage, the new generation and no active lease; the marker
+    holds the SHA-256 of that file. Before the marker is removed the layout is checked and the bytes of
+    the database at its live name are compared with that hash, and a layout that the steps cannot have
+    left keeps the marker and is refused. Nothing opens the live database with SQLite while the marker
+    exists, so the last check leaves no file and a stop inside it is recovered by running it again.
+    While the marker exists nothing starts; `orch db restore --continue`
+    finishes the restore and `--abandon` puts the replaced state back, byte for byte. An abandonment
+    that was stopped during its cleanup, with the replaced state whole at the live names, is finished
+    by `--abandon` whatever is left of the scratch directory; an abandonment is refused for a scratch
+    directory that is gone only while the direction is still `forward`. All of this is promised for a
+    stop of the process. After a loss of power it holds as far as the platform's sync had reached the
+    medium: the spec names the call meant for each platform, proves none, and lists what can then be
+    found, among it a state that no start recognises. A restore needs free
     space of the backup's size above the disk floor. So a database of one state never serves beside the
     blobs or the repositories of the other, and a backup's leases are never active at a live name. What a
     restore does with a workspace that already stands is not part of this and stays the owner's (decision
@@ -365,7 +376,10 @@ across a crash, lists that do not load everything, and a retried request that ru
     ordered and bounded: admission, the transaction in progress, the queued work until a deadline, then
     reads and the checkpoint, the lock last; events handed over and not committed are recorded in the
     spool and become a gap row at the next start (R139). Events are numbered at handover, and a start
-    continues above everything committed and everything recorded (R61). The record is published whole
+    continues above everything committed and everything recorded (R61). No committed or recorded
+    number is given again; a number lost with a killed daemon, or with the power under
+    `synchronous = NORMAL`, can be, and no gap row says so. The ranges of a stop are taken after the
+    writer's last transaction, and a start writes no gap row over a committed event. The record is published whole
     and merged with one that is already there, and it is removed only when its gap rows can no longer be
     lost with the power. And the classes cover every connection: corruption
     seen by a read, a checkpoint, a query or a backup fails the writer, other failures there are counted
@@ -478,6 +492,20 @@ across a crash, lists that do not load everything, and a retried request that ru
   that neither command could read. And a staged database has no `-wal`, so a missing staged `-wal` read as
   "moved in" could leave the new database beside the old log. Rejected for publication by rename and for
   the marker's list of members, with every replaced member moved out first.
+- **Open the moved-in database for the restore's last check.** The text read at `3c50293`. Opening a
+  database in write-ahead-log mode makes a `-wal` and a `-shm`, so a stop inside the check left both at
+  a live name beside the new database, which is the layout that both commands must refuse, and nothing
+  could finish the restore. Rejected for a check that reads files only: the staged file is read back
+  before the marker is written, and its hash is compared afterwards.
+- **Open it read-only and immutable, as the export reader does, or call the check's own leftovers
+  expected.** The first rests on what such a connection does with a database in write-ahead-log format
+  in the bundled build, which the spec's F13 records from a report that is not yet delivered or
+  reviewed; the second rests on what an interrupted connection leaves in a log. Neither is adopted,
+  because the recovery of a restore should not depend on either, and the hash needs neither.
+- **Refuse an abandonment whenever the scratch directory is gone.** The text read at `3c50293`. An
+  abandonment removes that directory itself, before the marker, so one that was stopped there was
+  refused by both commands. Rejected: the refusal holds under `forward` only, and under `back` the end
+  of an abandonment is tested first.
 - **Remove the stop record as soon as its gap rows commit.** Under `synchronous = NORMAL` a loss of power
   can take that commit back after the record is gone, and the gap is then lost without a trace. Rejected:
   the record stays until the rows are durable. The same question for a finish file is open (the red
@@ -545,7 +573,7 @@ across a crash, lists that do not load everything, and a retried request that ru
   until it is continued or abandoned; the RUNBOOK must say so, and must give the manual recovery for a
   marker that fails its check.
 - A stop can take up to its bound (20 s is proposed) and can leave a gap in a run's events; a daemon that
-  is killed records none. A service manager that runs the daemon must allow a stopping process longer
+  is killed records none, and the numbers of the events it held can be given again (R61). A service manager that runs the daemon must allow a stopping process longer
   than that bound before it kills it; the RUNBOOK must say so, and no default of any service manager is
   relied on here. A checkpoint that keeps failing, a backlog that stays, and corruption seen by
   any connection are shown by `orch status` and `orch doctor` and are not attention items.
