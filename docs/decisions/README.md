@@ -63,5 +63,6 @@ What gets easier, what gets harder, what must change as a result.
 | [0015](0015-cooperative-gate-target-recovery.md) | A use of a gate target is finished when the processes the gate started have exited under the cooperative lease | proposed. Decision 41 records the owner's decision of 2026-11-15 and is binding; decisions 42–47, the implementation contract, are proposed and would supersede named clauses of 0014 decisions 32–36 and 38 |
 
 | [0016](0016-partial-gate-receipts.md) | Partial gate receipts verify diagnostics separately from qualification | proposed |
+| [0017](0017-sqlite-storage.md) | SQLite is the only storage backend from release 1.1 | proposed. Decisions 1 to 6 and 14 restate the owner's binding decisions for the goal; the rest await the approval gate. On acceptance it supersedes named clauses of 0012 decisions 1, 8 and 9 and `docs/TRAITS-FROZEN.md` §2 |
 
 `docs/reviews/` holds historical gate reviews from the early port-era work; new material does not go there.
