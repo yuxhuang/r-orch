@@ -137,7 +137,13 @@ across a crash, lists that do not load everything, and a retried request that ru
     the revised budget selects the fallback. On 2026-11-21 the owner amended that sentence: every miss is
     kept and reported; a miss selects the fallback only when it is attributable to events; and a miss
     without events (claims alone, cell C0, a burst alone) or on one platform alone selects no event path and
-    goes back to the owner. The spec applies those words and adds no test of cause. A fallback that is
+    goes back to the owner. The spec applies those words and adds no test of cause. Before any path is
+    chosen a data set must be eligible: no defect and no unknown correctness in any repetition, no
+    required repetition invalid or without its backend shown, and coverage complete. A data set that is
+    not eligible selects no path, keeps its headline and its exit, and keeps every miss on its own axis.
+    Where the ruling's words stop the spec proposes readings and marks them. For "one platform alone" it
+    proposes a reading by cell, sets beside it a reading by kind of limit, which sends more to the owner,
+    with the case in which the two differ, and recommends neither; the owner chooses. A fallback that is
     selected is measured as built, and no figure shows it to be faster. Each data set gets one verdict from
     four axes reported apart (correctness, validity, coverage, budget), so that a miss on one platform with
     the other not yet run is a failure and incomplete at once. The measurement follows decisions 21 and 22
@@ -190,7 +196,15 @@ across a crash, lists that do not load everything, and a retried request that ru
     restored state is first built under a scratch name: the database already carries the new lineage and
     generation and has every lease of the backup ended, and the spool is empty. A synced marker is then
     written, the replaced state is moved aside and the staged state moved in by renames in a fixed order,
-    and the marker is removed last. While the marker exists nothing starts; `orch db restore --continue`
+    and the marker is removed last. The marker is published whole, by a temporary file, a sync and a
+    rename, for its first version and for the change of direction alike, so that a stop never leaves a
+    part of one; one that fails its check fails closed and is recovered by hand. It lists which members
+    the replaced state holds and which the staged state holds, the database's `-wal` and `-shm` among
+    them. Every replaced member is moved out before any staged member is moved in, a continuation
+    included, and a member that was never staged is never taken as moved in by its absence. Both
+    directories of a rename are synced. Before the marker is removed the layout, the lineage, the
+    generation and the ended leases are checked, and a layout that the steps cannot have left keeps the
+    marker and is refused. While the marker exists nothing starts; `orch db restore --continue`
     finishes the restore and `--abandon` puts the replaced state back, byte for byte. A restore needs free
     space of the backup's size above the disk floor. So a database of one state never serves beside the
     blobs or the repositories of the other, and a backup's leases are never active at a live name. What a
@@ -340,7 +354,10 @@ across a crash, lists that do not load everything, and a retried request that ru
     moves the timer, so a call that the size rule started delays the next timer call (R137). A stop is
     ordered and bounded: admission, the transaction in progress, the queued work until a deadline, then
     reads and the checkpoint, the lock last; events handed over and not committed are recorded in the
-    spool and become a gap row at the next start (R139). And the classes cover every connection: corruption
+    spool and become a gap row at the next start (R139). Events are numbered at handover, and a start
+    continues above everything committed and everything recorded (R61). The record is published whole
+    and merged with one that is already there, and it is removed only when its gap rows can no longer be
+    lost with the power. And the classes cover every connection: corruption
     seen by a read, a checkpoint, a query or a backup fails the writer, other failures there are counted
     and do not, and checkpoints that keep failing or a backlog that stays are reported (R140).
 
@@ -446,6 +463,18 @@ across a crash, lists that do not load everything, and a retried request that ru
   (the old out, the new in) and so still needs the marker, since a start between them would find no state
   and make a new one; and it moves the database, which changes the layout that decision 5, the backup and
   the names of decision 20 all rest on. The marker makes several renames as safe as two.
+- **Write the restore's marker in place, and tell what a stopped restore has left from where the staged
+  parts lie.** The text read at `a914e78`. A stop between the marker's creation and its write left a marker
+  that neither command could read. And a staged database has no `-wal`, so a missing staged `-wal` read as
+  "moved in" could leave the new database beside the old log. Rejected for publication by rename and for
+  the marker's list of members, with every replaced member moved out first.
+- **Remove the stop record as soon as its gap rows commit.** Under `synchronous = NORMAL` a loss of power
+  can take that commit back after the record is gone, and the gap is then lost without a trace. Rejected:
+  the record stays until the rows are durable. The same question for a finish file is open (the red
+  team's O8).
+- **Read "one platform alone" by kind of limit and not by cell.** Under it two different misses, one on
+  each platform, select no path. Neither adopted nor rejected: the spec states both readings and the case
+  in which they differ, and the choice is the owner's.
 - **Let any miss of the revised budget select the fallback.** The direction's first sentence. A miss in a
   cell with no events cannot show that moving events to files would help, and the fallback would then be
   built and miss the same way. The owner amended the sentence on 2026-11-21 (decision 12).
@@ -498,9 +527,12 @@ across a crash, lists that do not load everything, and a retried request that ru
   procedures change. The stable-sort rule stays: the scheduler still sorts in memory.
 - Backups become a product duty: database, blobs and repositories as one restorable point. A restore
   needs free space of the backup's size, and a restore that was stopped keeps the daemon from starting
-  until it is continued or abandoned; the RUNBOOK must say so.
+  until it is continued or abandoned; the RUNBOOK must say so, and must give the manual recovery for a
+  marker that fails its check.
 - A stop can take up to its bound (20 s is proposed) and can leave a gap in a run's events; a daemon that
-  is killed records none. A checkpoint that keeps failing, a backlog that stays, and corruption seen by
+  is killed records none. A service manager that runs the daemon must allow a stopping process longer
+  than that bound before it kills it; the RUNBOOK must say so, and no default of any service manager is
+  relied on here. A checkpoint that keeps failing, a backlog that stays, and corruption seen by
   any connection are shown by `orch status` and `orch doctor` and are not attention items.
 - `orch-peer` is touched at the places decision 18 names, which the owner approved, and nowhere else.
 - Files in the data directory can no longer be found by an id with `ls`: an event file and a project record

@@ -190,7 +190,7 @@ revision does with a finding, and none is closed by it.
 
 | Finding | Answer | Where |
 |---|---|---|
-| Method challenge MC1, red team O1 and P1, blocking: any miss selected the fallback, a miss with no events included | Accepted, by the owner's ruling of 2026-11-21, which amends the direction's sentence. Every miss is kept; only a miss attributable to events selects the fallback; a miss without events or on one platform alone selects no event path and goes back to the owner. Modified: the red team's test (C0 of the same block must pass) and its added cell are not adopted, and no test of cause is added. Three readings where the ruling's words stop are marked as this spec's | Spec R63, "What a miss selects", AP13, record E of "Owner's answers", G7; ADR decision 12; T4b |
+| Method challenge MC1, red team O1 and P1, blocking: any miss selected the fallback, a miss with no events included | Accepted, by the owner's ruling of 2026-11-21, which amends the direction's sentence. Every miss is kept; only a miss attributable to events selects the fallback; a miss without events or on one platform alone selects no event path and goes back to the owner. Modified: the red team's test (C0 of the same block must pass) and its added cell are not adopted, and no test of cause is added. Three readings where the ruling's words stop are marked as this spec's, and so is the step that comes from "The host" (see the next table) | Spec R63, "What a miss selects", AP13, record E of "Owner's answers", G7; ADR decision 12; T4b |
 | Method challenge MC2, blocking: what completes a checkpoint for the timer was not said, and calls of the size rule can leave no timer checkpoint in 660 s | Accepted. A call has a recorded outcome, and any call that succeeded moves the timer. Incomplete coverage is a result of its own with a reason, never a pass, a miss or evidence about events. Modified: the coverage rule is unchanged, so a valid run of the production rule can be incomplete; changing it needs a new reviewed revision | Spec R137, "Checkpoints in every repetition"; T10, T15, T4b |
 | Method challenge MC3, red team P4, blocking: no total verdict; a miss on one platform with the other unrun had two answers | Accepted. One rule, four axes, a headline by a fixed order and one exit for each; a miss with an absent platform is `FAIL, INCOMPLETE`; a recorded wrong outcome and an absent record are kept apart | Spec "The verdict" and its table of cases; T4b |
 | Method challenge MC8, red team O2 and P2, resilience F4, major: "a busy machine is valid" against ADR 0013 decision 22, and no platform class | Accepted. The method follows decisions 21 and 22: the lease held exclusively, the host sampled, a rule for idle written before the run. A met budget on a host that was not idle is no pass, and a miss there stands and selects no path. Platform classes are defined. The limits and the classes are proposals | Spec "The host", "Platforms and limits", R63; ADR decision 12; T4b |
@@ -206,9 +206,47 @@ part of MC8, which are the performance engineer's and stand before any measureme
 small windows and the burst demand, for the owner), O6 (a drain before the import and work that left the
 process group), O7 (the task graph), O8 (the spool removed before its commit is synced) and O9 (a long
 export under load); resilience F5 and F6; the security review's C2 (the fifth point of AP14) and its
-conditions before publication and before the product; facts F3, which is the publisher's. No independent
-review has yet read this revision. The answer D1 requires a re-review at the exact head before the spec is
-approved, and every condition above stays open until that review closes it.
+conditions before publication and before the product; facts F3, which is the publisher's.
+
+Five independent reviews then read revision `a914e78` on 2026-11-21 (method, resilience, security, facts,
+red team). The method review blocked it and the other four passed it with conditions. The table below is
+this revision's answer to each condition. None is closed by it, and no independent review has yet read
+this revision. The answer D1 requires a re-review at the exact head before the spec is approved, and every
+condition above and below stays open until that review closes it.
+
+| Finding at `a914e78` | Answer | Where |
+|---|---|---|
+| Method MC3 and red team P4, blocking: the ordered steps of "What a miss selects" had no guard for a defect. A diagnostic that stores an event twice, beside valid C24 misses on both platforms in a complete data set, reached the fallback at step 5 although the verdict says that a defect is fixed before any performance result is used | Accepted. A data set must be eligible before any step is read: correctness `ok` everywhere, no required repetition invalid or without its backend, settings, timing check or platform class, and coverage complete. Otherwise no path, with the verdict's headline and exit unchanged and every miss and axis kept. Three mixed cases are in the table of cases. No defect is renamed incomplete and no miss is left out | Spec R63, "The verdict", "What a miss selects"; ADR decision 12; T4b |
+| Method MC1 and red team R1, major: "one platform alone" is judged by cell, so two different misses, one on each platform, select the fallback; and the text said that every reading sends more to the owner, which is false for this one | Accepted as the review's second option. The cell reading stays, as a proposal; the false sentence is removed; the case (a claim at 230 ms in a checkpoint window on macOS, an event over 5,000 ms on Linux) and the limit reading are set beside it for the owner. No reading is chosen for the owner, no cell is added, and no cause is claimed. Technical attribution stays open | Spec "What a miss selects", AP13 |
+| Facts N1, minor: step 4 of those steps is not a reading of the ruling | Accepted. The text says four things are not the ruling's words and that step 4 comes from "The host" | Spec "What a miss selects" |
+| Method MC2 and red team R2, major: only the diagnostic was named as exposed to a size call that moves the timer, and nothing said what follows an incomplete data set | Accepted for the text. C24, H32 and B24 are named as exposed; an incomplete data set selects no path, and a new one needs the owner's direction or an approved revision of the method, never a repeat of the unchanged method. Not done: no call is forced, no repetition lengthened, no other call credited, no cell or count changed, nothing measured. Whether the method can complete stays open and is the performance engineer's | Spec "Checkpoints in every repetition", "The verdict", "Diagnostics" |
+| Resilience N1, major: the marker was created and rewritten in place, so a stop between its creation and its write, or during the change of direction, left a marker that neither command could read | Accepted. Every version is published whole by a temporary file, a sync, a rename and a directory sync; a temporary file is scratch; a marker that fails its check fails closed with a manual recovery that the RUNBOOK is to give; stops at each step of the publication are tested | Spec R138, "How a restore replaces the state", "Data directory"; ADR decision 16; T23, T26 |
+| Resilience N2 and N3, minor: one directory of two was synced after a rename and the `pre-restore` directory was never created; an abandonment after the staging directory was gone had nowhere to put a part | Accepted. The directory is created and synced before the marker and both directories are synced after each rename. Once the staging directory is gone the restore is complete: `--abandon` is refused and `--continue` only checks and removes the marker | Spec R138, "How a restore replaces the state"; T23 |
+| Security S-R1381, medium: a continuation told what was left from where the staged part lay, so with an old `-wal` and no staged one a stop after the database was moved out could end with the new database beside the old log | Accepted. The marker lists, for seven fixed members, which the replaced state holds and which the staged state holds. Every replaced member is moved out before any staged member is moved in, on a continuation too. The absence of a member that was never staged means nothing. The layout, the lineage, the generation and the ended leases are checked before the marker is removed, and a layout the steps cannot have left keeps the marker and is refused. This is a gap in the contract; no shipped code exists and no replay of an old log was shown | Spec R138, "How a restore replaces the state"; ADR decision 16; T23 |
+| Resilience N4 and N5, minor: nothing said that events have numbers before they commit, the stop record could be removed before its gap row was synced, and a second stop could overwrite the first record | Accepted. Events are numbered at handover; a start continues above everything committed and recorded; the record is published whole and merged, and is removed only when its gap rows are durable. The same rule for a finish file is the red team's O8 and stays open | Spec R61, R139, "Stopping", "Data directory"; ADR decision 23; T15, T16 |
+| Resilience N6, a note: a service manager's kill time must exceed the stop's bound | Carried as a duty of the RUNBOOK (T26). No service manager's default is stated, since none was checked, and the RUNBOOK is not edited by this revision | Spec "Stopping"; ADR "Consequences" |
+| Resilience N7 and red team R3, minor: "idle" sees load and build processes only | Accepted as a stated limit. The record says so in words; recording the scratch device's write activity is the performance engineer's to declare. No sample, limit or harness change is made here | Spec "The host" |
+| Facts N2 and N3, minor: "about ten minutes later"; the 1 s and the 4 KiB were not labelled, and the list of proposals left out the new names and the verdict's names and exits | Accepted. The time reads "recorded 14:07 UTC"; both numbers are labelled; the list below is extended | Spec record E, R137, "How a restore replaces the state", "The verdict"; this plan's "Open questions" |
+
+Kept as the reviews of `a914e78` left them, and changed by nothing here: resilience F3 (R140) and F4 (the
+idle-host rule) and the normative part of MC8; facts F1, F2 and F4; the security review's closures for
+R101 to R134. Not answered here and still open: the technical question of what shows that a miss is
+attributable to events; whether the method can reach checkpoint coverage; MC4 to MC7, MC9 and the
+harness's part of MC8; and everything listed as carried above.
+
+Why another round of design review runs. AGENTS.md asks for the reason from the third round on. This text
+has been read at `196f9087` and at `a914e78`, and this revision asks for a further read. The lead's
+reason, from its adjudication of the reviews of `a914e78`, is that the second read produced counterexamples
+that the text did not answer, and not a request for a wider design: (1) a diagnostic that stores an event
+twice, beside valid C24 misses on both platforms, reached the fallback by the ordered steps; (2) a restore
+stopped between creating its marker and writing it left a marker that no command could read; (3) a restore
+stopped after the old database was moved out and before its `-wal` could continue to a new database
+beside the old log; (4) a stop record removed before its gap row was synced lost the gap with the power,
+and a second stop overwrote the first record; (5) two different misses, one on each platform, selected the
+fallback while the text said that this reading sent more to the owner. The round is limited to those
+conditions and to what their corrections touch. A test cannot settle them yet, because no product code is
+built before the owner's gate; the named tests of R61, R138 and R139 and the verifier's cases carry them
+to T15, T16, T23 and T4b.
 
 ## Status
 
@@ -238,15 +276,25 @@ approved, and every condition above stays open until that review closes it.
   other: the live state unchanged; the marker present and every start refused; or the restore complete.
   A continued restore is compared with an uninterrupted one, and an abandoned one with the replaced state
   byte for byte. Free space is set one byte under the need, and a copy is made to fail while staging.
+  The stops include each step of the marker's publication (create, write, sync, rename, directory sync),
+  for `forward` and for the change to `back`, and each rename of `orch.db`, `orch.db-wal` and
+  `orch.db-shm` where the replaced state has the two companions and the staged state has none. Each
+  command is also run a second time. A layout that the steps cannot leave, a marker that fails its check
+  and an abandonment after the staging directory is gone are each refused with the marker kept.
 - A stop (spec R139): with a second connection holding the write lock and a fake clock, the stop ends at
   its bound; each step is recorded in order; events handed over and not committed are a gap row after the
-  next start, or are named by the stop when their record could not be written.
+  next start, or are named by the stop when their record could not be written. An event has its number
+  at handover; a start continues above the committed and the recorded numbers; a second stop keeps the
+  first record's ranges; the record is removed only after its gap rows are durable (a fake reports the
+  commit as not yet synced); a start that is killed and run again writes each gap once.
 - Other connections (spec R137, R140): a result is injected at the checkpoint, read, query and backup
   connections in turn. Corruption fails the writer from each; other failures are counted and reported at
   their thresholds and do not fail it; each outcome of a checkpoint call is produced from injected counts,
   and a running total repeated by the next call credits no second copy.
 - The verdict (spec "The verdict", "What a miss selects"): the verifier of T4b gives every row of the
-  spec's table of cases as written, from recorded inputs made for the purpose. No repetition of the
+  spec's table of cases as written, from recorded inputs made for the purpose, the mixed cases included
+  (a defect beside a miss, an unknown correctness or a backend not shown beside a miss): a verifier that
+  selects any path for them is wrong. No repetition of the
   measurement is shortened or run again to make such an input.
 - The importer is tested on generated projects of the live project's shape and on a hand-written corpus of
   damaged input (T21), then once on a copy of the live project (T27).
@@ -329,9 +377,18 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   T16's scope is written for either.
 - This revision proposes, and nobody has yet reviewed or approved: the limits for an idle host and the
   platform classes; the times of a stop (10 s, 5 s, 20 s); the counts and times of the reports for other
-  connections (three in a row, 5 minutes); and three readings under the spec's "What a miss selects".
+  connections (three in a row, 5 minutes); the 1 s before a failed checkpoint call is tried again; the
+  4 KiB bound of the restore's marker; the names `restore-in-progress`, `restore-staging-<random hex>/`,
+  `--continue`, `--abandon`, `spool/events-at-stop` and their temporary files; the names of the verdict's
+  axes and values, its headline words and its exits 0, 1, 2 and 3; and, under the spec's "What a miss
+  selects", the eligibility rule, three readings, the step taken from "The host" and the cell reading of
+  "one platform alone", beside which the spec sets the limit reading for the owner to choose.
   The coverage rule of the measurement is unchanged, and a valid run of the production rule can leave a
   repetition without it; whether the rule changes is a question for a reviewed revision of the method.
+  The mandatory cells C24, H32 and B24 may be exposed to that as well as the diagnostic, so whether the
+  method can produce a complete data set at all is open, and it is the performance engineer's to settle
+  before the cells are frozen. An incomplete data set selects no path and is not run again without the
+  owner's direction or an approved revision.
 - No task yet owns a native Linux host: the owner's answer D6 allows the evidence, the spec's "Verification
   environment" lists the host as not yet named, and until one exists T4b is incomplete and R5 and R63
   cannot be met.
