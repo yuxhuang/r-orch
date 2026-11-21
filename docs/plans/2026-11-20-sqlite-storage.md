@@ -186,7 +186,9 @@ Four independent reviews read revision `196f9087` on 2026-11-21 (security, red t
 each passed with conditions. A challenge of the method's machine-readable draft, read against the same
 revision, found the method not ready. The owner then ruled on what a miss selects and allowed the
 corrections below to be written in one pass; that word accepts none of them. Each row says what this
-revision does with a finding, and none is closed by it.
+revision does with a finding, and none is closed by it. The ids in the tables of this section are each
+review's own. An O with a number that is named with the red team is an item of its review of `196f9087`
+and is not the spec's open point of the same name.
 
 | Finding | Answer | Where |
 |---|---|---|
@@ -202,10 +204,11 @@ revision does with a finding, and none is closed by it.
 | Facts F2 and F4, minor: the summaries of what the owner holds left out T4c's use of the live copy; the lane numbers were called the owner's | Accepted | Spec "Requirements", "Owner's answers"; this plan's T4c, T7 and "Open questions"; ADR status lines |
 
 Carried, and not answered by this revision: the method challenge MC4 to MC7 and MC9 and the harness's
-part of MC8, which are the performance engineer's and stand before any measurement; red team O3 (what the
-small windows and the burst demand, for the owner), O6 (a drain before the import and work that left the
-process group), O7 (the task graph), O8 (the spool removed before its commit is synced) and O9 (a long
-export under load); resilience F5 and F6; the security review's C2 (the fifth point of AP14) and its
+part of MC8, which are the performance engineer's and stand before any measurement; of the red team's
+review of `196f9087`, its items O3 (what the small windows and the burst demand, for the owner), O6 (a
+drain before the import and work that left the process group), O7 (the task graph), O8 (the spool removed
+before its commit is synced) and O9 (a long export under load), none of which is the spec's open point of
+the same name; resilience F5 and F6; the security review's C2 (the fifth point of AP14) and its
 conditions before publication and before the product; facts F3, which is the publisher's.
 
 Five independent reviews then read revision `a914e78` on 2026-11-21 (method, resilience, security, facts,
@@ -223,7 +226,7 @@ condition above and below stays open until that review closes it.
 | Resilience N1, major: the marker was created and rewritten in place, so a stop between its creation and its write, or during the change of direction, left a marker that neither command could read | Accepted. Every version is published whole by a temporary file, a sync, a rename and a directory sync; a temporary file is scratch; a marker that fails its check fails closed with a manual recovery that the RUNBOOK is to give; stops at each step of the publication are tested | Spec R138, "How a restore replaces the state", "Data directory"; ADR decision 16; T23, T26 |
 | Resilience N2 and N3, minor: one directory of two was synced after a rename and the `pre-restore` directory was never created; an abandonment after the staging directory was gone had nowhere to put a part | Accepted. The directory is created and synced before the marker and both directories are synced after each rename. Once the staging directory is gone the restore is complete: `--abandon` is refused and `--continue` only checks and removes the marker. That refusal was later cut down to the direction `forward` (the table for `3c50293` below) | Spec R138, "How a restore replaces the state"; T23 |
 | Security S-R1381, medium: a continuation told what was left from where the staged part lay, so with an old `-wal` and no staged one a stop after the database was moved out could end with the new database beside the old log | Accepted. The marker lists, for seven fixed members, which the replaced state holds and which the staged state holds. Every replaced member is moved out before any staged member is moved in, on a continuation too. The absence of a member that was never staged means nothing. The layout, the lineage, the generation and the ended leases are checked before the marker is removed, and a layout the steps cannot have left keeps the marker and is refused. The last check was later changed to read files only (the table for `3c50293` below). This is a gap in the contract; no shipped code exists and no replay of an old log was shown | Spec R138, "How a restore replaces the state"; ADR decision 16; T23 |
-| Resilience N4 and N5, minor: nothing said that events have numbers before they commit, the stop record could be removed before its gap row was synced, and a second stop could overwrite the first record | Accepted. Events are numbered at handover; a start continues above everything committed and recorded; the record is published whole and merged, and is removed only when its gap rows are durable. The same rule for a finish file is the red team's O8 and stays open | Spec R61, R139, "Stopping", "Data directory"; ADR decision 23; T15, T16 |
+| Resilience N4 and N5, minor: nothing said that events have numbers before they commit, the stop record could be removed before its gap row was synced, and a second stop could overwrite the first record | Accepted. Events are numbered at handover; a start continues above everything committed and recorded; the record is published whole and merged, and is removed only when its gap rows are durable. The same rule for a finish file is item O8 of the red team's review of `196f9087` and stays open | Spec R61, R139, "Stopping", "Data directory"; ADR decision 23; T15, T16 |
 | Resilience N6, a note: a service manager's kill time must exceed the stop's bound | Carried as a duty of the RUNBOOK (T26). No service manager's default is stated, since none was checked, and the RUNBOOK is not edited by this revision | Spec "Stopping"; ADR "Consequences" |
 | Resilience N7 and red team R3, minor: "idle" sees load and build processes only | Accepted as a stated limit. The record says so in words; recording the scratch device's write activity is the performance engineer's to declare. No sample, limit or harness change is made here | Spec "The host" |
 | Facts N2 and N3, minor: "about ten minutes later"; the 1 s and the 4 KiB were not labelled, and the list of proposals left out the new names and the verdict's names and exits | Accepted. The time reads "recorded 14:07 UTC"; both numbers are labelled; the list below is extended | Spec record E, R137, "How a restore replaces the state", "The verdict"; this plan's "Open questions" |
@@ -245,8 +248,9 @@ into the spec, this plan and ADR 0017, and changes nothing else.
 | Red team D1, major: the rule that stops measurement after a miss was keyed on the headline `FAIL`, so a data set with a defect and a miss, whose headline is `CORRECTNESS_DEFECT`, could be followed by a data set that fixes the defect without the owner's word | "ask first": after a data set in which a mandatory repetition that is `valid` or `host_not_idle` has missed, no further data set is started without the owner's word, whatever the headline, a data set that only fixes a defect included. No exception | Spec R63, "The verdict" (the rule and the three rows of what may follow a data set), AP13, record F; ADR decision 12 |
 
 The two answers choose two rules. They accept no number, limit, proxy for cause, eligibility rule, method
-or result, and they permit no measurement. No independent review has read the text that states them, so
-neither condition is closed, and D1 in particular stays open until its reviewer has read the exact head.
+or result, and they permit no measurement. When that revision was written no independent review had read
+the text that states them, so it closed neither condition. The five reviews of `d2fe9b0` read that text
+afterwards (below); what each left is its own to say, and this plan records neither condition as closed.
 The other conditions of the reviews of `3c50293` are not answered by this revision and stay open as those
 reviews left them: resilience N8 to N12 (a stop inside the restore's last check, the end of an
 abandonment, on which the security review left a note too, the numbering claim, the order of the gap
@@ -254,20 +258,23 @@ range, the durability of the marker and of the stop record), facts N4 (the attri
 notes on review status. Whether the same pass may
 correct them was asked of the owner apart and is not part of these two answers.
 
-The owner's answer to that came the same day (the spec's record G): corrections for review findings on
-these three documents may be written without a new question each time, and the result still comes to
-the owner as a pull request. It closes no finding. The revision that carries this paragraph is the pass
-it allows. The table is its answer to each condition that the reviews of `3c50293` left open. None is
-closed by it, and no independent review has read this revision or the one before it.
+The owner's answer to that came the same day (the spec's record G). The owner's words were "yes always",
+to a question about corrections for review findings on the spec. The lead's record reads them as a
+standing rule for these three documents: such corrections may be written without a new question each
+time, and the result still comes to the owner as a pull request. It closes no finding. The revision that
+first carried this paragraph, `d2fe9b0`, is a pass that the rule allows. The table is that revision's
+answer to each condition that the reviews of `3c50293` left open. None was closed by it. When it was
+written no independent review had read that revision or the one before it; five have read both since
+(below).
 
 | Finding at `3c50293` | Answer | Where |
 |---|---|---|
 | Resilience N8, major: the restore's last check opened the database, which makes a `-wal` and a `-shm`; a stop inside the check left them at a live name beside the new database, a layout that both commands refuse, so nothing could finish the restore | Accepted, by the review's first option. The check opens no database. The staged database is closed, the staging directory is looked at for anything but staged members, and the file alone is read once more to hold the new lineage, the new generation and no active lease, with its SHA-256 the same before and after; the marker holds that hash, and the last check compares the bytes at the live name with it. Nothing opens the live database while the marker stands, so the check leaves no file and is run again after a stop. The rule that refuses a `-wal` at a live name is unchanged. No way of opening a database without companions is relied on | Spec R138, "How a restore replaces the state" (steps 2, 3 and 5, the table of stops); ADR decision 16; T23 |
 | Resilience N9, major, with the security review's note on the same case: an abandonment stopped after it had removed the staging directory was refused by `--abandon`, with a message that the restore was complete, and by `--continue`; and a part of the staging directory removed did not fit the table of places | Accepted. The refusal for a staging directory that is gone holds under `forward` only. Under `back`, `--abandon` first tests whether the abandonment has reached its end (every replaced member live, no other member live, `pre-restore` empty or absent), before the table of places and before any rule on the staging directory, and then only finishes the cleanup: the rest of the staging directory unread, the `pre-restore` directory, the marker, each skipped when already done | Spec R138, "How a restore replaces the state" (the two commands, the table of stops); ADR decision 16; T23 |
-| Resilience N10, minor: "No number of a run shall be given twice" does not hold for numbers lost with a killed daemon or with the power under `synchronous = NORMAL` | Accepted. The claim is cut down to numbers that are committed or recorded, and the loss is stated. No durable record of the numbers given is added, and nothing is closed: the loss stays open with the red team's O6 | Spec R61, "Stopping" (the table); ADR decision 23 |
+| Resilience N10, minor: "No number of a run shall be given twice" does not hold for numbers lost with a killed daemon or with the power under `synchronous = NORMAL` | Accepted. The claim is cut down to numbers that are committed or recorded, and the loss is stated. No durable record of the numbers given is added, and nothing is closed: the loss stays open as an item of its own, under this finding's name (the table of `d2fe9b0` below says what was corrected in this row) | Spec R61, "Stopping" (the table); ADR decision 23 |
 | Resilience N11, a nit: nothing said that the ranges of a stop are taken after the writer's last commit, so a gap row could cover an event that exists | Accepted, both ways the review offered. The ranges are taken once the writer has ended its last transaction and no event is given a number any more; and a start cuts each recorded range to the numbers that no committed event and no gap row holds | Spec R139, "Stopping"; ADR decision 23; T15, T16 |
 | Resilience N12, minor: the marker and the stop record are synced by this program and not by SQLite, and on macOS a plain sync does not empty the drive's cache, so what was said of a stop held for a stop of the process only | Accepted as a stated limit, with the intended call named. The spec now says which promises are for a stop of the process and rest on no sync, and what a sync means on each platform for these files. It proves nothing about a loss of power: no such test exists, whether macOS accepts the full flush for a directory was not checked, and the outcomes after a loss of power are listed, among them one that a start does not recognise. The manual recovery stays a duty of T26 | Spec "What a sync promises", R138, R139; ADR decision 16 |
-| Facts N4, moderate: in R63 the sentence "That is the owner's ruling" stood after the eligibility rule and so named a proposal as the ruling | Accepted. The attribution now follows the two sentences that state the ruling and names the owner's "1."; the eligibility rule is called this spec's proposal, which the owner has not read. The rule itself is unchanged | Spec R63 |
+| Facts N4, moderate: in R63 the sentence "That is the owner's ruling" stood after the eligibility rule and so named a proposal as the ruling | Accepted. The attribution now follows the two sentences that state the ruling and names the owner's "1."; the eligibility rule is called this spec's proposal, on which the owner has not ruled. The rule itself is unchanged | Spec R63 |
 | Red team D1, major: a data set with a defect and a miss could be followed by another without the owner's word | Accepted by the owner's answer of 2026-11-21, already written by the revision before this one and kept as it was: the rule reads the budget axis, has no exception for the fix of a defect, and has its three rows. Two questions about where a data set ends are named as not settled and are the owner's | Spec "The verdict", R63; ADR decision 12 |
 | Facts' notes: the status of the reviews in these documents was true when written and goes stale; the ADR's short form of the eligibility rule left out three of its terms | Accepted. The status lines say which revision each review read; the ADR names the backend, the settings, the timing check and the platform class | Spec (the text under the title), this plan, ADR decision 12 |
 
@@ -275,8 +282,27 @@ Left for the owner or for a named owner by this revision, and chosen by nothing 
 questions about where a data set ends (the owner's); whether a start should recognise members moved
 with no marker after a loss of power (the spec states the limit and adds no check); which sync call
 macOS accepts for a directory (the builder's, in T15, T16 and T23, with the spec corrected there);
-a durable record of the numbers given (with the red team's O6); and when a finish file may be removed
-(the red team's O8).
+a durable record of the numbers given (an open item of its own, resilience N10 of `3c50293`, which no
+other item closes); and when a finish file may be removed (item O8 of the red team's review of
+`196f9087`).
+
+Five independent reviews read revision `d2fe9b0` on 2026-11-21 (resilience, security, facts, method, red
+team), with the changes of `e8e681e` and of `d2fe9b0` together, and each passed it with conditions. The
+revision that carries this paragraph answers those of their conditions that are wording, in the table
+below. It changes no rule, number, limit, method or step, and it closes nothing.
+
+| Finding at `d2fe9b0` | Answer | Where |
+|---|---|---|
+| Resilience N14, minor: R61 and this plan counted the loss of event numbers that were given and neither committed nor recorded with "the red team's O6". That item of the red team's review of `196f9087` is the drain before an import and the work that left the process group, and nothing in it concerns event numbers, so closing it could have been read as closing the loss. The resilience review says that the error began in its own report on `3c50293` (N10) and was copied from there. O6 and O8 with no review named are also the spec's own open points, which the owner decided | Accepted. The tie is removed. The loss is an open item of its own, which no other item closes. An item of a review is named with its review and the revision it read, and the red team's O6 and O8 are told apart from the spec's. Neither the loss nor the red team's O6 or O8 is closed | Spec (the text under the title, R61, "Stopping", "What a sync promises"); this plan (the paragraphs and rows above that named those items); ADR 0017 (the alternative on the stop record) |
+| Resilience N15, a nit: R61 named two ways in which a given number is lost and can be given again; the spec states two more elsewhere, and the two could be read as all | Accepted. R61 names the four and says that the list is not complete; the ADR says "for example". No promise changes | Spec R61; ADR decision 23 |
+| Facts M1, minor: "the owner has not read it", of the eligibility rule, says more than the record shows. The record shows that the owner has not ruled on it | Accepted | Spec R63, AP13; this plan (the row of facts N4 above) |
+| Facts M2, minor: this plan gave the three-document scope as the owner's answer. The owner's words are "yes always"; the scope is in the lead's record of them | Accepted. The spec's record G, which already said so, is unchanged | This plan (the paragraph above the table of `3c50293`) |
+| Facts' condition on review status: "no independent review has read this revision" is true when written and stale as soon as a review reads it | Accepted. Each such sentence now says which revision which reviews read, as a thing of the past, and none says of the revision that carries it that it is unread | Spec (the text under the title, record F); this plan; ADR decision 12 |
+
+Not answered by this revision, and carried as each review left it: every other condition of the five
+reviews of `d2fe9b0`, among them the resilience review's that a start does not recognise members moved
+with no marker after a loss of power, which stays a stated limit; and everything listed as carried or
+left above.
 
 Why another round of design review runs. AGENTS.md asks for the reason from the third round on. This text
 has been read at `196f9087` and at `a914e78`, and this revision asks for a further read. The lead's
@@ -306,6 +332,12 @@ only. (6) R63 called the proposed eligibility rule the owner's ruling. (7) A dat
 miss could be followed by another without the owner's word, which the owner has since answered. The
 round is limited to those seven and to what their corrections touch. A test still cannot settle them
 before the owner's gate; the named tests of R61, R138 and R139 carry them to T15, T16 and T23.
+
+A fifth read follows the reviews of `d2fe9b0`. The lead's reason, from its disposition of those reviews,
+is one wrong attribution: the loss of unrecorded event numbers was counted with an item of the red team
+that is about something else, so that closing that item could have been read as closing the loss. Three
+points of wording are corrected in the same pass. The read is limited to what this revision changed after
+`d2fe9b0`, which is no rule; no test settles an attribution.
 
 ## Status
 

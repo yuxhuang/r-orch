@@ -153,8 +153,9 @@ across a crash, lists that do not load everything, and a retried request that ru
     proposal. The owner answered a second question the same day: after a data set in which a mandatory
     repetition that is valid or on a host that was not idle has missed, no further data set is started
     without the owner's word, whatever its headline, and a data set that only fixes a defect is no
-    exception. Both answers choose a rule; neither accepts a number, a limit, a method or a result, and
-    no independent review has read the text that carries them. A fallback that is
+    exception. Both answers choose a rule; neither accepts a number, a limit, a method or a result.
+    Independent reviews first read the text that carries them at revision `d2fe9b0`; the plan names them.
+    A fallback that is
     selected is measured as built, and no figure shows it to be faster. Each data set gets one verdict from
     four axes reported apart (correctness, validity, coverage, budget), so that a miss on one platform with
     the other not yet run is a failure and incomplete at once. The measurement follows decisions 21 and 22
@@ -377,8 +378,8 @@ across a crash, lists that do not load everything, and a retried request that ru
     reads and the checkpoint, the lock last; events handed over and not committed are recorded in the
     spool and become a gap row at the next start (R139). Events are numbered at handover, and a start
     continues above everything committed and everything recorded (R61). No committed or recorded
-    number is given again; a number lost with a killed daemon, or with the power under
-    `synchronous = NORMAL`, can be, and no gap row says so. The ranges of a stop are taken after the
+    number is given again; a number that was given and lost, for example with a killed daemon or with the
+    power under `synchronous = NORMAL`, can be, and no gap row says so. The ranges of a stop are taken after the
     writer's last transaction, and a start writes no gap row over a committed event. The record is published whole
     and merged with one that is already there, and it is removed only when its gap rows can no longer be
     lost with the power. And the classes cover every connection: corruption
@@ -508,8 +509,8 @@ across a crash, lists that do not load everything, and a retried request that ru
   of an abandonment is tested first.
 - **Remove the stop record as soon as its gap rows commit.** Under `synchronous = NORMAL` a loss of power
   can take that commit back after the record is gone, and the gap is then lost without a trace. Rejected:
-  the record stays until the rows are durable. The same question for a finish file is open (the red
-  team's O8).
+  the record stays until the rows are durable. The same question for a finish file is open (item O8 of
+  the red team's review of `196f9087`, which is not the spec's open point O8).
 - **Read "one platform alone" by cell and not by kind of limit.** Under it two different misses in one
   cell, one on each platform, select the fallback, although neither platform shows the other's miss. Not
   adopted: the owner was shown both readings and the case in which they differ, and chose the reading by
