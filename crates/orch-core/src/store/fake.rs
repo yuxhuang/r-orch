@@ -21,6 +21,7 @@ struct Project {
     events: events::fake::EventState,
     intents: intents::fake::IntentState,
     leases: leases::fake::LeaseState,
+    request_keys: request_keys::fake::KeyState,
     retries: retries::fake::RetryState,
     positions: BTreeMap<EntityKind, u64>,
 }
@@ -553,6 +554,37 @@ impl intents::IntentWrite for View {
     }
     fn list_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<intents::Intent>> {
         self.project.intents.pending(after, limit)
+    }
+}
+
+impl request_keys::RequestKeyWrite for View {
+    fn check_request_key(
+        &self,
+        scope: &request_keys::RequestScope,
+        op: &str,
+        req_sha256: &str,
+        now_ms: i64,
+    ) -> Result<request_keys::KeyCheck> {
+        scope.check_caller(&self.caller)?;
+        self.project
+            .request_keys
+            .check(scope, op, req_sha256, now_ms)
+    }
+    fn store_request_key(
+        &mut self,
+        scope: &request_keys::RequestScope,
+        op: &str,
+        req_sha256: &str,
+        result: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        scope.check_caller(&self.caller)?;
+        self.project
+            .request_keys
+            .store(scope, op, req_sha256, result, now_ms)
+    }
+    fn delete_expired_request_keys(&mut self, now_ms: i64, max_rows: usize) -> Result<usize> {
+        self.project.request_keys.delete_expired(now_ms, max_rows)
     }
 }
 

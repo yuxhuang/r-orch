@@ -4,7 +4,7 @@
 //! no SQLite (spec R17). It is not a product backend: nothing opens it outside
 //! tests, and the 1.0 stores in this module's parent are not changed by it.
 //!
-//! One document per project holds every row, event, gap, intent, lease and counter, and
+//! One document per project holds every row, event, gap, intent, lease, request key and counter, and
 //! is replaced by a rename, so a commit is one atomic step. Writers take one gate,
 //! as the port requires. A read loads its own copy of the document, so it keeps
 //! one committed state whatever commits next. Surviving a process stop mid-way
@@ -35,6 +35,7 @@ mod events;
 mod intents;
 mod leases;
 mod order;
+mod request_keys;
 mod retries;
 #[cfg(test)]
 mod tests;
@@ -51,6 +52,7 @@ use orch_core::store::events::{
 };
 use orch_core::store::intents::{FinishOutcome, Intent, IntentPayload, IntentRead, IntentWrite};
 use orch_core::store::leases::{ClaimOutcome, Lease, LeaseRead, LeaseWrite, NewLease};
+use orch_core::store::request_keys::{KeyCheck, RequestKeyWrite, RequestScope};
 use orch_core::store::retries::{Retry, RetryRead, RetryWrite};
 use orch_core::store::{
     Caller, Cursor, Entity, EntityKind, Filter, Lane, Page, PageRequest, ReadSnapshot, Record,
@@ -63,6 +65,7 @@ use events::Events;
 use intents::Intents;
 use leases::{By, Leases};
 use order::{Key, check_sort, key, matches};
+use request_keys::RequestKeys;
 use retries::Retries;
 
 const DOCUMENT: &str = "state.json";
@@ -80,6 +83,7 @@ struct Project {
     events: Events,
     intents: Intents,
     leases: Leases,
+    request_keys: RequestKeys,
     retries: Retries,
 }
 
@@ -93,6 +97,8 @@ struct Document {
     intents: Intents,
     #[serde(default)]
     leases: Leases,
+    #[serde(default)]
+    request_keys: RequestKeys,
     #[serde(default)]
     retries: Retries,
 }
@@ -223,10 +229,15 @@ fn load(dir: &Path) -> Result<Project> {
         events: document.events,
         intents: document.intents,
         leases: document.leases,
+        request_keys: document.request_keys,
         retries: document.retries,
     };
     project
         .intents
+        .validate()
+        .map_err(|detail| corrupt(&path, detail))?;
+    project
+        .request_keys
         .validate()
         .map_err(|detail| corrupt(&path, detail))?;
     project
@@ -261,6 +272,7 @@ fn persist(dir: &Path, project: &Project) -> Result<()> {
         events: project.events.clone(),
         intents: project.intents.clone(),
         leases: project.leases.clone(),
+        request_keys: project.request_keys.clone(),
         retries: project.retries.clone(),
     };
     let temp =
@@ -679,6 +691,43 @@ impl IntentWrite for Session {
     }
     fn list_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<Intent>> {
         self.project.intents.pending(after, limit)
+    }
+}
+
+impl RequestKeyWrite for Session {
+    fn check_request_key(
+        &self,
+        scope: &RequestScope,
+        op: &str,
+        req_sha256: &str,
+        now_ms: i64,
+    ) -> Result<KeyCheck> {
+        scope.check_caller(&self.caller)?;
+        self.project
+            .request_keys
+            .check(scope, op, req_sha256, now_ms)
+    }
+
+    fn store_request_key(
+        &mut self,
+        scope: &RequestScope,
+        op: &str,
+        req_sha256: &str,
+        result: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        scope.check_caller(&self.caller)?;
+        self.project
+            .request_keys
+            .store(scope, op, req_sha256, result, now_ms)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn delete_expired_request_keys(&mut self, now_ms: i64, max_rows: usize) -> Result<usize> {
+        let deleted = self.project.request_keys.delete_expired(now_ms, max_rows)?;
+        self.dirty |= deleted > 0;
+        Ok(deleted)
     }
 }
 

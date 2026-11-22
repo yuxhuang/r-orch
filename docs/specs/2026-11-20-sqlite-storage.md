@@ -541,6 +541,59 @@ port reads none):
 - The performers, recovery, the `intents.perform` job and the SQLite table
   (`intents` in the schema) are T13, T15 and T10's.
 
+T8c request-keys amendment (2026-11-22): the port `orch_core::store::request_keys`
+adds `RequestKeyWrite` to `UnitOfWork`, with the same two references
+(`memory_request_keys_v2`, `file_request_keys_v2`) running one shared suite. It
+refines the table row for `check_request_key` and `store_request_key`; no
+protocol, hashing, resend or dispatcher is added. `now_ms` is UTC milliseconds
+from the caller's clock; the port reads none.
+
+- `RequestScope::of(&Caller, key)` is the only way to make a scope. Its identity
+  and project are the caller's; its run and epoch are the held lease's for a task
+  principal and empty and 0 for an owner or worker session (the spec's owner
+  rule). A request supplies the key and nothing else of the scope. A task
+  principal with an empty run or epoch 0, an empty identity or project, or a key
+  that is not 16 to 128 characters of `A-Z a-z 0-9 _ -` is `InvalidRequestKey`.
+  A unit of work refuses a scope built from another caller, so another identity,
+  project, run or epoch is never looked up.
+- `check_request_key(&scope, op, req_sha256, now_ms) -> KeyCheck` reads only and
+  sees the unit of work's own stores: `New`, `Replay(result)`,
+  `ReplayWithoutResult` or `Mismatch`. `op` is 1 to 128 bytes of
+  `A-Z a-z 0-9 . _ -`; `req_sha256` is 64 lowercase hex digits computed by the
+  caller (the canonical form is T17's). A live row with another `op` or hash is
+  `Mismatch`, whichever differs.
+- `store_request_key(&scope, op, req_sha256, result, now_ms)` stores the row in
+  the unit of work that makes the change, `expires_at = now_ms + 3,600,000`. It
+  never replaces a live row, whatever it holds: storing over one, an invalid
+  input or a scope of another caller is `InvalidRequestKey` and changes nothing,
+  even when the callback catches it and commits. The caller checks first and
+  stores only on `New`; two concurrent repeats run on the one writer in turn, so
+  the second finds the first's row.
+- A row is replayable while `now_ms < expires_at`, so at exactly one hour it is
+  already gone. An expired row is as absent as a deleted one: `check` gives
+  `New` and `store` replaces it, before the expiry job has run.
+- A result of at most 65,536 bytes (bytes, not characters) is kept whole; a
+  longer one, whatever its text, keeps no body and no prefix
+  (`result_truncated = 1`), and its replay is `ReplayWithoutResult`. The first
+  outcome stands: a replay never re-evaluates the change.
+- `delete_expired_request_keys(now_ms, max_rows)` deletes rows with
+  `expires_at <= now_ms`, earliest expiry first, ties by scope, at most
+  `max_rows` (1 to 1,000), and returns the count; only the caller's project. It
+  is the body of the `request_keys.expire` job (T15).
+- Authorization comes first, in the consumer (R134). The port authorizes nothing.
+  The dispatcher must refuse an expired, revoked or disallowed principal, and an
+  operation that issues a credential, before it builds a scope or calls
+  `check_request_key`, so that a refused principal gets no stored result. A task
+  principal's run and epoch are taken from the lease the daemon authenticated for
+  the connection, never from a request field.
+- Request keys have no snapshot read: no read path may show a stored result
+  (R74), and the only reader is the writer, in the transaction of the change.
+  Rows are not exported or imported (R114). A restore ends leases but deletes no
+  key; epochs are not reused, so a later run never matches an earlier one's rows.
+- `state = 'in_flight'` and `commit_seq` stay unwritten in 1.1. The SQLite table
+  (`request_keys` in the schema) and the `request_keys.expire` job are T10's and
+  T15's.
+
 Each list has a fixed set of sorts. The default sort of a list is its 1.0 order, served by an index, and
 deliverable B confirms each line. Every list also offers the sort `id`, whose values never change (R49):
 

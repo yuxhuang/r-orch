@@ -124,8 +124,11 @@ the engine's dependency on the full operational port. The T8c intents slice
 (typed `process.start`, `process.stop`, `workspace.remove` and `blob.delete`
 payloads, project-local ids, bounded pending reads, idempotent completion and
 7-day retention, with the same memory and file references) follows the same
-rule; request keys, attention and the retry enumeration are later slices.
-The v1 runtime stays active.
+rule. The T8c request-keys slice (a whole-scope key found by identity, project,
+run, epoch and key, `New`/`Replay`/`ReplayWithoutResult`/`Mismatch`, one-hour
+UTC-millisecond expiry, results over 64 KiB not kept, bounded expiry deletion,
+with the same two references) is stacked on the intents slice; attention and the
+retry enumeration are later slices. The v1 runtime stays active.
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|
