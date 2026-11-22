@@ -14,7 +14,18 @@
 //!
 //! Cursors are tokens into a table held by the instance: they name the sort key
 //! of the last row returned and the project, filter and sort they were issued
-//! for, and no snapshot. They do not outlive the instance.
+//! for, and no snapshot. They do not outlive the instance, and the table is
+//! never trimmed.
+//!
+//! What it does not guarantee, because it is a test reference and not a
+//! product backend: it trusts the root it is given (a symlinked document or
+//! project directory is followed, and the document is created 0600 in a
+//! directory with the process umask); a load reads the whole document with no
+//! size cap, and a write rewrites all of it; a document that was removed reads
+//! as a project that was never written, so positions start again at 1; the
+//! rename is not preceded by a sync; and a hand-edited document is checked only
+//! for a row listed twice and a position past its counter, not for two task ids
+//! with one fold key or two rows at one position.
 
 mod order;
 #[cfg(test)]
@@ -97,6 +108,14 @@ fn io_error(context: &str, path: &Path, source: std::io::Error) -> StoreError {
     })
 }
 
+fn unparsable(path: &Path, source: serde_json::Error) -> StoreError {
+    StoreError::Backend(Error::serde(
+        "cannot parse the storage document",
+        path,
+        source,
+    ))
+}
+
 fn corrupt(path: &Path, detail: impl std::fmt::Display) -> StoreError {
     StoreError::Backend(Error::other(format!(
         "{} is not a valid storage document: {detail}",
@@ -111,7 +130,7 @@ fn load(dir: &Path) -> Result<Project> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Project::default()),
         Err(e) => return Err(io_error("cannot read", &path, e)),
     };
-    let document: Document = serde_json::from_slice(&bytes).map_err(|e| corrupt(&path, e))?;
+    let document: Document = serde_json::from_slice(&bytes).map_err(|e| unparsable(&path, e))?;
     let mut project = Project {
         rows: BTreeMap::new(),
         counters: document.counters,
@@ -139,7 +158,9 @@ fn persist(dir: &Path, project: &Project) -> Result<()> {
     };
     let temp =
         tempfile::NamedTempFile::new_in(dir).map_err(|e| io_error("cannot write in", dir, e))?;
-    serde_json::to_writer_pretty(&temp, &document).map_err(|e| corrupt(temp.path(), e))?;
+    // `Document` always serializes, so a failure here is the temp file's I/O.
+    serde_json::to_writer_pretty(&temp, &document)
+        .map_err(|e| io_error("cannot write", temp.path(), e.into()))?;
     let path = dir.join(DOCUMENT);
     temp.persist(&path)
         .map_err(|e| io_error("cannot replace", &path, e.error))?;
