@@ -702,6 +702,92 @@ mod tests {
         assert_eq!(store.purge_expired().await.unwrap(), 0);
     }
 
+    // Only this lock's pre-mutation timeout is safe to retry. Keep the number
+    // of attempts finite even if another store never releases the lock.
+    async fn retry_contended_mutation<T, F, Fut>(lock_path: &Path, mut operation: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut retries_left = 2;
+        loop {
+            let result = operation().await;
+            match &result {
+                Err(Error::Io {
+                    path: Some(path),
+                    source,
+                    ..
+                }) if path == lock_path
+                    && source.kind() == std::io::ErrorKind::TimedOut
+                    && retries_left > 0 =>
+                {
+                    retries_left -= 1;
+                }
+                _ => return result,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_fixture_retries_lock_timeouts_until_success() {
+        let lock_path = Path::new("messages/.mutation.lock");
+        let mut attempts = 0;
+        let result = retry_contended_mutation(lock_path, || {
+            attempts += 1;
+            std::future::ready(if attempts < 3 {
+                Err(Error::io(
+                    "contended",
+                    lock_path,
+                    std::io::ErrorKind::TimedOut.into(),
+                ))
+            } else {
+                Ok(42)
+            })
+        })
+        .await;
+        assert_eq!((result.unwrap(), attempts), (42, 3));
+    }
+
+    #[tokio::test]
+    async fn mutation_fixture_stops_after_three_lock_timeouts() {
+        let lock_path = Path::new("messages/.mutation.lock");
+        let mut attempts = 0;
+        let result: Result<()> = retry_contended_mutation(lock_path, || {
+            attempts += 1;
+            std::future::ready(Err(Error::io(
+                "contended",
+                lock_path,
+                std::io::ErrorKind::TimedOut.into(),
+            )))
+        })
+        .await;
+        assert!(
+            matches!(result, Err(Error::Io { source, .. }) if source.kind() == std::io::ErrorKind::TimedOut)
+                && attempts == 3
+        );
+    }
+
+    #[tokio::test]
+    async fn mutation_fixture_returns_unexpected_errors_without_retrying() {
+        let lock_path = Path::new("messages/.mutation.lock");
+        for (path, kind) in [
+            (lock_path, std::io::ErrorKind::PermissionDenied),
+            (Path::new("messages/msg.json"), std::io::ErrorKind::TimedOut),
+        ] {
+            let mut attempts = 0;
+            let result: Result<()> = retry_contended_mutation(lock_path, || {
+                attempts += 1;
+                std::future::ready(Err(Error::io("unexpected", path, kind.into())))
+            })
+            .await;
+            assert!(
+                matches!(result, Err(Error::Io { source, .. }) if source.kind() == kind)
+                    && attempts == 1,
+                "{path:?}: {kind:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_stores_preserve_valid_messages_during_expiry_and_acknowledgement() {
         let temp = tempfile::tempdir().unwrap();
@@ -719,26 +805,40 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let mut tasks = Vec::new();
-        for n in 0..32 {
-            let other = FileMessageStore::new(store.paths.clone(), clock.clone());
-            tasks.push(tokio::spawn(async move {
-                other
-                    .save(&message(&format!("msg_new{n}"), Some("cli@offline"), "t"))
-                    .await
-                    .unwrap();
-            }));
-        }
-        for n in 0..16 {
-            let other = FileMessageStore::new(store.paths.clone(), clock.clone());
-            tasks.push(tokio::spawn(async move {
-                other.mark_delivered(&format!("msg_ack{n}")).await.unwrap();
-                other.purge_expired().await.unwrap();
-            }));
-        }
-        for task in tasks {
-            task.await.unwrap();
-        }
+        // Independent stores still overlap. A permitted lock timeout must not
+        // bypass the integrity oracle, but retries and the whole concurrent
+        // phase are bounded. JoinSet aborts remaining waiters on failure.
+        tokio::time::timeout(Duration::from_secs(45), async {
+            let mut tasks = tokio::task::JoinSet::new();
+            for n in 0..32 {
+                let other = FileMessageStore::new(store.paths.clone(), clock.clone());
+                tasks.spawn(async move {
+                    let lock_path = other.paths.messages_dir().join(".mutation.lock");
+                    let msg = message(&format!("msg_new{n}"), Some("cli@offline"), "t");
+                    retry_contended_mutation(&lock_path, || other.save(&msg))
+                        .await
+                        .expect("concurrent save must make progress");
+                });
+            }
+            for n in 0..16 {
+                let other = FileMessageStore::new(store.paths.clone(), clock.clone());
+                tasks.spawn(async move {
+                    let lock_path = other.paths.messages_dir().join(".mutation.lock");
+                    let id = format!("msg_ack{n}");
+                    retry_contended_mutation(&lock_path, || other.mark_delivered(&id))
+                        .await
+                        .expect("concurrent acknowledgement must make progress");
+                    retry_contended_mutation(&lock_path, || other.purge_expired())
+                        .await
+                        .expect("concurrent expiry must make progress");
+                });
+            }
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .expect("concurrent mutations must finish within 45 seconds");
         let messages = store.list().await.unwrap();
         assert_eq!(messages.len(), 48);
         for m in messages {
