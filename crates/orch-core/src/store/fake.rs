@@ -19,6 +19,7 @@ type Rows = BTreeMap<(EntityKind, String), Record>;
 struct Project {
     rows: Rows,
     events: events::fake::EventState,
+    intents: intents::fake::IntentState,
     leases: leases::fake::LeaseState,
     positions: BTreeMap<EntityKind, u64>,
 }
@@ -500,5 +501,56 @@ impl events::EventWrite for View {
     }
     fn prune_events(&mut self, run: &str, max_rows: usize) -> Result<events::PruneResult> {
         self.project.events.prune(run, max_rows)
+    }
+}
+
+#[async_trait]
+impl intents::IntentRead for View {
+    async fn read_intent(&self, id: u64) -> Result<Option<intents::Intent>> {
+        Ok(self.project.intents.get(id))
+    }
+    async fn read_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<intents::Intent>> {
+        self.project.intents.pending(after, limit)
+    }
+}
+
+impl intents::IntentWrite for View {
+    fn add_intent(
+        &mut self,
+        payload: &intents::IntentPayload,
+        now_ms: i64,
+    ) -> Result<intents::Intent> {
+        payload.validate()?;
+        if let Some(run) = payload.run() {
+            // The lease of that run, as this unit of work sees it, under the
+            // current lineage; a task principal must be its holder.
+            let lease = self
+                .project
+                .leases
+                .all()
+                .into_iter()
+                .find(|lease| lease.run == run)
+                .ok_or(StoreError::StaleEpoch)?;
+            self.project.leases.check(
+                &self.caller,
+                &self.lineage,
+                leases::fake::By::Task(&lease.task),
+                &lease.lineage,
+                lease.epoch,
+            )?;
+        }
+        self.project.intents.add(payload, now_ms)
+    }
+    fn finish_intent(&mut self, id: u64, now_ms: i64) -> Result<intents::FinishOutcome> {
+        self.project.intents.finish(id, now_ms)
+    }
+    fn delete_finished_intents(&mut self, now_ms: i64, max_rows: usize) -> Result<usize> {
+        self.project.intents.delete_finished(now_ms, max_rows)
+    }
+    fn get_intent(&self, id: u64) -> Result<Option<intents::Intent>> {
+        Ok(self.project.intents.get(id))
+    }
+    fn list_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<intents::Intent>> {
+        self.project.intents.pending(after, limit)
     }
 }

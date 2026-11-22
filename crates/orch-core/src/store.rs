@@ -4,8 +4,8 @@
 //! Authorization of operations belongs to the dispatcher, not to this port.
 //! Writes run a synchronous callback on the backend's writer, so no transaction
 //! can escape or wait for an external side effect. A callback error aborts it.
-//! Events and leases share the entity transaction and its project boundary.
-//! The remaining operational families arrive in later slices.
+//! Events, leases and intents share the entity transaction and its project
+//! boundary. The remaining operational families arrive in later slices.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -15,6 +15,7 @@ pub mod entity;
 pub mod events;
 #[cfg(feature = "test-support")]
 pub mod fake;
+pub mod intents;
 pub mod leases;
 pub mod page;
 
@@ -78,6 +79,8 @@ pub enum StoreError {
     StaleEpoch,
     #[error("invalid events: {0}")]
     InvalidEvents(String),
+    #[error("invalid intent: {0}")]
+    InvalidIntent(String),
     #[error("storage counter exhausted")]
     CounterExhausted,
     #[error(transparent)]
@@ -88,7 +91,9 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 /// All reads share one committed state, including repeated page reads.
 #[async_trait]
-pub trait ReadSnapshot: events::EventRead + leases::LeaseRead + Send + Sync {
+pub trait ReadSnapshot:
+    events::EventRead + intents::IntentRead + leases::LeaseRead + Send + Sync
+{
     fn caller(&self) -> &Caller;
     async fn get(&self, kind: EntityKind, id: &str) -> Result<Option<Record>>;
     async fn list(&self, filter: &Filter, page: &PageRequest) -> Result<Page<Record>>;
@@ -98,7 +103,9 @@ pub trait ReadSnapshot: events::EventRead + leases::LeaseRead + Send + Sync {
 ///
 /// Errors leave that operation unchanged. Returning an error from `work`
 /// discards every operation, including positions and revision increments.
-pub trait UnitOfWork: events::EventWrite + leases::LeaseWrite + Send {
+pub trait UnitOfWork:
+    events::EventWrite + intents::IntentWrite + leases::LeaseWrite + Send
+{
     fn caller(&self) -> &Caller;
     fn get(&self, kind: EntityKind, id: &str) -> Result<Option<Record>>;
     fn list(&self, filter: &Filter, page: &PageRequest) -> Result<Page<Record>>;
