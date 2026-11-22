@@ -22,6 +22,7 @@ pub mod run;
 pub mod state;
 pub mod task;
 pub mod team;
+pub mod v2;
 
 pub use agent::FileAgentStore;
 pub use cached::{CachedAgentStore, CachedGoalStore, CachedTaskStore};
