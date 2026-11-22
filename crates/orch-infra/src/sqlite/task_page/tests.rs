@@ -1,17 +1,15 @@
-//! Compile the exact unregistered leaf until T10 owns module registration.
-#[path = "../src/sqlite/task_page/mod.rs"]
-mod task_page;
-
+use super::{self as task_page, Continuation, query};
+use crate::data_dir::{DataDir, Holder, LockKind};
+use crate::sqlite::{ConnectionRole, Synchronous, migrations::migrate, open_connection};
+use crate::sqlite::{ReadPool, SqliteError};
+use crate::storage::v2::FileStorage;
 use orch_core::store::{
     Caller, Entity, EntityKind, Filter, Lane, PageRequest, Principal, Revision, Sort, Storage,
     StoreError,
 };
 use orch_core::test_support::make_task;
 use orch_domain::{Task, TaskStatus};
-use orch_infra::data_dir::{DataDir, Holder, LockKind};
-use orch_infra::sqlite::{ConnectionRole, Synchronous, migrations::migrate, open_connection};
-use orch_infra::storage::v2::FileStorage;
-use task_page::{Continuation, query};
+use std::time::{Duration, Instant};
 
 fn owner(project: &str) -> Caller {
     Caller {
@@ -124,6 +122,7 @@ async fn ordered_ids_counts_and_filters_match_real_file_reference() {
             insert(&db, "other", &t, position);
         }
     }
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
     let filters = [
         filter(),
         Filter::Tasks {
@@ -152,8 +151,12 @@ async fn ordered_ids_counts_and_filters_match_real_file_reference() {
                 let mut after: Option<Continuation> = None;
                 let mut seen = Vec::new();
                 loop {
-                    let tx = db.transaction().unwrap();
-                    let got = query(&tx, "p", &f, &req, after.as_ref()).unwrap();
+                    let got = pool
+                        .read(deadline(), |tx| {
+                            Ok(query(tx, "p", &f, &req, after.as_ref()))
+                        })
+                        .unwrap()
+                        .unwrap();
                     let expected = snapshot.list(&f, &file_req).await.unwrap();
                     let ids: Vec<_> = expected
                         .items
@@ -164,7 +167,6 @@ async fn ordered_ids_counts_and_filters_match_real_file_reference() {
                     assert_eq!(got.total, expected.total);
                     assert_eq!(got.next.is_some(), expected.next_cursor.is_some());
                     seen.extend(got.ids);
-                    tx.commit().unwrap();
                     match got.next {
                         Some(next) => {
                             after = Some(next);
@@ -339,23 +341,25 @@ fn snapshot_stays_consistent_across_external_commit() {
     let mut writer = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
     migrate(&data, &mut writer).unwrap();
     insert(&writer, "p", &task("a", TaskStatus::Todo, 0, 0, None), 1);
-    let mut reader = open_connection(&data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
-    let tx = reader.transaction().unwrap();
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
     let req = request(Sort::Id, 100);
-    assert_eq!(
-        query(&tx, "p", &filter(), &req, None).unwrap().total,
-        Some(1)
-    );
-    insert(&writer, "p", &task("b", TaskStatus::Todo, 0, 0, None), 2);
-    let again = query(&tx, "p", &filter(), &req, None).unwrap();
-    assert_eq!(again.total, Some(1));
-    assert_eq!(again.ids, ["a"]);
-    tx.commit().unwrap();
-    let tx = reader.transaction().unwrap();
-    assert_eq!(
-        query(&tx, "p", &filter(), &req, None).unwrap().total,
-        Some(2)
-    );
+    pool.read(deadline(), |tx| {
+        assert_eq!(
+            query(&tx, "p", &filter(), &req, None).unwrap().total,
+            Some(1)
+        );
+        insert(&writer, "p", &task("b", TaskStatus::Todo, 0, 0, None), 2);
+        let again = query(&tx, "p", &filter(), &req, None).unwrap();
+        assert_eq!(again.total, Some(1));
+        assert_eq!(again.ids, ["a"]);
+        Ok(())
+    })
+    .unwrap();
+    let next = pool
+        .read(deadline(), |tx| Ok(query(tx, "p", &filter(), &req, None)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.total, Some(2));
 }
 
 #[test]
@@ -433,4 +437,51 @@ async fn mixed_timestamp_precision_is_a_documented_incompatible_representation()
         left.parse::<jiff::Timestamp>().unwrap().as_millisecond(),
         right.parse::<jiff::Timestamp>().unwrap().as_millisecond()
     );
+}
+
+fn deadline() -> Instant {
+    Instant::now() + Duration::from_secs(5)
+}
+
+#[test]
+fn read_pool_preserves_query_errors_and_returns_its_slot() {
+    let root = tempfile::tempdir().unwrap();
+    let data = data(&root);
+    let mut writer = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&data, &mut writer).unwrap();
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    let invalid = pool
+        .read(deadline(), |tx| {
+            Ok(query(tx, "p", &filter(), &request(Sort::Id, 0), None))
+        })
+        .unwrap();
+    assert!(matches!(
+        invalid,
+        Err(task_page::Error::Page(StoreError::InvalidPage(_)))
+    ));
+
+    // A malformed stored schema must reach the callback caller as a SQL error,
+    // not an empty page. Forward it through the pool's existing error channel.
+    writer
+        .execute("ALTER TABLE tasks RENAME TO unavailable_tasks", [])
+        .unwrap();
+    let failed: crate::sqlite::Result<()> = pool.read(deadline(), |tx| {
+        match query(tx, "p", &filter(), &request(Sort::Id, 1), None) {
+            Err(task_page::Error::Sql(error)) => Err(SqliteError::Sql(error)),
+            other => panic!("expected SQL failure, got {other:?}"),
+        }
+    });
+    assert!(matches!(failed, Err(SqliteError::Sql(_))));
+    writer
+        .execute("ALTER TABLE unavailable_tasks RENAME TO tasks", [])
+        .unwrap();
+    insert(&writer, "p", &task("a", TaskStatus::Todo, 0, 0, None), 1);
+    let recovered = pool
+        .read(deadline(), |tx| {
+            Ok(query(tx, "p", &filter(), &request(Sort::Id, 1), None))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.ids, ["a"]);
+    assert_eq!(recovered.total, Some(1));
 }

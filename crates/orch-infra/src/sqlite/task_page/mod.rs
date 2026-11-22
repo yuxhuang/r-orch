@@ -151,3 +151,6 @@ pub(crate) fn query(
         total,
     })
 }
+
+#[cfg(test)]
+mod tests;
