@@ -1083,6 +1083,81 @@ or need a resync (§2.1 G7, N4, N6). Persisted run events take a different path:
 `RunService::append_event` directly (`crates/orch-engine/src/orchestrator/collect.rs`); the run log is
 not written by a dashboard broadcast subscriber.
 
+### 6.6 SQLite writer and read pool (foundation, not wired)
+
+[ADR 0017](decisions/0017-sqlite-storage.md) decision 6 gives SQLite one task that performs every write, one
+transaction at a time, and a pool of read-only connections. `crates/orch-infra/src/sqlite/{writer,read_pool}.rs`
+is that executor and pool as an independent foundation (plan T10, first slice). Nothing else uses it yet: it is
+not behind `Storage`, the daemon still runs on the file backend, and the mutex model of §6.1 is unchanged. This
+is a blocking, thread-based design, not tokio: the engine has no async adapter around it yet.
+
+**Trust.** Both types run owned or borrowed closures written by the storage adapter, which must already have
+checked the caller and the project. Neither is an endpoint for client-supplied SQL, and neither has an
+authorizer.
+
+**One writer.** `Writer::open(&DataDir, Synchronous, capacity)` opens the only writing connection and returns a
+`Writer` and a cloneable `WriterHandle`. `Writer::run` blocks the calling thread until admission is closed and the
+queue is empty, so it belongs on a dedicated thread, started with `std::thread::scope`. `Writer` borrows the
+`DataDir`, so the exclusive data-directory lock outlives the connection, and a connection cannot be taken out of
+its handle. Open one executor per adapter, after migrations.
+
+```text
+clients ── WriterHandle::submit(lane, deadline, closure) ──> bounded queue (Mutex + Condvar)
+                                                                   │ one job at a time
+                                                      writer thread: BEGIN IMMEDIATE ── closure ── COMMIT
+clients <── WriteReceipt::wait() ───────────────────────── result (body or commit error)
+```
+
+- **Connection.** The writer connection has WAL, the configured `synchronous` level, foreign keys, a 5 s busy
+  timeout, `BEGIN IMMEDIATE` transactions, and automatic checkpointing off (`sqlite/connection.rs`).
+- **Transaction.** The closure receives a borrowed `rusqlite::Transaction` and returns `sqlite::Result<T>`. An
+  error from the closure rolls the transaction back, a commit error is returned the same way, and the worker
+  takes the next job. A panic in a closure rolls back, ends `run` and drops the `Writer`, which closes admission and
+  drops every queued job. Their receipts then return `WriterClosed`.
+- **Queue.** `capacity` bounds the number of waiting transactions, not their bytes. A full queue, and a second
+  waiting `Events` transaction, return `Overloaded` at once; the producer keeps its batch. Nothing coalesces
+  events yet.
+- **Order.** `Lane` is `Claims`, `Entities`, `Events` or `Maintenance`. The worker takes the oldest waiting
+  `Claims` job first. Otherwise it takes the job with the earliest deadline, which is its arrival plus the lane's
+  wait budget (entities 200 ms, events 1 s, maintenance 5 s), and the earlier arrival wins a tie. The budgets are
+  priorities, not timeouts and not measured results (ADR 0017 decision 9).
+- **Request deadline.** `submit` takes an optional `Instant`. The worker checks it just before `BEGIN`: a request
+  that has expired never begins and returns `Overloaded`. A deadline does not stop a transaction already running
+  and does not bound the busy wait inside `BEGIN IMMEDIATE`.
+- **Receipts.** `wait` blocks and returns the closure's result. Dropping a receipt does not cancel the work: an
+  accepted transaction still commits. Do not call `wait` on an async runtime thread; nothing adapts it yet.
+- **Close.** `WriterHandle::close` stops admission, is idempotent, and lets the worker drain what it accepted.
+  Dropping the last `WriterHandle` clone does the same, including on an early return or an unwind. `submit` after
+  close returns `WriterClosed`. Closures captured by a refused or abandoned job are dropped outside the queue lock.
+
+**Read pool.** `ReadPool::open(&DataDir, Synchronous, size)` opens exactly `size` read-only connections
+(`ReadPool::DEFAULT_CONNECTIONS` is 4), after schema setup. The caller supplies `size`; the
+`storage.read_connections` setting of spec R98 is not wired to it yet.
+
+- `read(deadline, closure)` waits for a free slot until `deadline` and then returns `Overloaded`. A free slot is
+  taken before the elapsed time is checked, and the pool never opens more than `size` connections. The
+  deadline bounds the wait for a slot, not the closure.
+- The closure runs in one deferred transaction, so every statement sees the snapshot taken at its first statement.
+  A later commit is not visible inside that call. A snapshot does not outlive the call.
+- A failed read discards its connection, and the slot reopens on its next use. A connection returned inside an open
+  transaction, including by a panic, is discarded the same way, so no reader inherits it. WAL readers do not block
+  the writer.
+
+**Limits of this slice** (follow-ups tracked in [issue 127](https://github.com/yuxhuang/r-orch/issues/127)):
+
+- No retry and no replay: a SQL error goes to its receipt. There is no shared fatal state, no failure
+  classification (spec R128, R140) and no distinction between a failed writer and a clean close.
+- A closure must not issue `COMMIT`, `BEGIN` or `SAVEPOINT`, or any side effect outside the database. The executor
+  does not detect it; a manual `COMMIT` can persist rows although the wrapper then reports an error. Side effects
+  belong in `intents` rows (ADR 0017 decision 10), which do not exist yet.
+- Claims always go first, so a steady stream of claims can delay every other lane. Bounded claim production is
+  not implemented.
+- Nothing cuts bulk work to 1,000 rows or 20 ms, and nothing merges the event batches of several runs into one
+  transaction (ADR 0017 decision 9).
+- Nothing checkpoints the WAL while the executor runs: automatic checkpointing is off, and the checkpoint
+  connection, the backlog counters and the interruption of long reads (R126, R127, R137) are not built. Wiring this to the daemon waits for them.
+- There is no query connection or authorizer for `orch db query` (R130) and no shutdown integration (R139).
+
 ---
 
 ## 7. Container and wiring
