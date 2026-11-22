@@ -1748,3 +1748,17 @@ The new data-directory guard requires an absolute, owner-only root (0700), refus
 Connections check WAL, foreign keys, a five-second busy timeout and NORMAL (or explicit FULL) synchronous mode. Writing connections disable automatic checkpoints and read back full-sync settings. Numbered migrations commit one version at a time, refuse a newer database with both versions, and verify the recorded history. Before upgrading a database containing a project, migration setup requires space above the disk floor for a database copy, writes a `database_only` manifest with its SHA-256 and size, checks the copy, and retains the two newest copies after success. Such a copy does not include blobs or repositories and is not a complete restore point. A failed copy stops migration; a failed migration preserves the preceding committed version. Incomplete copy directories are left untouched and excluded from retention. A pruning error after commit emits a warning and leaves the committed migration successful; inspect the retained copies before any manual cleanup.
 
 The initial schema uses project-scoped primary keys, including `(project_id, id)` for projects, intents and attention, and `(project_id, sha256)` for blobs. A project's two ID columns must match. Empty scope is reserved for daemon intents and attention. Intent writers must allocate integer IDs and finish by both scope and ID. New databases seed `local_owner`, `local_worker` and a random 128-bit `lineage`; reopening preserves that lineage. Restore will replace it in its own implementation.
+
+
+## Inactive SQLite blob adapter (T11)
+
+The running daemon still uses file storage until the SQLite cutover. The new adapter writes bytes to
+`blobs/tmp/`, syncs them, and renames them to `blobs/sha256/ab/cd/<hash>` before a transaction registers
+`blobs` and a run prompt or task attachment reference. Display names are database values, never paths.
+Every disk read checks the SHA-256; missing, malformed, oversized or corrupt blobs fail explicitly.
+
+A failed or rolled-back database transaction can leave an unreferenced blob file. Do not delete blobs
+manually: different projects, prompts and attachments can share their bytes. Reference-aware sweeping
+belongs to the maintenance implementation; this adapter does not start a sweep. Failed directory syncs
+are errors, and retries re-sync even an intact file before returning its hash. Reverting T11 requires no
+schema rollback or data migration and leaves the active file backend unchanged.
