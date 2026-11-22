@@ -1,5 +1,11 @@
 -- Initial 1.1 schema. Spec: docs/specs/2026-11-20-sqlite-storage.md, Schema for 1.1.
 
+CREATE TABLE projects (
+  project_id TEXT NOT NULL, id TEXT NOT NULL, name TEXT NOT NULL UNIQUE,
+  status TEXT NOT NULL, created_at INTEGER NOT NULL, revision INTEGER NOT NULL,
+  PRIMARY KEY (project_id, id), CHECK (project_id = id)
+) STRICT;
+
 CREATE TABLE project_sources (
   project_id TEXT PRIMARY KEY,
   adapter TEXT NOT NULL CHECK (adapter IN ('local', 'managed')),
@@ -96,6 +102,13 @@ CREATE TABLE task_scopes (
   PRIMARY KEY (project_id, task_id, pattern)
 ) STRICT;
 
+CREATE TABLE blobs (
+  project_id TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL, storage_location TEXT NOT NULL, created_at INTEGER NOT NULL,
+  unreferenced_since INTEGER,
+  PRIMARY KEY (project_id, sha256)
+) STRICT;
+CREATE INDEX blobs_sweepable ON blobs (unreferenced_since) WHERE unreferenced_since IS NOT NULL;
+
 CREATE TABLE task_attachments (
   project_id TEXT NOT NULL, task_id TEXT NOT NULL, name TEXT NOT NULL, sha256 TEXT NOT NULL,
   PRIMARY KEY (project_id, task_id, name)
@@ -188,6 +201,13 @@ CREATE TABLE retry_queue (
 
 CREATE INDEX retries_due ON retry_queue (due_at);
 
+CREATE TABLE intents (
+  project_id TEXT NOT NULL DEFAULT '', id INTEGER NOT NULL, worker_id TEXT, run_id TEXT,
+  kind TEXT NOT NULL, payload TEXT NOT NULL, created_at INTEGER NOT NULL, done_at INTEGER,
+  PRIMARY KEY (project_id, id)
+) STRICT;
+CREATE INDEX intents_pending ON intents (id) WHERE done_at IS NULL;
+
 CREATE TABLE request_keys (
   identity_id TEXT NOT NULL, project_id TEXT NOT NULL DEFAULT '',
   run_id TEXT NOT NULL DEFAULT '', epoch INTEGER NOT NULL DEFAULT 0,
@@ -255,6 +275,27 @@ CREATE TABLE identity_tokens (
 ) STRICT;
 
 CREATE INDEX identity_tokens_live ON identity_tokens (identity_id) WHERE revoked_at IS NULL;
+
+CREATE TABLE attention (
+  id TEXT NOT NULL,
+  project_id TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL,
+  subject_kind TEXT NOT NULL,
+  subject_id TEXT NOT NULL,
+  severity TEXT NOT NULL CHECK (severity IN ('blocking', 'warning')),
+  title TEXT NOT NULL, detail TEXT,
+  author_kind TEXT NOT NULL DEFAULT 'daemon' CHECK (author_kind IN ('daemon', 'agent', 'owner')),
+  author_run_id TEXT,
+  opened_at INTEGER NOT NULL,
+  acked_at INTEGER, acked_by TEXT,
+  resolved_at INTEGER, resolved_by TEXT, resolved_reason TEXT,
+  revision INTEGER NOT NULL,
+  PRIMARY KEY (project_id, id)
+) STRICT;
+CREATE UNIQUE INDEX attention_one_per_subject
+  ON attention (project_id, kind, subject_id) WHERE resolved_at IS NULL;
+CREATE INDEX attention_open ON attention (project_id, severity, opened_at) WHERE resolved_at IS NULL;
+CREATE INDEX attention_history ON attention (project_id, resolved_at);
 
 CREATE TABLE counters (
   project_id TEXT NOT NULL, name TEXT NOT NULL, value INTEGER NOT NULL, PRIMARY KEY (project_id, name)

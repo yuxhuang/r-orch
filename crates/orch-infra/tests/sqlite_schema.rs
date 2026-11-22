@@ -120,6 +120,14 @@ fn every_project_table_carries_project_id() {
     }) {
         let count: i64 = conn.query_row("SELECT count(*) FROM pragma_table_info(?1) WHERE name='project_id' AND \"notnull\"=1", [table], |r|r.get(0)).unwrap();
         assert_eq!(count, 1, "{table}");
+        let in_key: i64 = conn
+            .query_row(
+                "SELECT pk FROM pragma_table_info(?1) WHERE name='project_id'",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(in_key > 0, "{table}");
     }
 }
 
@@ -198,5 +206,130 @@ fn task_ids_are_unique_under_ascii_case_only_within_a_project() {
             .get(0))
             .unwrap(),
         1
+    );
+}
+
+#[test]
+fn project_keys_preserve_order_and_scope() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    for (table, expected) in [
+        ("projects", vec!["project_id", "id"]),
+        ("blobs", vec!["project_id", "sha256"]),
+        ("intents", vec!["project_id", "id"]),
+        ("attention", vec!["project_id", "id"]),
+    ] {
+        let key: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info(?1) WHERE pk > 0 ORDER BY pk")
+            .unwrap()
+            .query_map([table], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(key, expected, "{table}");
+    }
+    assert!(
+        conn.execute(
+            "INSERT INTO projects VALUES('p','q','bad','active',0,1)",
+            []
+        )
+        .is_err()
+    );
+    conn.execute(
+        "INSERT INTO projects VALUES('p','p','one','active',0,1)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO projects VALUES('q','q','one','active',0,1)",
+            []
+        )
+        .is_err()
+    );
+    for scope in ["p", "q"] {
+        conn.execute("INSERT INTO blobs(project_id,sha256,size,storage_location,created_at) VALUES(?1,'digest',0,'local',0)", [scope]).unwrap();
+    }
+    assert!(
+        conn.execute(
+            "INSERT INTO blobs VALUES('p','digest',0,'local',0,NULL)",
+            []
+        )
+        .is_err()
+    );
+    conn.execute(
+        "INSERT INTO intents(id,kind,payload,created_at) VALUES(1,'daemon','{}',0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO intents(project_id,id,kind,payload,created_at) VALUES('p',1,'project','{}',0)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO intents(project_id,kind,payload,created_at) VALUES('p','project','{}',0)",
+            []
+        )
+        .is_err()
+    );
+    assert!(conn.execute("INSERT INTO intents(project_id,id,kind,payload,created_at) VALUES(NULL,2,'daemon','{}',0)", []).is_err());
+    conn.execute(
+        "UPDATE intents SET done_at=1 WHERE project_id='p' AND id=1",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>(
+            "SELECT count(*) FROM intents WHERE project_id='' AND id=1 AND done_at IS NULL",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn attention_uniqueness_ends_when_an_item_is_resolved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    let insert = |scope: &str, id: &str| {
+        conn.execute("INSERT INTO attention(project_id,id,kind,subject_kind,subject_id,severity,title,opened_at,revision) VALUES(?1,?2,'disk_floor','daemon','subject','blocking','title',0,1)", [scope,id])
+    };
+    insert("", "same").unwrap();
+    insert("p", "same").unwrap();
+    assert!(insert("p", "other").is_err());
+    conn.execute(
+        "UPDATE attention SET resolved_at=1 WHERE project_id='p' AND id='same'",
+        [],
+    )
+    .unwrap();
+    insert("p", "other").unwrap();
+    assert_eq!(
+        conn.query_row::<String, _, _>(
+            "SELECT author_kind FROM attention WHERE project_id='p' AND id='other'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        "daemon"
+    );
+    let indexes: Vec<String> = conn.prepare("SELECT name FROM sqlite_schema WHERE type='index' AND name IN ('intents_pending','blobs_sweepable','attention_one_per_subject','attention_open','attention_history') ORDER BY name").unwrap()
+        .query_map([], |r|r.get(0)).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(
+        indexes,
+        [
+            "attention_history",
+            "attention_one_per_subject",
+            "attention_open",
+            "blobs_sweepable",
+            "intents_pending"
+        ]
     );
 }
