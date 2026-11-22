@@ -1,0 +1,333 @@
+//! The disk adapter. Writes follow R58: temporary file, sync, rename, and only then may a row name the blob.
+use super::{BlobHash, InvalidHash, MAX_BLOB_BYTES};
+use crate::data_dir::confined::{ConfinedDir, ConfinedError, FileAccess};
+use sha2::{Digest, Sha256};
+use std::io::{self, Read, Write};
+
+#[derive(Debug, thiserror::Error)]
+pub enum BlobError {
+    #[error(transparent)]
+    InvalidHash(#[from] InvalidHash),
+    #[error("no blob {0}")]
+    NotFound(BlobHash),
+    #[error("blob {0} does not hash to its name")]
+    Corrupt(BlobHash),
+    #[error("blob is over the {limit} byte limit")]
+    TooLarge { limit: u64 },
+    #[error(transparent)]
+    Confined(#[from] ConfinedError),
+    #[error(transparent)]
+    Io(#[from] io::Error),
+}
+
+pub(super) type Result<T> = std::result::Result<T, BlobError>;
+
+/// The steps of a write, in order. Each runs through [`Hooks`] so a test can see the order and fail one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    WriteTmp,
+    SyncTmp,
+    Publish,
+    SyncDirs,
+}
+
+/// A seam for the order of a write and for failing one step; production runs the operation unchanged.
+pub(crate) trait Hooks: Send + Sync {
+    fn run(&self, step: Step, op: &mut dyn FnMut() -> Result<()>) -> Result<()>;
+}
+
+#[derive(Debug)]
+struct Direct;
+
+impl Hooks for Direct {
+    fn run(&self, _step: Step, op: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+        op()
+    }
+}
+
+/// `blobs/sha256/` and `blobs/tmp/` of one data directory, held by descriptor.
+pub struct DiskBlobStore {
+    sha256: ConfinedDir,
+    tmp: ConfinedDir,
+    hooks: Box<dyn Hooks>,
+}
+
+impl std::fmt::Debug for DiskBlobStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiskBlobStore").finish_non_exhaustive()
+    }
+}
+
+fn is_missing(e: &ConfinedError) -> bool {
+    matches!(e, ConfinedError::Io(io) if io.kind() == io::ErrorKind::NotFound)
+}
+
+/// Opens or creates one directory; the flag says whether this call made it.
+fn open_or_create(parent: &ConfinedDir, name: &str) -> Result<(ConfinedDir, bool)> {
+    match parent.create_dir(name) {
+        Ok(dir) => Ok((dir, true)),
+        Err(ConfinedError::Io(e)) if e.kind() == io::ErrorKind::AlreadyExists => {
+            Ok((parent.open_dir(name)?, false))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+impl DiskBlobStore {
+    /// `data_root` is the data directory's confined root (`DataDir::root()`).
+    pub fn open(data_root: &ConfinedDir) -> Result<Self> {
+        Self::with_hooks(data_root, Box::new(Direct))
+    }
+
+    pub(crate) fn with_hooks(data_root: &ConfinedDir, hooks: Box<dyn Hooks>) -> Result<Self> {
+        let blobs = data_root.ensure_dir("blobs")?;
+        Ok(Self {
+            sha256: blobs.ensure_dir("sha256")?,
+            tmp: blobs.ensure_dir("tmp")?,
+            hooks,
+        })
+    }
+
+    /// Stores the bytes and returns their hash; a blob already stored, and intact, is not written again.
+    /// When this returns the bytes are durable under their name, so a row may name them.
+    pub fn put(&self, bytes: &[u8]) -> Result<BlobHash> {
+        if bytes.len() as u64 > MAX_BLOB_BYTES {
+            return Err(BlobError::TooLarge {
+                limit: MAX_BLOB_BYTES,
+            });
+        }
+        let hash = BlobHash::of(bytes);
+        let (ab, cd, name) = names(&hash);
+        // Anything unusable at the final name (a link, a FIFO, other bytes) is replaced by the rename below.
+        if self.is_intact(&hash, bytes.len() as u64, &ab, &cd, &name) {
+            return Ok(hash);
+        }
+        let tmp_name = tmp_name();
+        let result = self.publish(bytes, &tmp_name, &ab, &cd, &name);
+        if result.is_err() {
+            // The temporary file is ours; best effort, the sweep removes what this leaves.
+            let _ = self.tmp.remove_file(&tmp_name);
+        }
+        result.map(|()| hash)
+    }
+
+    fn publish(&self, bytes: &[u8], tmp_name: &str, ab: &str, cd: &str, name: &str) -> Result<()> {
+        let mut file = self.tmp.create_file(tmp_name)?;
+        self.hooks
+            .run(Step::WriteTmp, &mut || Ok(file.write_all(bytes)?))?;
+        self.hooks
+            .run(Step::SyncTmp, &mut || Ok(file.sync_all()?))?;
+        let (ab_dir, ab_new) = open_or_create(&self.sha256, ab)?;
+        let (cd_dir, cd_new) = open_or_create(&ab_dir, cd)?;
+        self.hooks.run(Step::Publish, &mut || {
+            Ok(self.tmp.rename(tmp_name, &cd_dir, name)?)
+        })?;
+        self.hooks.run(Step::SyncDirs, &mut || {
+            cd_dir.sync()?;
+            if cd_new {
+                ab_dir.sync()?;
+            }
+            if ab_new {
+                self.sha256.sync()?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The whole blob, after its bytes have been hashed against its name.
+    pub fn get(&self, hash: &BlobHash) -> Result<Vec<u8>> {
+        let (ab, cd, name) = names(hash);
+        let mut file = self
+            .shard(&ab, &cd)
+            .and_then(|dir| dir.open_file(&name, FileAccess::Read))
+            .map_err(|e| missing(hash, e))?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(MAX_BLOB_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_BLOB_BYTES {
+            return Err(BlobError::TooLarge {
+                limit: MAX_BLOB_BYTES,
+            });
+        }
+        if BlobHash::of(&bytes) != *hash {
+            return Err(BlobError::Corrupt(*hash));
+        }
+        Ok(bytes)
+    }
+
+    /// Deletes a blob's file; an absent blob is success (the `blob.delete` intent is repeated). Returns
+    /// whether a file was removed. A link or special file at the name is refused and left in place.
+    pub fn remove(&self, hash: &BlobHash) -> Result<bool> {
+        let (ab, cd, name) = names(hash);
+        match self.shard(&ab, &cd).and_then(|dir| dir.remove_file(&name)) {
+            Ok(()) => Ok(true),
+            Err(e) if is_missing(&e) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn shard(&self, ab: &str, cd: &str) -> std::result::Result<ConfinedDir, ConfinedError> {
+        self.sha256.open_dir(ab)?.open_dir(cd)
+    }
+
+    fn is_intact(&self, hash: &BlobHash, len: u64, ab: &str, cd: &str, name: &str) -> bool {
+        let Ok(mut file) = self
+            .shard(ab, cd)
+            .and_then(|dir| dir.open_file(name, FileAccess::Read))
+        else {
+            return false;
+        };
+        let mut hasher = Sha256::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut seen = 0u64;
+        loop {
+            match file.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    seen += n as u64;
+                    if seen > len {
+                        return false;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
+            }
+        }
+        seen == len && BlobHash::from_digest(hasher.finalize().into()) == *hash
+    }
+}
+
+fn missing(hash: &BlobHash, e: ConfinedError) -> BlobError {
+    if is_missing(&e) {
+        BlobError::NotFound(*hash)
+    } else {
+        e.into()
+    }
+}
+
+/// Shard directories and file name of a parsed hash: the first two and the next two hex digits.
+fn names(hash: &BlobHash) -> (String, String, String) {
+    let hex = hash.to_string();
+    (hex[0..2].to_owned(), hex[2..4].to_owned(), hex)
+}
+
+fn tmp_name() -> String {
+    const HEX: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    ];
+    nanoid::nanoid!(32, &HEX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    /// Records each step with whether the blob's final name existed when the step ran, runs the real
+    /// operation, and fails the chosen step instead of running it.
+    struct Probe {
+        final_path: PathBuf,
+        fail: Option<Step>,
+        seen: Mutex<Vec<(Step, bool)>>,
+    }
+
+    impl Hooks for std::sync::Arc<Probe> {
+        fn run(&self, step: Step, op: &mut dyn FnMut() -> Result<()>) -> Result<()> {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((step, self.final_path.exists()));
+            if self.fail == Some(step) {
+                return Err(BlobError::Io(io::Error::other("injected")));
+            }
+            op()
+        }
+    }
+
+    struct Rig {
+        _tmp: tempfile::TempDir,
+        root: PathBuf,
+        store: DiskBlobStore,
+        probe: std::sync::Arc<Probe>,
+    }
+
+    fn rig(bytes: &[u8], fail: Option<Step>) -> Rig {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let hex = BlobHash::of(bytes).to_string();
+        let probe = std::sync::Arc::new(Probe {
+            final_path: root.join(format!("blobs/sha256/{}/{}/{hex}", &hex[0..2], &hex[2..4])),
+            fail,
+            seen: Mutex::new(Vec::new()),
+        });
+        let store =
+            DiskBlobStore::with_hooks(&ConfinedDir::open(&root).unwrap(), Box::new(probe.clone()))
+                .unwrap();
+        Rig {
+            _tmp: tmp,
+            root,
+            store,
+            probe,
+        }
+    }
+
+    fn steps(rig: &Rig) -> Vec<(Step, bool)> {
+        rig.probe.seen.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn bytes_are_written_and_synced_before_the_blob_has_its_name() {
+        let rig = rig(b"ordered", None);
+        rig.store.put(b"ordered").unwrap();
+        assert_eq!(
+            steps(&rig),
+            [
+                (Step::WriteTmp, false),
+                (Step::SyncTmp, false),
+                (Step::Publish, false),
+                (Step::SyncDirs, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stored_blob_runs_no_write_step() {
+        let rig = rig(b"twice", None);
+        rig.store.put(b"twice").unwrap();
+        let first = steps(&rig).len();
+        rig.store.put(b"twice").unwrap();
+        assert_eq!(steps(&rig).len(), first);
+    }
+
+    #[test]
+    fn a_failure_before_publication_leaves_no_blob_and_no_temporary_file() {
+        for step in [Step::WriteTmp, Step::SyncTmp, Step::Publish] {
+            let rig = rig(b"fails", Some(step));
+            assert!(rig.store.put(b"fails").is_err(), "{step:?}");
+            assert!(!rig.probe.final_path.exists(), "{step:?}");
+            assert_eq!(
+                std::fs::read_dir(rig.root.join("blobs/tmp"))
+                    .unwrap()
+                    .count(),
+                0,
+                "{step:?}"
+            );
+            // A retry after the failure stores the blob.
+            let retry = DiskBlobStore::open(&ConfinedDir::open(&rig.root).unwrap()).unwrap();
+            assert!(retry.get(&BlobHash::of(b"fails")).is_err(), "{step:?}");
+            retry.put(b"fails").unwrap();
+            assert_eq!(retry.get(&BlobHash::of(b"fails")).unwrap(), b"fails");
+        }
+    }
+
+    #[test]
+    fn a_failure_to_sync_the_directories_reports_the_error_and_leaves_an_intact_blob() {
+        let rig = rig(b"dirs", Some(Step::SyncDirs));
+        assert!(rig.store.put(b"dirs").is_err());
+        // The caller got no hash, so no row names it; the bytes are whole and a later put is a no-op.
+        assert_eq!(rig.store.get(&BlobHash::of(b"dirs")).unwrap(), b"dirs");
+    }
+}
