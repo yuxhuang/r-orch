@@ -9,6 +9,12 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+# `fixture-gen` drives the real 1.0 file backend, so xtask reaches the stores directly. Normal edges
+# only, with no test-support feature: `cargo xtask crate-graph` keeps test APIs on dev edges.
+orch-core.workspace = true
+orch-domain.workspace = true
+orch-infra.workspace = true
+
 # anyhow is allowed in xtask and orch-cli only — never in a library signature.
 anyhow.workspace = true
 clap.workspace = true
@@ -19,6 +25,9 @@ nix = { workspace = true, features = ["fs", "dir", "user", "signal", "process", 
 
 # Safe Unix signal registration; no async subprocess rewrite or extra worker threads.
 tokio = { workspace = true, features = ["rt", "signal", "time"] }
+
+# The generator builds each scenario in a private directory before comparing or publishing it.
+tempfile.workspace = true
 
 [lints]
 workspace = true
