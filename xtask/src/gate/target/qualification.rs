@@ -217,15 +217,17 @@ fn observer_rejects_unready_file_when_holder_exits() {
     observer_control(
         r#"
 import tempfile
+from unittest.mock import patch
 class Holder:
  def poll(self): return 1
 with tempfile.TemporaryDirectory() as directory:
  case=pathlib.Path(directory)
  (case/'ready').write_text('')
  (case/'holder.stderr').write_text('holder failed')
- try: wait_for_pid(case,Holder(),'exited')
- except AssertionError as error: assert error.args[0]==('exited','holder failed')
- else: raise AssertionError('accepted an unready file after holder exit')
+ with patch.object(time,'sleep',side_effect=RuntimeError('unexpected retry')):
+  try: wait_for_pid(case,Holder(),'exited')
+  except AssertionError as error: assert error.args[0]==('exited','holder failed')
+  else: raise AssertionError('accepted an unready file after holder exit')
 "#,
     );
 }
@@ -241,7 +243,7 @@ class Holder:
 with tempfile.TemporaryDirectory() as directory:
  case=pathlib.Path(directory)
  (case/'ready').write_text('')
- with patch.object(time,'monotonic',side_effect=[0,30]):
+ with patch.object(time,'monotonic',side_effect=[0,30]), patch.object(time,'sleep',side_effect=RuntimeError('unexpected retry')):
   try: wait_for_pid(case,Holder(),'timeout')
   except AssertionError as error: assert error.args[0]==('timeout','holder not ready')
   else: raise AssertionError('accepted an unready file at the deadline')
