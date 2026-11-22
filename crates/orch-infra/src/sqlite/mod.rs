@@ -6,6 +6,12 @@ pub use connection::{ConnectionHandle, ConnectionRole, Synchronous, open_connect
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteError {
+    #[error("storage admission deadline or queue bound reached")]
+    Overloaded,
+    #[error("SQLite writer is closed")]
+    WriterClosed,
+    #[error("SQLite connection and queue capacities must be greater than zero")]
+    InvalidCapacity,
     #[error(transparent)]
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -30,3 +36,26 @@ pub enum SqliteError {
     Backup(String),
 }
 pub type Result<T> = std::result::Result<T, SqliteError>;
+
+mod read_pool;
+mod writer;
+pub use read_pool::ReadPool;
+pub use writer::{Lane, WriteReceipt, Writer, WriterHandle};
+
+#[cfg(test)]
+fn test_data() -> (tempfile::TempDir, crate::data_dir::DataDir) {
+    use crate::data_dir::{DataDir, Holder, LockKind};
+    let temp = tempfile::tempdir().unwrap();
+    let data = DataDir::acquire(
+        &temp.path().join("data"),
+        &Holder {
+            kind: LockKind::Daemon,
+            pid: std::process::id(),
+            started_at: "synthetic".into(),
+            binary_version: "test".into(),
+            executable: "/synthetic/orch".into(),
+        },
+    )
+    .unwrap();
+    (temp, data)
+}
