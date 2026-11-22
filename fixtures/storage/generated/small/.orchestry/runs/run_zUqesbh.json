@@ -1,0 +1,20 @@
+{
+  "id": "run_zUqesbh",
+  "task_id": "tsk_vRHqQcA",
+  "agent_id": "agt_cXM1BY8",
+  "attempt": 1,
+  "status": "succeeded",
+  "started_at": "2025-01-01T00:01:11.543Z",
+  "finished_at": "2025-01-01T00:01:20.407Z",
+  "workspace_path": "workspaces/tsk_vRHqQcA",
+  "prompt": "Synthetic prompt for tsk_vRHqQcA, attempt 1.",
+  "pid": 11374,
+  "tokens": {
+    "input": 9473,
+    "output": 2226,
+    "reasoning": 212,
+    "total": 11911,
+    "cache_read": 7896,
+    "cache_write": 877
+  }
+}

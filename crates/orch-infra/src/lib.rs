@@ -17,10 +17,12 @@
 
 pub mod adapters;
 pub mod clock;
+pub mod data_dir;
 pub mod ids;
 pub mod models;
 pub mod process;
 pub mod skills;
+pub mod sqlite;
 pub mod storage;
 pub mod template;
 pub mod workspace;

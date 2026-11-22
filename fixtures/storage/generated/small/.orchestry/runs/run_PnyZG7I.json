@@ -1,0 +1,20 @@
+{
+  "id": "run_PnyZG7I",
+  "task_id": "tsk_uAetqJG",
+  "agent_id": "agt__AKo7jx",
+  "attempt": 1,
+  "status": "succeeded",
+  "started_at": "2025-01-01T00:01:44.725Z",
+  "finished_at": "2025-01-01T00:01:51.153Z",
+  "workspace_path": "workspaces/tsk_uAetqJG",
+  "prompt": "Synthetic prompt for tsk_uAetqJG, attempt 1.",
+  "pid": 36301,
+  "tokens": {
+    "input": 9539,
+    "output": 3409,
+    "reasoning": 1240,
+    "total": 14188,
+    "cache_read": 7850,
+    "cache_write": 440
+  }
+}

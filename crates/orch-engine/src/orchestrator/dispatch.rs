@@ -828,6 +828,10 @@ impl Orchestrator {
         }
         self.report_effort_diagnostics(&run.id, &agent.id, &diagnostics);
 
+        let usage_seed = super::collect::UsageSeed {
+            adapter: adapter.kind(),
+            requested_model: params.config.model.clone(),
+        };
         let handle = match self.execute_prepared(adapter.as_ref(), params) {
             Ok(handle) => handle,
             Err(err) => {
@@ -876,7 +880,13 @@ impl Orchestrator {
         tokio::spawn(async move {
             let collector_task_id = task_id.clone();
             if let Err(err) = orchestrator
-                .collect_events(handle.events, &run_id, &task_id, &agent_id)
+                .collect_events_observing(
+                    handle.events,
+                    &run_id,
+                    &task_id,
+                    &agent_id,
+                    Some(usage_seed),
+                )
                 .await
             {
                 orchestrator.emit_error(err, format!("adapter execution for {task_id}"));

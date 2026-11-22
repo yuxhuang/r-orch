@@ -96,7 +96,15 @@ def encode(p):
         out += {34:b'\\"',92:b'\\\\',9:b'\\t',10:b'\\n',13:b'\\r'}.get(b,bytes([b]) if 0x20<=b<=0x7e else ('\\%03o'%b).encode())
     return out+b'"'
 def identity():
-    paths=git('ls-files','-z','--cached','--others','--exclude-standard','--','xtask','Cargo.toml','Cargo.lock','rust-toolchain.toml','.cargo/config.toml').split(b'\0')
+    # Keep this literal workspace closure in sync with gate/judge.rs. Git's
+    # ls-tree (commit verification) does not expand ls-files wildcard syntax.
+    inputs = ('xtask', 'crates/orch-core', 'crates/orch-domain', 'crates/orch-infra',
+              'crates/orch-cli/Cargo.toml', 'crates/orch-client/Cargo.toml',
+              'crates/orch-daemon/Cargo.toml', 'crates/orch-engine/Cargo.toml',
+              'crates/orch-peer/Cargo.toml', 'crates/orch-proto/Cargo.toml',
+              'crates/orch-tui/Cargo.toml', 'Cargo.toml', 'Cargo.lock',
+              'rust-toolchain.toml', '.cargo/config.toml')
+    paths=git('ls-files','-z','--cached','--others','--exclude-standard','--',*inputs).split(b'\0')
     if len(paths)>4096: raise RuntimeError('judge source count budget')
     records=[]
     for p in sorted(set(filter(None,paths))):

@@ -1,0 +1,21 @@
+id: agt_Nsf31rn
+name: cedar
+adapter: opencode
+role: Synthetic opencode worker for generated fixtures.
+config:
+  command: synthetic-opencode
+  model: synthetic-model
+  approval_policy: manual
+  max_turns: 38
+  timeout_ms: 602000
+status: idle
+stats:
+  tasks_completed: 1
+  tasks_failed: 2
+  total_runs: 3
+  total_runtime_ms: 180000
+  tokens_used: 27834
+last_error:
+  message: synthetic process crash
+  kind: process_crash
+  timestamp: '2025-01-01T00:02:31.977Z'

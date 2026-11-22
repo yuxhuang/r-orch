@@ -1,0 +1,22 @@
+{
+  "id": "run_drLHCzw",
+  "task_id": "tsk_O4T0dQu",
+  "agent_id": "agt_cXM1BY8",
+  "attempt": 1,
+  "status": "failed",
+  "started_at": "2025-01-01T00:02:07.300Z",
+  "finished_at": "2025-01-01T00:02:17.917Z",
+  "workspace_path": "workspaces/tsk_O4T0dQu",
+  "prompt": "Synthetic prompt for tsk_O4T0dQu, attempt 1.",
+  "pid": 33257,
+  "error": "synthetic process crash",
+  "error_kind": "process_crash",
+  "tokens": {
+    "input": 5559,
+    "output": 3284,
+    "reasoning": 170,
+    "total": 9013,
+    "cache_read": 8976,
+    "cache_write": 393
+  }
+}

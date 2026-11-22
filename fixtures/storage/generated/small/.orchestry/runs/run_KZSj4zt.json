@@ -1,0 +1,20 @@
+{
+  "id": "run_KZSj4zt",
+  "task_id": "tsk_lCRlmiI",
+  "agent_id": "agt_BneL5Al",
+  "attempt": 1,
+  "status": "succeeded",
+  "started_at": "2025-01-01T00:03:05.999Z",
+  "finished_at": "2025-01-01T00:03:16.632Z",
+  "workspace_path": "workspaces/tsk_lCRlmiI",
+  "prompt": "Synthetic prompt for tsk_lCRlmiI, attempt 1.",
+  "pid": 43462,
+  "tokens": {
+    "input": 7387,
+    "output": 4949,
+    "reasoning": 1028,
+    "total": 13364,
+    "cache_read": 7843,
+    "cache_write": 232
+  }
+}

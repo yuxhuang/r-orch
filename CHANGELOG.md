@@ -5,6 +5,10 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Storage groundwork
+
+- Add inactive SQLite schema, numbered migrations with checked pre-migration copies, private data-directory locks and confined file operations for the 1.1 storage adapter. The running daemon continues to use file storage.
+
 ### Development tooling
 
 - Pin file-storage ordering, complete-list and agent-rotation behaviour with reusable conformance tests and a synthetic import fixture corpus.

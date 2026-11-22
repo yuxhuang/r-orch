@@ -92,7 +92,8 @@ const ALLOWED: &[(&str, &[&str])] = &[
             "orch-tui",
         ],
     ),
-    ("xtask", &[]),
+    // `fixture-gen` scripts the real file backend (`orch-infra`) over `orch-core` and `orch-domain` types.
+    ("xtask", &["orch-core", "orch-domain", "orch-infra"]),
 ];
 
 /// Dev edges never authorize production imports or enabled test APIs.

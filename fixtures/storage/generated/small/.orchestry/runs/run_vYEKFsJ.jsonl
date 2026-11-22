@@ -1,0 +1,6 @@
+{"timestamp":"2025-01-01T00:02:35.530Z","type":"agent_output","data":"synthetic output line 0 for run_vYEKFsJ"}
+{"timestamp":"2025-01-01T00:02:36.500Z","type":"file_changed","data":"synthetic/file-1.txt"}
+{"timestamp":"2025-01-01T00:02:39.397Z","type":"file_changed","data":"synthetic/file-2.txt"}
+{"timestamp":"2025-01-01T00:02:42.792Z","type":"command_run","data":"synthetic-command --step 3"}
+{"timestamp":"2025-01-01T00:02:45.370Z","type":"file_changed","data":"synthetic/file-4.txt"}
+{"timestamp":"2025-01-01T00:02:45.596Z","type":"error","data":"synthetic run ended without success"}

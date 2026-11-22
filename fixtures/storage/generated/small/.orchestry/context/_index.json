@@ -1,0 +1,22 @@
+[
+  {
+    "key": "synthetic.ledger",
+    "value": "Invented value 1.",
+    "created_at": "2025-01-01T00:08:41.762Z",
+    "updated_at": "2025-01-01T00:08:41.762Z"
+  },
+  {
+    "key": "synthetic.harbor",
+    "value": "Invented value 2.",
+    "created_at": "2025-01-01T00:08:59.941Z",
+    "updated_at": "2025-01-01T00:08:59.941Z"
+  },
+  {
+    "key": "synthetic.orchard",
+    "value": "Invented value 3.",
+    "created_at": "2025-01-01T00:09:04.452Z",
+    "updated_at": "2025-01-01T00:09:04.452Z",
+    "ttl_ms": 86400000,
+    "expires_at": "2025-01-02T00:09:04.452Z"
+  }
+]

@@ -801,6 +801,10 @@ impl Orchestrator {
                         .await;
                         return Ok(true);
                     }
+                    let usage_seed = super::collect::UsageSeed {
+                        adapter: adapter.as_ref().expect("local adapter resolved").kind(),
+                        requested_model: params.config.model.clone(),
+                    };
                     let execution = {
                         let _scope = reservation.expect("local launch reservation").enter();
                         self.execute_prepared(
@@ -850,7 +854,13 @@ impl Orchestrator {
                     let run_id = run.id.clone();
                     tokio::spawn(async move {
                         if let Err(error) = orchestrator
-                            .collect_events(handle.events, &run_id, &collector_task_id, &agent_id)
+                            .collect_events_observing(
+                                handle.events,
+                                &run_id,
+                                &collector_task_id,
+                                &agent_id,
+                                Some(usage_seed),
+                            )
                             .await
                         {
                             let message = error.to_string();

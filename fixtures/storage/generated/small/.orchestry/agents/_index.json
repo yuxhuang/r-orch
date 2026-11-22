@@ -1,0 +1,101 @@
+[
+  {
+    "id": "agt_cXM1BY8",
+    "name": "delta",
+    "adapter": "shell",
+    "role": "Synthetic shell worker for generated fixtures.",
+    "config": {
+      "command": "synthetic-shell",
+      "model": "synthetic-model",
+      "approval_policy": "manual",
+      "max_turns": 43,
+      "timeout_ms": 3314000
+    },
+    "status": "idle",
+    "stats": {
+      "tasks_completed": 2,
+      "tasks_failed": 3,
+      "total_runs": 5,
+      "total_runtime_ms": 300000,
+      "tokens_used": 63251
+    },
+    "last_error": {
+      "message": "synthetic process crash",
+      "kind": "process_crash",
+      "timestamp": "2025-01-01T00:02:17.917Z"
+    }
+  },
+  {
+    "id": "agt_BneL5Al",
+    "name": "alpha",
+    "adapter": "claude",
+    "role": "Synthetic claude worker for generated fixtures.",
+    "config": {
+      "command": "synthetic-claude",
+      "model": "synthetic-model",
+      "approval_policy": "suggest",
+      "max_turns": 46,
+      "timeout_ms": 652000
+    },
+    "status": "idle",
+    "stats": {
+      "tasks_completed": 3,
+      "tasks_failed": 2,
+      "total_runs": 6,
+      "total_runtime_ms": 360000,
+      "tokens_used": 86349
+    },
+    "last_error": {
+      "message": "synthetic timeout",
+      "kind": "timeout",
+      "timestamp": "2025-01-01T00:02:45.596Z"
+    }
+  },
+  {
+    "id": "agt_Nsf31rn",
+    "name": "cedar",
+    "adapter": "opencode",
+    "role": "Synthetic opencode worker for generated fixtures.",
+    "config": {
+      "command": "synthetic-opencode",
+      "model": "synthetic-model",
+      "approval_policy": "manual",
+      "max_turns": 38,
+      "timeout_ms": 602000
+    },
+    "status": "idle",
+    "stats": {
+      "tasks_completed": 1,
+      "tasks_failed": 2,
+      "total_runs": 3,
+      "total_runtime_ms": 180000,
+      "tokens_used": 27834
+    },
+    "last_error": {
+      "message": "synthetic process crash",
+      "kind": "process_crash",
+      "timestamp": "2025-01-01T00:02:31.977Z"
+    }
+  },
+  {
+    "id": "agt__AKo7jx",
+    "name": "bravo",
+    "adapter": "codex",
+    "role": "Synthetic codex worker for generated fixtures.",
+    "config": {
+      "command": "synthetic-codex",
+      "model": "synthetic-model",
+      "approval_policy": "manual",
+      "max_turns": 10,
+      "timeout_ms": 902000
+    },
+    "status": "idle",
+    "stats": {
+      "tasks_completed": 1,
+      "tasks_failed": 0,
+      "total_runs": 1,
+      "total_runtime_ms": 60000,
+      "tokens_used": 14188
+    }
+  }
+]

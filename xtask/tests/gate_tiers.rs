@@ -413,6 +413,14 @@ fn sensitive_child_output() {{
     {failure}
 }}
 "#), true);
+    for name in [
+        "crates/orch-core/src/lib.rs",
+        "crates/orch-domain/src/shop/roles/example.md",
+        "crates/orch-infra/src/template/system.liquid",
+        "crates/orch-engine/Cargo.toml",
+    ] {
+        sandbox.write(name, "synthetic judge dependency input\n");
+    }
     // Supply the real judge's required source set, without pretending this
     // direct miniature invocation is a content-stamped bootstrap.
     sandbox.write(
@@ -426,6 +434,10 @@ fn sensitive_child_output() {{
         "Cargo.toml",
         "rust-toolchain.toml",
         "xtask/gate.sh",
+        "crates/orch-core/src/lib.rs",
+        "crates/orch-domain/src/shop/roles/example.md",
+        "crates/orch-infra/src/template/system.liquid",
+        "crates/orch-engine/Cargo.toml",
     ]
     .into_iter()
     .map(|name| {

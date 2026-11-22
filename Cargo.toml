@@ -85,6 +85,16 @@ saphyr-parser = "0.2"
 # Default features (the RFC 6902 `diff` generator) are off: only `merge` is used.
 json-patch = { version = "4.2", default-features = false }
 
+# ── SQLite storage (ADR 0017, decision 19) ────────────────────────────────
+rusqlite = { version = "=0.41.1", default-features = false, features = [
+  "bundled",
+  "backup",
+  "cache",
+  "limits",
+  "hooks",
+] }
+rusqlite_migration = { version = "=2.7.0", default-features = false }
+
 # ── Templates (ARCHITECTURE §4.3) ──────────────────────────────────────────
 liquid = "0.26.11"
 
