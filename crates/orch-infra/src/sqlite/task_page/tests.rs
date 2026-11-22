@@ -345,11 +345,11 @@ fn snapshot_stays_consistent_across_external_commit() {
     let req = request(Sort::Id, 100);
     pool.read(deadline(), |tx| {
         assert_eq!(
-            query(&tx, "p", &filter(), &req, None).unwrap().total,
+            query(tx, "p", &filter(), &req, None).unwrap().total,
             Some(1)
         );
         insert(&writer, "p", &task("b", TaskStatus::Todo, 0, 0, None), 2);
-        let again = query(&tx, "p", &filter(), &req, None).unwrap();
+        let again = query(tx, "p", &filter(), &req, None).unwrap();
         assert_eq!(again.total, Some(1));
         assert_eq!(again.ids, ["a"]);
         Ok(())
