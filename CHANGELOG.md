@@ -7,6 +7,8 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Storage groundwork
 
+- Add an inactive transactional claim helper that reserves a task, agent lease and preparing run together; production dispatch remains unchanged.
+
 - Add the inactive confined disk blob adapter and transactional prompt/attachment references, with content hashes, verified reads and byte publication before row linkage.
 
 - Add inactive SQLite schema, numbered migrations with checked pre-migration copies, private data-directory locks and confined file operations for the 1.1 storage adapter. The running daemon continues to use file storage.
