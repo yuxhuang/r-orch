@@ -34,3 +34,8 @@ v2_operations::operational_suite!(file_operations_v2, crate::v2_file::operations
 mod leases_v2;
 leases_v2::lease_suite!(memory_leases_v2, crate::v2_operations::memory_backend);
 leases_v2::lease_suite!(file_leases_v2, crate::v2_file::operations_backend);
+
+#[path = "storage_contract/retries_v2.rs"]
+mod retries_v2;
+retries_v2::retry_suite!(memory_retries_v2, crate::v2_operations::memory_backend);
+retries_v2::retry_suite!(file_retries_v2, crate::v2_file::operations_backend);
