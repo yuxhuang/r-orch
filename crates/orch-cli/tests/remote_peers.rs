@@ -362,42 +362,70 @@ impl Peer {
     fn start_with_path(&self, listen: Option<SocketAddr>, path: Option<&std::ffi::OsStr>) {
         assert!(self.owner.borrow().is_none(), "already running");
         self.release_seed();
-        let copied = self.home.join("orch-copy");
-        let executable = if copied.exists() {
-            copied.as_path()
-        } else {
-            Path::new(env!("CARGO_BIN_EXE_orch"))
-        };
-        let mut command = self.command(executable);
-        // A foreground `serve` is an explicit daemon start with dispatch ON.
-        command.args(["serve", "--peer-name", &self.name]);
-        if let Some(path) = path {
-            command.env("PATH", path);
-        }
-        if let Some(addr) = listen {
-            command.args(["--listen", &addr.to_string()]);
-        }
-        if let Some(filter) = self.owner_rust_log.borrow().as_deref() {
-            command.env("RUST_LOG", filter);
-        }
-        let process = self.spawn(command, "owner");
-        let pid = process.child.id();
-        *self.owner.borrow_mut() = Some(process);
-        // The owner lock is acquired before recovery. Cached remote online
-        // status can also survive a restart, so neither proves the saved
-        // reservations have been reconciled. Startup stamps state.pid only
-        // after recovery has completed; require this owner's stamp.
-        wait("engine owner recovery", &[self], || {
-            self.owner
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let copied = self.home.join("orch-copy");
+            let executable = if copied.exists() {
+                copied.as_path()
+            } else {
+                Path::new(env!("CARGO_BIN_EXE_orch"))
+            };
+            let mut command = self.command(executable);
+            // A foreground `serve` is an explicit daemon start with dispatch ON.
+            command.args(["serve", "--peer-name", &self.name]);
+            if let Some(path) = path {
+                command.env("PATH", path);
+            }
+            if let Some(addr) = listen {
+                command.args(["--listen", &addr.to_string()]);
+            }
+            if let Some(filter) = self.owner_rust_log.borrow().as_deref() {
+                command.env("RUST_LOG", filter);
+            }
+            let process = self.spawn(command, "owner");
+            let pid = process.child.id();
+            *self.owner.borrow_mut() = Some(process);
+            // The owner lock is acquired before recovery. Cached remote online
+            // status can also survive a restart, so neither proves the saved
+            // reservations have been reconciled. Startup stamps state.pid only
+            // after recovery has completed; require this owner's stamp.
+            wait_for(
+                "engine owner recovery or exit",
+                deadline.saturating_duration_since(Instant::now()),
+                &[self],
+                || {
+                    !self
+                        .owner
+                        .borrow_mut()
+                        .as_mut()
+                        .is_some_and(Process::running)
+                        || (text(self.path(".orchestry/orchestry.lock")).trim() == pid.to_string()
+                            && read_json(self.path(".orchestry/state.json"))["pid"] == pid
+                            && self.raw_cli(&["daemon", "status"]).status.success())
+                },
+            );
+            let running = self
+                .owner
                 .borrow_mut()
                 .as_mut()
-                .is_some_and(Process::running)
-                && text(self.path(".orchestry/orchestry.lock")).trim() == pid.to_string()
-                && read_json(self.path(".orchestry/state.json"))["pid"] == pid
-                // And the socket answers: the CLI is a daemon client, so a
-                // command issued before it listens would see "no daemon".
-                && self.raw_cli(&["daemon", "status"]).status.success()
-        });
+                .is_some_and(Process::running);
+            if running {
+                return;
+            }
+            // Reconnect scenarios deliberately retain the same address. Another
+            // process can bind it after port() (or a previous owner) releases it.
+            // Retry only a confirmed bind collision, never an unrelated crash.
+            let collision = self.owner.borrow().as_ref().is_some_and(|process| {
+                text(&process.stderr).contains("Address already in use")
+                    || text(&process.stdout).contains("Address already in use")
+            });
+            assert!(
+                listen.is_some() && collision && Instant::now() < deadline,
+                "owner exited before recovery\n{}",
+                self.diagnostics()
+            );
+            self.owner.borrow_mut().take();
+        }
     }
 
     /// Wait until the hand-spawned foreground owner answers `daemon status`:
@@ -697,6 +725,37 @@ fn release(peer: &Peer) {
 
 fn remote_id(agent: &str, alias: &str) -> String {
     format!("{agent}@{alias}")
+}
+
+/// Force the bind/release race without relying on another test's timing.
+#[test]
+fn occupied_listen_port_retries_after_the_competing_listener_exits() {
+    let worker = Peer::new("port-race-worker");
+    let competing = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = competing.local_addr().unwrap();
+    let root = worker.dir.path().to_path_buf();
+    thread::scope(|scope| {
+        scope.spawn(move || {
+            let deadline = Instant::now() + WAIT;
+            loop {
+                let rejected = fs::read_dir(&root)
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| text(entry.path()).contains("Address already in use"));
+                if rejected {
+                    drop(competing);
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "daemon never attempted occupied port"
+                );
+                thread::sleep(POLL);
+            }
+        });
+        worker.start(Some(addr));
+    });
+    assert!(TcpStream::connect_timeout(&addr, Duration::from_secs(2)).is_ok());
 }
 
 #[test]
@@ -1574,7 +1633,7 @@ fn connected_shutdown_detaches_the_remote_run(watch: bool) {
     let controller = Peer::new("shutdown-controller");
     let agent = worker.add_agent("executor", &shutdown_gated_body(&worker), "shared");
     let worker_addr = port();
-    let controller_addr = port();
+    let controller_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     controller.ok(&["remote", "add", "w1", &worker_addr.to_string()]);
     worker.start(Some(worker_addr));
     controller.release_seed();
@@ -1587,6 +1646,19 @@ fn connected_shutdown_detaches_the_remote_run(watch: bool) {
     command.args(["--listen", &controller_addr.to_string()]);
     *controller.owner.borrow_mut() = Some(controller.spawn(command, "shutdown-owner"));
     controller.await_owner_socket();
+    // The daemon socket and dispatch can start before listener publication.
+    // Ignore an absent/stale record and retain the address from this owner.
+    let owner_pid = controller.owner.borrow().as_ref().unwrap().child.id();
+    let mut controller_addr = None;
+    wait("current owner publishes listener", &[&controller], || {
+        let status = read_json(controller.path(".orchestry/remotes/_listener.json"));
+        controller_addr = status["listen_addr"]
+            .as_str()
+            .and_then(|addr| addr.parse::<SocketAddr>().ok())
+            .filter(|addr| addr.port() != 0 && status["pid"] == owner_pid);
+        controller_addr.is_some()
+    });
+    let controller_addr = controller_addr.expect("current owner's bound address");
     let peers = [&controller, &worker];
     controller.online("w1", &peers);
     let task = controller.task(
@@ -1624,7 +1696,7 @@ fn connected_shutdown_detaches_the_remote_run(watch: bool) {
 
     if !watch {
         // And the restart picks the execution back up, with no resubmit.
-        controller.start(Some(controller_addr));
+        controller.start(Some("127.0.0.1:0".parse().unwrap()));
         controller.online("w1", &peers);
         release(&worker);
         let value = controller.wait_task(&task, "done", &peers);

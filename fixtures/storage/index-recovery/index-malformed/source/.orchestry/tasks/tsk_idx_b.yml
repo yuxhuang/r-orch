@@ -1,0 +1,13 @@
+{
+  "id": "tsk_idx_b",
+  "title": "Case index-malformed: second by id, created second",
+  "description": "Hand-written entity file for tsk_idx_b",
+  "status": "todo",
+  "priority": 3,
+  "labels": [],
+  "depends_on": [],
+  "created_at": "2025-01-02T00:00:00.000Z",
+  "updated_at": "2025-01-02T00:00:00.000Z",
+  "attempts": 0,
+  "max_attempts": 3
+}

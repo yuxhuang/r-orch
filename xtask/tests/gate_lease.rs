@@ -445,12 +445,13 @@ fn replaced_lock_inode_is_lost_and_cannot_qualify() {
     parked_build(&sandbox, &boundary, "holder");
     let mut holder =
         sandbox.spawn(&mut sandbox.gate(&["pr", "--part", "suite", "--lease-wait", "0"]));
-    let mut peer = boundary.accept(&mut holder);
+    let _peer = boundary.accept(&mut holder);
     let lock = sandbox.temporary.join("lease/r-orch-gate.lease");
     fs::rename(&lock, sandbox.temporary.join("lease/old-owned-lock")).unwrap();
     fs::write(&lock, "").unwrap();
     fs::set_permissions(&lock, fs::Permissions::from_mode(0o600)).unwrap();
-    peer.release();
+    // Lease loss may stop the worker before a release request reaches it.
+    // Leave it parked so the gate's teardown is the only cause of completion.
     let output = holder.finish(COMMAND_BUDGET);
     output.code(1);
     let result = sandbox.result();

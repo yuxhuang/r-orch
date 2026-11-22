@@ -121,7 +121,7 @@ fn qualification(parent: &Path) {
     let home = root.join("observer-home");
     fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
     let output = Command::new("/usr/bin/python3")
-        .args(["-c", PROBE])
+        .args(["-c", &format!("{WAIT_FOR_PID}\n{PROBE}")])
         .env("HOME", &home)
         .env(
             "RC18_WORKTREE",
@@ -172,7 +172,7 @@ fn production_native_build_script_test_and_child_descriptor_propagation() {
     let home = root.join("observer-home");
     fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
     let output = Command::new("/usr/bin/python3")
-        .args(["-c", PROBE])
+        .args(["-c", &format!("{WAIT_FOR_PID}\n{PROBE}")])
         .env("HOME", &home)
         .env("RC18_PROPAGATION_ONLY", "1")
         .env(
@@ -191,6 +191,111 @@ fn production_native_build_script_test_and_child_descriptor_propagation() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn observer_waits_for_pid_after_ready_file_creation() {
+    observer_control(
+        r#"
+import tempfile
+from unittest.mock import patch
+class Holder:
+ def poll(self): return None
+with tempfile.TemporaryDirectory() as directory:
+ case=pathlib.Path(directory)
+ # Schedule the writer at polling boundaries: absence, creation, incomplete
+ # content, then the PID. No thread scheduling or wall-clock delay is needed.
+ writes=iter(['', 'not-a-pid', '12345'])
+ def publish(_): (case/'ready').write_text(next(writes))
+ with patch.object(time,'sleep',publish):
+  assert wait_for_pid(case,Holder(),'control')==12345
+"#,
+    );
+}
+
+#[test]
+fn observer_rejects_unready_file_when_holder_exits() {
+    observer_control(
+        r#"
+import tempfile
+from unittest.mock import patch
+class Holder:
+ def poll(self): return 1
+with tempfile.TemporaryDirectory() as directory:
+ case=pathlib.Path(directory)
+ (case/'ready').write_text('')
+ (case/'holder.stderr').write_text('holder failed')
+ with patch.object(time,'sleep',side_effect=RuntimeError('unexpected retry')):
+  try: wait_for_pid(case,Holder(),'exited')
+  except AssertionError as error: assert error.args[0]==('exited','holder failed')
+  else: raise AssertionError('accepted an unready file after holder exit')
+"#,
+    );
+}
+
+#[test]
+fn observer_times_out_when_ready_file_stays_empty() {
+    observer_control(
+        r#"
+import tempfile
+from unittest.mock import patch
+class Holder:
+ def poll(self): return None
+with tempfile.TemporaryDirectory() as directory:
+ case=pathlib.Path(directory)
+ (case/'ready').write_text('')
+ with patch.object(time,'monotonic',side_effect=[0,30]), patch.object(time,'sleep',side_effect=RuntimeError('unexpected retry')):
+  try: wait_for_pid(case,Holder(),'timeout')
+  except AssertionError as error: assert error.args[0]==('timeout','holder not ready')
+  else: raise AssertionError('accepted an unready file at the deadline')
+"#,
+    );
+}
+
+fn observer_control(control: &str) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "ready-observer-{}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+    let script = format!("{WAIT_FOR_PID}\n{control}");
+    let output = Command::new("/usr/bin/python3")
+        .args(["-c", &script])
+        .env("HOME", &root)
+        .env("TMPDIR", &root)
+        .output()
+        .unwrap();
+    fs::remove_dir_all(&root).unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const WAIT_FOR_PID: &str = r#"
+import pathlib,time
+
+def wait_for_pid(case,holder,label):
+ end=time.monotonic()+30
+ while True:
+  # fs::write creates the pathname before writing its PID. Existence alone is
+  # not the handshake: keep polling until the contents can be consumed.
+  try:
+   pid=int((case/'ready').read_text())
+  except (FileNotFoundError,ValueError):
+   pass
+  else:
+   return pid
+  assert holder.poll() is None,(label,(case/'holder.stderr').read_text())
+  assert time.monotonic()<end,(label,'holder not ready')
+  time.sleep(.002)
+"#;
 
 const PROBE: &str = r###"
 import os,sys,pathlib,subprocess,fcntl,json,time,select,shutil,hashlib
@@ -296,12 +401,7 @@ def probe(label,argv,mode='normal',source=None):
  holder=subprocess.Popen([exe,'--exact',fixture,'--nocapture'],env=env,stdin=writer,stdout=subprocess.DEVNULL,stderr=log);os.close(writer)
  out=bytearray();samples=[];row={'label':label,'argv':argv,'mode':mode,'device':repo.stat().st_dev};pid=None
  try:
-  end=time.monotonic()+30
-  while not (case/'ready').exists():
-   assert holder.poll() is None,(label,(case/'holder.stderr').read_text())
-   assert time.monotonic()<end,(label,'holder not ready')
-   time.sleep(.002)
-  pid=int((case/'ready').read_text());marker=repo/'target/.gate-state/warm.use';inode=marker.stat().st_ino
+  pid=wait_for_pid(case,holder,label);marker=repo/'target/.gate-state/warm.use';inode=marker.stat().st_ino
   row.update(pid=pid,marker_inode=inode)
   # Observation starts immediately after production spawn, before releasing any
   # command output; it does not claim visibility into spawn/exit kernel internals.

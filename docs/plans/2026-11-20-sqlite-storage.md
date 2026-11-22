@@ -16,7 +16,8 @@ working, and the file backend works on `main` until the PR that removes it.
 
 Everything the spec lists as out of scope and as a non-goal. In this plan specifically: no tag and no version
 bump; no change to the dashboard beyond what the new protocol forces; no product code before the owner's
-approval gate (T7).
+approval gate (T7). Since the owner's decision of 2026-11-21 (the spec's record I): no measurement of event
+throughput or of latency, no performance tuning and no event fallback.
 
 ## Context
 
@@ -57,7 +58,7 @@ adapter the daemon builds and nothing else.
 | Crate | What changes |
 |---|---|
 | `orch-core` | New `store` module: `Storage`, `UnitOfWork`, `ReadSnapshot`, `Caller`, paging, claims, events, the blob-store and scheduler ports. The 1.0 `storage` module stays until T25. |
-| `orch-infra` | New `sqlite/` (schema, migrations, connections, writer, readers, adapter), `blob/`, `data_dir/`; `storage/` gains the v2 file adapter and leaves in T25. `storage/remote` stays (orch-peer's files). `data_dir/` also holds the one confined-directory module (spec R102) that the blob store, the event files, backup, restore and the importer all use to reach files. |
+| `orch-infra` | New `sqlite/` (schema, migrations, connections, writer, readers, adapter), `blob/`, `data_dir/`; `storage/` gains the v2 file adapter and leaves in T25. `storage/remote` stays (orch-peer's files). `data_dir/` also holds the one confined-directory module (spec R102) that the blob store, the finish spool, the event files, backup, restore and the importer all use to reach files. |
 | `orch-engine` | Operations as units of work; leases, retries, recovery by generation; the intent performer; the scheduler behind its port; the maintenance loop; attention; usage; the facade for `orch-peer`. |
 | `orch-proto` | Protocol 3: keys, revisions, paging, four error codes, twelve operations. |
 | `orch-daemon` | The data directory and its lock; the authorization function in the dispatcher; the new operations; discovery by pointer file. |
@@ -90,6 +91,13 @@ The lasting choices are in ADR 0017. Limits and numbers live in the spec and in 
 A task that grows past about 3,000 changed lines is split in its own PR series and this table is edited in the
 first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`.
 
+**Changed by the owner on 2026-11-21** (the spec's record I;
+[issue 98](https://github.com/yuxhuang/r-orch/issues/98)). Claim latency is not a concern of release 1.1. T4's
+report is not delivered to `main`, T4b is not run, T16 stores events in SQLite by the batched design and
+builds no fallback, and no task measures a path as built. The rows of T4, T4b, T4c, T7, T16 and T27 say so
+where they stand, and text marked "as it stood" is kept as a record. No task tests an event file: the run-id
+vectors of the spec's "Filesystem names" are tested on the finish file, by T12 and T13.
+
 ### Entry steps: no product code
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
@@ -97,12 +105,12 @@ first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`
 | T1 | Spec, plan and ADR 0017 | R1 | `docs/specs/`, `docs/plans/`, `docs/decisions/` | — | `./xtask/gate.sh fast --base origin/main` | 1 (first-review text, merged), then a follow-up PR (the corrected text) |
 | T2 | Conformance suite on the file backend with its synthetic corpus; the pinned 1.0 contracts and the order-dependent reads list | R2, R3 | `crates/orch-engine/tests/storage_conformance.rs`, `crates/orch-engine/tests/storage_contract/`, `fixtures/storage-v1/`, `docs/storage-v1-conformance.md`, `docs/storage-order-dependent-reads.md` | — | Suite | 2 |
 | T3 | Choose the SQLite library and its migration runner: the §4.8 check and the report, with its probes. ADR 0017 decision 19 carries the choice: `rusqlite` 0.41.1 with five features and `rusqlite_migration` 2.7.0. The report is revised for the two features the reviews added (`limits`, `hooks`) with probes of the limits, the authorizer, the progress handler, the interrupt and the heap limit; no dependency enters the product workspace before T9 | R4 | `docs/sqlite-library.md`, `docs/experiments/sqlite-library/` | — | `cargo deny check` on a whole workspace with the candidates connected; the probes on macOS and Linux | 3 |
-| T4 | Measure batched event append against the first claim-latency budget, as a standalone experiment on macOS and native Linux | R5, R63 | `docs/sqlite-event-throughput.md`, `docs/experiments/sqlite-events/` | T3 | The report states the budget declared before the run, the figures and a verdict for each platform | 4 |
-| T4b | The revised event measurement that the owner directed at AP13: extend the standalone harness to the method of the spec's "Event measurement" (`ap13-realistic-v1`), write `protocol.json` from that section and record its SHA-256 with the spec's commit before the first repetition, and run the seven mandatory cells five times and the diagnostics three times on macOS hardware and on native Linux hardware. Every T4 file and figure is kept byte for byte, and the new results are a new data set. The proposed numbers and the results go back to the owner together; nothing in them is accepted before the owner answers. Each repetition runs under the host lease, held exclusively, with the host sampled, and on a platform whose class is recorded (the spec's "The host" and "Platforms and limits"). With no native Linux host the result is incomplete, a miss that macOS has shown stays a failure meanwhile, and a container on the macOS machine does not stand for a host | R5, R63, R26, R126 | `docs/sqlite-event-throughput.md`, `docs/experiments/sqlite-events/` | T4, T6 (the frozen method), T3's delivery for the library features | The harness's own checks and its timing check; the verifier's verdict for each platform and for both, by the one rule of the spec's "The verdict" (four axes; `PASS`, `FAIL`, `FAIL, INCOMPLETE`, `INCOMPLETE` or `CORRECTNESS_DEFECT`, with its exit), with each repetition's checkpoint calls and their outcomes, its host record and its overlap counts listed and the claims around each checkpoint reported apart; the cases of the spec's table under "What a miss selects", given by the verifier as written; the report names the path T16 takes only as the outcome the owner then rules on | 4 |
-| T4c | The number of rows in the largest goal pause and failure cascade on the live copy, counts only (AP8). The owner answered AP8 as recommended; this use of the copy still needs the owner's word, which neither that answer nor the answer D6 gives; it is the third thing the owner holds, outside the answers | R27 | records outside the repository; the count alone in `docs/sqlite-event-throughput.md` | T7 | The count and how it was taken, with no content of the copy | 4 |
+| T4 | **Dropped as an entry step by the owner on 2026-11-21; its PR is not opened.** The first run was made on 2026-11-20, and its figures and its FAIL on macOS are kept in [issue 98](https://github.com/yuxhuang/r-orch/issues/98), which links the report and the results at the revision that holds them. As it stood: Measure batched event append against the first claim-latency budget, as a standalone experiment on macOS and native Linux | R5, R63 | `docs/sqlite-event-throughput.md`, `docs/experiments/sqlite-events/` | T3 | The report states the budget declared before the run, the figures and a verdict for each platform | — (was 4) |
+| T4b | **Deferred by the owner on 2026-11-21: not run in 1.1.** No data set is authorised, and no harness, protocol file or verifier is built for it. As it stood, kept as a record: The revised event measurement that the owner directed at AP13: extend the standalone harness to the method of the spec's "Event measurement" (`ap13-realistic-v1`), write `protocol.json` from that section and record its SHA-256 with the spec's commit before the first repetition, and run the seven mandatory cells five times and the diagnostics three times on macOS hardware and on native Linux hardware. Every T4 file and figure is kept byte for byte, and the new results are a new data set. The proposed numbers and the results go back to the owner together; nothing in them is accepted before the owner answers. Each repetition runs under the host lease, held exclusively, with the host sampled, and on a platform whose class is recorded (the spec's "The host" and "Platforms and limits"). With no native Linux host the result is incomplete, a miss that macOS has shown stays a failure meanwhile, and a container on the macOS machine does not stand for a host | R5, R63, R26, R126 | `docs/sqlite-event-throughput.md`, `docs/experiments/sqlite-events/` | T4, T6 (the frozen method), T3's delivery for the library features | The harness's own checks and its timing check; the verifier's verdict for each platform and for both, by the one rule of the spec's "The verdict" (four axes; `PASS`, `FAIL`, `FAIL, INCOMPLETE`, `INCOMPLETE` or `CORRECTNESS_DEFECT`, with its exit), with each repetition's checkpoint calls and their outcomes, its host record and its overlap counts listed and the claims around each checkpoint reported apart; the cases of the spec's table under "What a miss selects", given by the verifier as written; the report names the path T16 takes only as the outcome the owner then rules on | — (was 4) |
+| T4c | The number of rows in the largest goal pause and failure cascade on the live copy, counts only (AP8). The owner answered AP8 as recommended; this use of the copy still needs the owner's word, which neither that answer nor the answer D6 gives; it is the third thing the owner holds, outside the answers. Since 2026-11-21 the report that was to hold the count is not delivered (T4); where the count is recorded is not settled by this revision and is settled before T4c runs | R27 | records outside the repository; where the count alone is written is not settled (was `docs/sqlite-event-throughput.md`, which is not delivered) | T7 | The count and how it was taken, with no content of the copy | not settled (was 4) |
 | T5 | Prototype "claim with a fenced lease" as a standalone workspace, across a suspend and resume and across a restore; report its result | R6 | `prototypes/fenced-lease/`, `docs/specs/2026-11-20-fenced-lease-prototype.md`, `docs/plans/2026-11-20-fenced-lease-prototype.md`, `docs/decisions/0018-fenced-lease-prototype.md` | T3 | The report states what a suspended machine and a restore do to a lease, and whether ADR 0017 decision 16 holds (spec AP11) | 5 |
 | T6 | Security review of the spec and red-team of the plan (import cutover, single writer); their findings become spec rows or plan edits | all | `docs/specs/`, `docs/plans/`, `docs/decisions/0017-sqlite-storage.md` | T1 | Each finding is answered in PR 6 as accepted, rejected or modified | 6 |
-| T7 | Approval gate. The owner has answered O1 to O10, AP1 to AP12, AP14 to AP20 and D1 to D8 as recommended, and AP13 in its direction; the spec's "Owner's answers" has a row for each id. Still the owner's: the numbers and results of T4b; the fifth point of AP14; outside the answers, the word on using the live copy for T4c (AP8); and the merge of the follow-up PR that carries the corrected spec, which by the answer D8 follows the validation and the PRs of the entry steps and the reviewers' conditions, and by the answer D1 a re-review at the exact head; the merge of PR 1 on 2026-11-21 carried the first-review text and is not that approval. Then spec `approved`, plan `active`, ADR 0017 `accepted` | — | status lines; `docs/decisions/README.md` | T2 to T6, T4b | The owner's approval recorded in PR 6 | 6 |
+| T7 | Approval gate. The owner has answered O1 to O10, AP1 to AP12, AP14 to AP20 and D1 to D8 as recommended, and AP13 in its direction; the spec's "Owner's answers" has a row for each id. Still the owner's: the numbers and results of T4b; the fifth point of AP14; outside the answers, the word on using the live copy for T4c (AP8); and the merge of the follow-up PR that carries the corrected spec, which by the answer D8 follows the validation and the PRs of the entry steps and the reviewers' conditions, and by the answer D1 a re-review at the exact head; the merge of PR 1 on 2026-11-21 carried the first-review text and is not that approval. Then spec `approved`, plan `active`, ADR 0017 `accepted`. Since 2026-11-21 (the spec's record I): T4 and T4b are not inputs of this gate, the numbers and results of T4b are deferred and nothing waits for them, and the gate presents the spec, the library choice, the prototype's result and the open points | — | status lines; `docs/decisions/README.md` | T2, T3, T5, T6 (until 2026-11-21 also T4 and T4b) | The owner's approval recorded in PR 6 | 6 |
 
 ### Product: built on files, then beside files
 
@@ -112,11 +120,11 @@ first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`
 | T9 | Data directory, its lock, the 1.0 owner lock, the network-filesystem check; the confined-directory module and the project record named by hash; schema, migrations, connection settings; the unique index on `tasks` over the project and the id without regard to ASCII case | R18, R19, R21 to R23, R29 to R33, R77 (the lineage column and row), R102, R107 (the record), R117 (the index), R124 (the copy before a migration), R126 (the writer's settings, the sync settings read back on every connection that can write) | `crates/orch-infra/src/sqlite/`, `crates/orch-infra/src/data_dir/`, the workspace `Cargo.toml` and `Cargo.lock` and `crates/orch-infra/Cargo.toml` (`rusqlite` and `rusqlite_migration` exactly as ADR 0017 decision 19 names them, all five features of `rusqlite` at once, with the versions and advisories checked again; the `fs` and `dir` features of `nix`), `crates/orch-infra/tests/confined_dir.rs`, `crates/orch-daemon/tests/daemon_data_dir.rs`, `.cargo/config.toml` | T7 | `cargo test -p orch-infra --test sqlite_schema --test sqlite_migrations --test sqlite_connection --test confined_dir`; `cargo test -p orch-daemon --test daemon_data_dir --test daemon_legacy_lock` | 8 |
 | T10 | SQLite adapter of port v2: the writer with lanes, the read pool, intents | R7 to R15, R24 to R28, R98, R126 (the backlog kept from the commit callback and the checkpoint's result), R127, R128, R130 (the query connection and its authorizer), R137 (the outcome of a checkpoint call), R140 (a failure on any connection) | `crates/orch-infra/src/sqlite/` | T8, T9 | Suite (SQLite); `cargo test -p orch-infra --test sqlite_writer --test sqlite_crash` | 9 |
 | T11 | Blob store on disk, on the confined-directory module: a blob is reached only by a parsed hash; prompts by hash; attachments as blobs | R58, R59, R101, R102 (blobs) | `crates/orch-core/src/store/blob.rs`, `crates/orch-infra/src/blob/` | T9 | `cargo test -p orch-infra --test blob_store` | 10 |
-| T12 | Engine on port v2, part 1: claims, leases, retries, start and finish a run; the workspace found by task id and the branch by its derived name, never by a stored path; workspace ownership: a directory is reused or entered, and a branch merged, only when a listing holds it under exactly the task's name, a new workspace is an exclusive create, and a task id that folds onto an existing one is drawn again; the `orch-peer` facade | R35, R36, R40, R20, R96, R106, R117 (`task.create`), R118 (prepare, reuse, merge), R129 (the spool is written, and what happens when it cannot be), R132 (an earlier lineage is refused and changes no row) | `crates/orch-engine/src/orchestrator/`, `crates/orch-engine/src/peer_facade*`, `crates/orch-infra/src/process/`, `crates/orch-infra/src/workspace/` | T8, T10 | `cargo test -p orch-engine --test transactions --test leases --test retries --test task_statuses --test task_ids`; `cargo test -p orch-infra workspace`; `cargo test -p orch-peer` | 11 |
-| T13 | Engine on port v2, part 2: cancel, pause, failure cascade; generations and recovery; the intent performer, whose intents hold ids and hashes and never a path, and whose `workspace.remove` and branch delete leave a directory or a branch that a listing holds under another spelling | R37 to R39, R41, R42, R28, R106 (intents), R118 (remove, delete, cleanup), R120, R129 (recovery applies the spool) | `crates/orch-engine/src/orchestrator/`, `crates/orch-engine/src/intents*` | T12, T4c | `cargo test -p orch-engine --test transactions --test intents --test leases` | 12 |
+| T12 | Engine on port v2, part 1: claims, leases, retries, start and finish a run; the workspace found by task id and the branch by its derived name, never by a stored path; workspace ownership: a directory is reused or entered, and a branch merged, only when a listing holds it under exactly the task's name, a new workspace is an exclusive create, and a task id that folds onto an existing one is drawn again; the `orch-peer` facade | R35, R36, R40, R20, R96, R106, R117 (`task.create`), R118 (prepare, reuse, merge), R101 and R129 (the spool is written under the finish file's name and removed after the commit, for any run id: the finish-file vectors of the spec's "Filesystem names", as a name and through both operations, with an outside canary; and what happens when the spool cannot be written), R132 (an earlier lineage is refused and changes no row) | `crates/orch-engine/src/orchestrator/`, `crates/orch-engine/src/peer_facade*`, `crates/orch-infra/src/process/`, `crates/orch-infra/src/workspace/`, `crates/orch-infra/src/data_dir/spool*` (the finish spool, on the confined-directory module of T9), `crates/orch-infra/tests/fs_names.rs` | T8, T10 | `cargo test -p orch-engine --test transactions --test leases --test retries --test task_statuses --test task_ids`; `cargo test -p orch-infra workspace`; `cargo test -p orch-infra --test fs_names`; `cargo test -p orch-peer` | 11 |
+| T13 | Engine on port v2, part 2: cancel, pause, failure cascade; generations and recovery; the intent performer, whose intents hold ids and hashes and never a path, and whose `workspace.remove` and branch delete leave a directory or a branch that a listing holds under another spelling | R37 to R39, R41, R42, R28, R106 (intents), R118 (remove, delete, cleanup), R120, R101 and R129 (recovery applies the spool and removes it, reaching a file only under the finish file's name, for any run id: the same vectors and canary) | `crates/orch-engine/src/orchestrator/`, `crates/orch-engine/src/intents*`, `crates/orch-infra/src/data_dir/spool*` (the read and the removal at recovery) | T12, T4c | `cargo test -p orch-engine --test transactions --test intents --test leases` | 12 |
 | T14 | Scheduler port with today's scheduler behind it; `metrics.get` with tick time and open tasks | R55 to R57 | `crates/orch-core/src/store/scheduler.rs`, `crates/orch-engine/src/scheduler*`, `crates/orch-daemon/src/ops/` | T12 | `cargo test -p orch-engine --test scheduler --test order_conformance`; `cargo test -p orch-daemon --test ops_metrics` | 13 |
 | T15 | Maintenance loop and its jobs; saved dispatch state | R43, R44, R60, R126 and R127 (the checkpoint job, its two triggers on time and on backlog, and the backlog's ceiling), R137 (which calls move the timer), R139 (the order and the bound of a stop), R140 (the reports for failing checkpoints and a backlog that stays) | `crates/orch-engine/src/maintenance*`, `crates/orch-daemon/src/lifecycle.rs` | T13 | `cargo test -p orch-engine --test maintenance`; `cargo test -p orch-daemon --test daemon_dispatch --test daemon_storage_failure` | 14 |
-| T16 | Run events through the port: numbering, batches, gaps, tail reads, pruning; the path that the owner's ruling on T4b's result selects, SQLite rows or the file fallback, measured as built by the method of the spec's "Event measurement" before this PR merges; if the fallback, each event file named by the whole hash of the spec's "Filesystem names" and reached through the confined-directory module on append, read, tail read and prune | R14, R26 (one event transaction for all runs), R61 to R63, R101, R102 (event files), R139 (events handed over and not committed when a stop ends) | `crates/orch-engine/src/orchestrator/collect*`, `crates/orch-infra/src/sqlite/events*`, `crates/orch-infra/src/blob/events*`, `crates/orch-infra/tests/event_files.rs` | T10, T11, T13, T4, T4b | `cargo test -p orch-engine --test run_events --test maintenance`; `cargo test -p orch-infra --test event_files`; the record of R63 for the path that ships, on macOS and native Linux hardware | 15 |
+| T16 | Run events through the port: numbering, batches, gaps, tail reads, pruning, stored in SQLite as rows, by the batched design of the spec's "Writer lanes" (spec R63). No event fallback, no event file and no setting for another event path is built, and nothing is measured as a condition of this PR (the owner's decision of 2026-11-21, the spec's record I). No test of an event file is due in 1.1, the test of its name included: the run-id vectors of the spec's "Filesystem names" are proved on the finish file by T12 and T13 (spec R101, R129). As it stood until 2026-11-21: Run events through the port: numbering, batches, gaps, tail reads, pruning; the path that the owner's ruling on T4b's result selects, SQLite rows or the file fallback, measured as built by the method of the spec's "Event measurement" before this PR merges; if the fallback, each event file named by the whole hash of the spec's "Filesystem names" and reached through the confined-directory module on append, read, tail read and prune | R14, R26 (one event transaction for all runs), R61 to R63, R139 (events handed over and not committed when a stop ends) | `crates/orch-engine/src/orchestrator/collect*`, `crates/orch-infra/src/sqlite/events*` | T10, T11, T13 | `cargo test -p orch-engine --test run_events --test maintenance` | 15 |
 | T17 | Protocol 3: revisions, paging, request keys, the four error codes; client resend; CLI list flags | R45 to R51, R134 | `crates/orch-proto/`, `crates/orch-daemon/src/ops/`, `crates/orch-client/`, `crates/orch-cli/` | T12 | `cargo test -p orch-proto`; `cargo test -p orch-daemon --test ops_request_keys --test ops_revisions --test ops_paging --test daemon_wire`; `cargo test -p orch-cli --test list_paging` | 16 |
 | T18 | Authorization matrix in the dispatcher, with test principals | R52 to R54, R93, R133 (the operations) | `crates/orch-daemon/src/ops/`, `crates/orch-proto/src/ops/` | T8, T17 | `cargo test -p orch-daemon --test ops_authorization`; `./xtask/gate.sh full` (security-relevant) | 17 |
 | T19 | Attention queue with its two kinds; the disk floor | R81 to R85, R131 | `crates/orch-engine/src/attention*`, `crates/orch-engine/src/disk_floor*`, `crates/orch-cli/` | T15, T17 | `cargo test -p orch-engine --test attention --test disk_floor`; `cargo test -p orch-cli --test attention` | 18 |
@@ -132,7 +140,7 @@ first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`
 | T24 | The switch: the daemon opens the data directory and SQLite; `orch init` and the pointer file, read without following a link and accepted only as one project id; discovery; the two `orch-peer` changes; the README upgrade notes and the RUNBOOK entries for the switch. The file adapter stays selectable by tests only | R34, R89, R92, R107 (the pointer), R121 (the check at a start), R133 (`orch init`), R135 | `crates/orch-daemon/src/lifecycle.rs`, `crates/orch-daemon/src/discovery.rs`, `crates/orch-client/src/discovery.rs`, `crates/orch-cli/src/commands/init*`, `crates/orch-peer/src/`, `README.md`, `docs/RUNBOOK.md` | T12 to T23 | `cargo test --workspace`; `./xtask/gate.sh full`; `cargo test -p orch-cli --test project_pointer` | 23 |
 | T25 | Removal: the file backend and the 1.0 traits move to `orch-file-reference`; TRAITS-FROZEN §2 rewritten; the `crate-graph` rule | R16, R17 | `crates/orch-core/src/storage.rs`, `crates/orch-infra/src/storage/`, `crates/orch-file-reference/`, `docs/TRAITS-FROZEN.md`, `xtask/` | T24 | `cargo xtask crate-graph`; suite on both backends; the `git grep` of R16 | 24 |
 | T26 | Documentation: manual, RUNBOOK, ARCHITECTURE, README upgrade notes, CHANGELOG, `docs/storage.md` | R88, R136 | `docs/`, `README.md`, `CHANGELOG.md` | T24 | Fact check against the code at the candidate commit; `cargo test -p xtask`; the command that installs 1.0 beside 1.1 run as written (recorded check, spec R136) | 25 |
-| T27 | Proof: the importer on a copy of the live project; the peer check on a second host; the cold gate; the spec's Verification table; spec and plan `done` | R71, R89, R91, G1 to G9 | `docs/specs/`, `docs/plans/`; records outside the repository | T25, T26 | `cargo xtask import-verify --source <copy> --record <dir>`; `./xtask/gate.sh full` on macOS and native Linux | 26 |
+| T27 | Proof: the importer on a copy of the live project; the peer check on a second host; the cold gate; the spec's Verification table; spec and plan `done` | R71, R89, R91, G1 to G6, G8 and G9 (G7 was retired on 2026-11-21) | `docs/specs/`, `docs/plans/`; records outside the repository | T25, T26 | `cargo xtask import-verify --source <copy> --record <dir>`; `./xtask/gate.sh full` on macOS and native Linux | 26 |
 
 Docs travel with their change: each product PR adds its CHANGELOG line and the RUNBOOK entry for any new
 message; T26 writes what spans the stack.
@@ -392,12 +400,31 @@ findings at `ec68890` above): one reader blocked on a headline that had two answ
 removes it is new. The read is limited to the changes that the table names, by the four readers of the
 sixth. No test settles it before the owner's gate.
 
+An eighth read follows the owner's decision of 2026-11-21 on latency (the spec's record I). Its reason is no
+finding: the owner dropped deliverable D and gate line 7, and the text that defers them is new. It is one
+independent review of that change, limited to the notes of deferral, to the gate as it stands in the three
+documents, and to whether the rulings on AP13 and every requirement on the correctness and the safety of
+events are kept. No test settles it. The findings on the measurement's method that were open when it was
+deferred are parked with it and are not closed.
+
+That review read `3a6189a` and passed it on one condition, which this text answers. The hostile run ids
+were tested on the event file's name, which 1.1 does not build, while the finish file that 1.1 writes had
+one harmless vector. The vectors and the outside canary now stand on the finish file: on its name and on
+the operations that write it, recover it and remove it (spec R101, R129 and "Filesystem names"; T12 and
+T13). Every test of an event file waits for the fallback (T16). The security reviewer of those rows agreed
+to that placement in writing before it was written, and has not read this text. Four small points of the
+same review are corrected with it: two rows of the spec that named R5 without its deferral, the layout row
+of the event file, the place of T4c's count, and the wording of T1's status. The same reviewer reads the
+change once more, and that read is limited to it.
+
 ## Status
 
 | Item | State (implemented / verified on <platform> / pending) |
 |---|---|
-| T1 | first-review text (`f5637805`) implemented in PR 1, `fast` on macOS, and merged to `main` by the owner on 2026-11-21; this corrected text, with the review corrections and the owner's answers, implemented in a follow-up PR that is pending its reviews and the owner's merge. The spec is not approved by either |
-| T2 to T27 | pending |
+| T1 | first-review text (`f5637805`) implemented in PR 1, `fast` on macOS, and merged to `main` by the owner on 2026-11-21; this corrected text, with the review corrections and the owner's answers, implemented in a follow-up PR that is pending its reviews and the owner's merge. The spec is not approved by either. Since then: the corrected text (`34b3b4d`) reached `main` on 2026-11-22 (UTC) through that follow-up PR, and the deferral of 2026-11-21 (the spec's record I) is implemented in a further documentation PR that is pending its review and its merge. This revision changes no document's status (`draft`, `proposed`) |
+| T4 | dropped as an entry step by the owner on 2026-11-21. The first run of 2026-11-20 is recorded in [issue 98](https://github.com/yuxhuang/r-orch/issues/98) and is not delivered to `main` |
+| T4b | deferred by the owner on 2026-11-21; not run |
+| T2 to T27, except T4 and T4b | pending, as this table stood before 2026-11-21; this revision brings no other row up to date |
 
 ## Test plan
 
@@ -410,7 +437,9 @@ sixth. No test settles it before the owner's gate.
 - The lanes' order is tested with a fake clock (T10). Their budgets are only measured, under load: by T4
   against the first budget, by T4b against the revised one, and by T16 on the path that ships. Every counted
   repetition of T4b and T16 holds checkpoints by the production rule. A green suite is not a performance
-  result, and neither is a run on a container that stands in for a host.
+  result, and neither is a run on a container that stands in for a host. Since 2026-11-21 none of those
+  measurements is part of 1.1 (the spec's record I): T4b is not run and T16 measures nothing, so 1.1 states
+  no performance result at all, and the order is what its tests prove.
 - A real suspend and resume on an isolated macOS machine (spec R42) is a recorded check that is still due;
   the clock-seam test does not replace it.
 - Processes (spec R100, R119): every test that could signal uses a fake process table that records each call,
@@ -444,7 +473,8 @@ sixth. No test settles it before the owner's gate.
   connections in turn. Corruption fails the writer from each; other failures are counted and reported at
   their thresholds and do not fail it; each outcome of a checkpoint call is produced from injected counts,
   and a running total repeated by the next call credits no second copy.
-- The verdict (spec "The verdict", "What a miss selects"): the verifier of T4b gives every row of the
+- Deferred on 2026-11-21 with T4b, kept as a record and not due in 1.1, where no verifier is built.
+  The verdict (spec "The verdict", "What a miss selects"): the verifier of T4b gives every row of the
   spec's table of cases as written, from recorded inputs made for the purpose, the mixed cases included
   (a defect beside a miss, an unknown correctness or a backend not shown beside a miss): a verifier that
   selects any path for them is wrong. So is one that selects a path when the two platforms miss different
@@ -474,8 +504,11 @@ sixth. No test settles it before the owner's gate.
 - Names and paths (spec R101 to R108, R117, R118): every test that plants a hostile name, link or special file
   also plants a canary outside its root and asserts that the canary's bytes and metadata are unchanged and that
   its contents appear in no row, blob or report. The vectors of the spec's "Filesystem names" are tested as
-  written, by T9 for the confined directory, T11 for blobs, T16 for event files, T21 for a 1.0 source and T23
-  for backups and exports.
+  written, by T9 for the confined directory, T11 for blobs, T12 and T13 for the finish file, T21 for a 1.0
+  source and T23 for backups and exports. Since 2026-11-21 no task tests an event file: its vectors, the
+  name's included, are due only with the event fallback, which 1.1 does not build (spec R63). The run ids of
+  those vectors are tested on the finish file instead, by T12 through the write and the removal after the
+  commit and by T13 through recovery, each with the canary (spec R129).
 - Two ids on one workspace (spec R117, R118): the pair `tsk_Case` and `tsk_case` and a foreign directory and
   branch under the other spelling, each with a canary, are tested as the spec's vectors say: by T8 and T9
   for the storage, T21 for a 1.0 source, T23 for an export and a backup, T12 and T13 for prepare, reuse,
@@ -522,7 +555,9 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   AP13 in its direction. No id is pending. The spec's "Owner's answers" gives the record for each and
   what each answer does not settle. An answer is not a proof, a review or a delivery.
 - A third thing is the owner's and lies outside the answers: the word on using the live copy for T4c (AP8).
-- Two things are still the owner's inside those answers. The numbers and results of AP13 (T4b). And the
+- Two things are still the owner's inside those answers. The numbers and results of AP13 (T4b), which the
+  owner deferred on 2026-11-21 with the measurement (the spec's record I), so that nothing in 1.1 waits for
+  them. And the
   fifth point of AP14, whether a backup is trusted as this project's own state for a workspace that
   already stands: the row recommended neither option, so the answer chose none, and T23 does not build
   restore's handling of an existing workspace before it is ruled.
@@ -544,7 +579,11 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
 - The owner has answered AP11: a restore lineage is carried beside the epoch (ADR 0017 decision 16, spec R77
   and R132). T5 still has to confirm the mechanics and settles how a process is held until its pid is
   committed (R96). Nothing before T12 depends on either.
-- T4 missed the first budget on macOS and has no figure from native Linux; that result is kept. The owner
+- **Deferred by the owner on 2026-11-21** (the spec's record I): this item is no longer open for 1.1. T16
+  stores events in SQLite by the batched design, no fallback is built, T4b is not run and nothing is measured
+  as built. The rest of the item is kept as a record; the rulings in it are not withdrawn and have nothing to
+  act on until latency is taken up again.
+  T4 missed the first budget on macOS and has no figure from native Linux; that result is kept. The owner
   directed a revised workload and budget (spec AP13), and T4b measures it by the method the spec states. The
   numbers of that budget are proposed and not accepted: T4b's results and the numbers go to the owner
   together, with what the spec proposes for the three numbers that do not agree with them (lane 1's 50 ms,
@@ -588,12 +627,18 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   method can produce a complete data set at all is open, and it is the performance engineer's to settle
   before the cells are frozen. An incomplete data set selects no path and is not run again without the
   owner's direction or an approved revision.
+  Since 2026-11-21 the proposals of this item that belong to the measurement alone are deferred with it and
+  are not due in 1.1: the limits for an idle host and the platform classes, the names of the verdict's axes
+  and values with its headlines and exits, the three things under "What a miss selects", and the coverage
+  rule. The other proposals of this item are unchanged.
 - No task yet owns a native Linux host: the owner's answer D6 allows the evidence, the spec's "Verification
   environment" lists the host as not yet named, and until one exists T4b is incomplete and R5 and R63
-  cannot be met.
+  cannot be met. Since 2026-11-21 neither measurement is due in 1.1 (the spec's record I); T27's cold gate
+  on native Linux is unchanged.
 - The task graph does not yet match this table (red-team condition C2): it has no task for T4b or T4c, its
   events task does not wait for T4b, and its qualification task still names the fallback. The lead repairs
-  it before any product task is released; this plan changes no task.
+  it before any product task is released; this plan changes no task. Since 2026-11-21 the graph needs no
+  task for T4b, and its events task waits for T10, T11 and T13 alone.
 - Two proofs are carried from the closure reviews and are not yet made: the command that installs 1.0
   beside 1.1 (T26, spec R136), and the read-only lock against a 1.0 daemon on macOS and Linux (T9, spec
   F9 and R31).

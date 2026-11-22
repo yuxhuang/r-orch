@@ -1,0 +1,27 @@
+{
+  "case": "index-absent-update-order",
+  "source": "source",
+  "spec": ["R65", "R122", "R123"],
+  "legacy_1_0": {
+    "listed_ids_sorted": ["tsk_idx_a", "tsk_idx_b", "tsk_idx_c"],
+    "list_order_specified": true,
+    "list_order": ["tsk_idx_c", "tsk_idx_a", "tsk_idx_b"],
+    "read_publishes_an_index": true,
+    "titles_by_get": {
+      "tsk_idx_a": "Case index-absent-update-order: first by id, created third, updated second",
+      "tsk_idx_b": "Case index-absent-update-order: second by id, created first, updated third",
+      "tsk_idx_c": "Case index-absent-update-order: third by id, created second, updated first"
+    }
+  },
+  "importer_1_1": {
+    "task_order": ["tsk_idx_a", "tsk_idx_b", "tsk_idx_c"],
+    "tasks": {
+      "tsk_idx_a": { "title": "Case index-absent-update-order: first by id, created third, updated second", "description": "Hand-written entity file for tsk_idx_a" },
+      "tsk_idx_b": { "title": "Case index-absent-update-order: second by id, created first, updated third", "description": "Hand-written entity file for tsk_idx_b" },
+      "tsk_idx_c": { "title": "Case index-absent-update-order: third by id, created second, updated first", "description": "Hand-written entity file for tsk_idx_c" }
+    },
+    "report": [
+      { "class": "index_unreadable", "subject": "tasks", "named_in_spec": true, "import": "goes_on" }
+    ]
+  }
+}
