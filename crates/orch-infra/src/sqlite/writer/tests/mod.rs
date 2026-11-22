@@ -1,5 +1,8 @@
 use super::*;
 use crate::sqlite::{ConnectionRole, SqliteError, Synchronous, open_connection, test_data};
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -26,12 +29,26 @@ impl Drop for ScenarioChild {
     }
 }
 
+fn scenario_output(path: &Path) -> String {
+    let mut output = String::new();
+    File::open(path)
+        .unwrap()
+        .take(64 * 1024)
+        .read_to_string(&mut output)
+        .unwrap();
+    output
+}
+
 #[track_caller]
 fn in_scenario_child(name: &str) -> bool {
     if std::env::var(CHILD_SCENARIO).as_deref() == Ok(name) {
         return true;
     }
     let root = tempfile::tempdir().unwrap();
+    // Keep nested libtest summaries out of the outer gate's test inventory.
+    // A regular file avoids a pipe filling and blocking the child's failure path.
+    let output_path = root.path().join("scenario.log");
+    let output = File::create(&output_path).unwrap();
     let mut child = ScenarioChild(
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
@@ -47,18 +64,25 @@ fn in_scenario_child(name: &str) -> bool {
                 root.path().join("global.yml"),
             )
             .env("ORCH_DATA_HOME", root.path().join("daemons"))
+            .stdout(output.try_clone().unwrap())
+            .stderr(output)
             .spawn()
             .expect("spawn writer scenario child"),
     );
     let deadline = Instant::now() + SCENARIO_BOUND;
     loop {
         if let Some(status) = child.0.try_wait().expect("poll writer scenario child") {
-            assert!(status.success(), "{name}: scenario failed: {status}");
+            assert!(
+                status.success(),
+                "{name}: scenario failed: {status}\n{}",
+                scenario_output(&output_path)
+            );
             return false;
         }
         assert!(
             Instant::now() < deadline,
-            "{name}: scenario exceeded {SCENARIO_BOUND:?}; killing stuck worker"
+            "{name}: scenario exceeded {SCENARIO_BOUND:?}; killing stuck worker\n{}",
+            scenario_output(&output_path)
         );
         // Poll process liveness only; no correctness oracle depends on this delay.
         std::thread::sleep(Duration::from_millis(10));
@@ -79,8 +103,8 @@ impl<T> WaitBounded<T> for WriteReceipt<T> {
     }
 }
 
-/// Closes admission when a scoped test body unwinds, so the scope's implicit join
-/// of the worker thread cannot hang behind a failed assertion.
+/// Closes admission on unwind so a working executor can finish its scoped join.
+/// The process deadline covers a regressed worker that ignores closure.
 struct CloseOnDrop<'a>(&'a WriterHandle);
 
 impl Drop for CloseOnDrop<'_> {
