@@ -1,0 +1,11 @@
+{
+  "id": "run_b",
+  "task_id": "tsk_b",
+  "agent_id": "agt_b",
+  "attempt": 1,
+  "status": "succeeded",
+  "started_at": "2025-01-01T00:00:00.000Z",
+  "workspace_path": "workspace",
+  "prompt": "do stuff",
+  "finished_at": "2025-01-01T00:00:00.000Z"
+}

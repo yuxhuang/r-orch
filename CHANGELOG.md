@@ -7,6 +7,8 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Development tooling
 
+- Pin file-storage ordering, complete-list and agent-rotation behaviour with reusable conformance tests and a synthetic import fixture corpus.
+
 - Give the folded suite one exclusive environment-witness writer and designate the separate fast witness explicitly.
 
 - Add local `gate fast` with fail-closed change selection, printed reasons, content-checked warm targets and a documentation-only build/lint path.

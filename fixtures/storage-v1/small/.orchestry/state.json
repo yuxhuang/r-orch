@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "onboardingCompleted": false,
+  "running": {},
+  "claimed": [],
+  "retry_queue": [],
+  "stats": {
+    "total_runs": 0,
+    "total_tasks_completed": 0,
+    "total_tasks_failed": 0,
+    "total_tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "total": 0,
+      "cache_read": 0,
+      "cache_write": 0
+    },
+    "total_runtime_ms": 0
+  }
+}
