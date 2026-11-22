@@ -21,8 +21,8 @@
 //! * Event batches over 1,000 rows are not refused here: the producer cuts them
 //!   (R27), as it does for the other bulk work.
 //!
-//! Stored form: `payload` is the whole `RunEvent` as JSON, so that a read
-//! returns the exact timestamp string and data that were appended. `type` repeats
+//! Stored form: `payload` is the whole `RunEvent` JSON through 64 KiB, then
+//! a tagged blob reference. Reads return the original timestamp string and data. `type` repeats
 //! the event type for queries and is checked against the payload on every read.
 //! `at` is the timestamp in UTC milliseconds, or 0 when it is not an RFC 3339
 //! instant (an imported 1.0 line can carry any text); it is for queries only.
@@ -31,6 +31,7 @@
 //!
 //! Registered for normal builds, but not wired into `Storage` or the daemon.
 
+use crate::blob::{BlobError, BlobHash, DiskBlobStore, Placement, placement};
 use orch_core::store::events::{AppendResult, EventGap, PruneResult, SequencedEvent};
 use orch_core::store::{Caller, Principal, StoreError};
 use orch_domain::{RunEvent, RunEventType};
@@ -50,6 +51,8 @@ pub(super) enum EventsError {
     /// never skipped, so that corruption does not become silent loss.
     #[error("stored run event is damaged: {0}")]
     Corrupt(String),
+    #[error(transparent)]
+    Blob(#[from] BlobError),
 }
 
 pub(super) type Result<T> = std::result::Result<T, EventsError>;
@@ -81,6 +84,18 @@ pub(super) fn append_events(
     epoch: u64,
     batch: &[SequencedEvent],
 ) -> Result<AppendResult> {
+    append_with_blobs(tx, caller, run, lineage, epoch, batch, None)
+}
+
+fn append_with_blobs(
+    tx: &Transaction<'_>,
+    caller: &Caller,
+    run: &str,
+    lineage: &str,
+    epoch: u64,
+    batch: &[SequencedEvent],
+    disk: Option<&DiskBlobStore>,
+) -> Result<AppendResult> {
     // The fence comes first, so an empty or duplicate batch is refused as well.
     check_lease(tx, caller, run, lineage, epoch)?;
     let mut rows = Vec::with_capacity(batch.len());
@@ -107,6 +122,18 @@ pub(super) fn append_events(
         skipped: 0,
     };
     for (seq, (at, kind, payload)) in rows {
+        // Check before publishing bytes: a skipped duplicate creates no file
+        // or metadata, including a duplicate later in the same batch.
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_events WHERE project_id=?1 AND run_id=?2 AND seq=?3)",
+            params![caller.project, run, seq],
+            |row| row.get(0),
+        )?;
+        if exists {
+            result.skipped += 1;
+            continue;
+        }
+        let payload = stored_payload(tx, &caller.project, payload, at, disk)?;
         if insert.exists(params![caller.project, run, seq, at, kind, payload])? {
             result.stored += 1;
         } else {
@@ -192,6 +219,17 @@ pub(super) fn read_events(
     after_seq: u64,
     limit: usize,
 ) -> Result<Vec<SequencedEvent>> {
+    read_with_blobs(conn, project, run, after_seq, limit, None)
+}
+
+fn read_with_blobs(
+    conn: &Connection,
+    project: &str,
+    run: &str,
+    after_seq: u64,
+    limit: usize,
+    disk: Option<&DiskBlobStore>,
+) -> Result<Vec<SequencedEvent>> {
     let limit = bound(limit)?;
     // Nothing above i64::MAX can be stored, so there is nothing after it.
     let Ok(after) = i64::try_from(after_seq) else {
@@ -201,7 +239,13 @@ pub(super) fn read_events(
         "SELECT seq, type, payload FROM run_events
          WHERE project_id = ?1 AND run_id = ?2 AND seq > ?3 ORDER BY seq LIMIT ?4",
     )?;
-    decode_all(&mut select, params![project, run, after, limit])
+    decode_all(
+        conn,
+        project,
+        disk,
+        &mut select,
+        params![project, run, after, limit],
+    )
 }
 
 /// The last `count` events, still oldest first. Zero is an empty tail.
@@ -211,6 +255,16 @@ pub(super) fn read_events_tail(
     run: &str,
     count: usize,
 ) -> Result<Vec<SequencedEvent>> {
+    tail_with_blobs(conn, project, run, count, None)
+}
+
+fn tail_with_blobs(
+    conn: &Connection,
+    project: &str,
+    run: &str,
+    count: usize,
+    disk: Option<&DiskBlobStore>,
+) -> Result<Vec<SequencedEvent>> {
     if count == 0 {
         return Ok(Vec::new());
     }
@@ -219,7 +273,13 @@ pub(super) fn read_events_tail(
         "SELECT seq, type, payload FROM run_events
          WHERE project_id = ?1 AND run_id = ?2 ORDER BY seq DESC LIMIT ?3",
     )?;
-    let mut tail = decode_all(&mut select, params![project, run, count])?;
+    let mut tail = decode_all(
+        conn,
+        project,
+        disk,
+        &mut select,
+        params![project, run, count],
+    )?;
     tail.reverse();
     Ok(tail)
 }
@@ -314,7 +374,87 @@ fn encode(event: &RunEvent) -> Result<(i64, &'static str, String)> {
     Ok((at, event.event_type.as_str(), payload))
 }
 
+const BLOB_TAG: &str = "orch.event.blob.v1";
+
+fn stored_payload(
+    tx: &Transaction<'_>,
+    project: &str,
+    payload: String,
+    at: i64,
+    disk: Option<&DiskBlobStore>,
+) -> Result<String> {
+    if placement(payload.as_bytes()) == Placement::Inline {
+        return Ok(payload);
+    }
+    let disk =
+        disk.ok_or_else(|| EventsError::Corrupt("oversized event requires the blob store".into()))?;
+    // Publish and sync before any row can reference the hash. Rollback may leave
+    // an unreferenced file; deletion belongs to reference-aware maintenance.
+    let hash = disk.put(payload.as_bytes())?.to_string();
+    let changed = tx.execute(
+        "INSERT INTO blobs (project_id,sha256,size,storage_location,created_at,unreferenced_since)
+         VALUES (?1,?2,?3,'disk',?4,NULL)
+         ON CONFLICT(project_id,sha256) DO UPDATE SET unreferenced_since=NULL
+         WHERE blobs.size=excluded.size AND blobs.storage_location=excluded.storage_location",
+        params![project, hash, payload.len() as i64, at],
+    )?;
+    if changed != 1 {
+        return Err(EventsError::Corrupt(
+            "event blob metadata disagrees with its bytes".into(),
+        ));
+    }
+    serde_json::to_string(&[BLOB_TAG, &hash]).map_err(|error| invalid(&error.to_string()))
+}
+
+fn load_payload(
+    conn: &Connection,
+    project: &str,
+    payload: &str,
+    disk: Option<&DiskBlobStore>,
+) -> Result<String> {
+    let value: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|error| EventsError::Corrupt(format!("invalid event JSON: {error}")))?;
+    // Historical objects (even oversized ones) retain the legacy decoder.
+    // Marker-like values inside data can never select a blob.
+    if value.is_object() {
+        return Ok(payload.to_owned());
+    }
+    let reference = value
+        .as_array()
+        .filter(|items| items.len() == 2)
+        .filter(|items| items[0].as_str() == Some(BLOB_TAG))
+        .and_then(|items| items[1].as_str())
+        .ok_or_else(|| EventsError::Corrupt("invalid event blob reference".into()))?;
+    let hash = reference.parse::<BlobHash>().map_err(BlobError::from)?;
+    let metadata: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT size,storage_location FROM blobs WHERE project_id=?1 AND sha256=?2",
+            params![project, reference],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (size, location) =
+        metadata.ok_or_else(|| EventsError::Corrupt("event blob metadata is missing".into()))?;
+    if size < 0 || location != "disk" {
+        return Err(EventsError::Corrupt(
+            "event blob metadata is invalid".into(),
+        ));
+    }
+    let bytes = disk
+        .ok_or_else(|| EventsError::Corrupt("event reference requires the blob store".into()))?
+        .get(&hash)?;
+    if bytes.len() as u64 != size as u64 {
+        return Err(EventsError::Corrupt(
+            "event blob size disagrees with metadata".into(),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|_| EventsError::Corrupt("event blob is not UTF-8".into()))
+}
+
 fn decode_all(
+    conn: &Connection,
+    project: &str,
+    disk: Option<&DiskBlobStore>,
     select: &mut rusqlite::CachedStatement<'_>,
     params: impl rusqlite::Params,
 ) -> Result<Vec<SequencedEvent>> {
@@ -329,6 +469,7 @@ fn decode_all(
     for row in rows {
         let (seq, kind, payload) = row?;
         let seq = unsigned(seq, "event sequence")?;
+        let payload = load_payload(conn, project, &payload, disk)?;
         let event: RunEvent = serde_json::from_str(&payload).map_err(|e| {
             EventsError::Corrupt(format!("event {seq}: payload is not an event: {e}"))
         })?;

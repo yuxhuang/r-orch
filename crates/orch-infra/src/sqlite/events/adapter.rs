@@ -2,12 +2,14 @@
 //! No raw connection escapes; caller.project selects every operation.
 use super::*;
 use crate::sqlite::{Lane, ReadPool, SqliteError, WriterHandle};
+use std::sync::Arc;
 use std::time::Instant;
 
 fn execution(error: EventsError) -> SqliteError {
     match error {
         EventsError::Store(error) => SqliteError::Store(error),
         EventsError::Sql(error) => SqliteError::Sql(error),
+        EventsError::Blob(error) => SqliteError::Io(std::io::Error::other(error)),
         EventsError::Corrupt(error) => SqliteError::EventCorrupt(error),
     }
 }
@@ -23,6 +25,7 @@ pub(super) struct EventAdapter<'a, 'data> {
     pub(super) writer: &'a WriterHandle,
     pub(super) readers: &'a ReadPool<'data>,
     pub(super) caller: Caller,
+    pub(super) blobs: &'a Arc<DiskBlobStore>,
 }
 
 impl EventAdapter<'_, '_> {
@@ -34,12 +37,14 @@ impl EventAdapter<'_, '_> {
         work: impl FnOnce(&mut EventBatch<'_>) -> orch_core::store::Result<T> + Send + 'static,
     ) -> orch_core::store::Result<T> {
         let caller = self.caller.clone();
+        let blobs = Arc::clone(self.blobs);
         self.writer
             .submit(Lane::Events, deadline, move |tx| {
                 let mut batch = EventBatch {
                     tx,
                     caller: &caller,
                     failed: None,
+                    blobs: &blobs,
                 };
                 let result = work(&mut batch);
                 if let Some(error) = batch.failed {
@@ -78,6 +83,7 @@ impl EventAdapter<'_, '_> {
                 read(&EventSnapshot {
                     tx,
                     caller: &self.caller,
+                    blobs: self.blobs,
                 })
                 .map_err(SqliteError::Store)
             })
@@ -89,6 +95,7 @@ pub(super) struct EventBatch<'a> {
     tx: &'a Transaction<'a>,
     caller: &'a Caller,
     failed: Option<SqliteError>,
+    blobs: &'a DiskBlobStore,
 }
 
 impl EventBatch<'_> {
@@ -125,7 +132,15 @@ impl EventBatch<'_> {
                 skipped: 0,
             }));
         }
-        let result = append_events(self.tx, self.caller, run, lineage, epoch, events);
+        let result = append_with_blobs(
+            self.tx,
+            self.caller,
+            run,
+            lineage,
+            epoch,
+            events,
+            Some(self.blobs),
+        );
         self.result(result)
     }
 
@@ -146,6 +161,7 @@ impl EventBatch<'_> {
 pub(super) struct EventSnapshot<'a> {
     tx: &'a Transaction<'a>,
     caller: &'a Caller,
+    blobs: &'a DiskBlobStore,
 }
 
 impl EventSnapshot<'_> {
@@ -155,16 +171,23 @@ impl EventSnapshot<'_> {
         after: u64,
         limit: usize,
     ) -> orch_core::store::Result<Vec<SequencedEvent>> {
-        read_events(self.tx, &self.caller.project, run, after, limit)
-            .map_err(execution)
-            .map_err(port)
+        read_with_blobs(
+            self.tx,
+            &self.caller.project,
+            run,
+            after,
+            limit,
+            Some(self.blobs),
+        )
+        .map_err(execution)
+        .map_err(port)
     }
     pub(super) fn tail(
         &self,
         run: &str,
         count: usize,
     ) -> orch_core::store::Result<Vec<SequencedEvent>> {
-        read_events_tail(self.tx, &self.caller.project, run, count)
+        tail_with_blobs(self.tx, &self.caller.project, run, count, Some(self.blobs))
             .map_err(execution)
             .map_err(port)
     }
