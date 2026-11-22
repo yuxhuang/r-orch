@@ -146,11 +146,14 @@ fn generate_tree() -> Result<Tree> {
 
 /// A test or a stray tempdir under a real project would make a path-walking helper find that
 /// project. The stores take their root explicitly, so this guards the premise, not a code path.
+/// It uses 1.0's own rule (`find_project_root`: any `.orchestry` entry counts), so it also stops
+/// a `TMPDIR` under a home directory that holds the 1.0 global-config `.orchestry`; the message
+/// names both causes.
 fn refuse_project_ancestor(dir: &Path) -> Result<()> {
     for ancestor in dir.ancestors().skip(1) {
         if ancestor.join(".orchestry").exists() {
             bail!(
-                "the private directory {} sits inside a project ({} has .orchestry); point TMPDIR elsewhere",
+                "the private directory {} sits under {}, which has a .orchestry entry (a 1.0 project root, or a 1.0 global-config directory); point TMPDIR elsewhere",
                 dir.display(),
                 ancestor.display()
             );
@@ -179,9 +182,21 @@ fn readme() -> String {
          followed by a newline. README.md alone does not grant replacement permission.\n\n\
          Each scenario holds synthetic records written through the 1.0 file stores, with nothing running.\n\
          This is a small serialization corpus, not a complete live-project or importer acceptance fixture.\n\
-         Runs use invented relative `workspace_path` values (`workspaces/<task-id>`); no workspace directories\n\
-         or repositories are created, and task proof is absent. It does not exercise live process identity,\n\
-         workspace ownership, hostile documents, import bounds, dry run or resume. Those checks remain in T21.\n\n\
+         Where it differs from what a 1.0 daemon leaves behind, a test written against it must not assume the\n\
+         corpus is typical:\n\n\
+         * Run `workspace_path` values are invented relative paths (`workspaces/<task-id>`). 1.0 writes an\n\
+         \x20 absolute path or `remote:<alias>`. No `workspaces/` directory and no repository exists.\n\
+         * No task sets `workspace`, `proof`, `review_results`, `feedback`, `scope` or `workspace_mode`.\n\
+         * No task is `in_progress` and no run is `running`: `state.json` holds no running or claimed\n\
+         \x20 entry (it does hold one retry-queue entry). Finished runs carry invented pids, which are not\n\
+         \x20 evidence of a process and may coincide with a live one on the machine that reads them.\n\
+         * Every `expires_at` and TTL falls in January 2025, so against the wall clock all of them have\n\
+         \x20 expired. Tests that read the corpus must fix the clock at the generator's start (`START_MS`).\n\
+         * Runtime statistics are a fixed 60 000 ms per run, which does not match the runs' own timestamps.\n\
+         * No agent has an explicit `approval_policy: auto`. Only the config default is `auto`, so the\n\
+         \x20 per-project pre-approval rule (decision 14) is reached through the effective policy alone.\n\n\
+         Live process identity, workspace ownership, hostile documents, import bounds, dry run and resume\n\
+         are not exercised here. Those checks remain in T21.\n\n\
          | Directory | Seed | Contents |\n|---|---|---|\n",
     );
     for scenario in SCENARIOS {
@@ -429,6 +444,53 @@ mod tests {
         assert_eq!(fs::read(dir.join("precious")).unwrap(), b"keep");
         assert!(fs::symlink_metadata(dir.join(MARKER)).unwrap().is_symlink());
         assert_eq!(fs::read(target).unwrap(), MARKER_CONTENT);
+    }
+
+    /// The whole tree is parsed before anything is removed: a link in an otherwise owned corpus
+    /// stops the replacement with every sibling intact.
+    #[test]
+    fn publish_validates_the_whole_tree_before_removing_anything() {
+        let private = tempfile::tempdir().unwrap();
+        let outside = private.path().join("outside");
+        fs::write(&outside, "outside").unwrap();
+        let dir = private.path().join("output");
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        fs::write(dir.join(MARKER), MARKER_CONTENT).unwrap();
+        fs::write(dir.join("nested/precious"), "keep").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("nested/link")).unwrap();
+        let err = publish(&dir, &tree(&[("new", "replacement")])).unwrap_err();
+        assert!(format!("{err:#}").contains("not a regular file"), "{err:#}");
+        assert_eq!(fs::read(dir.join("nested/precious")).unwrap(), b"keep");
+        assert_eq!(fs::read(dir.join(MARKER)).unwrap(), MARKER_CONTENT);
+        assert!(
+            fs::symlink_metadata(dir.join("nested/link"))
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(!dir.join("new").exists());
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn a_private_directory_under_a_1_0_project_or_global_config_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let clean = root.path().join("clean/private");
+        fs::create_dir_all(&clean).unwrap();
+        refuse_project_ancestor(&clean).unwrap();
+        // A `.orchestry` holding only the global config is refused too: 1.0's own root search
+        // (`find_project_root`) stops at any `.orchestry` entry.
+        let home = root.path().join("home");
+        fs::create_dir_all(home.join(".orchestry")).unwrap();
+        fs::write(home.join(".orchestry/global.yml"), "{}\n").unwrap();
+        let under = home.join("tmp/private");
+        fs::create_dir_all(&under).unwrap();
+        let err = refuse_project_ancestor(&under).unwrap_err().to_string();
+        assert!(err.contains("has a .orchestry entry"), "{err}");
+        assert!(err.contains(&home.display().to_string()), "{err}");
+        // The directory itself is not its own ancestor: only what is above it counts.
+        let own = root.path().join("own");
+        fs::create_dir_all(own.join(".orchestry")).unwrap();
+        refuse_project_ancestor(&own).unwrap();
     }
 
     #[test]

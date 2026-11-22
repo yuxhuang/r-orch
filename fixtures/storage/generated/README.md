@@ -12,9 +12,23 @@ followed by a newline. README.md alone does not grant replacement permission.
 
 Each scenario holds synthetic records written through the 1.0 file stores, with nothing running.
 This is a small serialization corpus, not a complete live-project or importer acceptance fixture.
-Runs use invented relative `workspace_path` values (`workspaces/<task-id>`); no workspace directories
-or repositories are created, and task proof is absent. It does not exercise live process identity,
-workspace ownership, hostile documents, import bounds, dry run or resume. Those checks remain in T21.
+Where it differs from what a 1.0 daemon leaves behind, a test written against it must not assume the
+corpus is typical:
+
+* Run `workspace_path` values are invented relative paths (`workspaces/<task-id>`). 1.0 writes an
+  absolute path or `remote:<alias>`. No `workspaces/` directory and no repository exists.
+* No task sets `workspace`, `proof`, `review_results`, `feedback`, `scope` or `workspace_mode`.
+* No task is `in_progress` and no run is `running`: `state.json` holds no running or claimed
+  entry (it does hold one retry-queue entry). Finished runs carry invented pids, which are not
+  evidence of a process and may coincide with a live one on the machine that reads them.
+* Every `expires_at` and TTL falls in January 2025, so against the wall clock all of them have
+  expired. Tests that read the corpus must fix the clock at the generator's start (`START_MS`).
+* Runtime statistics are a fixed 60 000 ms per run, which does not match the runs' own timestamps.
+* No agent has an explicit `approval_policy: auto`. Only the config default is `auto`, so the
+  per-project pre-approval rule (decision 14) is reached through the effective policy alone.
+
+Live process identity, workspace ownership, hostile documents, import bounds, dry run and resume
+are not exercised here. Those checks remain in T21.
 
 | Directory | Seed | Contents |
 |---|---|---|

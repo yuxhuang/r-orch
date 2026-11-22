@@ -1210,8 +1210,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                       # layers 1 to 4
 cargo deny check                             # supply chain — advisories, licences, bans
 cargo xtask crate-graph                      # asserts the whole inter-crate edge set (§3.1)
-cargo xtask fixture-gen --check              # SQLite-storage goal: the generated 1.0 corpus (fixtures/storage/generated) still matches its generator
 ```
+
+`cargo xtask fixture-gen --check` (the generated 1.0 corpus under `fixtures/storage/generated` still
+matches its generator) is not a separate CI step. `xtask/tests/fixture_gen.rs` runs it inside
+`cargo test --workspace`, so layer 1 to 4 CI covers it.
 
 `deny.toml` carries **two accepted advisories**, both *unmaintained* rather than vulnerable, and both
 transitive with no alternative:

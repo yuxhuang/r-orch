@@ -276,9 +276,10 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// The corpus is a real 1.0 data directory: the file stores read it, in the order their indexes
-/// hold, and every entity kind the importer must handle is present. Read on a copy, because a read
-/// may rebuild an index.
+/// The corpus is a real 1.0 data directory: the file stores read it and every entity kind the
+/// importer must handle is present. Counts and statuses are asserted here; the index order is
+/// pinned only by the byte comparison of `--check`. Read on a copy, because a read may rebuild an
+/// index.
 #[test]
 fn the_corpus_reads_back_through_the_real_file_stores() {
     let sandbox = Sandbox::new();
