@@ -557,11 +557,12 @@ pub async fn expiry_is_bounded_ordered_and_resumable(fixture: Fixture) {
     let s = fixture.storage.clone();
     seed(s.as_ref(), P).await;
     let total: i64 = 1_005;
-    // Stored in an order unlike their expiry, one millisecond apart.
+    // The later the key sorts, the earlier it expires, one millisecond apart: k0000
+    // expires last, so expiry order is the reverse of scope order.
     s.transaction(me(), Lane::Entities, move |u| {
-        for n in (0..total).rev() {
+        for n in 0..total {
             let scope = RequestScope::of(u.caller(), &key(&format!("k{n:04}")))?;
-            u.store_request_key(&scope, OP, &hash('a'), "x", T0 + n)?;
+            u.store_request_key(&scope, OP, &hash('a'), "x", T0 + total - 1 - n)?;
         }
         Ok(())
     })
@@ -575,10 +576,11 @@ pub async fn expiry_is_bounded_ordered_and_resumable(fixture: Fixture) {
         expire(s.as_ref(), P, T0 + HOUR - 1, 1_000).await.unwrap(),
         0
     );
-    // Rows with n up to 1,001 are due by now, 1,002 of them; one call takes 1,000.
+    // Rows stored at T0 + 0..=1,001 are due by now, 1,002 of them; one call takes 1,000.
     let now = T0 + HOUR + 1_001;
     assert_eq!(expire(s.as_ref(), P, now, 1_000).await.unwrap(), 1_000);
-    // The earliest went first: nothing due at the thousandth row's own expiry is left.
+    // The earliest went first: nothing due at the thousandth row's own expiry is
+    // left, though the scope order would have taken other rows.
     assert_eq!(
         expire(s.as_ref(), P, T0 + HOUR + 999, 1_000).await.unwrap(),
         0
@@ -586,7 +588,7 @@ pub async fn expiry_is_bounded_ordered_and_resumable(fixture: Fixture) {
     assert_eq!(expire(s.as_ref(), P, now, 1_000).await.unwrap(), 2);
     assert_eq!(expire(s.as_ref(), P, now, 1_000).await.unwrap(), 0);
     // The three that were not due are still stored, and then due in their turn.
-    let alive = request(s.as_ref(), me(), &key("k1004"), OP, &hash('a'), "x", now).await;
+    let alive = request(s.as_ref(), me(), &key("k0000"), OP, &hash('a'), "x", now).await;
     assert_eq!(alive.unwrap(), Outcome::Replayed("x".into()));
     assert_eq!(
         expire(s.as_ref(), P, T0 + HOUR + 1_004, 1_000)
