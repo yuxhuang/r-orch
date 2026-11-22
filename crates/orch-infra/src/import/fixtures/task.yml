@@ -1,0 +1,15 @@
+id: tsk_-8biszr
+title: Tally the steady harbor
+description: Invented work item 1; nothing here describes a real project.
+status: done
+priority: 4
+assignee: agt_Nsf31rn
+labels:
+- synthetic
+depends_on: []
+created_at: '2025-01-01T00:00:21.066Z'
+updated_at: '2025-01-01T00:00:38.083Z'
+attempts: 2
+max_attempts: 3
+attachments:
+- note.txt
