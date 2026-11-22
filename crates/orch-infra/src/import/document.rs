@@ -198,7 +198,12 @@ pub(crate) fn check_yaml(bytes: &[u8], limits: Limits) -> Result<()> {
         }
     }
     if documents != 1 {
-        return Err(Refusal::budget("documents", 1, documents));
+        return Err(Refusal {
+            rule: "documents",
+            limit: 1,
+            observed: documents,
+            detail: format!("expected one document, found {documents}"),
+        });
     }
     Ok(())
 }
@@ -229,6 +234,10 @@ enum Frame {
     ObjectValue,
     ObjectEnd,
 }
+
+// Keep the structural budget below the recursive typed decoder's ceiling.
+// Raising a caller's limit must not expose input-controlled stack growth.
+const JSON_DEPTH_CLAMP: u64 = 64;
 
 /// Iterative structural events; serde_json validates scalar tokens. Member
 /// names do not count as nodes. No tree or recursive visitor is constructed.
@@ -291,7 +300,11 @@ pub(crate) fn check_json(bytes: &[u8], limits: Limits) -> Result<()> {
             nodes = add("nodes", nodes, 1, limits.nodes)?;
         }
         if matches!(byte, b'[' | b'{') {
-            within("depth", stack.len() as u64 + 1, limits.depth.min(64))?;
+            within(
+                "depth",
+                stack.len() as u64 + 1,
+                limits.depth.min(JSON_DEPTH_CLAMP),
+            )?;
             stack.push(if byte == b'[' {
                 Frame::ArrayValue(true)
             } else {
