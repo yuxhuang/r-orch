@@ -1,0 +1,11 @@
+{
+  "id": "msg_p7MP9N1",
+  "channel": "broadcast",
+  "from_agent_id": "agt_Nsf31rn",
+  "to_agent_id": null,
+  "subject": "Synthetic subject 5",
+  "body": "Invented message body 5.",
+  "created_at": "2025-01-01T00:06:20.810Z",
+  "status": "delivered",
+  "delivered_at": "2025-01-01T00:06:55.154Z"
+}

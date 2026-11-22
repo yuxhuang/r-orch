@@ -103,6 +103,14 @@ fn working_judge_id(sandbox: &Sandbox) -> String {
         .filter(|path| {
             path.starts_with("xtask/")
                 || [
+                    "crates/orch-core/",
+                    "crates/orch-domain/",
+                    "crates/orch-infra/",
+                ]
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+                || (path.starts_with("crates/") && path.ends_with("/Cargo.toml"))
+                || [
                     "Cargo.toml",
                     "Cargo.lock",
                     "rust-toolchain.toml",
@@ -144,6 +152,52 @@ fn working_judge_id(sandbox: &Sandbox) -> String {
         })
         .collect::<String>();
     sandbox.blob(records.as_bytes())
+}
+
+#[test]
+fn dependency_inputs_reset_bootstrap_even_when_backdated() {
+    let sandbox = bootstrap();
+    let mut previous = require_first(&sandbox);
+    for path in [
+        "crates/orch-core/Cargo.toml",
+        "crates/orch-core/src/lib.rs",
+        "crates/orch-domain/src/lib.rs",
+        "crates/orch-domain/src/shop/roles/example.md",
+        "crates/orch-infra/src/lib.rs",
+        "crates/orch-infra/src/template/system.liquid",
+        "crates/orch-infra/build.rs",
+        "crates/orch-engine/Cargo.toml",
+    ] {
+        sandbox.write(path, "synthetic compile input\n");
+        sandbox.git(&["add", "--", path]);
+        let output = run(&sandbox);
+        output.code(0);
+        assert_ne!(returned_id(&output), previous, "{path} was omitted");
+        assert_eq!(returned_id(&output), working_judge_id(&sandbox));
+        previous = returned_id(&output).to_owned();
+        let canary = sandbox.root.join("target/gate-xtask/old-build-canary");
+        fs::write(&canary, "old target").unwrap();
+        sandbox.write(path, "changed compile input\n");
+        backdate(&sandbox.root.join(path));
+        let changed = run(&sandbox);
+        changed.code(0);
+        assert_ne!(returned_id(&changed), previous);
+        assert_eq!(returned_id(&changed), working_judge_id(&sandbox));
+        assert!(!canary.exists(), "{path} did not reset the target");
+        previous = returned_id(&changed).to_owned();
+    }
+    sandbox.write(
+        "crates/orch-engine/src/lib.rs",
+        "outside compiled closure\n",
+    );
+    let outside = run(&sandbox);
+    outside.code(0);
+    assert_eq!(returned_id(&outside), previous);
+    let input = "crates/orch-core/src/lib.rs";
+    fs::remove_file(sandbox.root.join(input)).unwrap();
+    let missing = run(&sandbox);
+    missing.code(1);
+    assert!(!stamp(&sandbox).exists());
 }
 
 #[test]

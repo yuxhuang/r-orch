@@ -265,7 +265,7 @@ r-orch/
 │   ├── orch-client/           # daemon client: discovery, connect, handshake, typed calls (domain, proto)
 │   ├── orch-cli/              # clap command tree, human + JSON rendering, serve mode. bins live here.
 │   └── orch-tui/              # ratatui dashboard
-├── xtask/                     # dev tooling: crate-graph, linux, gate.sh, mouse-e2e
+├── xtask/                     # dev tooling: crate-graph, fixture-gen, linux, gate.sh, mouse-e2e
 ├── fixtures/                  # golden prompts, adapter stdout recordings, shop catalogue, fake agents
 └── skills/library/            # shipped skill markdown
 ```
@@ -405,6 +405,9 @@ the check keeps the *list*. If they disagree, the check is right.
 **Enforced invariant: `orch-engine` has zero dependency on `orch-cli`, `orch-tui`, `orch-client` or
 `orch-daemon`.** The core engine has no knowledge of the CLI, TUI or daemon layers; the daemon composes the engine,
 not the other way round.
+
+`xtask` is the one tooling crate with normal edges into the product crates: `orch-core`, `orch-domain` and
+`orch-infra`, so that `cargo xtask fixture-gen` can script the real 1.0 file backend. It takes no test-support feature.
 
 `xtask crate-graph` asserts the **whole edge set** against a table, not just that one forbidden edge —
 including build- and dev-dependencies, since a test-only edge still compiles the crate. A single
@@ -1249,6 +1252,10 @@ cargo test --workspace                       # layers 1 to 4
 cargo deny check                             # supply chain — advisories, licences, bans
 cargo xtask crate-graph                      # asserts the whole inter-crate edge set (§3.1)
 ```
+
+`cargo xtask fixture-gen --check` (the generated 1.0 corpus under `fixtures/storage/generated` still
+matches its generator) is not a separate CI step. `xtask/tests/fixture_gen.rs` runs it inside
+`cargo test --workspace`, so layer 1 to 4 CI covers it.
 
 `deny.toml` carries **two accepted advisories**, both *unmaintained* rather than vulnerable, and both
 transitive with no alternative:

@@ -1,0 +1,212 @@
+[
+  {
+    "id": "tsk_-8biszr",
+    "title": "Tally the steady harbor",
+    "description": "Invented work item 1; nothing here describes a real project.",
+    "status": "done",
+    "priority": 4,
+    "assignee": "agt_Nsf31rn",
+    "labels": [
+      "synthetic"
+    ],
+    "depends_on": [],
+    "created_at": "2025-01-01T00:00:21.066Z",
+    "updated_at": "2025-01-01T00:00:38.083Z",
+    "attempts": 2,
+    "max_attempts": 3,
+    "attachments": [
+      "note.txt"
+    ]
+  },
+  {
+    "id": "tsk_7iefwwT",
+    "title": "Sort the hollow kettle",
+    "description": "Invented work item 2; nothing here describes a real project.",
+    "status": "failed",
+    "priority": 1,
+    "assignee": "agt_cXM1BY8",
+    "labels": [
+      "backend"
+    ],
+    "depends_on": [
+      "tsk_-8biszr"
+    ],
+    "created_at": "2025-01-01T00:00:38.083Z",
+    "updated_at": "2025-01-01T00:00:57.994Z",
+    "attempts": 2,
+    "max_attempts": 2
+  },
+  {
+    "id": "tsk_5XZAuwm",
+    "title": "Sort the quiet compass",
+    "description": "Invented work item 3; nothing here describes a real project.",
+    "status": "retrying",
+    "priority": 2,
+    "assignee": "agt_BneL5Al",
+    "labels": [
+      "docs"
+    ],
+    "depends_on": [],
+    "created_at": "2025-01-01T00:00:57.994Z",
+    "updated_at": "2025-01-01T00:01:09.835Z",
+    "attempts": 1,
+    "max_attempts": 3
+  },
+  {
+    "id": "tsk_vRHqQcA",
+    "title": "Weigh the quiet orchard",
+    "description": "Invented work item 4; nothing here describes a real project.",
+    "status": "review",
+    "priority": 3,
+    "assignee": "agt_cXM1BY8",
+    "labels": [
+      "synthetic"
+    ],
+    "depends_on": [],
+    "created_at": "2025-01-01T00:01:09.835Z",
+    "updated_at": "2025-01-01T00:01:20.407Z",
+    "attempts": 1,
+    "max_attempts": 3,
+    "goalId": "goal_4QPvvMS"
+  },
+  {
+    "id": "tsk_qZF9Fuw",
+    "title": "Trim the plain lantern",
+    "description": "Invented work item 5; nothing here describes a real project.",
+    "status": "cancelled",
+    "priority": 3,
+    "assignee": "agt_BneL5Al",
+    "labels": [
+      "frontend"
+    ],
+    "depends_on": [
+      "tsk_5XZAuwm",
+      "tsk_7iefwwT"
+    ],
+    "created_at": "2025-01-01T00:01:20.407Z",
+    "updated_at": "2025-01-01T00:01:36.831Z",
+    "attempts": 1,
+    "max_attempts": 3
+  },
+  {
+    "id": "tsk_-2wg0aj",
+    "title": "Pack the steady bridge",
+    "description": "Invented work item 6; nothing here describes a real project.",
+    "status": "todo",
+    "priority": 2,
+    "labels": [
+      "chore"
+    ],
+    "depends_on": [],
+    "created_at": "2025-01-01T00:01:36.831Z",
+    "updated_at": "2025-01-01T00:01:36.831Z",
+    "attempts": 0,
+    "max_attempts": 3,
+    "goalId": "goal_B4eWz60"
+  },
+  {
+    "id": "tsk_uAetqJG",
+    "title": "Polish the bright meadow",
+    "description": "Invented work item 7; nothing here describes a real project.",
+    "status": "done",
+    "priority": 3,
+    "assignee": "agt__AKo7jx",
+    "labels": [
+      "chore"
+    ],
+    "depends_on": [],
+    "created_at": "2025-01-01T00:01:40.192Z",
+    "updated_at": "2025-01-01T00:01:51.153Z",
+    "attempts": 1,
+    "max_attempts": 3,
+    "goalId": "goal_B4eWz60"
+  },
+  {
+    "id": "tsk_t1ufLsm",
+    "title": "Pack the hollow kettle",
+    "description": "Invented work item 8; nothing here describes a real project.",
+    "status": "done",
+    "priority": 3,
+    "assignee": "agt_BneL5Al",
+    "labels": [
+      "synthetic"
+    ],
+    "depends_on": [],
+    "created_at": "2025-01-01T00:01:51.153Z",
+    "updated_at": "2025-01-01T00:02:04.699Z",
+    "attempts": 1,
+    "max_attempts": 3
+  },
+  {
+    "id": "tsk_O4T0dQu",
+    "title": "Index the bright kettle",
+    "description": "Invented work item 9; nothing here describes a real project.",
+    "status": "done",
+    "priority": 1,
+    "assignee": "agt_cXM1BY8",
+    "labels": [
+      "synthetic"
+    ],
+    "depends_on": [
+      "tsk_uAetqJG"
+    ],
+    "created_at": "2025-01-01T00:02:04.699Z",
+    "updated_at": "2025-01-01T00:02:20.755Z",
+    "attempts": 2,
+    "max_attempts": 3,
+    "goalId": "goal_4QPvvMS"
+  },
+  {
+    "id": "tsk_DG6Hjmw",
+    "title": "Weigh the hollow bridge",
+    "description": "Invented work item 10; nothing here describes a real project.",
+    "status": "failed",
+    "priority": 4,
+    "assignee": "agt_BneL5Al",
+    "labels": [
+      "docs"
+    ],
+    "depends_on": [],
+    "created_at": "2025-01-01T00:02:20.755Z",
+    "updated_at": "2025-01-01T00:02:45.596Z",
+    "attempts": 2,
+    "max_attempts": 2,
+    "goalId": "goal_4QPvvMS"
+  },
+  {
+    "id": "tsk_ts6X2d2",
+    "title": "Pack the hollow meadow",
+    "description": "Invented work item 11; nothing here describes a real project.",
+    "status": "review",
+    "priority": 1,
+    "assignee": "agt_BneL5Al",
+    "labels": [
+      "frontend"
+    ],
+    "depends_on": [
+      "tsk_-2wg0aj"
+    ],
+    "created_at": "2025-01-01T00:02:45.596Z",
+    "updated_at": "2025-01-01T00:03:01.840Z",
+    "attempts": 1,
+    "max_attempts": 3,
+    "goalId": "goal_4QPvvMS"
+  },
+  {
+    "id": "tsk_lCRlmiI",
+    "title": "Index the narrow meadow",
+    "description": "Invented work item 12; nothing here describes a real project.",
+    "status": "done",
+    "priority": 1,
+    "assignee": "agt_BneL5Al",
+    "labels": [
+      "backend"
+    ],
+    "depends_on": [],
+    "created_at": "2025-01-01T00:03:01.840Z",
+    "updated_at": "2025-01-01T00:03:16.632Z",
+    "attempts": 1,
+    "max_attempts": 3,
+    "goalId": "goal_B4eWz60"
+  }
+]

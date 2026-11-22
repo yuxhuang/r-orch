@@ -1,0 +1,22 @@
+{
+  "id": "run_FkMwTnz",
+  "task_id": "tsk_DG6Hjmw",
+  "agent_id": "agt_Nsf31rn",
+  "attempt": 1,
+  "status": "failed",
+  "started_at": "2025-01-01T00:02:25.098Z",
+  "finished_at": "2025-01-01T00:02:31.977Z",
+  "workspace_path": "workspaces/tsk_DG6Hjmw",
+  "prompt": "Synthetic prompt for tsk_DG6Hjmw, attempt 1.",
+  "pid": 10810,
+  "error": "synthetic process crash",
+  "error_kind": "process_crash",
+  "tokens": {
+    "input": 3901,
+    "output": 3425,
+    "reasoning": 264,
+    "total": 7590,
+    "cache_read": 3301,
+    "cache_write": 497
+  }
+}

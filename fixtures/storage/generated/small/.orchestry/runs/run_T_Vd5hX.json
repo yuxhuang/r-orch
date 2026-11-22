@@ -1,0 +1,22 @@
+{
+  "id": "run_T_Vd5hX",
+  "task_id": "tsk_-8biszr",
+  "agent_id": "agt_cXM1BY8",
+  "attempt": 1,
+  "status": "failed",
+  "started_at": "2025-01-01T00:00:23.942Z",
+  "finished_at": "2025-01-01T00:00:34.438Z",
+  "workspace_path": "workspaces/tsk_-8biszr",
+  "prompt": "Synthetic prompt for tsk_-8biszr, attempt 1.",
+  "pid": 22914,
+  "error": "synthetic process crash",
+  "error_kind": "process_crash",
+  "tokens": {
+    "input": 10945,
+    "output": 4071,
+    "reasoning": 755,
+    "total": 15771,
+    "cache_read": 8911,
+    "cache_write": 712
+  }
+}

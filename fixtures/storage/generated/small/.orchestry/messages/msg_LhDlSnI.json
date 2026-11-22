@@ -1,0 +1,12 @@
+{
+  "id": "msg_LhDlSnI",
+  "channel": "lead",
+  "from_agent_id": "agt_BneL5Al",
+  "to_agent_id": "agt_Nsf31rn",
+  "subject": "Synthetic subject 6",
+  "body": "Invented message body 6.",
+  "created_at": "2025-01-01T00:06:55.154Z",
+  "expires_at": "2025-01-02T00:06:55.154Z",
+  "status": "pending",
+  "team_id": "team_CGVprCM"
+}

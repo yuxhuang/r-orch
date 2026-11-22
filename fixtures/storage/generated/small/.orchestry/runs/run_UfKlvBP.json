@@ -1,0 +1,20 @@
+{
+  "id": "run_UfKlvBP",
+  "task_id": "tsk_ts6X2d2",
+  "agent_id": "agt_BneL5Al",
+  "attempt": 1,
+  "status": "succeeded",
+  "started_at": "2025-01-01T00:02:46.789Z",
+  "finished_at": "2025-01-01T00:03:01.840Z",
+  "workspace_path": "workspaces/tsk_ts6X2d2",
+  "prompt": "Synthetic prompt for tsk_ts6X2d2, attempt 1.",
+  "pid": 16118,
+  "tokens": {
+    "input": 16422,
+    "output": 3934,
+    "reasoning": 1054,
+    "total": 21410,
+    "cache_read": 2528,
+    "cache_write": 830
+  }
+}

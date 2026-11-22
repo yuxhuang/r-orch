@@ -1,0 +1,20 @@
+{
+  "id": "run_yonRfoW",
+  "task_id": "tsk_O4T0dQu",
+  "agent_id": "agt_cXM1BY8",
+  "attempt": 2,
+  "status": "succeeded",
+  "started_at": "2025-01-01T00:02:17.917Z",
+  "finished_at": "2025-01-01T00:02:20.755Z",
+  "workspace_path": "workspaces/tsk_O4T0dQu",
+  "prompt": "Synthetic prompt for tsk_O4T0dQu, attempt 2.",
+  "pid": 24027,
+  "tokens": {
+    "input": 16322,
+    "output": 1375,
+    "reasoning": 1190,
+    "total": 18887,
+    "cache_read": 560,
+    "cache_write": 240
+  }
+}

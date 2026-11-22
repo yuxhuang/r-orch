@@ -1,0 +1,22 @@
+{
+  "id": "run_lzF15c2",
+  "task_id": "tsk_7iefwwT",
+  "agent_id": "agt_cXM1BY8",
+  "attempt": 2,
+  "status": "timed_out",
+  "started_at": "2025-01-01T00:00:52.817Z",
+  "finished_at": "2025-01-01T00:00:57.994Z",
+  "workspace_path": "workspaces/tsk_7iefwwT",
+  "prompt": "Synthetic prompt for tsk_7iefwwT, attempt 2.",
+  "pid": 17187,
+  "error": "synthetic timeout",
+  "error_kind": "timeout",
+  "tokens": {
+    "input": 3285,
+    "output": 3127,
+    "reasoning": 1257,
+    "total": 7669,
+    "cache_read": 5128,
+    "cache_write": 841
+  }
+}

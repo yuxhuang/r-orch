@@ -1,0 +1,7 @@
+{"timestamp":"2025-01-01T00:02:50.579Z","type":"file_changed","data":"synthetic/file-0.txt"}
+{"timestamp":"2025-01-01T00:02:52.458Z","type":"agent_output","data":"synthetic output line 1 for run_UfKlvBP"}
+{"timestamp":"2025-01-01T00:02:52.774Z","type":"command_run","data":"synthetic-command --step 2"}
+{"timestamp":"2025-01-01T00:02:55.416Z","type":"file_changed","data":"synthetic/file-3.txt"}
+{"timestamp":"2025-01-01T00:02:57.749Z","type":"file_changed","data":"synthetic/file-4.txt"}
+{"timestamp":"2025-01-01T00:03:00.948Z","type":"command_run","data":"synthetic-command --step 5"}
+{"timestamp":"2025-01-01T00:03:01.840Z","type":"done","data":"synthetic run finished"}

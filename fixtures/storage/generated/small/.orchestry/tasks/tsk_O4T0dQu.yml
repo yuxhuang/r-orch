@@ -1,0 +1,15 @@
+id: tsk_O4T0dQu
+title: Index the bright kettle
+description: Invented work item 9; nothing here describes a real project.
+status: done
+priority: 1
+assignee: agt_cXM1BY8
+labels:
+- synthetic
+depends_on:
+- tsk_uAetqJG
+created_at: '2025-01-01T00:02:04.699Z'
+updated_at: '2025-01-01T00:02:20.755Z'
+attempts: 2
+max_attempts: 3
+goalId: goal_4QPvvMS

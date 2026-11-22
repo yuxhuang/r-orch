@@ -1,0 +1,6 @@
+{"timestamp":"2025-01-01T00:01:25.451Z","type":"file_changed","data":"synthetic/file-0.txt"}
+{"timestamp":"2025-01-01T00:01:27.562Z","type":"file_changed","data":"synthetic/file-1.txt"}
+{"timestamp":"2025-01-01T00:01:30.980Z","type":"file_changed","data":"synthetic/file-2.txt"}
+{"timestamp":"2025-01-01T00:01:34.251Z","type":"command_run","data":"synthetic-command --step 3"}
+{"timestamp":"2025-01-01T00:01:36.612Z","type":"tool_call","data":"synthetic tool call 4"}
+{"timestamp":"2025-01-01T00:01:36.831Z","type":"error","data":"synthetic run ended without success"}

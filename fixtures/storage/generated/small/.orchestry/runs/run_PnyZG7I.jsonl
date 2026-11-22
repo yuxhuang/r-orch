@@ -1,0 +1,4 @@
+{"timestamp":"2025-01-01T00:01:46.738Z","type":"file_changed","data":"synthetic/file-0.txt"}
+{"timestamp":"2025-01-01T00:01:48.832Z","type":"file_changed","data":"synthetic/file-1.txt"}
+{"timestamp":"2025-01-01T00:01:51.032Z","type":"agent_output","data":"synthetic output line 2 for run_PnyZG7I"}
+{"timestamp":"2025-01-01T00:01:51.153Z","type":"done","data":"synthetic run finished"}

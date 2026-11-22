@@ -8,6 +8,22 @@ use std::process::Command;
 
 pub(super) const INPUTS: &[&str] = &[
     "xtask",
+    // fixture-gen compiles this normal workspace dependency closure. Keep the
+    // bootstrap list in gate.sh in sync, including embedded non-Rust assets.
+    "crates/orch-core",
+    "crates/orch-domain",
+    "crates/orch-infra",
+    // Cargo resolves the workspace together; other member manifests can affect
+    // resolution even though their sources are not compiled into this judge.
+    // Use literal paths: ls-tree does not expand the ls-files wildcard syntax.
+    // Update both lists when workspace membership changes.
+    "crates/orch-cli/Cargo.toml",
+    "crates/orch-client/Cargo.toml",
+    "crates/orch-daemon/Cargo.toml",
+    "crates/orch-engine/Cargo.toml",
+    "crates/orch-peer/Cargo.toml",
+    "crates/orch-proto/Cargo.toml",
+    "crates/orch-tui/Cargo.toml",
     "Cargo.toml",
     "Cargo.lock",
     "rust-toolchain.toml",
@@ -125,6 +141,91 @@ pub(super) fn stamped(repo: &Path, id: &str, executable: &Path) -> Result<()> {
 mod bootstrap_tests {
     use super::*;
     use crate::gate::steps::tests::Scratch;
+    #[test]
+    fn dependency_identity_agrees_at_commit_and_detects_each_input() {
+        let scratch = Scratch::new();
+        let repo = &scratch.0;
+        let write = |name: &str, bytes: &[u8]| {
+            let path = repo.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        };
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Fixture")
+                .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+                .env("GIT_COMMITTER_NAME", "Fixture")
+                .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        };
+        git(&["init", "--quiet"]);
+        for input in ["xtask/gate.sh", "Cargo.lock"] {
+            write(input, b"synthetic baseline");
+        }
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "baseline",
+        ]);
+        let mut previous = current(repo).unwrap();
+        assert_eq!(previous, at_commit(repo, "HEAD").unwrap());
+        for input in [
+            "crates/orch-core/Cargo.toml",
+            "crates/orch-core/src/lib.rs",
+            "crates/orch-domain/src/lib.rs",
+            "crates/orch-domain/src/shop/roles/example.md",
+            "crates/orch-infra/src/lib.rs",
+            "crates/orch-infra/src/template/system.liquid",
+            "crates/orch-infra/build.rs",
+            "crates/orch-engine/Cargo.toml",
+        ] {
+            write(input, b"synthetic compile input");
+            let live = current(repo).unwrap();
+            assert_ne!(live, previous, "omitted untracked {input}");
+            assert_eq!(previous, at_commit(repo, "HEAD").unwrap());
+            git(&["add", "."]);
+            git(&[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "input",
+            ]);
+            assert_eq!(live, at_commit(repo, "HEAD").unwrap());
+            write(input, b"changed compile input");
+            assert_ne!(live, current(repo).unwrap(), "omitted changed {input}");
+            git(&["checkout", "--", input]);
+            previous = live;
+        }
+        write("crates/orch-engine/src/lib.rs", b"outside closure");
+        assert_eq!(previous, current(repo).unwrap());
+        let input = repo.join("crates/orch-infra/src/lib.rs");
+        std::fs::remove_file(&input).unwrap();
+        assert!(current(repo).is_err());
+        std::os::unix::fs::symlink("system.liquid", &input).unwrap();
+        assert!(current(repo).is_err());
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--quiet",
+            "-m",
+            "link",
+        ]);
+        assert!(at_commit(repo, "HEAD").is_err());
+    }
+
     #[test]
     fn arbitrary_hardlinked_stamp_or_executable_remains_nonqualifying() {
         for component in ["judge-id", "debug/xtask"] {

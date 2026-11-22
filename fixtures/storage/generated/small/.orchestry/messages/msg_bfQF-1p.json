@@ -1,0 +1,12 @@
+{
+  "id": "msg_bfQF-1p",
+  "channel": "lead",
+  "from_agent_id": "agt_Nsf31rn",
+  "to_agent_id": "agt_cXM1BY8",
+  "subject": "Synthetic subject 3",
+  "body": "Invented message body 3.",
+  "created_at": "2025-01-01T00:04:45.166Z",
+  "status": "delivered",
+  "delivered_at": "2025-01-01T00:05:39.717Z",
+  "team_id": "team_CGVprCM"
+}

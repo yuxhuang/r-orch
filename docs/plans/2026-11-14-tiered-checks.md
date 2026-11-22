@@ -1993,3 +1993,30 @@ fmt/clippy/crate-graph and complete exact-head xtask pre-map/raw/inventory.
 SRE F-3 bootstrap lifetime remains carried minor; no redesign is authorized.
 Stop on first unexpected failure, retaining immutable channels/status/source.
 FS1/D45/option3 remain accepted, not fixed; native acceptance remains held.
+
+
+### D27 fixture-generator dependency coverage
+
+The judge also compiles `orch-core`, `orch-domain` and `orch-infra` through
+`fixture-gen`. Its input set therefore includes every tracked and nonignored
+untracked file beneath those three crate directories, including their manifests,
+embedded role/template data and any build scripts. All `crates/*/Cargo.toml`
+workspace member manifests are included because workspace resolution can affect
+the build; root manifest, lockfile, toolchain/config and `xtask/` remain inputs.
+The bootstrap, live capture and commit verifier use the same expanded set and
+retain existing bounds, path refusals, stamp publication and qualification rules.
+Workspace membership changes require updating the literal manifest lists in both
+implementations; `ls-tree` and `ls-files` do not share wildcard semantics. Future
+normal workspace dependencies require extending the crate directory set before use.
+Registry dependencies remain pinned by `Cargo.lock`; no manifest or dependency
+version changes are part of this correction.
+
+This changes the judge identity. It does not migrate or rewrite old evidence:
+verification with the corrected judge rejects an old receipt whose identity used
+the smaller set. Retain its original judge for historical verification, and
+produce fresh fast/PR evidence on the integrated candidate. A dependency compile
+failure now prevents bootstrap (and CI selection, which also builds `xtask`)
+before a gate stage starts; it must be reported as a bootstrap/selection failure,
+not a passing or failing suite. CI selection policy and stage contracts are
+unchanged. Dependency source edits now reset the bootstrap cache as D27 requires;
+no runtime or cache-performance claim is made.

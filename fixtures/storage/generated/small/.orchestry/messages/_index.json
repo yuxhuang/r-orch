@@ -1,0 +1,71 @@
+[
+  {
+    "id": "msg_3db3bcB",
+    "channel": "direct",
+    "from_agent_id": "agt_BneL5Al",
+    "to_agent_id": "agt_cXM1BY8",
+    "subject": "Synthetic subject 1",
+    "body": "Invented message body 1.",
+    "created_at": "2025-01-01T00:03:23.781Z",
+    "status": "delivered",
+    "delivered_at": "2025-01-01T00:03:48.750Z"
+  },
+  {
+    "id": "msg_hHum_3H",
+    "channel": "broadcast",
+    "from_agent_id": "agt_Nsf31rn",
+    "to_agent_id": null,
+    "subject": "Synthetic subject 2",
+    "body": "Invented message body 2.",
+    "created_at": "2025-01-01T00:03:48.750Z",
+    "expires_at": "2025-01-02T00:03:48.750Z",
+    "status": "pending"
+  },
+  {
+    "id": "msg_bfQF-1p",
+    "channel": "lead",
+    "from_agent_id": "agt_Nsf31rn",
+    "to_agent_id": "agt_cXM1BY8",
+    "subject": "Synthetic subject 3",
+    "body": "Invented message body 3.",
+    "created_at": "2025-01-01T00:04:45.166Z",
+    "status": "delivered",
+    "delivered_at": "2025-01-01T00:05:39.717Z",
+    "team_id": "team_CGVprCM"
+  },
+  {
+    "id": "msg_EeuZVu_",
+    "channel": "direct",
+    "from_agent_id": "agt_BneL5Al",
+    "to_agent_id": "agt__AKo7jx",
+    "subject": "Synthetic subject 4",
+    "body": "Invented message body 4.",
+    "created_at": "2025-01-01T00:05:39.717Z",
+    "expires_at": "2025-01-02T00:05:39.717Z",
+    "status": "pending",
+    "reply_to": "msg_bfQF-1p"
+  },
+  {
+    "id": "msg_p7MP9N1",
+    "channel": "broadcast",
+    "from_agent_id": "agt_Nsf31rn",
+    "to_agent_id": null,
+    "subject": "Synthetic subject 5",
+    "body": "Invented message body 5.",
+    "created_at": "2025-01-01T00:06:20.810Z",
+    "status": "delivered",
+    "delivered_at": "2025-01-01T00:06:55.154Z"
+  },
+  {
+    "id": "msg_LhDlSnI",
+    "channel": "lead",
+    "from_agent_id": "agt_BneL5Al",
+    "to_agent_id": "agt_Nsf31rn",
+    "subject": "Synthetic subject 6",
+    "body": "Invented message body 6.",
+    "created_at": "2025-01-01T00:06:55.154Z",
+    "expires_at": "2025-01-02T00:06:55.154Z",
+    "status": "pending",
+    "team_id": "team_CGVprCM"
+  }
+]

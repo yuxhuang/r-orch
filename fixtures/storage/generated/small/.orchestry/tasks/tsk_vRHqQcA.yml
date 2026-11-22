@@ -1,0 +1,14 @@
+id: tsk_vRHqQcA
+title: Weigh the quiet orchard
+description: Invented work item 4; nothing here describes a real project.
+status: review
+priority: 3
+assignee: agt_cXM1BY8
+labels:
+- synthetic
+depends_on: []
+created_at: '2025-01-01T00:01:09.835Z'
+updated_at: '2025-01-01T00:01:20.407Z'
+attempts: 1
+max_attempts: 3
+goalId: goal_4QPvvMS
