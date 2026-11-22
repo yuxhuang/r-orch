@@ -328,17 +328,36 @@ fn absent_index_falls_back_to_id_order_and_bad_entries_refuse() {
 async fn reviewed_synthetic_documents_parse_with_the_real_legacy_types() {
     use super::document::{parse_json, parse_yaml};
     use orch_domain::{agent::Agent, state::OrchestratorState, task::Task};
-    let _: Task = parse_yaml(&include_bytes!("fixtures/task.yml")[..], Limits::YAML)
-        .await
-        .unwrap();
-    let _: Agent = parse_yaml(&include_bytes!("fixtures/agent.yml")[..], Limits::YAML)
-        .await
-        .unwrap();
-    let config = include_bytes!("fixtures/config.yml");
+    let _: Task = parse_yaml(
+        &include_bytes!(
+            "../../../../../fixtures/storage/generated/small/.orchestry/tasks/tsk_-8biszr.yml"
+        )[..],
+        Limits::YAML,
+    )
+    .await
+    .unwrap();
+    let _: Agent = parse_yaml(
+        &include_bytes!(
+            "../../../../../fixtures/storage/generated/small/.orchestry/agents/agt_BneL5Al.yml"
+        )[..],
+        Limits::YAML,
+    )
+    .await
+    .unwrap();
+    let config =
+        include_bytes!("../../../../../fixtures/storage/generated/small/.orchestry/config.yml");
     let _: serde_yaml_ng::Value = parse_yaml(&config[..], Limits::YAML).await.unwrap();
     let _: OrchestratorState =
-        parse_json(&include_bytes!("fixtures/state.json")[..], Limits::JSON).unwrap();
-    let events = include_bytes!("fixtures/events.jsonl");
+        parse_json(
+            &include_bytes!(
+                "../../../../../fixtures/storage/generated/small/.orchestry/state.json"
+            )[..],
+            Limits::JSON,
+        )
+        .unwrap();
+    let events = include_bytes!(
+        "../../../../../fixtures/storage/generated/small/.orchestry/runs/run_FkMwTnz.jsonl"
+    );
     let rows: Vec<_> =
         super::event::EventStream::<_, orch_domain::run::RunEvent>::new(&events[..], Limits::EVENT)
             .collect::<Result<_, _>>()
@@ -377,8 +396,10 @@ async fn merged_stale_index_source_matches_reviewed_expectations_without_writes(
         }
     }
     let (rows, problems) = reconcile(index.as_ref(), files, "id").unwrap();
-    let expected: Value =
-        serde_json::from_slice(include_bytes!("fixtures/index-disagrees.json")).unwrap();
+    let expected: Value = serde_json::from_slice(include_bytes!(
+        "../../../../../fixtures/storage/index-recovery/index-disagrees/expected.json"
+    ))
+    .unwrap();
     assert_eq!(
         serde_json::json!(rows.iter().map(|(id, _)| id).collect::<Vec<_>>()),
         expected["importer_1_1"]["task_order"]
@@ -407,9 +428,9 @@ async fn reviewed_absent_index_snapshot_uses_id_order_not_legacy_updated_order()
     use serde_json::Value;
     let mut files = std::collections::BTreeMap::new();
     for bytes in [
-        include_bytes!("fixtures/tsk_idx_a.yml").as_slice(),
-        include_bytes!("fixtures/tsk_idx_b.yml").as_slice(),
-        include_bytes!("fixtures/tsk_idx_c.yml").as_slice(),
+        include_bytes!("../../../../../fixtures/storage/index-recovery/index-absent-update-order/source/.orchestry/tasks/tsk_idx_a.yml").as_slice(),
+        include_bytes!("../../../../../fixtures/storage/index-recovery/index-absent-update-order/source/.orchestry/tasks/tsk_idx_b.yml").as_slice(),
+        include_bytes!("../../../../../fixtures/storage/index-recovery/index-absent-update-order/source/.orchestry/tasks/tsk_idx_c.yml").as_slice(),
     ] {
         let value: Value = super::document::parse_yaml(bytes, Limits::YAML)
             .await
@@ -417,8 +438,10 @@ async fn reviewed_absent_index_snapshot_uses_id_order_not_legacy_updated_order()
         files.insert(value["id"].as_str().unwrap().to_owned(), value);
     }
     let (rows, _) = super::index::reconcile(None, files, "id").unwrap();
-    let expected: Value =
-        serde_json::from_slice(include_bytes!("fixtures/index-absent-update-order.json")).unwrap();
+    let expected: Value = serde_json::from_slice(include_bytes!(
+        "../../../../../fixtures/storage/index-recovery/index-absent-update-order/expected.json"
+    ))
+    .unwrap();
     let ids = serde_json::json!(rows.iter().map(|(id, _)| id).collect::<Vec<_>>());
     assert_eq!(ids, expected["importer_1_1"]["task_order"]);
     assert_ne!(ids, expected["legacy_1_0"]["list_order"]);
@@ -566,4 +589,65 @@ fn iterative_json_structure_agrees_with_the_real_reader_on_synthetic_tokens() {
             );
         }
     }
+}
+
+/// This is only a document-read pass, not whole-source importer preflight.
+#[tokio::test]
+async fn landed_generated_documents_pass_budgets_without_changing_source() {
+    use std::{
+        collections::BTreeMap,
+        fs,
+        path::{Path, PathBuf},
+    };
+    fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut result = BTreeMap::new();
+        for entry in fs::read_dir(root).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                result.extend(snapshot(&path));
+            } else {
+                result.insert(path.clone(), fs::read(path).unwrap());
+            }
+        }
+        result
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/storage/generated/small");
+    let before = snapshot(&root);
+    let mut documents = 0;
+    let mut events = 0;
+    for (path, bytes) in &before {
+        match path.extension().and_then(|s| s.to_str()) {
+            Some("yml") => {
+                let _: serde_yaml_ng::Value =
+                    super::document::parse_yaml(bytes.as_slice(), Limits::YAML)
+                        .await
+                        .unwrap();
+                documents += 1;
+            }
+            Some("json") => {
+                let _: serde_json::Value =
+                    super::document::parse_json(bytes.as_slice(), Limits::JSON).unwrap();
+                documents += 1;
+            }
+            Some("jsonl") => {
+                for row in super::event::EventStream::<_, orch_domain::run::RunEvent>::new(
+                    bytes.as_slice(),
+                    Limits::EVENT,
+                ) {
+                    assert!(matches!(
+                        row.unwrap(),
+                        super::event::EventItem::Event { .. }
+                    ));
+                    events += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(documents > 0 && events > 0);
+    assert_eq!(snapshot(&root), before);
+    eprintln!(
+        "document pass: {documents} documents, {events} event lines, {} files unchanged",
+        before.len()
+    );
 }

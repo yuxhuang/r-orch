@@ -720,3 +720,11 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   F9 and R31).
 - T24 and T25 could be one PR if the wiring is small. They are planned as two so that the switch is reviewed
   as behaviour and the removal as a move.
+
+### T21 bounded reader slice
+
+The private `orch-infra::import` module compiles the read-only YAML/JSON budget pass,
+streaming event decoder and index reconciliation. Its unit tests use the landed synthetic
+generator and index-recovery corpus. This is document-level evidence only: whole-source
+preflight, path confinement, reports, writes, resume and live-copy verification remain T21 work.
+The v1 daemon remains file-backed.

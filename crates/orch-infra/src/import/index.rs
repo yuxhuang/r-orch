@@ -4,19 +4,19 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum IndexProblem {
+pub(crate) enum IndexProblem {
     Unreadable,
     Differs(String),
     MissingFile(String),
     Unlisted(String),
 }
 
-pub type Reconciled = (Vec<(String, Value)>, Vec<IndexProblem>);
+pub(crate) type Reconciled = (Vec<(String, Value)>, Vec<IndexProblem>);
 
 /// Files provide content; an index supplies order only. The caller has already
 /// validated stems and document identities. Missing/unusable indexes use id order.
 /// `identity` is `id` for entities and `key` for context documents.
-pub fn reconcile(
+pub(crate) fn reconcile(
     index: Option<&Value>,
     mut files: BTreeMap<String, Value>,
     identity: &str,

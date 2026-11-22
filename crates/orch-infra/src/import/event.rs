@@ -4,14 +4,14 @@ use serde::de::DeserializeOwned;
 use std::io::{BufRead, BufReader, Read};
 
 #[derive(Debug, PartialEq)]
-pub enum EventItem<T> {
+pub(crate) enum EventItem<T> {
     Event { line: u64, value: T },
     Gap { first: u64, last: u64 },
 }
 
 /// Retains at most `line_bytes + 1` bytes of a line, even without a newline.
 /// Dropping the stream stops reading; consumers control batching and disk checks.
-pub struct EventStream<R, T> {
+pub(crate) struct EventStream<R, T> {
     reader: BufReader<R>,
     limits: Limits,
     line: u64,
@@ -19,7 +19,7 @@ pub struct EventStream<R, T> {
     finished: bool,
 }
 impl<R: Read, T: DeserializeOwned> EventStream<R, T> {
-    pub fn new(reader: R, limits: Limits) -> Self {
+    pub(crate) fn new(reader: R, limits: Limits) -> Self {
         Self {
             reader: BufReader::with_capacity(8192, reader),
             limits,

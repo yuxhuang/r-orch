@@ -4,29 +4,29 @@ use std::{collections::HashMap, fmt, io::Read, path::Path};
 
 /// Source document ceilings from the spec's Import bounds table.
 #[derive(Clone, Copy, Debug)]
-pub struct Limits {
-    pub bytes: usize,
-    pub depth: u64,
-    pub nodes: u64,
-    pub aliases: u64,
-    pub expanded_bytes: u64,
+pub(crate) struct Limits {
+    pub(crate) bytes: usize,
+    pub(crate) depth: u64,
+    pub(crate) nodes: u64,
+    pub(crate) aliases: u64,
+    pub(crate) expanded_bytes: u64,
 }
 impl Limits {
-    pub const YAML: Self = Self {
+    pub(crate) const YAML: Self = Self {
         bytes: 1_048_576,
         depth: 64,
         nodes: 200_000,
         aliases: 64,
         expanded_bytes: 4_194_304,
     };
-    pub const JSON: Self = Self {
+    pub(crate) const JSON: Self = Self {
         bytes: 16_777_216,
         depth: 64,
         nodes: 1_000_000,
         aliases: 0,
         expanded_bytes: 0,
     };
-    pub const EVENT: Self = Self {
+    pub(crate) const EVENT: Self = Self {
         bytes: 65_536,
         ..Self::JSON
     };
@@ -34,11 +34,11 @@ impl Limits {
 
 /// A path-free refusal; the caller supplies the escaped source-relative path.
 #[derive(Debug)]
-pub struct Refusal {
-    pub rule: &'static str,
-    pub limit: u64,
-    pub observed: u64,
-    pub detail: String,
+pub(crate) struct Refusal {
+    pub(crate) rule: &'static str,
+    pub(crate) limit: u64,
+    pub(crate) observed: u64,
+    pub(crate) detail: String,
 }
 impl Refusal {
     fn budget(rule: &'static str, limit: u64, observed: u64) -> Self {
@@ -86,7 +86,7 @@ fn add(rule: &'static str, a: u64, b: u64, limit: u64) -> Result<u64> {
 }
 
 /// Reads at most the ceiling plus one byte. Does not open or modify a path.
-pub fn read_bounded(reader: impl Read, limit: usize) -> Result<Vec<u8>> {
+pub(crate) fn read_bounded(reader: impl Read, limit: usize) -> Result<Vec<u8>> {
     let cap = (limit as u64)
         .checked_add(1)
         .ok_or_else(|| Refusal::invalid("bytes", "invalid byte ceiling"))?;
@@ -125,7 +125,7 @@ fn place(
 
 /// Iterative event fold. Anchors memoize counts and heights, never expanded trees.
 /// Uses the same maintained event parser as the guarded 1.0 reader.
-pub fn check_yaml(bytes: &[u8], limits: Limits) -> Result<()> {
+pub(crate) fn check_yaml(bytes: &[u8], limits: Limits) -> Result<()> {
     use saphyr_parser::{Event, Parser};
     within("bytes", bytes.len() as u64, limits.bytes as u64)?;
     let text = std::str::from_utf8(bytes).map_err(|e| Refusal::invalid("parse", e))?;
@@ -204,7 +204,10 @@ pub fn check_yaml(bytes: &[u8], limits: Limits) -> Result<()> {
 }
 
 /// Budget the bytes first, then use 1.0's real reader to preserve merge semantics.
-pub async fn parse_yaml<T: DeserializeOwned>(reader: impl Read, limits: Limits) -> Result<T> {
+pub(crate) async fn parse_yaml<T: DeserializeOwned>(
+    reader: impl Read,
+    limits: Limits,
+) -> Result<T> {
     let bytes = read_bounded(reader, limits.bytes)?;
     check_yaml(&bytes, limits)?;
     let value = orch_core::definition_yaml::parse_yaml_bytes(Path::new("<source>"), &bytes)
@@ -229,7 +232,7 @@ enum Frame {
 
 /// Iterative structural events; serde_json validates scalar tokens. Member
 /// names do not count as nodes. No tree or recursive visitor is constructed.
-pub fn check_json(bytes: &[u8], limits: Limits) -> Result<()> {
+pub(crate) fn check_json(bytes: &[u8], limits: Limits) -> Result<()> {
     use serde::de::IgnoredAny;
     within("bytes", bytes.len() as u64, limits.bytes as u64)?;
     let invalid = || Refusal::invalid("parse", "invalid JSON structure");
@@ -344,7 +347,7 @@ pub fn check_json(bytes: &[u8], limits: Limits) -> Result<()> {
     Ok(())
 }
 
-pub fn parse_json<T: DeserializeOwned>(reader: impl Read, limits: Limits) -> Result<T> {
+pub(crate) fn parse_json<T: DeserializeOwned>(reader: impl Read, limits: Limits) -> Result<T> {
     let bytes = read_bounded(reader, limits.bytes)?;
     check_json(&bytes, limits)?;
     T::deserialize(&mut serde_json::Deserializer::from_slice(&bytes))
@@ -352,11 +355,5 @@ pub fn parse_json<T: DeserializeOwned>(reader: impl Read, limits: Limits) -> Res
 }
 
 #[cfg(test)]
-mod arithmetic_tests {
-    #[test]
-    fn overflow_is_a_refusal_even_at_the_largest_ceiling() {
-        let error = super::add("expanded_nodes", u64::MAX, 1, u64::MAX).unwrap_err();
-        assert_eq!(error.rule, "expanded_nodes");
-        assert_eq!(error.observed, u64::MAX);
-    }
-}
+#[path = "tests/arithmetic.rs"]
+mod arithmetic_tests;

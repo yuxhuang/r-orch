@@ -1,4 +1,0 @@
-{"timestamp":"2025-01-01T00:02:27.563Z","type":"command_run","data":"synthetic-command --step 0"}
-{"timestamp":"2025-01-01T00:02:31.529Z","type":"tool_call","data":"synthetic tool call 1"}
-{"timestamp":"2025-01-01T00:02:31.764Z","type":"agent_output","data":"synthetic output line 2 for run_FkMwTnz"}
-{"timestamp":"2025-01-01T00:02:31.977Z","type":"error","data":"synthetic run ended without success"}
