@@ -755,14 +755,24 @@ What follows for T21, and nothing here is built by this text:
 2. With the wiring, T21 implements the whole-array examination of an index (the reader returns at the first
    problem today, which names the class by the order of the entries), the name `index_duplicate`, the
    statements of what 1.0 did with a file, and the tests of the C-V and X-V vectors. X-V13 is a unit test of
-   the `import` module, where a reader can be injected.
-3. Two things the vectors pin are unverified until then: whether the bounded pass counts a bare `---` as one
-   document (C-V6), and the bounded reader's refusal of a stream of no document for an agent, a goal and a
-   team (C-V11).
-4. Where the evidence of issue 146 adds a record of its own under `docs/internal/`, T21 brings it up to date
-   with this contract or folds it into this plan, in the PR that does the wiring. That record says that the
-   spec owner must reconcile R109 with the compatibility table before the first caller; this section and the
-   spec rows it names are that reconciliation.
+   the `import` module, where a reader can be injected. The statement for `index_duplicate` gives both of
+   1.0's cases and claims neither (the spec's F19 and R122): 1.0 used the index as it stood only where
+   every entry was a complete entity of the directory's type, and otherwise rebuilt it. The import stops
+   on identities alone in both cases, and T21 adds no decoding of an entry as its entity type. X-V5's test
+   runs 1.0's own reader beside the import, on disposable copies, to show the two cases.
+3. Three things the vectors pin are unverified until then: whether the bounded pass counts a bare `---` as
+   one document (C-V6); the bounded reader's refusal of a stream of no document for an agent, a goal and a
+   team (C-V11); and what 1.0's reader does with a repeated identity in each directory that has an index,
+   which is read from the code and was run once outside the repository (X-V5).
+4. The evidence of issue 146 is on `main` since 2026-11-22: its tests, the section "T21 reader compatibility
+   evidence" of this plan, and a record of its own, `docs/internal/import-reader-compatibility.md`. This
+   contract changes none of the three. T21 brings the record and that section up to date with this
+   contract, or folds the record into this plan, in the PR that does the wiring. Two of their statements
+   are then out of date. They say that the spec owner must reconcile R109 with the compatibility table
+   before the first caller; this section and the spec rows it names are that reconciliation, once the
+   owner has merged them. And the record's row on damaged indexes says that decoded duplicates survive
+   1.0's reader. That is so for the test type of one field that the test uses. In a real directory an
+   array of identities alone does not decode, and 1.0 rebuilds it (the spec's F19).
 
 ### T21 bounded reader slice
 
