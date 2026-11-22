@@ -14,10 +14,26 @@
 //!
 //! Deadlines are UTC milliseconds from the caller's `Clock::now_ms()`; the
 //! port reads no clock. A due row is one with `due_at <= now_ms`, the 1.0
-//! rule (`now >= due_at`). Due rows come back in the order the scheduler
-//! should take them: earliest deadline first, ties by task id. 1.0 took them
-//! in queue order, which the ordering by deadline replaces; the order is
-//! stable, so a repeated read of an unchanged table gives the same rows.
+//! rule (`now >= due_at`). Due rows come back earliest deadline first, ties by
+//! task id. That is a read order: it is stable, so a repeated read of an
+//! unchanged table gives the same rows, and it is not a dispatch policy.
+//!
+//! What 1.0 did, for the code that maps or replaces it (T12, T14, T21):
+//!
+//! - The daemon never drained the queue in queue order. Only the test-only
+//!   `process_retry_queue`, which does not run in daemon mode, did. In daemon
+//!   mode retrying tasks are dispatched in ordinary candidate order and a row
+//!   only holds its task back while `now < due_at`. Dispatch order and agent
+//!   rotation stay with the scheduler's candidate order, not with this read.
+//! - A `due_at` that did not parse never held a task back: the daemon treated
+//!   it as already due, so a mapping must read it as due, not as never due.
+//! - A second enqueue for a task that already had a row was ignored, so the
+//!   first row stayed. [`RetryWrite::put_retry`] replaces. A consumer that
+//!   needs 1.0's rule calls [`RetryWrite::get_retry`] first.
+//!
+//! The port has no complete read of the rows; only a point read and the due
+//! read. A caller that needs every row, such as `state.get`, recovery or
+//! export, needs a read that is added later.
 
 use async_trait::async_trait;
 
@@ -29,6 +45,9 @@ pub mod fake;
 /// The most rows one [`RetryRead::read_due_retries`] call returns.
 pub const MAX_DUE_RETRIES: usize = 1_000;
 /// The longest `error` a row may hold, in bytes (text up to 64 KiB, decision 7).
+/// R97 also requires larger text, written through the API or imported, to be
+/// returned whole from the blob store. This slice stores no blob and refuses
+/// longer text; how T12 and T21 meet R97 is open and tracked in #109.
 pub const MAX_RETRY_ERROR_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
