@@ -445,7 +445,7 @@ All three names are the same program:
 | Crate | Modules |
 |---|---|
 | `orch-domain` | `task`, `agent`, `run`, `goal`, `team`, `message`, `state`, `config`, `global_config`, `events`, `error`, `transitions`, `scope`, `model_tiers`, `shop` (agent-shop + org-shop + default-agents) |
-| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
+| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity, event and lease port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock, v2}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{agent, config, context, daemon, goal, init, msg, org, org_template, remote, rpc, run, status, task, team}`, `doctor`, `logs`, `tui` (`DaemonBackend`), `update`, `web`, `routing`, `tree`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
@@ -470,10 +470,32 @@ family and its filters; `PageRequest` bounds each list and selects a supported
 sort. `store::fake::FakeStorage`, behind `test-support`, serializes in-memory
 writers and retains immutable read views. Its cursor registry holds query
 bindings and sort keys, not snapshots, and lives only as long as that fake.
+`ReadSnapshot` and `UnitOfWork` also expose the `events::{EventRead, EventWrite}`
+and `leases::{LeaseRead, LeaseWrite}` contracts. Event batches keep the first
+payload for each sequence and report stored/skipped counts; range/tail reads are
+in sequence order, gaps are retained when bounded pruning removes event rows.
+A gap is keyed by project, run and `after_seq`: replaying the same `dropped`
+count is a no-op; a conflicting count returns `InvalidEvents` without a write.
+Claim, renew, release and event append share the enclosing transaction. The fake
+uses one per-project lease state and one daemon lineage for every lease-bound
+write, checking task/run/lineage/epoch before event append even for an empty or
+fully duplicate batch. A claim refuses an occupied task, agent or run and consumes
+no epoch; release keeps the task's epoch counter. Lease times are caller-supplied
+UTC milliseconds from `Clock::now_ms()`. Claims and renewals use checked
+`now_ms + LEASE_MS`, where `LEASE_MS = 120_000`. The
+port reads no clock and never expires a lease merely because time advanced:
+after sleep the daemon renews its supervised runs before expiry (spec AP12).
+Physical suspend, recovery and engine expiry ordering are later integration checks.
+The lease and combined conformance scenarios accept backend factories with a
+fixture restore hook; the memory and file references are registered for the event,
+lease and combined families.
 `orch_infra::storage::v2::FileStorage` is the file reference for the
 conformance suite (test-only by design: nothing outside tests constructs it).
-Lease operations, other storage families, large-text storage in the blob store
-and SQLite are subsequent slices. The daemon and all v1 storage traits still use the existing
+Its project document also holds events, gaps, leases and epoch counters, replaced
+by one rename with the rows; the daemon lineage is one file at its root, and
+`restore_to_lineage` (fixture authority) ends every lease and keeps every counter.
+The remaining operational families, large-text storage in the blob store and SQLite
+are subsequent slices. The daemon and all v1 storage traits still use the existing
 file implementation; this additive module changes no runtime storage path.
 
 ### 3.3.1 `orch mcp` (`orch-cli::mcp`)

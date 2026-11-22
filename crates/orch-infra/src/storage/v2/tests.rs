@@ -3,10 +3,13 @@
 
 use std::path::Path;
 
+use orch_core::store::events::{EventGap, SequencedEvent};
+use orch_core::store::leases::{ClaimOutcome, Lease, NewLease};
 use orch_core::store::*;
 use orch_core::test_support::{assert_hermetic, make_agent, make_task};
 use orch_domain::{
-    DEFAULT_TEAM_CONFIG, Message, MessageChannel, MessageStatus, Task, Team, TeamStatus,
+    DEFAULT_TEAM_CONFIG, Message, MessageChannel, MessageStatus, RunEvent, RunEventType, Task,
+    Team, TeamStatus,
 };
 
 use super::FileStorage;
@@ -53,6 +56,10 @@ fn documents(root: &Path) -> Vec<std::path::PathBuf> {
     let mut found = vec![];
     for dir in std::fs::read_dir(root).unwrap() {
         let dir = dir.unwrap().path();
+        // The root also holds the daemon's lineage file once a restore ran.
+        if !dir.is_dir() {
+            continue;
+        }
         for file in std::fs::read_dir(&dir).unwrap() {
             found.push(file.unwrap().path());
         }
@@ -337,4 +344,195 @@ async fn default_orders_put_their_own_column_before_the_id_tie_breaker() {
         let ids: Vec<_> = page.items.iter().map(|r| r.entity.id()).collect();
         assert_eq!(ids, expected, "{filter:?}");
     }
+}
+
+fn event(seq: u64) -> SequencedEvent {
+    SequencedEvent {
+        seq,
+        event: RunEvent {
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            event_type: RunEventType::AgentOutput,
+            data: serde_json::json!({ "seq": seq }),
+        },
+    }
+}
+
+fn new_lease(task: &str, agent: &str, run: &str) -> NewLease {
+    NewLease {
+        task: task.into(),
+        agent: agent.into(),
+        run: run.into(),
+    }
+}
+
+async fn claim(s: &FileStorage, new: NewLease) -> Lease {
+    s.transaction(owner("p"), Lane::Claims, move |u| {
+        match u.claim_lease(&new, 1_000)? {
+            ClaimOutcome::Granted(lease) => Ok(lease),
+            ClaimOutcome::Held(lease) => panic!("held by {lease:?}"),
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn events_gaps_leases_and_epochs_survive_a_new_instance() {
+    let root = root();
+    let first = FileStorage::new(root.path());
+    let one = claim(&first, new_lease("t", "a", "r1")).await;
+    let (lineage, epoch) = (one.lineage.clone(), one.epoch);
+    first
+        .write(
+            owner("p"),
+            Lane::Events,
+            Box::new(move |u| {
+                u.append_events("r1", &lineage, epoch, &[event(2), event(1)])?;
+                u.record_event_gap("r1", 2, 3)?;
+                u.release_lease("t", &lineage, epoch)?;
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap();
+    let second_lease = claim(&first, new_lease("t", "a", "r2")).await;
+    drop(first);
+
+    let second = FileStorage::new(root.path());
+    let view = second.read(owner("p")).await.unwrap();
+    assert_eq!(
+        view.read_events("r1", 0, 10).await.unwrap(),
+        vec![event(1), event(2)]
+    );
+    assert_eq!(
+        view.read_event_gaps("r1").await.unwrap(),
+        vec![EventGap {
+            after_seq: 2,
+            dropped: 3
+        }]
+    );
+    assert_eq!(view.read_leases().await.unwrap(), vec![second_lease]);
+    // The counter outlived the release and the instance.
+    second
+        .write(
+            owner("p"),
+            Lane::Claims,
+            Box::new(|u| {
+                let (lineage, epoch) = {
+                    let lease = u.get_lease("t")?.unwrap();
+                    (lease.lineage, lease.epoch)
+                };
+                u.release_lease("t", &lineage, epoch)?;
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(claim(&second, new_lease("t", "a", "r3")).await.epoch, 3);
+}
+
+#[tokio::test]
+async fn a_restore_ends_leases_keeps_epochs_and_the_lineage_outlives_the_instance() {
+    let root = root();
+    let first = FileStorage::new(root.path());
+    let before = claim(&first, new_lease("t", "a", "r1")).await;
+    first.restore_to_lineage("after-restore").await.unwrap();
+    drop(first);
+
+    let second = FileStorage::new(root.path());
+    assert!(
+        second
+            .read(owner("p"))
+            .await
+            .unwrap()
+            .read_leases()
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let after = claim(&second, new_lease("t", "a", "r2")).await;
+    assert_eq!(after.lineage, "after-restore");
+    assert_eq!((before.epoch, after.epoch), (1, 2));
+}
+
+#[tokio::test]
+async fn a_lease_past_its_epoch_counter_is_refused() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    claim(&s, new_lease("t", "a", "r1")).await;
+    let [document] = documents(root.path()).try_into().unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
+    value["leases"]["epochs"]["t"] = 0.into();
+    std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(matches!(
+        s.read(owner("p")).await,
+        Err(StoreError::Backend(_))
+    ));
+}
+
+#[tokio::test]
+async fn two_leases_on_one_agent_are_refused() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    claim(&s, new_lease("t1", "a", "r1")).await;
+    let [document] = documents(root.path()).try_into().unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
+    let mut second = value["leases"]["leases"]["t1"].clone();
+    second["run"] = "r2".into();
+    value["leases"]["leases"]["t2"] = second;
+    value["leases"]["epochs"]["t2"] = 1.into();
+    std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(matches!(
+        s.read(owner("p")).await,
+        Err(StoreError::Backend(_))
+    ));
+}
+
+#[tokio::test]
+async fn operations_that_change_nothing_do_not_rewrite_the_document() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    let lease = claim(&s, new_lease("t", "a", "r1")).await;
+    let (lineage, epoch) = (lease.lineage.clone(), lease.epoch);
+    s.write(
+        owner("p"),
+        Lane::Events,
+        Box::new({
+            let lineage = lineage.clone();
+            move |u| {
+                u.append_events("r1", &lineage, epoch, &[event(1)])?;
+                u.record_event_gap("r1", 1, 1)
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    let [document] = documents(root.path()).try_into().unwrap();
+    // A commit replaces the file, so a new inode shows a rewrite.
+    let inode =
+        |path: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap());
+    let before = inode(&document);
+    s.write(
+        owner("p"),
+        Lane::Events,
+        Box::new(move |u| {
+            // A duplicate batch, an empty batch, a repeated gap, a prune of
+            // nothing, a refused claim and a refused renewal change no row.
+            u.append_events("r1", &lineage, epoch, &[event(1)])?;
+            u.append_events("r1", &lineage, epoch, &[])?;
+            u.record_event_gap("r1", 1, 1)?;
+            u.prune_events("other-run", 1)?;
+            assert!(matches!(
+                u.claim_lease(&new_lease("t", "b", "r9"), 0)?,
+                ClaimOutcome::Held(_)
+            ));
+            u.renew_lease("t", &lineage, epoch + 1, 0).unwrap_err();
+            Ok(())
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(inode(&document), before);
 }

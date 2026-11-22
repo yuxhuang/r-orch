@@ -4,13 +4,16 @@
 //! no SQLite (spec R17). It is not a product backend: nothing opens it outside
 //! tests, and the 1.0 stores in this module's parent are not changed by it.
 //!
-//! One document per project holds every row and the position counters, and is
-//! replaced by a rename, so a commit is one atomic step. Writers take one gate,
+//! One document per project holds every row, event, gap, lease and counter, and
+//! is replaced by a rename, so a commit is one atomic step. Writers take one gate,
 //! as the port requires. A read loads its own copy of the document, so it keeps
 //! one committed state whatever commits next. Surviving a process stop mid-way
 //! is required of SQLite only (R17); the rename is only there so a reader never
 //! sees half a commit. A document that does not parse is an error, never an
 //! empty project: a later write would turn corruption into loss.
+//!
+//! The daemon's lineage is daemon-wide, so it is one small file at the root, and
+//! [`FileStorage::restore_to_lineage`] is the fixture's stand-in for a restore.
 //!
 //! Cursors are tokens into a table held by the instance: they name the sort key
 //! of the last row returned and the project, filter and sort they were issued
@@ -22,11 +25,14 @@
 //! project directory is followed, and the document is created 0600 in a
 //! directory with the process umask); a load reads the whole document with no
 //! size cap, and a write rewrites all of it; a document that was removed reads
-//! as a project that was never written, so positions start again at 1; the
-//! rename is not preceded by a sync; and a hand-edited document is checked only
-//! for a row listed twice and a position past its counter, not for two task ids
-//! with one fold key or two rows at one position.
+//! as a project that was never written, so positions and lease epochs start
+//! again at 1; the rename is not preceded by a sync; and a hand-edited document
+//! is checked only for a row listed twice, a position past its counter, and a
+//! lease past its epoch counter or sharing an agent or a run, not for two task
+//! ids with one fold key, two rows at one position, or events of no known run.
 
+mod events;
+mod leases;
 mod order;
 #[cfg(test)]
 mod tests;
@@ -37,6 +43,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use orch_core::Error;
+use orch_core::store::events::{
+    AppendResult, EventGap, EventRead, EventWrite, PruneResult, SequencedEvent,
+};
+use orch_core::store::leases::{ClaimOutcome, Lease, LeaseRead, LeaseWrite, NewLease};
 use orch_core::store::{
     Caller, Cursor, Entity, EntityKind, Filter, Lane, Page, PageRequest, ReadSnapshot, Record,
     Result, Revision, Sort, Storage, StoreError, UnitOfWork, WriteWork,
@@ -44,9 +54,14 @@ use orch_core::store::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
+use events::Events;
+use leases::{By, Leases};
 use order::{Key, check_sort, key, matches};
 
 const DOCUMENT: &str = "state.json";
+const LINEAGE: &str = "lineage";
+/// The lineage of a root that no restore has touched.
+const FIRST_LINEAGE: &str = "file-lineage-1";
 
 /// Rows of one project, in memory.
 #[derive(Clone, Default)]
@@ -55,12 +70,18 @@ struct Project {
     /// The last position handed out per family. Never lowered, so a deletion
     /// does not free a position.
     counters: BTreeMap<EntityKind, u64>,
+    events: Events,
+    leases: Leases,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Document {
     counters: BTreeMap<EntityKind, u64>,
     records: Vec<Record>,
+    #[serde(default)]
+    events: Events,
+    #[serde(default)]
+    leases: Leases,
 }
 
 struct Bookmark {
@@ -98,6 +119,58 @@ impl FileStorage {
         let hex: String = project.bytes().map(|b| format!("{b:02x}")).collect();
         self.root.join(format!("p-{hex}"))
     }
+
+    /// Fixture authority only: stands for a restore, which starts a new lineage,
+    /// ends every project's leases and keeps every epoch counter (R77, R138).
+    /// It takes the writer gate, so it never interleaves with a commit.
+    pub async fn restore_to_lineage(&self, lineage: &str) -> Result<()> {
+        let root = self.root.clone();
+        let lineage = lineage.to_owned();
+        let gate = self.writer.clone().lock_owned().await;
+        blocking(move || {
+            let _gate = gate;
+            let entries = match std::fs::read_dir(&root) {
+                Ok(entries) => entries.collect::<std::io::Result<Vec<_>>>(),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+                Err(e) => Err(e),
+            }
+            .map_err(|e| io_error("cannot list", &root, e))?;
+            for entry in entries {
+                let dir = entry.path();
+                if !entry.file_name().to_string_lossy().starts_with("p-") || !dir.is_dir() {
+                    continue;
+                }
+                let mut project = load(&dir)?;
+                if !project.leases.is_empty() {
+                    project.leases.end_all();
+                    persist(&dir, &project)?;
+                }
+            }
+            write_lineage(&root, &lineage)
+        })
+        .await
+    }
+}
+
+fn read_lineage(root: &Path) -> Result<String> {
+    let path = root.join(LINEAGE);
+    match std::fs::read_to_string(&path) {
+        Ok(lineage) => Ok(lineage),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FIRST_LINEAGE.to_owned()),
+        Err(e) => Err(io_error("cannot read", &path, e)),
+    }
+}
+
+fn write_lineage(root: &Path, lineage: &str) -> Result<()> {
+    std::fs::create_dir_all(root).map_err(|e| io_error("cannot create", root, e))?;
+    let mut temp =
+        tempfile::NamedTempFile::new_in(root).map_err(|e| io_error("cannot write in", root, e))?;
+    std::io::Write::write_all(&mut temp, lineage.as_bytes())
+        .map_err(|e| io_error("cannot write", temp.path(), e))?;
+    let path = root.join(LINEAGE);
+    temp.persist(&path)
+        .map_err(|e| io_error("cannot replace", &path, e.error))?;
+    Ok(())
 }
 
 fn io_error(context: &str, path: &Path, source: std::io::Error) -> StoreError {
@@ -134,7 +207,13 @@ fn load(dir: &Path) -> Result<Project> {
     let mut project = Project {
         rows: BTreeMap::new(),
         counters: document.counters,
+        events: document.events,
+        leases: document.leases,
     };
+    project
+        .leases
+        .validate()
+        .map_err(|detail| corrupt(&path, detail))?;
     for record in document.records {
         let kind = record.entity.kind();
         let id = record.entity.id().to_owned();
@@ -155,6 +234,8 @@ fn persist(dir: &Path, project: &Project) -> Result<()> {
     let document = Document {
         counters: project.counters.clone(),
         records: project.rows.values().cloned().collect(),
+        events: project.events.clone(),
+        leases: project.leases.clone(),
     };
     let temp =
         tempfile::NamedTempFile::new_in(dir).map_err(|e| io_error("cannot write in", dir, e))?;
@@ -185,9 +266,11 @@ async fn blocking<T: Send + 'static>(
 impl Storage for FileStorage {
     async fn read(&self, caller: Caller) -> Result<Box<dyn ReadSnapshot>> {
         let dir = self.project_dir(&caller.project);
+        let root = self.root.clone();
         let cursors = self.cursors.clone();
         let session = blocking(move || {
             Ok(Session {
+                lineage: read_lineage(&root)?,
                 project: load(&dir)?,
                 caller,
                 dirty: false,
@@ -200,6 +283,7 @@ impl Storage for FileStorage {
 
     async fn write(&self, caller: Caller, _lane: Lane, work: WriteWork) -> Result<()> {
         let dir = self.project_dir(&caller.project);
+        let root = self.root.clone();
         let cursors = self.cursors.clone();
         // The guard moves into the blocking work: a caller that stops waiting
         // does not release the gate while the work still runs.
@@ -207,6 +291,7 @@ impl Storage for FileStorage {
         blocking(move || {
             let _gate = gate;
             let mut session = Session {
+                lineage: read_lineage(&root)?,
                 project: load(&dir)?,
                 caller,
                 dirty: false,
@@ -226,6 +311,8 @@ impl Storage for FileStorage {
 /// copy, which is dropped unless the work returned `Ok`.
 struct Session {
     caller: Caller,
+    /// The daemon's lineage as of this session's start.
+    lineage: String,
     project: Project,
     dirty: bool,
     cursors: Arc<Mutex<Cursors>>,
@@ -408,5 +495,104 @@ impl UnitOfWork for Session {
             position,
             ..old
         }))
+    }
+}
+
+#[async_trait]
+impl LeaseRead for Session {
+    async fn read_lease(&self, task: &str) -> Result<Option<Lease>> {
+        Ok(self.project.leases.by_task(task))
+    }
+    async fn read_agent_lease(&self, agent: &str) -> Result<Option<Lease>> {
+        Ok(self.project.leases.by_agent(agent))
+    }
+    async fn read_leases(&self) -> Result<Vec<Lease>> {
+        Ok(self.project.leases.all())
+    }
+}
+
+impl LeaseWrite for Session {
+    fn claim_lease(&mut self, new: &NewLease, now_ms: i64) -> Result<ClaimOutcome> {
+        let outcome = self.project.leases.claim(&self.lineage, new, now_ms)?;
+        self.dirty |= matches!(outcome, ClaimOutcome::Granted(_));
+        Ok(outcome)
+    }
+
+    fn renew_lease(&mut self, task: &str, lineage: &str, epoch: u64, now_ms: i64) -> Result<Lease> {
+        let lease = self.project.leases.renew(
+            &self.caller,
+            &self.lineage,
+            task,
+            (lineage, epoch),
+            now_ms,
+        )?;
+        self.dirty = true;
+        Ok(lease)
+    }
+
+    fn release_lease(&mut self, task: &str, lineage: &str, epoch: u64) -> Result<Lease> {
+        let lease =
+            self.project
+                .leases
+                .release(&self.caller, &self.lineage, task, (lineage, epoch))?;
+        self.dirty = true;
+        Ok(lease)
+    }
+
+    fn get_lease(&self, task: &str) -> Result<Option<Lease>> {
+        Ok(self.project.leases.by_task(task))
+    }
+    fn get_agent_lease(&self, agent: &str) -> Result<Option<Lease>> {
+        Ok(self.project.leases.by_agent(agent))
+    }
+    fn list_leases(&self) -> Result<Vec<Lease>> {
+        Ok(self.project.leases.all())
+    }
+}
+
+#[async_trait]
+impl EventRead for Session {
+    async fn read_events(
+        &self,
+        run: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<SequencedEvent>> {
+        self.project.events.read(run, after_seq, limit)
+    }
+    async fn read_events_tail(&self, run: &str, count: usize) -> Result<Vec<SequencedEvent>> {
+        self.project.events.tail(run, count)
+    }
+    async fn read_event_gaps(&self, run: &str) -> Result<Vec<EventGap>> {
+        Ok(self.project.events.gaps(run))
+    }
+}
+
+impl EventWrite for Session {
+    fn append_events(
+        &mut self,
+        run: &str,
+        lineage: &str,
+        epoch: u64,
+        batch: &[SequencedEvent],
+    ) -> Result<AppendResult> {
+        // The fence comes first, so an empty or duplicate batch is refused too.
+        self.project
+            .leases
+            .check(&self.caller, &self.lineage, By::Run(run), lineage, epoch)?;
+        let result = self.project.events.append(run, batch)?;
+        self.dirty |= result.stored > 0;
+        Ok(result)
+    }
+
+    fn record_event_gap(&mut self, run: &str, after_seq: u64, dropped: u64) -> Result<()> {
+        self.dirty |= self.project.events.gap(run, after_seq, dropped)?;
+        Ok(())
+    }
+
+    fn prune_events(&mut self, run: &str, max_rows: usize) -> Result<PruneResult> {
+        let result = self.project.events.prune(run, max_rows)?;
+        self.dirty |= result.deleted > 0;
+        Ok(result)
     }
 }

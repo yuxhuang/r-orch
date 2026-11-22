@@ -18,6 +18,8 @@ type Rows = BTreeMap<(EntityKind, String), Record>;
 #[derive(Clone, Default)]
 struct Project {
     rows: Rows,
+    events: events::fake::EventState,
+    leases: leases::fake::LeaseState,
     positions: BTreeMap<EntityKind, u64>,
 }
 
@@ -45,14 +47,26 @@ struct Bookmarks {
 }
 
 /// Serializable writers and immutable snapshots, with no filesystem or clock.
-#[derive(Default)]
 pub struct FakeStorage {
     projects: AsyncMutex<BTreeMap<String, Project>>,
     bookmarks: Arc<Mutex<Bookmarks>>,
+    /// Daemon-wide, so it lives beside the projects. Lock `projects` first.
+    lineage: Mutex<String>,
+}
+
+impl Default for FakeStorage {
+    fn default() -> Self {
+        Self {
+            projects: AsyncMutex::default(),
+            bookmarks: Arc::default(),
+            lineage: Mutex::new("fake-lineage-1".into()),
+        }
+    }
 }
 
 struct View {
     caller: Caller,
+    lineage: String,
     project: Project,
     bookmarks: Arc<Mutex<Bookmarks>>,
 }
@@ -67,8 +81,10 @@ impl Storage for FakeStorage {
             .get(&caller.project)
             .cloned()
             .unwrap_or_default();
+        let lineage = self.lineage();
         Ok(Box::new(View {
             caller,
+            lineage,
             project,
             bookmarks: self.bookmarks.clone(),
         }))
@@ -79,12 +95,32 @@ impl Storage for FakeStorage {
         let project = projects.get(&caller.project).cloned().unwrap_or_default();
         let mut view = View {
             caller,
+            lineage: self.lineage(),
             project,
             bookmarks: self.bookmarks.clone(),
         };
         work(&mut view)?;
         projects.insert(view.caller.project, view.project);
         Ok(())
+    }
+}
+
+impl FakeStorage {
+    fn lineage(&self) -> String {
+        self.lineage
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Fixture authority only: stands for a restore, which starts a new lineage,
+    /// ends every lease and keeps every epoch counter (R77, R138).
+    pub async fn restore_to_lineage(&self, lineage: &str) {
+        let mut projects = self.projects.lock().await;
+        for project in projects.values_mut() {
+            project.leases.end_all();
+        }
+        *self.lineage.lock().unwrap_or_else(PoisonError::into_inner) = lineage.into();
     }
 }
 
@@ -374,4 +410,95 @@ fn sort_key(row: &Record, sort: Sort) -> Key {
     };
     key.push(Text(row.entity.id().into()));
     key
+}
+
+#[async_trait]
+impl leases::LeaseRead for View {
+    async fn read_lease(&self, task: &str) -> Result<Option<leases::Lease>> {
+        Ok(self.project.leases.by_task(task))
+    }
+    async fn read_agent_lease(&self, agent: &str) -> Result<Option<leases::Lease>> {
+        Ok(self.project.leases.by_agent(agent))
+    }
+    async fn read_leases(&self) -> Result<Vec<leases::Lease>> {
+        Ok(self.project.leases.all())
+    }
+}
+
+impl leases::LeaseWrite for View {
+    fn claim_lease(&mut self, new: &leases::NewLease, now_ms: i64) -> Result<leases::ClaimOutcome> {
+        self.project.leases.claim(&self.lineage, new, now_ms)
+    }
+    fn renew_lease(
+        &mut self,
+        task: &str,
+        lineage: &str,
+        epoch: u64,
+        now_ms: i64,
+    ) -> Result<leases::Lease> {
+        self.project
+            .leases
+            .renew(&self.caller, &self.lineage, task, lineage, epoch, now_ms)
+    }
+    fn release_lease(&mut self, task: &str, lineage: &str, epoch: u64) -> Result<leases::Lease> {
+        self.project
+            .leases
+            .release(&self.caller, &self.lineage, task, lineage, epoch)
+    }
+    fn get_lease(&self, task: &str) -> Result<Option<leases::Lease>> {
+        Ok(self.project.leases.by_task(task))
+    }
+    fn get_agent_lease(&self, agent: &str) -> Result<Option<leases::Lease>> {
+        Ok(self.project.leases.by_agent(agent))
+    }
+    fn list_leases(&self) -> Result<Vec<leases::Lease>> {
+        Ok(self.project.leases.all())
+    }
+}
+
+#[async_trait]
+impl events::EventRead for View {
+    async fn read_events(
+        &self,
+        run: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<events::SequencedEvent>> {
+        self.project.events.read(run, after_seq, limit)
+    }
+    async fn read_events_tail(
+        &self,
+        run: &str,
+        count: usize,
+    ) -> Result<Vec<events::SequencedEvent>> {
+        self.project.events.tail(run, count)
+    }
+    async fn read_event_gaps(&self, run: &str) -> Result<Vec<events::EventGap>> {
+        Ok(self.project.events.gaps(run))
+    }
+}
+
+impl events::EventWrite for View {
+    fn append_events(
+        &mut self,
+        run: &str,
+        lineage: &str,
+        epoch: u64,
+        batch: &[events::SequencedEvent],
+    ) -> Result<events::AppendResult> {
+        self.project.leases.check(
+            &self.caller,
+            &self.lineage,
+            leases::fake::By::Run(run),
+            lineage,
+            epoch,
+        )?;
+        self.project.events.append(run, batch)
+    }
+    fn record_event_gap(&mut self, run: &str, after_seq: u64, dropped: u64) -> Result<()> {
+        self.project.events.gap(run, after_seq, dropped)
+    }
+    fn prune_events(&mut self, run: &str, max_rows: usize) -> Result<events::PruneResult> {
+        self.project.events.prune(run, max_rows)
+    }
 }
