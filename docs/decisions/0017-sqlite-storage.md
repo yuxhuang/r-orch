@@ -24,11 +24,20 @@
   recommended no option. A third lies outside the answers: the owner's word on using the live copy for
   the plan's task T4c. An answer is not the acceptance of this
   ADR: it stays proposed until the owner merges the PR that carries this corrected text.
+- The owner's decision of 2026-11-21 on latency (the spec's record I;
+  [issue 98](https://github.com/yuxhuang/r-orch/issues/98)): claim latency is not a concern of release 1.1.
+  Decision 12 is amended by a dated note at its head: run events go into SQLite in batches, with no
+  measurement as a condition and no fallback in 1.1. The measurement, both budgets and the selection of a path
+  are deferred, and gate line 7 is retired. Their text is kept in decisions 9, 12 and 23 as a record, and the
+  owner's ruling and the answers on AP13 are not withdrawn. The numbers and results of AP13, named above as
+  still the owner's, are deferred with them, and nothing in 1.1 waits for them.
 - Where this text stands: the first-review text of this ADR (decisions 1 to 19 as first drafted, before the
   review corrections and the owner's answers) reached `main` on 2026-11-21, when the owner merged the PR
   that carried it at revision `f5637805`. This text replaces it through a follow-up PR and is pending until
   that PR merges. The record does not say that the first merge accepts this ADR, and it is read here as not
-  accepting it.
+  accepting it. Since then the corrected text (`34b3b4d`) reached `main` on 2026-11-22 (UTC) through that
+  follow-up PR. The revision that adds the note of 2026-11-21 changes no status: what that merge means for
+  the status of this ADR is for the approval gate to record.
 
 ## Context
 
@@ -104,7 +113,8 @@ across a crash, lists that do not load everything, and a retried request that ru
    lane's wait), so none of them starves, and a bulk job queues one transaction at a time, so overdue bulk work
    cannot pile up ahead of anything. A claim therefore waits behind at most the one transaction in progress.
    That is an order and not a time: a running statement and a commit are not cut short, so whether a wait is
-   met is a measured result (decision 12) and never a consequence of the lanes. The waiting event batches of
+   met is a measured result (decision 12) and never a consequence of the lanes. Since 2026-11-21 no such
+   measurement is part of release 1.1 (the note at the head of decision 12). The waiting event batches of
    all runs share one transaction, so the event lane puts at most one transaction ahead of an entity change.
    Bulk work (event batches, pruning, expiry, import) is cut into transactions of at most 1,000 rows or 20 ms.
    An operation that must be atomic is never cut; if it exceeds the bound it runs whole and is counted.
@@ -123,7 +133,14 @@ across a crash, lists that do not load everything, and a retried request that ru
     unreferenced file, which the sweep removes. Text up to 64 KiB may live in a column; larger or non-text
     bytes go behind the blob-store port, whose only adapter in 1.1 is files on disk.
 
-12. **Run events go into SQLite, in batches, unless the measurement says otherwise.** A collector numbers its
+12. **Run events go into SQLite, in batches, unless the measurement says otherwise.** *Amended by the
+    owner's decision of 2026-11-21 (the spec's record I): in release 1.1 run events go into SQLite, in batches,
+    and no measurement says otherwise. No claim-latency budget is met or measured in 1.1, no path is selected
+    from a miss, the path that ships is not measured as built, and the fallback of per-run files is not
+    built. Everything in this decision from "If the measured throughput cannot meet" on is kept as a record
+    and is dormant: the owner's direction, ruling and answers in it are not withdrawn, and they have nothing
+    to act on until latency is taken up again. The first run's figures are kept in
+    [issue 98](https://github.com/yuxhuang/r-orch/issues/98).* A collector numbers its
     run's events from 1 and hands batches to the events lane; the append ignores a sequence number already
     stored, so a repeated batch is harmless. If the measured throughput cannot meet the claim-latency budget
     (deliverable D), events are kept as per-run files in the data directory, each named by a hash (decision 20),
@@ -380,7 +397,8 @@ across a crash, lists that do not load everything, and a retried request that ru
     each checkpoint's result. Neither acts on the length of the log's file, which SQLite does not shorten
     after a checkpoint. With `synchronous = NORMAL` a commit is not synced and a checkpoint is; the proposal
     under AP13 is `fullfsync` and `checkpoint_fullfsync` on, so that on macOS a checkpoint's sync is a full
-    flush and is measured as one. A failure from
+    flush and is measured as one. Since 2026-11-21 its cost is not measured in release 1.1, and both
+    settings are built as the spec's R126 states them (the note at the head of decision 12). A failure from
     outside a transaction's logic is retried with nothing dropped, or fails the writer, which then refuses
     mutations and reports itself without the database (R128); an idle writer never fails for having nothing
     to commit. A run's finish is written to a spool file and
@@ -438,7 +456,14 @@ across a crash, lists that do not load everything, and a retried request that ru
 - **One database per project.** A claim and its lease would still be one database, but daemon-wide tables
   (identities, attention, request keys) would need a second file and cross-file transactions in 1.5.
 - **Run events kept as JSONL for good.** No transaction with the run row, a second pruning and backup path,
-  and no tail read by index. Kept only as the measured fallback of decision 12.
+  and no tail read by index. Kept only as the measured fallback of decision 12, and since 2026-11-21 not
+  built in release 1.1 at all (the note at the head of decision 12).
+- **Hold events out of SQLite until a latency measurement has passed.** Decision 12 as it stood until
+  2026-11-21, with the fallback for a miss. Deferred by the owner on 2026-11-21, whose words are in the
+  spec's record I: latency is not a concern of this phase. What that gate asked for before any product code
+  stored an event is not built or run in release 1.1: a measurement campaign, a method with points still
+  open, and a second event path as its fallback. Correctness and data safety gate release 1.1. The first
+  run's miss on macOS is on record (issue 98), and this choice does not answer it.
 - **An in-place conversion of `.orchestry/`.** It destroys the only rollback.
 - **A reorder on every save, kept inside the port.** It is the 1.0 rule the owner removed: it makes every write
   an ordering side effect that no caller asked for and no index can serve.
@@ -597,7 +622,9 @@ across a crash, lists that do not load everything, and a retried request that ru
   let the workspace keep `unsafe_code` forbidden. Decision 19 names it.
 - All writes share one thread of work. The budgets of decision 9 are promises that must be measured
   (deliverable D) and watched (`metrics.get`); the fallback of decision 12 exists because the promise might not
-  hold for events.
+  hold for events. Since 2026-11-21 they are not measured in release 1.1 and no fallback is built. Release 1.1
+  then ships one event path, with the first run's miss of the first budget on macOS on record (issue 98) and
+  with `metrics.get` as the only watch on the waits.
 - `docs/TRAITS-FROZEN.md` §2, ARCHITECTURE §1, §2.1, §5.1 to §5.3 and §6.1, and the RUNBOOK's storage
   procedures change. The stable-sort rule stays: the scheduler still sorts in memory.
 - Backups become a product duty: database, blobs and repositories as one restorable point. A restore
@@ -610,7 +637,8 @@ across a crash, lists that do not load everything, and a retried request that ru
   relied on here. A checkpoint that keeps failing, a backlog that stays, and corruption seen by
   any connection are shown by `orch status` and `orch doctor` and are not attention items.
 - `orch-peer` is touched at the places decision 18 names, which the owner approved, and nowhere else.
-- Files in the data directory can no longer be found by an id with `ls`: an event file and a project record
+- Files in the data directory can no longer be found by an id with `ls`: an event file (which exists only
+  with the fallback, not built in release 1.1) and a project record
   are named by hashes, which the storage reference (`docs/storage.md`) must explain how to compute. A copy
   of a 1.0 project or of a backup made with hard links (some snapshot tools) is refused by the importer and
   by the restore and must be copied again as plain files; a backup never shares files with the live blob

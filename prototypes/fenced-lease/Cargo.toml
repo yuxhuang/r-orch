@@ -1,0 +1,35 @@
+[package]
+name = "fenced-lease-prototype"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+publish = false
+
+# Deliberately independent: never linked into an orch product crate.
+[workspace]
+members = ["."]
+resolver = "3"
+
+[workspace.dependencies]
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled", "backup", "cache"] }
+tempfile = "3.27"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+allow_attributes_without_reason = "deny"
+
+[lints]
+workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
