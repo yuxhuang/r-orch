@@ -228,6 +228,20 @@ fn tmp_name() -> String {
     nanoid::nanoid!(32, &HEX)
 }
 
+impl orch_core::store::blob::BlobStore for DiskBlobStore {
+    type Hash = BlobHash;
+    type Error = BlobError;
+    fn put(&self, bytes: &[u8]) -> Result<BlobHash> {
+        DiskBlobStore::put(self, bytes)
+    }
+    fn get(&self, hash: &BlobHash) -> Result<Vec<u8>> {
+        DiskBlobStore::get(self, hash)
+    }
+    fn remove(&self, hash: &BlobHash) -> Result<bool> {
+        DiskBlobStore::remove(self, hash)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,19 +372,5 @@ mod tests {
         assert!(rig.store.put(b"dirs").is_err());
         // The caller got no hash, so no row names it; the bytes are whole and a later put must retry the directory sync.
         assert_eq!(rig.store.get(&rig.hash).unwrap(), b"dirs");
-    }
-}
-
-impl orch_core::store::blob::BlobStore for DiskBlobStore {
-    type Hash = BlobHash;
-    type Error = BlobError;
-    fn put(&self, bytes: &[u8]) -> Result<BlobHash> {
-        DiskBlobStore::put(self, bytes)
-    }
-    fn get(&self, hash: &BlobHash) -> Result<Vec<u8>> {
-        DiskBlobStore::get(self, hash)
-    }
-    fn remove(&self, hash: &BlobHash) -> Result<bool> {
-        DiskBlobStore::remove(self, hash)
     }
 }
