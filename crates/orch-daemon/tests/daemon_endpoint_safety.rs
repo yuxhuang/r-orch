@@ -16,7 +16,14 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+// A concurrent spawn can inherit a listener until exec closes its CLOEXEC fd.
+// Exclude that window while creating a socket that must already be stale.
+// Every spawn in this file must take this lock (use `Case::spawn_start`).
+// Hold this only for setup/spawn, not while the child runs.
+static ENDPOINT_SETUP: Mutex<()> = Mutex::new(());
 
 const CHILD_ROOT: &str = "ORCH_ENDPOINT_SAFETY_CHILD_ROOT";
 const CHILD_SOCKET: &str = "ORCH_ENDPOINT_SAFETY_CHILD_SOCKET";
@@ -114,6 +121,9 @@ impl Case {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let _setup = ENDPOINT_SETUP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         command.spawn().unwrap()
     }
 }
@@ -229,6 +239,9 @@ fn a_live_reachable_listener_is_left_alone() {
 fn a_stale_socket_is_replaced() {
     let case = Case::new();
     let socket = case.socket();
+    let setup = ENDPOINT_SETUP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     drop(UnixListener::bind(&socket).unwrap());
     // Keep the stale inode allocated so the replacement provably differs,
     // even on file systems that reuse a freed inode at once (Linux ext4).
@@ -240,6 +253,7 @@ fn a_stale_socket_is_replaced() {
         std::io::ErrorKind::ConnectionRefused,
         "precondition: nobody listens"
     );
+    drop(setup);
 
     let mut child = case.spawn_start();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
