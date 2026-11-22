@@ -184,12 +184,37 @@ fn local_filesystem(dir: &ConfinedDir) -> io::Result<bool> {
 #[cfg(target_os = "linux")]
 fn local_filesystem(dir: &ConfinedDir) -> io::Result<bool> {
     let fs = nix::sys::statfs::fstatfs(dir).map_err(io::Error::from)?;
-    // FUSE and 9p can be remote too; refuse rather than claiming WAL is safe.
-    let remote = [
-        0x6969, 0x517b, 0x564c, 0x73757245, 0xff534d42, 0xfe534d42, 0x65735546, 0x01021997,
-        0x00c36400, 0x0bd00bd0,
-    ];
-    Ok(!remote.contains(&fs.filesystem_type().0))
+    Ok(supported_linux_filesystem(fs.filesystem_type().0))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn supported_linux_filesystem(magic: i64) -> bool {
+    // Supported local filesystems only; network and unknown types fail closed.
+    // Magic values: Linux UAPI include/uapi/linux/magic.h. Overlay is used by
+    // isolated Linux CI; ext2/3/4 share one value.
+    matches!(
+        magic,
+        0xef53 | 0x58465342 | 0x9123683e | 0xf2f52010 | 0x01021994 | 0x794c7630
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::supported_linux_filesystem;
+
+    #[test]
+    fn linux_filesystems_fail_closed_for_remote_and_unknown_types() {
+        for magic in [
+            0x5346414f, 0x6969, 0xff534d42, 0x65735546, 0x01021997, 0x12345678,
+        ] {
+            assert!(!supported_linux_filesystem(magic), "{magic:#x}");
+        }
+        for magic in [
+            0xef53, 0x58465342, 0x9123683e, 0xf2f52010, 0x794c7630, 0x01021994,
+        ] {
+            assert!(supported_linux_filesystem(magic), "{magic:#x}");
+        }
+    }
 }
 
 /// Shared with a 1.0 daemon, but never created, truncated or rewritten by 1.1.

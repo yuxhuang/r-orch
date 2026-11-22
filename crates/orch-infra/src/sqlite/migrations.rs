@@ -1,5 +1,5 @@
 //! Numbered forward-only migrations, applied one transaction at a time.
-use super::{ConnectionRole, Result, SqliteError, Synchronous};
+use super::{ConnectionHandle, ConnectionRole, Result, SqliteError, Synchronous};
 use crate::data_dir::DataDir;
 use crate::data_dir::confined::{ConfinedDir, FileAccess};
 use rusqlite::{
@@ -36,7 +36,7 @@ fn capacity_bytes(blocks: impl Into<u64>, block: u64) -> u64 {
     blocks.into().saturating_mul(block)
 }
 
-pub fn migrate(data: &DataDir, conn: &mut Connection) -> Result<()> {
+pub fn migrate(data: &DataDir, conn: &mut ConnectionHandle<'_>) -> Result<()> {
     apply_migrations(data, conn, &[INITIAL_SCHEMA], DiskSpace::read(data)?)
 }
 
@@ -44,10 +44,11 @@ pub fn migrate(data: &DataDir, conn: &mut Connection) -> Result<()> {
 /// Disk space is supplied by the startup probe; tests use synthetic capacity.
 pub fn apply_migrations(
     data: &DataDir,
-    conn: &mut Connection,
+    conn: &mut ConnectionHandle<'_>,
     steps: &[&str],
     space: DiskSpace,
 ) -> Result<()> {
+    let conn = conn.for_migration();
     let version = conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))? as usize;
     if version > steps.len() {
         return Err(SqliteError::NewerSchema {

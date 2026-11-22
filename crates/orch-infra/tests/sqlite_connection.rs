@@ -103,3 +103,23 @@ fn sqlite_files_are_private_and_links_are_refused() {
     assert!(open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).is_err());
     assert_eq!(std::fs::read(canary).unwrap(), b"canary");
 }
+
+#[test]
+fn a_guarded_transaction_reserves_the_writer_before_its_first_statement() {
+    let temp = tempfile::tempdir().unwrap();
+    let data = DataDir::acquire(&temp.path().join("data"), &holder()).unwrap();
+    let mut writer = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let contender = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    contender.busy_timeout(std::time::Duration::ZERO).unwrap();
+    let transaction = writer.transaction().unwrap();
+    let error = contender.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+    assert_eq!(
+        error.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::DatabaseBusy)
+    );
+    assert!(DataDir::acquire(&temp.path().join("data"), &holder()).is_err());
+    transaction.rollback().unwrap();
+    contender
+        .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
+        .unwrap();
+}

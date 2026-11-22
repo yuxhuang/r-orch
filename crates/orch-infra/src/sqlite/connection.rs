@@ -2,7 +2,7 @@ use super::{Result, SqliteError};
 use crate::data_dir::DataDir;
 use crate::data_dir::confined::{ConfinedError, FileAccess};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionRole {
@@ -18,6 +18,14 @@ pub enum Synchronous {
 }
 
 /// A live connection cannot outlive its data directory's exclusive guard.
+/// The raw connection cannot be extracted through a mutable reference:
+///
+/// ```compile_fail
+/// use orch_infra::sqlite::ConnectionHandle;
+/// fn escape(mut handle: ConnectionHandle<'_>) -> rusqlite::Connection {
+///     std::mem::replace(&mut *handle, rusqlite::Connection::open_in_memory().unwrap())
+/// }
+/// ```
 pub struct ConnectionHandle<'a> {
     connection: Connection,
     _directory: &'a DataDir,
@@ -28,8 +36,15 @@ impl Deref for ConnectionHandle<'_> {
         &self.connection
     }
 }
-impl DerefMut for ConnectionHandle<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
+impl ConnectionHandle<'_> {
+    /// The transaction's borrow keeps this handle and its directory lock alive.
+    pub fn transaction(&mut self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        self.connection.transaction()
+    }
+
+    // Never expose mutable access publicly: mem::replace could extract the
+    // connection and let it outlive the directory guard.
+    pub(super) fn for_migration(&mut self) -> &mut Connection {
         &mut self.connection
     }
 }
