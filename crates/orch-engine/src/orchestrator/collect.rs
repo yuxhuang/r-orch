@@ -6,14 +6,14 @@
 //! write.
 
 use std::collections::BTreeSet;
-#[cfg(test)]
 use std::sync::Arc;
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use orch_core::adapter::{AdapterError, AgentEvent, AgentEventKind};
+use orch_core::adapter::{AdapterError, AdapterTestResult, AgentEvent, AgentEventKind};
 use orch_core::error::Result;
 use orch_core::storage::TaskStore;
+use orch_core::usage::{RunUsage, RunUsageObserver};
 use orch_domain::{
     AdapterErrorKind, AgentLastError, AgentStatus, OrchestratorEvent, OrchestratorState, RunStatus,
     RunningEntry, Task, TaskProof, TaskStatus, TokenUsage, TokenUsageOpts, classify_adapter_error,
@@ -77,6 +77,71 @@ pub(super) struct Collected {
     last_error_kind: Option<AdapterErrorKind>,
     /// A set, because an agent commonly edits the same file repeatedly.
     files_changed: BTreeSet<String>,
+    /// What the adapter supplied about tokens, model and version. `None`
+    /// when the caller named no adapter, so nothing is observed.
+    usage: Option<ObservedUsage>,
+}
+
+/// The adapter and requested model a run was started with, so the collector
+/// can seed and read its usage without reaching into `orch-infra`.
+pub(super) struct UsageSeed {
+    pub(super) adapter: &'static str,
+    pub(super) requested_model: Option<String>,
+}
+
+struct ObservedUsage {
+    adapter: &'static str,
+    usage: RunUsage,
+}
+
+impl Orchestrator {
+    /// Receive every ended run's observed usage. Observation never changes how
+    /// a run is recorded or finished; the durable finish will read the same
+    /// value. Replaces any previous observer.
+    pub fn set_run_usage_observer(&self, observer: Arc<dyn RunUsageObserver>) {
+        *self
+            .inner
+            .usage_observer
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(observer);
+    }
+
+    /// Cache the latest version probe of an adapter kind for this daemon
+    /// generation. A run reads it when it ends, so a probe that lands during
+    /// the run still counts. Failure to probe is never an error here.
+    pub fn record_adapter_probe(&self, kind: &str, probe: AdapterTestResult) {
+        self.inner
+            .adapter_probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(kind.to_owned(), probe);
+    }
+
+    /// Hand the run's usage to the observer. Called once per stream, after
+    /// the last event and before any success or failure handling, so a run
+    /// that ended in error, cancellation or shutdown reports what it had.
+    fn publish_usage(&self, run_id: &str, observed: Option<ObservedUsage>) {
+        let Some(ObservedUsage { adapter, mut usage }) = observed else {
+            return;
+        };
+        let probe = self
+            .inner
+            .adapter_probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(adapter)
+            .cloned();
+        usage.fill_adapter_version(probe.as_ref());
+        let observer = self
+            .inner
+            .usage_observer
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            observer.run_usage_observed(run_id, &usage);
+        }
+    }
 }
 
 impl Orchestrator {
@@ -84,14 +149,35 @@ impl Orchestrator {
     /// then hand off to the success or failure handler.
     /// Never await a collector inside an operation: nested boundaries would
     /// join it and buffer the whole stream under the project permit.
+    #[cfg(test)]
     pub(super) async fn collect_events(
+        &self,
+        events: BoxStream<'static, std::result::Result<AgentEvent, AdapterError>>,
+        run_id: &str,
+        task_id: &str,
+        agent_id: &str,
+    ) -> Result<()> {
+        self.collect_events_observing(events, run_id, task_id, agent_id, None)
+            .await
+    }
+
+    /// [`Self::collect_events`], also observing the run's usage from the
+    /// events the adapter supplies. With no seed nothing is observed.
+    pub(super) async fn collect_events_observing(
         &self,
         mut events: BoxStream<'static, std::result::Result<AgentEvent, AdapterError>>,
         run_id: &str,
         task_id: &str,
         agent_id: &str,
+        seed: Option<UsageSeed>,
     ) -> Result<()> {
-        let mut collected = Collected::default();
+        let mut collected = Collected {
+            usage: seed.map(|seed| ObservedUsage {
+                adapter: seed.adapter,
+                usage: RunUsage::new(seed.requested_model.as_deref(), None),
+            }),
+            ..Collected::default()
+        };
         let mut stream_error: Option<AdapterError> = None;
 
         while let Some(item) = events.next().await {
@@ -107,9 +193,15 @@ impl Orchestrator {
                     break;
                 }
             };
-            self.record_event(&mut collected, event, run_id, task_id, agent_id)
-                .await?;
+            if let Err(err) = self
+                .record_event(&mut collected, event, run_id, task_id, agent_id)
+                .await
+            {
+                self.publish_usage(run_id, collected.usage.take());
+                return Err(err);
+            }
         }
+        self.publish_usage(run_id, collected.usage.take());
 
         // Release the cached JSONL append handle for this run either way.
         self.deps().run_store.close_run_events(run_id);
@@ -215,6 +307,11 @@ impl Orchestrator {
                         .clone();
                     if let Some(tap) = tap {
                         tap.record(task_id, run_id, &event);
+                    }
+                    // Before anything below reduces the event, and independent of
+                    // `event.tokens`, which cannot tell unknown from zero.
+                    if let Some(observed) = collected.usage.as_mut() {
+                        observed.usage.observe_event(observed.adapter, &event);
                     }
                     match event.kind {
                         AgentEventKind::Done => {
