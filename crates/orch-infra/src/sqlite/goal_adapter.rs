@@ -42,7 +42,7 @@ impl<'a, 'data> GoalAdapter<'a, 'data> {
                     poisoned: false,
                 };
                 let result = work(&mut unit);
-                if unit.poisoned && result.is_ok() {
+                if (unit.poisoned || unit.read.tx.is_autocommit()) && result.is_ok() {
                     return Err(SqliteError::TransactionAborted);
                 }
                 result
@@ -83,7 +83,7 @@ pub(super) struct GoalWrite<'a, 'conn> {
 
 impl GoalWrite<'_, '_> {
     fn usable(&self) -> Result<()> {
-        if self.poisoned {
+        if self.poisoned || self.read.tx.is_autocommit() {
             Err(SqliteError::TransactionAborted)
         } else {
             Ok(())

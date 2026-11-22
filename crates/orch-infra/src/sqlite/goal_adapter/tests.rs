@@ -440,6 +440,71 @@ fn caught_rollback_failure_poison_prevents_later_operations_and_commit() {
 }
 
 #[test]
+fn ended_transaction_blocks_later_operations_without_leaking_rows_or_counter() {
+    ended_transaction_is_aborted(true);
+}
+
+#[test]
+fn ended_transaction_cannot_return_success_without_a_later_operation() {
+    ended_transaction_is_aborted(false);
+}
+
+fn ended_transaction_is_aborted(later_operation: bool) {
+    let (_temp, data) = test_data();
+    setup(&data);
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    std::thread::scope(|scope| {
+        let _close = Close(&handle);
+        scope.spawn(move || writer.run());
+        let adapter = GoalAdapter::new(&handle, &pool);
+        let result = adapter
+            .write("p".into(), deadline(), move |u| {
+                u.create(goal("before"))?;
+                // Deterministically simulate SQLite ending the outer transaction
+                // on an error outside an operation's savepoint (e.g. IOERR).
+                u.read.tx.execute_batch("ROLLBACK")?;
+                assert!(u.read.tx.is_autocommit());
+                if later_operation {
+                    u.create(goal("after"))?;
+                }
+                Ok(())
+            })
+            .unwrap()
+            .wait();
+        for id in ["before", "after"] {
+            assert_eq!(adapter.read("p", deadline(), |u| u.get(id)).unwrap(), None);
+        }
+        adapter
+            .read("p", deadline(), |u| {
+                let counters: i64 = u.tx.query_row(
+                    "SELECT count(*) FROM counters WHERE project_id='p' AND name='position:goal'",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(counters, 0);
+                Ok(())
+            })
+            .unwrap();
+        let fresh = adapter
+            .write("p".into(), deadline(), |u| u.create(goal("fresh")))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!((fresh.revision, fresh.position), (Revision::ONE, 1));
+        assert_eq!(
+            adapter.read("p", deadline(), |u| u.get("fresh")).unwrap(),
+            Some(fresh)
+        );
+        assert!(
+            matches!(result, Err(SqliteError::TransactionAborted)),
+            "{result:?}"
+        );
+        handle.close();
+    });
+}
+
+#[test]
 fn unrepresentable_stored_timestamp_does_not_partially_move_a_goal() {
     let (_temp, data) = test_data();
     setup(&data);
