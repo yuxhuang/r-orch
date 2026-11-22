@@ -11,6 +11,17 @@ pub use connection::{ConnectionHandle, ConnectionRole, Synchronous, open_connect
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteError {
+    #[error(transparent)]
+    Store(#[from] orch_core::store::StoreError),
+    #[error("value cannot be represented losslessly in the SQLite schema: {0}")]
+    Unrepresentable(String),
+    #[error("goal operation failed: {operation}; savepoint rollback failed: {rollback}")]
+    OperationRollback {
+        operation: Box<SqliteError>,
+        rollback: rusqlite::Error,
+    },
+    #[error("goal transaction cannot commit after a failed operation rollback")]
+    TransactionAborted,
     #[error("storage admission deadline or queue bound reached")]
     Overloaded,
     #[error("SQLite writer is closed")]
@@ -64,3 +75,9 @@ fn test_data() -> (tempfile::TempDir, crate::data_dir::DataDir) {
     .unwrap();
     (temp, data)
 }
+
+#[allow(
+    dead_code,
+    reason = "internal goal persistence slice; full Storage and safety policy are not wired yet"
+)]
+mod goal_adapter;

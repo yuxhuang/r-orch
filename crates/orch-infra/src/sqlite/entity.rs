@@ -111,6 +111,16 @@ fn next_position(tx: &Transaction<'_>, project: &str) -> Result<u64> {
     if last < 0 {
         return Err(invalid(0, "negative goal position counter").into());
     }
+    // Imported rows must seed this durable namespace. A missing/stale counter
+    // is corruption, not permission to allocate an already issued position.
+    let inconsistent: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM goals WHERE project_id=?1 AND (position<=0 OR position>?2))",
+        params![project, last],
+        |r| r.get(0),
+    )?;
+    if inconsistent {
+        return Err(invalid(0, "goal position is past its durable counter").into());
+    }
     let next = last.checked_add(1).ok_or(StoreError::CounterExhausted)?;
     Ok(next as u64)
 }
