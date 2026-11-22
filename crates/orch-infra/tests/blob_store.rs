@@ -346,3 +346,162 @@ fn concurrent_puts_of_the_same_bytes_leave_one_intact_blob() {
         0
     );
 }
+
+// Real schema/reader boundary: no mock database or parallel schema sketch.
+fn database(f: &Fixture) -> orch_infra::sqlite::ConnectionHandle<'_> {
+    use orch_infra::sqlite::{ConnectionRole, Synchronous, migrations::migrate, open_connection};
+    let mut c = open_connection(&f._data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&f._data, &mut c).unwrap();
+    for project in ["p", "other"] {
+        c.execute("INSERT INTO tasks (project_id,id,title,description,status,priority,attempts,max_attempts,position,created_by_kind,created_at,updated_at,revision) VALUES (?1,'task','t','','todo',1,0,3,0,'owner',0,0,1)", [project]).unwrap();
+        for (run, number) in [("run", 1), ("run2", 2)] {
+            c.execute("INSERT INTO runs (project_id,id,task_id,agent_id,run_no,counted,attempt_no,epoch,status,started_at,revision) VALUES (?1,?2,'task','agent',?3,1,?3,?3,'running',0,1)", rusqlite::params![project, run, number]).unwrap();
+        }
+    }
+    c
+}
+
+fn count(c: &rusqlite::Connection, table: &str) -> i64 {
+    // Table names are test constants, never application input.
+    c.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn prompt_rows_deduplicate_and_round_trip_with_the_real_reader() {
+    use orch_infra::blob::BlobReferences;
+    let f = fixture();
+    let mut c = database(&f);
+    let refs = BlobReferences::new(&f.store, "p");
+    let mut tx = c.transaction().unwrap();
+    let first = refs
+        .store_prompt(&mut tx, "run", "rendered prompt", 123)
+        .unwrap();
+    let second = refs
+        .store_prompt(&mut tx, "run2", "rendered prompt", 456)
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(count(&tx, "blobs"), 1);
+    let row: (String, i64, String, i64, Option<i64>) = tx
+        .query_row(
+            "SELECT sha256,size,storage_location,created_at,unreferenced_since FROM blobs",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (first.to_string(), 15, "disk".into(), 123, None));
+    assert_eq!(
+        f.store.get(&row.0.parse().unwrap()).unwrap(),
+        b"rendered prompt"
+    );
+    tx.commit().unwrap();
+    assert_eq!(
+        refs.load_prompt(&c, "run").unwrap(),
+        Some("rendered prompt".into())
+    );
+    assert_eq!(
+        BlobReferences::new(&f.store, "other")
+            .load_prompt(&c, "run")
+            .unwrap(),
+        None
+    );
+    assert_eq!(files_below(&f.root.join("blobs")).len(), 1);
+}
+
+#[test]
+fn attachment_is_a_blob_and_its_name_is_only_data() {
+    use orch_infra::blob::BlobReferences;
+    let f = fixture();
+    let mut c = database(&f);
+    let refs = BlobReferences::new(&f.store, "p");
+    let name = "../../outside/canary";
+    let mut tx = c.transaction().unwrap();
+    let hash = refs
+        .store_attachment(&mut tx, "task", name, &[0xff, 0x00], 0)
+        .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(count(&c, "task_attachments"), 1);
+    assert_eq!(
+        refs.load_attachment(&c, "task", name).unwrap(),
+        Some(vec![0xff, 0])
+    );
+    assert_eq!(
+        BlobReferences::new(&f.store, "other")
+            .load_attachment(&c, "task", name)
+            .unwrap(),
+        None
+    );
+    assert_eq!(c.query_row::<String,_,_>("SELECT sha256 FROM task_attachments WHERE project_id='p' AND task_id='task' AND name=?1", [name], |r| r.get(0)).unwrap(), hash.to_string());
+    f.canary_unchanged();
+}
+
+#[test]
+fn rolled_back_references_leave_no_rows_and_are_replayable() {
+    use orch_infra::blob::BlobReferences;
+    let f = fixture();
+    let mut c = database(&f);
+    let refs = BlobReferences::new(&f.store, "p");
+    let mut tx = c.transaction().unwrap();
+    let hash = refs.store_prompt(&mut tx, "run", "rollback", 0).unwrap();
+    refs.store_attachment(&mut tx, "task", "a", b"rollback", 0)
+        .unwrap();
+    tx.rollback().unwrap();
+    assert_eq!(count(&c, "blobs"), 0);
+    assert_eq!(count(&c, "task_attachments"), 0);
+    assert_eq!(refs.load_prompt(&c, "run").unwrap(), None);
+    assert_eq!(f.store.get(&hash).unwrap(), b"rollback");
+    let mut tx = c.transaction().unwrap();
+    refs.store_prompt(&mut tx, "run", "rollback", 1).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(count(&c, "blobs"), 1);
+}
+
+#[test]
+fn failed_owners_and_failed_disk_publication_leave_no_metadata() {
+    use orch_infra::blob::BlobReferences;
+    let f = fixture();
+    let mut c = database(&f);
+    let refs = BlobReferences::new(&f.store, "p");
+    let mut tx = c.transaction().unwrap();
+    assert!(refs.store_prompt(&mut tx, "missing", "x", 0).is_err());
+    assert!(
+        refs.store_attachment(&mut tx, "missing", "a", b"x", 0)
+            .is_err()
+    );
+    std::fs::remove_dir(f.root.join("blobs/tmp")).unwrap();
+    assert!(
+        refs.store_prompt(&mut tx, "run", "disk failure", 0)
+            .is_err()
+    );
+    assert_eq!(count(&tx, "blobs"), 0);
+    assert_eq!(count(&tx, "task_attachments"), 0);
+    tx.commit().unwrap();
+    assert_eq!(refs.load_prompt(&c, "run").unwrap(), None);
+}
+
+#[test]
+fn row_hashes_and_metadata_are_checked_before_reading_bytes() {
+    use orch_infra::blob::BlobReferences;
+    let f = fixture();
+    let mut c = database(&f);
+    let refs = BlobReferences::new(&f.store, "p");
+    let mut tx = c.transaction().unwrap();
+    let hash = refs.store_prompt(&mut tx, "run", "intact", 0).unwrap();
+    tx.commit().unwrap();
+    c.execute("UPDATE blobs SET size=99", []).unwrap();
+    assert!(refs.load_prompt(&c, "run").is_err());
+    let mut tx = c.transaction().unwrap();
+    assert!(refs.store_prompt(&mut tx, "run2", "intact", 0).is_err());
+    assert_eq!(refs.load_prompt(&tx, "run2").unwrap(), None);
+    tx.rollback().unwrap();
+    c.execute("UPDATE blobs SET size=6", []).unwrap();
+    std::fs::write(f.blob_path(&hash), b"broken").unwrap();
+    assert!(refs.load_prompt(&c, "run").is_err());
+    c.execute(
+        "UPDATE runs SET prompt_sha256='../../outside/canary' WHERE project_id='p'",
+        [],
+    )
+    .unwrap();
+    assert!(refs.load_prompt(&c, "run").is_err());
+    f.canary_unchanged();
+}

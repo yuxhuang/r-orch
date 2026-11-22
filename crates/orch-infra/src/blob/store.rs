@@ -81,11 +81,11 @@ impl DiskBlobStore {
 
     pub(crate) fn with_hooks(data_root: &ConfinedDir, hooks: Box<dyn Hooks>) -> Result<Self> {
         let blobs = data_root.ensure_dir("blobs")?;
-        Ok(Self {
-            sha256: blobs.ensure_dir("sha256")?,
-            tmp: blobs.ensure_dir("tmp")?,
-            hooks,
-        })
+        let sha256 = blobs.ensure_dir("sha256")?;
+        let tmp = blobs.ensure_dir("tmp")?;
+        blobs.sync()?;
+        data_root.sync()?;
+        Ok(Self { sha256, tmp, hooks })
     }
 
     /// Stores the bytes and returns their hash; a blob already stored, and intact, is not written again.
@@ -100,6 +100,9 @@ impl DiskBlobStore {
         let (ab, cd, name) = names(&hash);
         // Anything unusable at the final name (a link, a FIFO, other bytes) is replaced by the rename below.
         if self.is_intact(&hash, bytes.len() as u64, &ab, &cd, &name) {
+            // A prior publication may have failed its directory sync, or its
+            // transaction may have rolled back. Re-establish durability on retry.
+            self.sync_name(&ab, &cd, &name)?;
             return Ok(hash);
         }
         let tmp_name = tmp_name();
@@ -117,19 +120,24 @@ impl DiskBlobStore {
             .run(Step::WriteTmp, &mut || Ok(file.write_all(bytes)?))?;
         self.hooks
             .run(Step::SyncTmp, &mut || Ok(file.sync_all()?))?;
-        let (ab_dir, ab_new) = open_or_create(&self.sha256, ab)?;
-        let (cd_dir, cd_new) = open_or_create(&ab_dir, cd)?;
+        let (ab_dir, _) = open_or_create(&self.sha256, ab)?;
+        let (cd_dir, _) = open_or_create(&ab_dir, cd)?;
         self.hooks.run(Step::Publish, &mut || {
             Ok(self.tmp.rename(tmp_name, &cd_dir, name)?)
         })?;
+        self.sync_name(ab, cd, name)
+    }
+
+    fn sync_name(&self, ab: &str, cd: &str, name: &str) -> Result<()> {
         self.hooks.run(Step::SyncDirs, &mut || {
+            let ab_dir = self.sha256.open_dir(ab)?;
+            let cd_dir = ab_dir.open_dir(cd)?;
+            cd_dir.open_file(name, FileAccess::Read)?.sync_all()?;
             cd_dir.sync()?;
-            if cd_new {
-                ab_dir.sync()?;
-            }
-            if ab_new {
-                self.sha256.sync()?;
-            }
+            // Sync ancestors even if created by a previous failed put.
+            ab_dir.sync()?;
+            self.sha256.sync()?;
+            self.tmp.sync()?;
             Ok(())
         })
     }
@@ -313,12 +321,12 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_blob_runs_no_write_step() {
+    fn a_stored_blob_only_rechecks_durability() {
         let rig = rig(b"twice", None);
         rig.store.put(b"twice").unwrap();
         let first = steps(&rig).len();
         rig.store.put(b"twice").unwrap();
-        assert_eq!(steps(&rig).len(), first);
+        assert_eq!(&steps(&rig)[first..], &[(Step::SyncDirs, true)]);
     }
 
     #[test]
@@ -337,10 +345,32 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_after_failed_directory_sync_must_sync_before_returning_a_hash() {
+        let rig = rig(b"retry sync", Some(Step::SyncDirs));
+        assert!(rig.store.put(b"retry sync").is_err());
+        // Failure persists: a dedup hit cannot turn the unsynced publication into success.
+        assert!(rig.store.put(b"retry sync").is_err());
+    }
+
+    #[test]
     fn a_failure_to_sync_the_directories_reports_the_error_and_leaves_an_intact_blob() {
         let rig = rig(b"dirs", Some(Step::SyncDirs));
         assert!(rig.store.put(b"dirs").is_err());
-        // The caller got no hash, so no row names it; the bytes are whole and a later put is a no-op.
+        // The caller got no hash, so no row names it; the bytes are whole and a later put must retry the directory sync.
         assert_eq!(rig.store.get(&rig.hash).unwrap(), b"dirs");
+    }
+}
+
+impl orch_core::store::blob::BlobStore for DiskBlobStore {
+    type Hash = BlobHash;
+    type Error = BlobError;
+    fn put(&self, bytes: &[u8]) -> Result<BlobHash> {
+        DiskBlobStore::put(self, bytes)
+    }
+    fn get(&self, hash: &BlobHash) -> Result<Vec<u8>> {
+        DiskBlobStore::get(self, hash)
+    }
+    fn remove(&self, hash: &BlobHash) -> Result<bool> {
+        DiskBlobStore::remove(self, hash)
     }
 }

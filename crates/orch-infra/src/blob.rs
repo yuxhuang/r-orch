@@ -5,12 +5,14 @@
 //! hash column read from a row is parsed to a [`BlobHash`] before it selects a file, and no path string is
 //! ever built here.
 
+mod references;
 mod store;
 
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::str::FromStr;
 
+pub use references::{BlobReferences, ReferenceError};
 pub use store::{BlobError, DiskBlobStore};
 
 /// Text up to this many bytes may live in a column (ADR 0017 decision 11, R97); more goes to the blob store.
