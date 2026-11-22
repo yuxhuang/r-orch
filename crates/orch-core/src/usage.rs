@@ -4,8 +4,12 @@
 //! replace absent counters with zero. Read the original JSON instead. The
 //! raw-output entry point must run before an adapter drops lifecycle records;
 //! the event entry point can recover only metadata retained in `AgentEvent`.
+//!
+//! The record lives here, not in `orch-infra`, because the orchestrator's
+//! collector observes through `orch-core` types only (the crate-graph check
+//! limits which engine files may name `orch_infra`).
 
-use orch_core::adapter::{AdapterTestResult, AgentEvent, AgentEventKind};
+use crate::adapter::{AdapterTestResult, AgentEvent, AgentEventKind};
 use serde_json::Value;
 
 /// Values for the seven nullable usage columns of a run, independent of outcome.
@@ -30,6 +34,15 @@ impl RunUsage {
             model: metadata_text(requested_model),
             adapter_version: metadata_text(probe.and_then(|probe| probe.version.as_deref())),
             ..Self::default()
+        }
+    }
+
+    /// Fill the CLI version from a cached probe when no version is known yet.
+    /// A version already held is never replaced, and a probe without one
+    /// changes nothing. This performs no I/O.
+    pub fn fill_adapter_version(&mut self, probe: Option<&AdapterTestResult>) {
+        if self.adapter_version.is_none() {
+            self.adapter_version = metadata_text(probe.and_then(|probe| probe.version.as_deref()));
         }
     }
 
@@ -166,6 +179,13 @@ impl RunUsage {
     }
 }
 
+/// Receives a run's usage once its event stream has ended, whatever the
+/// outcome: success, failure, cancellation or shutdown. Storage-independent:
+/// the durable run finish (spec R36) replaces this as the consumer.
+pub trait RunUsageObserver: Send + Sync {
+    fn run_usage_observed(&self, run_id: &str, usage: &RunUsage);
+}
+
 fn count(value: &Value) -> Option<i64> {
     value.as_u64().and_then(|count| i64::try_from(count).ok())
 }
@@ -225,6 +245,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(RunUsage::new(None, Some(&probe)), RunUsage::default());
+    }
+
+    #[test]
+    fn a_late_probe_fills_only_an_unknown_version() {
+        let probe = |version: Option<&str>| AdapterTestResult {
+            ok: version.is_some(),
+            version: version.map(str::to_owned),
+            ..Default::default()
+        };
+        let mut usage = RunUsage::default();
+        usage.fill_adapter_version(Some(&probe(None)));
+        assert_eq!(usage.adapter_version, None);
+        usage.fill_adapter_version(Some(&probe(Some("cli 2"))));
+        assert_eq!(usage.adapter_version.as_deref(), Some("cli 2"));
+        usage.fill_adapter_version(Some(&probe(Some("cli 3"))));
+        assert_eq!(usage.adapter_version.as_deref(), Some("cli 2"));
+        usage.fill_adapter_version(None);
+        assert_eq!(usage.adapter_version.as_deref(), Some("cli 2"));
     }
 
     #[test]
@@ -559,27 +597,27 @@ mod tests {
         let cases = [
             (
                 "claude",
-                include_str!("../../../../fixtures/adapters/claude/session.jsonl"),
+                include_str!("../../../fixtures/adapters/claude/session.jsonl"),
                 [Some(100), Some(50), None, Some(10), None],
             ),
             (
                 "cursor",
-                include_str!("../../../../fixtures/adapters/cursor/session.jsonl"),
+                include_str!("../../../fixtures/adapters/cursor/session.jsonl"),
                 [Some(50), Some(25), None, Some(10), Some(5)],
             ),
             (
                 "codex",
-                include_str!("../../../../fixtures/adapters/codex/session.jsonl"),
+                include_str!("../../../fixtures/adapters/codex/session.jsonl"),
                 [Some(200), Some(80), None, None, None],
             ),
             (
                 "opencode",
-                include_str!("../../../../fixtures/adapters/opencode/session.jsonl"),
+                include_str!("../../../fixtures/adapters/opencode/session.jsonl"),
                 [Some(12416), Some(2), Some(0), None, None],
             ),
             (
                 "pi",
-                include_str!("../../../../fixtures/adapters/pi/session.jsonl"),
+                include_str!("../../../fixtures/adapters/pi/session.jsonl"),
                 [Some(42), Some(17), Some(3), Some(5), Some(0)],
             ),
         ];
@@ -597,27 +635,27 @@ mod tests {
         let cases = [
             (
                 "claude",
-                include_str!("../../../../fixtures/adapters/claude/session.expected.json"),
+                include_str!("../../../fixtures/adapters/claude/session.expected.json"),
                 [Some(100), Some(50), None, Some(10), None],
             ),
             (
                 "cursor",
-                include_str!("../../../../fixtures/adapters/cursor/session.expected.json"),
+                include_str!("../../../fixtures/adapters/cursor/session.expected.json"),
                 [Some(50), Some(25), None, Some(10), Some(5)],
             ),
             (
                 "codex",
-                include_str!("../../../../fixtures/adapters/codex/session.expected.json"),
+                include_str!("../../../fixtures/adapters/codex/session.expected.json"),
                 [Some(200), Some(80), None, None, None],
             ),
             (
                 "opencode",
-                include_str!("../../../../fixtures/adapters/opencode/session.expected.json"),
+                include_str!("../../../fixtures/adapters/opencode/session.expected.json"),
                 [Some(12416), Some(2), Some(0), None, None],
             ),
             (
                 "pi",
-                include_str!("../../../../fixtures/adapters/pi/session.expected.json"),
+                include_str!("../../../fixtures/adapters/pi/session.expected.json"),
                 [Some(42), Some(17), Some(3), Some(5), Some(0)],
             ),
         ];
