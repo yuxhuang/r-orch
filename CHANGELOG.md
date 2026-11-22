@@ -9,6 +9,8 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 - Add internal SQLite transactions and snapshot reads for goals. The daemon continues to store goals in files.
 
+- Add a private, inactive bounded import document reader tested against synthetic 1.0 fixtures; import commands and storage writes remain unwired.
+
 - Add the inactive confined disk blob adapter and transactional prompt/attachment references, with content hashes, verified reads and byte publication before row linkage.
 
 - Add inactive SQLite schema, numbered migrations with checked pre-migration copies, private data-directory locks and confined file operations for the 1.1 storage adapter. The running daemon continues to use file storage.

@@ -536,3 +536,405 @@ async fn operations_that_change_nothing_do_not_rewrite_the_document() {
     .unwrap();
     assert_eq!(inode(&document), before);
 }
+
+fn described(id: &str, text: String) -> Entity {
+    Entity::Task(Box::new(Task {
+        id: id.into(),
+        description: text,
+        ..make_task()
+    }))
+}
+
+fn document(s: &FileStorage, project: &str) -> std::path::PathBuf {
+    s.project_dir(project).join(super::DOCUMENT)
+}
+
+#[tokio::test]
+async fn text_over_64_kib_round_trips_through_the_blob_store() {
+    use crate::blob::{BlobHash, DiskBlobStore};
+    use crate::data_dir::confined::ConfinedDir;
+    let root = root();
+    let s = FileStorage::new(root.path());
+    let text = "é\n\"\\🦀".repeat(20_000);
+    let value = described("large", text.clone());
+    let expected = s
+        .transaction(owner("p"), Lane::Entities, move |u| u.create(value))
+        .await
+        .unwrap();
+    let bytes = std::fs::read(document(&s, "p")).unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        json["records"][0]["texts"][0]["sha256"],
+        BlobHash::of(text.as_bytes()).to_string()
+    );
+    assert!(json["records"][0]["row"]["entity"]["value"]["description"].is_null());
+    let dir = ConfinedDir::open(&s.project_dir("p")).unwrap();
+    let blobs = DiskBlobStore::open(&dir).unwrap();
+    assert_eq!(
+        blobs.get(&BlobHash::of(text.as_bytes())).unwrap(),
+        text.as_bytes()
+    );
+    drop(s);
+    let reopened = FileStorage::new(root.path());
+    assert_eq!(get(&reopened, "p", "large").await, Some(expected.clone()));
+    let page = reopened
+        .read(owner("p"))
+        .await
+        .unwrap()
+        .list(
+            &Filter::Tasks {
+                status: None,
+                goal: None,
+            },
+            &PageRequest::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(page.items, vec![expected]);
+}
+
+#[tokio::test]
+async fn inline_threshold_counts_utf8_bytes_and_preserves_empty_values() {
+    use crate::blob::INLINE_TEXT_MAX_BYTES as MAX;
+    let root = root();
+    let s = FileStorage::new(root.path());
+    for (index, text) in [
+        String::new(),
+        "x".repeat(MAX - 1),
+        "é".repeat(MAX / 2),
+        "x".repeat(MAX + 1),
+        "é".repeat(MAX / 2 + 1),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let project = index.to_string();
+        let external = text.len() > MAX;
+        let entity = described("t", text);
+        let expected = s
+            .transaction(owner(&project), Lane::Entities, move |u| u.create(entity))
+            .await
+            .unwrap();
+        let bytes = std::fs::read(document(&s, &project)).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["records"][0].get("texts").is_some(), external);
+        // Inline rows retain the staged reader's real Record encoding.
+        if !external {
+            assert_eq!(
+                serde_json::from_value::<Record>(json["records"][0].clone()).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(get(&s, &project, "t").await, Some(expected));
+    }
+}
+
+#[tokio::test]
+async fn large_text_is_isolated_by_project_and_updates_keep_old_snapshots() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    for project in ["../p", "other"] {
+        let value = described("same", project.repeat(70_000));
+        s.transaction(owner(project), Lane::Entities, move |u| u.create(value))
+            .await
+            .unwrap();
+    }
+    let old = s.read(owner("../p")).await.unwrap();
+    let before = old.get(EntityKind::Task, "same").await.unwrap();
+    let other = get(&s, "other", "same").await;
+    assert_ne!(before, other);
+    assert_eq!(root.path().read_dir().unwrap().count(), 2);
+    let replacement = described("same", "small".into());
+    s.transaction(owner("../p"), Lane::Entities, move |u| {
+        u.update(replacement, Revision::ONE)
+    })
+    .await
+    .unwrap();
+    assert_eq!(old.get(EntityKind::Task, "same").await.unwrap(), before);
+    assert_eq!(get(&s, "other", "same").await, other);
+    assert_eq!(get(&s, "absent", "same").await, None);
+    assert_eq!(get(&s, "../p", "same").await.unwrap().revision.get(), 2);
+}
+
+#[tokio::test]
+async fn returned_callback_errors_roll_back_large_text_rows_and_counters() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    create(&s, "p", "kept").await;
+    let path = document(&s, "p");
+    let before = std::fs::read(&path).unwrap();
+    let result = s
+        .write(
+            owner("p"),
+            Lane::Entities,
+            Box::new(|u| {
+                u.update(described("kept", "changed".repeat(70_000)), Revision::ONE)?;
+                u.create(described("lost", "large".repeat(70_000)))?;
+                Err(StoreError::InvalidPage("abort".into()))
+            }),
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(path).unwrap(), before);
+    assert!(!s.project_dir("p").join("blobs").exists());
+    assert_eq!(create(&s, "p", "next").await.position, 2);
+    assert_eq!(get(&s, "p", "lost").await, None);
+}
+
+#[tokio::test]
+async fn returned_blob_errors_preserve_the_committed_document() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    create(&s, "p", "kept").await;
+    let path = document(&s, "p");
+    let before = std::fs::read(&path).unwrap();
+    // A regular file cannot serve as the confined blob directory.
+    std::fs::write(s.project_dir("p").join("blobs"), b"blocked").unwrap();
+    let result = s
+        .transaction(owner("p"), Lane::Entities, |u| {
+            u.update(described("kept", "x".repeat(65_537)), Revision::ONE)
+        })
+        .await;
+    assert!(matches!(result, Err(StoreError::Backend(_))));
+    assert_eq!(std::fs::read(path).unwrap(), before);
+    assert_eq!(get(&s, "p", "kept").await.unwrap().revision, Revision::ONE);
+}
+
+#[tokio::test]
+async fn missing_corrupt_or_invalid_hashes_fail_without_rewriting_rows() {
+    use crate::blob::BlobHash;
+    let root = root();
+    for mode in ["missing", "corrupt", "invalid", "duplicate"] {
+        let s = FileStorage::new(root.path().join(mode));
+        let text = "x".repeat(65_537);
+        let hash = BlobHash::of(text.as_bytes()).to_string();
+        s.transaction(owner("p"), Lane::Entities, move |u| {
+            u.create(described("t", text))
+        })
+        .await
+        .unwrap();
+        let path = document(&s, "p");
+        let blob = s
+            .project_dir("p")
+            .join("blobs/sha256")
+            .join(&hash[..2])
+            .join(&hash[2..4])
+            .join(&hash);
+        match mode {
+            "missing" => std::fs::remove_file(blob).unwrap(),
+            "corrupt" => std::fs::write(blob, b"bad").unwrap(),
+            _ => {
+                let mut json: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                if mode == "invalid" {
+                    json["records"][0]["texts"][0]["sha256"] = "../outside".into();
+                } else {
+                    let item = json["records"][0]["texts"][0].clone();
+                    json["records"][0]["texts"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(item);
+                }
+                std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+            }
+        }
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            matches!(s.read(owner("p")).await, Err(StoreError::Backend(_))),
+            "{mode}"
+        );
+        assert!(
+            s.transaction(owner("p"), Lane::Entities, |u| u.create(task("new")))
+                .await
+                .is_err(),
+            "{mode}"
+        );
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+}
+
+#[tokio::test]
+async fn message_context_and_nested_optional_text_round_trip_together() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    let large = "synthetic\0é\n".repeat(10_000);
+    let mut t = make_task();
+    t.id = "nested".into();
+    t.proof = Some(orch_domain::TaskProof {
+        files_changed: vec![large.clone()],
+        test_results: Some(large.clone()),
+        agent_summary: Some(String::new()),
+        ..Default::default()
+    });
+    let entities = vec![
+        Entity::Task(Box::new(t)),
+        Entity::Context(orch_core::storage::ContextEntry {
+            key: "context/~key".into(),
+            value: large.clone(),
+            created_at: "1".into(),
+            updated_at: "1".into(),
+            ttl_ms: None,
+            expires_at: None,
+        }),
+        Entity::Message(Box::new(Message {
+            id: "message".into(),
+            channel: MessageChannel::Direct,
+            from_agent_id: "synthetic".into(),
+            to_agent_id: None,
+            subject: String::new(),
+            body: large,
+            created_at: "1".into(),
+            expires_at: None,
+            status: MessageStatus::Pending,
+            delivered_at: None,
+            team_id: None,
+            reply_to: None,
+        })),
+    ];
+    let expected = s
+        .transaction(owner("p"), Lane::Entities, move |u| {
+            entities
+                .into_iter()
+                .map(|e| u.create(e))
+                .collect::<Result<Vec<_>>>()
+        })
+        .await
+        .unwrap();
+    drop(s);
+    let s = FileStorage::new(root.path());
+    let read = s.read(owner("p")).await.unwrap();
+    for row in expected {
+        assert_eq!(
+            read.get(row.entity.kind(), row.entity.id()).await.unwrap(),
+            Some(row.clone())
+        );
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(document(&s, "p")).unwrap()).unwrap();
+    assert_eq!(json["records"].as_array().unwrap().len(), 3);
+    // One content hash per project even across fields and families.
+    let hashes: std::collections::BTreeSet<_> = json["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|row| row["texts"].as_array().unwrap())
+        .map(|text| text["sha256"].as_str().unwrap())
+        .collect();
+    assert_eq!(hashes.len(), 1);
+}
+
+#[tokio::test]
+async fn partial_blob_publication_leaves_no_rows_and_keeps_reusable_bytes() {
+    use crate::blob::{BlobHash, DiskBlobStore};
+    use crate::data_dir::confined::ConfinedDir;
+    let root = root();
+    let s = FileStorage::new(root.path());
+    create(&s, "p", "kept").await;
+    let path = document(&s, "p");
+    let before = std::fs::read(&path).unwrap();
+    let first = "a".repeat(65_537);
+    let second = "z".repeat(65_537);
+    let first_hash = BlobHash::of(first.as_bytes());
+    let second_hash = BlobHash::of(second.as_bytes()).to_string();
+    assert_ne!(&first_hash.to_string()[..2], &second_hash[..2]);
+    let confined = ConfinedDir::open(&s.project_dir("p")).unwrap();
+    let blobs = DiskBlobStore::open(&confined).unwrap();
+    // Block only the second hash's shard, after the first blob can be published.
+    std::fs::write(
+        s.project_dir("p")
+            .join("blobs/sha256")
+            .join(&second_hash[..2]),
+        b"blocked",
+    )
+    .unwrap();
+    let result = s
+        .write(
+            owner("p"),
+            Lane::Entities,
+            Box::new(move |u| {
+                u.create(described("a", first))?;
+                u.create(described("b", second))?;
+                Ok(())
+            }),
+        )
+        .await;
+    assert!(matches!(result, Err(StoreError::Backend(_))));
+    assert_eq!(std::fs::read(path).unwrap(), before);
+    assert_eq!(
+        blobs.get(&first_hash).unwrap(),
+        "a".repeat(65_537).as_bytes()
+    );
+    assert_eq!(get(&s, "p", "a").await, None);
+    assert_eq!(get(&s, "p", "b").await, None);
+    // Retrying the intact blob is safe; counters from the failed commit were not consumed.
+    let row = s
+        .transaction(owner("p"), Lane::Entities, |u| {
+            u.create(described("a", "a".repeat(65_537)))
+        })
+        .await
+        .unwrap();
+    assert_eq!((row.revision, row.position), (Revision::ONE, 2));
+}
+
+#[tokio::test]
+async fn large_text_commits_and_rollbacks_preserve_events_and_leases() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    let lease = claim(&s, new_lease("t", "a", "r")).await;
+    let expected = s
+        .transaction(owner("p"), Lane::Entities, move |u| {
+            u.append_events("r", &lease.lineage, lease.epoch, &[event(1)])?;
+            u.record_event_gap("r", 1, 2)?;
+            u.create(described("t", "x".repeat(65_537)))
+        })
+        .await
+        .unwrap();
+    let before = std::fs::read(document(&s, "p")).unwrap();
+    let lease = s
+        .read(owner("p"))
+        .await
+        .unwrap()
+        .read_leases()
+        .await
+        .unwrap()
+        .remove(0);
+    let result = s
+        .write(
+            owner("p"),
+            Lane::Entities,
+            Box::new(move |u| {
+                u.append_events("r", &lease.lineage, lease.epoch, &[event(2)])?;
+                u.release_lease("t", &lease.lineage, lease.epoch)?;
+                u.update(described("t", "y".repeat(65_537)), Revision::ONE)?;
+                Err(StoreError::InvalidPage("abort".into()))
+            }),
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(document(&s, "p")).unwrap(), before);
+    drop(s);
+    let s = FileStorage::new(root.path());
+    let view = s.read(owner("p")).await.unwrap();
+    assert_eq!(
+        view.get(EntityKind::Task, "t").await.unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(view.read_events("r", 0, 10).await.unwrap(), vec![event(1)]);
+    assert_eq!(
+        view.read_event_gaps("r").await.unwrap(),
+        vec![EventGap {
+            after_seq: 1,
+            dropped: 2
+        }]
+    );
+    assert_eq!(view.read_leases().await.unwrap().len(), 1);
+    s.restore_to_lineage("restored").await.unwrap();
+    assert_eq!(get(&s, "p", "t").await, Some(expected));
+    let restored = s.read(owner("p")).await.unwrap();
+    assert!(restored.read_leases().await.unwrap().is_empty());
+    assert_eq!(
+        restored.read_events("r", 0, 10).await.unwrap(),
+        vec![event(1)]
+    );
+    assert_eq!(claim(&s, new_lease("t", "a", "next")).await.epoch, 2);
+}

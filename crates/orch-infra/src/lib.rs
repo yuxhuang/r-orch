@@ -30,3 +30,9 @@ pub mod workspace;
 
 pub use clock::SystemClock;
 pub use ids::NanoIdGenerator;
+
+#[allow(
+    dead_code,
+    reason = "Bounded importer reader awaits the separate source integration"
+)]
+mod import;
