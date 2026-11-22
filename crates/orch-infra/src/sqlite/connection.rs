@@ -54,15 +54,16 @@ pub fn open_connection(
     role: ConnectionRole,
     sync: Synchronous,
 ) -> Result<ConnectionHandle<'_>> {
-    // SQLite opens these fixed names itself. Check descriptors first as defence
-    // in depth; the locked 0700 root is the actual protection for its VFS.
+    // SQLite opens these fixed names itself. Inspect without opening/closing
+    // them: an outside close would release SQLite's POSIX locks. The locked
+    // 0700 root is the protection against replacement between check and open.
     let access = if role == ConnectionRole::Reader {
         FileAccess::Read
     } else {
         FileAccess::Modify
     };
     for name in ["orch.db", "orch.db-wal", "orch.db-shm"] {
-        match data.root().open_file(name, access) {
+        match data.root().check_file(name, access) {
             Ok(_) => (),
             Err(ConfinedError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => return Err(e.into()),

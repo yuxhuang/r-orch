@@ -249,3 +249,88 @@ fn only_the_two_newest_copies_are_kept() {
     assert!(names[0].starts_with("pre-migration-v2-"));
     assert!(names[1].starts_with("pre-migration-v3-"));
 }
+
+#[test]
+fn incomplete_copies_do_not_count_toward_retention_or_fail_committed_migrations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    project(&conn);
+    let backups = dir.root().open_dir("backups").unwrap();
+    let incomplete = backups.create_dir("pre-migration-v1-1").unwrap();
+    incomplete.create_file("orch.db").unwrap();
+    incomplete.create_file("orch.db-wal").unwrap();
+    let steps = [INITIAL_SCHEMA, "SELECT 1", "SELECT 2", "SELECT 3"];
+    for version in 2..=4 {
+        apply_migrations(&dir, &mut conn, &steps[..version], plenty()).unwrap();
+        assert_eq!(
+            conn.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
+                .unwrap(),
+            version as u32
+        );
+    }
+    let names = backups.list().unwrap();
+    assert_eq!(names.len(), 3);
+    assert!(
+        names
+            .iter()
+            .any(|n| n.to_str().unwrap().starts_with("pre-migration-v2-"))
+    );
+    assert!(
+        names
+            .iter()
+            .any(|n| n.to_str().unwrap().starts_with("pre-migration-v3-"))
+    );
+    assert_eq!(
+        incomplete.list().unwrap(),
+        [
+            std::ffi::OsString::from("orch.db"),
+            std::ffi::OsString::from("orch.db-wal")
+        ]
+    );
+}
+
+#[test]
+fn retention_failure_does_not_report_a_committed_migration_as_failed() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    project(&conn);
+    let steps = [INITIAL_SCHEMA, "SELECT 1", "SELECT 2", "SELECT 3"];
+    apply_migrations(&dir, &mut conn, &steps[..2], plenty()).unwrap();
+    let old = std::fs::read_dir(tmp.path().join("data/backups"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = apply_migrations(&dir, &mut conn, &steps, plenty());
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // There are only two copies so far. Make a third to exercise pruning.
+    result.unwrap();
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let result = apply_migrations(
+        &dir,
+        &mut conn,
+        &[
+            INITIAL_SCHEMA,
+            "SELECT 1",
+            "SELECT 2",
+            "SELECT 3",
+            "SELECT 4",
+        ],
+        plenty(),
+    );
+    std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o700)).unwrap();
+    result.unwrap();
+    assert_eq!(
+        conn.pragma_query_value::<u32, _>(None, "user_version", |r| r.get(0))
+            .unwrap(),
+        5
+    );
+    assert!(old.join("orch.db").exists());
+}

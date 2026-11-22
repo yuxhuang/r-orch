@@ -1,7 +1,7 @@
 //! R102: one component per descriptor-relative operation; never follow a link.
 use nix::dir::Dir;
-use nix::fcntl::{OFlag, open, openat, renameat};
-use nix::sys::stat::{Mode, SFlag, fchmod, fstat, mkdirat};
+use nix::fcntl::{AtFlags, OFlag, open, openat, renameat};
+use nix::sys::stat::{Mode, SFlag, fchmod, fstat, fstatat, mkdirat};
 use nix::unistd::{UnlinkatFlags, unlinkat};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -122,6 +122,26 @@ impl ConfinedDir {
             }
             result => result,
         }
+    }
+
+    // SQLite owns its file descriptors. Closing another descriptor on a live
+    // database or WAL-index inode would release its process-wide POSIX locks.
+    pub(crate) fn check_file(&self, name: impl AsRef<OsStr>, access: FileAccess) -> Result<()> {
+        let name = name.as_ref();
+        component(name)?;
+        let stat =
+            fstatat(&self.file, name, AtFlags::AT_SYMLINK_NOFOLLOW).map_err(|e| error(name, e))?;
+        let kind = SFlag::from_bits_truncate(stat.st_mode);
+        if kind == SFlag::S_IFLNK {
+            return Err(ConfinedError::Symlink(name.to_owned()));
+        }
+        if kind != SFlag::S_IFREG {
+            return Err(ConfinedError::WrongType(name.to_owned()));
+        }
+        if access != FileAccess::Read && stat.st_nlink != 1 {
+            return Err(ConfinedError::HardLink(name.to_owned()));
+        }
+        Ok(())
     }
 
     pub fn open_file(&self, name: impl AsRef<OsStr>, access: FileAccess) -> Result<File> {

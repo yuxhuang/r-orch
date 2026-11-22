@@ -123,3 +123,117 @@ fn a_guarded_transaction_reserves_the_writer_before_its_first_statement() {
         .execute_batch("BEGIN IMMEDIATE; ROLLBACK")
         .unwrap();
 }
+
+#[test]
+fn opening_connections_preserves_cross_process_writer_locks() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    if let Some(path) = std::env::var_os("SQLITE_LOCK_CONTENDER_DB") {
+        let conn = rusqlite::Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+        .unwrap();
+        conn.busy_timeout(Duration::ZERO).unwrap();
+        let result = conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK");
+        if std::env::var_os("SQLITE_LOCK_EXPECT_BUSY").is_some() {
+            assert_eq!(
+                result.unwrap_err().sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+        } else {
+            result.unwrap();
+        }
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let data = DataDir::acquire(&temp.path().join("data"), &holder()).unwrap();
+    let mut writer = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    writer
+        .execute_batch("CREATE TABLE sample(id INTEGER) STRICT")
+        .unwrap();
+    let contend = |busy: bool| {
+        let home = tempfile::tempdir().unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "opening_connections_preserves_cross_process_writer_locks",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("TMPDIR", home.path())
+            .env(
+                "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                home.path().join("global.yml"),
+            )
+            .env("ORCH_DATA_HOME", home.path().join("daemons"))
+            .env("SQLITE_LOCK_CONTENDER_DB", data.database_path())
+            .stdout(Stdio::null());
+        if busy {
+            command.env("SQLITE_LOCK_EXPECT_BUSY", "1");
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "external contender failed (expected busy={busy}): {status}"
+                );
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("external contender timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let transaction = writer.transaction().unwrap();
+    contend(true);
+    let reader = open_connection(&data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
+    contend(true);
+    let checkpoint =
+        open_connection(&data, ConnectionRole::Checkpoint, Synchronous::Normal).unwrap();
+    contend(true);
+    drop(reader);
+    drop(checkpoint);
+    contend(true);
+    transaction.rollback().unwrap();
+    contend(false);
+}
+
+#[test]
+fn every_sqlite_filename_refuses_links_and_special_files() {
+    use std::os::unix::fs::symlink;
+    for name in ["orch.db", "orch.db-wal", "orch.db-shm"] {
+        for kind in ["symlink", "hardlink", "fifo", "directory"] {
+            let temp = tempfile::tempdir().unwrap();
+            let data = DataDir::acquire(&temp.path().join("data"), &holder()).unwrap();
+            drop(open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap());
+            let path = temp.path().join("data").join(name);
+            if path.exists() {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let canary = temp.path().join("canary");
+            std::fs::write(&canary, b"unchanged").unwrap();
+            match kind {
+                "symlink" => symlink(&canary, &path).unwrap(),
+                "hardlink" => std::fs::hard_link(&canary, &path).unwrap(),
+                "fifo" => nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRUSR).unwrap(),
+                "directory" => std::fs::create_dir(&path).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(
+                open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).is_err(),
+                "{name}: {kind}"
+            );
+            assert_eq!(std::fs::read(canary).unwrap(), b"unchanged");
+        }
+    }
+}

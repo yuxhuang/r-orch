@@ -94,8 +94,10 @@ pub fn apply_migrations(
             .to_version(conn, target)
             .map_err(|e| SqliteError::Migration(e.to_string()))?;
     }
-    if holds_project {
-        retain_two(data)?;
+    if holds_project && let Err(error) = retain_two(data) {
+        // Every migration has already committed. Cleanup cannot undo it or
+        // truthfully turn that success into a migration failure.
+        tracing::warn!(%error, "could not prune old pre-migration copies after migration committed");
     }
     Ok(())
 }
@@ -232,6 +234,20 @@ fn retain_two(data: &DataDir) -> Result<()> {
             continue;
         }
         let Ok(at) = at.parse::<u128>() else { continue };
+        let dir = match backups.open_dir(&name) {
+            Ok(dir) => dir,
+            Err(_) => continue,
+        };
+        // A crash may leave a partial copy. Preserve it for inspection and do
+        // not let it displace a completed copy in the retention count.
+        if dir.list()?
+            != [
+                std::ffi::OsString::from("manifest.json"),
+                std::ffi::OsString::from("orch.db"),
+            ]
+        {
+            continue;
+        }
         copies.push((at, name));
     }
     copies.sort_by_key(|r| r.0);
