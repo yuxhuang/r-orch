@@ -114,6 +114,13 @@ vectors of the spec's "Filesystem names" are tested on the finish file, by T12 a
 
 ### Product: built on files, then beside files
 
+T8 is delivered in small additive slices: T8a supplies the entity port; T8b
+supplies remaining entity families and the file reference; T8c first supplies
+event/lease contracts and their memory reference, followed by retries, intents,
+request keys and attention. Operational file wiring follows the real T8b adapter;
+SQLite wiring follows T9/T10. This first T8c slice does not complete T8 or release
+the engine's dependency on the full operational port. The v1 runtime stays active.
+
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|
 | T8 | Port v2 in `orch-core`, its fakes, and the v2 file adapter; the suite extended to all of port v2, with the rule that no two task ids of a project differ only in case, kept by the file adapter's own comparison | R7 to R15, R17, R97, R117 (the port and the file adapter), R132 (the caller's lineage in the port) | `crates/orch-core/src/store*`, `crates/orch-infra/src/storage/v2*`, the suite | T7 | Suite (file adapter) | 7 |
