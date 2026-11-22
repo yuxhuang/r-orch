@@ -505,3 +505,119 @@ fn row_hashes_and_metadata_are_checked_before_reading_bytes() {
     assert!(refs.load_prompt(&c, "run").is_err());
     f.canary_unchanged();
 }
+
+// Project and error-contract regressions from independent review I1.
+#[test]
+fn owner_only_in_another_project_is_missing() {
+    use orch_infra::blob::{BlobReferences, ReferenceError};
+    let f = fixture();
+    let mut c = database(&f);
+    c.execute("INSERT INTO tasks (project_id,id,title,description,status,priority,attempts,max_attempts,position,created_by_kind,created_at,updated_at,revision) VALUES ('other','only_other','t','','todo',1,0,3,0,'owner',0,0,1)", []).unwrap();
+    c.execute("INSERT INTO runs (project_id,id,task_id,agent_id,run_no,counted,attempt_no,epoch,status,started_at,revision) VALUES ('other','run_other','only_other','agent',9,1,9,9,'running',0,1)", []).unwrap();
+    let refs = BlobReferences::new(&f.store, "p");
+    let mut tx = c.transaction().unwrap();
+    assert!(matches!(
+        refs.store_prompt(&mut tx, "run_other", "x", 0),
+        Err(ReferenceError::MissingOwner { kind: "run" })
+    ));
+    assert!(matches!(
+        refs.store_attachment(&mut tx, "only_other", "a", b"x", 0),
+        Err(ReferenceError::MissingOwner { kind: "task" })
+    ));
+    assert_eq!(count(&tx, "blobs"), 0);
+    assert_eq!(count(&tx, "task_attachments"), 0);
+}
+
+#[test]
+fn another_projects_blob_row_does_not_authorize_a_read() {
+    use orch_infra::blob::{BlobReferences, ReferenceError};
+    let f = fixture();
+    let mut c = database(&f);
+    let mut tx = c.transaction().unwrap();
+    let hash = BlobReferences::new(&f.store, "p")
+        .store_prompt(&mut tx, "run", "shared", 0)
+        .unwrap();
+    tx.commit().unwrap();
+    c.execute(
+        "UPDATE runs SET prompt_sha256=?1 WHERE project_id='other' AND id='run'",
+        [hash.to_string()],
+    )
+    .unwrap();
+    assert!(matches!(
+        BlobReferences::new(&f.store, "other").load_prompt(&c, "run"),
+        Err(ReferenceError::Metadata)
+    ));
+}
+
+#[test]
+fn reregistration_clears_the_sweep_mark_and_attachment_replaces() {
+    use orch_infra::blob::BlobReferences;
+    let f = fixture();
+    let mut c = database(&f);
+    let refs = BlobReferences::new(&f.store, "p");
+    let mut tx = c.transaction().unwrap();
+    refs.store_prompt(&mut tx, "run", "mark", 0).unwrap();
+    tx.execute("UPDATE blobs SET unreferenced_since=5", [])
+        .unwrap();
+    refs.store_prompt(&mut tx, "run2", "mark", 1).unwrap();
+    assert_eq!(
+        tx.query_row::<Option<i64>, _, _>("SELECT unreferenced_since FROM blobs", [], |r| r.get(0))
+            .unwrap(),
+        None
+    );
+    refs.store_attachment(&mut tx, "task", "a", b"one", 0)
+        .unwrap();
+    refs.store_attachment(&mut tx, "task", "a", b"two", 0)
+        .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        refs.load_attachment(&c, "task", "a").unwrap(),
+        Some(b"two".to_vec())
+    );
+    assert_eq!(count(&c, "task_attachments"), 1);
+}
+
+#[test]
+fn error_variants_and_location() {
+    use orch_infra::blob::{BlobError, BlobReferences, ReferenceError};
+    let f = fixture();
+    let mut c = database(&f);
+    let refs = BlobReferences::new(&f.store, "p");
+    let mut tx = c.transaction().unwrap();
+    let hash = refs.store_prompt(&mut tx, "run", "loc", 0).unwrap();
+    tx.commit().unwrap();
+    c.execute("UPDATE blobs SET storage_location='object'", [])
+        .unwrap();
+    assert!(matches!(
+        refs.load_prompt(&c, "run"),
+        Err(ReferenceError::Metadata)
+    ));
+    c.execute("UPDATE blobs SET storage_location='disk'", [])
+        .unwrap();
+    std::fs::write(f.blob_path(&hash), b"bad").unwrap();
+    assert!(matches!(
+        refs.load_prompt(&c, "run"),
+        Err(ReferenceError::Blob(BlobError::Corrupt(_)))
+    ));
+    std::fs::remove_file(f.blob_path(&hash)).unwrap();
+    assert!(matches!(
+        refs.load_prompt(&c, "run"),
+        Err(ReferenceError::Blob(BlobError::NotFound(_)))
+    ));
+    c.execute(
+        "UPDATE runs SET prompt_sha256='../x' WHERE project_id='p' AND id='run'",
+        [],
+    )
+    .unwrap();
+    c.execute("INSERT INTO task_attachments (project_id,task_id,name,sha256) VALUES ('p','task','bad','../x')", []).unwrap();
+    c.execute("UPDATE blobs SET sha256='../x'", []).unwrap();
+    assert!(matches!(
+        refs.load_prompt(&c, "run"),
+        Err(ReferenceError::Blob(BlobError::InvalidHash(_)))
+    ));
+    assert!(matches!(
+        refs.load_attachment(&c, "task", "bad"),
+        Err(ReferenceError::Blob(BlobError::InvalidHash(_)))
+    ));
+    f.canary_unchanged();
+}
