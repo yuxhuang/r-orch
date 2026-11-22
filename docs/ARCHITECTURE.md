@@ -265,7 +265,7 @@ r-orch/
 │   ├── orch-client/           # daemon client: discovery, connect, handshake, typed calls (domain, proto)
 │   ├── orch-cli/              # clap command tree, human + JSON rendering, serve mode. bins live here.
 │   └── orch-tui/              # ratatui dashboard
-├── xtask/                     # dev tooling: crate-graph, linux, gate.sh, mouse-e2e
+├── xtask/                     # dev tooling: crate-graph, fixture-gen, linux, gate.sh, mouse-e2e
 ├── fixtures/                  # golden prompts, adapter stdout recordings, shop catalogue, fake agents
 └── skills/library/            # shipped skill markdown
 ```
@@ -406,6 +406,9 @@ the check keeps the *list*. If they disagree, the check is right.
 `orch-daemon`.** The core engine has no knowledge of the CLI, TUI or daemon layers; the daemon composes the engine,
 not the other way round.
 
+`xtask` is the one tooling crate with normal edges into the product crates: `orch-core`, `orch-domain` and
+`orch-infra`, so that `cargo xtask fixture-gen` can script the real 1.0 file backend. It takes no test-support feature.
+
 `xtask crate-graph` asserts the **whole edge set** against a table, not just that one forbidden edge —
 including build- and dev-dependencies, since a test-only edge still compiles the crate. A single
 forbidden-edge check would pass a workspace in which `orch-infra` had started depending on `orch-engine`,
@@ -442,11 +445,49 @@ All three names are the same program:
 | Crate | Modules |
 |---|---|
 | `orch-domain` | `task`, `agent`, `run`, `goal`, `team`, `message`, `state`, `config`, `global_config`, `events`, `error`, `transitions`, `scope`, `model_tiers`, `shop` (agent-shop + org-shop + default-agents) |
-| `orch-core` | `storage` (9 traits), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
+| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity, event and lease port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{agent, config, context, daemon, goal, init, msg, org, org_template, remote, rpc, run, status, task, team}`, `doctor`, `logs`, `tui` (`DaemonBackend`), `update`, `web`, `routing`, `tree`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
 | `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
+
+The additive `orch_core::store` entity port is the first part of SQLite-storage
+plan T8. `Storage::read(Caller)` returns an immutable committed snapshot;
+`Storage::write(Caller, Lane, WriteWork)` runs a synchronous, fallible unit of
+work on one writer. A callback error discards its entity, revision and position
+changes. Owned callbacks can cross a dedicated writer-task boundary.
+`StorageExt::transaction` returns a typed callback result only after the backend
+confirms the commit, without serializing it through the port.
+A caller selects one project at entry; row keys cannot select another project.
+Operation authorization remains the dispatcher's responsibility.
+
+`Record` wraps the existing task, goal, agent, team, run, message or context
+payload with a positive revision and an explicit position. Updates preserve
+position; `move_to_end` changes position and revision. `Filter` selects an entity
+family and its filters; `PageRequest` bounds each list and selects a supported
+sort. `store::fake::FakeStorage`, behind `test-support`, serializes in-memory
+writers and retains immutable read views. Its cursor registry holds query
+bindings and sort keys, not snapshots, and lives only as long as that fake.
+`ReadSnapshot` and `UnitOfWork` also expose the `events::{EventRead, EventWrite}`
+and `leases::{LeaseRead, LeaseWrite}` contracts. Event batches keep the first
+payload for each sequence and report stored/skipped counts; range/tail reads are
+in sequence order, gaps are retained when bounded pruning removes event rows.
+A gap is keyed by project, run and `after_seq`: replaying the same `dropped`
+count is a no-op; a conflicting count returns `InvalidEvents` without a write.
+Claim, renew, release and event append share the enclosing transaction. The fake
+uses one per-project lease state and one daemon lineage for every lease-bound
+write, checking task/run/lineage/epoch before event append even for an empty or
+fully duplicate batch. A claim refuses an occupied task, agent or run and consumes
+no epoch; release keeps the task's epoch counter. Lease times are caller-supplied
+UTC milliseconds from `Clock::now_ms()`. Claims and renewals use checked
+`now_ms + LEASE_MS`, where `LEASE_MS = 120_000`. The
+port reads no clock and never expires a lease merely because time advanced:
+after sleep the daemon renews its supervised runs before expiry (spec AP12).
+Physical suspend, recovery and engine expiry ordering are later integration checks.
+The lease and combined conformance scenarios accept backend factories with a
+fixture restore hook; only the memory reference is registered for these families.
+The remaining operational families, file reference and SQLite are subsequent
+slices. The daemon and all v1 storage traits still use the existing file implementation; this additive module changes no runtime storage path.
 
 ### 3.3.1 `orch mcp` (`orch-cli::mcp`)
 
@@ -1060,6 +1101,26 @@ loop {
   yields a trailing fragment, and caps each line at 16384 characters. Write our own `line_reader`; do not
   reach for the convenience method.
 
+`orch_core::usage::RunUsage` holds the nullable usage fields of storage v2 (SQLite spec R86/R87): five token
+counts, the model and the CLI version. It lives in `orch-core` because the orchestrator's collector, which may
+not name `orch_infra` (`cargo xtask crate-graph`), observes through it. The model is seeded from the prepared
+configuration and replaced by the one the CLI reports; the version comes from a cached `AdapterTestResult`
+(`Orchestrator::record_adapter_probe`), including a failed probe that supplied one. Omitted counters remain
+unknown, explicit zero stays zero, and repeated snapshots are not summed. Invalid counts (fractional, negative
+or outside SQLite's signed INTEGER range) are ignored. Blank or over-64-KiB model/version strings are ignored
+without truncation. The helper performs no I/O and does not infer counts from the lossy legacy `TokenUsage`,
+which fills absent counters with zero.
+
+`collect_events_observing` calls `RunUsage::observe_event` on every event an adapter supplies, before the event
+is reduced, and hands the result to the `RunUsageObserver` set with `Orchestrator::set_run_usage_observer` once
+the stream ends: after a normal run, a failed run (an `Err` item or an `error` event), a cancellation or a
+shutdown. Only what survives the adapter's own event conversion is observable: a lifecycle record an adapter
+drops (OpenCode `tool-calls` step finishes, Pi's passive `message_end`/`turn_end` running reports, so a Pi run
+that dies before `agent_end` reports nothing, and Codex lifecycle records) stays unknown. The
+observation is in memory and storage-independent; the 1.0 token record, run events and run finish are
+unchanged, and the durable finish (R36) will read the same value. Nothing probes a CLI version on the dispatch
+path, so a version is known only after `record_adapter_probe`; remote runs are not observed.
+
 ### 6.4 Cancellation
 
 `tokio_util::sync::CancellationToken`, one per running task, stored in
@@ -1283,6 +1344,10 @@ cargo test --workspace                       # layers 1 to 4
 cargo deny check                             # supply chain — advisories, licences, bans
 cargo xtask crate-graph                      # asserts the whole inter-crate edge set (§3.1)
 ```
+
+`cargo xtask fixture-gen --check` (the generated 1.0 corpus under `fixtures/storage/generated` still
+matches its generator) is not a separate CI step. `xtask/tests/fixture_gen.rs` runs it inside
+`cargo test --workspace`, so layer 1 to 4 CI covers it.
 
 `deny.toml` carries **two accepted advisories**, both *unmaintained* rather than vulnerable, and both
 transitive with no alternative:

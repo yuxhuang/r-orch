@@ -1,6 +1,7 @@
 //! Dev tooling for r-orch. `cargo xtask <command>`.
 
 mod crate_graph;
+mod fixture_gen;
 mod gate;
 mod gate_selection;
 mod linux;
@@ -21,6 +22,8 @@ struct Cli {
 enum Task {
     /// Assert the crate layering from ARCHITECTURE §3.1.
     CrateGraph,
+    /// Generate the synthetic 1.0 import corpus, or with --check compare it with the checked-in tree.
+    FixtureGen(fixture_gen::FixtureGenArgs),
     /// Run the Linux checks from macOS in a linux/amd64 Docker container (AGENTS.md).
     Linux(linux::LinuxArgs),
     /// Tiered checks: full is the goal/release gate; pr is the merge tier after policy transition; fast is staged.
@@ -33,6 +36,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Task::CrateGraph => crate_graph::run(&repo_root),
+        Task::FixtureGen(args) => fixture_gen::run(&repo_root, args),
         Task::Linux(args) => linux::run(&repo_root, args),
         Task::Gate(args) => {
             // Helpers operate on the caller's repository, including disposable fixtures.

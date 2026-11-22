@@ -1,0 +1,22 @@
+{
+  "id": "run_TsyqzjV",
+  "task_id": "tsk_7iefwwT",
+  "agent_id": "agt_Nsf31rn",
+  "attempt": 1,
+  "status": "failed",
+  "started_at": "2025-01-01T00:00:41.583Z",
+  "finished_at": "2025-01-01T00:00:52.817Z",
+  "workspace_path": "workspaces/tsk_7iefwwT",
+  "prompt": "Synthetic prompt for tsk_7iefwwT, attempt 1.",
+  "pid": 21485,
+  "error": "synthetic process crash",
+  "error_kind": "process_crash",
+  "tokens": {
+    "input": 3830,
+    "output": 570,
+    "reasoning": 1908,
+    "total": 6308,
+    "cache_read": 313,
+    "cache_write": 439
+  }
+}

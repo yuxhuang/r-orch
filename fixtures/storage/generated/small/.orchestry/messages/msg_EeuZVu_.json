@@ -1,0 +1,12 @@
+{
+  "id": "msg_EeuZVu_",
+  "channel": "direct",
+  "from_agent_id": "agt_BneL5Al",
+  "to_agent_id": "agt__AKo7jx",
+  "subject": "Synthetic subject 4",
+  "body": "Invented message body 4.",
+  "created_at": "2025-01-01T00:05:39.717Z",
+  "expires_at": "2025-01-02T00:05:39.717Z",
+  "status": "pending",
+  "reply_to": "msg_bfQF-1p"
+}

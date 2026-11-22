@@ -1,0 +1,6 @@
+{"timestamp":"2025-01-01T00:03:07.626Z","type":"file_changed","data":"synthetic/file-0.txt"}
+{"timestamp":"2025-01-01T00:03:08.027Z","type":"file_changed","data":"synthetic/file-1.txt"}
+{"timestamp":"2025-01-01T00:03:11.502Z","type":"command_run","data":"synthetic-command --step 2"}
+{"timestamp":"2025-01-01T00:03:15.316Z","type":"file_changed","data":"synthetic/file-3.txt"}
+{"timestamp":"2025-01-01T00:03:15.793Z","type":"agent_output","data":"synthetic output line 4 for run_KZSj4zt"}
+{"timestamp":"2025-01-01T00:03:16.632Z","type":"done","data":"synthetic run finished"}

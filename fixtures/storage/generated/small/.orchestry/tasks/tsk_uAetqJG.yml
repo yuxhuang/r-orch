@@ -1,0 +1,14 @@
+id: tsk_uAetqJG
+title: Polish the bright meadow
+description: Invented work item 7; nothing here describes a real project.
+status: done
+priority: 3
+assignee: agt__AKo7jx
+labels:
+- chore
+depends_on: []
+created_at: '2025-01-01T00:01:40.192Z'
+updated_at: '2025-01-01T00:01:51.153Z'
+attempts: 1
+max_attempts: 3
+goalId: goal_B4eWz60

@@ -1,0 +1,20 @@
+{
+  "id": "run_aJLjknW",
+  "task_id": "tsk_t1ufLsm",
+  "agent_id": "agt_BneL5Al",
+  "attempt": 1,
+  "status": "succeeded",
+  "started_at": "2025-01-01T00:01:53.269Z",
+  "finished_at": "2025-01-01T00:02:04.699Z",
+  "workspace_path": "workspaces/tsk_t1ufLsm",
+  "prompt": "Synthetic prompt for tsk_t1ufLsm, attempt 1.",
+  "pid": 13607,
+  "tokens": {
+    "input": 15987,
+    "output": 1097,
+    "reasoning": 1588,
+    "total": 18672,
+    "cache_read": 2,
+    "cache_write": 803
+  }
+}

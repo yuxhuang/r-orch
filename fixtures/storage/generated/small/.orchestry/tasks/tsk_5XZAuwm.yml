@@ -1,0 +1,13 @@
+id: tsk_5XZAuwm
+title: Sort the quiet compass
+description: Invented work item 3; nothing here describes a real project.
+status: retrying
+priority: 2
+assignee: agt_BneL5Al
+labels:
+- docs
+depends_on: []
+created_at: '2025-01-01T00:00:57.994Z'
+updated_at: '2025-01-01T00:01:09.835Z'
+attempts: 1
+max_attempts: 3

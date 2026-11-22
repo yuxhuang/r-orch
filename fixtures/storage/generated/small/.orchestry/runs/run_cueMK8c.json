@@ -1,0 +1,20 @@
+{
+  "id": "run_cueMK8c",
+  "task_id": "tsk_qZF9Fuw",
+  "agent_id": "agt_BneL5Al",
+  "attempt": 1,
+  "status": "cancelled",
+  "started_at": "2025-01-01T00:01:22.069Z",
+  "finished_at": "2025-01-01T00:01:36.831Z",
+  "workspace_path": "workspaces/tsk_qZF9Fuw",
+  "prompt": "Synthetic prompt for tsk_qZF9Fuw, attempt 1.",
+  "pid": 13310,
+  "tokens": {
+    "input": 5451,
+    "output": 863,
+    "reasoning": 245,
+    "total": 6559,
+    "cache_read": 2048,
+    "cache_write": 472
+  }
+}

@@ -247,6 +247,11 @@ struct Inner {
     /// [`Orchestrator::set_config_store`].
     config_store: std::sync::RwLock<Option<Arc<dyn orch_core::storage::ConfigStore>>>,
     event_tap: std::sync::RwLock<Option<Arc<dyn orch_core::remote::RunEventTap>>>,
+    /// Receives each ended run's observed usage; see
+    /// [`Orchestrator::set_run_usage_observer`].
+    usage_observer: std::sync::RwLock<Option<Arc<dyn orch_core::usage::RunUsageObserver>>>,
+    /// Latest version probe per adapter kind for this daemon generation.
+    adapter_probes: std::sync::Mutex<HashMap<String, orch_core::adapter::AdapterTestResult>>,
     /// The instance id of the controller connected to this instance's peer
     /// listener, if any. Dispatch consults it before starting a mirror.
     inbound_controller: std::sync::RwLock<Option<String>>,
@@ -352,6 +357,8 @@ impl Orchestrator {
                 )),
                 config_store: std::sync::RwLock::new(None),
                 event_tap: std::sync::RwLock::new(None),
+                usage_observer: std::sync::RwLock::new(None),
+                adapter_probes: std::sync::Mutex::new(HashMap::new()),
                 inbound_controller: std::sync::RwLock::new(None),
                 config: std::sync::RwLock::new(deps.config.clone()),
                 deps,

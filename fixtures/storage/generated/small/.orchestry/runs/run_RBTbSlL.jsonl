@@ -1,0 +1,3 @@
+{"timestamp":"2025-01-01T00:00:36.540Z","type":"command_run","data":"synthetic-command --step 0"}
+{"timestamp":"2025-01-01T00:00:37.727Z","type":"command_run","data":"synthetic-command --step 1"}
+{"timestamp":"2025-01-01T00:00:38.083Z","type":"done","data":"synthetic run finished"}

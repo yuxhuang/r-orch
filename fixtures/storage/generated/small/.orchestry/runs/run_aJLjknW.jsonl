@@ -1,0 +1,6 @@
+{"timestamp":"2025-01-01T00:01:55.193Z","type":"file_changed","data":"synthetic/file-0.txt"}
+{"timestamp":"2025-01-01T00:01:58.724Z","type":"tool_call","data":"synthetic tool call 1"}
+{"timestamp":"2025-01-01T00:02:00.273Z","type":"agent_output","data":"synthetic output line 2 for run_aJLjknW"}
+{"timestamp":"2025-01-01T00:02:01.161Z","type":"agent_output","data":"synthetic output line 3 for run_aJLjknW"}
+{"timestamp":"2025-01-01T00:02:04.203Z","type":"tool_call","data":"synthetic tool call 4"}
+{"timestamp":"2025-01-01T00:02:04.699Z","type":"done","data":"synthetic run finished"}

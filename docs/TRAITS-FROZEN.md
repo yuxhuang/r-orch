@@ -106,6 +106,54 @@ plain objects, so unknown keys in `config.yml` survive a `config set`. Use
 `serde_json::Value`, and deserialize the typed struct only for consumers.
 `FakeConfigStore` does exactly this and has the test for it.
 
+### Additive v2 event and lease contracts (ADR 0017 decision 3)
+
+The existing v1 signatures remain active until T25. The additive `orch_core::store`
+port is governed by the storage spec's "Storage port v2" and ADR 0017; it returns
+`store::Result<T>`. Its `ReadSnapshot` extends `EventRead + LeaseRead`, and
+`UnitOfWork` extends `EventWrite + LeaseWrite`. All operations use the enclosing
+caller's project; authorization belongs to the dispatcher. These operations are
+not yet wired into the running daemon.
+
+```rust
+// events::EventRead (async, &self)
+read_events(run: &str, after_seq: u64, limit: usize) -> Result<Vec<SequencedEvent>>;
+read_events_tail(run: &str, count: usize) -> Result<Vec<SequencedEvent>>;
+read_event_gaps(run: &str) -> Result<Vec<EventGap>>;
+// events::EventWrite (&mut self)
+append_events(run: &str, lineage: &str, epoch: u64, batch: &[SequencedEvent]) -> Result<AppendResult>;
+record_event_gap(run: &str, after_seq: u64, dropped: u64) -> Result<()>;
+prune_events(run: &str, max_rows: usize) -> Result<PruneResult>;
+// leases::LeaseRead (async, &self)
+read_lease(task: &str) -> Result<Option<Lease>>;
+read_agent_lease(agent: &str) -> Result<Option<Lease>>;
+read_leases() -> Result<Vec<Lease>>;
+// leases::LeaseWrite (&mut self for changes; &self for reads)
+claim_lease(new: &NewLease, now_ms: i64) -> Result<ClaimOutcome>;
+renew_lease(task: &str, lineage: &str, epoch: u64, now_ms: i64) -> Result<Lease>;
+release_lease(task: &str, lineage: &str, epoch: u64) -> Result<Lease>;
+get_lease(task: &str) -> Result<Option<Lease>>;
+get_agent_lease(agent: &str) -> Result<Option<Lease>>;
+list_leases() -> Result<Vec<Lease>>;
+```
+
+`SequencedEvent` carries `seq` (positive, collector-assigned) and `RunEvent`.
+`AppendResult` holds `stored` and `skipped`; first stored bytes win on duplicates.
+`EventGap { after_seq, dropped }` names `(after_seq, after_seq + dropped]`.
+Its key is `(project_id, run_id, after_seq)`: identical `dropped` replays are
+no-ops; conflicting counts return `InvalidEvents` without changing any row.
+`PruneResult { deleted, complete }` reports whether any event rows remain, retaining
+gaps. Read/prune bounds are 1..=1000; a tail of zero is empty.
+`NewLease { task, agent, run }` receives a backend-assigned lineage and epoch in
+`Lease { task, agent, run, lineage, epoch, expires_at }`. Lease clocks use UTC
+milliseconds from `Clock::now_ms()`; claims/renewals store checked
+`now_ms + LEASE_MS`, where `LEASE_MS: i64 = 120_000`. A late renewal is allowed until explicit release
+(AP12). `ClaimOutcome` is `Granted(Lease)` or `Held(Lease)`; an occupied task, agent
+or run is checked in that order and burns no epoch. Renew, release and append
+refuse `StaleEpoch` for a missing lease, stale lineage/epoch or mismatching task
+principal. Invalid event arguments return `InvalidEvents(String)`. Operation errors
+leave the operation unchanged; a callback error rolls back the entire unit of work.
+
 ## 3. `orch_core::adapter`
 
 ```rust

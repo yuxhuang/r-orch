@@ -108,8 +108,19 @@ struct Hanging {
     _dir: tempfile::TempDir,
 }
 
+// Both the supervisor socket and the descendant readiness socket need a short
+// root: the helper otherwise nests another tempdir under the supervisor's root.
+// Keep this independent of the runner's TMPDIR and owner-only on both platforms.
+fn socket_fixture_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("oc-")
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir_in("/tmp")
+        .expect("short private cleanup fixture directory")
+}
+
 fn hanging() -> Hanging {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = socket_fixture_dir();
     let ready = dir.path().join("ready.sock");
     let socket = UnixDatagram::bind(&ready).unwrap();
     socket
@@ -319,7 +330,7 @@ fn full_stderr_does_not_delay_final_owner_cleanup() {
 
     // Isolate fd 2 in a helper process; never redirect the test runner's global
     // stderr. Python is already used by this target's readiness fixture.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = socket_fixture_dir();
     let result = Command::new("/usr/bin/python3")
         .args(["-c", FULL_STDERR_SUPERVISOR])
         .arg(std::env::current_exe().unwrap())

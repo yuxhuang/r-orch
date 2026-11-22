@@ -3452,8 +3452,12 @@ dependencies = [
  "anyhow",
  "clap",
  "nix 0.31.3",
+ "orch-core",
+ "orch-domain",
+ "orch-infra",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 
