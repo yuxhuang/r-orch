@@ -455,23 +455,29 @@ change once more, and that read is limited to it.
 ### T10 split: the independent writer and read-pool foundation
 
 T10's row stays as written, and so does its completion rule: T10 is done only when its whole row is. A first slice
-that needs no port v2 type is delivered as its own PR (PR 122) so that the later slices review against it.
+that needs no port v2 type is delivered as its own PR (PR 122) so that the later slices review against it. A second
+executor slice, the deadline recheck after `BEGIN IMMEDIATE` and the bounded writer tests, is delivered as PR 154,
+which is open and pending its review and merge.
 
 **What the foundation is.** The writer executor and the read pool, in `crates/orch-infra/src/sqlite/writer.rs`
 and `read_pool.rs`, with their module tests. It uses T9's data directory and connection setup and nothing from T8.
 It is wired to nothing: not to `Storage`, not to the daemon. Its behaviour and limits are in
 [ARCHITECTURE.md §6.6](../ARCHITECTURE.md#66-sqlite-writer-and-read-pool-foundation-not-wired). Of the spec it
 covers R24 (one writer, `BEGIN IMMEDIATE`, read-only readers), R25 (a snapshot per read), R98 (pool size, bounded
-wait, no extra connection) and the order of R26's lanes. Nothing else of R26 and nothing of R27, R28, R126 to R128,
-R130, R137, R139 or R140.
+wait, no extra connection) and the order of R26's lanes. Of R128 it covers one case only, from PR 154: a request
+whose deadline passes while `BEGIN IMMEDIATE` waits for the write reservation is refused before its body runs and
+never commits. Nothing else of R26 and nothing else of R27, R28, R126 to R128, R130, R137, R139 or R140.
 
 **Module tests.** Unit tests under `crates/orch-infra/src/sqlite/writer/tests/mod.rs` and
 `read_pool/tests/mod.rs`. They are not the `sqlite_writer` and `sqlite_crash` integration tests that T10's
-"Verify" column names; those and the SQLite run of the conformance suite remain T10's.
+"Verify" column names; those and the SQLite run of the conformance suite remain T10's. Every receipt wait in the
+`writer` module gives up after 10 s, and a scoped test closes admission when its body unwinds so that the join of the
+worker cannot hang behind a failed assertion: a regression fails by name instead of hanging. `a_withdrawn_request_is_never_committed` covers a deadline that
+passes during the `BEGIN IMMEDIATE` wait only. It is not the oracle of R128's retry case.
 
 | Module | Tests |
 |---|---|
-| `writer` (9) | `writes_run_one_at_a_time_on_one_connection`, `body_and_commit_errors_keep_nothing_and_writer_continues`, `claims_precede_queued_work_and_other_lanes_use_deadlines`, `bounded_queue_and_single_pending_event_transaction`, `expired_queued_request_never_runs_and_close_drains_accepted_work`, `a_panicking_transaction_rolls_back_and_closes_the_worker`, `executor_runs_claims_first_and_dropped_receipts_still_commit`, `a_deadline_that_passes_behind_active_work_withdraws_the_request`, `dropping_the_last_handle_closes_admission_and_drains` |
+| `writer` (11) | `writes_run_one_at_a_time_on_one_connection`, `body_and_commit_errors_keep_nothing_and_writer_continues`, `claims_precede_queued_work_and_other_lanes_use_deadlines`, `bounded_queue_and_single_pending_event_transaction`, `expired_queued_request_never_runs_and_close_drains_accepted_work`, `a_panicking_transaction_rolls_back_and_closes_the_worker`, `executor_runs_claims_first_and_dropped_receipts_still_commit`, `a_deadline_that_passes_behind_active_work_withdraws_the_request`, `dropping_the_last_handle_closes_admission_and_drains`, `a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body`, `a_withdrawn_request_is_never_committed` |
 | `read_pool` (7) | `a_read_snapshot_does_not_see_a_later_commit`, `exhaustion_waits_until_deadline_and_never_opens_an_extra_reader`, `error_and_panic_release_the_slot_and_end_the_snapshot`, `a_waiting_reader_uses_the_released_slot_before_its_deadline`, `a_free_slot_is_usable_when_a_waiter_reacquires_after_its_deadline`, `a_failed_read_discards_its_connection_local_state`, `a_lease_left_in_a_transaction_is_discarded` |
 
 **Dependencies of the full T10.** The SQLite adapter of port v2 needs T9 and the whole of T8:
@@ -491,9 +497,11 @@ bulk identities and the 1,000-row or 20 ms cut (R27); event aggregation into one
 connection, its backlog, outcomes and the expiry of long reads (R126, R127, R137); the authorizer and query
 connection (R130); and shutdown integration (R139). The review conditions of the foundation that belong to the
 adapter are tracked in [issue 127](https://github.com/yuxhuang/r-orch/issues/127): detecting transaction control
-in a callback, rechecking a request's expiry after `BEGIN IMMEDIATE`, non-blocking receipt waits on async
-threads, bounded claim production, writer tests that fail in bounded time instead of hanging, and fatal-state handling
-that keeps queue locks free of callbacks. The daemon is wired to this executor only after those exist.
+in a callback, non-blocking receipt waits on async threads, bounded claim production, and fatal-state handling
+that keeps queue locks free of callbacks. PR 154 delivers two items of that list, the recheck of a request's expiry
+after `BEGIN IMMEDIATE` and writer tests that fail in bounded time. Both are pending its merge. The retry case of
+R128, in which a request answered `overloaded` cannot commit later, is still owed at the adapter integration. The
+daemon is wired to this executor only after all of these exist.
 
 ## Status
 
@@ -502,7 +510,7 @@ that keeps queue locks free of callbacks. The daemon is wired to this executor o
 | T1 | first-review text (`f5637805`) implemented in PR 1, `fast` on macOS, and merged to `main` by the owner on 2026-11-21; this corrected text, with the review corrections and the owner's answers, implemented in a follow-up PR that is pending its reviews and the owner's merge. The spec is not approved by either. Since then: the corrected text (`34b3b4d`) reached `main` on 2026-11-22 (UTC) through that follow-up PR, and the deferral of 2026-11-21 (the spec's record I) is implemented in a further documentation PR that is pending its review and its merge. This revision changes no document's status (`draft`, `proposed`) |
 | T4 | dropped as an entry step by the owner on 2026-11-21. The first run of 2026-11-20 is recorded in [issue 98](https://github.com/yuxhuang/r-orch/issues/98) and is not delivered to `main` |
 | T4b | deferred by the owner on 2026-11-21; not run |
-| T10, first slice (writer and read pool) | implemented as an unwired foundation in PR 122 at `63edf0f9`, with its module tests; its Linux CI, independent reviews and the owner's merge are pending, as are the follow-ups of issue 127. The rest of T10 is pending behind T8b and T8c ("T10 split") |
+| T10, first slice (writer and read pool) | implemented as an unwired foundation in PR 122 at `63edf0f9`, with its module tests; its Linux CI, independent reviews and the owner's merge are pending, as are the follow-ups of issue 127. The rest of T10 is pending behind T8b and T8c ("T10 split"). The deadline recheck and the bounded writer tests are in PR 154, which is open and pending its Linux CI, reviews and merge |
 | T2 to T27, except T4 and T4b | pending, as this table stood before 2026-11-21; this revision brings no other row up to date |
 
 ## Test plan
