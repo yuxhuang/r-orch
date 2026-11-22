@@ -92,7 +92,9 @@ pub struct ProbeAdapter {
     clear_effort: Mutex<bool>,
     prepare_model: Mutex<Option<String>>,
     hang_next: Mutex<u32>,
-    gate: Arc<tokio::sync::Semaphore>,
+    /// One release switch per gated stream created since the last
+    /// [`ProbeAdapter::release`]. A switch opens exactly one stream, once.
+    gates: Mutex<Vec<tokio::sync::oneshot::Sender<()>>>,
     execute_error: Mutex<Option<AdapterError>>,
 }
 
@@ -107,7 +109,7 @@ impl ProbeAdapter {
             clear_effort: Mutex::new(false),
             prepare_model: Mutex::new(None),
             hang_next: Mutex::new(0),
-            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            gates: Mutex::new(Vec::new()),
             execute_error: Mutex::new(None),
         })
     }
@@ -116,15 +118,31 @@ impl ProbeAdapter {
         self.scripts.lock().unwrap().push_back(script);
     }
 
-    /// The next `n` executions produce a stream that never yields until the
-    /// run is cancelled (a long-running agent).
-    /// Let every gated stream produce its events. Streams do not progress
-    /// until the test releases them, so a dispatch pass never races a run that
-    /// finishes instantly (which would make start times nondeterministic).
+    /// Let every stream gated so far produce its events. Streams do not
+    /// progress until the test releases them, so a dispatch pass never races a
+    /// run that finishes instantly (which would make start times, and the
+    /// order of a collector's bus events against the tick's, nondeterministic).
+    ///
+    /// A release opens exactly the streams that exist now. It leaves no credit
+    /// behind: a stream created after this call waits for the next release,
+    /// even when this one found nothing to open (an empty pass).
     pub fn release(&self) {
-        self.gate.add_permits(10_000);
+        let gates = std::mem::take(&mut *self.gates.lock().unwrap());
+        for gate in gates {
+            // A dropped stream (a cancelled run) has nothing left to release.
+            let _ = gate.send(());
+        }
     }
 
+    /// Streams still waiting for a release (a dropped stream no longer waits).
+    pub fn gated_streams(&self) -> usize {
+        let mut gates = self.gates.lock().unwrap();
+        gates.retain(|gate| !gate.is_closed());
+        gates.len()
+    }
+
+    /// The next `n` executions produce a stream that never yields until the
+    /// run is cancelled (a long-running agent). It ignores [`Self::release`].
     pub fn hang_next(&self, n: u32) {
         *self.hang_next.lock().unwrap() = n;
     }
@@ -238,9 +256,13 @@ impl Adapter for ProbeAdapter {
                 Ok(done_event("2025-10-13T16:37:33.426Z")),
             ]
         });
-        let gate = Arc::clone(&self.gate);
+        // Registered before `execute` returns, so a release that follows the
+        // tick that made this call always sees the stream it must open.
+        let (open, opened) = tokio::sync::oneshot::channel();
+        self.gates.lock().unwrap().push(open);
         let events = stream::once(async move {
-            gate.acquire().await.expect("gate open").forget();
+            // `Err` means the adapter is gone: nothing will ever release it.
+            let _ = opened.await;
             stream::iter(script)
         })
         .flatten();

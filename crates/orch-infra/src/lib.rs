@@ -16,6 +16,7 @@
 )]
 
 pub mod adapters;
+pub mod blob;
 pub mod clock;
 pub mod data_dir;
 pub mod ids;
