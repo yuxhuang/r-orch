@@ -29,7 +29,7 @@
 //! Sequence numbers and gap ranges must fit a SQLite integer, so one above
 //! `i64::MAX` is refused as invalid, and a read after such a number is empty.
 //!
-//! Not wired into `Storage` or the daemon: the parent registers this module.
+//! Registered for normal builds, but not wired into `Storage` or the daemon.
 
 use orch_core::store::events::{AppendResult, EventGap, PruneResult, SequencedEvent};
 use orch_core::store::{Caller, Principal, StoreError};
@@ -37,10 +37,10 @@ use orch_domain::{RunEvent, RunEventType};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 /// The most rows a read, a tail or a prune handles in one call (the port's bound).
-pub const MAX_ROWS: usize = 1_000;
+pub(super) const MAX_ROWS: usize = 1_000;
 
 #[derive(Debug, thiserror::Error)]
-pub enum EventsError {
+pub(super) enum EventsError {
     /// A refusal of the port's contract: `StaleEpoch` or `InvalidEvents`.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -52,7 +52,7 @@ pub enum EventsError {
     Corrupt(String),
 }
 
-pub type Result<T> = std::result::Result<T, EventsError>;
+pub(super) type Result<T> = std::result::Result<T, EventsError>;
 
 fn invalid(reason: &str) -> EventsError {
     StoreError::InvalidEvents(reason.into()).into()
@@ -73,7 +73,7 @@ const MAX_STORED: u64 = i64::MAX as u64;
 /// stored and how many were skipped as already present (a duplicate inside the
 /// batch counts as skipped too). A zero or too-large sequence refuses the whole
 /// batch before anything is stored.
-pub fn append_events(
+pub(super) fn append_events(
     tx: &Transaction<'_>,
     caller: &Caller,
     run: &str,
@@ -119,7 +119,7 @@ pub fn append_events(
 /// Records the missing interval `(after_seq, after_seq + dropped]`. A repeat of
 /// a stored gap is a no-op and a different count for the same start is refused;
 /// neither writes anything.
-pub fn record_event_gap(
+pub(super) fn record_event_gap(
     tx: &Transaction<'_>,
     project: &str,
     run: &str,
@@ -158,7 +158,7 @@ pub fn record_event_gap(
 /// Deletes at most `max_rows` events of one run, lowest sequence first, and
 /// reports whether any are left. Gaps stay as loss records; the run, its result
 /// and its blobs are never touched. The caller picks the runs to prune.
-pub fn prune_events(
+pub(super) fn prune_events(
     tx: &Transaction<'_>,
     project: &str,
     run: &str,
@@ -185,7 +185,7 @@ pub fn prune_events(
 
 /// Events with a sequence above `after_seq`, oldest first; `limit` is 1..=1,000.
 /// Call it inside one read transaction for a consistent snapshot.
-pub fn read_events(
+pub(super) fn read_events(
     conn: &Connection,
     project: &str,
     run: &str,
@@ -205,7 +205,7 @@ pub fn read_events(
 }
 
 /// The last `count` events, still oldest first. Zero is an empty tail.
-pub fn read_events_tail(
+pub(super) fn read_events_tail(
     conn: &Connection,
     project: &str,
     run: &str,
@@ -225,7 +225,11 @@ pub fn read_events_tail(
 }
 
 /// Every recorded loss of the run, by start. Not paged: a run has few gaps.
-pub fn read_event_gaps(conn: &Connection, project: &str, run: &str) -> Result<Vec<EventGap>> {
+pub(super) fn read_event_gaps(
+    conn: &Connection,
+    project: &str,
+    run: &str,
+) -> Result<Vec<EventGap>> {
     let mut select = conn.prepare_cached(
         "SELECT after_seq, dropped FROM run_event_gaps
          WHERE project_id = ?1 AND run_id = ?2 ORDER BY after_seq",
@@ -344,3 +348,5 @@ fn unsigned(value: i64, what: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests;
+
+mod adapter;
