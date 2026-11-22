@@ -223,23 +223,32 @@ fn tmp_name() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
-    /// Records each step with whether the blob's final name existed when the step ran, runs the real
+    /// Whether the blob has its final name, looked at through the same confined module.
+    fn published(root: &ConfinedDir, hash: &BlobHash) -> bool {
+        let (ab, cd, name) = names(hash);
+        root.open_dir("blobs")
+            .and_then(|d| d.open_dir("sha256"))
+            .and_then(|d| d.open_dir(&ab))
+            .and_then(|d| d.open_dir(&cd))
+            .and_then(|d| d.open_file(&name, FileAccess::Read))
+            .is_ok()
+    }
+
+    /// Records each step with whether the blob had its final name when the step ran, runs the real
     /// operation, and fails the chosen step instead of running it.
     struct Probe {
-        final_path: PathBuf,
+        root: ConfinedDir,
+        hash: BlobHash,
         fail: Option<Step>,
         seen: Mutex<Vec<(Step, bool)>>,
     }
 
-    impl Hooks for std::sync::Arc<Probe> {
+    impl Hooks for Arc<Probe> {
         fn run(&self, step: Step, op: &mut dyn FnMut() -> Result<()>) -> Result<()> {
-            self.seen
-                .lock()
-                .unwrap()
-                .push((step, self.final_path.exists()));
+            let named = published(&self.root, &self.hash);
+            self.seen.lock().unwrap().push((step, named));
             if self.fail == Some(step) {
                 return Err(BlobError::Io(io::Error::other("injected")));
             }
@@ -249,33 +258,43 @@ mod tests {
 
     struct Rig {
         _tmp: tempfile::TempDir,
-        root: PathBuf,
+        root: ConfinedDir,
         store: DiskBlobStore,
-        probe: std::sync::Arc<Probe>,
+        probe: Arc<Probe>,
+        hash: BlobHash,
     }
 
     fn rig(bytes: &[u8], fail: Option<Step>) -> Rig {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().to_path_buf();
-        let hex = BlobHash::of(bytes).to_string();
-        let probe = std::sync::Arc::new(Probe {
-            final_path: root.join(format!("blobs/sha256/{}/{}/{hex}", &hex[0..2], &hex[2..4])),
+        let hash = BlobHash::of(bytes);
+        let probe = Arc::new(Probe {
+            root: ConfinedDir::open(tmp.path()).unwrap(),
+            hash,
             fail,
             seen: Mutex::new(Vec::new()),
         });
-        let store =
-            DiskBlobStore::with_hooks(&ConfinedDir::open(&root).unwrap(), Box::new(probe.clone()))
-                .unwrap();
+        let root = ConfinedDir::open(tmp.path()).unwrap();
+        let store = DiskBlobStore::with_hooks(&root, Box::new(probe.clone())).unwrap();
         Rig {
             _tmp: tmp,
             root,
             store,
             probe,
+            hash,
         }
     }
 
     fn steps(rig: &Rig) -> Vec<(Step, bool)> {
         rig.probe.seen.lock().unwrap().clone()
+    }
+
+    fn tmp_entries(rig: &Rig) -> usize {
+        rig.root
+            .open_dir("blobs")
+            .and_then(|d| d.open_dir("tmp"))
+            .and_then(|d| d.list())
+            .unwrap()
+            .len()
     }
 
     #[test]
@@ -307,19 +326,13 @@ mod tests {
         for step in [Step::WriteTmp, Step::SyncTmp, Step::Publish] {
             let rig = rig(b"fails", Some(step));
             assert!(rig.store.put(b"fails").is_err(), "{step:?}");
-            assert!(!rig.probe.final_path.exists(), "{step:?}");
-            assert_eq!(
-                std::fs::read_dir(rig.root.join("blobs/tmp"))
-                    .unwrap()
-                    .count(),
-                0,
-                "{step:?}"
-            );
-            // A retry after the failure stores the blob.
-            let retry = DiskBlobStore::open(&ConfinedDir::open(&rig.root).unwrap()).unwrap();
-            assert!(retry.get(&BlobHash::of(b"fails")).is_err(), "{step:?}");
+            assert!(!published(&rig.root, &rig.hash), "{step:?}");
+            assert_eq!(tmp_entries(&rig), 0, "{step:?}");
+            // A retry without the fault stores the blob.
+            let retry = DiskBlobStore::open(&rig.root).unwrap();
+            assert!(retry.get(&rig.hash).is_err(), "{step:?}");
             retry.put(b"fails").unwrap();
-            assert_eq!(retry.get(&BlobHash::of(b"fails")).unwrap(), b"fails");
+            assert_eq!(retry.get(&rig.hash).unwrap(), b"fails");
         }
     }
 
@@ -328,6 +341,6 @@ mod tests {
         let rig = rig(b"dirs", Some(Step::SyncDirs));
         assert!(rig.store.put(b"dirs").is_err());
         // The caller got no hash, so no row names it; the bytes are whole and a later put is a no-op.
-        assert_eq!(rig.store.get(&BlobHash::of(b"dirs")).unwrap(), b"dirs");
+        assert_eq!(rig.store.get(&rig.hash).unwrap(), b"dirs");
     }
 }
