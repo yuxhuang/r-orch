@@ -255,6 +255,18 @@ pub async fn gaps_and_bounded_prune_preserve_other_runs_and_projects(storage: Ar
                 .unwrap(),
             PruneResult { deleted, complete }
         );
+        if !complete {
+            assert_eq!(
+                storage
+                    .read(caller("p"))
+                    .await
+                    .unwrap()
+                    .read_events("run", 0, 10)
+                    .await
+                    .unwrap(),
+                vec![event(5)]
+            );
+        }
     }
     let view = storage.read(caller("p")).await.unwrap();
     assert_eq!(
@@ -370,6 +382,64 @@ pub async fn matching_task_fence_is_accepted(storage: Arc<dyn Storage>) {
     );
 }
 
+pub async fn repeated_gap_is_idempotent_and_conflict_changes_nothing(storage: Arc<dyn Storage>) {
+    for attempt in 0..3 {
+        storage
+            .transaction(caller("p"), Lane::Events, move |u| {
+                if attempt < 2 {
+                    u.record_event_gap("run", 5, 3)?;
+                } else {
+                    // Catch the refusal and commit: operation atomicity must still hold.
+                    assert!(matches!(
+                        u.record_event_gap("run", 5, 4),
+                        Err(StoreError::InvalidEvents(_))
+                    ));
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .read(caller("p"))
+                .await
+                .unwrap()
+                .read_event_gaps("run")
+                .await
+                .unwrap(),
+            vec![EventGap {
+                after_seq: 5,
+                dropped: 3
+            }]
+        );
+    }
+    storage
+        .transaction(caller("other"), Lane::Events, |u| {
+            u.record_event_gap("run", 5, 9)
+        })
+        .await
+        .unwrap();
+    storage
+        .transaction(caller("p"), Lane::Events, |u| {
+            u.record_event_gap("another", 5, 8)
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        storage
+            .read(caller("p"))
+            .await
+            .unwrap()
+            .read_event_gaps("run")
+            .await
+            .unwrap(),
+        vec![EventGap {
+            after_seq: 5,
+            dropped: 3
+        }]
+    );
+}
+
 macro_rules! event_suite {
     ($module:ident, $factory:path) => {
         mod $module {
@@ -388,6 +458,7 @@ macro_rules! event_suite {
             case!(gaps_and_bounded_prune_preserve_other_runs_and_projects);
             case!(empty_tails_batches_and_invalid_bounds_are_explicit);
             case!(matching_task_fence_is_accepted);
+            case!(repeated_gap_is_idempotent_and_conflict_changes_nothing);
         }
     };
 }

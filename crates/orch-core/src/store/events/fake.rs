@@ -81,6 +81,13 @@ impl EventState {
             ));
         }
         let gaps = self.gaps.entry(run.into()).or_default();
+        if let Some(existing) = gaps.iter().find(|gap| gap.after_seq == after_seq) {
+            return if existing.dropped == dropped {
+                Ok(())
+            } else {
+                Err(StoreError::InvalidEvents("conflicting gap count".into()))
+            };
+        }
         gaps.push(EventGap { after_seq, dropped });
         gaps.sort_by_key(|gap| (gap.after_seq, gap.dropped));
         Ok(())

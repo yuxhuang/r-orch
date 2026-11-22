@@ -420,19 +420,19 @@ impl leases::LeaseRead for View {
 }
 
 impl leases::LeaseWrite for View {
-    fn claim_lease(&mut self, new: &leases::NewLease, now: i64) -> Result<leases::ClaimOutcome> {
-        self.project.leases.claim(&self.lineage, new, now)
+    fn claim_lease(&mut self, new: &leases::NewLease, now_ms: i64) -> Result<leases::ClaimOutcome> {
+        self.project.leases.claim(&self.lineage, new, now_ms)
     }
     fn renew_lease(
         &mut self,
         task: &str,
         lineage: &str,
         epoch: u64,
-        now: i64,
+        now_ms: i64,
     ) -> Result<leases::Lease> {
         self.project
             .leases
-            .renew(&self.caller, &self.lineage, task, lineage, epoch, now)
+            .renew(&self.caller, &self.lineage, task, lineage, epoch, now_ms)
     }
     fn release_lease(&mut self, task: &str, lineage: &str, epoch: u64) -> Result<leases::Lease> {
         self.project

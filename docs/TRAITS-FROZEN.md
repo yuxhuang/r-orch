@@ -129,8 +129,8 @@ read_lease(task: &str) -> Result<Option<Lease>>;
 read_agent_lease(agent: &str) -> Result<Option<Lease>>;
 read_leases() -> Result<Vec<Lease>>;
 // leases::LeaseWrite (&mut self for changes; &self for reads)
-claim_lease(new: &NewLease, now: i64) -> Result<ClaimOutcome>;
-renew_lease(task: &str, lineage: &str, epoch: u64, now: i64) -> Result<Lease>;
+claim_lease(new: &NewLease, now_ms: i64) -> Result<ClaimOutcome>;
+renew_lease(task: &str, lineage: &str, epoch: u64, now_ms: i64) -> Result<Lease>;
 release_lease(task: &str, lineage: &str, epoch: u64) -> Result<Lease>;
 get_lease(task: &str) -> Result<Option<Lease>>;
 get_agent_lease(agent: &str) -> Result<Option<Lease>>;
@@ -140,17 +140,19 @@ list_leases() -> Result<Vec<Lease>>;
 `SequencedEvent` carries `seq` (positive, collector-assigned) and `RunEvent`.
 `AppendResult` holds `stored` and `skipped`; first stored bytes win on duplicates.
 `EventGap { after_seq, dropped }` names `(after_seq, after_seq + dropped]`.
+Its key is `(project_id, run_id, after_seq)`: identical `dropped` replays are
+no-ops; conflicting counts return `InvalidEvents` without changing any row.
 `PruneResult { deleted, complete }` reports whether any event rows remain, retaining
 gaps. Read/prune bounds are 1..=1000; a tail of zero is empty.
 `NewLease { task, agent, run }` receives a backend-assigned lineage and epoch in
-`Lease { task, agent, run, lineage, epoch, expires_at }`. Lease clocks use seconds;
-claims/renewals store `now + 120`. A late renewal is allowed until explicit release
+`Lease { task, agent, run, lineage, epoch, expires_at }`. Lease clocks use UTC
+milliseconds from `Clock::now_ms()`; claims/renewals store checked
+`now_ms + LEASE_MS`, where `LEASE_MS: i64 = 120_000`. A late renewal is allowed until explicit release
 (AP12). `ClaimOutcome` is `Granted(Lease)` or `Held(Lease)`; an occupied task, agent
 or run is checked in that order and burns no epoch. Renew, release and append
 refuse `StaleEpoch` for a missing lease, stale lineage/epoch or mismatching task
 principal. Invalid event arguments return `InvalidEvents(String)`. Operation errors
 leave the operation unchanged; a callback error rolls back the entire unit of work.
-
 
 ## 3. `orch_core::adapter`
 

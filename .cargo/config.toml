@@ -20,3 +20,6 @@ xtask = "run --quiet --package xtask --"
 # asserts that the name is fixed whatever the ambient environment says, and it
 # is right to — pointing this at some other name broke it deterministically.
 ORCHESTRY_GLOBAL_CONFIG_PATH = { value = "target/test-global/global.yml", relative = true }
+
+# SQLite state in cargo-driven tests must never default to the real home.
+ORCH_DATA_HOME = { value = "target/test-daemons", relative = true }

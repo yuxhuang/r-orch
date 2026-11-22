@@ -442,7 +442,7 @@ All three names are the same program:
 | Crate | Modules |
 |---|---|
 | `orch-domain` | `task`, `agent`, `run`, `goal`, `team`, `message`, `state`, `config`, `global_config`, `events`, `error`, `transitions`, `scope`, `model_tiers`, `shop` (agent-shop + org-shop + default-agents) |
-| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity, event and lease port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
+| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity, event and lease port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{agent, config, context, daemon, goal, init, msg, org, org_template, remote, rpc, run, status, task, team}`, `doctor`, `logs`, `tui` (`DaemonBackend`), `update`, `web`, `routing`, `tree`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
@@ -469,17 +469,22 @@ bindings and sort keys, not snapshots, and lives only as long as that fake.
 and `leases::{LeaseRead, LeaseWrite}` contracts. Event batches keep the first
 payload for each sequence and report stored/skipped counts; range/tail reads are
 in sequence order, gaps are retained when bounded pruning removes event rows.
+A gap is keyed by project, run and `after_seq`: replaying the same `dropped`
+count is a no-op; a conflicting count returns `InvalidEvents` without a write.
 Claim, renew, release and event append share the enclosing transaction. The fake
 uses one per-project lease state and one daemon lineage for every lease-bound
 write, checking task/run/lineage/epoch before event append even for an empty or
 fully duplicate batch. A claim refuses an occupied task, agent or run and consumes
 no epoch; release keeps the task's epoch counter. Lease times are caller-supplied
-seconds in the daemon's clock domain, with a 120-second renewal interval. The
+UTC milliseconds from `Clock::now_ms()`. Claims and renewals use checked
+`now_ms + LEASE_MS`, where `LEASE_MS = 120_000`. The
 port reads no clock and never expires a lease merely because time advanced:
 after sleep the daemon renews its supervised runs before expiry (spec AP12).
 Physical suspend, recovery and engine expiry ordering are later integration checks.
-The remaining operational families, file reference and SQLite are subsequent slices. The daemon and all v1 storage traits still use the existing
-file implementation; this additive module changes no runtime storage path.
+The lease and combined conformance scenarios accept backend factories with a
+fixture restore hook; only the memory reference is registered for these families.
+The remaining operational families, file reference and SQLite are subsequent
+slices. The daemon and all v1 storage traits still use the existing file implementation; this additive module changes no runtime storage path.
 
 ### 3.3.1 `orch mcp` (`orch-cli::mcp`)
 
@@ -1092,6 +1097,26 @@ loop {
   `tokio::io::AsyncBufReadExt::lines()` does: it splits on `0x0A` only (keeping `\r`), **skips empty lines**,
   yields a trailing fragment, and caps each line at 16384 characters. Write our own `line_reader`; do not
   reach for the convenience method.
+
+`orch_core::usage::RunUsage` holds the nullable usage fields of storage v2 (SQLite spec R86/R87): five token
+counts, the model and the CLI version. It lives in `orch-core` because the orchestrator's collector, which may
+not name `orch_infra` (`cargo xtask crate-graph`), observes through it. The model is seeded from the prepared
+configuration and replaced by the one the CLI reports; the version comes from a cached `AdapterTestResult`
+(`Orchestrator::record_adapter_probe`), including a failed probe that supplied one. Omitted counters remain
+unknown, explicit zero stays zero, and repeated snapshots are not summed. Invalid counts (fractional, negative
+or outside SQLite's signed INTEGER range) are ignored. Blank or over-64-KiB model/version strings are ignored
+without truncation. The helper performs no I/O and does not infer counts from the lossy legacy `TokenUsage`,
+which fills absent counters with zero.
+
+`collect_events_observing` calls `RunUsage::observe_event` on every event an adapter supplies, before the event
+is reduced, and hands the result to the `RunUsageObserver` set with `Orchestrator::set_run_usage_observer` once
+the stream ends: after a normal run, a failed run (an `Err` item or an `error` event), a cancellation or a
+shutdown. Only what survives the adapter's own event conversion is observable: a lifecycle record an adapter
+drops (OpenCode `tool-calls` step finishes, Pi's passive `message_end`/`turn_end` running reports, so a Pi run
+that dies before `agent_end` reports nothing, and Codex lifecycle records) stays unknown. The
+observation is in memory and storage-independent; the 1.0 token record, run events and run finish are
+unchanged, and the durable finish (R36) will read the same value. Nothing probes a CLI version on the dispatch
+path, so a version is known only after `record_adapter_probe`; remote runs are not observed.
 
 ### 6.4 Cancellation
 

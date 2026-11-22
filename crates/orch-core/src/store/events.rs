@@ -63,6 +63,8 @@ pub trait EventWrite: Send {
         batch: &[SequencedEvent],
     ) -> Result<AppendResult>;
     /// Records a positive missing interval; overflowing intervals are refused.
+    /// Keyed by project, run and after_seq. An identical dropped count is a
+    /// no-op; a conflicting count returns InvalidEvents without any write.
     fn record_event_gap(&mut self, run: &str, after_seq: u64, dropped: u64) -> Result<()>;
     /// Deletes at most max_rows (1..=1,000), lowest sequence first. The caller
     /// selects runs eligible for retention; this operation never deletes a run.

@@ -32,8 +32,8 @@ pub mod fake;
 #[cfg(all(test, feature = "test-support"))]
 mod tests;
 
-/// Seconds added to the caller's clock by a claim or a renewal (prototype `LEASE`).
-pub const LEASE_SECS: i64 = 120;
+/// Milliseconds added to the caller's UTC clock by a claim or renewal.
+pub const LEASE_MS: i64 = 120_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lease {
@@ -42,7 +42,7 @@ pub struct Lease {
     pub run: String,
     pub lineage: String,
     pub epoch: u64,
-    /// Seconds in the daemon's clock domain; the port never reads a clock.
+    /// UTC milliseconds, matching `Clock::now_ms()`; the port reads no clock.
     pub expires_at: i64,
 }
 
@@ -75,12 +75,12 @@ pub trait LeaseRead: Send + Sync {
 /// back with the run row and the task status the engine writes beside it.
 pub trait LeaseWrite: Send {
     /// Grants a lease only when the task has none and the agent has none.
-    /// `now` is the caller's clock reading; `expires_at` is `now + LEASE_SECS`.
-    fn claim_lease(&mut self, new: &NewLease, now: i64) -> Result<ClaimOutcome>;
-    /// Moves `expires_at` to `now + LEASE_SECS`, whether or not the old one has
+    /// `now_ms` is from `Clock::now_ms()`; expiry is checked `now_ms + LEASE_MS`.
+    fn claim_lease(&mut self, new: &NewLease, now_ms: i64) -> Result<ClaimOutcome>;
+    /// Moves `expires_at` to `now_ms + LEASE_MS`, whether or not the old one has
     /// passed (AP12). Refused as stale unless `lineage` and `epoch` are the
     /// lease's and the backend's current lineage.
-    fn renew_lease(&mut self, task: &str, lineage: &str, epoch: u64, now: i64) -> Result<Lease>;
+    fn renew_lease(&mut self, task: &str, lineage: &str, epoch: u64, now_ms: i64) -> Result<Lease>;
     /// Ends the lease and returns it. The task's epoch counter is kept.
     fn release_lease(&mut self, task: &str, lineage: &str, epoch: u64) -> Result<Lease>;
     fn get_lease(&self, task: &str) -> Result<Option<Lease>>;

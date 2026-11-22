@@ -2624,7 +2624,13 @@ mod definition_tests {
         let path = dir.path().join(".definition.lock");
         let first = mutation_lock(&path).await.unwrap();
         let error = mutation_lock(&path).await.unwrap_err();
-        assert!(error.to_string().contains("timed out"));
+        assert!(matches!(
+            error,
+            Error::Io { source, .. } if source.kind() == std::io::ErrorKind::TimedOut
+        ));
+        // OS lock release can lag drop while a forked child still holds the
+        // descriptor. Give that release real time, not the paused clock's jumps.
+        tokio::time::resume();
         drop(first);
         let _next = mutation_lock(&path).await.unwrap();
     }

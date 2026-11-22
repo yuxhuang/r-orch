@@ -23,7 +23,7 @@ pub enum By<'a> {
 }
 
 impl LeaseState {
-    pub fn claim(&mut self, lineage: &str, new: &NewLease, now: i64) -> Result<ClaimOutcome> {
+    pub fn claim(&mut self, lineage: &str, new: &NewLease, now_ms: i64) -> Result<ClaimOutcome> {
         let in_the_way = self
             .leases
             .get(&new.task)
@@ -32,7 +32,7 @@ impl LeaseState {
         if let Some(lease) = in_the_way {
             return Ok(ClaimOutcome::Held(lease.clone()));
         }
-        let expires_at = expiry(now)?;
+        let expires_at = expiry(now_ms)?;
         let epoch = self
             .epochs
             .get(&new.task)
@@ -60,10 +60,10 @@ impl LeaseState {
         task: &str,
         lineage: &str,
         epoch: u64,
-        now: i64,
+        now_ms: i64,
     ) -> Result<Lease> {
         self.check(caller, current, By::Task(task), lineage, epoch)?;
-        let expires_at = expiry(now)?;
+        let expires_at = expiry(now_ms)?;
         let lease = self.leases.get_mut(task).ok_or(StoreError::StaleEpoch)?;
         lease.expires_at = expires_at;
         Ok(lease.clone())
@@ -135,7 +135,8 @@ impl LeaseState {
     }
 }
 
-fn expiry(now: i64) -> Result<i64> {
-    now.checked_add(LEASE_SECS)
+fn expiry(now_ms: i64) -> Result<i64> {
+    now_ms
+        .checked_add(LEASE_MS)
         .ok_or(StoreError::CounterExhausted)
 }

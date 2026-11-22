@@ -299,9 +299,9 @@ holds them.
 | R9 | A list shall return at most 100 rows by default and at most 1,000 on request, shall refuse a larger limit, shall return a cursor while more rows remain, and shall count the matching rows only when asked. | F | must | `storage_conformance::list_defaults_to_100_rows`, `::list_refuses_a_limit_over_1000`, `::count_is_absent_unless_requested`; both |
 | R10 | A walk through a list by cursor shall return every row whose sort values did not change during the walk exactly once, whatever is inserted or deleted meanwhile, and a cursor used with another filter or sort shall be refused. | F | must | `storage_conformance::cursor_walk_is_stable_under_inserts_and_deletes`, `::cursor_from_another_filter_is_refused`; both |
 | R11 | Creating an entity shall give it the next `position` of its project and table, an update shall leave `position` unchanged, and `move_to_end` shall give it the next `position`. | F, B3 | must | `storage_conformance::update_keeps_position`, `::move_to_end_takes_the_next_position`; both |
-| R12 | When several callers claim a lease for one task at once, exactly one shall be granted and the others shall be told who holds it; no agent shall hold two active leases. | F, B9 | must | `storage_conformance::one_of_many_concurrent_claims_wins`, `::an_agent_holds_at_most_one_active_lease`; both |
-| R13 | Every lease shall carry an epoch larger than every epoch issued before for that task, and a renew, release, event append or finish that names an older epoch shall be refused and change nothing. | F, S1 | must | `storage_conformance::epochs_only_grow`, `::a_stale_epoch_is_refused`; both |
-| R14 | An event append shall store a batch in one transaction and skip every sequence number already stored for that run, reporting how many it stored and how many it skipped. | F, M | must | `storage_conformance::repeated_event_batch_stores_nothing_twice`; both |
+| R12 | When several callers claim a lease for one task at once, exactly one shall be granted and the others shall be told who holds it; no agent shall hold two active leases. | F, B9 | must | `storage_conformance::memory_leases_v2::one_of_many_concurrent_claims_wins`, `::an_agent_holds_at_most_one_active_lease`; memory reference now; file/SQLite registrations pending |
+| R13 | Every lease shall carry an epoch larger than every epoch issued before for that task, and a renew, release, event append or finish that names an older epoch shall be refused and change nothing. | F, S1 | must | `storage_conformance::memory_leases_v2::epochs_only_grow`, `::a_stale_epoch_is_refused`; memory reference now; file/SQLite registrations pending |
+| R14 | An event append shall store a batch in one transaction and skip every sequence number already stored for that run, reporting how many it stored and how many it skipped. | F, M | must | `storage_conformance::memory_events_v2::duplicate_counts_first_bytes_and_range_tail_order`; memory reference now; file/SQLite registrations pending |
 | R15 | The port shall be entered only through `Storage::read` and `Storage::write`, each taking a caller (principal and project), and a call shall see and change only rows of the caller's project. | F, B4 | must | `storage_conformance::a_caller_sees_only_its_project`, `::a_write_to_another_project_is_refused`; both |
 | R16 | After the engine PR, `orch-core` shall export no whole-document state store, no merge-key rule and no implicit reorder on save, and `docs/TRAITS-FROZEN.md` §2 shall describe port v2. | B3 | must | `git grep -nE 'trait StateStore\|apply_merge' crates/orch-core crates/orch-engine/src` prints nothing; reviewer check of TRAITS-FROZEN §2 against the port; macOS |
 | R17 | The file backend shall implement port v2, so that the conformance suite runs whole on both backends; after the removal PR it shall live in a crate that only dev-dependencies may name, for one release. Atomicity across a process stop is required of SQLite only. | B1 | must | `cargo xtask crate-graph` fails when a product crate depends on it (`xtask` test `file_reference_is_dev_only`); both |
@@ -443,14 +443,23 @@ The contract of deliverable F. Rust signatures are fixed by the port PR and reco
 | `Page<T>` | `{ items, next_cursor, total }`. `next_cursor` is absent on the last page. `total` is present only when `with_count` was set. |
 | `Cursor` | Opaque text of at most 512 bytes: the sort, the last row's sort values and id, and a hash of the filter. It holds no snapshot. |
 | `position` | Explicit order (R11). `move_to_end(kind, id)` is its only other writer. |
-| `claim_lease(new)` | Inserts a lease only if the task has none and the agent has no active one, and gives it the task's next epoch. Returns `Granted(lease)` or `Held(lease)`. |
-| `renew_lease`, `release_lease` | Take `(task, lineage, epoch)`; refuse with `StaleEpoch` unless both are the lease's (R132). |
-| `append_events(run, lineage, epoch, batch)` | Refused with `StaleEpoch` unless lineage and epoch are the lease's. Inserts with "ignore if `(run, seq)` exists". Returns `{ stored, skipped }`. `record_event_gap(run, after_seq, dropped)` records a loss. |
+| `claim_lease(new, now_ms)` | Inserts a lease only if the task has none and the agent has no active one, and gives it the task's next epoch. Returns `Granted(lease)` or `Held(lease)`. `now_ms` is UTC milliseconds from `Clock::now_ms()`; `expires_at` is checked `now_ms + LEASE_MS` (`LEASE_MS: i64 = 120_000`). |
+| `renew_lease`, `release_lease` | Renew takes `(task, lineage, epoch, now_ms)` and sets the same checked millisecond deadline as claim; release takes `(task, lineage, epoch)` without a clock input. Both refuse with `StaleEpoch` unless lineage and epoch are the lease's (R132). |
+| `append_events(run, lineage, epoch, batch)` | Refused with `StaleEpoch` unless lineage and epoch are the lease's. Inserts with "ignore if `(run, seq)` exists". Returns `{ stored, skipped }`. `record_event_gap(run, after_seq, dropped)` records a loss keyed by `(project_id, run_id, after_seq)`. Replaying an identical count is a no-op; a conflicting count returns `InvalidEvents` and writes nothing, even if the caller catches the error and commits. |
 | `read_events(run, after_seq, limit)`, `read_events_tail(run, count)`, `prune_events(run, max_rows)` | Range read, tail read, and a bounded delete that reports whether the run is finished. |
 | `put_retry`, `due_retries(now, limit)`, `delete_retry` | The retry table; one row per task; no cap. |
 | `add_intent(kind, payload)`, `pending_intents(limit)`, `finish_intent(id)` | Side effects (R28). |
 | `check_request_key(scope, op, hash)`, `store_request_key(scope, op, hash, result)` | Return `New`, `Replay(result)`, `ReplayWithoutResult` or `Mismatch`. |
 | `open_attention`, `ack_attention`, `resolve_attention` | The attention queue; `open` is a no-op when an open item exists for the subject. |
+
+T8c contract amendment (2026-11-22): the registered `memory_leases_v2` and
+`memory_operations_v2` modules run backend-neutral lease and combined scenarios
+through factories with an explicit restore hook. The latter covers entity/event/
+lease rollback, same-transaction release fencing, restore fencing and injected
+clock jumps. `memory_events_v2::repeated_gap_is_idempotent_and_conflict_changes_nothing`
+pins gap identity. File and SQLite must register these same suites when wired;
+this memory-only slice proves neither two-backend acceptance nor physical suspend.
+R42 hardware suspend and runtime renewal ordering remain integration checks.
 
 Each list has a fixed set of sorts. The default sort of a list is its 1.0 order, served by an index, and
 deliverable B confirms each line. Every list also offers the sort `id`, whose values never change (R49):

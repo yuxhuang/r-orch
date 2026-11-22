@@ -1,6 +1,37 @@
-//! Combined event/lease boundaries on the transactional memory reference.
+//! Backend-neutral combined event/lease boundaries and restore fixture hook.
 
+use async_trait::async_trait;
 use orch_core::store::{events::SequencedEvent, fake::FakeStorage, leases::*, *};
+use std::sync::Arc;
+
+#[async_trait]
+pub trait Restore: Send + Sync {
+    /// End active leases and switch the daemon lineage, retaining task epochs.
+    async fn restore_to_lineage(&self, lineage: &str);
+}
+
+pub struct Fixture {
+    pub storage: Arc<dyn Storage>,
+    pub restore: Arc<dyn Restore>,
+    pub initial_lineage: String,
+}
+
+#[async_trait]
+impl Restore for FakeStorage {
+    async fn restore_to_lineage(&self, lineage: &str) {
+        FakeStorage::restore_to_lineage(self, lineage).await;
+    }
+}
+
+pub async fn memory_backend() -> Fixture {
+    let storage = Arc::new(FakeStorage::default());
+    storage.restore_to_lineage("initial-lineage").await;
+    Fixture {
+        storage: storage.clone(),
+        restore: storage,
+        initial_lineage: "initial-lineage".into(),
+    }
+}
 use orch_domain::{RunEvent, RunEventType};
 
 fn owner(project: &str) -> Caller {
@@ -31,7 +62,7 @@ fn event(seq: u64) -> SequencedEvent {
     }
 }
 
-async fn claim(storage: &FakeStorage, run: &'static str) -> Lease {
+async fn claim(storage: &dyn Storage, run: &'static str) -> Lease {
     storage
         .transaction(owner("p"), Lane::Claims, move |unit| {
             let ClaimOutcome::Granted(lease) = unit.claim_lease(&new(run), 0)? else {
@@ -43,9 +74,8 @@ async fn claim(storage: &FakeStorage, run: &'static str) -> Lease {
         .unwrap()
 }
 
-#[tokio::test]
-async fn claim_and_events_commit_or_roll_back_with_entities() {
-    let storage = FakeStorage::default();
+pub async fn claim_and_events_commit_or_roll_back_with_entities(fixture: Fixture) {
+    let storage = fixture.storage.clone();
     let result = storage
         .transaction(owner("p"), Lane::Claims, |unit| {
             unit.create(Entity::Task(Box::new(crate::contract::task("task"))))?;
@@ -67,7 +97,7 @@ async fn claim_and_events_commit_or_roll_back_with_entities() {
     );
     assert!(before.read_leases().await.unwrap().is_empty());
     assert!(before.read_events("run", 0, 10).await.unwrap().is_empty());
-    let lease = claim(&storage, "run").await;
+    let lease = claim(storage.as_ref(), "run").await;
     assert_eq!(lease.epoch, 1);
     storage
         .transaction(owner("p"), Lane::Events, move |unit| {
@@ -86,10 +116,9 @@ async fn claim_and_events_commit_or_roll_back_with_entities() {
     );
 }
 
-#[tokio::test]
-async fn release_immediately_fences_append_even_within_the_same_transaction() {
-    let storage = FakeStorage::default();
-    let lease = claim(&storage, "run").await;
+pub async fn release_immediately_fences_append_even_within_the_same_transaction(fixture: Fixture) {
+    let storage = fixture.storage.clone();
+    let lease = claim(storage.as_ref(), "run").await;
     storage
         .transaction(owner("p"), Lane::Claims, move |unit| {
             unit.append_events("run", &lease.lineage, lease.epoch, &[event(1)])?;
@@ -112,10 +141,11 @@ async fn release_immediately_fences_append_even_within_the_same_transaction() {
     );
 }
 
-#[tokio::test]
-async fn restore_refuses_old_append_without_changing_entities_events_gaps_or_leases() {
-    let storage = FakeStorage::default();
-    let old = claim(&storage, "run").await;
+pub async fn restore_refuses_old_append_without_changing_entities_events_gaps_or_leases(
+    fixture: Fixture,
+) {
+    let storage = fixture.storage.clone();
+    let old = claim(storage.as_ref(), "run").await;
     let token = old.clone();
     storage
         .transaction(owner("p"), Lane::Events, move |unit| {
@@ -125,8 +155,8 @@ async fn restore_refuses_old_append_without_changing_entities_events_gaps_or_lea
         })
         .await
         .unwrap();
-    storage.restore_to_lineage("new-lineage").await;
-    let current = claim(&storage, "replacement").await;
+    fixture.restore.restore_to_lineage("new-lineage").await;
+    let current = claim(storage.as_ref(), "replacement").await;
     assert_eq!(current.epoch, old.epoch + 1);
     let before = storage.read(owner("p")).await.unwrap();
     for caller in [
@@ -171,11 +201,10 @@ async fn restore_refuses_old_append_without_changing_entities_events_gaps_or_lea
     );
 }
 
-#[tokio::test]
-async fn a_clock_jump_keeps_the_supervised_lease_and_event_authority() {
-    let storage = FakeStorage::default();
-    let lease = claim(&storage, "run").await;
-    let resumed_at = lease.expires_at + 86_400;
+pub async fn a_clock_jump_keeps_the_supervised_lease_and_event_authority(fixture: Fixture) {
+    let storage = fixture.storage.clone();
+    let lease = claim(storage.as_ref(), "run").await;
+    let resumed_at = lease.expires_at + 86_400_000;
     storage
         .transaction(owner("p"), Lane::Claims, move |unit| {
             // A rival cannot reap a supervised run solely because time advanced.
@@ -184,7 +213,7 @@ async fn a_clock_jump_keeps_the_supervised_lease_and_event_authority() {
                 ClaimOutcome::Held(lease.clone())
             );
             let renewed = unit.renew_lease("task", &lease.lineage, lease.epoch, resumed_at)?;
-            assert_eq!(renewed.expires_at, resumed_at + LEASE_SECS);
+            assert_eq!(renewed.expires_at, resumed_at + LEASE_MS);
             unit.append_events("run", &lease.lineage, lease.epoch, &[event(1)])?;
             Ok(())
         })
@@ -197,3 +226,23 @@ async fn a_clock_jump_keeps_the_supervised_lease_and_event_authority() {
     );
     assert_eq!(view.read_leases().await.unwrap().len(), 1);
 }
+
+macro_rules! operational_suite {
+    ($module:ident, $factory:path) => {
+        mod $module {
+            macro_rules! case {
+                ($name:ident) => {
+                    #[tokio::test]
+                    async fn $name() {
+                        crate::v2_operations::$name($factory().await).await;
+                    }
+                };
+            }
+            case!(claim_and_events_commit_or_roll_back_with_entities);
+            case!(release_immediately_fences_append_even_within_the_same_transaction);
+            case!(restore_refuses_old_append_without_changing_entities_events_gaps_or_leases);
+            case!(a_clock_jump_keeps_the_supervised_lease_and_event_authority);
+        }
+    };
+}
+pub(crate) use operational_suite;
