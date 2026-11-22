@@ -1,0 +1,4 @@
+{"timestamp":"2025-01-01T00:01:16.717Z","type":"agent_output","data":"synthetic output line 0 for run_zUqesbh"}
+{"timestamp":"2025-01-01T00:01:18.083Z","type":"agent_output","data":"synthetic output line 1 for run_zUqesbh"}
+{"timestamp":"2025-01-01T00:01:19.687Z","type":"command_run","data":"synthetic-command --step 2"}
+{"timestamp":"2025-01-01T00:01:20.407Z","type":"done","data":"synthetic run finished"}

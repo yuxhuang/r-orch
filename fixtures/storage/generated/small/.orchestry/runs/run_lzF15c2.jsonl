@@ -1,0 +1,3 @@
+{"timestamp":"2025-01-01T00:00:54.754Z","type":"agent_output","data":"synthetic output line 0 for run_lzF15c2"}
+{"timestamp":"2025-01-01T00:00:57.322Z","type":"tool_call","data":"synthetic tool call 1"}
+{"timestamp":"2025-01-01T00:00:57.994Z","type":"error","data":"synthetic run ended without success"}

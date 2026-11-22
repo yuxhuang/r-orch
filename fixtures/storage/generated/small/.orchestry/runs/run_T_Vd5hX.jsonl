@@ -1,0 +1,4 @@
+{"timestamp":"2025-01-01T00:00:28.490Z","type":"command_run","data":"synthetic-command --step 0"}
+{"timestamp":"2025-01-01T00:00:30.559Z","type":"tool_call","data":"synthetic tool call 1"}
+{"timestamp":"2025-01-01T00:00:33.693Z","type":"command_run","data":"synthetic-command --step 2"}
+{"timestamp":"2025-01-01T00:00:34.438Z","type":"error","data":"synthetic run ended without success"}

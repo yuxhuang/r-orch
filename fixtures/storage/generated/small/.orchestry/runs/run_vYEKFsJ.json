@@ -1,0 +1,22 @@
+{
+  "id": "run_vYEKFsJ",
+  "task_id": "tsk_DG6Hjmw",
+  "agent_id": "agt_BneL5Al",
+  "attempt": 2,
+  "status": "timed_out",
+  "started_at": "2025-01-01T00:02:31.977Z",
+  "finished_at": "2025-01-01T00:02:45.596Z",
+  "workspace_path": "workspaces/tsk_DG6Hjmw",
+  "prompt": "Synthetic prompt for tsk_DG6Hjmw, attempt 2.",
+  "pid": 37021,
+  "error": "synthetic timeout",
+  "error_kind": "timeout",
+  "tokens": {
+    "input": 14382,
+    "output": 164,
+    "reasoning": 1831,
+    "total": 16377,
+    "cache_read": 8595,
+    "cache_write": 43
+  }
+}

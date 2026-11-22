@@ -1,0 +1,19 @@
+[
+  {
+    "id": "goal_B4eWz60",
+    "title": "Synthetic goal 1",
+    "description": "Invented goal number 1 for generated fixtures.",
+    "status": "active",
+    "assignee": "agt_BneL5Al",
+    "created_at": "2025-01-01T00:00:03.633Z",
+    "updated_at": "2025-01-01T00:00:08.633Z"
+  },
+  {
+    "id": "goal_4QPvvMS",
+    "title": "Synthetic goal 2",
+    "description": "Invented goal number 2 for generated fixtures.",
+    "status": "paused",
+    "assignee": "agt__AKo7jx",
+    "created_at": "2025-01-01T00:00:17.529Z"
+  }
+]

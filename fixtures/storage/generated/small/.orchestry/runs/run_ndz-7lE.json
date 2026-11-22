@@ -1,0 +1,22 @@
+{
+  "id": "run_ndz-7lE",
+  "task_id": "tsk_5XZAuwm",
+  "agent_id": "agt_BneL5Al",
+  "attempt": 1,
+  "status": "failed",
+  "started_at": "2025-01-01T00:01:01.595Z",
+  "finished_at": "2025-01-01T00:01:09.835Z",
+  "workspace_path": "workspaces/tsk_5XZAuwm",
+  "prompt": "Synthetic prompt for tsk_5XZAuwm, attempt 1.",
+  "pid": 41831,
+  "error": "synthetic process crash",
+  "error_kind": "process_crash",
+  "tokens": {
+    "input": 8844,
+    "output": 513,
+    "reasoning": 610,
+    "total": 9967,
+    "cache_read": 6534,
+    "cache_write": 626
+  }
+}

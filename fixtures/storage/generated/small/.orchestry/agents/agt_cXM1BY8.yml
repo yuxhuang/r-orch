@@ -1,0 +1,21 @@
+id: agt_cXM1BY8
+name: delta
+adapter: shell
+role: Synthetic shell worker for generated fixtures.
+config:
+  command: synthetic-shell
+  model: synthetic-model
+  approval_policy: manual
+  max_turns: 43
+  timeout_ms: 3314000
+status: idle
+stats:
+  tasks_completed: 2
+  tasks_failed: 3
+  total_runs: 5
+  total_runtime_ms: 300000
+  tokens_used: 63251
+last_error:
+  message: synthetic process crash
+  kind: process_crash
+  timestamp: '2025-01-01T00:02:17.917Z'

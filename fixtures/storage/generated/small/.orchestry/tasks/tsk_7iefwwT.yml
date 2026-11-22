@@ -1,0 +1,14 @@
+id: tsk_7iefwwT
+title: Sort the hollow kettle
+description: Invented work item 2; nothing here describes a real project.
+status: failed
+priority: 1
+assignee: agt_cXM1BY8
+labels:
+- backend
+depends_on:
+- tsk_-8biszr
+created_at: '2025-01-01T00:00:38.083Z'
+updated_at: '2025-01-01T00:00:57.994Z'
+attempts: 2
+max_attempts: 2

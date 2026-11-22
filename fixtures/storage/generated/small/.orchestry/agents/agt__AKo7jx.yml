@@ -1,0 +1,17 @@
+id: agt__AKo7jx
+name: bravo
+adapter: codex
+role: Synthetic codex worker for generated fixtures.
+config:
+  command: synthetic-codex
+  model: synthetic-model
+  approval_policy: manual
+  max_turns: 10
+  timeout_ms: 902000
+status: idle
+stats:
+  tasks_completed: 1
+  tasks_failed: 0
+  total_runs: 1
+  total_runtime_ms: 60000
+  tokens_used: 14188

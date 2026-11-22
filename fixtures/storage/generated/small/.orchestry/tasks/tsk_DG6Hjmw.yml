@@ -1,0 +1,14 @@
+id: tsk_DG6Hjmw
+title: Weigh the hollow bridge
+description: Invented work item 10; nothing here describes a real project.
+status: failed
+priority: 4
+assignee: agt_BneL5Al
+labels:
+- docs
+depends_on: []
+created_at: '2025-01-01T00:02:20.755Z'
+updated_at: '2025-01-01T00:02:45.596Z'
+attempts: 2
+max_attempts: 2
+goalId: goal_4QPvvMS

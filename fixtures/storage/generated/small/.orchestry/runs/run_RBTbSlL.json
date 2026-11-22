@@ -1,0 +1,20 @@
+{
+  "id": "run_RBTbSlL",
+  "task_id": "tsk_-8biszr",
+  "agent_id": "agt_Nsf31rn",
+  "attempt": 2,
+  "status": "succeeded",
+  "started_at": "2025-01-01T00:00:34.438Z",
+  "finished_at": "2025-01-01T00:00:38.083Z",
+  "workspace_path": "workspaces/tsk_-8biszr",
+  "prompt": "Synthetic prompt for tsk_-8biszr, attempt 2.",
+  "pid": 7003,
+  "tokens": {
+    "input": 11151,
+    "output": 1217,
+    "reasoning": 1568,
+    "total": 13936,
+    "cache_read": 7716,
+    "cache_write": 336
+  }
+}
