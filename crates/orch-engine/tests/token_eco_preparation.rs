@@ -405,6 +405,43 @@ fn production_part(source: &str) -> &str {
     &source[..cut]
 }
 
+fn is_adapter_execute_candidate(source: &str) -> bool {
+    let first_line = source.lines().next().unwrap_or_default();
+    first_line.match_indices(".execute(").any(|(at, _)| {
+        let argument = source[at + ".execute(".len()..].trim_start();
+        // rusqlite shares this method name, but a string literal cannot be
+        // Adapter's ExecuteParams. Keep every other argument/receiver a candidate.
+        let string_literal = argument.starts_with('"')
+            || argument
+                .strip_prefix('r')
+                .is_some_and(|rest| rest.trim_start_matches('#').starts_with('"'));
+        !string_literal
+    })
+}
+
+#[test]
+fn execute_audit_distinguishes_sql_literals_from_adapter_params() {
+    for line in [
+        "adapter.execute(params)",
+        "other.execute(params)",
+        "sp.execute(params)",
+        "conn.execute(r#params)",
+        "conn.execute(\"SELECT 1\", []); adapter.execute(params)",
+        "adapter.execute(params); // conn.execute(\"SELECT 1\", [])",
+    ] {
+        assert!(is_adapter_execute_candidate(line), "{line}");
+    }
+    for line in [
+        "sp.execute(\"INSERT INTO blobs VALUES (?1)\", params![hash])",
+        "sp.execute(\n  \"INSERT INTO blobs VALUES (?1)\", params![hash])",
+        "conn.execute(  \"UPDATE runs SET prompt_sha256=?1\", params![hash])",
+        "conn.execute(r\"DELETE FROM blobs\", [])",
+        "conn.execute(r###\"UPDATE task_attachments SET name=?1\"###, [name])",
+    ] {
+        assert!(!is_adapter_execute_candidate(line), "{line}");
+    }
+}
+
 #[test]
 fn dispatch_is_the_only_production_caller_of_adapter_execute_and_awaits_preparation_first() {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
@@ -434,12 +471,19 @@ fn dispatch_is_the_only_production_caller_of_adapter_execute_and_awaits_preparat
         }
         let text = std::fs::read_to_string(file).unwrap();
         let prod = production_part(&text);
-        for (n, line) in prod.lines().enumerate() {
+        let mut offset = 0;
+        for (n, line) in prod.split_inclusive('\n').enumerate() {
+            let remaining = &prod[offset..];
+            offset += line.len();
             let t = line.trim_start();
             if t.starts_with("//") || t.starts_with("///") {
                 continue;
             }
-            if line.contains(".execute(") && !line.contains("sqlx") && !line.contains("query") {
+            if line.contains(".execute(")
+                && !line.contains("sqlx")
+                && !line.contains("query")
+                && is_adapter_execute_candidate(remaining)
+            {
                 callers.push((rel.clone(), n + 1, line.trim().to_owned()));
             }
         }
