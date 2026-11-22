@@ -4,8 +4,9 @@
 //! Authorization of operations belongs to the dispatcher, not to this port.
 //! Writes run a synchronous callback on the backend's writer, so no transaction
 //! can escape or wait for an external side effect. A callback error aborts it.
-//! Events, leases and intents share the entity transaction and its project
-//! boundary. The remaining operational families arrive in later slices.
+//! Events, leases, intents and retries share the entity transaction and
+//! its project boundary. The remaining operational families arrive in later
+//! slices.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,7 @@ pub mod fake;
 pub mod intents;
 pub mod leases;
 pub mod page;
+pub mod retries;
 
 pub use entity::{ConfigEntry, Entity, EntityKind, Record, Revision, TemplateEntry};
 pub use page::{Cursor, Filter, Page, PageRequest, Sort};
@@ -81,6 +83,8 @@ pub enum StoreError {
     InvalidEvents(String),
     #[error("invalid intent: {0}")]
     InvalidIntent(String),
+    #[error("invalid retry: {0}")]
+    InvalidRetry(String),
     #[error("storage counter exhausted")]
     CounterExhausted,
     #[error(transparent)]
@@ -92,7 +96,7 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// All reads share one committed state, including repeated page reads.
 #[async_trait]
 pub trait ReadSnapshot:
-    events::EventRead + intents::IntentRead + leases::LeaseRead + Send + Sync
+    events::EventRead + intents::IntentRead + leases::LeaseRead + retries::RetryRead + Send + Sync
 {
     fn caller(&self) -> &Caller;
     async fn get(&self, kind: EntityKind, id: &str) -> Result<Option<Record>>;
@@ -104,7 +108,7 @@ pub trait ReadSnapshot:
 /// Errors leave that operation unchanged. Returning an error from `work`
 /// discards every operation, including positions and revision increments.
 pub trait UnitOfWork:
-    events::EventWrite + intents::IntentWrite + leases::LeaseWrite + Send
+    events::EventWrite + intents::IntentWrite + leases::LeaseWrite + retries::RetryWrite + Send
 {
     fn caller(&self) -> &Caller;
     fn get(&self, kind: EntityKind, id: &str) -> Result<Option<Record>>;

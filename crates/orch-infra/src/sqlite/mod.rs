@@ -59,3 +59,9 @@ fn test_data() -> (tempfile::TempDir, crate::data_dir::DataDir) {
     .unwrap();
     (temp, data)
 }
+
+#[allow(
+    dead_code,
+    reason = "Internal lease adapter awaits T10 Storage integration; issue 127 holds production wiring"
+)]
+mod leases;

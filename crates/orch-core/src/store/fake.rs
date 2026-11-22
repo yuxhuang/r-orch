@@ -21,6 +21,7 @@ struct Project {
     events: events::fake::EventState,
     intents: intents::fake::IntentState,
     leases: leases::fake::LeaseState,
+    retries: retries::fake::RetryState,
     positions: BTreeMap<EntityKind, u64>,
 }
 
@@ -552,5 +553,30 @@ impl intents::IntentWrite for View {
     }
     fn list_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<intents::Intent>> {
         self.project.intents.pending(after, limit)
+    }
+}
+
+#[async_trait]
+impl retries::RetryRead for View {
+    async fn read_retry(&self, task: &str) -> Result<Option<retries::Retry>> {
+        Ok(self.project.retries.get(task))
+    }
+    async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<retries::Retry>> {
+        self.project.retries.due(now_ms, limit)
+    }
+}
+
+impl retries::RetryWrite for View {
+    fn put_retry(&mut self, retry: &retries::Retry) -> Result<()> {
+        self.project.retries.put(retry)
+    }
+    fn delete_retry(&mut self, task: &str) -> Result<bool> {
+        Ok(self.project.retries.delete(task))
+    }
+    fn get_retry(&self, task: &str) -> Result<Option<retries::Retry>> {
+        Ok(self.project.retries.get(task))
+    }
+    fn due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<retries::Retry>> {
+        self.project.retries.due(now_ms, limit)
     }
 }

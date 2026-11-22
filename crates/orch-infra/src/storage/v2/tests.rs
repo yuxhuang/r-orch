@@ -6,6 +6,7 @@ use std::path::Path;
 use orch_core::store::events::{EventGap, SequencedEvent};
 use orch_core::store::intents::{DONE_RETENTION_MS, FinishOutcome, IntentPayload};
 use orch_core::store::leases::{ClaimOutcome, Lease, NewLease};
+use orch_core::store::retries::Retry;
 use orch_core::store::*;
 use orch_core::test_support::{assert_hermetic, make_agent, make_task};
 use orch_domain::{
@@ -1103,4 +1104,91 @@ async fn large_text_commits_and_rollbacks_preserve_events_and_leases() {
         vec![event(1)]
     );
     assert_eq!(claim(&s, new_lease("t", "a", "next")).await.epoch, 2);
+}
+
+fn retry(task: &str, attempt: u32, due_at: i64) -> Retry {
+    Retry {
+        task: task.into(),
+        attempt,
+        due_at,
+        error: "boom".into(),
+    }
+}
+
+async fn due(s: &FileStorage, project: &str) -> Vec<Retry> {
+    s.read(owner(project))
+        .await
+        .unwrap()
+        .read_due_retries(i64::MAX, 1_000)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn retry_rows_survive_a_new_instance_and_a_replacement_is_kept() {
+    let root = root();
+    let first = FileStorage::new(root.path());
+    first
+        .transaction(owner("p"), Lane::Entities, |u| {
+            u.put_retry(&retry("t1", 1, 20))?;
+            u.put_retry(&retry("t2", 2, 10))?;
+            u.put_retry(&retry("t1", 3, 30))
+        })
+        .await
+        .unwrap();
+    drop(first);
+    let second = FileStorage::new(root.path());
+    assert_eq!(
+        due(&second, "p").await,
+        vec![retry("t2", 2, 10), retry("t1", 3, 30)]
+    );
+    assert!(due(&second, "other").await.is_empty());
+    second
+        .transaction(owner("p"), Lane::Entities, |u| u.delete_retry("t2"))
+        .await
+        .unwrap();
+    drop(second);
+    assert_eq!(
+        due(&FileStorage::new(root.path()), "p").await,
+        vec![retry("t1", 3, 30)]
+    );
+}
+
+#[tokio::test]
+async fn a_document_written_before_retries_existed_loads_with_none() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    create(&s, "p", "t1").await;
+    let [document] = documents(root.path()).try_into().unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
+    assert!(value.as_object_mut().unwrap().remove("retries").is_some());
+    std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert!(due(&s, "p").await.is_empty());
+    assert!(get(&s, "p", "t1").await.is_some());
+}
+
+#[tokio::test]
+async fn retry_operations_that_change_nothing_do_not_rewrite_the_document() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    s.transaction(owner("p"), Lane::Entities, |u| {
+        u.put_retry(&retry("t1", 1, 5))
+    })
+    .await
+    .unwrap();
+    let [document] = documents(root.path()).try_into().unwrap();
+    let inode =
+        |path: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap());
+    let before = inode(&document);
+    s.transaction(owner("p"), Lane::Entities, |u| {
+        // A delete of a missing row, a refused row and the reads change nothing.
+        assert!(!u.delete_retry("never")?);
+        u.put_retry(&retry("t1", 0, 5)).unwrap_err();
+        assert_eq!(u.due_retries(i64::MAX, 10)?.len(), 1);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(inode(&document), before);
 }
