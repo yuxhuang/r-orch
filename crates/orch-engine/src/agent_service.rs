@@ -8,7 +8,6 @@
 //! which is why the scoring sort must be stable — the
 //! workspace `clippy.toml` denies `sort_unstable*` to enforce it.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use orch_core::error::{Error, Result};
@@ -22,6 +21,9 @@ use orch_domain::{
 
 use crate::events::EventBus;
 use crate::prompt_mode::{AgentDiagnostic, DefinitionLock, agent_effort_diagnostics};
+pub use crate::scheduler::agent_eligible;
+#[cfg(test)]
+use crate::scheduler::score_agent;
 
 /// Fields `agent edit` may change.
 ///
@@ -609,35 +611,10 @@ impl AgentService {
     }
 
     /// Dispatch supplies its explicitly merged directory and reservations.
+    /// The rule lives in [`crate::scheduler::choose_agent`]; the order of
+    /// `agents` is the tie order.
     pub fn find_best_in(task: &Task, agents: Vec<Agent>) -> Option<Agent> {
-        let available: Vec<Agent> = agents
-            .iter()
-            .filter(|a| agent_eligible(task, a))
-            .cloned()
-            .collect();
-
-        if available.is_empty() {
-            return None;
-        }
-
-        if let Some(assignee) = task.assignee.as_deref().filter(|a| !a.is_empty()) {
-            let assigned = agents
-                .into_iter()
-                .find(|a| a.id == assignee || a.name == assignee);
-            return assigned.filter(|a| agent_eligible(task, a));
-        }
-
-        // Lower-cased once because the inner loops are O(n·m).
-        let lower_labels: Vec<String> = task.labels.iter().map(|l| l.to_lowercase()).collect();
-        let labels = (!lower_labels.is_empty()).then_some(lower_labels.as_slice());
-
-        let mut scored: Vec<(i64, Agent)> = available
-            .into_iter()
-            .map(|agent| (score_agent(&agent, labels), agent))
-            .collect();
-        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
-
-        scored.into_iter().next().map(|(_, agent)| agent)
+        crate::scheduler::choose_agent(task, agents)
     }
 }
 
@@ -686,58 +663,6 @@ fn check_shell_effort(
 fn normalize_summary(raw: &str) -> Result<String> {
     normalize_role_summary(raw)
         .map_err(|err| Error::invalid_arguments(format!("config.role_summary: {err}")))
-}
-
-/// Capability labels constrain explicit and automatic assignment alike.
-pub fn agent_eligible(task: &Task, agent: &Agent) -> bool {
-    agent.status == AgentStatus::Idle
-        && agent.remote.as_ref().is_none_or(|remote| remote.online)
-        && task
-            .labels
-            .iter()
-            .filter_map(|label| label.strip_prefix("cap:"))
-            .all(|cap| agent.capabilities.iter().any(|actual| actual == cap))
-}
-
-/// The agent scoring. Split out so it is unit-testable without
-/// a store, and so the weights sit in one place.
-fn score_agent(agent: &Agent, lower_labels: Option<&[String]>) -> i64 {
-    let mut score = 0i64;
-
-    if let (Some(labels), Some(skills)) = (lower_labels, agent.config.skills.as_deref())
-        && !skills.is_empty()
-    {
-        let skill_set: HashSet<String> = skills.iter().map(|s| s.to_lowercase()).collect();
-        score += 50 * labels.iter().filter(|l| skill_set.contains(*l)).count() as i64;
-    }
-
-    // `contains`, not equality: a label of "end" matches both "frontend" and
-    // "backend". That is a known false-positive source that the tests assert on
-    // deliberately.
-    if let (Some(labels), Some(role)) = (lower_labels, agent.role.as_deref()) {
-        let lower_role = role.to_lowercase();
-        if labels.iter().any(|l| lower_role.contains(l.as_str())) {
-            score += 30;
-        }
-    }
-
-    if agent.status == AgentStatus::Idle {
-        score += 20;
-    }
-
-    let total = agent.stats.tasks_completed + agent.stats.tasks_failed;
-    if total > 0 {
-        score += js_round(agent.stats.tasks_completed as f64 / total as f64 * 10.0);
-    }
-
-    score
-}
-
-/// `Math.round`: half rounds **up** (towards +∞), unlike Rust's `f64::round`,
-/// which rounds half away from zero. The inputs here are non-negative so the
-/// two agree, but spelling it out keeps the intent checkable.
-fn js_round(value: f64) -> i64 {
-    (value + 0.5).floor() as i64
 }
 
 #[cfg(test)]
