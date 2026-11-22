@@ -456,7 +456,7 @@ that needs no port v2 type is delivered as its own PR (PR 122) so that the later
 
 **What the foundation is.** The writer executor and the read pool, in `crates/orch-infra/src/sqlite/writer.rs`
 and `read_pool.rs`, with their module tests. It uses T9's data directory and connection setup and nothing from T8.
-It is wired to nothing: not to `Storage`, not to the daemon. Its behaviour and limits are in
+The internal goal adapter now uses the executor. The daemon still uses file storage. The executor’s behaviour and limits are in
 [ARCHITECTURE.md §6.6](../ARCHITECTURE.md#66-sqlite-writer-and-read-pool-foundation-not-wired). Of the spec it
 covers R24 (one writer, `BEGIN IMMEDIATE`, read-only readers), R25 (a snapshot per read), R98 (pool size, bounded
 wait, no extra connection) and the order of R26's lanes. Nothing else of R26 and nothing of R27, R28, R126 to R128,
@@ -479,8 +479,7 @@ R130, R137, R139 or R140.
   request keys and attention. Its first slice, the events and the leases, is not enough. The time unit of the
   operational port and the database's must be reconciled deliberately.
 
-Until T8b and T8c are accepted, T10 maps no port operation, and T12 stays dependent on a completed T8 and a
-completed T10.
+The public SQLite port awaits accepted T8b and T8c. T12 depends on completion of T8 and T10.
 
 **What remains of T10 after the foundation.** The adapter of the Storage v2 port and its conformance run on SQLite;
 bulk identities and the 1,000-row or 20 ms cut (R27); event aggregation into one transaction (R26); intents
@@ -499,7 +498,8 @@ that keeps queue locks free of callbacks. The daemon is wired to this executor o
 | T1 | first-review text (`f5637805`) implemented in PR 1, `fast` on macOS, and merged to `main` by the owner on 2026-11-21; this corrected text, with the review corrections and the owner's answers, implemented in a follow-up PR that is pending its reviews and the owner's merge. The spec is not approved by either. Since then: the corrected text (`34b3b4d`) reached `main` on 2026-11-22 (UTC) through that follow-up PR, and the deferral of 2026-11-21 (the spec's record I) is implemented in a further documentation PR that is pending its review and its merge. This revision changes no document's status (`draft`, `proposed`) |
 | T4 | dropped as an entry step by the owner on 2026-11-21. The first run of 2026-11-20 is recorded in [issue 98](https://github.com/yuxhuang/r-orch/issues/98) and is not delivered to `main` |
 | T4b | deferred by the owner on 2026-11-21; not run |
-| T10, first slice (writer and read pool) | implemented as an unwired foundation in PR 122 at `63edf0f9`, with its module tests; its Linux CI, independent reviews and the owner's merge are pending, as are the follow-ups of issue 127. The rest of T10 is pending behind T8b and T8c ("T10 split") |
+| T10, writer and read pool | Merged in PR 122. Issue 127 tracks safeguards required before daemon wiring. |
+| T10, internal goal adapter | Goal reads, creates, updates, deletes and explicit moves use the executor. Module tests cover transactions, snapshots, reopen and file-reference behavior for supported inputs. Public conformance still requires timestamp and counter compatibility, imported position high-water marks, and text/blob handling. |
 | T2 to T27, except T4 and T4b | pending, as this table stood before 2026-11-21; this revision brings no other row up to date |
 
 ## Test plan

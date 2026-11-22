@@ -1167,9 +1167,11 @@ not written by a dashboard broadcast subscriber.
 
 [ADR 0017](decisions/0017-sqlite-storage.md) decision 6 gives SQLite one task that performs every write, one
 transaction at a time, and a pool of read-only connections. `crates/orch-infra/src/sqlite/{writer,read_pool}.rs`
-is that executor and pool as an independent foundation (plan T10, first slice). Nothing else uses it yet: it is
-not behind `Storage`, the daemon still runs on the file backend, and the mutex model of §6.1 is unchanged. This
-is a blocking, thread-based design, not tokio: the engine has no async adapter around it yet.
+is that executor and pool as an independent foundation (plan T10, first slice). The internal goal adapter borrows both. It groups goal changes in a writer transaction and reads a consistent
+snapshot through the pool. Each goal operation uses the project supplied by its caller. A failed savepoint
+rollback invalidates the write callback. Timestamps must round-trip as millisecond UTC strings, and revisions
+and positions must fit a positive signed SQLite integer. The daemon uses file storage and the mutex model of
+§6.1. The executor runs on a dedicated thread.
 
 **Trust.** Both types run owned or borrowed closures written by the storage adapter, which must already have
 checked the caller and the project. Neither is an endpoint for client-supplied SQL, and neither has an
