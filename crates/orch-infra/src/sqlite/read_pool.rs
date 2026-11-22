@@ -74,14 +74,16 @@ impl<'a> ReadPool<'a> {
     fn acquire(&self, deadline: Instant) -> Result<ReadLease<'_, 'a>> {
         let mut free = self.free.lock().expect("read pool lock poisoned");
         loop {
-            if Instant::now() >= deadline {
-                return Err(SqliteError::Overloaded);
-            }
+            // A late woken waiter must consume a released slot rather than
+            // swallow the sole wakeup and leave other waiters asleep.
             if let Some(connection) = free.pop() {
                 return Ok(ReadLease {
                     pool: self,
                     connection,
                 });
+            }
+            if Instant::now() >= deadline {
+                return Err(SqliteError::Overloaded);
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
             (free, _) = self

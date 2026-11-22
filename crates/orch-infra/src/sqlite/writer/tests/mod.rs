@@ -238,3 +238,38 @@ fn a_deadline_that_passes_behind_active_work_withdraws_the_request() {
         worker.join().unwrap();
     });
 }
+
+#[test]
+fn dropping_the_last_handle_closes_admission_and_drains() {
+    let (_temp, data) = test_data();
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let clone = handle.clone();
+    let receipt = handle.submit(Lane::Entities, None, |_| Ok(17)).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || {
+            writer.run();
+            done_tx.send(()).unwrap();
+        });
+        drop(handle);
+        assert!(
+            done_rx.try_recv().is_err(),
+            "another handle still owns admission"
+        );
+        // Keep an independent emergency close so even a regression fails rather
+        // than hanging the scoped join forever. It is not a client handle.
+        let shared = Arc::clone(&clone.admission.shared);
+        drop(clone);
+        let returned = done_rx.recv_timeout(Duration::from_secs(2));
+        if returned.is_err() {
+            shared.state.lock().unwrap().accepting = false;
+            shared.available.notify_all();
+        }
+        worker.join().unwrap();
+        assert!(
+            returned.is_ok(),
+            "worker did not stop after the last handle"
+        );
+    });
+    assert_eq!(receipt.wait().unwrap(), 17);
+}

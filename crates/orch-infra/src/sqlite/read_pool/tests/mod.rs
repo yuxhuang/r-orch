@@ -122,3 +122,67 @@ fn a_waiting_reader_uses_the_released_slot_before_its_deadline() {
         assert_eq!(waiting.join().unwrap().unwrap(), 0);
     });
 }
+
+#[test]
+fn a_free_slot_is_usable_when_a_waiter_reacquires_after_its_deadline() {
+    let (_temp, data) = test_data();
+    let writer = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    // Model a late wake deterministically: a slot is already free, and the
+    // admission limit has elapsed. Taking the slot avoids losing its wakeup.
+    pool.read(Instant::now(), |_| Ok(())).unwrap();
+    drop(writer);
+}
+
+#[test]
+fn a_failed_read_discards_its_connection_local_state() {
+    let (_temp, data) = test_data();
+    let writer = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    writer
+        .execute_batch("CREATE TABLE sample(id INTEGER) STRICT")
+        .unwrap();
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    let error: Result<()> = pool.read(deadline(), |tx| {
+        tx.execute_batch("CREATE TEMP TABLE marker(id INTEGER); COMMIT")?;
+        Err(SqliteError::Sql(rusqlite::Error::InvalidQuery))
+    });
+    assert!(error.is_err());
+    pool.read(deadline(), |tx| {
+        let count: i64 = tx.query_row(
+            "SELECT count(*) FROM sqlite_temp_master WHERE name='marker'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, 0, "failed read connection was reused");
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_lease_left_in_a_transaction_is_discarded() {
+    let (_temp, data) = test_data();
+    let writer = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    // Exercise lease cleanup directly: rusqlite normally rolls back before
+    // this Drop runs, so a callback panic alone does not cover this branch.
+    let lease = pool.acquire(deadline()).unwrap();
+    lease
+        .connection
+        .as_ref()
+        .unwrap()
+        .execute_batch("CREATE TEMP TABLE marker(id INTEGER); BEGIN")
+        .unwrap();
+    drop(lease);
+    pool.read(deadline(), |tx| {
+        let count: i64 = tx.query_row(
+            "SELECT count(*) FROM sqlite_temp_master WHERE name='marker'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(count, 0);
+        Ok(())
+    })
+    .unwrap();
+    drop(writer);
+}

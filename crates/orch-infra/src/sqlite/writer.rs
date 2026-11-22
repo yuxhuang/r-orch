@@ -47,10 +47,13 @@ impl<T> Schedule<T> {
         }
     }
 
+    fn admits(&self, lane: Lane) -> bool {
+        self.entries.len() < self.capacity
+            && !(lane == Lane::Events && self.entries.iter().any(|e| e.lane == Lane::Events))
+    }
+
     fn push(&mut self, lane: Lane, arrival: Instant, work: T) -> Result<()> {
-        if self.entries.len() == self.capacity
-            || (lane == Lane::Events && self.entries.iter().any(|e| e.lane == Lane::Events))
-        {
+        if !self.admits(lane) {
             return Err(SqliteError::Overloaded);
         }
         self.entries.push(Entry {
@@ -91,7 +94,7 @@ struct Shared {
 
 /// Owns the sole writing connection of this executor. Run it on a dedicated,
 /// scoped thread: its borrow keeps the data directory lock alive through exit.
-/// The caller must close admission before joining that thread. Construct one
+/// Close admission or drop every client handle before joining that thread. Construct one
 /// executor per adapter after migrations, never one per request.
 pub struct Writer<'a> {
     connection: ConnectionHandle<'a>,
@@ -100,7 +103,30 @@ pub struct Writer<'a> {
 
 #[derive(Clone)]
 pub struct WriterHandle {
+    admission: Arc<Admission>,
+}
+
+// Only client handles own Admission. The worker owns Shared separately, so
+// dropping the final client closes admission even on an early return/unwind.
+struct Admission {
     shared: Arc<Shared>,
+}
+
+impl Admission {
+    fn close(&self) {
+        self.shared
+            .state
+            .lock()
+            .expect("writer queue lock poisoned")
+            .accepting = false;
+        self.shared.available.notify_all();
+    }
+}
+
+impl Drop for Admission {
+    fn drop(&mut self) {
+        self.close();
+    }
 }
 
 /// Dropping a receipt does not cancel an accepted mutation. Request deadlines
@@ -136,7 +162,9 @@ impl<'a> Writer<'a> {
             available: Condvar::new(),
         });
         let handle = WriterHandle {
-            shared: Arc::clone(&shared),
+            admission: Arc::new(Admission {
+                shared: Arc::clone(&shared),
+            }),
         };
         Ok((Self { connection, shared }, handle))
     }
@@ -223,6 +251,7 @@ impl WriterHandle {
             let _ = response.send(result);
         });
         let mut state = self
+            .admission
             .shared
             .state
             .lock()
@@ -235,26 +264,19 @@ impl WriterHandle {
         }
         // Check capacity before moving the callback into push: refusal must not
         // drop a user capture under the lock (it might itself close admission).
-        if state.queue.entries.len() == state.queue.capacity
-            || (lane == Lane::Events && state.queue.entries.iter().any(|e| e.lane == Lane::Events))
-        {
+        if !state.queue.admits(lane) {
             drop(state);
             drop(job);
             return Err(SqliteError::Overloaded);
         }
         state.queue.push(lane, Instant::now(), job)?;
-        self.shared.available.notify_one();
+        self.admission.shared.available.notify_one();
         Ok(WriteReceipt { response: receiver })
     }
 
     /// Close admission and drain previously accepted transactions. Idempotent.
     pub fn close(&self) {
-        self.shared
-            .state
-            .lock()
-            .expect("writer queue lock poisoned")
-            .accepting = false;
-        self.shared.available.notify_all();
+        self.admission.close();
     }
 }
 
