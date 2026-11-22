@@ -242,6 +242,15 @@ if sys.platform=='darwin': cases += [('load',['sysctl','-n','vm.loadavg']),('boo
 missing=[(label,argv) for label,argv in cases if not shutil.which(argv[0])]
 cases=[(label,argv) for label,argv in cases if shutil.which(argv[0])]
 print(json.dumps({'unmeasured_missing_tools':missing}),flush=True)
+# This row builds the real xtask, whose dependency graph can include native
+# libraries. Prepare it before the marker observation: the drain deadline tests
+# last-close recovery, not cold compiler throughput. The observed argv and its
+# private target stay unchanged; no build output is shared between fixtures.
+graph_argv=next(argv for label,argv in cases if label=='crate-graph')
+prepared_at=time.monotonic()
+prepared=subprocess.run(graph_argv,cwd=fixture,env=env,stdin=subprocess.DEVNULL,capture_output=True,timeout=300)
+print(json.dumps({'preparation':'crate-graph','argv':graph_argv,'elapsed_seconds':time.monotonic()-prepared_at,'returncode':prepared.returncode,'output_tail':(prepared.stdout+prepared.stderr).decode(errors='replace')[-500:]}),flush=True)
+assert prepared.returncode==0,'crate-graph preparation failed'
 holder_code=sys.argv[2]
 def exists(pid):
  p=subprocess.run(['/bin/ps','-p',str(pid),'-o','stat='],capture_output=True,text=True)
@@ -253,6 +262,7 @@ def grant(marker):
   except BlockingIOError:return False
  finally:os.close(fd)
 def probe(label,argv,mutant='none'):
+ started_at=time.monotonic()
  marker=root/(label+'.use');pidfile=root/(label+'.pid')
  reader,writer=os.pipe();fcntl.fcntl(writer,fcntl.F_SETFL,os.O_NONBLOCK)
  filled=0
@@ -320,10 +330,10 @@ def probe(label,argv,mutant='none'):
       if len(output)<1024*1024:output.extend(rest[:1024*1024-len(output)])
      except BlockingIOError:break
     break
-   assert time.monotonic()<end, 'retained fixture: direct process has not exited'
+   assert time.monotonic()<end, ('retained fixture: direct process has not exited',label,argv,time.monotonic()-started_at,bytes(output).decode(errors='replace')[-500:])
    select.select([reader],[],[],.01)
   os.close(reader)
- observations.update(last_close_granted=grant(marker),direct_absent=not bool(exists(observations['pid'])),output_tail=bytes(output).decode(errors='replace')[-500:])
+ observations.update(elapsed_seconds=time.monotonic()-started_at,last_close_granted=grant(marker),direct_absent=not bool(exists(observations['pid'])),output_tail=bytes(output).decode(errors='replace')[-500:])
  (root/(label+'.json')).write_text(json.dumps(observations,indent=2)+'\n')
  print(json.dumps(observations),flush=True)
  return observations
