@@ -159,11 +159,14 @@ T8b adds two families to the port, project settings (`project_config`: key,
 value, revision) and templates (`templates`: name, body, revision), listed by
 their exact key in byte order like context entries, and the shared scenarios for
 them, for the 64 KiB text threshold of R97 and for the task-id fold rule of R117.
-The file reference's large-text storage is a separate slice on the same
-document; these families carry free text and use it unchanged. Until that slice
-lands, `text_over_64_kib_round_trips_through_the_blob_store` checks that text on
-both sides of the line comes back whole and replaceable, and nothing observes a
-blob store: R97's blob clause stays unverified on every backend until then.
+The shared `text_over_64_kib_round_trips_through_the_blob_store` scenario checks
+that text on both sides of the line comes back whole and replaceable. The file
+reference also checks its persisted hash-backed rows against the confined disk
+blob store in `storage::v2::tests`, including the UTF-8 byte boundary, reopening,
+project separation and rollback. Inline rows retain their existing encoding;
+external rows need the new reference reader. This reference-only encoding does
+not migrate production files. R97's SQLite blob integration remains with its
+adapter; the shared round trip alone does not prove that backing.
 
 ### Switch, removal, proof
 

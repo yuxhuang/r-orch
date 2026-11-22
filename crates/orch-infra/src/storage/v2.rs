@@ -26,8 +26,8 @@
 //! directory with the process umask); a load reads the whole document with no
 //! size cap, and a write rewrites all of it; a document that was removed reads
 //! as a project that was never written, so positions and lease epochs start
-//! again at 1; the rename is not preceded by a sync; and a hand-edited document
-//! is checked only for a row listed twice, a position past its counter, and a
+//! again at 1; the rename is not followed by a directory sync; and a hand-edited
+//! document is checked only for a row listed twice, a position past its counter, and a
 //! lease past its epoch counter or sharing an agent or a run, not for two task
 //! ids with one fold key, two rows at one position, or events of no known run.
 
@@ -36,6 +36,7 @@ mod leases;
 mod order;
 #[cfg(test)]
 mod tests;
+mod text;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -77,7 +78,7 @@ struct Project {
 #[derive(Serialize, Deserialize)]
 struct Document {
     counters: BTreeMap<EntityKind, u64>,
-    records: Vec<Record>,
+    records: Vec<text::StoredRecord>,
     #[serde(default)]
     events: Events,
     #[serde(default)]
@@ -214,7 +215,8 @@ fn load(dir: &Path) -> Result<Project> {
         .leases
         .validate()
         .map_err(|detail| corrupt(&path, detail))?;
-    for record in document.records {
+    for stored in document.records {
+        let record = stored.resolve(dir)?;
         let kind = record.entity.kind();
         let id = record.entity.id().to_owned();
         if record.position > project.counters.get(&kind).copied().unwrap_or(0) {
@@ -233,7 +235,11 @@ fn persist(dir: &Path, project: &Project) -> Result<()> {
     std::fs::create_dir_all(dir).map_err(|e| io_error("cannot create", dir, e))?;
     let document = Document {
         counters: project.counters.clone(),
-        records: project.rows.values().cloned().collect(),
+        records: project
+            .rows
+            .values()
+            .map(|row| text::StoredRecord::encode(dir, row))
+            .collect::<Result<_>>()?,
         events: project.events.clone(),
         leases: project.leases.clone(),
     };
@@ -242,6 +248,9 @@ fn persist(dir: &Path, project: &Project) -> Result<()> {
     // `Document` always serializes, so a failure here is the temp file's I/O.
     serde_json::to_writer_pretty(&temp, &document)
         .map_err(|e| io_error("cannot write", temp.path(), e.into()))?;
+    temp.as_file()
+        .sync_all()
+        .map_err(|e| io_error("cannot sync", temp.path(), e))?;
     let path = dir.join(DOCUMENT);
     temp.persist(&path)
         .map_err(|e| io_error("cannot replace", &path, e.error))?;
