@@ -6,7 +6,7 @@ fn db() -> Connection {
     db.execute_batch(include_str!("../schema.sql")).unwrap();
     db
 }
-fn owner(project: &str) -> Caller {
+pub(super) fn owner(project: &str) -> Caller {
     Caller {
         project: project.into(),
         principal: Principal::Owner {
@@ -14,20 +14,20 @@ fn owner(project: &str) -> Caller {
         },
     }
 }
-fn new(task: &str, agent: &str, run: &str) -> NewLease {
+pub(super) fn new(task: &str, agent: &str, run: &str) -> NewLease {
     NewLease {
         task: task.into(),
         agent: agent.into(),
         run: run.into(),
     }
 }
-fn grant(tx: &Transaction<'_>, who: &Caller, n: NewLease, now: i64) -> Lease {
+pub(super) fn grant(tx: &Transaction<'_>, who: &Caller, n: NewLease, now: i64) -> Lease {
     match claim_lease(tx, who, &n, now).unwrap() {
         ClaimOutcome::Granted(l) => l,
         other => panic!("{other:?}"),
     }
 }
-fn holder(who: &Caller, l: &Lease) -> Caller {
+pub(super) fn holder(who: &Caller, l: &Lease) -> Caller {
     Caller {
         project: who.project.clone(),
         principal: Principal::Task {

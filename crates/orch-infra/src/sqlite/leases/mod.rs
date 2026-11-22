@@ -152,20 +152,24 @@ pub(crate) fn claim_lease(
     // never calls another lease operation inside its savepoint.
     tx.execute_batch("SAVEPOINT orch_lease_claim")
         .map_err(backend)?;
-    struct Rollback<'a>(&'a Transaction<'a>);
-    impl Drop for Rollback<'_> {
-        fn drop(&mut self) {
-            let _ = self
-                .0
-                .execute_batch("ROLLBACK TO orch_lease_claim; RELEASE orch_lease_claim");
+    let result = (|| {
+        tx.execute("INSERT INTO task_epochs(project_id,task_id,next_epoch) VALUES(?1,?2,?3) ON CONFLICT(project_id,task_id) DO UPDATE SET next_epoch=excluded.next_epoch", params![caller.project, new.task, next]).map_err(backend)?;
+        tx.execute("INSERT INTO leases(project_id,task_id,run_id,agent_id,worker_id,epoch,lineage,state,granted_at,renewed_at,expires_at) VALUES(?1,?2,?3,?4,'local_worker',?5,?6,'active',?7,?7,?8)", params![caller.project, new.task, new.run, new.agent, epoch, lineage, now_ms, expires_at]).map_err(backend)?;
+        tx.execute_batch("RELEASE orch_lease_claim")
+            .map_err(backend)
+    })();
+    if let Err(operation) = result {
+        if let Err(cleanup) =
+            tx.execute_batch("ROLLBACK TO orch_lease_claim; RELEASE orch_lease_claim")
+        {
+            // The borrowed Transaction cannot install hooks or mark its writer
+            // poisoned. Unwind instead of returning a catchable operation error:
+            // Writer drops the transaction and connection and closes receipts.
+            // In particular, never silently ignore failed cleanup and commit.
+            panic!("{operation}; SQLite lease cleanup failed: {cleanup}");
         }
+        return Err(operation);
     }
-    let rollback = Rollback(tx);
-    tx.execute("INSERT INTO task_epochs(project_id,task_id,next_epoch) VALUES(?1,?2,?3) ON CONFLICT(project_id,task_id) DO UPDATE SET next_epoch=excluded.next_epoch", params![caller.project, new.task, next]).map_err(backend)?;
-    tx.execute("INSERT INTO leases(project_id,task_id,run_id,agent_id,worker_id,epoch,lineage,state,granted_at,renewed_at,expires_at) VALUES(?1,?2,?3,?4,'local_worker',?5,?6,'active',?7,?7,?8)", params![caller.project, new.task, new.run, new.agent, epoch, lineage, now_ms, expires_at]).map_err(backend)?;
-    tx.execute_batch("RELEASE orch_lease_claim")
-        .map_err(backend)?;
-    std::mem::forget(rollback);
     Ok(ClaimOutcome::Granted(Lease {
         task: new.task.clone(),
         agent: new.agent.clone(),
@@ -215,3 +219,7 @@ pub(crate) fn release_lease(
 
 #[cfg(test)]
 mod tests;
+
+mod adapter;
+#[cfg(test)]
+mod executor_tests;
