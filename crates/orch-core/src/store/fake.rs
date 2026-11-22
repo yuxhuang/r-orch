@@ -512,6 +512,13 @@ impl retries::RetryRead for View {
     async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<retries::Retry>> {
         self.project.retries.due(now_ms, limit)
     }
+    async fn read_retries(
+        &self,
+        after: Option<&retries::RetryCursor>,
+        limit: usize,
+    ) -> Result<retries::RetryPage> {
+        self.project.retries.page(after, limit)
+    }
 }
 
 impl retries::RetryWrite for View {
@@ -526,5 +533,12 @@ impl retries::RetryWrite for View {
     }
     fn due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<retries::Retry>> {
         self.project.retries.due(now_ms, limit)
+    }
+    fn list_retries(
+        &self,
+        after: Option<&retries::RetryCursor>,
+        limit: usize,
+    ) -> Result<retries::RetryPage> {
+        self.project.retries.page(after, limit)
     }
 }

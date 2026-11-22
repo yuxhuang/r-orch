@@ -49,7 +49,7 @@ use orch_core::store::events::{
     AppendResult, EventGap, EventRead, EventWrite, PruneResult, SequencedEvent,
 };
 use orch_core::store::leases::{ClaimOutcome, Lease, LeaseRead, LeaseWrite, NewLease};
-use orch_core::store::retries::{Retry, RetryRead, RetryWrite};
+use orch_core::store::retries::{Retry, RetryCursor, RetryPage, RetryRead, RetryWrite};
 use orch_core::store::{
     Caller, Cursor, Entity, EntityKind, Filter, Lane, Page, PageRequest, ReadSnapshot, Record,
     Result, Revision, Sort, Storage, StoreError, UnitOfWork, WriteWork,
@@ -622,6 +622,9 @@ impl RetryRead for Session {
     async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>> {
         self.project.retries.due(now_ms, limit)
     }
+    async fn read_retries(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage> {
+        self.project.retries.page(after, limit)
+    }
 }
 
 impl RetryWrite for Session {
@@ -640,5 +643,8 @@ impl RetryWrite for Session {
     }
     fn due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>> {
         self.project.retries.due(now_ms, limit)
+    }
+    fn list_retries(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage> {
+        self.project.retries.page(after, limit)
     }
 }
