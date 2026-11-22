@@ -443,7 +443,7 @@ All three names are the same program:
 |---|---|
 | `orch-domain` | `task`, `agent`, `run`, `goal`, `team`, `message`, `state`, `config`, `global_config`, `events`, `error`, `transitions`, `scope`, `model_tiers`, `shop` (agent-shop + org-shop + default-agents) |
 | `orch-core` | `storage` (9 traits), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
-| `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
+| `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, usage, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{agent, config, context, daemon, goal, init, msg, org, org_template, remote, rpc, run, status, task, team}`, `doctor`, `logs`, `tui` (`DaemonBackend`), `update`, `web`, `routing`, `tree`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
 | `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
@@ -1059,6 +1059,16 @@ loop {
   `tokio::io::AsyncBufReadExt::lines()` does: it splits on `0x0A` only (keeping `\r`), **skips empty lines**,
   yields a trailing fragment, and caps each line at 16384 characters. Write our own `line_reader`; do not
   reach for the convenience method.
+
+`adapters::usage::RunUsage` is an additive conversion helper for the nullable usage fields of storage v2
+(SQLite spec R86/R87). It seeds the model from the prepared configuration and the CLI version from an
+existing `AdapterTestResult`, including a failed probe that supplied a version. Known CLI metadata can replace
+the model and individual counters; omitted counters remain unknown, explicit zero stays zero, and repeated
+snapshots are not summed. Invalid counts (including fractional, negative or outside SQLite's signed INTEGER
+range) are ignored. Blank or over-64-KiB model/version strings are ignored without truncation. The helper
+performs no I/O and does not infer counts from the lossy legacy `TokenUsage` type. Call `observe_output` on
+decoded CLI JSON before an adapter drops lifecycle records; `observe_event` handles only data retained in
+existing events. The helper is not yet wired into collection or durable run finish; the 1.0 path is unchanged.
 
 ### 6.4 Cancellation
 

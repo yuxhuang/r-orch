@@ -21,6 +21,7 @@ pub mod opencode;
 pub mod pi;
 pub mod registry;
 pub mod shell;
+pub mod usage;
 pub mod util;
 
 pub use antigravity::AntigravityAdapter;
