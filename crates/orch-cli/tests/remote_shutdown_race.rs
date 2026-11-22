@@ -405,12 +405,19 @@ fn daemon_sigterm_exits_only_after_the_owners_own_shutdown() {
     wait("running shell under the daemon", &peers, || {
         controller.path("started").exists()
     });
-    let controller_addr: SocketAddr =
-        read_json(controller.path(".orchestry/remotes/_listener.json"))["listen_addr"]
+    // The daemon socket and dispatch can start before listener publication.
+    // Ignore an absent/stale record and retain the address from this owner.
+    let owner_pid = daemon.child.id();
+    let mut controller_addr = None;
+    wait("current owner publishes listener", &[&controller], || {
+        let status = read_json(controller.path(".orchestry/remotes/_listener.json"));
+        controller_addr = status["listen_addr"]
             .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
+            .and_then(|addr| addr.parse::<SocketAddr>().ok())
+            .filter(|addr| addr.port() != 0 && status["pid"] == owner_pid);
+        controller_addr.is_some()
+    });
+    let controller_addr = controller_addr.expect("current owner's bound address");
     let pid = text(controller.path("started"))
         .trim()
         .parse::<i32>()

@@ -1646,12 +1646,19 @@ fn connected_shutdown_detaches_the_remote_run(watch: bool) {
     command.args(["--listen", &controller_addr.to_string()]);
     *controller.owner.borrow_mut() = Some(controller.spawn(command, "shutdown-owner"));
     controller.await_owner_socket();
-    let controller_addr: SocketAddr =
-        read_json(controller.path(".orchestry/remotes/_listener.json"))["listen_addr"]
+    // The daemon socket and dispatch can start before listener publication.
+    // Ignore an absent/stale record and retain the address from this owner.
+    let owner_pid = controller.owner.borrow().as_ref().unwrap().child.id();
+    let mut controller_addr = None;
+    wait("current owner publishes listener", &[&controller], || {
+        let status = read_json(controller.path(".orchestry/remotes/_listener.json"));
+        controller_addr = status["listen_addr"]
             .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
+            .and_then(|addr| addr.parse::<SocketAddr>().ok())
+            .filter(|addr| addr.port() != 0 && status["pid"] == owner_pid);
+        controller_addr.is_some()
+    });
+    let controller_addr = controller_addr.expect("current owner's bound address");
     let peers = [&controller, &worker];
     controller.online("w1", &peers);
     let task = controller.task(
