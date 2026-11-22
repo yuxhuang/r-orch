@@ -125,6 +125,19 @@ first of them. "Suite" is `cargo test -p orch-engine --test storage_conformance`
 | T22 | `orch db` with the daemon running: status, verify, query, prune | R72 to R74, R79, R121 (status), R130 | `crates/orch-daemon/src/ops/`, `crates/orch-cli/src/commands/db*` | T10, T16, T17 | `cargo test -p orch-cli --test db_commands` | 21 |
 | T23 | Backup, restore, vacuum, export, and import from an export file; a backup is written and read through the confined-directory module, its manifest's names are checked against the layout and never opened, and an export's names, ids and paths are stored as data. Before an export's database is published and before a restore changes anything, the check of the spec's R117: no two task ids of one fold key, no directory in the project's `workspaces/` that the tasks brought may not own, and a backup's database refused when it lacks the index. The export format of the spec's "Import bounds" (blob bytes in chunks, a manifest, tables only) and its hostile reader: the header checked before SQLite opens the file, a read-only immutable connection with the schema untrusted, triggers, views and extensions off, run-time limits, a heap limit, an authorizer and a progress handler, `quick_check` first, the schema compared and never adopted, rows copied by fixed statements into a database built by the product's own migrations under a scratch name and published by a rename; and the hostile-export corpus, made by altering the bytes of an export the product wrote, run in a child process under the same ceilings. A restore replaces the state as the spec's R138 says: the whole state staged under a scratch name with its new lineage and generation and its leases ended, a synced marker, renames in a fixed order, `--continue` and `--abandon`, a refusal to start anything while the marker exists, and a check of free space that counts the backup; tested by stopping a child at every step | R75 to R80, R100, R108, R101 and R102 (backups), R105 and R107 (export), R113 to R115, R116 (an export), R67 (no resume for an export), R117 (an export, a restore), R124 (restoring the copy), R125 (an export), R132 (a restore), R133 (the confirmation), R138 | `crates/orch-infra/src/sqlite/backup*`, `crates/orch-infra/src/import/export*`, `crates/orch-cli/src/commands/db*`, `crates/orch-cli/tests/export_hostile.rs` (the `limits` and `hooks` features of `rusqlite` that this task uses are on since T9, ADR 0017 decision 19) | T21, T22 | `cargo test -p orch-cli --test db_backup_restore --test db_export_import --test export_hostile --test restore_fencing --test db_offline`; `./xtask/gate.sh full` (security-relevant) | 22 |
 
+T8 is split to keep each PR below about 3,000 changed lines. T8a introduces the
+additive entity contract, the in-memory fake and backend-neutral entity scenarios
+(R7–R11, R15, and the caller fields of R132); it leaves v1 traits and runtime
+wiring intact. T8b depends on T8a and adds the file reference plus blob,
+configuration and template coverage, including the file adapter's own R117
+comparison. T8c depends on those foundations and supplies the operational port
+and full conformance coverage (leases, event batches, retries, intents, request
+keys and attention). Prototype-dependent lease mechanics consume accepted E
+there. Full-port consumers T10 and T12 remain dependent on completed T8, not on
+T8a alone. This split implements the supervising session's 2026-11-21 direction
+to start independent T8/T9 work from merged PR 95; it does not approve the
+remaining entry evidence or reserved owner decisions.
+
 ### Switch, removal, proof
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
