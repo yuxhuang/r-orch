@@ -58,6 +58,8 @@ pub enum Filter {
         recipient: Option<String>,
     },
     Context,
+    Config,
+    Templates,
 }
 
 impl Filter {
@@ -70,6 +72,8 @@ impl Filter {
             Self::Runs { .. } => EntityKind::Run,
             Self::Messages { .. } => EntityKind::Message,
             Self::Context => EntityKind::Context,
+            Self::Config => EntityKind::Config,
+            Self::Templates => EntityKind::Template,
         }
     }
 }

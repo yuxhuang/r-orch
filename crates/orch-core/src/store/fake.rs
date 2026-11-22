@@ -287,7 +287,9 @@ fn matches_filter(entity: &Entity, filter: &Filter) -> bool {
         (Entity::Goal(v), Filter::Goals { status }) => status.is_none_or(|s| s == v.status),
         (Entity::Agent(_), Filter::Agents)
         | (Entity::Team(_), Filter::Teams)
-        | (Entity::Context(_), Filter::Context) => true,
+        | (Entity::Context(_), Filter::Context)
+        | (Entity::Config(_), Filter::Config)
+        | (Entity::Template(_), Filter::Templates) => true,
         (Entity::Run(v), Filter::Runs { task, agent }) => {
             task.as_ref().is_none_or(|t| t == &v.task_id)
                 && agent.as_ref().is_none_or(|a| a == &v.agent_id)
@@ -308,7 +310,11 @@ fn validate_sort(kind: EntityKind, sort: Sort) -> Result<()> {
             ),
             EntityKind::Goal => sort == Sort::CreatedAt,
             EntityKind::Agent | EntityKind::Team => sort == Sort::Name,
-            EntityKind::Run | EntityKind::Message | EntityKind::Context => false,
+            EntityKind::Run
+            | EntityKind::Message
+            | EntityKind::Context
+            | EntityKind::Config
+            | EntityKind::Template => false,
         };
     if valid {
         Ok(())
@@ -364,7 +370,7 @@ fn sort_key(row: &Record, sort: Sort) -> Key {
         (_, Entity::Team(v)) => vec![Text(v.created_at.clone())],
         (_, Entity::Run(v)) => vec![Newest(Reverse(Some(v.started_at.clone())))],
         (_, Entity::Message(v)) => vec![Text(v.created_at.clone()), Position(row.position)],
-        (_, Entity::Context(_)) => vec![],
+        (_, Entity::Context(_) | Entity::Config(_) | Entity::Template(_)) => vec![],
     };
     key.push(Text(row.entity.id().into()));
     key

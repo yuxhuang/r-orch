@@ -27,7 +27,9 @@ pub(super) fn matches(entity: &Entity, filter: &Filter) -> bool {
         (Entity::Goal(g), Filter::Goals { status }) => status.is_none_or(|s| s == g.status),
         (Entity::Agent(_), Filter::Agents)
         | (Entity::Team(_), Filter::Teams)
-        | (Entity::Context(_), Filter::Context) => true,
+        | (Entity::Context(_), Filter::Context)
+        | (Entity::Config(_), Filter::Config)
+        | (Entity::Template(_), Filter::Templates) => true,
         (Entity::Run(r), Filter::Runs { task, agent }) => {
             task.as_ref().is_none_or(|t| *t == r.task_id)
                 && agent.as_ref().is_none_or(|a| *a == r.agent_id)
@@ -50,7 +52,11 @@ pub(super) fn check_sort(kind: EntityKind, sort: Sort) -> Result<(), StoreError>
         ],
         EntityKind::Goal => &[Sort::CreatedAt],
         EntityKind::Agent | EntityKind::Team => &[Sort::Name],
-        EntityKind::Run | EntityKind::Message | EntityKind::Context => &[],
+        EntityKind::Run
+        | EntityKind::Message
+        | EntityKind::Context
+        | EntityKind::Config
+        | EntityKind::Template => &[],
     };
     if matches!(sort, Sort::Default | Sort::Id) || offered.contains(&sort) {
         Ok(())
@@ -112,7 +118,7 @@ pub(super) fn key(row: &Record, sort: Sort) -> Key {
         (Entity::Team(t), Sort::Name) => vec![Text(t.name.clone())],
         (Entity::Run(r), Sort::Default) => vec![newest(&r.started_at)],
         (Entity::Message(m), Sort::Default) => vec![Text(m.created_at.clone()), position],
-        (Entity::Context(_), Sort::Default) => vec![],
+        (Entity::Context(_) | Entity::Config(_) | Entity::Template(_), Sort::Default) => vec![],
         // `check_sort` refuses every other pair before a key is asked for.
         _ => vec![],
     };

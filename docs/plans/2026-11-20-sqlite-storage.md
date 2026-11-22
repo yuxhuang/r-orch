@@ -146,6 +146,13 @@ T8a alone. This split implements the supervising session's 2026-11-21 direction
 to start independent T8/T9 work from merged PR 95; it does not approve the
 remaining entry evidence or reserved owner decisions.
 
+T8b adds two families to the port, project settings (`project_config`: key,
+value, revision) and templates (`templates`: name, body, revision), listed by
+their exact key in byte order like context entries, and the shared scenarios for
+them, for the 64 KiB text threshold of R97 and for the task-id fold rule of R117.
+The file reference's large-text storage is a separate slice on the same
+document; these families carry free text and use it unchanged.
+
 ### Switch, removal, proof
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |

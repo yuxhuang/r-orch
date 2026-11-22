@@ -459,7 +459,9 @@ A caller selects one project at entry; row keys cannot select another project.
 Operation authorization remains the dispatcher's responsibility.
 
 `Record` wraps the existing task, goal, agent, team, run, message or context
-payload with a positive revision and an explicit position. Updates preserve
+payload, or a project setting (`ConfigEntry`, a key and its value text) or a
+template (`TemplateEntry`, a name and its body), with a positive revision and an
+explicit position. Updates preserve
 position; `move_to_end` changes position and revision. `Filter` selects an entity
 family and its filters; `PageRequest` bounds each list and selects a supported
 sort. `store::fake::FakeStorage`, behind `test-support`, serializes in-memory
