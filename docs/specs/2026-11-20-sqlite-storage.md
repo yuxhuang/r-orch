@@ -1844,7 +1844,7 @@ The new operations are in no MCP allowlist.
   | `id_alias`, `workspace_alias` (R117) | Stops |
   | `in_flight_live`, `in_flight_remote` (R119) | Stops, unless each run is named with `--assume-stopped` |
   | Unknown configuration keys over 64 KiB; a template over 64 KiB | Stops |
-  | `index_differs`; `index_unreadable` (an index that is missing, is not an array, or was read in full within its bounds and is not JSON); an entity its index does not list; an index entry with no file (R122) | Goes on, as "Order" above says; listed |
+  | `index_differs`, `index_unreadable`; an entity its index does not list; an index entry with no file (R122). `index_unreadable` is an index that is missing, is not an array, or was read in full within its bounds and is not JSON | Goes on, as "Order" above says; listed |
   | `index_entry`: an index array with an entry that is not an object or has no string identity (R122) | Stops, naming the index and saying that 1.0 rebuilt such an index from the entity files (F19). Drafted from the default of T21-X1 |
   | `index_duplicate`: an index array whose every entry has a string identity, with one identity more than once (R122) | Stops, naming the index and the identity and saying that 1.0 used such an index as it stood only if every entry was a complete entity of the directory's type, and otherwise rebuilt it from the entity files (F19). The refusal does not say which of the two 1.0 did with this index, and the stop is the same in both. No occurrence is chosen. Drafted from the default of T21-X2; the name is a proposal |
   | A dangling reference; an unknown key; a workspace that no task names; a path with no rule | Goes on; listed |
