@@ -3,6 +3,33 @@ use crate::sqlite::{ConnectionRole, SqliteError, Synchronous, open_connection, t
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+/// Bound for every wait in this module: a regression must fail with a name, not hang.
+const BOUND: Duration = Duration::from_secs(10);
+
+trait WaitBounded<T> {
+    fn wait_bounded(self) -> Result<T>;
+}
+
+impl<T> WaitBounded<T> for WriteReceipt<T> {
+    fn wait_bounded(self) -> Result<T> {
+        match self.response.recv_timeout(BOUND) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(SqliteError::WriterClosed),
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("receipt not answered within bound"),
+        }
+    }
+}
+
+/// Closes admission when a scoped test body unwinds, so the scope's implicit join
+/// of the worker thread cannot hang behind a failed assertion.
+struct CloseOnDrop<'a>(&'a WriterHandle);
+
+impl Drop for CloseOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 fn count(conn: &rusqlite::Connection) -> i64 {
     conn.query_row("SELECT count(*) FROM sample", [], |r| r.get(0))
         .unwrap()
@@ -20,7 +47,8 @@ fn writes_run_one_at_a_time_on_one_connection() {
         .unwrap();
     std::thread::scope(|scope| {
         let worker = scope.spawn(|| writer.run());
-        setup.wait().unwrap();
+        let _close = CloseOnDrop(&handle);
+        setup.wait_bounded().unwrap();
         let mut jobs = Vec::new();
         for id in 0..16 {
             let handle = handle.clone();
@@ -30,7 +58,7 @@ fn writes_run_one_at_a_time_on_one_connection() {
                 // A connection-local table proves the same connection serves every job.
                 tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS seen(n INTEGER); INSERT INTO seen VALUES(1)")?;
                 Ok(())
-            }).unwrap().wait().unwrap()));
+            }).unwrap().wait_bounded().unwrap()));
         }
         for job in jobs {
             job.join().unwrap();
@@ -40,7 +68,7 @@ fn writes_run_one_at_a_time_on_one_connection() {
                 Ok(tx.query_row("SELECT count(*) FROM temp.seen", [], |r| r.get::<_, i64>(0))?)
             })
             .unwrap()
-            .wait()
+            .wait_bounded()
             .unwrap();
         assert_eq!(total, 16);
         handle.close();
@@ -56,11 +84,12 @@ fn body_and_commit_errors_keep_nothing_and_writer_continues() {
     let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
     std::thread::scope(|scope| {
         let worker = scope.spawn(|| writer.run());
+        let _close = CloseOnDrop(&handle);
         handle.submit(Lane::Entities, None, |tx| {
             tx.execute_batch("CREATE TABLE sample(id INTEGER PRIMARY KEY) STRICT;
                 CREATE TABLE child(id INTEGER REFERENCES sample(id) DEFERRABLE INITIALLY DEFERRED) STRICT")?;
             Ok(())
-        }).unwrap().wait().unwrap();
+        }).unwrap().wait_bounded().unwrap();
         let body = handle
             .submit(Lane::Entities, None, |tx| {
                 tx.execute("INSERT INTO sample VALUES(1)", [])?;
@@ -68,7 +97,7 @@ fn body_and_commit_errors_keep_nothing_and_writer_continues() {
                 Ok(())
             })
             .unwrap()
-            .wait();
+            .wait_bounded();
         assert!(matches!(body, Err(SqliteError::Sql(_))));
         let commit = handle
             .submit(Lane::Entities, None, |tx| {
@@ -77,12 +106,12 @@ fn body_and_commit_errors_keep_nothing_and_writer_continues() {
                 Ok(())
             })
             .unwrap()
-            .wait();
+            .wait_bounded();
         assert!(matches!(commit, Err(SqliteError::Sql(_))));
         let total = handle
             .submit(Lane::Entities, None, |tx| Ok(count(tx)))
             .unwrap()
-            .wait()
+            .wait_bounded()
             .unwrap();
         assert_eq!(total, 0);
         handle.close();
@@ -128,8 +157,14 @@ fn bounded_queue_and_single_pending_event_transaction() {
         Err(SqliteError::Overloaded)
     ));
     drop(writer);
-    assert!(matches!(first.wait(), Err(SqliteError::WriterClosed)));
-    assert!(matches!(second.wait(), Err(SqliteError::WriterClosed)));
+    assert!(matches!(
+        first.wait_bounded(),
+        Err(SqliteError::WriterClosed)
+    ));
+    assert!(matches!(
+        second.wait_bounded(),
+        Err(SqliteError::WriterClosed)
+    ));
     assert!(matches!(
         handle.submit(Lane::Claims, None, |_| Ok(())),
         Err(SqliteError::WriterClosed)
@@ -150,9 +185,12 @@ fn expired_queued_request_never_runs_and_close_drains_accepted_work() {
     let accepted = handle.submit(Lane::Entities, None, |_| Ok(42)).unwrap();
     handle.close();
     writer.run();
-    assert!(matches!(expired.wait(), Err(SqliteError::Overloaded)));
+    assert!(matches!(
+        expired.wait_bounded(),
+        Err(SqliteError::Overloaded)
+    ));
     assert!(received.try_recv().is_err());
-    assert_eq!(accepted.wait().unwrap(), 42);
+    assert_eq!(accepted.wait_bounded().unwrap(), 42);
     assert!(matches!(
         handle.submit(Lane::Claims, None, |_| Ok(())),
         Err(SqliteError::WriterClosed)
@@ -176,8 +214,14 @@ fn a_panicking_transaction_rolls_back_and_closes_the_worker() {
     let queued = handle.submit(Lane::Entities, None, |_| Ok(())).unwrap();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| writer.run()));
     assert!(result.is_err());
-    assert!(matches!(failed.wait(), Err(SqliteError::WriterClosed)));
-    assert!(matches!(queued.wait(), Err(SqliteError::WriterClosed)));
+    assert!(matches!(
+        failed.wait_bounded(),
+        Err(SqliteError::WriterClosed)
+    ));
+    assert!(matches!(
+        queued.wait_bounded(),
+        Err(SqliteError::WriterClosed)
+    ));
     let reader = open_connection(&data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
     assert_eq!(count(&reader), 0);
 }
@@ -223,6 +267,7 @@ fn a_deadline_that_passes_behind_active_work_withdraws_the_request() {
         .unwrap();
     std::thread::scope(|scope| {
         let worker = scope.spawn(|| writer.run());
+        let _close = CloseOnDrop(&handle);
         started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let limit = Instant::now() + Duration::from_millis(10);
         let expired = handle
@@ -232,8 +277,11 @@ fn a_deadline_that_passes_behind_active_work_withdraws_the_request() {
             .unwrap();
         std::thread::sleep(limit.saturating_duration_since(Instant::now()));
         release_tx.send(()).unwrap();
-        active.wait().unwrap();
-        assert!(matches!(expired.wait(), Err(SqliteError::Overloaded)));
+        active.wait_bounded().unwrap();
+        assert!(matches!(
+            expired.wait_bounded(),
+            Err(SqliteError::Overloaded)
+        ));
         handle.close();
         worker.join().unwrap();
     });
@@ -271,5 +319,108 @@ fn dropping_the_last_handle_closes_admission_and_drains() {
             "worker did not stop after the last handle"
         );
     });
-    assert_eq!(receipt.wait().unwrap(), 17);
+    assert_eq!(receipt.wait_bounded().unwrap(), 17);
+}
+
+fn tx_state_is_autocommit(connection: &ConnectionHandle<'_>) -> bool {
+    connection.is_autocommit()
+}
+
+#[test]
+fn a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body() {
+    let (_temp, data) = test_data();
+    let mut connection =
+        open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    connection
+        .execute_batch("CREATE TABLE sample(id INTEGER) STRICT")
+        .unwrap();
+    let limit = Instant::now() + Duration::from_secs(60);
+    // First read (before BEGIN): in time. Second (reservation held): expired.
+    let reads = std::cell::Cell::new(0);
+    let clock = || {
+        reads.set(reads.get() + 1);
+        if reads.get() == 1 {
+            limit - Duration::from_secs(1)
+        } else {
+            limit
+        }
+    };
+    let ran = std::cell::Cell::new(false);
+    let outcome = execute(&mut connection, Some(limit), clock, |tx| {
+        ran.set(true);
+        tx.execute("INSERT INTO sample VALUES(1)", [])?;
+        Ok(())
+    });
+    assert!(matches!(outcome, Err(SqliteError::Overloaded)));
+    assert_eq!(reads.get(), 2, "deadline read before and after BEGIN");
+    assert!(
+        !ran.get(),
+        "the body must not run after the recheck refuses it"
+    );
+    assert!(tx_state_is_autocommit(&connection), "reservation released");
+    assert_eq!(count(&connection), 0);
+    // Without a deadline the same path commits, so the refusal came from the recheck.
+    execute(&mut connection, None, Instant::now, |tx| {
+        tx.execute("INSERT INTO sample VALUES(2)", [])?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(count(&connection), 1);
+}
+
+#[test]
+fn a_withdrawn_request_is_never_committed() {
+    // A second connection holds the write lock, so the worker's BEGIN IMMEDIATE
+    // waits inside SQLite. The deadline passes during that wait; the request
+    // must be refused and must not commit once the lock frees.
+    let (_temp, data) = test_data();
+    let holder = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    holder
+        .execute_batch("CREATE TABLE sample(id INTEGER) STRICT")
+        .unwrap();
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let limit = Instant::now() + Duration::from_millis(600);
+    let (ran_tx, ran_rx) = mpsc::channel();
+    let receipt = handle
+        .submit(Lane::Claims, Some(limit), move |tx| {
+            ran_tx.send(()).unwrap();
+            tx.execute("INSERT INTO sample VALUES(1)", [])?;
+            Ok(())
+        })
+        .unwrap();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| writer.run());
+        let _close = CloseOnDrop(&handle);
+        // Still blocked in BEGIN: it passed the pre-BEGIN check and has no answer.
+        assert!(
+            receipt
+                .response
+                .recv_timeout(Duration::from_millis(150))
+                .is_err(),
+            "request answered while the write lock was held"
+        );
+        std::thread::sleep(
+            limit.saturating_duration_since(Instant::now()) + Duration::from_millis(50),
+        );
+        holder.execute_batch("COMMIT").unwrap();
+        assert!(matches!(
+            receipt.wait_bounded(),
+            Err(SqliteError::Overloaded)
+        ));
+        handle.close();
+        worker.join().unwrap();
+    });
+    assert!(ran_rx.try_recv().is_err(), "expired body ran");
+    assert_eq!(count(&holder), 0);
+    // The writer's reservation was released: a later request commits.
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let later = handle.submit(Lane::Claims, None, |tx| {
+        tx.execute("INSERT INTO sample VALUES(2)", [])?;
+        Ok(())
+    });
+    handle.close();
+    writer.run();
+    later.unwrap().wait_bounded().unwrap();
+    assert_eq!(count(&holder), 1);
 }
