@@ -16,6 +16,13 @@ pub(super) enum EntityError {
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// The transaction can no longer promise operation-local rollback. The
+    /// adapter must abort it, retaining both errors for failure classification.
+    #[error("goal operation failed: {operation}; savepoint rollback failed: {rollback}")]
+    Rollback {
+        operation: Box<EntityError>,
+        rollback: rusqlite::Error,
+    },
 }
 type Result<T> = std::result::Result<T, EntityError>;
 
@@ -129,10 +136,16 @@ fn atomic<T>(tx: &Transaction<'_>, work: impl FnOnce() -> Result<T>) -> Result<T
     match result {
         Ok(value) => Ok(value),
         Err(error) => {
-            // A rollback failure is surfaced as SQL, never the caught semantic
-            // error; the adapter must abort the outer transaction in that case.
-            tx.execute_batch("ROLLBACK TO goal_entity; RELEASE goal_entity")?;
-            Err(error)
+            // Some SQLite errors abort the whole transaction, removing the
+            // savepoint too. Do not hide the original result behind the later
+            // "no such savepoint" error; the writer needs both results.
+            match tx.execute_batch("ROLLBACK TO goal_entity; RELEASE goal_entity") {
+                Ok(()) => Err(error),
+                Err(rollback) => Err(EntityError::Rollback {
+                    operation: Box::new(error),
+                    rollback,
+                }),
+            }
         }
     }
 }

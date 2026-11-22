@@ -481,3 +481,36 @@ fn committed_rows_and_deleted_positions_survive_reopening_the_database() {
     let conn = Connection::open(&path).unwrap();
     assert_eq!(get_goal(&conn, "p", "next").unwrap(), Some(created));
 }
+
+#[test]
+fn an_aborted_transaction_retains_the_original_error_and_the_rollback_error() {
+    let mut conn = connection();
+    let tx = conn.transaction().unwrap();
+    create_goal(&tx, "p", &row("earlier")).unwrap();
+    tx.execute_batch(
+        "CREATE TEMP TRIGGER abort_transaction BEFORE INSERT ON counters
+        BEGIN SELECT RAISE(ROLLBACK, 'injected transaction abort'); END;",
+    )
+    .unwrap();
+    let error = create_goal(&tx, "p", &row("failed")).unwrap_err();
+    let EntityError::Rollback {
+        operation,
+        rollback,
+    } = error
+    else {
+        panic!("transaction abort must retain both errors: {error:?}");
+    };
+    let EntityError::Sql(original) = *operation else {
+        panic!("original SQLite error was lost");
+    };
+    assert_eq!(
+        original.sqlite_error_code(),
+        Some(rusqlite::ErrorCode::ConstraintViolation)
+    );
+    assert!(original.to_string().contains("injected transaction abort"));
+    assert!(rollback.to_string().contains("no such savepoint"));
+    assert!(tx.is_autocommit());
+    assert_eq!(get_goal(&tx, "p", "earlier").unwrap(), None);
+    assert_eq!(get_goal(&tx, "p", "failed").unwrap(), None);
+    assert!(tx.commit().is_err());
+}
