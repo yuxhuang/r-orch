@@ -10,8 +10,25 @@
   section of `docs/TRAITS-FROZEN.md` (§2: the ten storage traits and their three rules). Everything else in 0012
   stands: one daemon owns state, no client opens it, nothing starts a daemon on its own, exit 7.
 - Decisions 1 to 6 and 14 restate decisions the owner already took in the goal and are binding. Decisions 7 to 13
-  and 15 to 19 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
-  the owner's.
+  and 15 to 25 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
+  the owner's to rule (the spec's AP13); no record shows that the owner set them.
+- The owner's answers (2026-11-20 and 2026-11-21): every point of the spec is answered as recommended,
+  except AP13, which is answered in its direction; the spec's "Owner's answers" has a row for every id and
+  its record. Decision 16 follows the answer to AP11, decision 17 the answer to O1, decision 18 the answer
+  to AP1, decision 12 the direction on AP13, the owner's ruling of 2026-11-21 on what a miss selects and
+  the owner's two answers of the same day on how "one platform alone" is judged and on a further data set
+  after a miss, with four answers given the same day under the owner's delegation on the list of kinds, on
+  the whole data set and on what counts as further measurement (the spec's record H), and decisions 20 to 25 the answers to AP14 to AP19 and D1 to D5. Two things are still the
+  owner's: the
+  numbers and results of AP13 (decisions 12 and 23), and the one part of decision 20 for which the spec
+  recommended no option. A third lies outside the answers: the owner's word on using the live copy for
+  the plan's task T4c. An answer is not the acceptance of this
+  ADR: it stays proposed until the owner merges the PR that carries this corrected text.
+- Where this text stands: the first-review text of this ADR (decisions 1 to 19 as first drafted, before the
+  review corrections and the owner's answers) reached `main` on 2026-11-21, when the owner merged the PR
+  that carried it at revision `f5637805`. This text replaces it through a follow-up PR and is pending until
+  that PR merges. The record does not say that the first merge accepts this ADR, and it is read here as not
+  accepting it.
 
 ## Context
 
@@ -70,7 +87,9 @@ across a crash, lists that do not load everything, and a retried request that ru
 
 7. **Migrations are numbered, forward-only and run at daemon start.** `schema_migrations` records each one.
    A database whose version is newer than the binary refuses to open and names both versions. There is no down
-   migration; the way back from a failed upgrade is the backup taken before it.
+   migration. Before each pending migration the daemon copies the database, checks the copy and keeps the
+   newest two (the spec's R124); the way back from a failed or a wrong migration is that copy. It is not a
+   scheduled backup, which 1.1 does not have.
 
 8. **1.1 creates 33 of the sketch's 50 tables.** A whole table that only a later phase uses arrives by a
    migration in that phase (17 tables and the FTS5 index). A column whose later addition could not be filled in
@@ -79,11 +98,14 @@ across a crash, lists that do not load everything, and a retried request that ru
    `task_epochs`, `position`, and `project_id` everywhere. The spec lists the tables and every difference from
    the sketch.
 
-9. **The writer serves four lanes: claims first, the rest by deadline.** The lanes and their longest waits are
+9. **The writer serves four lanes: claims first, the rest by deadline.** The lanes and the budgets for their waits are
    claims and lease work 50 ms, entity changes 200 ms, events 1 s, pruning and other maintenance 5 s. A queued
    claim always goes first. Among the other lanes the writer takes the earliest deadline (arrival plus the
    lane's wait), so none of them starves, and a bulk job queues one transaction at a time, so overdue bulk work
    cannot pile up ahead of anything. A claim therefore waits behind at most the one transaction in progress.
+   That is an order and not a time: a running statement and a commit are not cut short, so whether a wait is
+   met is a measured result (decision 12) and never a consequence of the lanes. The waiting event batches of
+   all runs share one transaction, so the event lane puts at most one transaction ahead of an entity change.
    Bulk work (event batches, pruning, expiry, import) is cut into transactions of at most 1,000 rows or 20 ms.
    An operation that must be atomic is never cut; if it exceeds the bound it runs whole and is counted.
 
@@ -104,9 +126,67 @@ across a crash, lists that do not load everything, and a retried request that ru
 12. **Run events go into SQLite, in batches, unless the measurement says otherwise.** A collector numbers its
     run's events from 1 and hands batches to the events lane; the append ignores a sequence number already
     stored, so a repeated batch is harmless. If the measured throughput cannot meet the claim-latency budget
-    (deliverable D), events are kept as per-run files in the data directory behind the same port operations
-    and nothing else in this ADR changes. The measurement has since missed the budget on macOS and met it on
-    Linux (the spec's point AP13), so 1.1 is planned on the fallback unless the owner rules otherwise.
+    (deliverable D), events are kept as per-run files in the data directory, each named by a hash (decision 20),
+    behind the same port operations and nothing else in this ADR changes. The first measurement missed its
+    budget on macOS (50 ms at the 99th percentile and 100 ms at the worst, at 50 claims a second) and met it
+    in a Linux container on the same machine; no figure from native Linux hardware exists yet. That result
+    is kept as it is and is not measured away. On 2026-11-20 the owner chose, at the spec's point AP13, to
+    revise the workload and the budget and to measure anew, in place of a diagnosis at the first budget, and
+    set no numbers. The spec's "Event measurement" states the revised method before it runs: one claim a
+    second, 1 to 24 event streams, a burst cell, 200 ms and 1,000 ms proposed, 660 s repetitions that each
+    hold checkpoints by the production rule of decision 23, the claims around each checkpoint judged apart,
+    and macOS hardware and native Linux hardware. Those numbers are proposed; they and the results return to
+    the owner, and no budget is met until the owner accepts both. The owner's direction said that a miss of
+    the revised budget selects the fallback. On 2026-11-21 the owner amended that sentence: every miss is
+    kept and reported; a miss selects the fallback only when it is attributable to events; and a miss
+    without events (claims alone, cell C0, a burst alone) or on one platform alone selects no event path and
+    goes back to the owner. The spec applies those words and adds no test of cause. Before any path is
+    chosen a data set must be eligible: no defect and no unknown correctness in any repetition, no
+    required repetition invalid or without its backend, its settings, its timing check or its platform
+    class shown, and coverage complete. That rule is the spec's proposal and not the owner's ruling. A data set that is
+    not eligible selects no path, keeps its headline and its exit, and keeps every miss on its own axis.
+    Where the ruling's words stop the spec proposes readings and marks them. How "one platform alone" is
+    judged is no longer one of them. The spec set a reading by cell beside a reading by kind of limit,
+    with the case in which the two differ, and on 2026-11-21 the owner chose the kind reading: a miss is
+    shown by both platforms only when each missed the same kind of limit in the same population of the
+    same cell, so two different kinds of miss in one cell, one on each platform, select no path and go
+    back to the owner. The reading by cell is not adopted. The list of kinds was the spec's proposal
+    when that answer was given. The owner answered a second question the same day: after a data set in which a mandatory
+    repetition that is valid or on a host that was not idle has missed, no further data set is started
+    without the owner's word, whatever its headline, and a data set that only fixes a defect is no
+    exception. Both answers choose a rule; neither accepts a number, a limit, a method or a result.
+    Independent reviews first read the text that carries them at revision `d2fe9b0`; the plan names them.
+    Four more answers were given on 2026-11-21 under the owner's delegation; they are not the owner's own
+    words, and the spec's record H gives the delegation. The five kinds are adopted and are operative: the
+    match is made on the cell, the population and the kind together, and kinds named in a report beside a
+    selection made without them do not apply the reading. A miss of the spec's steps 2 to 4 anywhere in a
+    data set keeps it from selecting an event path, while an eligible data set in which every miss is a
+    valid miss in a population that holds events, shown by both platforms in the same cell, population and
+    kind, still selects the fallback. Starting the second platform's block after a mandatory miss on the
+    first, and replacing an invalid set of five, or one on a host that was not idle, while such a miss
+    stands, are each further measurement that needs the owner's word, with the old set and every miss
+    kept. Neither answer changes a data set's headline or exit: a defect still comes first, with the other
+    axes printed. No answer settles what is done with a block that is already running when a mandatory miss
+    is seen or whether the blocks of two platforms may overlap, and no measurement campaign is started
+    before those two are settled; nor does one settle which data set a block that the owner allows belongs to.
+    Selecting a path is not permission to measure it and does not qualify it to ship. These answers
+    too choose rules and accept no number, limit, method or result.
+    A fallback that is
+    selected is measured as built before anything ships on it, and only on the owner's word, and no figure
+    shows it to be faster. Each data set gets one verdict from
+    four axes reported apart (correctness, validity, coverage, budget), so that a miss on one platform with
+    the other not yet run is a failure and incomplete at once. The measurement follows decisions 21 and 22
+    of ADR 0013: it holds the host lease exclusively and samples the host, a budget met on a host that was
+    not idle is no pass, and a miss there stands and selects no path. The limits for an idle host and the
+    classes of the two platforms are proposals. The path that ships is
+    measured by the same method before its PR merges. Two numbers of decision 9 stand beside the proposal
+    and are not changed by it. The 50 ms is the target for a claim's wait before its transaction starts
+    and gates nothing, where the proposed 200 ms runs from arrival to commit. The 1 s is the deadline
+    that orders an event batch, where the proposed 5,000 ms limits an event's age. The experiment batches
+    events over 50 ms and is no evidence about the shipped collector's 256 events or 250 ms; the run of
+    the path that ships is. The spec's "Event measurement" says what is proposed for each and how each is
+    reported; the owner rules on them with the numbers and the results, and no measured result is read
+    differently on their account.
 
 13. **A retried change runs once.** A request may carry a key. The key, scoped by (identity, project, run,
     epoch, key), is stored with a hash of the request and the result in the same transaction as the change, and
@@ -123,18 +203,52 @@ across a crash, lists that do not load everything, and a retried request that ru
     deliverable B). Agent rotation is therefore the same as 1.0 and is now a line of engine code that a test
     names.
 
-16. **A restore starts a new generation, and an epoch is never issued twice.** A start sets the generation to
-    `max(highest known generation + 1, UTC seconds now)` and writes it, synced, to the database and to the
-    file `generation` in the data directory before any epoch is issued. A restore takes "highest known" over
-    the backup, the replaced database when it can be read, and that file. A task's next epoch is
-    `max(task_epochs.next_epoch, generation * 2^20)`; a task that would need more than 2^20 epochs in one
-    generation is refused a claim until the next start. An epoch issued before a restore is therefore smaller
-    than any issued after it, whatever the backup's age. On a directory that has neither the replaced state
-    nor the file (a new machine), the guarantee rests on the clock, and the restore says so. This mechanism is
-    proposed; the lease prototype (deliverable E) confirms or replaces it, and the requirement it serves (gate
-    line 9) does not depend on it. The prototype's first finding is that a restore should also start a new
-    lineage: a random id carried beside the epoch on every lease-bound call, which fences without a clock. The
-    spec's point AP11 puts both to the owner.
+16. **A restore starts a new generation and a new lineage; no pair of lineage and epoch is issued twice.** The
+    owner decided this on 2026-11-20 (the spec's AP11) and amended gate line 9 to match. The lineage is a
+    random 128-bit id made with the database, replaced by every restore, kept by every other start, stored in
+    `daemon_config` and held by every lease beside its epoch. Every lease-bound call carries both and is
+    refused unless both equal the lease's (R77, R132). A call refused for an earlier lineage changes no row:
+    a finish of an earlier lineage does not update even its own run, and a run that a restore brought back
+    is closed by the daemon's recovery under the new lineage (R36). A task's next epoch comes from `task_epochs` alone. The
+    generation is a counter of starts, one more than the highest that the database and the file `generation`
+    record; it orders the starts of one lineage and promises nothing about numbers. An epoch's number may
+    repeat under another lineage, and nothing compares epochs across lineages. The first draft of this
+    decision took a floor for epochs from the clock (`generation * 2^20`, with the generation at least the
+    UTC second) and concluded that a number was never issued twice. That does not hold: a backup restored
+    onto a directory with no earlier state, while the clock is behind an earlier start, issues the same
+    number again. The floor is withdrawn. The lease prototype (deliverable E) is still to confirm the
+    mechanics. A restore also refuses while a recorded process lives (R100). That refusal is the only ground
+    for sending a restored task out again in 1.1. The prototype's alternative, a waiting period of one lease
+    after the restore, holds only where a holder stops itself at its deadline; 1.1's processes do not (the
+    owner's answer to AP12 keeps R42), so time alone shows nothing here, and the alternative waits for 1.5.
+    A restore replaces the state in steps that a stop cannot leave half done unseen (R138). The whole
+    restored state is first built under a scratch name: the database already carries the new lineage and
+    generation and has every lease of the backup ended, and the spool is empty. A synced marker is then
+    written, the replaced state is moved aside and the staged state moved in by renames in a fixed order,
+    and the marker is removed last. The marker is published whole, by a temporary file, a sync and a
+    rename, for its first version and for the change of direction alike, so that a stop never leaves a
+    part of one; one that fails its check fails closed and is recovered by hand. It lists which members
+    the replaced state holds and which the staged state holds, the database's `-wal` and `-shm` among
+    them. Every replaced member is moved out before any staged member is moved in, a continuation
+    included, and a member that was never staged is never taken as moved in by its absence. Both
+    directories of a rename are synced. The staged database is closed and its file is read once more,
+    with no log beside it, to hold the new lineage, the new generation and no active lease; the marker
+    holds the SHA-256 of that file. Before the marker is removed the layout is checked and the bytes of
+    the database at its live name are compared with that hash, and a layout that the steps cannot have
+    left keeps the marker and is refused. Nothing opens the live database with SQLite while the marker
+    exists, so the last check leaves no file and a stop inside it is recovered by running it again.
+    While the marker exists nothing starts; `orch db restore --continue`
+    finishes the restore and `--abandon` puts the replaced state back, byte for byte. An abandonment
+    that was stopped during its cleanup, with the replaced state whole at the live names, is finished
+    by `--abandon` whatever is left of the scratch directory; an abandonment is refused for a scratch
+    directory that is gone only while the direction is still `forward`. All of this is promised for a
+    stop of the process. After a loss of power it holds as far as the platform's sync had reached the
+    medium: the spec names the call meant for each platform, proves none, and lists what can then be
+    found, among it a state that no start recognises. A restore needs free
+    space of the backup's size above the disk floor. So a database of one state never serves beside the
+    blobs or the repositories of the other, and a backup's leases are never active at a live name. What a
+    restore does with a workspace that already stands is not part of this and stays the owner's (decision
+    20).
 
 17. **The project is named by a pointer file from 1.1.** `orch init` and `orch import` write `.orch-project`
     in the project directory, holding the project id and nothing else. The daemon's data directory is created as
@@ -144,19 +258,33 @@ across a crash, lists that do not load everything, and a retried request that ru
     outright. `daemon.json`
     and the socket move into the data directory's `run/`. `--project` and `ORCH_PROJECT`, which name a project
     without a directory, arrive when one daemon serves many projects (1.5). The frozen handshake envelope of
-    0012 decision 6 does not change. This is open point 1 of the goal; the owner decides it at the gate.
+    0012 decision 6 does not change. This is open point 1 of the goal; the owner answered it as recommended.
 
 18. **orch-peer keeps its wire protocol and its own files, and loses its direct reads of the 1.0 stores.**
     Decision 15 of the goal says orch-peer is not changed, or the spec says exactly what breaks. `orch-peer`
     runs inside the daemon on the engine. It reads `tasks/_index.json` and `messages/_index.json` itself, builds
     a `FileMessageStore`, and reads `state.json` through the state store; none of these survives decision 1.
-    The spec names each place and asks the owner to approve adapting those places and nothing else. Its other
+    The spec names each place, and the owner approved adapting those places and nothing else (AP1), with the
+    proof on a second host still due. Its other
     storage calls keep compiling against a facade with the 1.0 trait shapes, kept in `orch-engine` for
     `orch-peer` alone until 2.0. The peer protocol, the `remotes` files and `peer-id` stay as they are.
 
 19. **The SQLite library is `rusqlite`, and `rusqlite_migration` runs the migrations.** `rusqlite` 0.41.1
-    with the features `bundled`, `backup` and `cache` and its default features off, and `rusqlite_migration`
-    2.7.0, both pinned exactly and used from `orch-infra` only. The report of deliverable C
+    with the features `bundled`, `backup`, `cache`, `limits` and `hooks` and its default features off, and
+    `rusqlite_migration` 2.7.0 with its default features off, both pinned exactly and used from `orch-infra`
+    only. `limits` and `hooks` were added after the report's first version, for decisions 21, 23 and 24:
+    they are the library's safe calls for run-time limits, the authorizer, the progress handler and the
+    write-ahead log's commit callback. Both are parts of the crate and bring no other crate (in 0.41.1's
+    manifest `limits = []`, `hooks = ["wal"]`, `wal = []`). The report's revision audits the five
+    together: the features that resolve are `backup`, `bundled`, `cache`, `hashlink`, `hooks`, `limits`,
+    `modern_sqlite` and `wal` and no other; `cargo deny check` on the whole workspace with the pair
+    connected passes under the unchanged policy with no new warning, exception or licence allowance, and
+    with the same packages as the three-feature set; and its probes of the limits, the authorizer, the
+    progress handler, the interrupt, the untrusted-schema settings and the heap limit pass on macOS and in
+    Linux containers of two architectures. No further feature is needed. Two calls that decision 23 uses,
+    `wal_hook` and `wal_checkpoint_v2`, are in those features and were read in the library's source; the
+    revision's probe does not run them. The revision is not yet delivered through its PR or independently
+    reviewed. `load_extension` stays off. The report of deliverable C
     (`docs/sqlite-library.md`) holds the §4.8 check and its evidence: both crates maintained; a declared MSRV
     of 1.89 under the pinned toolchain; MIT and Apache-2.0, inside `deny.toml`'s allow-list; `cargo deny check`
     passing on the whole workspace with the two crates connected and no new exception; the bundled engine
@@ -165,6 +293,129 @@ across a crash, lists that do not load everything, and a retried request that ru
     preferred to a hand-written one (ARCHITECTURE §4.8). Each migration is applied in its own transaction,
     which also writes its `schema_migrations` row. The versions and the advisories are checked again in the
     PR that adds the dependency.
+
+20. **No value from outside the daemon names a file.** An id, a key, a name or a path that came from a request,
+    a 1.0 source, an export file, a backup's manifest or a row of an imported or restored database is data in a
+    column. Below the data directory, in a backup and in the data home's `projects/`, a path component is a
+    fixed name of the layout, 64 hex digits of a SHA-256 the daemon computed (or its first two, as a shard
+    directory), or a name the daemon generated; an export is one file and holds no path at all. A run's event
+    file (decision 12) is named by the SHA-256 over a fixed label, the project id and the run id, each id
+    preceded by its length; a project's record by the SHA-256 of its id. One module in `orch-infra` reaches
+    every such file, and writes the pointer file in the project directory: it opens the root once and then goes
+    through directory descriptors, one name at a time, refusing links and special files, judging an entry by the
+    descriptor it opened, and creating exclusively. It refuses a file with more than one hard link in a tree
+    from elsewhere (an import source, a backup being restored) and before any append; reads below the data
+    directory rely on the hash check instead, so that a hard-link snapshot of the directory does not stop the
+    daemon. The importer reads its source the same way, by listing, and opens nothing that a document names. A
+    pid, a workspace path or a project directory read from a 1.0 source or an export is never acted on: an
+    import writes no lease and no intent and signals nothing. A restore does not act on a backup's rows either: a
+    process that the backup records makes it refuse and report, never signal, and it stops, when asked, only
+    the processes that the replaced state of this directory records (R100). The spec's "Filesystem names" is the contract and holds the test vectors. The one id
+    that still names a directory is `workspaces/<task id>` in the project directory, 1.0's layout, with 1.0's
+    reject-never-rewrite check; the spec's point AP14 puts it to the owner. A check of the id shows that it is
+    one name, not that the directory is one task's: the review's second reading found that `tsk_Case` and
+    `tsk_case` are two rows and, on a filesystem that folds case, one workspace and one branch. So the kept
+    layout comes with an ownership rule. No two tasks of a project have ids that differ only in the case of
+    ASCII letters: one rule on every platform, whatever the filesystem tells apart, kept by a unique index
+    under SQLite's `NOCASE` collation, with the exact id still the key and no id ever lower-cased or
+    rewritten. An import, from a 1.0 directory or from an export, and a restore refuse such a pair before
+    they publish anything, together with a directory in `workspaces/` that the tasks they bring may not own.
+    And before every reuse, merge, delete and cleanup a listing must hold the directory, or the branch,
+    under exactly the task's name; a new workspace is an exclusive create. A filesystem that folds a name
+    keeps the spelling it was created under, so what is reached through another spelling is seen as another
+    name's and is never adopted or removed. One part of this rule is not decided: whether a backup given to
+    a restore is taken to be this project's own state, so that a directory already at a restored task's
+    exact name is that task's. A name, a device and an inode do not show who wrote a backup. The spec's
+    AP14 puts two options to the owner, trust with a listing in the confirmation or refusal as for an
+    export, and this ADR takes neither until the owner has ruled. The owner's answer to AP14, "as
+    recommended", settles the rest of this decision and chooses neither option, because the spec
+    recommended neither. This decision answers the security
+    review's finding S2, which showed the first layout (`blobs/events/ab/<run id>`) leaving the data directory
+    for a run id shaped like a path. The descriptor calls exist, without `unsafe`, in `nix`, which the workspace
+    already depends on and already uses this way (`crates/orch-daemon/src/ops/transport.rs`); `orch-infra` needs
+    its `fs` and `dir` features turned on, which adds no crate. The PR that adds the module does the §4.8 check
+    on a capability-style crate such as `cap-std` before it settles on `nix`, and the contract is the same
+    either way.
+
+21. **Input from outside is measured before anything is built from it.** A 1.0 source file and an export
+    file are content from elsewhere, whatever directory the owner named. Every limit on them is checked on
+    the bytes or on a parser's events, by code whose memory and stack do not depend on what the input says
+    about itself, and no limit is a deadline. For a 1.0 document the limits are bytes, nesting depth, node
+    count, aliases, and the nodes and bytes of the document as expanded, with one budget for every
+    expansion whether an alias stands as a value or under a merge key; an explicit YAML tag is refused. The
+    numbers are those of 1.0's own guarded reader where it has them (1 MiB, 64 aliases, 200,000 expanded
+    nodes), so that a document 1.0 wrote always passes and aliases and merge keys are still resolved as 1.0
+    resolved them; three rules are new and stricter (tags, depth 64, expanded bytes 4 MiB) and the spec's
+    point AP15 puts them to the owner. An import checks its whole source, as its dry run does, before it
+    writes anything. An export is a SQLite file and is read as a hostile one, with the settings SQLite
+    documents for that case: its header is checked before SQLite opens it; the connection is its own,
+    read-only and immutable, in defensive mode, with the schema untrusted, triggers, views and extension
+    loading off, lowered run-time limits, a heap limit, an authorizer that allows only a fixed list of
+    statements and a progress handler; `quick_check` runs first; the file's schema is compared with the one
+    this binary writes and never adopted; rows are copied by fixed statements into a database made by the
+    binary's own migrations, so the destination's constraints judge every row; blob bytes arrive in chunks of
+    at most 1 MiB. That database is built under a scratch name and renamed into place only when everything
+    has passed, so an import from an export is all or nothing. The spec's "Import bounds" is the contract and
+    holds the numbers and the test vectors. This decision answers the security review's finding S1, which
+    showed a 40,001-byte document of depth 20,000 and a 412-byte document standing for 100,000,000 scalars
+    inside the first draft's byte bound.
+
+22. **A cutover refuses while 1.0 work may still run, and a 1.0 run after it is detected.** 1.0's own recovery
+    keeps a local entry whose pid is alive and a remote entry whose peer is registered, and a 1.0 stop leaves
+    both behind. Closing them would send their tasks out a second time. So the import refuses while a local
+    process of a run exists or any remote run is recorded, and names it (R119); it does not trust the peer
+    registry, since removing a peer there stops nothing on the peer. It asks only whether the pid's process
+    exists and whether its process group still has a member, and never signals: 1.0 makes each agent the
+    leader of its own group, a child can outlive the leader, and a 1.0 entry has no
+    start time, so the pid may be another program's. The owner ends the work with the 1.0 daemon or names the
+    run as ended. A run the import closed is never attached again (R120). The import keeps the size and hash
+    of `state.json` and of each index, and a 1.1 start refuses when they have changed, because a 1.0 daemon
+    ran meanwhile (R121). Where an index and an entity's file differ the file wins, since 1.0 writes it first
+    (R122). The importer still writes nothing under `.orchestry/`.
+
+23. **The writer never checkpoints, fails by class, and a finish is on disk before it is queued.** Automatic
+    checkpointing is off on the writer's connection, and a second connection runs passive checkpoints, so no
+    commit carries one (R126); a long pooled read is interrupted once the backlog is large (R127). Both rules
+    act on the log's backlog, the frames not yet checkpointed, kept from the writer's commit callback and
+    each checkpoint's result. Neither acts on the length of the log's file, which SQLite does not shorten
+    after a checkpoint. With `synchronous = NORMAL` a commit is not synced and a checkpoint is; the proposal
+    under AP13 is `fullfsync` and `checkpoint_fullfsync` on, so that on macOS a checkpoint's sync is a full
+    flush and is measured as one. A failure from
+    outside a transaction's logic is retried with nothing dropped, or fails the writer, which then refuses
+    mutations and reports itself without the database (R128); an idle writer never fails for having nothing
+    to commit. A run's finish is written to a spool file and
+    synced before it waits for the writer, and recovery applies it before it judges the run, so a restart
+    behind a locked or failing database does not turn a finished run into a cancelled one (R129). When the
+    spool write itself fails, the finish is kept in memory, retried and reported, and is lost only if the
+    daemon is stopped before the file or the commit succeeds; the stop names it. Three rules were added
+    after the resilience review and the method challenge, and their times and counts are proposals. Every
+    checkpoint call is recorded with what started it and with its outcome, and any call that succeeded
+    moves the timer, so a call that the size rule started delays the next timer call (R137). A stop is
+    ordered and bounded: admission, the transaction in progress, the queued work until a deadline, then
+    reads and the checkpoint, the lock last; events handed over and not committed are recorded in the
+    spool and become a gap row at the next start (R139). Events are numbered at handover, and a start
+    continues above everything committed and everything recorded (R61). No committed or recorded
+    number is given again; a number that was given and lost, for example with a killed daemon or with the
+    power under `synchronous = NORMAL`, can be, and no gap row says so. The ranges of a stop are taken after the
+    writer's last transaction, and a start writes no gap row over a committed event. The record is published whole
+    and merged with one that is already there, and it is removed only when its gap rows can no longer be
+    lost with the power. And the classes cover every connection: corruption
+    seen by a read, a checkpoint, a query or a backup fails the writer, other failures there are counted
+    and do not, and checkpoints that keep failing or a backlog that stays are reported (R140).
+
+24. **`orch db query` reads fixed views under an authorizer; a backup stays in the data directory.** The
+    command has its own read-only connection, an authorizer that denies by default, and run-time limits; it
+    reads views that show no identity, token, stored request result or daemon setting (R74, R130). These are
+    the `hooks` and `limits` features that decision 19 already names. `orch db backup` writes only into a
+    directory it creates below `backups/`, mode 0700 with files 0600 (R75). Before a migration the daemon
+    makes its own copy (decision 7).
+
+25. **Trust is turned on by named paths only, and an attention item holds no outside text.** `preapproval`
+    is turned on by `policy.set`, `orch init`, the import of a 1.0 project whose agents use `auto`, and an
+    import or a restore whose data has it on; every import and restore that turns it on names it in what the
+    owner confirms, and none works in agent context, where `orch init` leaves it off (R133, following the owner's answer to AP5). An attention item's words
+    are fixed for its kind (R131). A request key never applies to a credential operation, and authorization
+    comes before a stored result is looked up (R134).
 
 ## Alternatives considered
 
@@ -193,6 +444,145 @@ across a crash, lists that do not load everything, and a retried request that ru
   an ordering side effect that no caller asked for and no index can serve.
 - **Epochs as a plain counter, raised by a constant at restore.** It guesses how many epochs were issued after
   the backup; decision 16 does not need to know.
+- **Keep ids in file names and validate them.** A check on every path builder holds only until one caller
+  forgets it; 1.0's wire and domain id types check a length and nothing else. A name the daemon computes
+  cannot be shaped by its input, whatever a later caller passes.
+- **Hash only a directory prefix of the id.** The first layout: the basename was still the id, and it escaped.
+- **A generated event-file name stored in a column.** As safe, but a column, a lookup before every append and a
+  second thing for backup and export to keep in step; the derived hash needs none.
+- **Resolve and compare paths (`canonicalize`, then a prefix test).** It races with a link planted between the
+  check and the use, and it follows the link it was meant to refuse. Descriptor-relative calls do neither.
+- **Name workspaces by a hash, with a mapping for the ones that exist.** No id would be a path component, and
+  no project would be refused for two ids that differ only in case. But every agent would see a new path,
+  the branch `orchestry/<task id>/...` would keep the same alias unless it changed too, and each mapped old
+  name would still need the ownership rule that decision 20 now has. The rule alone is the smaller change;
+  the spec's point AP14 keeps this alternative before the owner.
+- **Refuse a pair of ids only where the filesystem folds case.** A project with such a pair would import on
+  Linux, and its database, backup or export would then be refused on macOS: whether stored state is valid
+  would depend on the disk under it, and a moved project directory would meet the alias later.
+- **Lower-case every task id.** It rewrites ids that messages, branches, results and agents' own notes
+  already hold, and two ids would still become one.
+- **Record each workspace's device and inode as its owner.** It binds a task to one object, and breaks when
+  the project directory is copied, restored from a file backup or moved to another disk, which changes every
+  inode and no name. The listing answers the question that matters, under which name the object was made,
+  and survives all three.
+- **Rely on the parser libraries' own limits.** `serde_yaml_ng` stops at 128 nested collections, `serde_json`
+  at 128, and both refuse the review's depth document today. Those are properties of two versions of two
+  crates, not rules of this project, and neither counts what a document expands to.
+- **Refuse every alias and merge key.** The simplest rule, and 1.0 resolves merge keys: a `config.yml` that
+  a person wrote with `<<` would stop its project's import. The expansion is bounded instead.
+- **A time limit on the parse.** 1.0 had one and removed it: it could not stop the work it timed, so a slow
+  failure became one that never ended.
+- **Run the parsers in a child process under operating-system limits.** A second defence worth having some
+  day, and not a portable one: the review could not set a data-size limit on macOS. The budgets hold by
+  construction on both platforms.
+- **An export that is not a SQLite file (rows as JSON lines in an archive).** No SQLite on hostile bytes, at
+  the price of a second serialisation of every table that must keep integers, nulls and blobs exact for gate
+  line 4. SQLite documents how to read a file from elsewhere, and decision 21 follows it.
+- **Trust an export because its manifest's hashes agree.** The file's author wrote the manifest too. It finds
+  damage; it is not a reason to skip a check.
+- **Attach the export to the writer and copy with `INSERT ... SELECT`.** Fast and short, and it puts a
+  hostile schema on the connection that owns the destination.
+- **Load an export into `orch.db` directly, with a resume.** A refusal at the last row would leave a database
+  that is neither a project nor nothing. A scratch name and one rename need no resume.
+- **Close in-flight 1.0 state without looking at any process.** The first answer to the security review: no
+  value of a source then chooses a process to examine. A run still at work on this machine or on a peer is
+  then dispatched again, in the same workspace or with a second merge. Refusing costs a blocked import when
+  a pid was reused or a peer is gone for good, which the owner clears by naming the run.
+- **Stop surviving 1.0 processes from the import.** A 1.0 entry holds a pid and no start time, and the file
+  that holds it is input. Nothing shows the process to be the run's.
+- **An epoch floor taken from the clock.** The first draft of decision 16. It needs no new field, and its
+  promise about numbers fails on a fresh directory with the clock set back. The owner chose the lineage.
+- **A release between the engine's move and the switch, or SQLite chosen for each project in 1.1.** The red
+  team's "path not taken". Neither is the two-backends-in-step design rejected above: each project would
+  have one writer of truth. The first separates an engine regression from an import defect at the cost of a
+  release; the second gives field use of the importer and two tiers of guarantees, and changes a binding
+  decision of the goal. This ADR keeps one release; the spec's AP20 puts both to the owner.
+- **Replace the state in place, part by part, with no marker.** What the first text of the restore implied.
+  A stop between two parts leaves a database beside the other state's blobs with the lock released, and
+  the next start cannot tell. Rejected for decision 16's staging and marker.
+- **Keep the whole state in one directory and swap it with one rename.** Fewer renames. It still needs two
+  (the old out, the new in) and so still needs the marker, since a start between them would find no state
+  and make a new one; and it moves the database, which changes the layout that decision 5, the backup and
+  the names of decision 20 all rest on. The marker makes several renames as safe as two.
+- **Write the restore's marker in place, and tell what a stopped restore has left from where the staged
+  parts lie.** The text read at `a914e78`. A stop between the marker's creation and its write left a marker
+  that neither command could read. And a staged database has no `-wal`, so a missing staged `-wal` read as
+  "moved in" could leave the new database beside the old log. Rejected for publication by rename and for
+  the marker's list of members, with every replaced member moved out first.
+- **Open the moved-in database for the restore's last check.** The text read at `3c50293`. Opening a
+  database in write-ahead-log mode makes a `-wal` and a `-shm`, so a stop inside the check left both at
+  a live name beside the new database, which is the layout that both commands must refuse, and nothing
+  could finish the restore. Rejected for a check that reads files only: the staged file is read back
+  before the marker is written, and its hash is compared afterwards.
+- **Open it read-only and immutable, as the export reader does, or call the check's own leftovers
+  expected.** The first rests on what such a connection does with a database in write-ahead-log format
+  in the bundled build, which the spec's F13 records from a report that is not yet delivered or
+  reviewed; the second rests on what an interrupted connection leaves in a log. Neither is adopted,
+  because the recovery of a restore should not depend on either, and the hash needs neither.
+- **Refuse an abandonment whenever the scratch directory is gone.** The text read at `3c50293`. An
+  abandonment removes that directory itself, before the marker, so one that was stopped there was
+  refused by both commands. Rejected: the refusal holds under `forward` only, and under `back` the end
+  of an abandonment is tested first.
+- **Remove the stop record as soon as its gap rows commit.** Under `synchronous = NORMAL` a loss of power
+  can take that commit back after the record is gone, and the gap is then lost without a trace. Rejected:
+  the record stays until the rows are durable. The same question for a finish file is open (item O8 of
+  the red team's review of `196f9087`, which is not the spec's open point O8).
+- **Read "one platform alone" by cell and not by kind of limit.** Under it two different misses in one
+  cell, one on each platform, select the fallback, although neither platform shows the other's miss. Not
+  adopted: the owner was shown both readings and the case in which they differ, and chose the reading by
+  kind on 2026-11-21 (decision 12). Neither reading shows a cause.
+- **Let a data set that only fixes a defect start without the owner's word after a miss.** A data set
+  with a defect has the headline of the defect whatever it missed, so a rule that reads the headline
+  would let a second campaign follow a miss unasked. Not adopted: the owner answered "ask first" on
+  2026-11-21, with no exception for the fix of a defect (decision 12).
+- **Stop at any mandatory miss, select nothing, and keep the kinds as names in a report.** One rule in place
+  of four
+  answers: simpler to apply, and it asks the owner every time. It also removes the one case that the owner's
+  ruling of 2026-11-21 decides, the selection of the fallback for a miss attributable to events, and so
+  amends that ruling. Not adopted: the session that answers under the owner's delegation withdrew it for
+  that reason, and the kinds stay operative with the fallback still selected for an eligible data set whose
+  every miss both platforms show in one cell, population and kind (decision 12). The owner can choose it; it
+  would be recorded as an amendment of the ruling.
+- **Finish a frozen data set on both platforms although the first platform missed.** It completes the
+  comparison across platforms in one campaign. Not adopted as the default: "ask first" must not depend on
+  whether two platform blocks are called one data set, so the second block waits for the owner's word, and
+  so does the replacement of a set of five while a mandatory miss stands (decision 12). The cost is that an
+  early miss leaves the data set incomplete until the owner allows the rest. What is done with a block that
+  is already running when the miss is seen is not decided here (decision 12).
+- **Let any miss of the revised budget select the fallback.** The direction's first sentence. A miss in a
+  cell with no events cannot show that moving events to files would help, and the fallback would then be
+  built and miss the same way. The owner amended the sentence on 2026-11-21 (decision 12).
+- **Add a test of cause to that ruling**: require that the cell without events passes in the same block, or
+  add a cell with a burst and no events. The red team proposed both. Neither is in the owner's ruling, the
+  first makes the choice depend on cells run hours apart, and the second changes the cells and their count.
+  Not adopted; the spec applies the ruling's words and marks where it reads beyond them.
+- **Count a run on a busy host as valid.** The earlier text of the method. It is realistic, and it lets a
+  colleague's build decide a verdict that cannot be run again. ADR 0013 decision 22 already rules the other
+  way for timing samples, and this ADR follows it without amending it.
+- **Count a size checkpoint toward the two timer checkpoints**, or end the stop only when every queue is
+  empty. The first would report coverage that the run did not have, and whether the coverage rule should
+  change is left to a reviewed revision of the method. The second has no bound while the writer retries.
+- **Automatic checkpointing left on.** SQLite's default, and what the first measurement ran with. The
+  checkpoint then runs inside whichever commit crosses the threshold, a claim's included.
+- **Diagnose at the first budget before anything else.** The recommendation until 2026-11-20: run the first
+  experiment again with checkpointing moved off the writer and one event transaction for all runs. The owner
+  chose a revised workload and budget instead. Both changes are in the design in any case (decisions 9 and
+  23), and the revised method measures them with a real checkpoint in every repetition, which a 12 s cell
+  with automatic checkpointing off never held.
+- **Act on the length of the log's file.** One `stat` and no counting. The file keeps its length after every
+  frame has been checkpointed, so a rule on it stays tripped until the daemon closes. Setting
+  `journal_size_limit` would shorten the file when the log starts again; the backlog needs no such setting
+  and is what a checkpoint and a held-back read actually change.
+- **Let an earlier-lineage finish record its outcome on its own run.** It keeps usage for a run that a
+  restore superseded. It is also a write by a caller that decision 16 calls stale, and what it may write
+  would need its own contract. Recovery closes such a run instead.
+- **Results kept in memory until they commit.** No file, and a daemon restarted behind a locked database
+  loses the result and cancels the run.
+- **`orch db query` on every table, guarded by reading the SQL.** A filter on text is a parser to keep
+  correct; the authorizer sees what the statement does.
+- **Skip or set aside a source file the import cannot read.** The import always finishes, and a task can be
+  missing from 1.1 unnoticed. The spec's AP17 puts it to the owner.
 
 ## Consequences
 
@@ -210,8 +600,34 @@ across a crash, lists that do not load everything, and a retried request that ru
   hold for events.
 - `docs/TRAITS-FROZEN.md` §2, ARCHITECTURE §1, §2.1, §5.1 to §5.3 and §6.1, and the RUNBOOK's storage
   procedures change. The stable-sort rule stays: the scheduler still sorts in memory.
-- Backups become a product duty: database, blobs and repositories as one restorable point.
-- `orch-peer` is touched at the places decision 18 names, if the owner approves it, and nowhere else.
+- Backups become a product duty: database, blobs and repositories as one restorable point. A restore
+  needs free space of the backup's size, and a restore that was stopped keeps the daemon from starting
+  until it is continued or abandoned; the RUNBOOK must say so, and must give the manual recovery for a
+  marker that fails its check.
+- A stop can take up to its bound (20 s is proposed) and can leave a gap in a run's events; a daemon that
+  is killed records none, and the numbers of the events it held can be given again (R61). A service manager that runs the daemon must allow a stopping process longer
+  than that bound before it kills it; the RUNBOOK must say so, and no default of any service manager is
+  relied on here. A checkpoint that keeps failing, a backlog that stays, and corruption seen by
+  any connection are shown by `orch status` and `orch doctor` and are not attention items.
+- `orch-peer` is touched at the places decision 18 names, which the owner approved, and nowhere else.
+- Files in the data directory can no longer be found by an id with `ls`: an event file and a project record
+  are named by hashes, which the storage reference (`docs/storage.md`) must explain how to compute. A copy
+  of a 1.0 project or of a backup made with hard links (some snapshot tools) is refused by the importer and
+  by the restore and must be copied again as plain files; a backup never shares files with the live blob
+  store by hard links. A hard-link snapshot of the data directory itself does not stop reads, but the daemon
+  refuses to append to an event file that has a second link, since the append would change the snapshot.
+- A 1.0 document that a person edited to hold an explicit tag, to nest deeper than 64 or to expand past 4 MiB
+  was readable by 1.0 and stops the import, by name and before anything is written; the owner changes the
+  document or keeps the project on 1.0. An import reads its source twice. An import from an export that is
+  interrupted starts again. An export cannot be read by a build of another schema version, and reading one
+  rests on SQLite's own handling of a hostile file under the settings of decision 21, which this project
+  configures and does not prove.
+- Two task ids that differ only in the case of ASCII letters cannot live in one project, on any platform. 1.0's
+  generated ids make that about 7 in 100,000 for a project of 3,000 tasks, and only a project kept on a
+  filesystem that tells case apart can hold such a pair; its import is refused, naming both, until the owner
+  removes one task with the 1.0 binary. An export is not imported for a project directory that already holds
+  a workspace under one of its tasks' names. Preparing and cleaning up a workspace list `workspaces/` once
+  each, which is a few thousand names at most.
 - The data directory lives outside the project, so moving a project directory no longer moves its state. The
   pointer file and the record under the data home are what let the daemon find it again instead of offering a
   second import. `<project>/.orchestry/` must stay in place: it is still the handshake's project identity.
