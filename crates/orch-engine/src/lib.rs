@@ -114,6 +114,7 @@ pub mod org_templates;
 pub mod prompt_mode;
 pub mod review_runner;
 pub mod run_service;
+pub mod scheduler;
 pub mod task_service;
 pub mod team_service;
 
