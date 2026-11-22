@@ -144,6 +144,14 @@ impl ScriptedProcessManager {
         children.last_mut().expect("a spawned child").stdout = None;
     }
 
+    /// Close the child's stderr. An adapter that captures a stderr tail for
+    /// its failure message waits for this, as it would for a real exit.
+    #[allow(dead_code, reason = "only suites that script a failing exit use it")]
+    pub fn close_stderr(&self) {
+        let mut children = Self::lock(&self.children);
+        children.last_mut().expect("a spawned child").stderr = None;
+    }
+
     /// Everything the adapter wrote to the child's stdin so far.
     pub async fn read_stdin(&self) -> String {
         let mut stdin = {

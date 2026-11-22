@@ -29,6 +29,7 @@ pub mod skills;
 pub mod storage;
 pub mod store;
 pub mod template;
+pub mod usage;
 pub mod workspace;
 
 #[cfg(feature = "test-support")]
@@ -55,4 +56,5 @@ pub use template::{
     MessageContext, ProjectContext, PromptContext, RetryContext, SharedContextEntry, TaskContext,
     TemplateEngine,
 };
+pub use usage::{RunUsage, RunUsageObserver};
 pub use workspace::{MergeResult, PrepareResult, WorkspaceManager};
