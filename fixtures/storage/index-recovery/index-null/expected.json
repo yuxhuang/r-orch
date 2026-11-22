@@ -1,0 +1,26 @@
+{
+  "case": "index-null",
+  "source": "source",
+  "spec": ["R65", "R122", "R123"],
+  "legacy_1_0": {
+    "listed_ids_sorted": ["tsk_idx_a", "tsk_idx_b", "tsk_idx_c"],
+    "list_order_specified": false,
+    "read_publishes_an_index": true,
+    "titles_by_get": {
+      "tsk_idx_a": "Case index-null: first by id, created last",
+      "tsk_idx_b": "Case index-null: second by id, created second",
+      "tsk_idx_c": "Case index-null: third by id, created first"
+    }
+  },
+  "importer_1_1": {
+    "task_order": ["tsk_idx_a", "tsk_idx_b", "tsk_idx_c"],
+    "tasks": {
+      "tsk_idx_a": { "title": "Case index-null: first by id, created last", "description": "Hand-written entity file for tsk_idx_a" },
+      "tsk_idx_b": { "title": "Case index-null: second by id, created second", "description": "Hand-written entity file for tsk_idx_b" },
+      "tsk_idx_c": { "title": "Case index-null: third by id, created first", "description": "Hand-written entity file for tsk_idx_c" }
+    },
+    "report": [
+      { "class": "index_unreadable", "subject": "tasks", "named_in_spec": true, "import": "goes_on" }
+    ]
+  }
+}

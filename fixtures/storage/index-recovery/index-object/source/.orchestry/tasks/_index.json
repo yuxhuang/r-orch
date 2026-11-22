@@ -1,0 +1,17 @@
+{
+  "tasks": [
+    {
+      "id": "tsk_idx_c",
+      "title": "Stale title from an index that is an object",
+      "description": "stale",
+      "status": "todo",
+      "priority": 3,
+      "labels": [],
+      "depends_on": [],
+      "created_at": "2025-01-01T00:00:00.000Z",
+      "updated_at": "2025-01-01T00:00:00.000Z",
+      "attempts": 0,
+      "max_attempts": 3
+    }
+  ]
+}
