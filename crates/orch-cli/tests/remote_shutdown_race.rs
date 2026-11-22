@@ -375,13 +375,6 @@ fn wait(label: &str, peers: &[&Peer], mut predicate: impl FnMut() -> bool) {
     }
 }
 
-fn port() -> SocketAddr {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("ephemeral port")
-        .local_addr()
-        .unwrap()
-}
-
 /// Ignores SIGTERM, so the owner's wind-down sits in its full kill grace.
 /// Publishes the PID by rename: the test waits for `started` to exist and
 /// then parses it, so it must never be observed empty.
@@ -400,7 +393,7 @@ fn daemon_sigterm_exits_only_after_the_owners_own_shutdown() {
     let controller = Peer::new("race-controller");
     let agent = controller.add_agent("executor", &slow_ack_body(&controller));
     let task = controller.task("slow shutdown under the daemon", &agent);
-    let controller_addr = port();
+    let controller_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
 
     // The explicit owner: a foreground `serve` is a daemon start with dispatch
     // ON, so it picks the queued task up and runs the TERM-ignoring shell.
@@ -412,6 +405,12 @@ fn daemon_sigterm_exits_only_after_the_owners_own_shutdown() {
     wait("running shell under the daemon", &peers, || {
         controller.path("started").exists()
     });
+    let controller_addr: SocketAddr =
+        read_json(controller.path(".orchestry/remotes/_listener.json"))["listen_addr"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
     let pid = text(controller.path("started"))
         .trim()
         .parse::<i32>()
