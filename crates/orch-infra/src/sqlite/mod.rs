@@ -1,6 +1,11 @@
 //! SQLite connection setup and forward-only schema migrations (T9).
 //! The file backend remains the product backend until the T24 switch.
 mod connection;
+#[allow(
+    dead_code,
+    reason = "private entity helpers staged for the T10 adapter"
+)]
+mod entity;
 pub mod migrations;
 pub use connection::{ConnectionHandle, ConnectionRole, Synchronous, open_connection};
 
