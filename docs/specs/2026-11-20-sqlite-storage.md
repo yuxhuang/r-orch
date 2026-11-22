@@ -2610,3 +2610,5 @@ Filled in by the PR that completes the work.
 
 Defects found outside the requirements:
 - ...
+
+<!-- CI validation: this specification is an importer reference test input. -->
