@@ -1,0 +1,12 @@
+[package]
+name = "sqlx-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+[workspace]
+[dependencies]
+sqlx = { version = "=0.9.1", default-features = false, features = ["sqlite-bundled", "runtime-tokio", "migrate"] }
+tokio = { version = "1.53", default-features = false, features = ["rt", "macros"] }
+[profile.release]
+strip = true

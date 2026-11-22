@@ -1,0 +1,62 @@
+{
+  "baseline": "fb6a1e1",
+  "toolchain": "1.99.1",
+  "cargo_deny_version": "0.20.2",
+  "rustsec_revision": "f291af9b1cc0d21dfcea1709d6b037963cef262b",
+  "deny_toml_sha256": "70b17eabf01801a94dc17652e5e8c122bcc4809fa3526ebdcd21d04119c454f6",
+  "baseline_deny_exit": 0,
+  "workspace_plus_chosen_pair_deny_exit": 0,
+  "deny_summary": "advisories ok, bans ok, licenses ok, sources ok",
+  "baseline_duplicate_warnings": 13,
+  "added_warnings": 0,
+  "measurements": [
+    {
+      "candidate": "rusqlite",
+      "seconds": 12.723,
+      "exit": 0,
+      "bytes": 2211408,
+      "smoke_exit": 0,
+      "platform": "macOS arm64"
+    },
+    {
+      "candidate": "rusqlite",
+      "seconds": 27.186,
+      "exit": 0,
+      "platform": "Linux (Docker linux/arm64, native)",
+      "bytes": 2380208,
+      "smoke_exit": 0
+    },
+    {
+      "candidate": "sqlx",
+      "seconds": 16.386,
+      "exit": 0,
+      "bytes": 2885312,
+      "smoke_exit": 0,
+      "platform": "macOS arm64"
+    },
+    {
+      "candidate": "sqlx",
+      "seconds": 29.591,
+      "exit": 0,
+      "platform": "Linux (Docker linux/arm64, native)",
+      "bytes": 3036256,
+      "smoke_exit": 0
+    },
+    {
+      "candidate": "rusqlite",
+      "seconds": 59.321,
+      "exit": 0,
+      "platform": "Linux (Docker linux/amd64, emulated)",
+      "bytes": 2517536,
+      "smoke_exit": 0
+    }
+  ],
+  "probe_sha256": {
+    "rusqlite/Cargo.toml": "60bffa6e7bdce1279439bdb24ab639052e5d7c0e2f83760d3a72f822401f367c",
+    "rusqlite/Cargo.lock": "62d52d0787e38a7449b033c546082bbd6894bf5d4cac7c8c9d31f5c0261ff656",
+    "rusqlite/src/main.rs": "a9644253e92db70bad946ffd2d72a09b31621921e9a745860aa3539487d063e7",
+    "sqlx/Cargo.toml": "f54966b5bfc8e2fe9389ecc57c4d87d5764f5e089f5aad9d15fbf813e294cd17",
+    "sqlx/Cargo.lock": "af274ea90c8f21664246db971732b699248d2edcfee17a8690cfed6055c56fb9",
+    "sqlx/src/main.rs": "43a49e0123fdf281ab52bc8252dd9a3d7fd8582bb043294099cfe7c4cd790828"
+  }
+}
