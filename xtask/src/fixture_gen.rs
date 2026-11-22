@@ -24,7 +24,8 @@ use script::Profile;
 const CORPUS_DIR: &str = "fixtures/storage/generated";
 /// Written by the generator and required before a regeneration replaces a directory, so a wrong
 /// `--dir` cannot wipe a directory that is not a generated corpus.
-const MARKER: &str = "README.md";
+const MARKER: &str = ".orch-fixture-gen";
+const MARKER_CONTENT: &[u8] = b"orch fixture-gen corpus v1\n";
 /// A generated corpus is small; a bigger file or a deeper tree is not one.
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_FILES: usize = 10_000;
@@ -138,7 +139,8 @@ fn generate_tree() -> Result<Tree> {
             tree.insert(format!("{}/{path}", scenario.name), bytes);
         }
     }
-    tree.insert(MARKER.to_owned(), readme().into_bytes());
+    tree.insert("README.md".to_owned(), readme().into_bytes());
+    tree.insert(MARKER.to_owned(), MARKER_CONTENT.to_vec());
     Ok(tree)
 }
 
@@ -172,9 +174,14 @@ fn readme() -> String {
          order and the event files are what 1.0 writes. Every value is invented, and the clock and the ids\n\
          come from the seed. Nothing was read from a real project.\n\n\
          `cargo xtask fixture-gen --check` regenerates the corpus privately and compares exact file sets\n\
-         and bytes with this directory without changing it. `cargo xtask fixture-gen` rewrites it.\n\n\
-         Each scenario holds a project directory: its `.orchestry/` is a complete 1.0 data directory with\n\
-         nothing running (a running entry names a process; the import refuses a live one).\n\n\
+         and bytes with this directory without changing it. `cargo xtask fixture-gen` rewrites it. A nonempty\n\
+         destination is replaced only when `.orch-fixture-gen` contains exactly `orch fixture-gen corpus v1`\n\
+         followed by a newline. README.md alone does not grant replacement permission.\n\n\
+         Each scenario holds synthetic records written through the 1.0 file stores, with nothing running.\n\
+         This is a small serialization corpus, not a complete live-project or importer acceptance fixture.\n\
+         Runs use invented relative `workspace_path` values (`workspaces/<task-id>`); no workspace directories\n\
+         or repositories are created, and task proof is absent. It does not exercise live process identity,\n\
+         workspace ownership, hostile documents, import bounds, dry run or resume. Those checks remain in T21.\n\n\
          | Directory | Seed | Contents |\n|---|---|---|\n",
     );
     for scenario in SCENARIOS {
@@ -185,7 +192,7 @@ fn readme() -> String {
     }
     text.push_str(
         "\nThe hand-written conformance corpus is `fixtures/storage-v1/`. Large corpora for the importer's\n\
-         bounds are made on demand by its tests and are not checked in.\n",
+         bounds remain work for T21 and are not checked in.\n",
     );
     text
 }
@@ -274,21 +281,23 @@ fn compare(expected: &Tree, found: &Tree) -> Vec<String> {
     drift
 }
 
-/// Replace the corpus directory with `tree`. Only a directory that holds the marker, or none at
-/// all, is replaced.
+/// Replace the corpus directory with `tree`. An existing nonempty directory requires the exact
+/// generator/version marker. An absent or empty directory needs no ownership marker.
 fn publish(dir: &Path, tree: &Tree) -> Result<()> {
     match fs::symlink_metadata(dir) {
         Ok(meta) if meta.is_dir() => {
-            if !dir.join(MARKER).is_file() {
+            // Parse the whole tree first: a link or a special file inside stops the replacement
+            // before anything is removed. Only the exact generator/version marker grants ownership.
+            let found = read_tree(dir)
+                .with_context(|| format!("check {} before replacing it", dir.display()))?;
+            if fs::read_dir(dir)?.next().is_some()
+                && found.get(MARKER).map(Vec::as_slice) != Some(MARKER_CONTENT)
+            {
                 bail!(
-                    "{} exists and has no {MARKER}; it is not a generated corpus, so it is not replaced",
+                    "{} exists without the exact {MARKER} version marker; it is not a generated corpus, so it is not replaced",
                     dir.display()
                 );
             }
-            // Parse the whole tree first: a link or a special file inside stops the replacement
-            // before anything is removed.
-            read_tree(dir)
-                .with_context(|| format!("check {} before replacing it", dir.display()))?;
             fs::remove_dir_all(dir).with_context(|| format!("remove {}", dir.display()))?;
         }
         Ok(_) => bail!("{} is not a directory", dir.display()),
@@ -361,6 +370,65 @@ mod tests {
             .to_string();
         assert!(err.contains("not a generated corpus"), "{err}");
         assert!(dir.path().join("precious").is_file());
+    }
+
+    #[test]
+    fn publish_preserves_unowned_nonempty_destinations() {
+        for marker in [
+            None,
+            Some(b"".as_slice()),
+            Some(b"orch fixture-gen corpus v2\n"),
+            Some(b"another generator v1\n"),
+            Some(b"orch fixture-gen corpus v1"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("README.md"), "unrelated project").unwrap();
+            fs::create_dir(dir.path().join("nested")).unwrap();
+            fs::write(dir.path().join("nested/precious"), b"keep\0bytes").unwrap();
+            if let Some(bytes) = marker {
+                fs::write(dir.path().join(MARKER), bytes).unwrap();
+            }
+            let before = read_tree(dir.path()).unwrap();
+            let err = publish(dir.path(), &tree(&[("new", "replacement")])).unwrap_err();
+            assert!(err.to_string().contains("not a generated corpus"), "{err}");
+            assert_eq!(read_tree(dir.path()).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn publish_accepts_empty_absent_and_owned_destinations() {
+        let private = tempfile::tempdir().unwrap();
+        let expected = tree(&[
+            (MARKER, std::str::from_utf8(MARKER_CONTENT).unwrap()),
+            ("new", "data"),
+        ]);
+        for name in ["absent", "empty", "owned"] {
+            let dir = private.path().join(name);
+            if name != "absent" {
+                fs::create_dir(&dir).unwrap();
+            }
+            if name == "owned" {
+                fs::write(dir.join(MARKER), MARKER_CONTENT).unwrap();
+                fs::write(dir.join("stale"), "remove").unwrap();
+            }
+            publish(&dir, &expected).unwrap();
+            assert_eq!(read_tree(&dir).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn publish_refuses_a_linked_marker_and_preserves_its_target() {
+        let private = tempfile::tempdir().unwrap();
+        let target = private.path().join("marker");
+        fs::write(&target, MARKER_CONTENT).unwrap();
+        let dir = private.path().join("output");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("precious"), "keep").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(MARKER)).unwrap();
+        assert!(publish(&dir, &tree(&[("new", "replacement")])).is_err());
+        assert_eq!(fs::read(dir.join("precious")).unwrap(), b"keep");
+        assert!(fs::symlink_metadata(dir.join(MARKER)).unwrap().is_symlink());
+        assert_eq!(fs::read(target).unwrap(), MARKER_CONTENT);
     }
 
     #[test]

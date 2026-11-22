@@ -6,14 +6,19 @@ order and the event files are what 1.0 writes. Every value is invented, and the 
 come from the seed. Nothing was read from a real project.
 
 `cargo xtask fixture-gen --check` regenerates the corpus privately and compares exact file sets
-and bytes with this directory without changing it. `cargo xtask fixture-gen` rewrites it.
+and bytes with this directory without changing it. `cargo xtask fixture-gen` rewrites it. A nonempty
+destination is replaced only when `.orch-fixture-gen` contains exactly `orch fixture-gen corpus v1`
+followed by a newline. README.md alone does not grant replacement permission.
 
-Each scenario holds a project directory: its `.orchestry/` is a complete 1.0 data directory with
-nothing running (a running entry names a process; the import refuses a live one).
+Each scenario holds synthetic records written through the 1.0 file stores, with nothing running.
+This is a small serialization corpus, not a complete live-project or importer acceptance fixture.
+Runs use invented relative `workspace_path` values (`workspaces/<task-id>`); no workspace directories
+or repositories are created, and task proof is absent. It does not exercise live process identity,
+workspace ownership, hostile documents, import bounds, dry run or resume. Those checks remain in T21.
 
 | Directory | Seed | Contents |
 |---|---|---|
 | `small/` | 1 | four agents, two goals, one team, twelve tasks with their runs and events, two deleted tasks, six messages, three context entries, a template and one attachment |
 
 The hand-written conformance corpus is `fixtures/storage-v1/`. Large corpora for the importer's
-bounds are made on demand by its tests and are not checked in.
+bounds remain work for T21 and are not checked in.

@@ -78,6 +78,7 @@ impl Sandbox {
         ] {
             fs::create_dir(root.path().join(name)).unwrap();
         }
+        fs::write(root.path().join("global.yml"), "{}\n").unwrap();
         Sandbox { root }
     }
 
@@ -92,6 +93,7 @@ impl Sandbox {
             .env_clear()
             .env("HOME", self.path("home"))
             .env("TMPDIR", self.path("tmp"))
+            .env("ORCHESTRY_GLOBAL_CONFIG_PATH", self.path("global.yml"))
             .env("XDG_CONFIG_HOME", self.path("config"))
             .env("XDG_DATA_HOME", self.path("data"))
             .env("XDG_CACHE_HOME", self.path("cache"))
@@ -232,6 +234,8 @@ fn regeneration_repairs_a_damaged_copy_and_refuses_a_directory_that_is_not_a_cor
     let precious = sandbox.path("precious");
     fs::create_dir(&precious).unwrap();
     fs::write(precious.join("keep.txt"), "keep").unwrap();
+    fs::write(precious.join("README.md"), "unrelated project").unwrap();
+    let before = snapshot(&precious);
     let out = sandbox.xtask(&["--dir", precious.to_str().unwrap()], &[]);
     assert_eq!(out.status.code(), Some(1));
     assert!(
@@ -239,7 +243,7 @@ fn regeneration_repairs_a_damaged_copy_and_refuses_a_directory_that_is_not_a_cor
         "{}",
         text(&out.stderr)
     );
-    assert_eq!(fs::read(precious.join("keep.txt")).unwrap(), b"keep");
+    assert_eq!(snapshot(&precious), before);
 }
 
 #[test]
