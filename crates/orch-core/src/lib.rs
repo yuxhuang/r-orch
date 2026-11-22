@@ -27,6 +27,7 @@ pub mod process;
 pub mod remote;
 pub mod skills;
 pub mod storage;
+pub mod store;
 pub mod template;
 pub mod usage;
 pub mod workspace;

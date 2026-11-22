@@ -442,11 +442,32 @@ All three names are the same program:
 | Crate | Modules |
 |---|---|
 | `orch-domain` | `task`, `agent`, `run`, `goal`, `team`, `message`, `state`, `config`, `global_config`, `events`, `error`, `transitions`, `scope`, `model_tiers`, `shop` (agent-shop + org-shop + default-agents) |
-| `orch-core` | `storage` (9 traits), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
+| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{agent, config, context, daemon, goal, init, msg, org, org_template, remote, rpc, run, status, task, team}`, `doctor`, `logs`, `tui` (`DaemonBackend`), `update`, `web`, `routing`, `tree`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
 | `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
+
+The additive `orch_core::store` entity port is the first part of SQLite-storage
+plan T8. `Storage::read(Caller)` returns an immutable committed snapshot;
+`Storage::write(Caller, Lane, WriteWork)` runs a synchronous, fallible unit of
+work on one writer. A callback error discards its entity, revision and position
+changes. Owned callbacks can cross a dedicated writer-task boundary.
+`StorageExt::transaction` returns a typed callback result only after the backend
+confirms the commit, without serializing it through the port.
+A caller selects one project at entry; row keys cannot select another project.
+Operation authorization remains the dispatcher's responsibility.
+
+`Record` wraps the existing task, goal, agent, team, run, message or context
+payload with a positive revision and an explicit position. Updates preserve
+position; `move_to_end` changes position and revision. `Filter` selects an entity
+family and its filters; `PageRequest` bounds each list and selects a supported
+sort. `store::fake::FakeStorage`, behind `test-support`, serializes in-memory
+writers and retains immutable read views. Its cursor registry holds query
+bindings and sort keys, not snapshots, and lives only as long as that fake.
+Lease operations, other storage families, the file reference and SQLite are
+subsequent slices. The daemon and all v1 storage traits still use the existing
+file implementation; this additive module changes no runtime storage path.
 
 ### 3.3.1 `orch mcp` (`orch-cli::mcp`)
 
