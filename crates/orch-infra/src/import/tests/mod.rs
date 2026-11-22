@@ -651,3 +651,5 @@ async fn landed_generated_documents_pass_budgets_without_changing_source() {
         before.len()
     );
 }
+
+mod compatibility;

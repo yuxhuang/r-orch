@@ -33,10 +33,11 @@ impl<R: Read, T: DeserializeOwned> EventStream<R, T> {
         let ceiling = self.limits.bytes.saturating_add(1);
         let mut seen = false;
         loop {
-            let chunk = self
-                .reader
-                .fill_buf()
-                .map_err(|e| Refusal::invalid("io", e))?;
+            let chunk = match self.reader.fill_buf() {
+                Ok(chunk) => chunk,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(Refusal::invalid("io", error)),
+            };
             if chunk.is_empty() {
                 return Ok(seen.then_some(bytes));
             }

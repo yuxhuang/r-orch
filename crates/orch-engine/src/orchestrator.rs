@@ -37,6 +37,7 @@
 //! through spawning. Goal status changes take that gate without taking state;
 //! their queued-task cancellations use `cancel_record` to avoid re-entry.
 
+pub mod claim_v2;
 mod collect;
 mod daemon;
 mod dispatch;

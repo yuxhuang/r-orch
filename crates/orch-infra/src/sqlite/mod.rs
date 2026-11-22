@@ -81,3 +81,9 @@ fn test_data() -> (tempfile::TempDir, crate::data_dir::DataDir) {
     reason = "internal goal persistence slice; full Storage and safety policy are not wired yet"
 )]
 mod goal_adapter;
+
+#[allow(
+    dead_code,
+    reason = "Internal lease adapter awaits T10 Storage integration; issue 127 holds production wiring"
+)]
+mod leases;

@@ -1203,9 +1203,15 @@ clients <── WriteReceipt::wait() ──────────────�
   `Claims` job first. Otherwise it takes the job with the earliest deadline, which is its arrival plus the lane's
   wait budget (entities 200 ms, events 1 s, maintenance 5 s), and the earlier arrival wins a tie. The budgets are
   priorities, not timeouts and not measured results (ADR 0017 decision 9).
-- **Request deadline.** `submit` takes an optional `Instant`. The worker checks it just before `BEGIN`: a request
-  that has expired never begins and returns `Overloaded`. A deadline does not stop a transaction already running
-  and does not bound the busy wait inside `BEGIN IMMEDIATE`.
+- **Request deadline.** `submit` takes an optional `Instant`. The worker checks it twice: just before `BEGIN`, and
+  again once `BEGIN IMMEDIATE` has obtained the write reservation. A request found expired at either check returns
+  `Overloaded` before its closure runs. At the second check the transaction is dropped, which rolls it back and
+  releases the reservation, so a request that expired while it waited for another connection's write lock never
+  commits (spec R128). The deadline is an admission check, not an interrupt. It does not shorten the busy wait
+  inside `BEGIN IMMEDIATE`, which runs for up to the 5 s busy timeout whatever the deadline, and it does not stop a
+  closure or a `COMMIT` that has started: both can finish after the deadline. A `BEGIN` that is still busy at the
+  timeout returns its SQL error to the receipt, not `Overloaded`, even when the deadline has passed. Classifying
+  that failure belongs to the retry work (R128, issue 127).
 - **Receipts.** `wait` blocks and returns the closure's result. Dropping a receipt does not cancel the work: an
   accepted transaction still commits. Do not call `wait` on an async runtime thread; nothing adapts it yet.
 - **Close.** `WriterHandle::close` stops admission, is idempotent, and lets the worker drain what it accepted.

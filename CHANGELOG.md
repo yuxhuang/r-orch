@@ -8,6 +8,7 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 ### Storage groundwork
 
 - Add internal SQLite transactions and snapshot reads for goals. The daemon continues to store goals in files.
+- Add an inactive transactional claim helper that reserves a task, agent lease and preparing run together; production dispatch remains unchanged.
 
 - Add a private, inactive bounded import document reader tested against synthetic 1.0 fixtures; import commands and storage writes remain unwired.
 
