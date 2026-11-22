@@ -1737,3 +1737,14 @@ neutral, failed or unexplained skipped jobs block merge. Record tested merge
 SHA/tree separately from PR head. Before the next stacked merge, require previous
 main-push test and ambient success at that merge commit. Rule readback and rollback
 are owner-only operations; no agent applies them. TV50–55/cache/native remain due.
+
+
+## SQLite adapter groundwork
+
+The `orch-infra` SQLite and data-directory modules are available for adapter development. The running daemon still uses the 1.0 file backend; this change does not introduce an import command or change startup or discovery.
+
+The new data-directory guard requires an absolute, owner-only root (0700), refuses network and unsupported filesystems and holds `orch.lock` until all borrowed connections close. A contending guard reports its holder and maps to exit 4; do not delete the lock file to bypass it. Linux supports ext2/3/4, XFS, Btrfs, F2FS, tmpfs and overlayfs; macOS supports APFS, HFS, UFS and tmpfs. Unknown types are refused. An existing 1.0 `.daemon-owner.lock` can be held without creating or rewriting a legacy file. An absent legacy lock does not prove exclusion: the eventual startup caller must check socket liveness and document procedural exclusion.
+
+Connections check WAL, foreign keys, a five-second busy timeout and NORMAL (or explicit FULL) synchronous mode. Writing connections disable automatic checkpoints and read back full-sync settings. Numbered migrations commit one version at a time, refuse a newer database with both versions, and verify the recorded history. Before upgrading a database containing a project, migration setup requires space above the disk floor for a database copy, writes a `database_only` manifest with its SHA-256 and size, checks the copy, and retains the two newest copies after success. Such a copy does not include blobs or repositories and is not a complete restore point. A failed copy stops migration; a failed migration preserves the preceding committed version. Incomplete copy directories are left untouched and excluded from retention. A pruning error after commit emits a warning and leaves the committed migration successful; inspect the retained copies before any manual cleanup.
+
+The initial schema uses project-scoped primary keys, including `(project_id, id)` for projects, intents and attention, and `(project_id, sha256)` for blobs. A project's two ID columns must match. Empty scope is reserved for daemon intents and attention. Intent writers must allocate integer IDs and finish by both scope and ID. New databases seed `local_owner`, `local_worker` and a random 128-bit `lineage`; reopening preserves that lineage. Restore will replace it in its own implementation.
