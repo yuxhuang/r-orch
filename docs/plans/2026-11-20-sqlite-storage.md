@@ -117,8 +117,9 @@ vectors of the spec's "Filesystem names" are tested on the finish file, by T12 a
 T8 is delivered in small additive slices: T8a supplies the entity port; T8b
 supplies remaining entity families and the file reference; T8c first supplies
 event/lease contracts and their memory reference, followed by retries, intents,
-request keys and attention. Operational file wiring follows the real T8b adapter;
-SQLite wiring follows T9/T10. This first T8c slice does not complete T8 or release
+request keys and attention. The file reference carries the event and lease
+families too (registered beside the memory reference); SQLite wiring follows
+T9/T10. The T8c event and lease slice does not complete T8 or release
 the engine's dependency on the full operational port. The v1 runtime stays active.
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
@@ -153,6 +154,16 @@ there. Full-port consumers T10 and T12 remain dependent on completed T8, not on
 T8a alone. This split implements the supervising session's 2026-11-21 direction
 to start independent T8/T9 work from merged PR 95; it does not approve the
 remaining entry evidence or reserved owner decisions.
+
+T8b adds two families to the port, project settings (`project_config`: key,
+value, revision) and templates (`templates`: name, body, revision), listed by
+their exact key in byte order like context entries, and the shared scenarios for
+them, for the 64 KiB text threshold of R97 and for the task-id fold rule of R117.
+The file reference's large-text storage is a separate slice on the same
+document; these families carry free text and use it unchanged. Until that slice
+lands, `text_over_64_kib_round_trips_through_the_blob_store` checks that text on
+both sides of the line comes back whole and replaceable, and nothing observes a
+blob store: R97's blob clause stays unverified on every backend until then.
 
 ### Switch, removal, proof
 

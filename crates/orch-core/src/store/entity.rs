@@ -28,7 +28,7 @@ impl Revision {
     }
 }
 
-/// Entity families provided by the first v2 slice.
+/// Entity families of port v2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntityKind {
@@ -39,6 +39,24 @@ pub enum EntityKind {
     Run,
     Message,
     Context,
+    Config,
+    Template,
+}
+
+/// One project setting (`project_config`). The key is the row's id; the value
+/// is text that the engine interprets and the port never parses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigEntry {
+    pub key: String,
+    pub value: String,
+}
+
+/// One template (`templates`). The name is the row's id and is only ever
+/// compared, never used as a path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TemplateEntry {
+    pub name: String,
+    pub body: String,
 }
 
 /// Payload validation stays in the domain and the operation dispatcher.
@@ -52,6 +70,8 @@ pub enum Entity {
     Run(Box<Run>),
     Message(Box<Message>),
     Context(ContextEntry),
+    Config(ConfigEntry),
+    Template(TemplateEntry),
 }
 
 impl Entity {
@@ -64,6 +84,8 @@ impl Entity {
             Self::Run(_) => EntityKind::Run,
             Self::Message(_) => EntityKind::Message,
             Self::Context(_) => EntityKind::Context,
+            Self::Config(_) => EntityKind::Config,
+            Self::Template(_) => EntityKind::Template,
         }
     }
 
@@ -77,6 +99,8 @@ impl Entity {
             Self::Run(v) => &v.id,
             Self::Message(v) => &v.id,
             Self::Context(v) => &v.key,
+            Self::Config(v) => &v.key,
+            Self::Template(v) => &v.name,
         }
     }
 }

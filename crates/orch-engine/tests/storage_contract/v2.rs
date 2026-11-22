@@ -102,6 +102,28 @@ pub async fn revisions_and_positions_for_every_entity_family(b: Backend) {
             Filter::Messages { recipient: None },
         ),
         (context("b"), context("a"), Filter::Context),
+        (
+            Entity::Config(ConfigEntry {
+                key: "b".into(),
+                value: "v".into(),
+            }),
+            Entity::Config(ConfigEntry {
+                key: "a".into(),
+                value: "v".into(),
+            }),
+            Filter::Config,
+        ),
+        (
+            Entity::Template(TemplateEntry {
+                name: "b".into(),
+                body: "t".into(),
+            }),
+            Entity::Template(TemplateEntry {
+                name: "a".into(),
+                body: "t".into(),
+            }),
+            Filter::Templates,
+        ),
     ];
     for (first, second, filter) in rows {
         let kind = first.kind();
@@ -480,6 +502,14 @@ macro_rules! entity_suite {
             case!(duplicate_create_and_missing_mutations_are_unchanged);
             case!(declared_secondary_sorts_use_values_then_tie_breakers);
             case!(message_and_run_filters_stay_within_their_family);
+            case!(settings_and_templates_are_keyed_rows_listed_by_their_exact_key);
+            case!(settings_and_templates_belong_to_their_project);
+            case!(a_failed_unit_of_work_keeps_no_setting_or_template_row_or_position);
+            case!(text_over_64_kib_round_trips_through_the_blob_store);
+            case!(text_over_the_limit_stays_whole_when_rows_projects_and_aborted_work_share_it);
+            case!(two_task_ids_that_differ_only_in_case_are_refused);
+            case!(task_lookups_stay_exact_to_the_byte);
+            case!(only_task_ids_fold_and_only_the_ascii_letters);
         }
     };
 }
@@ -492,4 +522,16 @@ pub use paging::{
     declared_secondary_sorts_use_values_then_tie_breakers,
     list_sorts_and_filters_match_the_reference, message_and_run_filters_stay_within_their_family,
     page_bounds_defaults_and_optional_count,
+};
+
+#[path = "v2_settings.rs"]
+mod settings;
+pub use settings::{
+    a_failed_unit_of_work_keeps_no_setting_or_template_row_or_position,
+    only_task_ids_fold_and_only_the_ascii_letters,
+    settings_and_templates_are_keyed_rows_listed_by_their_exact_key,
+    settings_and_templates_belong_to_their_project, task_lookups_stay_exact_to_the_byte,
+    text_over_64_kib_round_trips_through_the_blob_store,
+    text_over_the_limit_stays_whole_when_rows_projects_and_aborted_work_share_it,
+    two_task_ids_that_differ_only_in_case_are_refused,
 };

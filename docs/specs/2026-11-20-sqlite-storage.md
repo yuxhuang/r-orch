@@ -457,8 +457,10 @@ T8c contract amendment (2026-11-22): the registered `memory_leases_v2` and
 through factories with an explicit restore hook. The latter covers entity/event/
 lease rollback, same-transaction release fencing, restore fencing and injected
 clock jumps. `memory_events_v2::repeated_gap_is_idempotent_and_conflict_changes_nothing`
-pins gap identity. File and SQLite must register these same suites when wired;
-this memory-only slice proves neither two-backend acceptance nor physical suspend.
+pins gap identity. The file reference registers these same suites
+(`file_events_v2`, `file_operations_v2`, `file_leases_v2`); SQLite must register
+them when wired. Two-backend acceptance of the operational port is therefore
+unproven until SQLite is registered, and physical suspend is unproven.
 R42 hardware suspend and runtime renewal ordering remain integration checks.
 
 Each list has a fixed set of sorts. The default sort of a list is its 1.0 order, served by an index, and

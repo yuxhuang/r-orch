@@ -446,7 +446,7 @@ All three names are the same program:
 |---|---|
 | `orch-domain` | `task`, `agent`, `run`, `goal`, `team`, `message`, `state`, `config`, `global_config`, `events`, `error`, `transitions`, `scope`, `model_tiers`, `shop` (agent-shop + org-shop + default-agents) |
 | `orch-core` | `storage` (v1 traits), `store` (additive v2 entity, event and lease port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
-| `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models`, `blob::{DiskBlobStore, BlobReferences}` |
+| `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock, v2}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models`, `blob::{DiskBlobStore, BlobReferences}` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{agent, config, context, daemon, goal, init, msg, org, org_template, remote, rpc, run, status, task, team}`, `doctor`, `logs`, `tui` (`DaemonBackend`), `update`, `web`, `routing`, `tree`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
 | `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
@@ -462,7 +462,9 @@ A caller selects one project at entry; row keys cannot select another project.
 Operation authorization remains the dispatcher's responsibility.
 
 `Record` wraps the existing task, goal, agent, team, run, message or context
-payload with a positive revision and an explicit position. Updates preserve
+payload, or a project setting (`ConfigEntry`, a key and its value text) or a
+template (`TemplateEntry`, a name and its body), with a positive revision and an
+explicit position. Updates preserve
 position; `move_to_end` changes position and revision. `Filter` selects an entity
 family and its filters; `PageRequest` bounds each list and selects a supported
 sort. `store::fake::FakeStorage`, behind `test-support`, serializes in-memory
@@ -485,9 +487,16 @@ port reads no clock and never expires a lease merely because time advanced:
 after sleep the daemon renews its supervised runs before expiry (spec AP12).
 Physical suspend, recovery and engine expiry ordering are later integration checks.
 The lease and combined conformance scenarios accept backend factories with a
-fixture restore hook; only the memory reference is registered for these families.
-The remaining operational families, file reference and SQLite are subsequent
-slices. The daemon and all v1 storage traits still use the existing file implementation; this additive module changes no runtime storage path.
+fixture restore hook; the memory and file references are registered for the event,
+lease and combined families.
+`orch_infra::storage::v2::FileStorage` is the file reference for the
+conformance suite (test-only by design: nothing outside tests constructs it).
+Its project document also holds events, gaps, leases and epoch counters, replaced
+by one rename with the rows; the daemon lineage is one file at its root, and
+`restore_to_lineage` (fixture authority) ends every lease and keeps every counter.
+The remaining operational families, large-text storage in the blob store and SQLite
+are subsequent slices. The daemon and all v1 storage traits still use the existing
+file implementation; this additive module changes no runtime storage path.
 
 The additive `orch_core::store::blob::BlobStore` port is synchronous and names
 bytes by a parsed content hash. Its inactive `orch_infra::blob::DiskBlobStore`

@@ -1,4 +1,4 @@
-//! Event correctness on the transactional in-memory reference. The fixture
+//! Event correctness on the transactional references (memory and file). The fixture
 //! claims real reference leases; production lifecycle wiring belongs to T12.
 
 use std::sync::Arc;
@@ -29,6 +29,12 @@ fn event(seq: u64) -> SequencedEvent {
 pub async fn memory_backend() -> Arc<dyn Storage> {
     let storage = FakeStorage::default();
     storage.restore_to_lineage("current").await;
+    seed(&storage).await;
+    Arc::new(storage)
+}
+
+/// Claims the reference leases the scenarios append under, in lineage "current".
+pub async fn seed(storage: &dyn Storage) {
     for (project, run, task, epoch) in [
         ("p", "run", "task", 2),
         ("other", "run", "task", 2),
@@ -55,7 +61,6 @@ pub async fn memory_backend() -> Arc<dyn Storage> {
             .await
             .unwrap();
     }
-    Arc::new(storage)
 }
 
 async fn append(

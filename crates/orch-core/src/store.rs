@@ -18,7 +18,7 @@ pub mod fake;
 pub mod leases;
 pub mod page;
 
-pub use entity::{Entity, EntityKind, Record, Revision};
+pub use entity::{ConfigEntry, Entity, EntityKind, Record, Revision, TemplateEntry};
 pub use page::{Cursor, Filter, Page, PageRequest, Sort};
 
 /// The authority and project carried by both storage entry points.
