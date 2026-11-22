@@ -483,7 +483,7 @@ The contract of deliverable F. Rust signatures are fixed by the port PR and reco
 | `append_events(run, lineage, epoch, batch)` | Refused with `StaleEpoch` unless lineage and epoch are the lease's. Inserts with "ignore if `(run, seq)` exists". Returns `{ stored, skipped }`. `record_event_gap(run, after_seq, dropped)` records a loss keyed by `(project_id, run_id, after_seq)`. Replaying an identical count is a no-op; a conflicting count returns `InvalidEvents` and writes nothing, even if the caller catches the error and commits. |
 | `read_events(run, after_seq, limit)`, `read_events_tail(run, count)`, `prune_events(run, max_rows)` | Range read, tail read, and a bounded delete that reports whether the run is finished. |
 | `put_retry`, `due_retries(now, limit)`, `delete_retry` | The retry table; one row per task; no cap. |
-| `add_intent(kind, payload)`, `pending_intents(limit)`, `finish_intent(id)` | Side effects (R28). |
+| `add_intent(payload, now_ms)`, `pending_intents(after, limit)`, `finish_intent(id, now_ms)`, `delete_finished_intents(now_ms, max_rows)` | Side effects (R28); the T8c intents amendment below states the typed payloads, the lease boundary and the retention. |
 | `check_request_key(scope, op, hash)`, `store_request_key(scope, op, hash, result)` | Return `New`, `Replay(result)`, `ReplayWithoutResult` or `Mismatch`. |
 | `open_attention`, `ack_attention`, `resolve_attention` | The attention queue; `open` is a no-op when an open item exists for the subject. |
 
@@ -497,6 +497,49 @@ pins gap identity. The file reference registers these same suites
 them when wired. Two-backend acceptance of the operational port is therefore
 unproven until SQLite is registered, and physical suspend is unproven.
 R42 hardware suspend and runtime renewal ordering remain integration checks.
+
+T8c intents amendment (2026-11-22): the port `orch_core::store::intents` adds
+`IntentRead` to `ReadSnapshot` and `IntentWrite` to `UnitOfWork`, with the same
+two references (`memory_intents_v2`, `file_intents_v2`) running one shared
+suite. Signatures, with `now_ms` UTC milliseconds from the caller's clock (the
+port reads none):
+
+- `add_intent(&IntentPayload, now_ms) -> Intent`; `finish_intent(id, now_ms) ->
+  FinishOutcome`; `delete_finished_intents(now_ms, max_rows) -> usize`;
+  `get_intent(id)` and `list_pending_intents(after, limit)` in a unit of work;
+  `read_intent(id)` and `read_pending_intents(after, limit)` on a snapshot.
+- `IntentPayload` is closed: `process.start { run }`, `process.stop { run }`,
+  `workspace.remove { task }`, `blob.delete { hash }`. A run or task is one name
+  of 1 to 128 bytes of `A-Z a-z 0-9 . _ -` other than `.` and `..`; a hash is 64
+  lowercase hex digits. Anything else is `InvalidIntent` and changes nothing, so
+  no row holds a path (R105, R106). The spec's event-file form of `blob.delete`
+  is not in 1.1 (owner decision of 2026-11-21). R118's check that a directory is
+  the task's stays the performer's.
+- Ids are project-local, start at 1, grow by one and are never reused, even
+  after retention emptied the table. `pending` returns undone rows with an id
+  above `after`, lowest first, at most `limit` (1 to 1,000), so a backlog of any
+  size is enumerated by resuming from the last id.
+- Completion is idempotent and the first time wins: a second `finish`, or one
+  for a row that retention deleted, is `AlreadyDone`; an id that was never
+  issued in the project is `InvalidIntent`. Retention deletes finished rows
+  whose `done_at` is at least 7 days (`DONE_RETENTION_MS`) before `now_ms`,
+  lowest id first, at most 1,000 a call; pending rows are never deleted.
+- Authority (R132): `process.start` and `process.stop` need the run of a lease
+  that exists in the unit of work under the current lineage, and a task
+  principal may name only its own run with its own lineage and epoch, else
+  `StaleEpoch`. The lease is read when the intent is added, so a cancel (R37)
+  adds the stop intent before it releases the lease. A restore ends every lease
+  and so the right to add either kind; rows already written stay. `add_intent`
+  carries no lineage or epoch of its own, because the lease in the same
+  transaction is the fence, as for `finish` (R36).
+- `IntentKind::repeats_after_restart` states the kind's rule: false for
+  `process.start` only. The port keeps a `process.start` pending until recovery
+  (R41, T13) finishes it, and never performs anything; intents of an earlier
+  generation are recovery's to judge, as the port has no generation.
+- A callback that catches a refusal and commits leaves no partial change: every
+  check precedes the first write, and an id is spent only by a stored row.
+- The performers, recovery, the `intents.perform` job and the SQLite table
+  (`intents` in the schema) are T13, T15 and T10's.
 
 Each list has a fixed set of sorts. The default sort of a list is its 1.0 order, served by an index, and
 deliverable B confirms each line. Every list also offers the sort `id`, whose values never change (R49):

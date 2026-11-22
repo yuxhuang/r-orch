@@ -120,7 +120,12 @@ event/lease contracts and their memory reference, followed by retries, intents,
 request keys and attention. The file reference carries the event and lease
 families too (registered beside the memory reference); SQLite wiring follows
 T9/T10. The T8c event and lease slice does not complete T8 or release
-the engine's dependency on the full operational port. The v1 runtime stays active.
+the engine's dependency on the full operational port. The T8c intents slice
+(typed `process.start`, `process.stop`, `workspace.remove` and `blob.delete`
+payloads, project-local ids, bounded pending reads, idempotent completion and
+7-day retention, with the same memory and file references) follows the same
+rule; request keys, attention and the retry enumeration are later slices.
+The v1 runtime stays active.
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|

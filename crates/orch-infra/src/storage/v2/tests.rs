@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use orch_core::store::events::{EventGap, SequencedEvent};
+use orch_core::store::intents::{DONE_RETENTION_MS, FinishOutcome, IntentPayload};
 use orch_core::store::leases::{ClaimOutcome, Lease, NewLease};
 use orch_core::store::retries::Retry;
 use orch_core::store::*;
@@ -536,6 +537,171 @@ async fn operations_that_change_nothing_do_not_rewrite_the_document() {
     .await
     .unwrap();
     assert_eq!(inode(&document), before);
+}
+
+fn stop_run(run: &str) -> IntentPayload {
+    IntentPayload::ProcessStop { run: run.into() }
+}
+
+fn remove_workspace(task: &str) -> IntentPayload {
+    IntentPayload::WorkspaceRemove { task: task.into() }
+}
+
+async fn add_intent(s: &FileStorage, payload: IntentPayload, now: i64) -> u64 {
+    s.transaction(owner("p"), Lane::Entities, move |u| {
+        Ok(u.add_intent(&payload, now)?.id)
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn intents_ids_and_completion_survive_a_new_instance() {
+    let root = root();
+    let first = FileStorage::new(root.path());
+    claim(&first, new_lease("t", "a", "r1")).await;
+    assert_eq!(add_intent(&first, stop_run("r1"), 10).await, 1);
+    assert_eq!(add_intent(&first, remove_workspace("t"), 11).await, 2);
+    first
+        .transaction(owner("p"), Lane::Entities, |u| u.finish_intent(2, 12))
+        .await
+        .unwrap();
+    drop(first);
+
+    let second = FileStorage::new(root.path());
+    let view = second.read(owner("p")).await.unwrap();
+    let pending = view.read_pending_intents(0, 10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!((pending[0].id, pending[0].created_at), (1, 10));
+    assert_eq!(pending[0].payload, stop_run("r1"));
+    assert_eq!(
+        view.read_intent(2).await.unwrap().unwrap().done_at,
+        Some(12)
+    );
+    // Retention deletes the finished row; the counter outlives it and the instance.
+    let deleted = second
+        .transaction(owner("p"), Lane::Maintenance, |u| {
+            u.delete_finished_intents(12 + DONE_RETENTION_MS, 10)
+        })
+        .await
+        .unwrap();
+    assert_eq!(deleted, 1);
+    drop(view);
+    drop(second);
+    let third = FileStorage::new(root.path());
+    assert_eq!(add_intent(&third, remove_workspace("t"), 13).await, 3);
+    let finished = third
+        .transaction(owner("p"), Lane::Entities, |u| u.finish_intent(2, 99))
+        .await
+        .unwrap();
+    assert_eq!(finished, FinishOutcome::AlreadyDone);
+}
+
+#[tokio::test]
+async fn a_document_from_before_intents_reads_as_an_empty_set() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    create(&s, "p", "t1").await;
+    let [document] = documents(root.path()).try_into().unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
+    assert!(value.as_object_mut().unwrap().remove("intents").is_some());
+    std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let reopened = FileStorage::new(root.path());
+    let view = reopened.read(owner("p")).await.unwrap();
+    assert!(view.read_pending_intents(0, 10).await.unwrap().is_empty());
+    assert!(view.get(EntityKind::Task, "t1").await.unwrap().is_some());
+    assert_eq!(add_intent(&reopened, remove_workspace("t1"), 1).await, 1);
+}
+
+#[tokio::test]
+async fn intent_operations_that_change_nothing_do_not_rewrite_the_document() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    claim(&s, new_lease("t", "a", "r1")).await;
+    add_intent(&s, stop_run("r1"), 1).await;
+    s.transaction(owner("p"), Lane::Entities, |u| u.finish_intent(1, 2))
+        .await
+        .unwrap();
+    let [document] = documents(root.path()).try_into().unwrap();
+    // A commit replaces the file, so a new inode shows a rewrite.
+    let inode =
+        |path: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap());
+    let before = (inode(&document), std::fs::read(&document).unwrap());
+    s.write(
+        owner("p"),
+        Lane::Entities,
+        Box::new(|u| {
+            // A repeated finish, a retention call with nothing due, reads, and
+            // refusals that the callback catches change no row and spend no id.
+            assert_eq!(u.finish_intent(1, 9)?, FinishOutcome::AlreadyDone);
+            assert_eq!(u.delete_finished_intents(3, 10)?, 0);
+            u.list_pending_intents(0, 10)?;
+            u.get_intent(1)?;
+            u.add_intent(&remove_workspace("../x"), 1).unwrap_err();
+            u.add_intent(&stop_run("no-lease"), 1).unwrap_err();
+            u.finish_intent(7, 1).unwrap_err();
+            Ok(())
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (inode(&document), std::fs::read(&document).unwrap()),
+        before
+    );
+}
+
+#[tokio::test]
+async fn a_failed_unit_of_work_keeps_no_intent_on_disk() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    claim(&s, new_lease("t", "a", "r1")).await;
+    let [document] = documents(root.path()).try_into().unwrap();
+    let before = std::fs::read(&document).unwrap();
+    let failed = s
+        .transaction(owner("p"), Lane::Entities, |u| {
+            u.add_intent(&stop_run("r1"), 1)?;
+            Err::<(), _>(StoreError::CounterExhausted)
+        })
+        .await;
+    assert!(matches!(failed, Err(StoreError::CounterExhausted)));
+    assert_eq!(std::fs::read(&document).unwrap(), before);
+    assert_eq!(add_intent(&s, stop_run("r1"), 2).await, 1);
+}
+
+async fn edited_intents(mutate: impl FnOnce(&mut serde_json::Value)) -> StoreError {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    claim(&s, new_lease("t", "a", "r1")).await;
+    add_intent(&s, stop_run("r1"), 1).await;
+    let [document] = documents(root.path()).try_into().unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
+    mutate(&mut value["intents"]);
+    std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
+    FileStorage::new(root.path())
+        .read(owner("p"))
+        .await
+        .err()
+        .expect("a document that is not the contract is refused")
+}
+
+#[tokio::test]
+async fn a_hand_edited_intent_outside_the_contract_is_refused_on_read() {
+    // A path where an id belongs, an id past the counter, a kind nobody defined.
+    for edit in [
+        (|v: &mut serde_json::Value| v["rows"]["1"]["payload"]["run"] = "../escape".into())
+            as fn(&mut serde_json::Value),
+        |v| v["last"] = 0.into(),
+        |v| v["rows"]["1"]["payload"]["kind"] = "process.kill".into(),
+        |v| {
+            v["rows"]["1"]["payload"]["pid"] = 42.into();
+        },
+    ] {
+        assert!(matches!(edited_intents(edit).await, StoreError::Backend(_)));
+    }
 }
 
 fn described(id: &str, text: String) -> Entity {

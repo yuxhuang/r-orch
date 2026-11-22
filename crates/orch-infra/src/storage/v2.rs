@@ -4,7 +4,7 @@
 //! no SQLite (spec R17). It is not a product backend: nothing opens it outside
 //! tests, and the 1.0 stores in this module's parent are not changed by it.
 //!
-//! One document per project holds every row, event, gap, lease and counter, and
+//! One document per project holds every row, event, gap, intent, lease and counter, and
 //! is replaced by a rename, so a commit is one atomic step. Writers take one gate,
 //! as the port requires. A read loads its own copy of the document, so it keeps
 //! one committed state whatever commits next. Surviving a process stop mid-way
@@ -32,6 +32,7 @@
 //! ids with one fold key, two rows at one position, or events of no known run.
 
 mod events;
+mod intents;
 mod leases;
 mod order;
 mod retries;
@@ -48,6 +49,7 @@ use orch_core::Error;
 use orch_core::store::events::{
     AppendResult, EventGap, EventRead, EventWrite, PruneResult, SequencedEvent,
 };
+use orch_core::store::intents::{FinishOutcome, Intent, IntentPayload, IntentRead, IntentWrite};
 use orch_core::store::leases::{ClaimOutcome, Lease, LeaseRead, LeaseWrite, NewLease};
 use orch_core::store::retries::{Retry, RetryRead, RetryWrite};
 use orch_core::store::{
@@ -58,6 +60,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
 use events::Events;
+use intents::Intents;
 use leases::{By, Leases};
 use order::{Key, check_sort, key, matches};
 use retries::Retries;
@@ -75,6 +78,7 @@ struct Project {
     /// does not free a position.
     counters: BTreeMap<EntityKind, u64>,
     events: Events,
+    intents: Intents,
     leases: Leases,
     retries: Retries,
 }
@@ -85,6 +89,8 @@ struct Document {
     records: Vec<text::StoredRecord>,
     #[serde(default)]
     events: Events,
+    #[serde(default)]
+    intents: Intents,
     #[serde(default)]
     leases: Leases,
     #[serde(default)]
@@ -215,9 +221,14 @@ fn load(dir: &Path) -> Result<Project> {
         rows: BTreeMap::new(),
         counters: document.counters,
         events: document.events,
+        intents: document.intents,
         leases: document.leases,
         retries: document.retries,
     };
+    project
+        .intents
+        .validate()
+        .map_err(|detail| corrupt(&path, detail))?;
     project
         .leases
         .validate()
@@ -248,6 +259,7 @@ fn persist(dir: &Path, project: &Project) -> Result<()> {
             .map(|row| text::StoredRecord::encode(dir, row))
             .collect::<Result<_>>()?,
         events: project.events.clone(),
+        intents: project.intents.clone(),
         leases: project.leases.clone(),
         retries: project.retries.clone(),
     };
@@ -611,6 +623,62 @@ impl EventWrite for Session {
         let result = self.project.events.prune(run, max_rows)?;
         self.dirty |= result.deleted > 0;
         Ok(result)
+    }
+}
+
+#[async_trait]
+impl IntentRead for Session {
+    async fn read_intent(&self, id: u64) -> Result<Option<Intent>> {
+        Ok(self.project.intents.get(id))
+    }
+    async fn read_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<Intent>> {
+        self.project.intents.pending(after, limit)
+    }
+}
+
+impl IntentWrite for Session {
+    fn add_intent(&mut self, payload: &IntentPayload, now_ms: i64) -> Result<Intent> {
+        payload.validate()?;
+        if let Some(run) = payload.run() {
+            // The lease of that run as this unit of work sees it, under the
+            // current lineage; a task principal must be its holder.
+            let lease = self
+                .project
+                .leases
+                .all()
+                .into_iter()
+                .find(|lease| lease.run == run)
+                .ok_or(StoreError::StaleEpoch)?;
+            self.project.leases.check(
+                &self.caller,
+                &self.lineage,
+                By::Task(&lease.task),
+                &lease.lineage,
+                lease.epoch,
+            )?;
+        }
+        let added = self.project.intents.add(payload, now_ms)?;
+        self.dirty = true;
+        Ok(added)
+    }
+
+    fn finish_intent(&mut self, id: u64, now_ms: i64) -> Result<FinishOutcome> {
+        let outcome = self.project.intents.finish(id, now_ms)?;
+        self.dirty |= outcome == FinishOutcome::Finished;
+        Ok(outcome)
+    }
+
+    fn delete_finished_intents(&mut self, now_ms: i64, max_rows: usize) -> Result<usize> {
+        let deleted = self.project.intents.delete_finished(now_ms, max_rows)?;
+        self.dirty |= deleted > 0;
+        Ok(deleted)
+    }
+
+    fn get_intent(&self, id: u64) -> Result<Option<Intent>> {
+        Ok(self.project.intents.get(id))
+    }
+    fn list_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<Intent>> {
+        self.project.intents.pending(after, limit)
     }
 }
 
