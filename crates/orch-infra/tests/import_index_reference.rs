@@ -20,20 +20,30 @@ use orch_core::test_support::assert_hermetic;
 use orch_infra::storage::{FileTaskStore, Paths};
 use serde::Deserialize;
 
-const CASES: [&str; 5] = [
+const CASES: [&str; 6] = [
     "index-absent",
+    "index-absent-update-order",
     "index-disagrees",
     "index-malformed",
     "index-null",
     "index-object",
 ];
 /// The cases whose `_index.json` is missing or unusable (R122: "lists nothing").
-const REBUILT: [&str; 4] = [
+const REBUILT: [&str; 5] = [
     "index-absent",
+    "index-absent-update-order",
     "index-malformed",
     "index-null",
     "index-object",
 ];
+
+/// The rebuilt case whose id order, creation order and 1.0 list order all differ.
+const DISTINCT_ORDERS: &str = "index-absent-update-order";
+
+const INDEX_DIFFERS: &str = "index_differs";
+const INDEX_UNREADABLE: &str = "index_unreadable";
+const NO_FILE: &str = "an index entry with no file";
+const UNLISTED: &str = "an entity its index does not list";
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -94,9 +104,32 @@ fn load(case: &str) -> Expected {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
-/// The project root a case reads from, resolved from its own `source` entry.
+/// The project root a case reads from: its own `source/`, or a reference that stays
+/// inside `fixtures/` (the stale-index case is another directory's source).
+fn confine_source(case: &str, source: &str) -> Result<PathBuf, String> {
+    if Path::new(source).is_absolute() {
+        return Err(format!("{case}: source {source:?} is absolute"));
+    }
+    let fixtures = corpus()
+        .join("../..")
+        .canonicalize()
+        .map_err(|e| format!("fixtures root: {e}"))?;
+    let resolved = corpus()
+        .join(case)
+        .join(source)
+        .canonicalize()
+        .map_err(|e| format!("{case}: source {source:?}: {e}"))?;
+    if !resolved.starts_with(&fixtures) {
+        return Err(format!("{case}: source {source:?} leaves the fixtures"));
+    }
+    if !resolved.join(".orchestry").is_dir() {
+        return Err(format!("{case}: source {source:?} holds no .orchestry"));
+    }
+    Ok(corpus().join(case).join(source))
+}
+
 fn source_of(case: &str, expected: &Expected) -> PathBuf {
-    corpus().join(case).join(&expected.source)
+    confine_source(case, &expected.source).unwrap_or_else(|why| panic!("{why}"))
 }
 
 fn copy_tree(from: &Path, to: &Path) {
@@ -146,6 +179,87 @@ fn entity_ids(source: &Path) -> Vec<String> {
         .collect();
     ids.sort();
     ids
+}
+
+/// What the spec says the importer makes of a task directory, worked out from the
+/// source files alone (R69 "Order", R122): the import order, and the report as one
+/// (class, subject) pair per finding, sorted. No expectation file is read.
+struct Derived {
+    order: Vec<String>,
+    report: Vec<(String, String)>,
+}
+
+fn derive(source: &Path) -> Result<Derived, String> {
+    let dir = source.join(".orchestry").join("tasks");
+    let mut files = BTreeMap::new();
+    for id in entity_ids(source) {
+        let text = std::fs::read_to_string(dir.join(format!("{id}.yml")))
+            .map_err(|e| format!("{id}: {e}"))?;
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+            format!("{id}: the entity file does not parse (R123, not this corpus): {e}")
+        })?;
+        files.insert(id, value);
+    }
+    // A missing file and an unparseable one are the same thing to R122: no usable index.
+    let index = std::fs::read(dir.join("_index.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+    let Some(serde_json::Value::Array(entries)) = index else {
+        return Ok(Derived {
+            order: files.keys().cloned().collect(),
+            report: vec![(INDEX_UNREADABLE.into(), "tasks".into())],
+        });
+    };
+
+    let mut order = Vec::new();
+    let mut report = Vec::new();
+    let mut listed = BTreeSet::new();
+    for entry in &entries {
+        let id = entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("an index entry has no string id; the spec is silent on it")?;
+        if !listed.insert(id.to_owned()) {
+            return Err(format!("{id} is listed twice; the spec is silent on it"));
+        }
+        match files.get(id) {
+            None => report.push((NO_FILE.into(), id.to_owned())),
+            Some(file) => {
+                // The index's position is the array position (R69); its content is never used.
+                order.push(id.to_owned());
+                if file != entry {
+                    report.push((INDEX_DIFFERS.into(), id.to_owned()));
+                }
+            }
+        }
+    }
+    for id in files.keys().filter(|id| !listed.contains(*id)) {
+        report.push((UNLISTED.into(), id.clone()));
+        order.push(id.clone());
+    }
+    report.sort();
+    Ok(Derived { order, report })
+}
+
+/// The entity ids of a source ordered by a timestamp field of the files themselves,
+/// ascending. The timestamps must be pairwise different, or the order is a tie.
+fn ids_by_field(source: &Path, field: &str) -> Vec<String> {
+    let mut keyed: Vec<(String, String)> = entity_ids(source)
+        .into_iter()
+        .map(|id| {
+            let text =
+                std::fs::read_to_string(source.join(format!(".orchestry/tasks/{id}.yml"))).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+            (value[field].as_str().unwrap().to_owned(), id)
+        })
+        .collect();
+    keyed.sort();
+    assert!(
+        keyed.windows(2).all(|w| w[0].0 != w[1].0),
+        "{field} ties in {}",
+        source.display()
+    );
+    keyed.into_iter().map(|(_, id)| id).collect()
 }
 
 /// Run 1.0's real reader on a copy of `source` and compare it with `expected.legacy_1_0`.
@@ -220,6 +334,8 @@ async fn check_legacy(source: &Path, expected: &Expected) -> Result<(), String> 
         let rebuilt: Vec<serde_json::Value> =
             serde_json::from_slice(&after.ok_or("no index published")?)
                 .map_err(|e| format!("published index is not an array: {e}"))?;
+        // The published array follows directory enumeration, which nothing specifies:
+        // membership only. (`list()` above is specified; this file is not.)
         let mut published_ids: Vec<&str> =
             rebuilt.iter().filter_map(|v| v["id"].as_str()).collect();
         published_ids.sort();
@@ -276,29 +392,32 @@ async fn check_expectation(source: &Path, expected: &Expected, spec: &str) -> Re
         }
     }
 
-    if REBUILT.contains(&expected.case.as_str()) {
+    // Order and report come from the source alone, and must match exactly (R69, R122).
+    let derived = derive(source)?;
+    if want.task_order != derived.order {
+        return Err(format!(
+            "task_order {:?}, the source gives {:?}",
+            want.task_order, derived.order
+        ));
+    }
+    let mut recorded: Vec<(String, String)> = want
+        .report
+        .iter()
+        .map(|f| (f.class.clone(), f.subject.clone()))
+        .collect();
+    recorded.sort();
+    if recorded != derived.report {
+        return Err(format!(
+            "report {recorded:?}, the source gives {:?}",
+            derived.report
+        ));
+    }
+    if REBUILT.contains(&expected.case.as_str()) && want.task_order != on_disk {
         // An index that lists nothing: every file, in id order (R122).
-        if want.task_order != on_disk {
-            return Err(format!(
-                "task_order {:?}, id order is {on_disk:?}",
-                want.task_order
-            ));
-        }
-    } else {
-        // A usable index gives order: its entries that have a file keep their
-        // relative order and come first (R69, "Order").
-        let kept: Vec<&String> = expected
-            .legacy_1_0
-            .list_order
-            .iter()
-            .filter(|id| members.contains(id.as_str()))
-            .collect();
-        if want.task_order.iter().take(kept.len()).collect::<Vec<_>>() != kept {
-            return Err(format!(
-                "task_order {:?} does not start with the index order {kept:?}",
-                want.task_order
-            ));
-        }
+        return Err(format!(
+            "task_order {:?}, id order is {on_disk:?}",
+            want.task_order
+        ));
     }
 
     // The classification is the spec's: every finding goes on, and the row says so.
@@ -331,18 +450,6 @@ async fn check_expectation(source: &Path, expected: &Expected, spec: &str) -> Re
             return Err(format!(
                 "{:?}: named_in_spec is {}",
                 finding.class, finding.named_in_spec
-            ));
-        }
-        if !members.contains(finding.subject.as_str())
-            && finding.subject != "tasks"
-            && !expected
-                .legacy_1_0
-                .listed_ids_sorted
-                .contains(&finding.subject)
-        {
-            return Err(format!(
-                "finding subject {:?} is neither a directory nor a known id",
-                finding.subject
             ));
         }
     }
@@ -417,7 +524,7 @@ async fn the_importer_expectations_agree_with_the_source_files_and_the_spec() {
 }
 
 #[test]
-fn rebuilt_cases_have_files_whose_id_order_differs_from_creation_and_file_order() {
+fn rebuilt_cases_have_files_whose_id_order_differs_from_creation_order() {
     for case in REBUILT {
         let expected = load(case);
         let source = source_of(case, &expected);
@@ -425,22 +532,61 @@ fn rebuilt_cases_have_files_whose_id_order_differs_from_creation_and_file_order(
             entity_ids(&source).len() >= 2,
             "{case}: id order needs two entity files"
         );
-        let mut by_created: Vec<(String, String)> = entity_ids(&source)
-            .into_iter()
-            .map(|id| {
-                let text =
-                    std::fs::read_to_string(source.join(format!(".orchestry/tasks/{id}.yml")))
-                        .unwrap();
-                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
-                (value["created_at"].as_str().unwrap().to_owned(), id)
-            })
-            .collect();
-        by_created.sort();
-        let created_order: Vec<String> = by_created.into_iter().map(|(_, id)| id).collect();
         assert_ne!(
-            created_order, expected.importer_1_1.task_order,
+            ids_by_field(&source, "created_at"),
+            expected.importer_1_1.task_order,
             "{case}: creation order equals id order"
         );
+        // 1.0's list order is specified wherever `updated_at` has no tie (equal status).
+        assert!(expected.legacy_1_0.list_order_specified, "{case}");
+        assert_eq!(expected.importer_1_1.task_order, entity_ids(&source));
+    }
+}
+
+/// An importer that copies 1.0's `list()` (newest update first) or follows creation
+/// time must fail one case: here the three orders are pairwise different.
+#[test]
+fn one_rebuilt_case_tells_id_creation_and_1_0_list_order_apart() {
+    let expected = load(DISTINCT_ORDERS);
+    let source = source_of(DISTINCT_ORDERS, &expected);
+    let id_order = entity_ids(&source);
+    let created = ids_by_field(&source, "created_at");
+    let mut updated = ids_by_field(&source, "updated_at");
+    updated.reverse(); // list(): equal status, `updated_at` descending
+    for status in entity_ids(&source).iter().map(|id| {
+        let text = std::fs::read_to_string(source.join(format!(".orchestry/tasks/{id}.yml")));
+        let value: serde_json::Value = serde_json::from_str(&text.unwrap()).unwrap();
+        value["status"].as_str().unwrap().to_owned()
+    }) {
+        assert_eq!(status, "todo", "a status difference would reorder list()");
+    }
+
+    assert_eq!(expected.legacy_1_0.list_order, updated);
+    assert_eq!(expected.importer_1_1.task_order, id_order);
+    assert_ne!(id_order, created);
+    assert_ne!(id_order, updated);
+    assert_ne!(created, updated);
+}
+
+#[test]
+fn a_source_reference_must_stay_inside_the_fixtures() {
+    assert!(confine_source("index-absent", "source").is_ok());
+    assert!(
+        confine_source("index-disagrees", "../../../storage-v1/index-disagrees").is_ok(),
+        "the one reference the corpus uses"
+    );
+    for (case, bad) in [
+        ("index-absent", "/etc"),
+        ("index-absent", "../../../../crates"),
+        ("index-absent", "../../../.."),
+        (
+            "index-absent",
+            "../../../storage-v1/index-disagrees/../../../../crates",
+        ),
+        ("index-absent", "../index-absent-update-order/missing"),
+        ("index-absent", "../../../storage-v1"), // inside, but no .orchestry
+    ] {
+        assert!(confine_source(case, bad).is_err(), "{case} source {bad:?}");
     }
 }
 
@@ -485,6 +631,121 @@ fn the_corpus_carries_no_private_location() {
         ] {
             assert!(!text.contains(marker), "{name} contains {marker:?}");
         }
+    }
+}
+
+/// Every one-step change to a case's recorded report: drop, repeat, re-class or
+/// re-subject each finding, and add one that the source does not give. The reviewed
+/// survivors M1-M4 and M6, and a dropped orphan finding, are among them (see the
+/// test `the_named_report_mutants_are_caught`).
+fn report_mutants(expected: &Expected) -> Vec<(String, Expected)> {
+    let mut out = Vec::new();
+    let report = &expected.importer_1_1.report;
+    let classes = [INDEX_DIFFERS, INDEX_UNREADABLE, NO_FILE, UNLISTED];
+    let mut push = |label: String, edit: &dyn Fn(&mut Vec<Finding>)| {
+        let mut wrong = expected.clone();
+        edit(&mut wrong.importer_1_1.report);
+        out.push((label, wrong));
+    };
+    for (i, f) in report.iter().enumerate() {
+        let name = format!("{} {}", f.class, f.subject);
+        push(format!("drop {name}"), &|r| {
+            r.remove(i);
+        });
+        push(format!("repeat {name}"), &|r| {
+            let again = r[i].clone();
+            r.push(again);
+        });
+        push(format!("re-subject {name}"), &|r| {
+            r[i].subject = "tsk_idx_a_other".into();
+        });
+        for class in classes.iter().filter(|c| **c != f.class) {
+            push(format!("{name} as {class}"), &|r| {
+                r[i].class = (*class).to_owned();
+            });
+        }
+    }
+    push("an extra finding".into(), &|r| {
+        r.push(Finding {
+            class: NO_FILE.into(),
+            subject: "tsk_nowhere".into(),
+            named_in_spec: false,
+            import: "goes_on".into(),
+        });
+    });
+    out
+}
+
+type ReportEdit = fn(&mut Vec<Finding>);
+
+/// The reviewed report mutants (M1-M4, M6, a dropped orphan), by name, each of which must be caught
+/// (they survived the first version of this suite).
+#[tokio::test]
+async fn the_named_report_mutants_are_caught() {
+    let spec = spec_text();
+    let load_case = |case: &str| {
+        let expected = load(case);
+        let source = source_of(case, &expected);
+        (expected, source)
+    };
+    let mutants: [(&str, &str, ReportEdit); 6] = [
+        (
+            "M1 index-absent: index_unreadable -> index_differs",
+            "index-absent",
+            |r| {
+                r[0].class = INDEX_DIFFERS.into();
+            },
+        ),
+        (
+            "M2 index-disagrees: drop the tsk_ghost finding",
+            "index-disagrees",
+            |r| {
+                r.retain(|f| f.subject != "tsk_ghost");
+            },
+        ),
+        (
+            "M3 index-disagrees: drop index_differs tsk_b",
+            "index-disagrees",
+            |r| {
+                r.retain(|f| f.class != INDEX_DIFFERS);
+            },
+        ),
+        (
+            "M4 index-null: subject tasks -> tsk_idx_a",
+            "index-null",
+            |r| {
+                r[0].subject = "tsk_idx_a".into();
+            },
+        ),
+        (
+            "M6 index-disagrees: index_differs tsk_b -> index_unreadable tasks",
+            "index-disagrees",
+            |r| {
+                let f = r.iter_mut().find(|f| f.class == INDEX_DIFFERS).unwrap();
+                f.class = INDEX_UNREADABLE.into();
+                f.subject = "tasks".into();
+            },
+        ),
+        (
+            "index-disagrees: drop the tsk_orphan finding",
+            "index-disagrees",
+            |r| {
+                r.retain(|f| f.subject != "tsk_orphan");
+            },
+        ),
+    ];
+    for (label, case, edit) in mutants {
+        let (expected, source) = load_case(case);
+        assert!(
+            check_expectation(&source, &expected, &spec).await.is_ok(),
+            "{label}: baseline"
+        );
+        let mut wrong = expected.clone();
+        edit(&mut wrong.importer_1_1.report);
+        assert!(
+            check_expectation(&source, &wrong, &spec).await.is_err(),
+            "survives: {label}"
+        );
     }
 }
 
@@ -592,5 +853,22 @@ async fn a_changed_payload_or_membership_is_caught() {
             check_expectation(&source, &wrong, &spec).await.is_err(),
             "{case}: changed classification"
         );
+
+        // The report: class, subject, multiplicity and membership are all checked.
+        for (label, wrong) in report_mutants(&expected) {
+            assert!(
+                check_expectation(&source, &wrong, &spec).await.is_err(),
+                "{case}: report mutant survives: {label}"
+            );
+        }
+        if case == DISTINCT_ORDERS {
+            // An importer that copies 1.0's list() order.
+            let mut wrong = expected.clone();
+            wrong.importer_1_1.task_order = expected.legacy_1_0.list_order.clone();
+            assert!(
+                check_expectation(&source, &wrong, &spec).await.is_err(),
+                "{case}: list order taken for import order"
+            );
+        }
     }
 }

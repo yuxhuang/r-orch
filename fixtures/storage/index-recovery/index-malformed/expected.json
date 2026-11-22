@@ -4,7 +4,8 @@
   "spec": ["R65", "R122", "R123"],
   "legacy_1_0": {
     "listed_ids_sorted": ["tsk_idx_a", "tsk_idx_b", "tsk_idx_c"],
-    "list_order_specified": false,
+    "list_order_specified": true,
+    "list_order": ["tsk_idx_a", "tsk_idx_b", "tsk_idx_c"],
     "read_publishes_an_index": true,
     "titles_by_get": {
       "tsk_idx_a": "Case index-malformed: first by id, created last",
