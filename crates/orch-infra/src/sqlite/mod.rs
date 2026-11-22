@@ -11,8 +11,6 @@ pub use connection::{ConnectionHandle, ConnectionRole, Synchronous, open_connect
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteError {
-    #[error(transparent)]
-    Store(#[from] orch_core::store::StoreError),
     #[error("value cannot be represented losslessly in the SQLite schema: {0}")]
     Unrepresentable(String),
     #[error("goal operation failed: {operation}; savepoint rollback failed: {rollback}")]
@@ -24,6 +22,10 @@ pub enum SqliteError {
     TransactionAborted,
     #[error("storage admission deadline or queue bound reached")]
     Overloaded,
+    #[error(transparent)]
+    Store(#[from] orch_core::store::StoreError),
+    #[error("stored run event is damaged: {0}")]
+    EventCorrupt(String),
     #[error("SQLite writer is closed")]
     WriterClosed,
     #[error("SQLite connection and queue capacities must be greater than zero")]
@@ -53,6 +55,11 @@ pub enum SqliteError {
 }
 pub type Result<T> = std::result::Result<T, SqliteError>;
 
+#[allow(
+    dead_code,
+    reason = "event integration is internal until the combined storage adapter lands"
+)]
+pub(crate) mod events;
 mod read_pool;
 mod writer;
 pub use read_pool::ReadPool;

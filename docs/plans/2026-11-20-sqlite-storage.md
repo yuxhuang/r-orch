@@ -120,7 +120,12 @@ event/lease contracts and their memory reference, followed by retries, intents,
 request keys and attention. The file reference carries the event and lease
 families too (registered beside the memory reference); SQLite wiring follows
 T9/T10. The T8c event and lease slice does not complete T8 or release
-the engine's dependency on the full operational port. The v1 runtime stays active.
+the engine's dependency on the full operational port. The T8c intents slice
+(typed `process.start`, `process.stop`, `workspace.remove` and `blob.delete`
+payloads, project-local ids, bounded pending reads, idempotent completion and
+7-day retention, with the same memory and file references) follows the same
+rule; request keys, attention and the retry enumeration are later slices.
+The v1 runtime stays active.
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|
@@ -138,7 +143,7 @@ the engine's dependency on the full operational port. The v1 runtime stays activ
 | T19 | Attention queue with its two kinds; the disk floor | R81 to R85, R131 | `crates/orch-engine/src/attention*`, `crates/orch-engine/src/disk_floor*`, `crates/orch-cli/` | T15, T17 | `cargo test -p orch-engine --test attention --test disk_floor`; `cargo test -p orch-cli --test attention` | 18 |
 | T20 | Usage for every run, with the model and the agent CLI version | R86, R87 | `crates/orch-engine/src/orchestrator/`, `crates/orch-infra/src/adapters/` | T12 | `cargo test -p orch-engine --test usage` | 19 |
 | T21a | The seeded fixture generator split out of T21 as a preparatory slice: `cargo xtask fixture-gen` scripts the real 1.0 file backend in a private temporary directory from a fixed seed, with a deterministic clock and ids; `--check` compares exact file sets and bytes with the checked-in `fixtures/storage/generated/` and changes nothing. One small scenario is checked in; large corpora for R66 and the importer's results stay in T21 | R90 | `xtask/src/fixture_gen*`, `xtask/src/main.rs`, `xtask/Cargo.toml`, `xtask/src/crate_graph.rs`, `xtask/tests/fixture_gen.rs`, `fixtures/storage/generated/` | T2 | `cargo xtask fixture-gen --check`; `cargo test -p xtask --test fixture_gen` | 20 (first slice) |
-| T21 | `orch import` from a 1.0 directory: dry run, bounds, resume; the source read by listing through the confined-directory module, the id rule, and nothing done outside the database; the seeded fixture generator's further scenarios (T21a owns `xtask/src/fixture_gen.rs` and its first scenario; T21 extends it) and the hand-written hostile-source corpus (links, special files, traversal-shaped ids and names, a live canary process, a canary child left in the process group of a leader that has gone, two task ids that differ only in case, and a workspace with a canary under another spelling of a task's id). The check, before the first write, that no two task ids of the source have one fold key and that no name listed in `workspaces/` folds onto a task's id without being it; `workspaces/` is listed for its names alone. The source-budget pass of the spec's "Import bounds": every document measured for bytes, depth, nodes, aliases, expansion and tags before anything is built from it, on 1.0's own guarded reader (`orch_core::definition_yaml`) where that already holds the limit; event lines read as a bounded stream; the check of the whole source before the first write; and the hostile-document corpus (the review's depth and alias documents, merge-key bombs, tags, each limit and one over), run in a child process under a time and a memory ceiling | R64 to R70, R90, R99, R103 to R105, R109 to R112, R116 (a 1.0 source), R117 (a 1.0 source), R119, R121 (the record), R122, R123, R125 | `crates/orch-infra/src/import/`, `crates/orch-cli/src/commands/import*`, `xtask/src/fixture_gen.rs`, `fixtures/storage/`, `crates/orch-infra/tests/source_budget.rs`, `crates/orch-cli/tests/import_hostile.rs` | T10, T11, T2 | `cargo test -p orch-cli --test import --test import_hostile`; `cargo test -p orch-infra --test source_budget`; `cargo xtask fixture-gen --check` | 20 |
+| T21 | `orch import` from a 1.0 directory: dry run, bounds, resume; the source read by listing through the confined-directory module, the id rule, and nothing done outside the database; the seeded fixture generator's further scenarios (T21a owns `xtask/src/fixture_gen.rs` and its first scenario; T21 extends it) and the hand-written hostile-source corpus (links, special files, traversal-shaped ids and names, a live canary process, a canary child left in the process group of a leader that has gone, two task ids that differ only in case, and a workspace with a canary under another spelling of a task's id). The check, before the first write, that no two task ids of the source have one fold key and that no name listed in `workspaces/` folds onto a task's id without being it; `workspaces/` is listed for its names alone. The source-budget pass of the spec's "Import bounds": every document measured for bytes, depth, nodes, aliases, expansion and tags before anything is built from it, on 1.0's own guarded reader (`orch_core::definition_yaml`) where that already holds the limit; event lines read as a bounded stream; the check of the whole source before the first write; and the hostile-document corpus (the review's depth and alias documents, merge-key bombs, tags, each limit and one over), run in a child process under a time and a memory ceiling. The six cases of `config.yml` and the classes of an `_index.json` that the spec's "Import rules" tabulate, with the statements of what 1.0 did with a refused file and the vectors C-V1 to C-V14 and X-V1 to X-V14 as tests; neither path gets a caller before the owner has merged the contract text that carries them ("T21 config and index contract") | R64 to R70, R90, R99, R103 to R105, R109 to R112, R116 (a 1.0 source), R117 (a 1.0 source), R119, R121 (the record), R122, R123, R125 | `crates/orch-infra/src/import/`, `crates/orch-cli/src/commands/import*`, `xtask/src/fixture_gen.rs`, `fixtures/storage/`, `crates/orch-infra/tests/source_budget.rs`, `crates/orch-cli/tests/import_hostile.rs` | T10, T11, T2 | `cargo test -p orch-cli --test import --test import_hostile`; `cargo test -p orch-infra --test source_budget`; `cargo xtask fixture-gen --check` | 20 |
 | T22 | `orch db` with the daemon running: status, verify, query, prune | R72 to R74, R79, R121 (status), R130 | `crates/orch-daemon/src/ops/`, `crates/orch-cli/src/commands/db*` | T10, T16, T17 | `cargo test -p orch-cli --test db_commands` | 21 |
 | T23 | Backup, restore, vacuum, export, and import from an export file; a backup is written and read through the confined-directory module, its manifest's names are checked against the layout and never opened, and an export's names, ids and paths are stored as data. Before an export's database is published and before a restore changes anything, the check of the spec's R117: no two task ids of one fold key, no directory in the project's `workspaces/` that the tasks brought may not own, and a backup's database refused when it lacks the index. The export format of the spec's "Import bounds" (blob bytes in chunks, a manifest, tables only) and its hostile reader: the header checked before SQLite opens the file, a read-only immutable connection with the schema untrusted, triggers, views and extensions off, run-time limits, a heap limit, an authorizer and a progress handler, `quick_check` first, the schema compared and never adopted, rows copied by fixed statements into a database built by the product's own migrations under a scratch name and published by a rename; and the hostile-export corpus, made by altering the bytes of an export the product wrote, run in a child process under the same ceilings. A restore replaces the state as the spec's R138 says: the whole state staged under a scratch name with its new lineage and generation and its leases ended, a synced marker, renames in a fixed order, `--continue` and `--abandon`, a refusal to start anything while the marker exists, and a check of free space that counts the backup; tested by stopping a child at every step | R75 to R80, R100, R108, R101 and R102 (backups), R105 and R107 (export), R113 to R115, R116 (an export), R67 (no resume for an export), R117 (an export, a restore), R124 (restoring the copy), R125 (an export), R132 (a restore), R133 (the confirmation), R138 | `crates/orch-infra/src/sqlite/backup*`, `crates/orch-infra/src/import/export*`, `crates/orch-cli/src/commands/db*`, `crates/orch-cli/tests/export_hostile.rs` (the `limits` and `hooks` features of `rusqlite` that this task uses are on since T9, ADR 0017 decision 19) | T21, T22 | `cargo test -p orch-cli --test db_backup_restore --test db_export_import --test export_hostile --test restore_fencing --test db_offline`; `./xtask/gate.sh full` (security-relevant) | 22 |
 
@@ -641,6 +646,10 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
 - The owner has answered all 38 ids of the spec (O1 to O10, AP1 to AP20, D1 to D8): 37 as recommended, and
   AP13 in its direction. No id is pending. The spec's "Owner's answers" gives the record for each and
   what each answer does not settle. An answer is not a proof, a review or a delivery.
+- Five points were added to the spec on 2026-11-22 and are not answered: T21-C1, T21-C2, T21-X1, T21-X2
+  and T21-O1 (the spec's record J). The spec drafts the first four from their defaults and the fifth from
+  a proposal, and T21 builds no caller on the `config.yml` path or on the index reconciliation before the
+  owner has merged that text ("T21 config and index contract").
 - A third thing is the owner's and lies outside the answers: the word on using the live copy for T4c (AP8).
 - Two things are still the owner's inside those answers. The numbers and results of AP13 (T4b), which the
   owner deferred on 2026-11-21 with the measurement (the spec's record I), so that nothing in 1.1 waits for
@@ -731,6 +740,52 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   F9 and R31).
 - T24 and T25 could be one PR if the wiring is small. They are planned as two so that the switch is reviewed
   as behaviour and the removal as a move.
+
+### T21 config and index contract (issue 146)
+
+The compatibility evidence on the bounded reader ([issue 146](https://github.com/yuxhuang/r-orch/issues/146))
+left two questions to the spec owner before the reader gets a caller: what the import does with a `config.yml`
+that 1.0 ran on its defaults, and what it does with an index array that holds an entry without a string
+identity, or one identity twice. The spec now carries the contract for both: R65, R70, R109, R110, R122 and
+R123, the tables under "Import rules" ("Order", `config.yml`, "Import problem classes"), the row of the
+document count in "Compatibility with 1.0", and the vectors C-V1 to C-V14 and X-V1 to X-V14 with a test name
+each. It also corrects three statements of the spec and one of ADR 0017 decision 21 that were wrong in fact
+for an empty `config.yml` (the spec's fact F18).
+
+The decision is still open in one sense, and this plan does not close it. Five points were put to the owner
+on 2026-11-22 (the spec's T21-C1, T21-C2, T21-X1, T21-X2 and T21-O1) and none is answered. The text is
+drafted from the default that each of the first four carried, which keeps a stop that the spec or the reader
+already had, and from
+a proposal for the fifth, which carried none: what a key that `config.yml` does not set imports as, and so
+whether a project with no such key gets `run_cap` 6 or none. The spec owner recommends another answer than
+the default on three of the four. The owner ratifies the drafted rows by merging the PR that carries them,
+and an explicit answer replaces a default through a new contract PR before T21 builds on it.
+
+What follows for T21, and nothing here is built by this text:
+
+1. T21 gives the `config.yml` path and the index reconciliation no caller before the owner has merged that
+   PR. The rest of T21 is not held by it.
+2. With the wiring, T21 implements the whole-array examination of an index (the reader returns at the first
+   problem today, which names the class by the order of the entries), the name `index_duplicate`, the
+   statements of what 1.0 did with a file, and the tests of the C-V and X-V vectors. X-V13 is a unit test of
+   the `import` module, where a reader can be injected. The statement for `index_duplicate` gives both of
+   1.0's cases and claims neither (the spec's F19 and R122): 1.0 used the index as it stood only where
+   every entry was a complete entity of the directory's type, and otherwise rebuilt it. The import stops
+   on identities alone in both cases, and T21 adds no decoding of an entry as its entity type. X-V5's test
+   runs 1.0's own reader beside the import, on disposable copies, to show the two cases.
+3. Three things the vectors pin are unverified until then: whether the bounded pass counts a bare `---` as
+   one document (C-V6); the bounded reader's refusal of a stream of no document for an agent, a goal and a
+   team (C-V11); and what 1.0's reader does with a repeated identity in each directory that has an index,
+   which is read from the code and was run once outside the repository (X-V5).
+4. The evidence of issue 146 is on `main` since 2026-11-22: its tests, the section "T21 reader compatibility
+   evidence" of this plan, and a record of its own, `docs/internal/import-reader-compatibility.md`. This
+   contract changes none of the three. T21 brings the record and that section up to date with this
+   contract, or folds the record into this plan, in the PR that does the wiring. Two of their statements
+   are then out of date. They say that the spec owner must reconcile R109 with the compatibility table
+   before the first caller; this section and the spec rows it names are that reconciliation, once the
+   owner has merged them. And the record's row on damaged indexes says that decoded duplicates survive
+   1.0's reader. That is so for the test type of one field that the test uses. In a real directory an
+   array of identities alone does not decode, and 1.0 rebuilds it (the spec's F19).
 
 ### T21 bounded reader slice
 
