@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 
 use orch_core::store::StoreError;
-use orch_core::store::retries::{Retry, check_limit};
+use orch_core::store::retries::{Retry, RetryCursor, RetryPage, check_limit};
 use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -68,5 +68,29 @@ impl Retries {
             .take(limit)
             .map(|(t, r)| retry(t, r))
             .collect())
+    }
+
+    /// Every row from just after `after`, in the order of [`Self::due`].
+    pub(super) fn page(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage> {
+        check_limit(limit)?;
+        if let Some(cursor) = after {
+            cursor.validate()?;
+        }
+        let mut rest: Vec<_> = self
+            .rows
+            .iter()
+            .filter(|(t, r)| {
+                after.is_none_or(|c| (r.due_at, t.as_str()) > (c.due_at, c.task.as_str()))
+            })
+            .collect();
+        rest.sort_by(|(ta, a), (tb, b)| (a.due_at, ta).cmp(&(b.due_at, tb)));
+        let more = rest.len() > limit;
+        let rows: Vec<Retry> = rest
+            .into_iter()
+            .take(limit)
+            .map(|(t, r)| retry(t, r))
+            .collect();
+        let next = rows.last().filter(|_| more).map(RetryCursor::after);
+        Ok(RetryPage { rows, next })
     }
 }
