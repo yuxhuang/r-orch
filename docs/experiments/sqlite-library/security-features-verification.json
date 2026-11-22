@@ -1,0 +1,180 @@
+{
+  "audit_date": "2026-11-20",
+  "task": "tsk_XSfN3G8",
+  "source_parent": "1c72fef450c7bdd01157b3d972f4e093bfee91ef",
+  "baseline": "fb6a1e13fd9ba370fa0de9b8565196a52e4ae407",
+  "spec_contract_head": "04e24be8bc7ae05992271c66d7b797ac2572e48b",
+  "toolchain": "1.99.1",
+  "rustc_commit": "58cf8f9c35b355199727627d07ae34a4e2846d67",
+  "rusqlite": {
+    "version": "0.41.1",
+    "default_features": false,
+    "features": [
+      "bundled",
+      "backup",
+      "cache",
+      "hooks",
+      "limits"
+    ],
+    "resolved_features": [
+      "backup",
+      "bundled",
+      "cache",
+      "hashlink",
+      "hooks",
+      "limits",
+      "modern_sqlite",
+      "wal"
+    ],
+    "msrv": "1.89.0",
+    "license": "MIT"
+  },
+  "rusqlite_migration": {
+    "version": "2.7.0",
+    "default_features": false,
+    "resolved_features": [],
+    "msrv": "1.89",
+    "license": "Apache-2.0"
+  },
+  "libsqlite3_sys": {
+    "version": "0.39.1",
+    "msrv": "1.88.0",
+    "license": "MIT",
+    "sqlite_version": "3.54.1",
+    "sqlite_source_id": "2026-10-16 14:45:20 555e07ef33f69a0957d24d8e555b702464a131d6f1607f4c3c1e4551e8e6ca76",
+    "sqlite3_c_sha3_256": "e2b869d3003b33c942b7dd7063604fbc53553e1b66609570df39b9b7b558ee81"
+  },
+  "dependency_audit": {
+    "cargo_deny": "0.20.2",
+    "rustsec_revision": "f291af9b1cc0d21dfcea1709d6b037963cef262b",
+    "deny_toml_sha256": "70b17eabf01801a94dc17652e5e8c122bcc4809fa3526ebdcd21d04119c454f6",
+    "policy_changed": false,
+    "baseline_exit": 0,
+    "candidate_exit": 0,
+    "baseline_duplicate_warnings": 13,
+    "candidate_duplicate_warnings": 13,
+    "warning_headers_identical": true,
+    "added_exceptions": 0,
+    "three_to_five_feature_registry_package_delta": 0,
+    "three_to_five_feature_workspace_lock_changed": false,
+    "standalone_lock_changed": false,
+    "target_filter": "x86_64-unknown-linux-gnu",
+    "all_features": true
+  },
+  "capabilities": {
+    "import_limits_read_back": 14,
+    "query_limits_read_back": 7,
+    "limit_negative_cases": 8,
+    "authorizer_denials_observed": 11,
+    "automatic_reprepare_callback_observed": true,
+    "progress_interrupt": true,
+    "quick_check_interrupt": true,
+    "cross_thread_interrupt": true,
+    "interrupted_connection_reusable": true,
+    "defensive_schema_trigger_view_readbacks": 4,
+    "heap_bytes_readback": 268435456,
+    "injected_heap_bytes": 8388608,
+    "heap_allocation_refused_bytes": 16777216,
+    "heap_error": "SQLITE_NOMEM",
+    "immutable_source_value": 42,
+    "immutable_source_db_and_three_companions_unchanged": true,
+    "snapshot_and_backup_sum": 10,
+    "live_sum": 11,
+    "entity_count": 1,
+    "fts_count": 1,
+    "backup_integrity": "ok",
+    "migration_rollback_restart_newer_refusal": true
+  },
+  "independent_reader": {
+    "sqlite": "3.54.1",
+    "reader": "Python sqlite3",
+    "checks": [
+      {
+        "file": "probe.db",
+        "rows": 1,
+        "sum_n": 11,
+        "fts_rows": 1,
+        "integrity": "ok"
+      },
+      {
+        "file": "backup.db",
+        "rows": 1,
+        "sum_n": 10,
+        "fts_rows": 1,
+        "integrity": "ok"
+      }
+    ]
+  },
+  "negative_control": {
+    "old_three_feature_compile_exit": 101,
+    "reason": "hooks/limits APIs unavailable"
+  },
+  "measurements": [
+    {
+      "platform": "macOS arm64",
+      "build_seconds": 17.007,
+      "bytes": 2707664,
+      "build_exit": 0,
+      "smoke_exit": 0,
+      "heap_exit": 0,
+      "linkage_exit": 0,
+      "dynamic_sqlite_linked": false
+    },
+    {
+      "platform": "Linux (Docker linux/arm64, native ISA VM)",
+      "build_seconds": 27.909,
+      "bytes": 2511288,
+      "build_exit": 0,
+      "smoke_exit": 0,
+      "heap_exit": 0,
+      "linkage_exit": 0,
+      "image_id": "sha256:8a4e90c7946b74626488b1446f712c0fe0ed1a596cbd3d871684bc9c5433ae07",
+      "dynamic_sqlite_linked": false
+    },
+    {
+      "platform": "Linux (Docker linux/amd64, emulated)",
+      "build_seconds": 54.969,
+      "bytes": 2682920,
+      "build_exit": 0,
+      "smoke_exit": 0,
+      "heap_exit": 0,
+      "linkage_exit": 0,
+      "image_id": "sha256:9bd963cbaa28a8fe95d96d57da858372d6d82a6c0a8f35a10788d3b97459f885",
+      "dynamic_sqlite_linked": false
+    }
+  ],
+  "native_standalone_fmt_exit": 0,
+  "native_standalone_clippy_exit": 0,
+  "probe_sha256": {
+    "rusqlite/Cargo.toml": "ff0d23118244385221c3b03a27f78e0628836eca55ef2d2bf30f51098988a102",
+    "rusqlite/Cargo.lock": "62d52d0787e38a7449b033c546082bbd6894bf5d4cac7c8c9d31f5c0261ff656",
+    "rusqlite/src/main.rs": "60fc4fd776537cbfd65aa42d21dc7bfa9f3c2b00e7cb4503197f410562e96c4d",
+    "rusqlite/src/security.rs": "8ab041928a69b9377ad4ad770f72e1d177b3ebc442b270556bd34b7b00039dee"
+  },
+  "historical_record": {
+    "file": "verification.json",
+    "source_commit": "1c72fef450c7bdd01157b3d972f4e093bfee91ef",
+    "sha256": "0fc177da1a6039b6aa017bc2209e9cd1b0340b8d9d890f5c53c65194ac7e23f0",
+    "sqlx_reaudited": false
+  },
+  "delivery": {
+    "status": "BLOCKED",
+    "root_acceptance": false,
+    "convergence_task": "tsk_KPH2_ni",
+    "successor_disposition_task": "tsk_T09HVD_",
+    "fast_run": false,
+    "ordinary_prepr_run": false,
+    "pr_run": false,
+    "push": false,
+    "pull_request": null,
+    "linux_ci": null,
+    "product_dependencies_changed": false
+  },
+  "limits": [
+    "Standalone synthetic capability probes only; no product importer/query/restore/security certification.",
+    "MSRV values are declarations; builds ran on 1.99.1 only.",
+    "Docker arm64 is native ISA in a VM on this Mac; amd64 is emulated; neither is native Linux hardware or GitHub CI.",
+    "Single cold expanded-probe cost per platform, not incremental product cost or a performance distribution.",
+    "cargo-deny uses unchanged Linux/all-features policy; it is not a full SQLite C vulnerability audit."
+  ]
+}
