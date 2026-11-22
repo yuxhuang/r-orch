@@ -731,3 +731,22 @@ streaming event decoder and index reconciliation. Its unit tests use the landed 
 generator and index-recovery corpus. This is document-level evidence only: whole-source
 preflight, path confinement, reports, writes, resume and live-copy verification remain T21 work.
 The v1 daemon remains file-backed.
+
+
+### T21 reader compatibility evidence (issue 146)
+
+The inactive reader now pins ordinary config, blank event lines and damaged indexes
+against the real file readers in `import::tests::compatibility`. It retries interrupted
+buffered event reads and propagates terminal I/O failures. The document-count rule,
+physical gap semantics and index disposition are unchanged. JSON's effective depth
+ceiling remains 64, even when a caller requests more.
+
+Before the first runtime caller, the spec owner must reconcile R109's exactly-one-document
+rule with the R110 compatibility table: the effective legacy config reader supplies
+defaults for missing, empty, space/newline-only, comment-only and explicit-null config;
+the bounded reader refuses the three zero-document streams. Explicit null passes the
+budget check but is not a typed entity. Multi-document config is refused by both readers.
+This evidence does not grant a config exception or amend AP15. See
+[the compatibility record](../internal/import-reader-compatibility.md) for the decision
+and individually tracked integration conditions. Full T21 still requires its actual
+writer, source confinement/preflight, reporting, dry run, resume and acceptance evidence.
