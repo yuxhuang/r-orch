@@ -34,6 +34,7 @@
 mod events;
 mod leases;
 mod order;
+mod retries;
 #[cfg(test)]
 mod tests;
 mod text;
@@ -48,6 +49,7 @@ use orch_core::store::events::{
     AppendResult, EventGap, EventRead, EventWrite, PruneResult, SequencedEvent,
 };
 use orch_core::store::leases::{ClaimOutcome, Lease, LeaseRead, LeaseWrite, NewLease};
+use orch_core::store::retries::{Retry, RetryRead, RetryWrite};
 use orch_core::store::{
     Caller, Cursor, Entity, EntityKind, Filter, Lane, Page, PageRequest, ReadSnapshot, Record,
     Result, Revision, Sort, Storage, StoreError, UnitOfWork, WriteWork,
@@ -58,6 +60,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use events::Events;
 use leases::{By, Leases};
 use order::{Key, check_sort, key, matches};
+use retries::Retries;
 
 const DOCUMENT: &str = "state.json";
 const LINEAGE: &str = "lineage";
@@ -73,6 +76,7 @@ struct Project {
     counters: BTreeMap<EntityKind, u64>,
     events: Events,
     leases: Leases,
+    retries: Retries,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -83,6 +87,8 @@ struct Document {
     events: Events,
     #[serde(default)]
     leases: Leases,
+    #[serde(default)]
+    retries: Retries,
 }
 
 struct Bookmark {
@@ -210,6 +216,7 @@ fn load(dir: &Path) -> Result<Project> {
         counters: document.counters,
         events: document.events,
         leases: document.leases,
+        retries: document.retries,
     };
     project
         .leases
@@ -242,6 +249,7 @@ fn persist(dir: &Path, project: &Project) -> Result<()> {
             .collect::<Result<_>>()?,
         events: project.events.clone(),
         leases: project.leases.clone(),
+        retries: project.retries.clone(),
     };
     let temp =
         tempfile::NamedTempFile::new_in(dir).map_err(|e| io_error("cannot write in", dir, e))?;
@@ -603,5 +611,34 @@ impl EventWrite for Session {
         let result = self.project.events.prune(run, max_rows)?;
         self.dirty |= result.deleted > 0;
         Ok(result)
+    }
+}
+
+#[async_trait]
+impl RetryRead for Session {
+    async fn read_retry(&self, task: &str) -> Result<Option<Retry>> {
+        Ok(self.project.retries.get(task))
+    }
+    async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>> {
+        self.project.retries.due(now_ms, limit)
+    }
+}
+
+impl RetryWrite for Session {
+    fn put_retry(&mut self, retry: &Retry) -> Result<()> {
+        self.project.retries.put(retry)?;
+        self.dirty = true;
+        Ok(())
+    }
+    fn delete_retry(&mut self, task: &str) -> Result<bool> {
+        let existed = self.project.retries.delete(task);
+        self.dirty |= existed;
+        Ok(existed)
+    }
+    fn get_retry(&self, task: &str) -> Result<Option<Retry>> {
+        Ok(self.project.retries.get(task))
+    }
+    fn due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>> {
+        self.project.retries.due(now_ms, limit)
     }
 }
