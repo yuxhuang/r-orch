@@ -1721,8 +1721,8 @@ can guarantee log delivery. The test and ambient jobs have a 40-minute ceiling.
 A six-run Linux main sample peaked at 29m42s for test and 28m46s for ambient,
 leaving only 18s and 74s under the previous 30-minute ceiling. This bounded
 sample motivates the added headroom; it does not establish the <=20-minute PR
-performance target. Continue recording real durations in TV51/53 and preserve
-failed attempts when applying the owner's CI retry policy.
+performance target. Continue recording real durations in TV51/53.
+Do not rerun failures away.
 
 PR code executes static plus one suite; docs-only executes build/static without
 tests. Main forces all and retains a separate unwrapped ordinary ambient suite.
