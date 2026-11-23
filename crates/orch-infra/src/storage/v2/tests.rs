@@ -71,6 +71,29 @@ fn documents(root: &Path) -> Vec<std::path::PathBuf> {
     found
 }
 
+enum Corruption {
+    Parse(&'static str),
+    Invalid(&'static str),
+}
+
+fn assert_corruption(error: StoreError, path: &Path, expected: Corruption) {
+    match expected {
+        Corruption::Invalid(detail) => assert_document_error(error, path, detail),
+        Corruption::Parse(detail) => match error {
+            StoreError::Backend(orch_core::Error::Serde {
+                context,
+                path: reported,
+                source,
+            }) => {
+                assert_eq!(context, "cannot parse the storage document");
+                assert_eq!(reported.as_deref(), Some(path));
+                assert!(source.to_string().contains(detail), "{source}");
+            }
+            other => panic!("expected a parse error, got {other:?}"),
+        },
+    }
+}
+
 fn assert_parse_error(error: StoreError, document: &Path) {
     match error {
         StoreError::Backend(orch_core::Error::Serde {
@@ -707,7 +730,9 @@ async fn a_failed_unit_of_work_keeps_no_intent_on_disk() {
     assert_eq!(add_intent(&s, stop_run("r1"), 2).await, 1);
 }
 
-async fn edited_intents(mutate: impl FnOnce(&mut serde_json::Value)) -> StoreError {
+async fn edited_intents(
+    mutate: impl FnOnce(&mut serde_json::Value),
+) -> (std::path::PathBuf, StoreError) {
     let root = root();
     let s = FileStorage::new(root.path());
     claim(&s, new_lease("t", "a", "r1")).await;
@@ -717,17 +742,18 @@ async fn edited_intents(mutate: impl FnOnce(&mut serde_json::Value)) -> StoreErr
         serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
     mutate(&mut value["intents"]);
     std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
-    FileStorage::new(root.path())
+    let error = FileStorage::new(root.path())
         .read(owner("p"))
         .await
         .err()
-        .expect("a document that is not the contract is refused")
+        .expect("a document that is not the contract is refused");
+    (document, error)
 }
 
 #[tokio::test]
 async fn a_hand_edited_intent_outside_the_contract_is_refused_on_read() {
     // A path where an id belongs, an id past the counter, a kind nobody defined.
-    for edit in [
+    let edits = [
         (|v: &mut serde_json::Value| v["rows"]["1"]["payload"]["run"] = "../escape".into())
             as fn(&mut serde_json::Value),
         |v| v["last"] = 0.into(),
@@ -735,8 +761,19 @@ async fn a_hand_edited_intent_outside_the_contract_is_refused_on_read() {
         |v| {
             v["rows"]["1"]["payload"]["pid"] = 42.into();
         },
-    ] {
-        assert!(matches!(edited_intents(edit).await, StoreError::Backend(_)));
+    ];
+    let expected = [
+        Corruption::Invalid(
+            "intent 1: invalid intent: an intent names one id of 1 to 128 bytes of A-Z a-z 0-9 . _ -, other than . and ..",
+        ),
+        Corruption::Invalid("intent 1 is past its counter"),
+        Corruption::Parse("unknown variant `process.kill`"),
+        Corruption::Parse("unknown field `pid`"),
+    ];
+    assert_eq!(edits.len(), expected.len());
+    for (edit, expected) in edits.into_iter().zip(expected) {
+        let (path, error) = edited_intents(edit).await;
+        assert_corruption(error, &path, expected);
     }
 }
 
@@ -887,7 +924,9 @@ async fn a_failed_unit_of_work_keeps_no_request_key_on_disk() {
     assert_eq!(check_key(&s, "failed", 2).await, KeyCheck::New);
 }
 
-async fn edited_request_keys(mutate: impl FnOnce(&mut serde_json::Value)) -> StoreError {
+async fn edited_request_keys(
+    mutate: impl FnOnce(&mut serde_json::Value),
+) -> (std::path::PathBuf, StoreError) {
     let root = root();
     let s = FileStorage::new(root.path());
     store_key(&s, "first", "r", 1).await;
@@ -897,16 +936,17 @@ async fn edited_request_keys(mutate: impl FnOnce(&mut serde_json::Value)) -> Sto
         serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
     mutate(&mut value["request_keys"]);
     std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
-    FileStorage::new(root.path())
+    let error = FileStorage::new(root.path())
         .read(owner("p"))
         .await
         .err()
-        .expect("a document that is not the contract is refused")
+        .expect("a document that is not the contract is refused");
+    (document, error)
 }
 
 #[tokio::test]
 async fn a_hand_edited_request_key_outside_the_contract_is_refused_on_read() {
-    for edit in [
+    let edits = [
         // A key outside the shape, a hash that is not a hash, an operation with a path in it.
         (|v: &mut serde_json::Value| v["rows"][0]["key"] = "short".into())
             as fn(&mut serde_json::Value),
@@ -920,11 +960,28 @@ async fn a_hand_edited_request_key_outside_the_contract_is_refused_on_read() {
         // A run without an epoch, and a field nobody defined.
         |v| v["rows"][0]["run"] = "r1".into(),
         |v| v["rows"][0]["pid"] = 42.into(),
-    ] {
-        assert!(matches!(
-            edited_request_keys(edit).await,
-            StoreError::Backend(_)
-        ));
+    ];
+    let expected = [
+        Corruption::Invalid(
+            "request key 0: invalid request key: a key is 16 to 128 characters of A-Z a-z 0-9 _ -",
+        ),
+        Corruption::Invalid(
+            "request key 0: invalid request key: a request hash is 64 lowercase hex digits",
+        ),
+        Corruption::Invalid(
+            "request key 0: invalid request key: an operation is 1 to 128 bytes of A-Z a-z 0-9 . _ -",
+        ),
+        Corruption::Invalid("request key 0 keeps a result over the bound"),
+        Corruption::Invalid("request key 0 does not expire an hour after it was stored"),
+        Corruption::Invalid("request key 1 is out of order or repeated"),
+        Corruption::Invalid("request key 1 is out of order or repeated"),
+        Corruption::Invalid("request key 0 has an impossible scope"),
+        Corruption::Parse("unknown field `pid`"),
+    ];
+    assert_eq!(edits.len(), expected.len());
+    for (edit, expected) in edits.into_iter().zip(expected) {
+        let (path, error) = edited_request_keys(edit).await;
+        assert_corruption(error, &path, expected);
     }
 }
 
