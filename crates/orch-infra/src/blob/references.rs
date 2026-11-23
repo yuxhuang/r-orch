@@ -83,13 +83,32 @@ impl<'a> BlobReferences<'a> {
     }
 
     fn register(&self, conn: &Connection, bytes: &[u8], now: i64) -> Result<BlobHash> {
+        let size = i64::try_from(bytes.len()).map_err(|_| ReferenceError::Metadata)?;
         // No row may name bytes until put has completed its sync and publication.
         let hash = self.disk.put(bytes)?;
-        let changed = conn.execute("INSERT INTO blobs (project_id,sha256,size,storage_location,created_at,unreferenced_since) VALUES (?1,?2,?3,'disk',?4,NULL) ON CONFLICT(project_id,sha256) DO UPDATE SET unreferenced_since=NULL WHERE blobs.size=excluded.size AND blobs.storage_location=excluded.storage_location", params![self.project,hash.to_string(),bytes.len() as i64,now])?;
+        Self::register_published(conn, self.project, &hash, size, now)?;
+        Ok(hash)
+    }
+
+    /// Register disk bytes the caller has already durably published.
+    /// `project` must be authorized by the caller. `conn` is its existing transaction
+    /// or savepoint; this helper neither opens nor commits one and performs no disk I/O.
+    /// The caller checks the byte length fits `i64` before supplying `size`.
+    pub(crate) fn register_published(
+        conn: &Connection,
+        project: &str,
+        hash: &BlobHash,
+        size: i64,
+        now: i64,
+    ) -> Result<()> {
+        if size < 0 {
+            return Err(ReferenceError::Metadata);
+        }
+        let changed = conn.execute("INSERT INTO blobs (project_id,sha256,size,storage_location,created_at,unreferenced_since) VALUES (?1,?2,?3,'disk',?4,NULL) ON CONFLICT(project_id,sha256) DO UPDATE SET unreferenced_since=NULL WHERE blobs.size=excluded.size AND blobs.storage_location=excluded.storage_location", params![project,hash.to_string(),size,now])?;
         if changed != 1 {
             return Err(ReferenceError::Metadata);
         }
-        Ok(hash)
+        Ok(())
     }
 
     pub fn load_prompt(&self, conn: &Connection, run: &str) -> Result<Option<String>> {
@@ -138,5 +157,168 @@ impl<'a> BlobReferences<'a> {
             return Err(ReferenceError::Metadata);
         }
         Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data_dir::{DataDir, Holder, LockKind};
+    use crate::sqlite::{ConnectionRole, Synchronous, migrations::migrate, open_connection};
+
+    fn with_database(test: impl FnOnce(&mut crate::sqlite::ConnectionHandle<'_>)) {
+        let root = tempfile::tempdir().unwrap();
+        let data = DataDir::acquire(
+            &root.path().join("data"),
+            &Holder {
+                kind: LockKind::Daemon,
+                pid: std::process::id(),
+                started_at: "synthetic".into(),
+                binary_version: "test".into(),
+                executable: "test".into(),
+            },
+        )
+        .unwrap();
+        let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        migrate(&data, &mut conn).unwrap();
+        // No disk blob store is opened: the helper needs only the caller's SQL context.
+        test(&mut conn);
+        for directory in ["data/blobs/sha256", "data/blobs/tmp"] {
+            assert_eq!(
+                std::fs::read_dir(root.path().join(directory))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    type Row = (String, String, i64, String, i64, Option<i64>);
+    fn rows(conn: &Connection) -> Vec<Row> {
+        conn.prepare("SELECT project_id,sha256,size,storage_location,created_at,unreferenced_since FROM blobs ORDER BY project_id,sha256")
+            .unwrap().query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    #[test]
+    fn published_row_insert_and_reuse_preserve_creation_and_clear_mark() {
+        with_database(|conn| {
+            let tx = conn.transaction().unwrap();
+            let hash = BlobHash::of(b"synthetic published bytes");
+            assert!(rows(&tx).is_empty());
+            BlobReferences::register_published(&tx, "p", &hash, 25, 123).unwrap();
+            assert_eq!(
+                rows(&tx),
+                vec![("p".into(), hash.to_string(), 25, "disk".into(), 123, None)]
+            );
+            tx.execute("UPDATE blobs SET unreferenced_since=456", [])
+                .unwrap();
+            BlobReferences::register_published(&tx, "p", &hash, 25, 789).unwrap();
+            assert_eq!(
+                rows(&tx),
+                vec![("p".into(), hash.to_string(), 25, "disk".into(), 123, None)]
+            );
+            tx.commit().unwrap();
+            assert_eq!(rows(conn).len(), 1);
+        });
+    }
+
+    #[test]
+    fn published_row_conflicts_refuse_without_modifying_metadata() {
+        with_database(|conn| {
+            for (size, location) in [(24, "disk"), (25, "object")] {
+                let tx = conn.transaction().unwrap();
+                let hash = BlobHash::of(b"synthetic published bytes");
+                tx.execute(
+                    "INSERT INTO blobs VALUES ('p',?1,?2,?3,123,456)",
+                    params![hash.to_string(), size, location],
+                )
+                .unwrap();
+                let before = rows(&tx);
+                assert!(matches!(
+                    BlobReferences::register_published(&tx, "p", &hash, 25, 789),
+                    Err(ReferenceError::Metadata)
+                ));
+                assert_eq!(rows(&tx), before);
+                // Committing a caught refusal must not hide any mutation.
+                tx.commit().unwrap();
+                assert_eq!(rows(conn), before);
+                conn.execute("DELETE FROM blobs", []).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn published_rows_and_reuse_obey_outer_rollback_after_savepoint_commit() {
+        with_database(|conn| {
+            let hash = BlobHash::of(b"existing");
+            let new_hash = BlobHash::of(b"new");
+            conn.execute(
+                "INSERT INTO blobs VALUES ('p',?1,8,'disk',123,456)",
+                [hash.to_string()],
+            )
+            .unwrap();
+            let before = rows(conn);
+            let mut tx = conn.transaction().unwrap();
+            let sp = tx.savepoint().unwrap();
+            BlobReferences::register_published(&sp, "p", &hash, 8, 789).unwrap();
+            BlobReferences::register_published(&sp, "p", &new_hash, 3, 789).unwrap();
+            assert_eq!(rows(&sp).len(), 2);
+            assert!(rows(&sp).iter().all(|r| r.5.is_none()));
+            sp.commit().unwrap();
+            tx.rollback().unwrap();
+            assert_eq!(rows(conn), before);
+        });
+    }
+
+    #[test]
+    fn published_rows_are_isolated_by_authorized_project() {
+        with_database(|conn| {
+            let tx = conn.transaction().unwrap();
+            let hash = BlobHash::of(b"same hash");
+            tx.execute(
+                "INSERT INTO blobs VALUES ('other',?1,99,'object',111,222)",
+                [hash.to_string()],
+            )
+            .unwrap();
+            let other = rows(&tx)[0].clone();
+            BlobReferences::register_published(&tx, "p", &hash, 9, 333).unwrap();
+            assert_eq!(
+                rows(&tx),
+                vec![
+                    other.clone(),
+                    ("p".into(), hash.to_string(), 9, "disk".into(), 333, None)
+                ]
+            );
+            tx.execute(
+                "UPDATE blobs SET unreferenced_since=444 WHERE project_id='p'",
+                [],
+            )
+            .unwrap();
+            BlobReferences::register_published(&tx, "p", &hash, 9, 555).unwrap();
+            assert_eq!(rows(&tx)[0], other);
+            assert_eq!(rows(&tx)[1].4, 333);
+            assert_eq!(rows(&tx)[1].5, None);
+        });
+    }
+
+    #[test]
+    fn published_row_negative_length_refuses_without_a_write() {
+        with_database(|conn| {
+            let tx = conn.transaction().unwrap();
+            let hash = BlobHash::of(b"");
+            assert!(matches!(
+                BlobReferences::register_published(&tx, "p", &hash, -1, 123),
+                Err(ReferenceError::Metadata)
+            ));
+            assert!(rows(&tx).is_empty());
+            BlobReferences::register_published(&tx, "p", &hash, 0, 123).unwrap();
+            let before = rows(&tx);
+            assert!(matches!(
+                BlobReferences::register_published(&tx, "p", &hash, -1, 456),
+                Err(ReferenceError::Metadata)
+            ));
+            assert_eq!(rows(&tx), before);
+        });
     }
 }
