@@ -300,20 +300,43 @@ fn attention_uniqueness_ends_when_an_item_is_resolved() {
     let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
     migrate(&dir, &mut conn).unwrap();
     let insert = |scope: &str, id: &str| {
-        conn.execute("INSERT INTO attention(project_id,id,kind,subject_kind,subject_id,severity,title,opened_at,revision) VALUES(?1,?2,'disk_floor','daemon','subject','blocking','title',0,1)", [scope,id])
+        use orch_core::store::attention::{AttentionFacts, DiskSubject};
+        let (facts, kind, subject_kind, severity) = if scope.is_empty() {
+            (
+                AttentionFacts::DiskFloor {
+                    subject: DiskSubject::DataDirectory,
+                    free_bytes: 1,
+                    floor_bytes: 10,
+                },
+                "disk_floor",
+                "data_directory",
+                "blocking",
+            )
+        } else {
+            (
+                AttentionFacts::DispatchOffWithWork {
+                    waiting_tasks: 1,
+                    oldest_waiting_at: 0,
+                },
+                "dispatch_off_with_work",
+                "dispatch",
+                "warning",
+            )
+        };
+        conn.execute("INSERT INTO attention(project_id,id,kind,subject_kind,subject_id,severity,title,opened_at,revision,facts_json) VALUES(?1,?2,?3,?4,?5,?6,?7,0,1,?8)", rusqlite::params![scope,id,kind,subject_kind,facts.subject_id(),severity,facts.title(),serde_json::to_string(&facts).unwrap()])
     };
-    insert("", "same").unwrap();
-    insert("p", "same").unwrap();
-    assert!(insert("p", "other").is_err());
+    insert("", "1").unwrap();
+    insert("p", "1").unwrap();
+    assert!(insert("p", "2").is_err());
     conn.execute(
-        "UPDATE attention SET resolved_at=1 WHERE project_id='p' AND id='same'",
+        "UPDATE attention SET resolved_at=1,resolved_by='daemon',resolved_reason='dispatch_enabled' WHERE project_id='p' AND id='1'",
         [],
     )
     .unwrap();
-    insert("p", "other").unwrap();
+    insert("p", "2").unwrap();
     assert_eq!(
         conn.query_row::<String, _, _>(
-            "SELECT author_kind FROM attention WHERE project_id='p' AND id='other'",
+            "SELECT author_kind FROM attention WHERE project_id='p' AND id='2'",
             [],
             |r| r.get(0)
         )

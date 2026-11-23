@@ -216,7 +216,7 @@ fn duplicate_transitions_rollback_and_caught_failed_insert_preserve_counter() {
         .unwrap(),
         row
     );
-    tx.execute_batch("CREATE TRIGGER fail_attention AFTER INSERT ON attention BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;").unwrap();
+    tx.execute_batch("CREATE TRIGGER fail_attention AFTER UPDATE ON counters BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;").unwrap();
     assert!(open(&tx, "p1", &dispatch(), 50).is_err());
     tx.execute_batch("DROP TRIGGER fail_attention").unwrap();
     assert_eq!(open(&tx, "p1", &dispatch(), 50).unwrap().id, 2);
