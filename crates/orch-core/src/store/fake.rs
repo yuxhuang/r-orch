@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
-use orch_domain::{GoalStatus, TaskStatus};
+use orch_domain::{GoalStatus, MessageStatus, TaskStatus};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::attention::*;
@@ -194,7 +194,7 @@ impl View {
 
     fn page(&self, filter: &Filter, request: &PageRequest) -> Result<Page<Record>> {
         request.validate()?;
-        validate_sort(filter.kind(), request.sort)?;
+        validate_sort(filter, request.sort)?;
         let after = if let Some(cursor) = &request.cursor {
             let bookmarks = self
                 .bookmarks
@@ -361,11 +361,26 @@ fn matches_filter(entity: &Entity, filter: &Filter) -> bool {
         (Entity::Message(v), Filter::Messages { recipient }) => recipient
             .as_ref()
             .is_none_or(|r| v.to_agent_id.as_ref() == Some(r)),
+        (Entity::Message(v), Filter::PendingMessages { recipient, now }) => {
+            v.status == MessageStatus::Pending
+                && v.to_agent_id.as_ref() == Some(recipient)
+                && v.expires_at.as_ref().is_none_or(|expiry| expiry >= now)
+        }
         _ => false,
     }
 }
 
-fn validate_sort(kind: EntityKind, sort: Sort) -> Result<()> {
+fn validate_sort(filter: &Filter, sort: Sort) -> Result<()> {
+    let kind = filter.kind();
+    if sort == Sort::Attempt {
+        return if matches!(filter, Filter::Runs { task: Some(_), .. }) {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidPage(
+                "Attempt requires a task-scoped Runs filter".into(),
+            ))
+        };
+    }
     let valid = matches!(sort, Sort::Default | Sort::Id)
         || match kind {
             EntityKind::Task => matches!(
@@ -432,6 +447,7 @@ fn sort_key(row: &Record, sort: Sort) -> Key {
         ],
         (_, Entity::Agent(_)) => vec![Position(row.position)],
         (_, Entity::Team(v)) => vec![Text(v.created_at.clone())],
+        (Sort::Attempt, Entity::Run(v)) => vec![Number(-i64::from(v.attempt))],
         (_, Entity::Run(v)) => vec![Newest(Reverse(Some(v.started_at.clone())))],
         (_, Entity::Message(v)) => vec![Text(v.created_at.clone()), Position(row.position)],
         (_, Entity::Context(_) | Entity::Config(_) | Entity::Template(_)) => vec![],

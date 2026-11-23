@@ -4,7 +4,7 @@
 use std::cmp::Reverse;
 
 use orch_core::store::{Entity, EntityKind, Filter, Record, Sort, StoreError};
-use orch_domain::{GoalStatus, TaskStatus};
+use orch_domain::{GoalStatus, MessageStatus, TaskStatus};
 
 /// One comparable component of a sort key.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,12 +37,26 @@ pub(super) fn matches(entity: &Entity, filter: &Filter) -> bool {
         (Entity::Message(m), Filter::Messages { recipient }) => recipient
             .as_ref()
             .is_none_or(|r| m.to_agent_id.as_ref() == Some(r)),
+        (Entity::Message(m), Filter::PendingMessages { recipient, now }) => {
+            m.to_agent_id.as_ref() == Some(recipient)
+                && m.status == MessageStatus::Pending
+                && m.expires_at.as_ref().is_none_or(|deadline| deadline >= now)
+        }
         _ => false,
     }
 }
 
 /// Every list offers `Default` and `Id`; the rest is per family.
-pub(super) fn check_sort(kind: EntityKind, sort: Sort) -> Result<(), StoreError> {
+pub(super) fn check_sort(filter: &Filter, sort: Sort) -> Result<(), StoreError> {
+    let kind = filter.kind();
+    if sort == Sort::Attempt {
+        if let Filter::Runs { task: Some(_), .. } = filter {
+            return Ok(());
+        }
+        return Err(StoreError::InvalidPage(
+            "Attempt is offered only for runs of one task".into(),
+        ));
+    }
     let offered: &[Sort] = match kind {
         EntityKind::Task => &[
             Sort::Position,
@@ -116,6 +130,7 @@ pub(super) fn key(row: &Record, sort: Sort) -> Key {
         (Entity::Agent(a), Sort::Name) => vec![Text(a.name.clone()), position],
         (Entity::Team(t), Sort::Default) => vec![Text(t.created_at.clone())],
         (Entity::Team(t), Sort::Name) => vec![Text(t.name.clone())],
+        (Entity::Run(r), Sort::Attempt) => vec![Int(-i64::from(r.attempt))],
         (Entity::Run(r), Sort::Default) => vec![newest(&r.started_at)],
         (Entity::Message(m), Sort::Default) => vec![Text(m.created_at.clone()), position],
         (Entity::Context(_) | Entity::Config(_) | Entity::Template(_), Sort::Default) => vec![],

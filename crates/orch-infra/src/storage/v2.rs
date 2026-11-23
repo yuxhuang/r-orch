@@ -422,7 +422,7 @@ impl Session {
 
     fn page(&self, filter: &Filter, request: &PageRequest) -> Result<Page<Record>> {
         request.validate()?;
-        check_sort(filter.kind(), request.sort)?;
+        check_sort(filter, request.sort)?;
         let after = match &request.cursor {
             Some(cursor) => Some(self.resume(cursor, filter, request.sort)?),
             None => None,

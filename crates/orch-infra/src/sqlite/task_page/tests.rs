@@ -207,7 +207,12 @@ fn invalid_requests_and_misbound_continuations_are_refused() {
             Err(task_page::Error::Page(StoreError::InvalidPage(_)))
         ));
     }
-    assert!(query(&tx, "p", &filter(), &request(Sort::Name, 1), None).is_err());
+    for sort in [Sort::Name, Sort::Attempt] {
+        assert!(matches!(
+            query(&tx, "p", &filter(), &request(sort, 1), None),
+            Err(task_page::Error::Page(StoreError::InvalidPage(_)))
+        ));
+    }
     assert!(query(&tx, "p", &Filter::Agents, &request(Sort::Id, 1), None).is_err());
     let req = request(Sort::Id, 1);
     let first = query(&tx, "p", &filter(), &req, None).unwrap();
