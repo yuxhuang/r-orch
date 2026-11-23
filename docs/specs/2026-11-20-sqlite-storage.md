@@ -607,6 +607,20 @@ inactive operational port, registered by `memory_attention_v2` and
   including its facts and revision. Reopening after resolution allocates a fresh
   monotonic scope-local id, bounded by SQLite's signed integer range and mapped
   to decimal TEXT. Retention never reuses an id. Revisions begin at 1.
+- SQLite mapping (#183): numbered migration 2 adds nullable `facts_json` to
+  the existing table without changing migration 1. New rows store the closed
+  `AttentionFacts` serde JSON (at most 512 bytes), including the tagged disk
+  subject. `subject_kind` is `data_directory`, `project_workspaces`, or `dispatch`;
+  `subject_id` is the port's uniqueness key. Kind/severity/title are derived and
+  checked against facts on read; detail is not parsed. Legacy rows lacking facts
+  are preserved but refused on read, since prose cannot recover typed facts.
+  IDs remain canonical positive decimal TEXT through i64::MAX. Paging compares
+  and orders `CAST(id AS INTEGER)`; bounded expiry uses that same numeric order.
+  A numeric expression index supports scoped enumeration. A scope-local
+  `attention:id` counter survives deletion; an insert trigger advances it in
+  the same SQL statement, so a caught failed insert cannot consume an ID.
+  Empty scope remains daemon-wide and has no project foreign key. Reads validate
+  facts against the explicit scope, including both disk subject variants.
 - `ack_attention(id, expected, at)` records the first identity from
   `Caller.principal` and UTC-ms time without resolving. `resolve_attention`
   records the first closed kind-compatible reason/time. Both check the expected
