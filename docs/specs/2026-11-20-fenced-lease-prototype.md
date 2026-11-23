@@ -56,6 +56,10 @@ on separate threads and barriers. Sleep, wall jumps, restart and restore use det
 clock injection and real database reopen/backup. Linux/real suspend integration is
 future product acceptance, not a claim made by this experiment.
 
+Since the owner's ruling of 2026-11-23 (record K of the storage spec) every later check of this prototype and
+of the product it informs runs on Linux only, through 2.0. The results below were taken on macOS arm64 and stay
+as recorded history. A real suspend is no longer a required check; the injected clock tests are the evidence.
+
 Restore immediate redispatch assumes all previous holders are proven terminated;
 the model does not enforce this. Two additional review tests isolate lineage with
 reused session labels and stale reattachment after a second restart.
@@ -65,7 +69,7 @@ reused session labels and stale reattachment after a second restart.
 AP11 accepts compound restore lineage/counter fencing; AP12 keeps supervised 1.1
 children alive across suspend and defers holder self-deadlines to 1.5. The accepted
 [storage spec](2026-11-20-sqlite-storage.md) governs product behavior. Numeric no-reuse
-cannot be proven from a snapshot alone. Real suspend proof remains due under R42.
+cannot be proven from a snapshot alone. A real suspend proof was due under R42 and is withdrawn by record K of the storage spec (2026-11-23).
 
 ## Verification
 

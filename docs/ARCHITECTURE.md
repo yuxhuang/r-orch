@@ -1601,3 +1601,42 @@ full origin and generation across viewer, editor and direct-field surfaces. Draf
 session and remains memory only. No frozen orch-core port, storage format or peer protocol changes.
 See [ADR 0003](decisions/0003-tui-focus-viewer-and-clipboard-boundaries.md), the
 [backend contract](../crates/orch-tui/BACKEND.md) and [operator guidance](RUNBOOK.md#copying-text-from-the-dashboard).
+
+---
+
+## 13. Roadmap and platform scope
+
+### Releases to 2.0
+
+One release per phase; each leaves a single-machine install working from one start command. The 1.1 contract is
+the [SQLite storage spec](specs/2026-11-20-sqlite-storage.md), its [plan](plans/2026-11-20-sqlite-storage.md) and
+[ADR 0017](decisions/0017-sqlite-storage.md); the later phases have no spec yet.
+
+| Release | Phase |
+|---|---|
+| 1.1 | Storage: SQLite replaces the file backend; a one-way import; `orch db`. |
+| 1.2 | Evidence as stored records, text search (SQLite FTS5), live log follow. |
+| 1.3 | HTTP/2 over TLS on loopback, with a token. |
+| 1.4 | Authentication: enrolment, client certificates, a project list per identity. |
+| 1.5 | Workers with fenced leases, a managed git hub, daemon-side landing, one daemon serving many projects (opt-in). |
+| 2.0 | `orch-peer` is removed. |
+
+### Linux only until 2.0
+
+By the owner's ruling of 2026-11-23, every release above, from 1.1 through 2.0, is developed, tested, gated and
+qualified on Linux only. GitHub's Linux CI is the gate, as before; the Linux development hosts and the Linux cold
+gate carry the rest. No macOS check, Darwin or APFS row, macOS peer or hardware proof and physical suspend test
+is required of any of these releases. The peer check on a second host is a Linux host.
+
+- **Product code is unchanged.** The macOS code paths described elsewhere in this document (for example the
+  complete-spawn exclusion domain under "Daemon process admission") stay; the ruling is about what is run and
+  required, not about what is compiled or removed.
+- **macOS findings are deferred, not lost.** A failure or gap that occurs only on macOS is a GitHub issue in the
+  [After 2.0](https://github.com/yuxhuang/r-orch/milestone/20) milestone, unless triage assigns another. A failure
+  that Linux shows too is an ordinary Linux failure.
+- **Earlier evidence stays.** Results taken on macOS before the ruling are kept as recorded and as what they
+  measured. They are not current acceptance rows.
+- **After 2.0** macOS compatibility is taken up as its own work. This page decides nothing about it.
+
+The rule for contributors is in [AGENTS.md](../AGENTS.md), non-negotiable 10; the record of the ruling is record K
+of the [storage spec](specs/2026-11-20-sqlite-storage.md).
