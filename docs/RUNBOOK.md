@@ -430,6 +430,23 @@ the operation releases the permit and grows with the number of events the operat
 [How clients follow changes](manual/18-daemon.md#how-clients-follow-changes). An overflow design for in-process
 listeners remains deferred.
 
+## Staged SQLite goal counter damage
+
+The SQLite goal adapter is internal and inactive; the running daemon still uses file storage.
+Its `CounterMissing`, `CounterNegative` and `CounterBehind` errors indicate inconsistent staged
+storage. A nonpositive surviving goal position is also damaged metadata. Create and move refuse
+these states without consuming a position. Delete retains the durable high-water mark.
+
+Never reset a counter from the maximum surviving row position: deleted rows may have used higher
+positions, so that reset loses allocation history. If every row has been deleted, a missing counter
+cannot be distinguished from a new family. Import/export must preserve those durable marks.
+
+After SQLite activation, supported verification and restore tooling must guide recovery before
+mutation resumes; those commands and that recovery workflow are not supplied by this internal slice.
+T22 owns verification of positive positions, nonnegative counters, presence for nonempty families
+and positions no greater than the matching counter. T13/T23 own import/export and restore obligations.
+Do not treat this note as an available repair command or manually rewrite counters.
+
 ## Corrupt lock file
 
 **Symptom.** `orch daemon start` (or `orch serve`, `orch run --watch`) exits 4 with
