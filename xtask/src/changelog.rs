@@ -48,14 +48,14 @@ struct Fragment {
 // rather than a general Markdown, TOML, SemVer or calendar parser.
 fn version(s: &str) -> Result<[u64; 3]> {
     let parts: Vec<_> = s.split('.').collect();
-    ensure!(parts.len() == 3, "invalid version: {s}");
+    ensure!(parts.len() == 3, "invalid version: {s:?}");
     let mut out = [0; 3];
     for (i, p) in parts.iter().enumerate() {
         ensure!(
             !p.is_empty()
                 && p.bytes().all(|c| c.is_ascii_digit())
                 && (p.len() == 1 || !p.starts_with('0')),
-            "invalid version: {s}"
+            "invalid version: {s:?}"
         );
         out[i] = p.parse().context("version component overflow")?;
     }
@@ -64,13 +64,13 @@ fn version(s: &str) -> Result<[u64; 3]> {
 fn date(s: &str) -> Result<()> {
     ensure!(
         s.len() == 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[7] == b'-',
-        "invalid date: {s}"
+        "invalid date: {s:?}"
     );
     ensure!(
         s.bytes()
             .enumerate()
             .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()),
-        "invalid date: {s}"
+        "invalid date: {s:?}"
     );
     let y: u32 = s[..4].parse()?;
     let m: usize = s[5..7].parse()?;
@@ -92,7 +92,7 @@ fn date(s: &str) -> Result<()> {
     ];
     ensure!(
         y > 0 && (1..=12).contains(&m) && d > 0 && d <= days[m - 1],
-        "invalid date: {s}"
+        "invalid date: {s:?}"
     );
     Ok(())
 }
@@ -101,20 +101,18 @@ fn read(path: &Path, limit: u64) -> Result<String> {
         .read(true)
         .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
         .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+        .with_context(|| format!("open {path:?}"))?;
     ensure!(
         file.metadata()?.is_file(),
-        "{}: expected regular file",
-        path.display()
+        "{path:?}: expected regular file"
     );
     let mut bytes = Vec::new();
     file.take(limit + 1).read_to_end(&mut bytes)?;
     ensure!(
         bytes.len() as u64 <= limit,
-        "{}: exceeds {limit} bytes",
-        path.display()
+        "{path:?}: exceeds {limit} bytes"
     );
-    String::from_utf8(bytes).with_context(|| format!("{}: invalid UTF-8", path.display()))
+    String::from_utf8(bytes).with_context(|| format!("{path:?}: invalid UTF-8"))
 }
 fn fragments(root: &Path) -> Result<Vec<Fragment>> {
     // Refuse symlinked ancestors too, including when the final directory is missing.
@@ -124,8 +122,7 @@ fn fragments(root: &Path) -> Result<Vec<Fragment>> {
         match fs::symlink_metadata(&dir) {
             Ok(m) => ensure!(
                 m.is_dir() && !m.file_type().is_symlink(),
-                "{}: expected directory",
-                dir.display()
+                "{dir:?}: expected directory"
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
@@ -187,7 +184,7 @@ fn fragments(root: &Path) -> Result<Vec<Fragment>> {
         match parsed {
             Ok(Some(f)) => result.push(f),
             Ok(None) => {}
-            Err(e) => errors.push(format!("{}: {e:#}", path.display())),
+            Err(e) => errors.push(format!("{path:?}: {e:#}")),
         }
     }
     ensure!(result.len() <= 500, "more than 500 fragments");
@@ -196,6 +193,10 @@ fn fragments(root: &Path) -> Result<Vec<Fragment>> {
 }
 
 pub(crate) fn run(root: &Path, args: ChangelogArgs) -> Result<()> {
+    ensure!(
+        fs::symlink_metadata(root.join("CHANGELOG.md")).is_ok_and(|m| m.is_file()),
+        "run from the repository root (expected a regular CHANGELOG.md)"
+    );
     let fragments = fragments(root)?;
     match args.command {
         Command::Check => println!("changelog: checked {} fragments", fragments.len()),
@@ -256,7 +257,10 @@ fn assemble(root: &Path, fragments: &[Fragment], next: &str, day: &str, dry: boo
         "version must be newer than previous release"
     );
     ensure!(
-        !original.contains(&format!("## [{next}]")) && !original.contains(&format!("[{next}]:")),
+        !lines
+            .iter()
+            .any(|line| line.starts_with(&format!("## [{next}]"))
+                || line.starts_with(&format!("[{next}]:"))),
         "version already present"
     );
     let links: Vec<_> = lines
@@ -280,7 +284,7 @@ fn assemble(root: &Path, fragments: &[Fragment], next: &str, day: &str, dry: boo
     let body = lines[start + 1..end].concat();
     let body = body.trim_matches('\n');
     ensure!(
-        !body.is_empty() || !fragments.is_empty(),
+        !body.trim().is_empty() || !fragments.is_empty(),
         "no release notes"
     );
     let mut release = format!("## [{next}] - {day}\n\n");
@@ -318,7 +322,7 @@ fn assemble(root: &Path, fragments: &[Fragment], next: &str, day: &str, dry: boo
         .write(true)
         .create_new(true)
         .open(&tmp)
-        .context("create exclusive CHANGELOG.md.tmp")?;
+        .context("create exclusive CHANGELOG.md.tmp; inspect and remove any stale temporary file before retrying")?;
     let publish = (|| -> Result<()> {
         file.set_permissions(fs::metadata(&path)?.permissions())?;
         file.write_all(output.as_bytes())?;
@@ -330,8 +334,8 @@ fn assemble(root: &Path, fragments: &[Fragment], next: &str, day: &str, dry: boo
         for f in fragments {
             ensure!(
                 read(&f.path, 1000)? == f.bytes,
-                "{} changed during assembly",
-                f.path.display()
+                "{:?} changed during assembly",
+                f.path
             );
         }
         fs::rename(&tmp, &path)?;
@@ -341,10 +345,30 @@ fn assemble(root: &Path, fragments: &[Fragment], next: &str, day: &str, dry: boo
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
+    let counts = KINDS
+        .iter()
+        .enumerate()
+        .filter_map(|(kind, name)| {
+            let count = fragments.iter().filter(|f| f.kind == kind).count();
+            (count > 0).then(|| format!("{}{} {count}", name[..1].to_ascii_uppercase(), &name[1..]))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     println!(
-        "changelog: assembled {next} ({day}): {} entries; wrote CHANGELOG.md",
-        fragments.len()
+        "changelog: assembled {next} ({day}): {} {} ({counts}); existing Unreleased text: {}",
+        fragments.len(),
+        if fragments.len() == 1 {
+            "entry"
+        } else {
+            "entries"
+        },
+        if body.trim().is_empty() {
+            "none"
+        } else {
+            "present"
+        }
     );
+    println!("changelog: wrote CHANGELOG.md");
     let mut failures = Vec::new();
     for f in fragments {
         let remove = (|| -> Result<()> {
@@ -356,11 +380,15 @@ fn assemble(root: &Path, fragments: &[Fragment], next: &str, day: &str, dry: boo
             Ok(())
         })();
         if let Err(e) = remove {
-            failures.push(format!("{}: {e:#}", f.path.display()));
+            failures.push(format!("{:?}: {e:#}", f.path));
         } else {
             println!(
                 "changelog: removed {}",
-                f.path.strip_prefix(root)?.display()
+                f.path
+                    .strip_prefix(root)?
+                    .display()
+                    .to_string()
+                    .escape_debug()
             );
         }
     }

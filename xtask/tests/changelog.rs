@@ -81,7 +81,12 @@ fn golden_no_legacy() {
         "socket-timeout.fixed.md",
         b"Fix the client socket timeout so a slow daemon reply no longer ends a command early.\n",
     );
-    assert!(assemble(t.path(), &[]).status.success());
+    let out = assemble(t.path(), &[]);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        "changelog: assembled 1.0.1 (2026-12-01): 1 entry (Fixed 1); existing Unreleased text: none\nchangelog: wrote CHANGELOG.md\nchangelog: removed docs/changelog/unreleased/socket-timeout.fixed.md\n"
+    );
     assert_eq!(
         fs::read_to_string(t.path().join("CHANGELOG.md")).unwrap(),
         "## [Unreleased]\n\n## [1.0.1] - 2026-12-01\n\n### Fixed\n\n- Fix the client socket timeout so a slow daemon reply no longer ends a command early.\n\n## [1.0.0] - 2026-11-14\n...\n[Unreleased]: https://github.com/yuxhuang/r-orch/compare/v1.0.1...HEAD\n[1.0.1]: https://github.com/yuxhuang/r-orch/compare/v1.0.0...v1.0.1\n[1.0.0]: https://github.com/yuxhuang/r-orch/compare/v0.13.0...v1.0.0\n"
@@ -181,7 +186,10 @@ fn exclusive_temp_failure_does_not_consume() {
     let t = fixture();
     note(t.path(), "a.fixed.md", b"Fix a thing.\n");
     fs::write(t.path().join("CHANGELOG.md.tmp"), "Existing temp").unwrap();
-    assert!(!assemble(t.path(), &[]).status.success());
+    refused(
+        assemble(t.path(), &[]),
+        "inspect and remove any stale temporary file",
+    );
     assert_eq!(
         fs::read_to_string(t.path().join("CHANGELOG.md")).unwrap(),
         BEFORE
@@ -215,4 +223,234 @@ fn directory_file_symlinks_and_limits() {
     assert!(run(t.path(), &["check"]).status.success());
     symlink(t.path(), &dir).unwrap();
     assert!(!run(t.path(), &["check"]).status.success());
+}
+
+fn refused(out: Output, reason: &str) {
+    assert!(!out.status.success(), "unexpected success: {out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(reason),
+        "expected {reason:?}: {out:?}"
+    );
+}
+
+#[test]
+fn subdirectories_cannot_silently_skip_validation() {
+    let t = fixture();
+    note(t.path(), "Bad.fixed.md", b"Hello\n");
+    for sub in ["docs", "docs/changelog/unreleased"] {
+        refused(
+            run(&t.path().join(sub), &["check"]),
+            "run from the repository root",
+        );
+        refused(
+            assemble(&t.path().join(sub), &[]),
+            "run from the repository root",
+        );
+    }
+    refused(run(t.path(), &["check"]), "invalid slug");
+}
+
+#[test]
+fn byte_and_slug_boundaries_pin_the_refusal_reason() {
+    let t = fixture();
+    let name = format!("{}.fixed.md", "a".repeat(64));
+    let mut bytes = vec![b'A'; 999];
+    bytes.push(b'\n');
+    note(t.path(), &name, &bytes);
+    assert!(run(t.path(), &["check"]).status.success());
+    bytes.insert(0, b'A');
+    note(t.path(), &name, &bytes);
+    refused(run(t.path(), &["check"]), "exceeds 1000 bytes");
+    fs::remove_file(t.path().join("docs/changelog/unreleased").join(name)).unwrap();
+    note(
+        t.path(),
+        &format!("{}.fixed.md", "a".repeat(65)),
+        b"Hello\n",
+    );
+    refused(run(t.path(), &["check"]), "invalid slug");
+}
+
+#[test]
+fn same_kind_filename_byte_order_and_mode_survive_assembly() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = fixture();
+    for name in ["b", "a", "a-b"] {
+        note(
+            t.path(),
+            &format!("{name}.fixed.md"),
+            format!("Fix {name}.\n").as_bytes(),
+        );
+    }
+    fs::set_permissions(
+        t.path().join("CHANGELOG.md"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let out = assemble(t.path(), &[]);
+    assert!(out.status.success(), "{out:?}");
+    let text = fs::read_to_string(t.path().join("CHANGELOG.md")).unwrap();
+    assert!(text.contains("- Fix a-b.\n- Fix a.\n- Fix b.\n"));
+    assert_eq!(
+        fs::metadata(t.path().join("CHANGELOG.md"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("3 entries (Fixed 3); existing Unreleased text: present")
+    );
+}
+
+#[test]
+fn agreeing_manifest_versions_and_structure_refuse_for_the_right_reason() {
+    let t = fixture();
+    for (v, reason) in [
+        ("0.9.9", "newer than previous"),
+        ("1.0.01", "invalid version"),
+    ] {
+        fs::write(
+            t.path().join("Cargo.toml"),
+            format!("[workspace.package]\nversion = \"{v}\"\n"),
+        )
+        .unwrap();
+        refused(
+            run(
+                t.path(),
+                &["assemble", "--version", v, "--date", "2026-12-01"],
+            ),
+            reason,
+        );
+    }
+    fs::write(
+        t.path().join("Cargo.toml"),
+        "[workspace.package]\nversion = \"1.0.1\"\n",
+    )
+    .unwrap();
+    for (text, reason) in [
+        (
+            BEFORE.replace("v1.0.0...HEAD", "v0.9.0...HEAD"),
+            "compare link disagrees",
+        ),
+        (
+            format!("## [Unreleased]\n{BEFORE}"),
+            "exactly one Unreleased heading",
+        ),
+        (
+            format!("{BEFORE}[1.0.1]: https://example.org/old\n"),
+            "version already present",
+        ),
+        (
+            BEFORE.replace("### Legacy\n\n- Keep  two spaces.\n\n", " \t\n\n"),
+            "no release notes",
+        ),
+    ] {
+        fs::write(t.path().join("CHANGELOG.md"), &text).unwrap();
+        refused(assemble(t.path(), &[]), reason);
+        assert_eq!(
+            fs::read_to_string(t.path().join("CHANGELOG.md")).unwrap(),
+            text
+        );
+    }
+    fs::write(
+        t.path().join("CHANGELOG.md"),
+        BEFORE.replace(
+            "Historical text.",
+            "Historical mention of [1.0.1]: as prose.",
+        ),
+    )
+    .unwrap();
+    assert!(assemble(t.path(), &[]).status.success());
+}
+
+#[test]
+fn untrusted_diagnostics_are_escaped_in_captured_output() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    let t = fixture();
+    let dir = t.path().join("docs/changelog/unreleased");
+    for name in [
+        b"bad\x1b]52;c;test\x07.fixed.md".to_vec(),
+        b"bad\n\t.fixed.md".to_vec(),
+        "bad\u{202e}.fixed.md".as_bytes().to_vec(),
+        b"bad\xff.fixed.md".to_vec(),
+    ] {
+        let path = dir.join(OsString::from_vec(name));
+        fs::write(&path, b"Hello\n").unwrap();
+        for args in [
+            vec!["check"],
+            vec!["assemble", "--version", "1.0.1", "--date", "2026-12-01"],
+        ] {
+            let out = run(t.path(), &args);
+            assert!(!out.status.success());
+            assert!(out.stdout.is_empty());
+            let text = String::from_utf8(out.stderr).unwrap();
+            assert!(text.contains(&format!("{path:?}")), "{text:?}");
+            assert!(
+                !text
+                    .chars()
+                    .any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'),
+                "{text:?}"
+            );
+        }
+        assert_eq!(fs::read(&path).unwrap(), b"Hello\n");
+        assert_eq!(
+            fs::read_to_string(t.path().join("CHANGELOG.md")).unwrap(),
+            BEFORE
+        );
+        fs::remove_file(path).unwrap();
+    }
+    // Parent paths and argument values are independent untrusted diagnostic sources.
+    let odd = t.path().join("parent\x1b\u{202e}");
+    fs::create_dir(&odd).unwrap();
+    fs::copy(t.path().join("CHANGELOG.md"), odd.join("CHANGELOG.md")).unwrap();
+    fs::create_dir_all(odd.join("docs/changelog")).unwrap();
+    fs::write(odd.join("docs/changelog/unreleased"), b"not a directory").unwrap();
+    let out = run(&odd, &["check"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(stderr.contains("expected directory"));
+    assert!(!stderr.contains(['\x1b', '\u{202e}']));
+    for (option, value) in [("--version", "1.\x1b.0"), ("--date", "2026-\u{202e}-01")] {
+        let mut args = vec!["assemble", "--version", "1.0.1", "--date", "2026-12-01"];
+        let i = args.iter().position(|s| *s == option).unwrap();
+        args[i + 1] = value;
+        let out = run(t.path(), &args);
+        assert!(!out.status.success());
+        assert!(
+            !String::from_utf8(out.stderr)
+                .unwrap()
+                .contains(['\x1b', '\u{202e}'])
+        );
+    }
+}
+
+#[test]
+fn post_rename_unlink_failure_reports_each_note_and_blocks_rerun() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = fixture();
+    note(t.path(), "a.fixed.md", b"Fix a.\n");
+    note(t.path(), "b.fixed.md", b"Fix b.\n");
+    let dir = t.path().join("docs/changelog/unreleased");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let out = assemble(t.path(), &[]);
+    // Restore fixture permissions even if the assertion below fails.
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    refused(
+        out.clone(),
+        "changelog committed; remove remaining consumed fragments manually",
+    );
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert!(err.contains("a.fixed.md") && err.contains("b.fixed.md"));
+    let text = fs::read_to_string(t.path().join("CHANGELOG.md")).unwrap();
+    assert!(text.contains("## [1.0.1] - 2026-12-01"));
+    assert!(dir.join("a.fixed.md").exists() && dir.join("b.fixed.md").exists());
+    refused(assemble(t.path(), &[]), "newer than previous");
+    assert_eq!(
+        fs::read_to_string(t.path().join("CHANGELOG.md")).unwrap(),
+        text
+    );
 }
