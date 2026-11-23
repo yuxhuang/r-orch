@@ -444,7 +444,7 @@ cannot be distinguished from a new family. Import/export must preserve those dur
 After SQLite activation, supported verification and restore tooling must guide recovery before
 mutation resumes; those commands and that recovery workflow are not supplied by this internal slice.
 T22 owns verification of positive positions, nonnegative counters, presence for nonempty families
-and positions no greater than the matching counter. T13/T23 own import/export and restore obligations.
+and positions no greater than the matching counter. T21/T23 own import/export and restore obligations.
 Do not treat this note as an available repair command or manually rewrite counters.
 
 ## Corrupt lock file

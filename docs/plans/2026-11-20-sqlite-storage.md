@@ -528,7 +528,7 @@ complete the public adapter or conformance; the daemon still uses file storage.
 
 Remaining consumer obligations, before activation:
 
-- T13 initializes each imported ordered family's high-water mark transactionally and preserves larger
+- T21 initializes each imported ordered family's high-water mark transactionally and preserves larger
   durable marks. Import/export must carry marks for emptied families: `MAX(position)` loses deleted
   issued positions and is not counter recovery. Export integration remains with T23.
 - T22 verification checks positive row positions, nonnegative family counters, counter presence for
