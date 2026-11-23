@@ -1227,9 +1227,31 @@ clients <── WriteReceipt::wait() ──────────────�
   request with the caller's deadline, wait for the receipt on a blocking-pool thread, and answer at the deadline.
   A request still waiting then is withdrawn and answered `Overloaded`, and never commits (spec R128). One whose body
   had already started is answered with an error that says its outcome is unknown, since the commit is no longer
-  ours to stop; events carry sequence numbers and a prune can be repeated, so a retry is safe. The blocking thread
-  ends when the writer answers or drops the request. The synchronous `write` and `prune` stay for tests and threads
-  that may block. Lease submissions are not adapted yet.
+  ours to stop. Retrying such a request is safe for the stored rows only: an append is `ON CONFLICT DO NOTHING` per
+  sequence number, so the repeat adds nothing already there, and a prune can be repeated. It is not safe for
+  accounting. The repeat answers only what it did itself (an append reports `stored: 0, skipped: n`, a prune its
+  own `deleted`), so the counts of the attempt whose answer was lost never reach the caller, and a caller that
+  adds the answer to `events_pruned_count` (spec R62) under-counts. Do not derive counters from the answer of a
+  retry. The blocking thread ends when the writer answers or drops the request. The synchronous `write` and
+  `prune` stay for tests and threads that may block. Lease submissions are not adapted yet.
+  Known limits, all unreachable while nothing calls the adapter and all tracked in issue 127 for the daemon
+  wiring:
+  - *Cancellation does not withdraw.* If the caller drops the future before its deadline (an outer timeout, a
+    client disconnect), the request stays queued and commits later with nobody to answer. Wiring must either add a
+    withdraw-on-drop guard or accept that cancellation is not refusal.
+  - *Misuse panics after admission.* `write_async` queues the request before it spawns the wait and arms the
+    timer. Called outside a Tokio runtime, or on one without the time driver, it panics after admission and the
+    write still commits. It needs a runtime with the time driver enabled.
+  - *A failed wait task is not settled.* If the blocking wait itself fails (the runtime shuts down or the task
+    panics) the request is neither withdrawn nor reported as of unknown outcome; it may still commit while the
+    caller is told only that the wait failed.
+  - *Withdrawn requests keep their queue slot* until the writer reaches them. During a long stall, repeated
+    timed-out retries can fill the bounded queue and make every lane, claims included, refuse new work. Back off
+    between retries until the writer drains them; removing a withdrawn entry on the writer side needs `writer.rs`
+    and waits for PR 188.
+  - *Dropping the runtime blocks* until the writer has reached every parked wait (700 ms in one probe with the
+    writer stalled for that long). Shutdown must drain the writer before the runtime is dropped, or use
+    `Runtime::shutdown_timeout`.
 - **Close.** `WriterHandle::close` stops admission, is idempotent, and lets the worker drain what it accepted.
   Dropping the last `WriterHandle` clone does the same, including on an early return or an unwind. `submit` after
   close returns `WriterClosed`. Closures captured by a refused or abandoned job are dropped outside the queue lock.
