@@ -963,3 +963,15 @@ T8 reference acceptance is separate from runtime acceptance: T12 owns Linux
 restart/recovery and lease-bound finish, T13 owns Linux sleep/wake fencing and
 second-host peer verification, and T23 owns durable restore including a new lineage.
 macOS compatibility is deferred to After 2.0 and is not a release gate.
+
+### T10 attention mapping (#183)
+
+Implement the spec's migration-2 facts JSON and numeric TEXT-ID queries as an
+internal SQLite module; T10 composes it once into Storage. Verify reopen of both
+kinds and disk subjects, scope isolation, bounded pages and strict expiry across
+9/10/11. References retain the same scenarios. I2/N1/N2 reference coverage and
+N3/N4 consumer follow-ups remain separately accountable under issue 183.
+Reference no-op writes are tracked in [#204](https://github.com/yuxhuang/r-orch/issues/204);
+T19 observation wording in [#205](https://github.com/yuxhuang/r-orch/issues/205);
+T15/T19 clock handling in [#206](https://github.com/yuxhuang/r-orch/issues/206).
+[ADR 0019](../decisions/0019-sqlite-storage-attention.md) records the mapping.
