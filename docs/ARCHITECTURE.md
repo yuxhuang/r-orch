@@ -1222,7 +1222,14 @@ clients <── WriteReceipt::wait() ──────────────�
   timeout returns its SQL error to the receipt, not `Overloaded`, even when the deadline has passed. Classifying
   that failure belongs to the retry work (R128, issue 127).
 - **Receipts.** `wait` blocks and returns the closure's result. Dropping a receipt does not cancel the work: an
-  accepted transaction still commits. Do not call `wait` on an async runtime thread; nothing adapts it yet.
+  accepted transaction still commits. Do not call `wait` on an async runtime thread. The internal event adapter
+  (`sqlite/events/adapter.rs`) adapts it for event writes and prunes: `write_async` and `prune_async` queue the
+  request with the caller's deadline, wait for the receipt on a blocking-pool thread, and answer at the deadline.
+  A request still waiting then is withdrawn and answered `Overloaded`, and never commits (spec R128). One whose body
+  had already started is answered with an error that says its outcome is unknown, since the commit is no longer
+  ours to stop; events carry sequence numbers and a prune can be repeated, so a retry is safe. The blocking thread
+  ends when the writer answers or drops the request. The synchronous `write` and `prune` stay for tests and threads
+  that may block. Lease submissions are not adapted yet.
 - **Close.** `WriterHandle::close` stops admission, is idempotent, and lets the worker drain what it accepted.
   Dropping the last `WriterHandle` clone does the same, including on an early return or an unwind. `submit` after
   close returns `WriterClosed`. Closures captured by a refused or abandoned job are dropped outside the queue lock.
