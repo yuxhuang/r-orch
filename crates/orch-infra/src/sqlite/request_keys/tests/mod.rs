@@ -127,6 +127,85 @@ fn exact_expiry_replaces_without_maintenance_and_restarts_the_ttl() {
     );
 }
 
+// Regression for #203: replacement must refresh hash, result-size metadata and TTL.
+#[test]
+fn exact_ttl_replacements_refresh_hash_result_size_and_persisted_timestamps() {
+    let (_root, data) = test_data();
+    let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrations::migrate(&data, &mut conn).unwrap();
+    drop(conn);
+    let caller = caller("p", "owner");
+    let scope = scope(&caller);
+    let large = "x".repeat(MAX_RESULT_BYTES + 1);
+    let hashes = ["a".repeat(64), "b".repeat(64), "c".repeat(64)];
+
+    for (stage, result) in [large.as_str(), "small λ", large.as_str()]
+        .into_iter()
+        .enumerate()
+    {
+        let now = stage as i64 * KEY_TTL_MS;
+        let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        let tx = conn.transaction().unwrap();
+        let mut keys = RequestKeys::new(&tx, &caller);
+        assert_eq!(
+            keys.check_request_key(&scope, OP, &hashes[stage], now)
+                .unwrap(),
+            KeyCheck::New,
+            "stage {stage}: exact expiry permits a new hash without maintenance"
+        );
+        keys.store_request_key(&scope, OP, &hashes[stage], result, now)
+            .unwrap();
+        tx.commit().unwrap();
+        drop(conn);
+
+        // Reopen after every commit so replay and metadata are persisted observations.
+        let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        let tx = conn.transaction().unwrap();
+        let keys = RequestKeys::new(&tx, &caller);
+        let expected = if stage == 1 {
+            KeyCheck::Replay(result.into())
+        } else {
+            KeyCheck::ReplayWithoutResult
+        };
+        for time in [now, now + KEY_TTL_MS - 1] {
+            assert_eq!(
+                keys.check_request_key(&scope, OP, &hashes[stage], time)
+                    .unwrap(),
+                expected,
+                "stage {stage}: replay at {time}"
+            );
+        }
+        for old_hash in &hashes[..stage] {
+            assert_eq!(
+                keys.check_request_key(&scope, OP, old_hash, now).unwrap(),
+                KeyCheck::Mismatch,
+                "stage {stage}: superseded hashes cannot replay"
+            );
+        }
+        let row = tx.query_row(
+            "SELECT req_sha256,result,result_truncated,created_at,expires_at,state FROM request_keys",
+            [],
+            |r| Ok((
+                r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?,
+                r.get::<_, i64>(2)?, r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?, r.get::<_, String>(5)?,
+            )),
+        ).unwrap();
+        assert_eq!(
+            row,
+            (
+                hashes[stage].clone(),
+                (stage == 1).then(|| result.to_owned()),
+                i64::from(stage != 1),
+                now,
+                now + KEY_TTL_MS,
+                "done".into()
+            ),
+            "stage {stage}: the committed row replaces all result and lifetime metadata"
+        );
+    }
+}
+
 #[test]
 fn byte_boundary_keeps_whole_utf8_or_no_prefix() {
     let mut conn = database();
