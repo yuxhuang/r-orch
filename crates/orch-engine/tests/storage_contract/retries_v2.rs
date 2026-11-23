@@ -57,6 +57,23 @@ async fn get(s: &dyn Storage, project: &str, task: &str) -> Option<Retry> {
         .unwrap()
 }
 
+/// Walks the whole complete read of one snapshot with `limit` rows a page,
+/// returning the pages' sizes and every row in the order they arrived.
+async fn walk(snap: &dyn ReadSnapshot, limit: usize) -> (Vec<usize>, Vec<Retry>) {
+    let (mut sizes, mut rows, mut after) = (Vec::new(), Vec::new(), None);
+    loop {
+        let page = snap.read_retries(after.as_ref(), limit).await.unwrap();
+        assert!(!page.rows.is_empty() || (rows.is_empty() && page.next.is_none()));
+        sizes.push(page.rows.len());
+        assert!(sizes.len() <= 3_000, "the cursor does not advance");
+        rows.extend(page.rows);
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return (sizes, rows),
+        }
+    }
+}
+
 fn tasks(rows: &[Retry]) -> Vec<&str> {
     rows.iter().map(|r| r.task.as_str()).collect()
 }
@@ -381,14 +398,318 @@ pub async fn retry_rows_commit_or_roll_back_with_the_lease_that_ends_a_run(fixtu
     assert_eq!(get(s.as_ref(), P, "t1").await, None);
 }
 
+/// 2,500 rows, seven to a deadline so that ties are everywhere, written in
+/// descending id order so that no backend can return them in insertion order.
+fn many_rows() -> Vec<Retry> {
+    (0..2_500)
+        .rev()
+        .map(|i| retry(&format!("t{i:04}"), 1, 1_000 + i64::from(i / 7) * 10))
+        .collect()
+}
+
+pub async fn the_complete_read_pages_every_row_including_future_ones_in_read_order(
+    fixture: Fixture,
+) {
+    let s = fixture.storage.clone();
+    assert!(
+        s.read(caller(P))
+            .await
+            .unwrap()
+            .read_retries(None, 10)
+            .await
+            .unwrap()
+            == RetryPage {
+                rows: Vec::new(),
+                next: None
+            }
+    );
+    put(s.as_ref(), P, many_rows()).await;
+    let mut expected = many_rows();
+    expected.sort_by(|a, b| (a.due_at, &a.task).cmp(&(b.due_at, &b.task)));
+    let snap = s.read(caller(P)).await.unwrap();
+    // Nothing is due yet, and every row is still read.
+    assert!(snap.read_due_retries(999, 10).await.unwrap().is_empty());
+    let (sizes, rows) = walk(snap.as_ref(), MAX_DUE_RETRIES).await;
+    assert_eq!(sizes, [1_000, 1_000, 500]);
+    assert_eq!(rows, expected);
+    // Other page sizes cover the same rows once each; a total that is an exact
+    // multiple of the limit ends on a full page and no empty one.
+    let (sizes, rows) = walk(snap.as_ref(), 500).await;
+    assert_eq!(sizes, [500; 5]);
+    assert_eq!(rows, expected);
+    let (sizes, rows) = walk(snap.as_ref(), 999).await;
+    assert_eq!(sizes, [999, 999, 502]);
+    assert_eq!(rows, expected);
+    let (sizes, rows) = walk(snap.as_ref(), 1).await;
+    assert_eq!((sizes.len(), rows), (2_500, expected.clone()));
+    // The due read is the prefix of the complete read it filters (here with
+    // fewer than the due read's own bound due), and the rest is still ahead.
+    let now = expected[499].due_at;
+    let due_now = snap.read_due_retries(now, MAX_DUE_RETRIES).await.unwrap();
+    assert!(!due_now.is_empty() && due_now.len() < expected.len());
+    assert_eq!(due_now[..], expected[..due_now.len()]);
+    assert!(expected[due_now.len()..].iter().all(|r| r.due_at > now));
+}
+
+pub async fn ties_and_task_ids_are_read_in_one_stable_byte_order(fixture: Fixture) {
+    let s = fixture.storage.clone();
+    // One deadline, ids that differ by case, digits and a non-ASCII letter:
+    // the order is bytewise, not locale or case folding.
+    put(
+        s.as_ref(),
+        P,
+        ["é", "b", "a", "Z", "10", "9", "B", "a1"]
+            .map(|t| retry(t, 1, 500))
+            .into(),
+    )
+    .await;
+    put(s.as_ref(), P, vec![retry("zz", 1, 100)]).await;
+    let snap = s.read(caller(P)).await.unwrap();
+    let want = ["zz", "10", "9", "B", "Z", "a", "a1", "b", "é"];
+    for limit in [1, 2, 3, 100] {
+        let (_, rows) = walk(snap.as_ref(), limit).await;
+        assert_eq!(tasks(&rows), want, "limit {limit}");
+    }
+    // The same table read twice gives the same pages.
+    let first = snap.read_retries(None, 4).await.unwrap();
+    assert_eq!(first, snap.read_retries(None, 4).await.unwrap());
+    // A cursor between two rows of one deadline continues at the next task id.
+    let cursor = RetryCursor {
+        due_at: 500,
+        task: "a".into(),
+    };
+    let page = snap.read_retries(Some(&cursor), 100).await.unwrap();
+    assert_eq!((tasks(&page.rows), page.next), (vec!["a1", "b", "é"], None));
+}
+
+pub async fn the_complete_read_limit_and_cursor_are_checked(fixture: Fixture) {
+    let s = fixture.storage.clone();
+    put(s.as_ref(), P, vec![retry("t1", 1, 10)]).await;
+    let snap = s.read(caller(P)).await.unwrap();
+    let bad_cursors = [
+        RetryCursor {
+            due_at: 0,
+            task: String::new(),
+        },
+        RetryCursor {
+            due_at: -1,
+            task: "t1".into(),
+        },
+    ];
+    for bad in [0, MAX_DUE_RETRIES + 1] {
+        assert!(matches!(
+            snap.read_retries(None, bad).await,
+            Err(StoreError::InvalidRetry(_))
+        ));
+        let result = s
+            .transaction(caller(P), Lane::Entities, move |u| {
+                u.list_retries(None, bad).map(|_| ())
+            })
+            .await;
+        assert!(matches!(result, Err(StoreError::InvalidRetry(_))));
+    }
+    for bad in bad_cursors {
+        assert!(matches!(
+            snap.read_retries(Some(&bad), 0).await,
+            Err(StoreError::InvalidRetry(_))
+        ));
+        let invalid = bad.clone();
+        let result = s.transaction(caller(P), Lane::Entities, move |u| {
+            u.list_retries(Some(&invalid), 0).map(|_| ())
+        }).await;
+        assert!(matches!(result, Err(StoreError::InvalidRetry(_))));
+        assert!(matches!(
+            snap.read_retries(Some(&bad), 10).await,
+            Err(StoreError::InvalidCursor)
+        ));
+        let result = s
+            .transaction(caller(P), Lane::Entities, move |u| {
+                u.list_retries(Some(&bad), 10).map(|_| ())
+            })
+            .await;
+        assert!(matches!(result, Err(StoreError::InvalidCursor)));
+    }
+    // Both bounds are accepted, and a cursor past the last row is an empty end.
+    assert_eq!(snap.read_retries(None, 1).await.unwrap().rows.len(), 1);
+    assert_eq!(
+        snap.read_retries(None, MAX_DUE_RETRIES)
+            .await
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    let past = RetryCursor {
+        due_at: i64::MAX,
+        task: "t1".into(),
+    };
+    assert_eq!(
+        snap.read_retries(Some(&past), 10).await.unwrap(),
+        RetryPage {
+            rows: Vec::new(),
+            next: None
+        }
+    );
+}
+
+pub async fn a_snapshot_walk_ignores_commits_made_between_its_pages(fixture: Fixture) {
+    let s = fixture.storage.clone();
+    put(s.as_ref(), P, many_rows()).await;
+    let mut expected = many_rows();
+    expected.sort_by(|a, b| (a.due_at, &a.task).cmp(&(b.due_at, &b.task)));
+    let snap = s.read(caller(P)).await.unwrap();
+    let first = snap.read_retries(None, 1_000).await.unwrap();
+    let cursor = first.next.clone().unwrap();
+    assert_eq!(cursor, RetryCursor::after(&first.rows[999]));
+    // Between pages: delete the cursor's own row and two later ones, replace a
+    // later row and an earlier one, and add rows on both sides of the cursor.
+    let (gone, moved) = (first.rows[999].task.clone(), expected[1_500].task.clone());
+    let (gone2, early) = (expected[2_000].task.clone(), first.rows[3].task.clone());
+    s.transaction(caller(P), Lane::Entities, move |u| {
+        assert!(u.delete_retry(&gone)?);
+        assert!(u.delete_retry(&gone2)?);
+        u.put_retry(&retry(&moved, 2, 0))?;
+        u.put_retry(&retry(&early, 2, 9_999_999))?;
+        u.put_retry(&retry("before-everything", 1, 0))?;
+        u.put_retry(&retry("zz-after-everything", 1, i64::MAX))?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    // The old snapshot's remaining pages are the original table's.
+    let mut rows = first.rows;
+    let mut after = Some(cursor);
+    let mut pages = 0;
+    while let Some(cursor) = after {
+        pages += 1;
+        assert!(pages <= 3, "the cursor does not advance");
+        let page = snap.read_retries(Some(&cursor), 1_000).await.unwrap();
+        rows.extend(page.rows);
+        after = page.next;
+    }
+    assert_eq!(rows, expected);
+    // A new snapshot reads the new table, whole and in order.
+    let fresh = s.read(caller(P)).await.unwrap();
+    let (_, now) = walk(fresh.as_ref(), 1_000).await;
+    assert_eq!(now.len(), 2_500 - 2 + 2);
+    assert_eq!(now[0].task, "before-everything");
+    assert_eq!(now.last().unwrap().task, "zz-after-everything");
+    assert!(
+        now.windows(2)
+            .all(|w| (w[0].due_at, &w[0].task) < (w[1].due_at, &w[1].task))
+    );
+}
+
+pub async fn a_cursor_outlives_its_row_in_a_later_snapshot(fixture: Fixture) {
+    let s = fixture.storage.clone();
+    put(
+        s.as_ref(),
+        P,
+        vec![retry("a", 1, 10), retry("b", 1, 20), retry("c", 1, 30)],
+    )
+    .await;
+    let page = s
+        .read(caller(P))
+        .await
+        .unwrap()
+        .read_retries(None, 2)
+        .await
+        .unwrap();
+    let cursor = page.next.unwrap();
+    assert_eq!(cursor, RetryCursor::after(&retry("b", 1, 20)));
+    // The row the cursor names is replaced with a later deadline: the walk
+    // continues after the old key, and the replaced row is read again later.
+    put(s.as_ref(), P, vec![retry("b", 2, 40)]).await;
+    let snap = s.read(caller(P)).await.unwrap();
+    let rest = snap.read_retries(Some(&cursor), 10).await.unwrap();
+    assert_eq!(tasks(&rest.rows), ["c", "b"]);
+    // And deleted outright it just continues.
+    s.transaction(caller(P), Lane::Entities, |u| {
+        u.delete_retry("b")?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let snap = s.read(caller(P)).await.unwrap();
+    let rest = snap.read_retries(Some(&cursor), 10).await.unwrap();
+    assert_eq!(tasks(&rest.rows), ["c"]);
+}
+
+pub async fn a_unit_of_work_pages_its_own_writes(fixture: Fixture) {
+    let s = fixture.storage.clone();
+    put(
+        s.as_ref(),
+        P,
+        vec![retry("t1", 1, 10), retry("t2", 1, 20), retry("t3", 1, 30)],
+    )
+    .await;
+    s.transaction(caller(P), Lane::Entities, |u| {
+        u.put_retry(&retry("t0", 1, 5))?;
+        assert!(u.delete_retry("t2")?);
+        u.put_retry(&retry("t4", 1, i64::MAX))?;
+        let first = u.list_retries(None, 2)?;
+        assert_eq!(tasks(&first.rows), ["t0", "t1"]);
+        let rest = u.list_retries(first.next.as_ref(), 2)?;
+        assert_eq!(tasks(&rest.rows), ["t3", "t4"]);
+        assert_eq!(rest.next, None);
+        // A write between pages is seen by the next one.
+        u.put_retry(&retry("t11", 1, 11))?;
+        let rest = u.list_retries(first.next.as_ref(), 10)?;
+        assert_eq!(tasks(&rest.rows), ["t11", "t3", "t4"]);
+        Err::<(), _>(StoreError::CounterExhausted)
+    })
+    .await
+    .unwrap_err();
+    // Nothing of that stayed.
+    let (_, rows) = walk(s.read(caller(P)).await.unwrap().as_ref(), 10).await;
+    assert_eq!(tasks(&rows), ["t1", "t2", "t3"]);
+}
+
+pub async fn the_complete_read_is_one_projects_rows_only(fixture: Fixture) {
+    let s = fixture.storage.clone();
+    put(s.as_ref(), P, vec![retry("t1", 1, 10), retry("t3", 1, 30)]).await;
+    put(
+        s.as_ref(),
+        "other",
+        vec![retry("t1", 7, 70), retry("t2", 1, 20), retry("t9", 1, 90)],
+    )
+    .await;
+    let mine = s.read(caller(P)).await.unwrap();
+    let (_, rows) = walk(mine.as_ref(), 1).await;
+    assert_eq!(rows, vec![retry("t1", 1, 10), retry("t3", 1, 30)]);
+    let theirs = s.read(caller("other")).await.unwrap();
+    let (_, rows) = walk(theirs.as_ref(), 2).await;
+    assert_eq!(
+        tasks(&rows),
+        ["t2", "t1", "t9"],
+        "own rows, by their own deadlines"
+    );
+    assert_eq!(rows[1], retry("t1", 7, 70));
+    // A cursor taken in one project reads only the other's own rows after it.
+    let cursor = mine.read_retries(None, 1).await.unwrap().next.unwrap();
+    assert_eq!(cursor.task, "t1");
+    let page = theirs.read_retries(Some(&cursor), 10).await.unwrap();
+    assert_eq!(tasks(&page.rows), ["t2", "t1", "t9"]);
+    let never = s.read(caller("never-written")).await.unwrap();
+    assert!(never.read_retries(None, 10).await.unwrap().rows.is_empty());
+}
+
 pub async fn a_restore_keeps_every_retry_row(fixture: Fixture) {
     let s = fixture.storage.clone();
-    put(s.as_ref(), P, vec![retry("t1", 3, 10), retry("t2", 1, 5)]).await;
+    let mut expected = many_rows();
+    expected.push(Retry {
+        error: "é".repeat(MAX_RETRY_ERROR_BYTES / 2),
+        ..retry("whole-error", 3, 0)
+    });
+    expected.sort_by(|a, b| (a.due_at, &a.task).cmp(&(b.due_at, &b.task)));
+    put(s.as_ref(), P, expected.clone()).await;
     fixture.restore.restore_to_lineage("restored-lineage").await;
-    assert_eq!(
-        due(s.as_ref(), P, i64::MAX, 10).await,
-        vec![retry("t2", 1, 5), retry("t1", 3, 10)]
-    );
+    let (pages, rows) = walk(s.read(caller(P)).await.unwrap().as_ref(), MAX_DUE_RETRIES).await;
+    assert_eq!(pages, vec![1_000, 1_000, 501]);
+    assert_eq!(rows, expected);
+    // Enumeration is read-only: another complete walk returns the same text and rows.
+    let (_, again) = walk(s.read(caller(P)).await.unwrap().as_ref(), 999).await;
+    assert_eq!(again, expected);
 }
 
 macro_rules! retry_suite {
@@ -412,6 +733,13 @@ macro_rules! retry_suite {
             case!(a_snapshot_keeps_its_rows_and_a_unit_of_work_reads_its_own_writes);
             case!(projects_do_not_see_or_change_each_others_rows);
             case!(retry_rows_commit_or_roll_back_with_the_lease_that_ends_a_run);
+            case!(the_complete_read_pages_every_row_including_future_ones_in_read_order);
+            case!(ties_and_task_ids_are_read_in_one_stable_byte_order);
+            case!(the_complete_read_limit_and_cursor_are_checked);
+            case!(a_snapshot_walk_ignores_commits_made_between_its_pages);
+            case!(a_cursor_outlives_its_row_in_a_later_snapshot);
+            case!(a_unit_of_work_pages_its_own_writes);
+            case!(the_complete_read_is_one_projects_rows_only);
             case!(a_restore_keeps_every_retry_row);
         }
     };

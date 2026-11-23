@@ -445,7 +445,7 @@ All three names are the same program:
 | Crate | Modules |
 |---|---|
 | `orch-domain` | `task`, `agent`, `run`, `goal`, `team`, `message`, `state`, `config`, `global_config`, `events`, `error`, `transitions`, `scope`, `model_tiers`, `shop` (agent-shop + org-shop + default-agents) |
-| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity, event and lease port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
+| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity, event, lease, retry, intent, request-key and attention port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock, v2}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models`, `blob::{DiskBlobStore, BlobReferences}` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{agent, config, context, daemon, goal, init, msg, org, org_template, remote, rpc, run, status, task, team}`, `doctor`, `logs`, `tui` (`DaemonBackend`), `update`, `web`, `routing`, `tree`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
@@ -1612,3 +1612,9 @@ full origin and generation across viewer, editor and direct-field surfaces. Draf
 session and remains memory only. No frozen orch-core port, storage format or peer protocol changes.
 See [ADR 0003](decisions/0003-tui-focus-viewer-and-clipboard-boundaries.md), the
 [backend contract](../crates/orch-tui/BACKEND.md) and [operator guidance](RUNBOOK.md#copying-text-from-the-dashboard).
+
+The retry port also provides complete snapshot-paged enumeration for recovery and
+export (`RetryRead::read_retries`), alongside point and bounded due reads. Both
+memory and file references delegate through their existing project session;
+transaction-local `list_retries` sees its own writes. Pages use exclusive
+`(due_at, task)` byte ordering, include future rows, and have no total-row cap.

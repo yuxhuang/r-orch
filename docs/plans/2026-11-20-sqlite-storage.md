@@ -823,3 +823,24 @@ This evidence does not grant a config exception or amend AP15. See
 [the compatibility record](../internal/import-reader-compatibility.md) for the decision
 and individually tracked integration conditions. Full T21 still requires its actual
 writer, source confinement/preflight, reporting, dry run, resume and acceptance evidence.
+
+### T8c complete retry enumeration follow-up
+
+The landed retry port is extended, without replacing its point/due/write contracts,
+by `RetryCursor`, `RetryPage`, `read_retries` and transaction-local `list_retries`.
+Both references enumerate all rows, including future rows, ordered by UTC-ms
+`due_at` and UTF-8 task bytes in pages of 1..=1,000 on one snapshot. Recovery and
+export must follow `next` until absent without deleting rows or capping totals.
+For T10 the existing SQL names require `WHERE project_id = ?` and the exclusive
+`(due_at, task_id)` key, `ORDER BY due_at, task_id COLLATE BINARY`, fetching limit+1.
+No index migration is required by this reference change. The shared retry suite
+covers 2,500 rows and a 2,501-row restore containing a whole 65,536-byte UTF-8 error.
+The reference's larger-error refusal does not satisfy or weaken whole-text R97;
+T10/T12/T21 retain blob mapping under #109. T12 retains first-wins enqueue, T21
+legacy invalid-deadline handling, and T14 dispatch/rotation order. The historical
+builder's due-only limitation is superseded by the reviewed module contract.
+
+T8 reference acceptance is separate from runtime acceptance: T12 owns Linux
+restart/recovery and lease-bound finish, T13 owns Linux sleep/wake fencing and
+second-host peer verification, and T23 owns durable restore including a new lineage.
+macOS compatibility is deferred to After 2.0 and is not a release gate.
