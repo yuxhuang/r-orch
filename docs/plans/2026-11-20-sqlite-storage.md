@@ -649,7 +649,7 @@ hydration seam to the slice that wires the public task page, whose tests check t
 |---|---|---|
 | T10, task mapping | Create, update, delete and move for `Task`; the migration (next free number); hydration in the selecting snapshot or unit of work; the physical R97 mapping; the creator, `landing_state` and attachment-row rules of the spec; the structured `SqliteError::TaskCorrupt`, fatal under R140, classified before any public conversion; the shared entity suites registered on SQLite for tasks | R141's named tests (the corruption ones among them); `cargo test -p orch-infra --test sqlite_task_format --test sqlite_migrations`; the shared suites on the three references and SQLite |
 | T10, retry mapping | Its own mapping of `retry_queue.error` with the same thresholds and split, and none of this format's tables | The issue 109 tests; independent of R141 |
-| T11 | Nothing new: the blob adapter and `BlobReferences::register` are used as they are | `blob_store` unchanged |
+| T11 | One change in T11's own file, `crates/orch-infra/src/blob/references.rs`: row-only registration of an object that is already published, callable from `crate::sqlite` (a `pub(crate)` method of `BlobReferences`, or `register` split so that its upsert is `pub(crate)` and the `put` stays out of it). The `blobs` row is the one `register` writes for a prompt (`storage_location = 'disk'`, the object's own size, `unreferenced_since` cleared, refused when an existing row disagrees on size or location), and the method never calls `DiskBlobStore::put`. `register` itself, `store_prompt`, `store_attachment` and the two loaders keep their behaviour. At `07bc81124` `register` is a private method (visible only inside the `references` module) that calls `put` before its upsert, so the mapping cannot call it and could only reach it by publishing every object a second time after the spec's step 2 (a second hash and sync of each object, interleaved with row writes). The blob adapter (`DiskBlobStore::put`, `get`) is otherwise used as it is. The owner is T11; which PR carries the change is open (below) | the existing `blob_store` tests unchanged, plus one new test, not yet written, that row-only registration writes the same row as a prompt's, publishes nothing, and refuses a size or location that disagrees |
 | T12 | Nothing new: a consumer reads a `Task` through the port and never through these tables | the T12 tests |
 | T15 | `blobs.sweep` counts `task_blob_refs.sha256` as a naming row | `maintenance::a_referenced_blob_is_never_deleted`, extended for a task text and a split text |
 | T21 | One codec for every task row; list order, repeats and `Option` presence as the 1.0 document says; the decision and the record for a non-canonical timestamp; `import` and NULL as the creator of a legacy task; text over 64 KiB as references; no path or hash made from an attachment name | an importer test per case, and the R97 importer test the spec still lists as pending |
@@ -672,7 +672,11 @@ over NULL. (3) A revision-checked `delete` removes the task's `task_attachments`
 its own savepoint, and keeps the `blobs` registrations and object bytes for the sweep (R60). The same text corrects the
 presence rule: `proof` and `workspace_mode` are optional, and `files_changed` is required only inside a present `proof`.
 The mapping slice consumes this correction before it writes any of these columns. What remains open is the owner's
-approval of the two tables (O2), given by the merge, and the structured classification of the other entities, which issue 127 holds.
+approval of the two tables (O2), given by the merge, the structured classification of the other entities, which issue 127 holds,
+and the carrier of the T11 change in the table above: the mapping's scope is the SQLite source and tests, and
+`crates/orch-infra/src/blob/references.rs` is outside it. Either a small T11 PR with the row-only registration lands first, or the lead
+widens the mapping's scope by that one file and its `blob_store` test. The mapping's references slice (b) cannot write its
+`blobs` rows until one of the two exists.
 
 **Task corruption, settled before code.** The lead decided on 2026-11-23 what "the typed stored-data error of R140" is. The mapping
 adds `SqliteError::TaskCorrupt { task, check, locator }`: the id the caller asked for, a bounded check code and a bounded

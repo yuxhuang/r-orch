@@ -981,8 +981,10 @@ Each tag has K rows in `task_blob_refs`. Their `locator` is the RFC 6901 JSON Po
 (`/description`, `/review_results/2/output`, `/labels/7`, with `~0` and `~1` escaping as the file reference does),
 their `ordinal` runs 0 to K-1 without a gap, and each row holds that object's `sha256` and `size`. For K = 1 the object's hash is the value's.
 A value that repeats a chunk repeats the row: the same hash may stand at two ordinals, and two slots with equal text name one
-object. Every object also has its `blobs` row (`storage_location = 'disk'`, the same `size`), registered as the
-blob store's reference helper registers a prompt, so verification, the sweep, a backup and an export all find it.
+object. Every object also has its `blobs` row (`storage_location = 'disk'`, the same `size`, `unreferenced_since` cleared), the row that the blob
+store's reference helper writes for a prompt, so verification, the sweep, a backup and an export all find it. The row is written by
+row-only registration of an object that "Writing" step 2 has already published; it never publishes. At `07bc81124` the helper's
+`BlobReferences::register` is private and publishes by itself (see "Blob helper change" below), so this step needs that change.
 
 Vectors (the text is the byte `a`, repeated; hashes computed with SHA-256 over those bytes):
 
@@ -1093,7 +1095,9 @@ atomic as one operation:
    before any row names one.
 3. In one savepoint, write the `tasks` row (revision, position), the detail, the reference rows, the membership
    rows and the `blobs` rows (which clear `unreferenced_since` and require an equal size), replacing a
-   task's old detail, reference and membership rows whole.
+   task's old detail, reference and membership rows whole. A `blobs` row is written by row-only registration of the object
+   that step 2 published; this step calls no `put`, so no object is hashed, synced or renamed a second time while the writer holds
+   the savepoint (see "Blob helper change").
 4. On any error roll the savepoint back and return it. The old row and its references stay readable and unchanged,
    even when the caller catches the error and commits other work in the same unit of work (R7). Objects already
    published stay on disk unreferenced and follow R60.
@@ -1104,6 +1108,17 @@ work holds the one writer for the time the files take; a text over 64 KiB is rar
 moving publication before the writer is an optimization only after a measurement asks for it.
 `move_to_end` changes only `position` and `revision` of the row: the detail, the references, the memberships and
 `updated_at` are untouched and no object is read or written.
+
+**Blob helper change.** Step 3 needs one change in T11's file, `crates/orch-infra/src/blob/references.rs`, which is outside the
+mapping's SQLite source and test scope. At `07bc81124` the only code that writes a `blobs` row for a disk object is
+`BlobReferences::register`, a private method that calls `DiskBlobStore::put` and then upserts the row (`storage_location =
+'disk'`, the object's size, `unreferenced_since` cleared; the upsert changes nothing, and `register` answers
+`ReferenceError::Metadata`, when the existing row differs in size or location). It cannot be called from `crate::sqlite`. Used
+unchanged it would publish each object a second time (hash, sync, rename) after step 2, inside the savepoint. The owed change is
+a crate-visible row-only registration of an already-published object, with that same upsert and refusal and no `put`;
+`register` may call it after its own `put`, and prompts and attachments behave as they do. It is T11's change. Whether a
+small T11 PR carries it ahead of the mapping, or the lead widens the mapping's scope by that one file and its `blob_store`
+test, is open (below). Until one exists the mapping cannot write a `blobs` row for a task text.
 
 `delete` runs after authorization and a successful revision check. In the same savepoint it removes the `tasks` row,
 the detail, the reference rows (`task_blob_refs`), the memberships and every `task_attachments` row for exactly
@@ -1171,6 +1186,7 @@ the last naming row (R60).
 | Task | Obligation |
 |---|---|
 | T10 | The mapping above for `Task`, with the R141 tests; register the shared entity suites (`text_over_64_kib_round_trips_through_the_blob_store` and the task-id fold scenarios) on SQLite; keep the mapping behind the internal adapter; `SqliteError::TaskCorrupt` and its classification before any public conversion (R140, R141), on the writer that the T10 integration latches. Other entities and the public cursor stay with their own slices. |
+| T11 | Row-only registration of an already-published disk object, crate-visible, in `crates/orch-infra/src/blob/references.rs` ("Blob helper change" above). The rest of the blob adapter is used as it is. |
 | T15 | `blobs.sweep` counts `task_blob_refs.sha256` as a naming row for the 7-day rule (R60), beside `runs.prompt_sha256`, `task_attachments.sha256` and the retry mapping. A task's `delete` removes its naming rows and keeps its blobs, so an object it named becomes eligible only after seven days with no naming row at all, and a hash that another task, run or project still names is kept. |
 | T21 | Build each task through the same codec as the port, never by inserting rows. Keep list order, repeats and `Option` presence exactly as the 1.0 document says. Record `import` and NULL as the creator of a legacy task of unknown origin, on the owner-authorized path and through the same codec. Decide and record what a non-canonical timestamp does (above). A task text over 64 KiB becomes the references above, as R97 says for imported text, and a source document is at most 1 MiB, so an import never needs a split. A source or an export that is itself corrupt refuses the import and leaves the live writer usable (R140). |
 | T22 | `orch db verify` runs the read checks above for every task, and reports an object, a reference row or a detail with no task. A check of the live database that proves a task corrupt is `TaskCorrupt` and fails the writer (R140), as any other live read does; a check of a backup or an export file refuses that command alone. Two diagnostic views are owed: `diag_task_details` lists every column except `detail` (which can be large and duplicates `diag_tasks`), and `diag_task_blob_refs` lists its columns. |
@@ -1182,10 +1198,13 @@ the last naming row (R60).
 lead decided them on 2026-11-23, and the owner of the attachment path (T11) concurred in the removal after checking the
 schema, the blob adapter and R59 and R60. The lead also settled on 2026-11-23 what the stored-data error is and its
 class: `SqliteError::TaskCorrupt`, fatal under R140, with the writer rules of "When a Task read proves its data
-corrupt". Two points remain open. The owner's answer to O2 named the exact schema of this spec at 33 tables; the two
-tables here widen it, and the owner's merge of this text is the approval. And the structured classification that
+corrupt". Three points remain open. The owner's answer to O2 named the exact schema of this spec at 33 tables; the two
+tables here widen it, and the owner's merge of this text is the approval. The structured classification that
 issue 127 asks for on the other entities (a goal, a lease, an event, a request key) is not settled here: this text
-defines the variant and the class for `Task` alone, and the mapping must not read it as a rule for another entity.
+defines the variant and the class for `Task` alone, and the mapping must not read it as a rule for another entity. And
+the carrier of the "Blob helper change" is not decided: T11 owns it, but the mapping's scope is the SQLite source and
+tests, so either a small T11 PR lands the row-only registration first or the lead widens the mapping's scope by
+`crates/orch-infra/src/blob/references.rs` and its `blob_store` test.
 
 ## Transactions and intents
 

@@ -466,7 +466,9 @@ across a crash, lists that do not load everything, and a retried request that ru
     stays inline; a longer one becomes one blob object, or objects of 67,108,864 bytes when it is longer
     still, named by a tagged JSON object that no text can equal and by ordered rows; a detail that is itself over
     65,536 bytes is stored the same way. A write publishes its objects first and installs every row in one
-    savepoint, so a failure, caught or not, leaves the old row and its references readable. A read in the
+    savepoint, so a failure, caught or not, leaves the old row and its references readable. The `blobs` rows are
+    written by row-only registration of the objects already published, which needs one crate-visible change in
+    T11's reference helper (the spec's "Blob helper change"); the helper's `register` publishes by itself and is private. A read in the
     selecting snapshot answers `SqliteError::TaskCorrupt { task, check, locator }`, a variant that this decision
     adds, for an unknown format, a missing or malformed detail, a projection that disagrees or a broken
     reference, and never rebuilds a task from unordered sets. The error holds the task id, a bounded check code
