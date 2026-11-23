@@ -514,9 +514,11 @@ pub async fn the_complete_read_limit_and_cursor_are_checked(fixture: Fixture) {
             Err(StoreError::InvalidRetry(_))
         ));
         let invalid = bad.clone();
-        let result = s.transaction(caller(P), Lane::Entities, move |u| {
-            u.list_retries(Some(&invalid), 0).map(|_| ())
-        }).await;
+        let result = s
+            .transaction(caller(P), Lane::Entities, move |u| {
+                u.list_retries(Some(&invalid), 0).map(|_| ())
+            })
+            .await;
         assert!(matches!(result, Err(StoreError::InvalidRetry(_))));
         assert!(matches!(
             snap.read_retries(Some(&bad), 10).await,
