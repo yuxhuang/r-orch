@@ -308,6 +308,54 @@ async fn a_run_that_fails_after_reporting_usage_keeps_it_including_zero() {
 }
 
 #[tokio::test]
+async fn codex_native_counters_reach_the_observer_without_double_counting() {
+    let report = r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":20,"reasoning_output_tokens":7,"total_tokens":120}}"#;
+    let (rig, recorder) = run_scripted("codex", &[report, report], 0, TaskStatus::Done).await;
+    let (run_id, usage) = recorder.only();
+    assert_eq!(
+        counters(&usage),
+        [Some(100), Some(20), Some(7), Some(60), None]
+    );
+    // The legacy record still uses its existing extractor: the native detail
+    // fields do not add a second copy of tokens already in input and output.
+    assert_eq!(
+        rig.runs.peek(&run_id).expect("run").tokens,
+        Some(TokenUsage {
+            input: 100,
+            output: 20,
+            reasoning: 0,
+            cache_read: 0,
+            cache_write: 0,
+            total: 120
+        })
+    );
+}
+
+#[tokio::test]
+async fn codex_native_zero_and_absence_reach_the_observer_on_success_and_failure() {
+    for (kind, code, status) in [
+        ("turn.completed", 0, TaskStatus::Done),
+        ("turn.failed", 1, TaskStatus::Failed),
+    ] {
+        for (fields, expected) in [
+            (
+                r#""cached_input_tokens":0,"reasoning_output_tokens":0"#,
+                [None, None, Some(0), Some(0), None],
+            ),
+            ("", [None; 5]),
+        ] {
+            let report = format!(
+                r#"{{"type":"{kind}","usage":{{{fields}}},"error":{{"message":"synthetic failure"}}}}"#
+            );
+            let (rig, recorder) = run_scripted("codex", &[&report], code, status).await;
+            let (run_id, usage) = recorder.only();
+            assert_eq!(counters(&usage), expected, "{report}");
+            assert_eq!(rig.runs.peek(&run_id).expect("run").tokens, None);
+        }
+    }
+}
+
+#[tokio::test]
 async fn usage_survives_a_nonzero_exit_that_the_done_event_forgives() {
     // The adapter treats a `result` as completion whatever the exit code says,
     // so this run succeeds; the counts must be the same either way.
