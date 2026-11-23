@@ -122,6 +122,29 @@ pub(super) fn classify(path: &str, graph: &Graph) -> (Reason, BTreeSet<String>) 
             )
         };
     }
+    if path == "docs/specs/2026-11-20-sqlite-storage.md" {
+        return if graph.contains("orch-infra") {
+            (
+                reason(
+                    path,
+                    Class::Coupled,
+                    "orch-infra",
+                    "import_index_reference reads the SQLite spec problem-class table",
+                ),
+                BTreeSet::from(["orch-infra".into()]),
+            )
+        } else {
+            (
+                reason(
+                    path,
+                    Class::Error,
+                    "all",
+                    "document coupling names a missing orch-infra member",
+                ),
+                BTreeSet::new(),
+            )
+        };
+    }
     if path.starts_with("docs/")
         || (!path.contains('/') && (path.ends_with(".md") || matches!(path, "LICENSE" | "NOTICE")))
     {
