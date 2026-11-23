@@ -248,6 +248,202 @@ fn invalid_requests_and_misbound_continuations_are_refused() {
     }
 }
 
+#[test]
+fn decoded_continuations_validate_every_tuple_component_before_querying() {
+    use rusqlite::types::Value;
+
+    let root = tempfile::tempdir().unwrap();
+    let data = data(&root);
+    let mut db = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&data, &mut db).unwrap();
+    for id in ["a", "b"] {
+        insert(&db, "p", &task(id, TaskStatus::Todo, 0, 0, None), 1);
+    }
+    let tx = db.transaction().unwrap();
+    for sort in SORTS {
+        let req = request(sort, 1);
+        let first = query(&tx, "p", &filter(), &req, None).unwrap();
+        let anchor = first.next.unwrap();
+        let mut malformed = Vec::new();
+        // Every truncated length, an extra component and a large decoded tuple.
+        for len in 0..anchor.values.len() {
+            malformed.push(anchor.values[..len].to_vec());
+        }
+        let mut extra = anchor.values.clone();
+        extra.push(Value::Integer(0));
+        malformed.push(extra);
+        malformed.push(vec![Value::Integer(0); 1024]);
+        // No SQLite coercions: NULL, REAL, BLOB and the other scalar type
+        // are refused at every position, including the final text ID.
+        for index in 0..anchor.values.len() {
+            for wrong in [
+                Value::Null,
+                Value::Real(1.0),
+                Value::Blob(vec![1]),
+                if index + 1 == anchor.values.len() {
+                    Value::Integer(1)
+                } else {
+                    Value::Text("1".into())
+                },
+            ] {
+                let mut values = anchor.values.clone();
+                values[index] = wrong;
+                malformed.push(values);
+            }
+        }
+        for values in malformed {
+            assert!(
+                matches!(
+                    Continuation::from_decoded(
+                        "p".into(),
+                        filter(),
+                        sort,
+                        values.clone(),
+                        "p",
+                        &filter(),
+                        sort,
+                    ),
+                    Err(StoreError::InvalidCursor)
+                ),
+                "sort={sort:?}, values={values:?}"
+            );
+            // Defense in depth: even an internally forged continuation must
+            // fail with the typed error, never panic or reach SQLite coercion.
+            let forged = Continuation {
+                values,
+                ..anchor.clone()
+            };
+            assert!(matches!(
+                query(&tx, "p", &filter(), &req, Some(&forged)),
+                Err(task_page::Error::Page(StoreError::InvalidCursor))
+            ));
+        }
+        let decoded = Continuation::from_decoded(
+            "p".into(),
+            filter(),
+            sort,
+            anchor.values,
+            "p",
+            &filter(),
+            sort,
+        )
+        .unwrap();
+        // Limit and count are deliberately not part of the cursor binding.
+        let mut changed_request = request(sort, 2);
+        changed_request.with_count = true;
+        let last = query(&tx, "p", &filter(), &changed_request, Some(&decoded)).unwrap();
+        assert_eq!(last.ids, ["b"]);
+        assert_eq!(last.total, Some(2));
+        assert!(last.next.is_none());
+    }
+}
+
+#[test]
+fn decoded_continuations_refuse_mismatched_bindings_and_unsupported_sorts() {
+    use rusqlite::types::Value;
+
+    for sort in SORTS {
+        let values = vec![Value::Integer(0); super::sort_keys(sort).unwrap().len() - 1]
+            .into_iter()
+            .chain([Value::Text("a".into())])
+            .collect::<Vec<_>>();
+        let other_sort = if sort == Sort::Id {
+            Sort::Position
+        } else {
+            Sort::Id
+        };
+        for (project, decoded_filter, decoded_sort) in [
+            ("other", filter(), sort),
+            (
+                "p",
+                Filter::Tasks {
+                    status: Some(TaskStatus::Todo),
+                    goal: None,
+                },
+                sort,
+            ),
+            (
+                "p",
+                Filter::Tasks {
+                    status: None,
+                    goal: Some("other".into()),
+                },
+                sort,
+            ),
+            ("p", Filter::Agents, sort),
+            ("p", filter(), other_sort),
+            ("p", filter(), Sort::Name),
+        ] {
+            assert!(matches!(
+                Continuation::from_decoded(
+                    project.into(),
+                    decoded_filter,
+                    decoded_sort,
+                    values.clone(),
+                    "p",
+                    &filter(),
+                    sort,
+                ),
+                Err(StoreError::InvalidCursor)
+            ));
+        }
+    }
+    for (f, sort) in [(Filter::Agents, Sort::Id), (filter(), Sort::Name)] {
+        assert!(matches!(
+            Continuation::from_decoded(
+                "p".into(),
+                f.clone(),
+                sort,
+                vec![Value::Text("a".into())],
+                "p",
+                &f,
+                sort
+            ),
+            Err(StoreError::InvalidCursor)
+        ));
+    }
+}
+
+#[test]
+fn malformed_decoded_continuation_keeps_read_pool_available() {
+    use rusqlite::types::Value;
+
+    let root = tempfile::tempdir().unwrap();
+    let data = data(&root);
+    let mut db = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&data, &mut db).unwrap();
+    insert(&db, "p", &task("a", TaskStatus::Todo, 0, 0, None), 1);
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    let forged = Continuation {
+        project: "p".into(),
+        filter: filter(),
+        sort: Sort::Id,
+        values: vec![Value::Null],
+    };
+    let refused = pool
+        .read(deadline(), |tx| {
+            Ok(query(
+                tx,
+                "p",
+                &filter(),
+                &request(Sort::Id, 1),
+                Some(&forged),
+            ))
+        })
+        .unwrap();
+    assert!(matches!(
+        refused,
+        Err(task_page::Error::Page(StoreError::InvalidCursor))
+    ));
+    let next = pool
+        .read(deadline(), |tx| {
+            Ok(query(tx, "p", &filter(), &request(Sort::Id, 1), None))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(next.ids, ["a"]);
+}
+
 #[tokio::test]
 async fn keyset_walk_survives_insert_and_deleted_anchor_for_every_sort() {
     for sort in SORTS {
