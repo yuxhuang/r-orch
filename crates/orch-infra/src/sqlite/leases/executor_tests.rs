@@ -6,7 +6,7 @@ use orch_core::Clock;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use std::time::{Duration, Instant};
 
-struct ClockAt(i64);
+pub(super) struct ClockAt(pub(super) i64);
 impl Clock for ClockAt {
     fn now_ms(&self) -> i64 {
         self.0
@@ -15,11 +15,17 @@ impl Clock for ClockAt {
         orch_core::clock::iso_from_epoch_ms(self.0)
     }
 }
-fn deadline() -> Instant {
+pub(super) fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
 
-fn executor(test: impl FnOnce(&WriterHandle, &ReadPool<'_>)) {
+pub(super) fn executor(test: impl FnOnce(&WriterHandle, &ReadPool<'_>)) {
+    executor_with_data(|writer, readers, _| test(writer, readers));
+}
+
+pub(super) fn executor_with_data(
+    test: impl FnOnce(&WriterHandle, &ReadPool<'_>, &crate::data_dir::DataDir),
+) {
     let (_temp, data) = test_data();
     let conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
     conn.execute_batch(include_str!("../schema.sql")).unwrap();
@@ -34,7 +40,7 @@ fn executor(test: impl FnOnce(&WriterHandle, &ReadPool<'_>)) {
             }
         }
         let _close = Close(&handle);
-        test(&handle, &pool);
+        test(&handle, &pool, &data);
     });
 }
 
@@ -48,7 +54,7 @@ fn receipts_preserve_typed_outcomes_and_project_bound_reads() {
             clock: &ClockAt(-1),
         };
         let lease = match adapter
-            .claim(new("t", "a", "r"))
+            .claim(None, new("t", "a", "r"))
             .unwrap()
             .wait()
             .unwrap()
@@ -60,7 +66,7 @@ fn receipts_preserve_typed_outcomes_and_project_bound_reads() {
         assert_eq!(lease.expires_at, LEASE_MS - 1);
         assert_eq!(
             adapter
-                .claim(new("t", "b", "s"))
+                .claim(None, new("t", "b", "s"))
                 .unwrap()
                 .wait()
                 .unwrap()
@@ -69,7 +75,7 @@ fn receipts_preserve_typed_outcomes_and_project_bound_reads() {
         );
         assert!(matches!(
             adapter
-                .renew("t".into(), "wrong".into(), 1)
+                .renew(None, "t".into(), "wrong".into(), 1)
                 .unwrap()
                 .wait()
                 .unwrap(),
@@ -100,7 +106,7 @@ fn receipts_preserve_typed_outcomes_and_project_bound_reads() {
         };
         assert_eq!(
             holder
-                .renew("t".into(), lease.lineage.clone(), 1)
+                .renew(None, "t".into(), lease.lineage.clone(), 1)
                 .unwrap()
                 .wait()
                 .unwrap()
@@ -109,7 +115,7 @@ fn receipts_preserve_typed_outcomes_and_project_bound_reads() {
             LEASE_MS + 100
         );
         holder
-            .release("t".into(), lease.lineage.clone(), 1)
+            .release(None, "t".into(), lease.lineage.clone(), 1)
             .unwrap()
             .wait()
             .unwrap()
@@ -123,7 +129,7 @@ fn receipts_preserve_typed_outcomes_and_project_bound_reads() {
         );
         assert_eq!(
             holder
-                .claim(new("t", "a", "r2"))
+                .claim(None, new("t", "a", "r2"))
                 .unwrap()
                 .wait()
                 .unwrap()
@@ -150,7 +156,11 @@ fn pooled_snapshot_stays_fixed_while_writer_commits() {
         adapter
             .snapshot(deadline(), |tx, c| {
                 assert!(list_leases(tx, c)?.is_empty());
-                adapter.claim(new("t", "a", "r")).unwrap().wait().unwrap()?;
+                adapter
+                    .claim(None, new("t", "a", "r"))
+                    .unwrap()
+                    .wait()
+                    .unwrap()?;
                 assert!(list_leases(tx, c)?.is_empty());
                 Ok(())
             })
@@ -339,7 +349,7 @@ async fn registered_lease_sequence_matches_file_reference() {
                 );
                 assert!(matches!(
                     renew_lease(tx, &owner("p"), "t", "wrong", 1, 0),
-                    Err(StoreError::StaleEpoch)
+                    Err(LeaseError::Store(StoreError::StaleEpoch))
                 ));
                 release_lease(tx, &owner("p"), "t", &first.lineage, first.epoch).unwrap();
                 claim_lease(tx, &owner("p"), &new("t", "a", "r2"), 120_001).unwrap();
@@ -369,7 +379,7 @@ fn imported_high_water_issues_once_then_returns_typed_exhaustion() {
             clock: &ClockAt(i64::MAX - LEASE_MS),
         };
         let lease = match adapter
-            .claim(new("t", "a", "r"))
+            .claim(None, new("t", "a", "r"))
             .unwrap()
             .wait()
             .unwrap()
@@ -381,13 +391,17 @@ fn imported_high_water_issues_once_then_returns_typed_exhaustion() {
         assert_eq!(lease.epoch, (i64::MAX - 1) as u64);
         assert_eq!(lease.expires_at, i64::MAX);
         adapter
-            .release("t".into(), lease.lineage, lease.epoch)
+            .release(None, "t".into(), lease.lineage, lease.epoch)
             .unwrap()
             .wait()
             .unwrap()
             .unwrap();
         assert!(matches!(
-            adapter.claim(new("t", "a", "r2")).unwrap().wait().unwrap(),
+            adapter
+                .claim(None, new("t", "a", "r2"))
+                .unwrap()
+                .wait()
+                .unwrap(),
             Err(StoreError::CounterExhausted)
         ));
         adapter
@@ -405,5 +419,253 @@ fn imported_high_water_issues_once_then_returns_typed_exhaustion() {
             })
             .unwrap()
             .unwrap();
+    });
+}
+
+fn sql_code(result: crate::sqlite::Result<impl std::fmt::Debug>) -> rusqlite::ffi::ErrorCode {
+    match result {
+        Err(crate::sqlite::SqliteError::Sql(error)) => error
+            .sqlite_error_code()
+            .unwrap_or_else(|| panic!("SQLite error lost its code: {error:?}")),
+        other => panic!("expected the SQLite error to reach the receipt: {other:?}"),
+    }
+}
+
+pub(super) fn exec(writer: &WriterHandle, sql: &'static str) {
+    writer
+        .submit(Lane::Claims, None, move |tx| {
+            tx.execute_batch(sql)?;
+            Ok(())
+        })
+        .unwrap()
+        .wait()
+        .unwrap();
+}
+
+pub(super) fn lease_state(readers: &ReadPool<'_>) -> (Vec<Lease>, i64, i64) {
+    readers
+        .read(deadline(), |tx| {
+            Ok((
+                list_leases(tx, &owner("p")).unwrap(),
+                tx.query_row("SELECT count(*) FROM task_epochs", [], |r| r.get(0))?,
+                tx.query_row(
+                    "SELECT count(*) FROM daemon_config WHERE key='outer'",
+                    [],
+                    |r| r.get(0),
+                )?,
+            ))
+        })
+        .unwrap()
+}
+
+#[test]
+fn sqlite_initiated_rollback_in_renew_and_release_reaches_the_receipt_typed_and_commits_nothing() {
+    use rusqlite::ffi::ErrorCode::ConstraintViolation;
+    executor(|writer, readers| {
+        let adapter = LeaseAdapter {
+            writer,
+            readers,
+            caller: owner("p"),
+            clock: &ClockAt(0),
+        };
+        let lease = match adapter
+            .claim(None, new("t", "a", "r"))
+            .unwrap()
+            .wait()
+            .unwrap()
+            .unwrap()
+        {
+            ClaimOutcome::Granted(l) => l,
+            other => panic!("{other:?}"),
+        };
+        let before = lease_state(readers);
+        exec(
+            writer,
+            "CREATE TRIGGER end_on_renew BEFORE UPDATE ON leases BEGIN SELECT RAISE(ROLLBACK,'synthetic'); END;
+             CREATE TRIGGER end_on_release BEFORE DELETE ON leases BEGIN SELECT RAISE(ROLLBACK,'synthetic'); END;",
+        );
+        let renew = LeaseAdapter {
+            clock: &ClockAt(500),
+            ..adapter
+        };
+        let receipt = renew
+            .renew(None, "t".into(), lease.lineage.clone(), lease.epoch)
+            .unwrap()
+            .wait();
+        assert_eq!(sql_code(receipt), ConstraintViolation);
+        let receipt = renew
+            .release(None, "t".into(), lease.lineage.clone(), lease.epoch)
+            .unwrap()
+            .wait();
+        assert_eq!(sql_code(receipt), ConstraintViolation);
+        assert_eq!(lease_state(readers), before);
+        // The writer survived: ordinary typed refusals still arrive as outcomes.
+        assert!(matches!(
+            renew
+                .renew(None, "t".into(), "wrong".into(), 1)
+                .unwrap()
+                .wait()
+                .unwrap(),
+            Err(StoreError::StaleEpoch)
+        ));
+    });
+}
+
+#[test]
+fn claim_read_failure_before_the_savepoint_is_a_typed_receipt_error_and_commits_nothing() {
+    executor(|writer, readers| {
+        exec(writer, "ALTER TABLE task_epochs RENAME TO task_epochs_gone");
+        let adapter = LeaseAdapter {
+            writer,
+            readers,
+            caller: owner("p"),
+            clock: &ClockAt(0),
+        };
+        let receipt = adapter.claim(None, new("t", "a", "r")).unwrap().wait();
+        assert!(
+            matches!(&receipt, Err(crate::sqlite::SqliteError::Sql(e)) if e.to_string().contains("task_epochs")),
+            "{receipt:?}"
+        );
+        exec(writer, "ALTER TABLE task_epochs_gone RENAME TO task_epochs");
+        assert_eq!(lease_state(readers), (vec![], 0, 0));
+    });
+}
+
+#[test]
+fn composed_lease_job_keeps_nothing_when_a_later_lease_step_fails() {
+    use rusqlite::ffi::ErrorCode::ConstraintViolation;
+    executor(|writer, readers| {
+        exec(
+            writer,
+            "CREATE TRIGGER end_on_renew BEFORE UPDATE ON leases BEGIN SELECT RAISE(ROLLBACK,'synthetic'); END",
+        );
+        let receipt = writer
+            .submit(Lane::Claims, None, |tx| {
+                let who = owner("p");
+                tx.execute(
+                    "INSERT INTO daemon_config(key,value,revision) VALUES('outer','x',1)",
+                    [],
+                )?;
+                let ClaimOutcome::Granted(lease) = claim_lease(tx, &who, &new("t", "a", "r"), 0)?
+                else {
+                    unreachable!()
+                };
+                renew_lease(tx, &who, "t", &lease.lineage, lease.epoch, 9)?;
+                tx.execute(
+                    "INSERT INTO daemon_config(key,value,revision) VALUES('later','x',1)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .unwrap()
+            .wait();
+        assert_eq!(sql_code(receipt), ConstraintViolation);
+        assert_eq!(lease_state(readers), (vec![], 0, 0));
+        readers
+            .read(deadline(), |tx| {
+                assert_eq!(
+                    tx.query_row(
+                        "SELECT count(*) FROM daemon_config WHERE key='later'",
+                        [],
+                        |r| { r.get::<_, i64>(0) }
+                    )?,
+                    0
+                );
+                Ok(())
+            })
+            .unwrap();
+    });
+}
+
+#[test]
+fn snapshot_read_failure_reaches_the_pool_as_a_sql_error_not_a_backend_string() {
+    executor(|writer, readers| {
+        let adapter = LeaseAdapter {
+            writer,
+            readers,
+            caller: owner("p"),
+            clock: &ClockAt(0),
+        };
+        exec(writer, "ALTER TABLE leases RENAME TO leases_gone");
+        assert!(matches!(
+            adapter.snapshot(deadline(), |tx, c| get_lease(tx, c, "t")),
+            Err(crate::sqlite::SqliteError::Sql(_))
+        ));
+    });
+}
+
+#[test]
+fn claim_write_failure_inside_the_savepoint_keeps_its_sqlite_code_and_commits_nothing() {
+    use rusqlite::ffi::ErrorCode::ConstraintViolation;
+    // Both writes of the claim's savepoint: the counter upsert runs first, so a
+    // failing `leases` insert also proves the counter is rolled back with it.
+    for table in ["task_epochs", "leases"] {
+        executor(|writer, readers| {
+            exec(
+                writer,
+                match table {
+                    "task_epochs" => {
+                        "CREATE TRIGGER refuse_claim BEFORE INSERT ON task_epochs BEGIN SELECT RAISE(ABORT,'synthetic'); END"
+                    }
+                    _ => {
+                        "CREATE TRIGGER refuse_claim BEFORE INSERT ON leases BEGIN SELECT RAISE(ABORT,'synthetic'); END"
+                    }
+                },
+            );
+            // Through the adapter: the job fails, so the receipt carries the code.
+            let adapter = LeaseAdapter {
+                writer,
+                readers,
+                caller: owner("p"),
+                clock: &ClockAt(0),
+            };
+            let receipt = adapter.claim(None, new("t", "a", "r")).unwrap().wait();
+            assert_eq!(sql_code(receipt), ConstraintViolation, "{table}");
+            // The helper itself must hand the executor `LeaseError::Sql`, not a
+            // typed `StoreError`, which the executor would commit.
+            let direct = writer
+                .submit(Lane::Claims, None, |tx| {
+                    Ok(matches!(
+                        claim_lease(tx, &owner("p"), &new("t", "a", "r"), 0),
+                        Err(LeaseError::Sql(_))
+                    ))
+                })
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert!(direct, "{table}: claim write failure lost its SQL error");
+            assert_eq!(lease_state(readers), (vec![], 0, 0), "{table}");
+        });
+    }
+}
+
+#[test]
+fn statement_level_failure_in_a_composed_lease_job_is_rolled_back_by_the_executor() {
+    use rusqlite::ffi::ErrorCode::ConstraintViolation;
+    executor(|writer, readers| {
+        // RAISE(ABORT) fails the statement and leaves the transaction open, so
+        // only the executor dropping it can remove the earlier writes.
+        exec(
+            writer,
+            "CREATE TRIGGER abort_renew BEFORE UPDATE ON leases BEGIN SELECT RAISE(ABORT,'synthetic'); END",
+        );
+        let receipt = writer
+            .submit(Lane::Claims, None, |tx| {
+                let who = owner("p");
+                tx.execute(
+                    "INSERT INTO daemon_config(key,value,revision) VALUES('outer','x',1)",
+                    [],
+                )?;
+                let ClaimOutcome::Granted(lease) = claim_lease(tx, &who, &new("t", "a", "r"), 0)?
+                else {
+                    unreachable!()
+                };
+                renew_lease(tx, &who, "t", &lease.lineage, lease.epoch, 9)?;
+                Ok(())
+            })
+            .unwrap()
+            .wait();
+        assert_eq!(sql_code(receipt), ConstraintViolation);
+        assert_eq!(lease_state(readers), (vec![], 0, 0));
     });
 }

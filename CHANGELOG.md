@@ -1,7 +1,7 @@
 # Changelog
 
 All notable user-visible changes. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning:
-[SemVer](https://semver.org/spec/v2.0.0.html). Add entries under `[Unreleased]` in the PR that makes the change.
+[SemVer](https://semver.org/spec/v2.0.0.html). Write entries as fragments in `docs/changelog/unreleased/` (see AGENTS.md); assemble them with `cargo xtask changelog assemble` at release.
 
 ## [Unreleased]
 

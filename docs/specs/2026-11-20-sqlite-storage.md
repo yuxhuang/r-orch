@@ -689,11 +689,45 @@ deliverable B confirms each line. Every list also offers the sort `id`, whose va
 |---|---|---|
 | tasks | status rank, `updated_at` descending, `position` | `position`, `priority`, `created_at`, `updated_at` |
 | agents | `position` | `name` |
-| goals | status rank, `updated_at` descending, `position` | `created_at` |
+| goals | status rank, a present `updated_at` before an absent one (a present empty text is present), the original `updated_at` text descending, `position`, `id` ("Run and goal default order" below) | `created_at` |
 | messages | `created_at`, `position` | none |
 | context entries | `key` | none |
 | teams | `created_at`, `id` (1.0's order came from the filesystem and was not a contract) | `name` |
-| runs | `started_at` descending, `id` (1.0 broke equal start times by directory order, which was not a contract) | per task: `run_no` |
+| runs | `started_at` descending, `id` (1.0 broke equal start times by directory order, which was not a contract); when the filter names a task, with or without an `agent` filter beside it: `attempt` numerically descending, then `id` ("Run and goal default order" below) | per task: `run_no` |
+
+**Run and goal default order.** These two rows are settled by the lead's decision of 2026-11-23.
+
+- *Run key.* The default order of runs depends on the filter and on nothing else. A filter that names a task, alone or
+  beside an `agent`, selects the numeric `attempt` of the run, descending, then the identity by bytes. A list with no
+  task in its filter (all runs, or one agent's) keeps the original text of `started_at`, descending, then the identity
+  by bytes. The explicit sort `id` is always the identity ascending, with any filter. A page's cursor continues the key
+  of the order that produced it, so a task-filtered page resumes by attempt.
+- *Attempts in numeric order.* For one task's runs, attempts 2, 10 and 10 are listed 10, 10, 2, the two tens in the
+  byte order of their ids, whatever the order of creation; a text order would put 2 first. The value is the run's
+  `attempt`; it is never taken from `attempt_no`, from `position` or from `run_no`. How SQLite stores and indexes it is
+  the migration's (T10).
+- *Goal key.* The default key compares, in turn: the status rank (active, paused, achieved, abandoned); the presence of
+  `updated_at`, a present value first and a present empty text counting as present; the original text of `updated_at`,
+  descending; `position` ascending; and the identity by bytes. A goal with an absent `updated_at` is therefore never
+  tied with one whose `updated_at` is the empty text, and an absent value is never read as the empty text. The cursor
+  resumes the same key.
+- *Text is compared as written.* A time that a list orders by is compared by the bytes of the original string. Two
+  strings of one instant are two keys, an opaque string is a key, and an offset string does not sort by its instant.
+- *One contract for the references and SQLite.* The memory reference, the file reference and the SQLite adapter shall
+  implement the run key and the goal key above and pass the same shared scenarios in
+  `crates/orch-engine/tests/storage_contract/v2_paging.rs`: `message_and_run_filters_stay_within_their_family` and
+  `declared_secondary_sorts_use_values_then_tie_breakers`. Each walks size-one pages to the exhausted cursor and checks
+  the total count. The run scenario uses attempts 2, 10 and 10 whose timestamps, insertion order and ids disagree with
+  the attempt order, rows of another task and of another agent, and the task-and-agent, task-only, agent-only,
+  unfiltered and explicit `id` queries. The goal scenario mixes every status with an absent, an empty and a non-empty
+  `updated_at`, equal texts whose positions and ids disagree with each other, and the status-filtered, `created_at` and
+  `id` queries.
+- *Contract and qualification are different things.* The text of this section is the contract. That a reference meets
+  it is shown only by those two scenarios passing on it, and that SQLite meets it only by the registration of the same
+  scenarios on SQLite passing. The change that aligns the memory and file references and strengthens the scenarios is
+  reviewed on its own, with an exact-head hosted Linux check and test; it lands in the same train as this text, and a
+  reference that disagrees with this section is a defect of the reference. T10 registers the shared scenarios on SQLite
+  after that change has landed.
 
 The engine calls `move_to_end` only at the call sites deliverable B lists as observable. Until that list
 exists the rule is: wherever 1.0 saved a task, agent, goal or message.
