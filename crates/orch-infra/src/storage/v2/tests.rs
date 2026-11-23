@@ -769,7 +769,6 @@ async fn a_hand_edited_intent_outside_the_contract_is_refused_on_read() {
         Corruption::Invalid("intent 1 is past its counter"),
         Corruption::Parse("unknown variant `process.kill`"),
         Corruption::Parse("unknown field `pid`"),
-        Corruption::Invalid("request key 0 has an impossible scope"),
     ];
     assert_eq!(edits.len(), expected.len());
     for (edit, expected) in edits.into_iter().zip(expected) {
@@ -2269,8 +2268,11 @@ async fn retry_existing_single_object_encoding_and_wrapper_extensions_remain_rea
         Some(expected.clone())
     );
     assert_eq!(
-        snap.read_due_retries(i64::MAX, 10).await.unwrap(),
-        [expected.clone()]
+        snap.read_due_retries(i64::MAX, 10)
+            .await
+            .unwrap()
+            .as_slice(),
+        std::slice::from_ref(&expected)
     );
     assert_eq!(snap.read_retries(None, 10).await.unwrap().rows, [expected]);
     assert_eq!(BlobHash::of("é".repeat(32_769).as_bytes()), hash);

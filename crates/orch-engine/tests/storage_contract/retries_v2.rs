@@ -795,8 +795,8 @@ pub async fn retry_whole_text_replacement_rolls_back_and_snapshots_keep_original
     assert_eq!(get(s.as_ref(), P, "t1").await, Some(short.clone()));
     let snap = s.read(caller(P)).await.unwrap();
     assert_eq!(
-        snap.read_due_retries(i64::MAX, 1).await.unwrap(),
-        [short.clone()]
+        snap.read_due_retries(i64::MAX, 1).await.unwrap().as_slice(),
+        std::slice::from_ref(&short)
     );
     assert_eq!(walk(snap.as_ref(), 1).await.1, [short]);
     let mut long = retry("t1", 4, 40);
