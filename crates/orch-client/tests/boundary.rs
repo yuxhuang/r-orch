@@ -1,6 +1,7 @@
 use orch_client::{ClientConfig, Project};
 use orch_proto::handshake::{Caller, CallerKind, SessionMode};
 use std::fs;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
 
@@ -21,7 +22,10 @@ pub fn config(root: &Path, socket: &Path) -> ClientConfig {
 }
 fn project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
-    fs::create_dir(dir.path().join(".orchestry")).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.path().join(".orchestry"))
+        .unwrap();
     dir
 }
 
@@ -80,10 +84,7 @@ fn discovery_rejects_unsafe_modes_symlinks_fifos_and_oversize_without_hanging() 
 #[tokio::test]
 async fn test_root_confinement_checks_components_and_resolves_symlink_parents() {
     let p = project();
-    let base = tempfile::Builder::new()
-        .prefix("oc-")
-        .tempdir_in("/tmp")
-        .unwrap();
+    let base = tempfile::Builder::new().prefix("oc-").tempdir().unwrap();
     let allowed = base.path().join("allowed");
     let sibling = base.path().join("allowed-sibling");
     fs::create_dir(&allowed).unwrap();
@@ -140,7 +141,10 @@ fn safe_record_is_read_from_the_pinned_state_directory_and_wrong_identity_is_rej
         root.path().join("old-state"),
     )
     .unwrap();
-    fs::create_dir(root.path().join(".orchestry")).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.path().join(".orchestry"))
+        .unwrap();
     // A swapped path cannot redirect the already selected project's read.
     assert_eq!(selected.read_record().unwrap(), record);
     record.project_id.ino += 1;
