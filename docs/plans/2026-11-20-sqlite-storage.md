@@ -234,11 +234,85 @@ are useful but do not replace those registrations. T12 owns stale-epoch finish
 and runtime restart/renewal proof; T16 consumes SQLite event conformance. T21 owns
 R97 import backing (the proposed import test does not exist yet). T27 records
 those actual named checks and rejects empty or ignored selections. T25 retains
-the file reference as a dev-only dependency. R7/R117/R132-caller name alignment
-and the frozen-trait and sort decisions remain with issue 109; none is changed by this name reconciliation. Full T8
-acceptance still requires the accepted operational integration and issue 109's
-consumer dispositions. macOS is tracked in After 2.0 under the owner's Linux-only
-direction through 2.0.
+the file reference as a dev-only dependency. The name alignment for R7, R117
+and the caller part of R132, the frozen-trait record and the pending-message,
+run-order and retry-text decisions belong to issue 109 and are in "T8 consumer
+contracts (issue 109)" below; this name reconciliation changes none of them. Full
+T8 acceptance still requires the accepted operational integration and issue
+109's consumer dispositions. macOS is tracked in After 2.0 under the owner's
+Linux-only direction through 2.0.
+
+### T8 consumer contracts (issue 109)
+
+[ADR 0020](../decisions/0020-storage-consumer-contracts.md) records the decisions, and the spec's "T8 consumer-contract
+amendment (issue 109)" states the contract. They add `Filter::PendingMessages { recipient, now }`,
+`Sort::Attempt` (per task only) and whole `Retry.error` text through the blob store (as ordered chunks above one 64 MiB
+object), and
+`docs/TRAITS-FROZEN.md` records the landed v2 signatures beside them. None of the three is on `main` until the PR that
+closes #109 lands; that PR (the integration task) writes the code, registers the shared tests on the memory fake and
+the file reference, and updates this section's status. This task changes documents only.
+
+**Verification names for R7, R117 and the caller part of R132.** Use the same procedure as the crosswalk above: list
+the bare filter, require every registration, run it, and require that many passing tests with none failed or
+ignored. Each of the three entity registrations is `memory_v2`, `queued_memory_v2` and `file_v2`.
+
+| Requirement | Bare filters (actual test names) | Expected registrations per filter |
+|---|---|---|
+| R7 | `unit_of_work_keeps_nothing_after_an_error`, `a_failed_unit_of_work_keeps_no_setting_or_template_row_or_position` | 3 entity references |
+| R7, writer process crash | `cargo test -p orch-infra --test sqlite_crash -- kill_before_commit_keeps_nothing` (also `kill_at_body_return_commit_boundary_keeps_nothing` and `kill_after_commit_receipt_keeps_all_changes`) | one test each; this is the production writer's process-crash boundary, not the SQLite adapter's port-level run, which T10 registers |
+| R117 | `two_task_ids_that_differ_only_in_case_are_refused`, `task_ascii_aliases_are_refused_without_rewriting_ids`, `task_lookups_stay_exact_to_the_byte`, `only_task_ids_fold_and_only_the_ascii_letters` | 3 entity references |
+| R117, schema | `cargo test -p orch-infra --test sqlite_schema -- task_ids_are_unique_under_ascii_case_only_within_a_project` | one test |
+| R132, caller fields | `caller_selects_the_project_and_keeps_the_principal` (a task principal's lineage and epoch come back unchanged from both entry points) | 3 entity references |
+
+The importer-side R117 rule has an existing unit test in `orch-infra`'s library:
+`import::preflight::tests::two_task_ids_that_differ_only_in_case_are_refused_before_any_write`. The command-level import, export and restore tests that R117 names, and the lineage tests
+of R132 (`leases`, `restore_fencing`), do not exist yet and stay with T21, T12, T13 and T23.
+
+Representative verification is **pending**: nobody has run these selections at the commit that lands #109. The
+integration task runs the table above, with `--list` and then the run, on both references and records the commit,
+the counts and the platform. The filter spellings were checked against the test sources and against a listing of the
+conformance suite on `07b5f967`; that is not a test result for any later commit, and a selection that matches zero
+tests, or ignores one, fails verification.
+
+**Retry text above one blob object (ADR 0020 decision 4).** The reference implementation, in the PR that closes #109,
+meets this mapping and is accepted only with these focused Linux checks on both references. Each check is one named
+test; the integration task records its commit, count and platform, and an empty or ignored selection fails it.
+
+| Check | What it shows |
+|---|---|
+| 65,536 and 65,537 bytes | Inline, then one blob object named by the row's hash |
+| 67,108,864 and 67,108,865 bytes | One object at the limit; chunks and a whole-value hash one byte above it |
+| A character split across a chunk boundary | The joined bytes decode only after the whole-value hash matches |
+| A retry with no run | The whole text is the retry's own, never the run's |
+| Failure on a later chunk after an earlier chunk was published | The previous row reads back whole, also after the caller catches the error and commits other work |
+| A missing, a corrupt and a reordered chunk | Each is a read error on every retry read, never a partial value |
+| Identical chunks at two positions | The mapping keeps both positions |
+| An existing one-object row | Still readable after the change |
+| Physical backing | The objects and the mapping are checked on disk or in the fake, not only the value read back |
+
+This is reference-port proof only. It gives no measurement above 64 MiB beyond these boundaries and accepts none of
+T10, T12, T21 or T23. T10 repeats the physical checks on SQLite. T21 rebuilds an imported 1.0 error into the same
+representation. T23 carries every reachable chunk, in order, with the whole-value hash, through backup, restore,
+export and import. Memory reference: `orch-core` cannot depend on `orch-infra`, so the memory fake needs an
+injectable blob double to exercise a failed publication, a missing blob and a corrupt blob; that test seam is the
+closing PR's design choice.
+
+**What each consumer keeps.** The reference tests prove the port, not the runtime, and no row below is accepted by
+them.
+
+| Owner | Obligation | Source |
+|---|---|---|
+| T10 | SQLite representation: the retry blob and chunk mapping (publish first, whole text, whole-value hash and ordered chunks above 64 MiB, unchanged row on a missing or corrupt blob or chunk), SQLite parity for the physical checks below, the pending-message statement (`status`, exact recipient, `expires_at IS NULL OR expires_at >= ?now`, text comparison, filter before count and cursor), an index for `Sort::Attempt` (attempt descending, id ascending), adapter registration of the retry, message and run scenarios, and an independent due-read test: after the enlarged complete-read restore, compare the first 1,000 expected rows of a due read at `i64::MAX` through its own SQL statement (the reference queries share a loader, so the walk does not prove it). Update the crosswalk's expected registrations when SQLite joins | ADR 0020; issue 109 (N-a); crosswalk |
+| T12 | `put_retry` after `get_retry` (1.0 enqueue was first-wins) in one unit of work; a finish that writes the retry row, the task status and the lease release together; lease-bound finish and restart fencing (R36, R132, run through issue 110); a finish of a long error whole | ADR 0020; R35, R36 |
+| T13 | Generations and recovery (R41) and the Linux sleep and wake fencing check (R42, issue 110, pending) | R41, R42 |
+| T14 | `retry_pending` gating per task; dispatch in candidate order and agent rotation, never due-row order | retries module |
+| T21 | A 1.0 retry deadline that does not parse becomes due, and the dry run counts it; the whole 1.0 error is imported (R97), rebuilt into the same chunk representation when it exceeds one blob object | R65, R69, R97 |
+| T23 | Durable restore with a new lineage, with the open point AP14 (a backup's workspace names); a whole retry export and import round trip including blob-backed text and every reachable chunk, its order and the whole-value hash, through backup, restore, export and import | R117, R132, R138 |
+| T27 | The second-host peer check on Linux (R89) and the recorded named checks of the crosswalk, rejecting an empty or ignored selection | R89 |
+
+Follow-ups kept with their owners from the review of #191 (none is a contract waiver): N-a above (T10), N-b the
+retry entry belongs in `CHANGELOG.md`'s existing "Storage groundwork" section and says that no daemon consumer is
+activated (the PR that closes #109), N-c `docs/ARCHITECTURE.md`'s store module inventory names `blob` (the same PR).
 
 ### Switch, removal, proof
 
@@ -932,12 +1006,20 @@ For T10 the existing SQL names require `WHERE project_id = ?` and the exclusive
 `(due_at, task_id)` key, `ORDER BY due_at, task_id COLLATE BINARY`, fetching limit+1.
 No index migration is required by this reference change. The shared retry suite
 covers 2,500 rows and a 2,501-row restore containing a whole 65,536-byte UTF-8 error.
-The reference's larger-error refusal does not satisfy or weaken whole-text R97;
-T10/T12/T21 retain blob mapping under #109. T12 retains first-wins enqueue, T21
+The reference's larger-error refusal does not satisfy or weaken whole-text R97:
+[ADR 0020](../decisions/0020-storage-consumer-contracts.md) decides that a retry keeps its whole `error`
+text and the PR that closes #109 changes the references to meet it (see "T8 consumer contracts (issue 109)").
+T10 owns the SQLite representation of the blob mapping. T12 retains first-wins enqueue, T21
 legacy invalid-deadline handling, and T14 dispatch/rotation order. The historical
 builder's due-only limitation is superseded by the reviewed module contract.
 
-T8 reference acceptance is separate from runtime acceptance: T12 owns Linux
-restart/recovery and lease-bound finish, T13 owns Linux sleep/wake fencing and
-second-host peer verification, and T23 owns durable restore including a new lineage.
+T8 reference acceptance is separate from runtime acceptance, and each runtime check has one owner:
+
+- T12 owns lease-bound finish and restart lease fencing (R36, R132; the runtime proof is issue 110).
+- T13 owns generations and recovery (R41) and the Linux sleep and wake fencing check (R42, issue 110: a real
+  suspend and resume of an isolated Linux host that the owner has authorized; pending).
+- T23 owns durable restore, including a new lineage, and the owner's open point AP14 on a backup's workspace
+  names.
+- T27 owns the second-host peer check on Linux (R89).
+
 macOS compatibility is deferred to After 2.0 and is not a release gate.

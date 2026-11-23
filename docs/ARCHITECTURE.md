@@ -445,7 +445,7 @@ All three names are the same program:
 | Crate | Modules |
 |---|---|
 | `orch-domain` | `task`, `agent`, `run`, `goal`, `team`, `message`, `state`, `config`, `global_config`, `events`, `error`, `transitions`, `scope`, `model_tiers`, `shop` (agent-shop + org-shop + default-agents) |
-| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity, event, lease, retry, intent, request-key and attention port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
+| `orch-core` | `storage` (v1 traits), `store::{entity, page, events, leases, retries, intents, request_keys, attention, blob, fake}` (additive v2 entity, paging, event, lease, retry, intent, request-key, attention and blob-store port, and the memory reference), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock, v2}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models`, `blob::{DiskBlobStore, BlobReferences}` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{agent, config, context, daemon, goal, init, msg, org, org_template, remote, rpc, run, status, task, team}`, `doctor`, `logs`, `tui` (`DaemonBackend`), `update`, `web`, `routing`, `tree`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
@@ -470,8 +470,9 @@ family and its filters; `PageRequest` bounds each list and selects a supported
 sort. `store::fake::FakeStorage`, behind `test-support`, serializes in-memory
 writers and retains immutable read views. Its cursor registry holds query
 bindings and sort keys, not snapshots, and lives only as long as that fake.
-`ReadSnapshot` and `UnitOfWork` also expose the `events::{EventRead, EventWrite}`
-and `leases::{LeaseRead, LeaseWrite}` contracts. Event batches keep the first
+`ReadSnapshot` also extends `AttentionRead`, `EventRead`, `IntentRead`, `LeaseRead` and `RetryRead`; `UnitOfWork`
+extends `AttentionWrite`, `EventWrite`, `IntentWrite`, `LeaseWrite`, `RequestKeyWrite` and `RetryWrite`
+([TRAITS-FROZEN](TRAITS-FROZEN.md) records each signature). Event batches keep the first
 payload for each sequence and report stored/skipped counts; range/tail reads are
 in sequence order, gaps are retained when bounded pruning removes event rows.
 A gap is keyed by project, run and `after_seq`: replaying the same `dropped`
@@ -494,9 +495,22 @@ conformance suite (test-only by design: nothing outside tests constructs it).
 Its project document also holds events, gaps, leases and epoch counters, replaced
 by one rename with the rows; the daemon lineage is one file at its root, and
 `restore_to_lineage` (fixture authority) ends every lease and keeps every counter.
-The remaining operational families, large-text storage in the blob store and SQLite
-are subsequent slices. The daemon and all v1 storage traits still use the existing
-file implementation; this additive module changes no runtime storage path.
+The daemon and all v1 storage traits still use the existing file implementation;
+this additive module changes no runtime storage path. Operational families beyond
+the entity, event, lease, retry, intent, request-key, attention and blob ports are
+later slices.
+
+Three contracts for its consumers are decided in
+[ADR 0020](decisions/0020-storage-consumer-contracts.md) and are not on `main` until
+the PR that closes issue 109 lands. `Filter::PendingMessages { recipient, now }` selects a
+recipient's unexpired pending messages before the page is cut, with 1.0's string
+comparison of the expiry (equality is pending). `Sort::Attempt`, offered only for one task's
+runs, orders by `Run.attempt` descending. A retry keeps its whole `error` text: inline up
+to 65,536 UTF-8 bytes, one blob object up to the blob store's 64 MiB object limit, and above
+that a whole-value hash with an ordered mapping to chunk objects. Until then `main`
+refuses a retry `error` over 65,536 bytes. These are reference-port contracts; the
+SQLite mapping, the callers and the import and restore paths remain with T10, T12, T21
+and T23.
 
 The inactive `orch_core::store::attention` operational port shares these buffered
 transactions and snapshots in both references. Fixed typed facts control item text;
