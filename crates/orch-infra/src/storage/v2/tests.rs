@@ -1721,3 +1721,462 @@ async fn malformed_inline_record_preserves_parse_error_path_and_variant_diagnost
     }
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
+
+#[tokio::test]
+async fn retry_text_boundary_is_backed_before_the_hash_row_and_reopens_whole() {
+    use crate::blob::{BlobHash, DiskBlobStore};
+    use crate::data_dir::confined::ConfinedDir;
+    let root = root();
+    let storage = FileStorage::new(root.path());
+    let inline = Retry {
+        error: "é".repeat(32_768),
+        ..retry("inline", 1, 10)
+    };
+    let row = inline.clone();
+    storage
+        .transaction(owner("p"), Lane::Entities, move |u| u.put_retry(&row))
+        .await
+        .unwrap();
+    let dir = storage.project_dir("p");
+    assert!(!dir.join("blobs").exists());
+    let external = Retry {
+        error: format!("{}!", "é".repeat(32_768)),
+        ..retry("external", 2, 20)
+    };
+    let hash = BlobHash::of(external.error.as_bytes());
+    let row = external.clone();
+    let blob_dir = dir.clone();
+    storage
+        .transaction(owner("p"), Lane::Entities, move |u| {
+            u.put_retry(&row)?;
+            // No document with a hash row has committed, but its complete bytes exist.
+            let document: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(blob_dir.join("state.json")).unwrap())
+                    .unwrap();
+            assert!(document["retries"]["rows"]["external"].is_null());
+            let blobs = DiskBlobStore::open(&ConfinedDir::open(&blob_dir).unwrap()).unwrap();
+            assert_eq!(blobs.get(&hash).unwrap(), row.error.as_bytes());
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    assert!(document["records"].as_array().unwrap().is_empty());
+    assert_eq!(document["retries"]["rows"]["inline"]["error"], inline.error);
+    assert_eq!(
+        document["retries"]["rows"]["external"]["error"],
+        serde_json::json!({"sha256":hash.to_string()})
+    );
+    drop(storage);
+    let reopened = FileStorage::new(root.path());
+    let snap = reopened.read(owner("p")).await.unwrap();
+    assert_eq!(
+        snap.read_retry("inline").await.unwrap(),
+        Some(inline.clone())
+    );
+    assert_eq!(
+        snap.read_retry("external").await.unwrap(),
+        Some(external.clone())
+    );
+    assert_eq!(
+        snap.read_due_retries(i64::MAX, 10).await.unwrap(),
+        [inline.clone(), external.clone()]
+    );
+    assert_eq!(
+        snap.read_retries(None, 10).await.unwrap().rows,
+        [inline, external]
+    );
+}
+
+// Only synthetic bytes and a task-local directory. The memory reference uses
+// the existing blob port with the real disk adapter, not a whole-string stand-in.
+fn retry_backing(
+    memory: bool,
+    root: &Path,
+    store: impl orch_core::store::blob::BlobStore<
+        Hash = crate::blob::BlobHash,
+        Error = crate::blob::BlobError,
+    > + 'static,
+) -> std::sync::Arc<dyn Storage> {
+    if memory {
+        std::sync::Arc::new(orch_core::store::fake::FakeStorage::with_retry_blob_store(
+            store,
+            crate::blob::BlobHash::of,
+            crate::blob::MAX_BLOB_BYTES as usize,
+        ))
+    } else {
+        let mut storage = FileStorage::new(root);
+        storage.retry_blobs = Some(std::sync::Arc::new(store));
+        std::sync::Arc::new(storage)
+    }
+}
+
+fn retry_blob_path(dir: &Path, bytes: &[u8]) -> std::path::PathBuf {
+    let hash = crate::blob::BlobHash::of(bytes).to_string();
+    dir.join("blobs/sha256")
+        .join(&hash[..2])
+        .join(&hash[2..4])
+        .join(hash)
+}
+
+#[tokio::test]
+async fn retry_missing_and_corrupt_blobs_fail_all_read_paths_on_both_references() {
+    use crate::blob::DiskBlobStore;
+    use crate::data_dir::confined::ConfinedDir;
+    for memory in [false, true] {
+        for corrupt in [false, true] {
+            let root = root();
+            let dir = root.path().join("p-70");
+            std::fs::create_dir(&dir).unwrap();
+            let store = DiskBlobStore::open(&ConfinedDir::open(&dir).unwrap()).unwrap();
+            let storage = retry_backing(memory, root.path(), store);
+            let row = Retry {
+                error: "é".repeat(32_769),
+                ..retry("damaged", 1, 10)
+            };
+            let bytes = row.error.as_bytes().to_vec();
+            storage
+                .transaction(owner("p"), Lane::Entities, move |u| u.put_retry(&row))
+                .await
+                .unwrap();
+            let snap = storage.read(owner("p")).await.unwrap();
+            let path = retry_blob_path(&dir, &bytes);
+            if corrupt {
+                std::fs::write(&path, b"wrong bytes").unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            // A held snapshot retains the reference; damage cannot turn it into a shortened row.
+            let error = snap.read_retry("damaged").await.unwrap_err().to_string();
+            assert!(error.contains("damaged"), "{error}");
+            assert!(
+                error.contains(if corrupt { "does not hash" } else { "no blob" }),
+                "{error}"
+            );
+            assert!(snap.read_due_retries(i64::MAX, 10).await.is_err());
+            assert!(snap.read_retries(None, 10).await.is_err());
+            let document = std::fs::read(dir.join("state.json")).ok();
+            storage
+                .transaction(owner("p"), Lane::Entities, |u| {
+                    assert!(u.get_retry("damaged").is_err());
+                    assert!(u.due_retries(i64::MAX, 10).is_err());
+                    assert!(u.list_retries(None, 10).is_err());
+                    assert_eq!(u.get_retry("absent")?, None);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(dir.join("state.json")).ok(), document);
+        }
+    }
+}
+
+// Damage the published name after the real disk put returns. The retry
+// adapter must verify it before staging a reference. Neither failure may replace the staged row.
+struct RetryPublicationFault {
+    store: crate::blob::DiskBlobStore,
+    dir: std::path::PathBuf,
+    corrupt: bool,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl orch_core::store::blob::BlobStore for RetryPublicationFault {
+    type Hash = crate::blob::BlobHash;
+    type Error = crate::blob::BlobError;
+    fn put(&self, bytes: &[u8]) -> std::result::Result<Self::Hash, Self::Error> {
+        use std::sync::atomic::Ordering;
+        let hash = self.store.put(bytes)?;
+        if self.armed.load(Ordering::SeqCst) {
+            let path = retry_blob_path(&self.dir, bytes);
+            if self.corrupt {
+                std::fs::write(path, b"wrong bytes")?;
+            } else {
+                std::fs::remove_file(path)?;
+            }
+        }
+        Ok(hash)
+    }
+    fn get(&self, hash: &Self::Hash) -> std::result::Result<Vec<u8>, Self::Error> {
+        self.store.get(hash)
+    }
+    fn remove(&self, hash: &Self::Hash) -> std::result::Result<bool, Self::Error> {
+        self.store.remove(hash)
+    }
+}
+
+#[tokio::test]
+async fn retry_publication_refusal_preserves_prior_rows_even_when_caught_on_both_references() {
+    use crate::blob::DiskBlobStore;
+    use crate::data_dir::confined::ConfinedDir;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    for memory in [false, true] {
+        for corrupt in [false, true] {
+            let root = root();
+            let dir = root.path().join("p-70");
+            std::fs::create_dir(&dir).unwrap();
+            let replacement = Retry {
+                error: format!("{}!", "é".repeat(32_768)),
+                ..retry("keep", 2, 20)
+            };
+            let armed = Arc::new(AtomicBool::new(false));
+            let store = DiskBlobStore::open(&ConfinedDir::open(&dir).unwrap()).unwrap();
+            let store = RetryPublicationFault {
+                store,
+                dir: dir.clone(),
+                corrupt,
+                armed: armed.clone(),
+            };
+            let storage = retry_backing(memory, root.path(), store);
+            let previous = Retry {
+                error: "old".repeat(30_000),
+                ..retry("keep", 1, 10)
+            };
+            let old = previous.clone();
+            storage
+                .transaction(owner("p"), Lane::Entities, move |u| u.put_retry(&old))
+                .await
+                .unwrap();
+            let document = std::fs::read(dir.join("state.json")).ok();
+            armed.store(true, Ordering::SeqCst);
+            let old = previous.clone();
+            storage
+                .transaction(owner("p"), Lane::Entities, move |u| {
+                    let error = u.put_retry(&replacement).unwrap_err().to_string();
+                    assert!(
+                        error.contains(if corrupt { "does not hash" } else { "no blob" })
+                            || error.contains("No such file"),
+                        "{error}"
+                    );
+                    assert_eq!(u.get_retry("keep")?, Some(old.clone()));
+                    assert_eq!(
+                        u.due_retries(i64::MAX, 10)?.as_slice(),
+                        std::slice::from_ref(&old)
+                    );
+                    assert_eq!(u.list_retries(None, 10)?.rows, [old]);
+                    Ok(()) // Deliberately catch the failure and commit.
+                })
+                .await
+                .unwrap();
+            assert_eq!(std::fs::read(dir.join("state.json")).ok(), document);
+            assert_eq!(
+                storage
+                    .read(owner("p"))
+                    .await
+                    .unwrap()
+                    .read_retry("keep")
+                    .await
+                    .unwrap(),
+                Some(previous)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified() {
+    use crate::blob::{BlobHash, DiskBlobStore, MAX_BLOB_BYTES};
+    use crate::data_dir::confined::ConfinedDir;
+    let max = MAX_BLOB_BYTES as usize;
+    for memory in [false, true] {
+        for extra in [false, true] {
+            let root = root();
+            let dir = root.path().join("p-70");
+            std::fs::create_dir(&dir).unwrap();
+            let store = DiskBlobStore::open(&ConfinedDir::open(&dir).unwrap()).unwrap();
+            let storage = retry_backing(memory, root.path(), store);
+            let mut error = "€".repeat(max / 3); // 67,108,863 bytes.
+            error.push_str(if extra { "é" } else { "!" });
+            assert_eq!(error.len(), max + usize::from(extra));
+            let hash = BlobHash::of(error.as_bytes());
+            let row = Retry {
+                error,
+                ..retry("large", 1, 10)
+            };
+            let expected = row.clone();
+            storage
+                .transaction(owner("p"), Lane::Entities, move |u| {
+                    u.put_retry(&row)?;
+                    assert_eq!(u.get_retry("large")?, Some(row));
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            let snap = storage.read(owner("p")).await.unwrap();
+            assert_eq!(
+                snap.read_retry("large").await.unwrap(),
+                Some(expected.clone())
+            );
+            assert_eq!(
+                snap.read_due_retries(i64::MAX, 1).await.unwrap().as_slice(),
+                std::slice::from_ref(&expected)
+            );
+            assert_eq!(
+                snap.read_retries(None, 1).await.unwrap().rows.as_slice(),
+                std::slice::from_ref(&expected)
+            );
+            let blobs = DiskBlobStore::open(&ConfinedDir::open(&dir).unwrap()).unwrap();
+            if extra {
+                assert!(!retry_blob_path(&dir, expected.error.as_bytes()).exists());
+                let mut combined = Vec::new();
+                for chunk in expected.error.as_bytes().chunks(max) {
+                    let bytes = blobs.get(&BlobHash::of(chunk)).unwrap();
+                    assert_eq!(bytes, chunk);
+                    // The two-byte character straddles the object boundary.
+                    assert!(std::str::from_utf8(&bytes).is_err());
+                    combined.extend(bytes);
+                }
+                assert_eq!(BlobHash::of(&combined), hash);
+                assert_eq!(combined, expected.error.as_bytes());
+                let tail = &expected.error.as_bytes()[max..];
+                let path = retry_blob_path(&dir, tail);
+                std::fs::write(&path, b"damaged tail").unwrap();
+                assert!(snap.read_retry("large").await.is_err());
+                assert!(snap.read_due_retries(i64::MAX, 1).await.is_err());
+                assert!(snap.read_retries(None, 1).await.is_err());
+                std::fs::write(&path, tail).unwrap();
+                std::fs::remove_file(&path).unwrap();
+                assert!(snap.read_retry("large").await.is_err());
+                std::fs::write(&path, tail).unwrap();
+                if !memory {
+                    let path = dir.join("state.json");
+                    let mut document: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    let mapping = &mut document["retries"]["rows"]["large"]["error"];
+                    assert_eq!(mapping["sha256"], hash.to_string());
+                    let chunks = mapping["chunks"].as_array_mut().unwrap();
+                    assert_eq!(chunks.len(), 2);
+                    chunks.swap(0, 1);
+                    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+                    let reopened = FileStorage::new(root.path());
+                    let error = reopened
+                        .read(owner("p"))
+                        .await
+                        .unwrap()
+                        .read_retry("large")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        error.contains("reconstructed retry does not hash"),
+                        "{error}"
+                    );
+                }
+            } else {
+                assert_eq!(blobs.get(&hash).unwrap(), expected.error.as_bytes());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn retry_later_chunk_failure_keeps_prior_row_and_earlier_published_bytes() {
+    use crate::blob::{BlobHash, DiskBlobStore, MAX_BLOB_BYTES};
+    use crate::data_dir::confined::ConfinedDir;
+    for memory in [false, true] {
+        let root = root();
+        let dir = root.path().join("p-70");
+        std::fs::create_dir(&dir).unwrap();
+        let store = DiskBlobStore::open(&ConfinedDir::open(&dir).unwrap()).unwrap();
+        let storage = retry_backing(memory, root.path(), store);
+        let old = retry("keep", 1, 10);
+        let previous = old.clone();
+        storage
+            .transaction(owner("p"), Lane::Entities, move |u| u.put_retry(&previous))
+            .await
+            .unwrap();
+        let document = std::fs::read(dir.join("state.json")).ok();
+        let max = MAX_BLOB_BYTES as usize;
+        let first = "x".repeat(max);
+        let last = b"!";
+        let hash = BlobHash::of(first.as_bytes());
+        let path = retry_blob_path(&dir, last);
+        // The second object's shard is unusable; the first can publish normally.
+        std::fs::create_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+        std::fs::write(path.parent().unwrap(), b"blocked shard").unwrap();
+        let new = Retry {
+            error: format!("{first}!"),
+            ..retry("keep", 2, 20)
+        };
+        let previous = old.clone();
+        storage
+            .transaction(owner("p"), Lane::Entities, move |u| {
+                assert!(u.put_retry(&new).is_err());
+                assert_eq!(u.get_retry("keep")?, Some(previous));
+                // Other work commits even though the replacement failed.
+                u.put_retry(&retry("other", 1, 30))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .read(owner("p"))
+                .await
+                .unwrap()
+                .read_retry("keep")
+                .await
+                .unwrap(),
+            Some(old)
+        );
+        let blobs = DiskBlobStore::open(&ConfinedDir::open(&dir).unwrap()).unwrap();
+        assert_eq!(blobs.get(&hash).unwrap(), first.as_bytes());
+        if let Some(document) = document {
+            let before: serde_json::Value = serde_json::from_slice(&document).unwrap();
+            let after: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+            assert_eq!(
+                before["retries"]["rows"]["keep"],
+                after["retries"]["rows"]["keep"]
+            );
+            assert_eq!(after["retries"]["rows"].as_object().unwrap().len(), 2);
+        }
+    }
+}
+
+#[tokio::test]
+async fn retry_repeated_chunks_reconstruct_every_occurrence_on_both_references() {
+    use crate::blob::{BlobHash, DiskBlobStore, MAX_BLOB_BYTES};
+    use crate::data_dir::confined::ConfinedDir;
+    for memory in [false, true] {
+        let root = root();
+        let dir = root.path().join("p-70");
+        std::fs::create_dir(&dir).unwrap();
+        let store = DiskBlobStore::open(&ConfinedDir::open(&dir).unwrap()).unwrap();
+        let storage = retry_backing(memory, root.path(), store);
+        let chunk = "x".repeat(MAX_BLOB_BYTES as usize);
+        let hash = BlobHash::of(chunk.as_bytes());
+        let row = Retry {
+            error: format!("{chunk}{chunk}!"),
+            ..retry("repeated", 1, 10)
+        };
+        let expected = row.clone();
+        storage
+            .transaction(owner("p"), Lane::Entities, move |u| u.put_retry(&row))
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .read(owner("p"))
+                .await
+                .unwrap()
+                .read_retry("repeated")
+                .await
+                .unwrap(),
+            Some(expected)
+        );
+        let blobs = DiskBlobStore::open(&ConfinedDir::open(&dir).unwrap()).unwrap();
+        assert_eq!(blobs.get(&hash).unwrap(), chunk.as_bytes());
+        if !memory {
+            let document: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+            let chunks = document["retries"]["rows"]["repeated"]["error"]["chunks"]
+                .as_array()
+                .unwrap();
+            assert_eq!(chunks.len(), 3);
+            assert_eq!(chunks[0], hash.to_string());
+            assert_eq!(chunks[1], chunks[0]);
+        }
+    }
+}

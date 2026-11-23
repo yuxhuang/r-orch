@@ -247,16 +247,9 @@ pub async fn a_failed_unit_of_work_changes_no_retry_row(fixture: Fixture) {
 pub async fn a_refused_row_changes_nothing_even_when_the_caller_commits(fixture: Fixture) {
     let s = fixture.storage.clone();
     put(s.as_ref(), P, vec![retry("t1", 1, 10)]).await;
-    let mut long = retry("t1", 2, 20);
-    long.error = "x".repeat(MAX_RETRY_ERROR_BYTES + 1);
     let mut exact = retry("t2", 1, 30);
     exact.error = "y".repeat(MAX_RETRY_ERROR_BYTES);
-    let bad = vec![
-        retry("", 1, 1),
-        retry("t1", 0, 20),
-        retry("t1", 2, -1),
-        long,
-    ];
+    let bad = vec![retry("", 1, 1), retry("t1", 0, 20), retry("t1", 2, -1)];
     let exact_row = exact.clone();
     s.transaction(caller(P), Lane::Entities, move |u| {
         for row in &bad {
@@ -714,6 +707,125 @@ pub async fn a_restore_keeps_every_retry_row(fixture: Fixture) {
     assert_eq!(again, expected);
 }
 
+// No run or task entity exists: the retry owns the complete diagnostic.
+pub async fn retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run(fixture: Fixture) {
+    let s = fixture.storage.clone();
+    let mut inline = retry("inline", 1, 10);
+    inline.error = "é".repeat(32_768);
+    let mut external = retry("external", 2, 20);
+    external.error = format!("{}!", "é".repeat(32_768));
+    assert_eq!(inline.error.len(), 65_536);
+    assert_eq!(external.error.len(), 65_537);
+    let expected = vec![inline, external];
+    let rows = expected.clone();
+    s.transaction(caller(P), Lane::Entities, move |u| {
+        for row in &rows {
+            assert!(u.get_retry(&row.task)?.is_none());
+            u.put_retry(row)?;
+            // T12 enqueue is get-before-put; a repeated enqueue keeps the first.
+            if u.get_retry(&row.task)?.is_none() {
+                u.put_retry(&retry(&row.task, 9, 99))?;
+            }
+            assert_eq!(u.get_retry(&row.task)?, Some(row.clone()));
+        }
+        assert_eq!(u.due_retries(i64::MAX, 10)?, rows);
+        assert_eq!(u.list_retries(None, 10)?.rows, rows);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let snapshot = s.read(caller(P)).await.unwrap();
+    for row in &expected {
+        assert_eq!(
+            snapshot.read_retry(&row.task).await.unwrap(),
+            Some(row.clone())
+        );
+    }
+    assert_eq!(
+        snapshot.read_due_retries(i64::MAX, 10).await.unwrap(),
+        expected
+    );
+    assert_eq!(walk(snapshot.as_ref(), 1).await.1, expected);
+    fixture
+        .restore
+        .restore_to_lineage("whole-text-restore")
+        .await;
+    assert_eq!(
+        walk(s.read(caller(P)).await.unwrap().as_ref(), 1).await.1,
+        expected
+    );
+}
+
+pub async fn retry_whole_text_replacement_rolls_back_and_snapshots_keep_original(fixture: Fixture) {
+    let s = fixture.storage.clone();
+    let mut original = retry("t1", 1, 10);
+    original.error = format!("{}!", "é".repeat(32_768));
+    put(s.as_ref(), P, vec![original.clone()]).await;
+    let snapshot = s.read(caller(P)).await.unwrap();
+    let mut replacement = retry("t1", 2, 20);
+    replacement.error = "new diagnostic".repeat(10_000);
+    let new = replacement.clone();
+    let result = s
+        .transaction(caller(P), Lane::Entities, move |u| {
+            u.put_retry(&new)?;
+            u.put_retry(&Retry {
+                task: "new".into(),
+                ..new.clone()
+            })?;
+            assert_eq!(u.get_retry("t1")?, Some(new));
+            Err::<(), _>(StoreError::CounterExhausted)
+        })
+        .await;
+    assert!(matches!(result, Err(StoreError::CounterExhausted)));
+    assert_eq!(get(s.as_ref(), P, "t1").await, Some(original.clone()));
+    assert_eq!(get(s.as_ref(), P, "new").await, None);
+    put(s.as_ref(), P, vec![replacement.clone()]).await;
+    assert_eq!(get(s.as_ref(), P, "t1").await, Some(replacement));
+    assert_eq!(
+        snapshot.read_retry("t1").await.unwrap(),
+        Some(original.clone())
+    );
+    assert_eq!(
+        snapshot.read_due_retries(i64::MAX, 10).await.unwrap(),
+        [original.clone()]
+    );
+    assert_eq!(walk(snapshot.as_ref(), 1).await.1, [original]);
+}
+
+struct BlobMemoryFixture {
+    _root: tempfile::TempDir,
+    storage: std::sync::Arc<orch_core::store::fake::FakeStorage>,
+}
+
+#[async_trait::async_trait]
+impl crate::v2_operations::Restore for BlobMemoryFixture {
+    async fn restore_to_lineage(&self, lineage: &str) {
+        self.storage.restore_to_lineage(lineage).await;
+    }
+}
+
+pub async fn blob_memory_backend() -> Fixture {
+    use orch_infra::blob::{BlobHash, DiskBlobStore, MAX_BLOB_BYTES};
+    use orch_infra::data_dir::confined::ConfinedDir;
+    let root = tempfile::tempdir().unwrap();
+    orch_core::test_support::assert_hermetic(root.path());
+    let blobs = DiskBlobStore::open(&ConfinedDir::open(root.path()).unwrap()).unwrap();
+    let storage = std::sync::Arc::new(orch_core::store::fake::FakeStorage::with_retry_blob_store(
+        blobs,
+        BlobHash::of,
+        MAX_BLOB_BYTES as usize,
+    ));
+    storage.restore_to_lineage("initial-lineage").await;
+    Fixture {
+        storage: storage.clone(),
+        restore: std::sync::Arc::new(BlobMemoryFixture {
+            _root: root,
+            storage,
+        }),
+        initial_lineage: "initial-lineage".into(),
+    }
+}
+
 macro_rules! retry_suite {
     ($module:ident, $factory:path) => {
         mod $module {
@@ -725,6 +837,8 @@ macro_rules! retry_suite {
                     }
                 };
             }
+            case!(retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run);
+            case!(retry_whole_text_replacement_rolls_back_and_snapshots_keep_original);
             case!(a_task_has_one_row_and_a_put_replaces_it_whole);
             case!(due_rows_are_ordered_by_deadline_then_task_and_bounded);
             case!(the_limit_is_one_to_one_thousand);

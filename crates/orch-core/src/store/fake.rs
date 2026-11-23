@@ -57,6 +57,7 @@ pub struct FakeStorage {
     bookmarks: Arc<Mutex<Bookmarks>>,
     /// Daemon-wide, so it lives beside the projects. Lock `projects` first.
     lineage: Mutex<String>,
+    retry_state: retries::fake::RetryState,
 }
 
 impl Default for FakeStorage {
@@ -65,6 +66,7 @@ impl Default for FakeStorage {
             projects: AsyncMutex::default(),
             bookmarks: Arc::default(),
             lineage: Mutex::new("fake-lineage-1".into()),
+            retry_state: retries::fake::RetryState::default(),
         }
     }
 }
@@ -85,7 +87,10 @@ impl Storage for FakeStorage {
             .await
             .get(&caller.project)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|| Project {
+                retries: self.retry_state.clone(),
+                ..Project::default()
+            });
         let lineage = self.lineage();
         Ok(Box::new(View {
             caller,
@@ -97,7 +102,13 @@ impl Storage for FakeStorage {
 
     async fn write(&self, caller: Caller, _lane: Lane, work: WriteWork) -> Result<()> {
         let mut projects = self.projects.lock().await;
-        let project = projects.get(&caller.project).cloned().unwrap_or_default();
+        let project = projects
+            .get(&caller.project)
+            .cloned()
+            .unwrap_or_else(|| Project {
+                retries: self.retry_state.clone(),
+                ..Project::default()
+            });
         let mut view = View {
             caller,
             lineage: self.lineage(),
@@ -111,6 +122,18 @@ impl Storage for FakeStorage {
 }
 
 impl FakeStorage {
+    /// Use a blob port for retry backing and publication/damage fault proofs.
+    pub fn with_retry_blob_store<B: blob::BlobStore + 'static>(
+        blobs: B,
+        hash: fn(&[u8]) -> B::Hash,
+        chunk_bytes: usize,
+    ) -> Self {
+        Self {
+            retry_state: retries::fake::RetryState::with_blob_store(blobs, hash, chunk_bytes),
+            ..Self::default()
+        }
+    }
+
     fn lineage(&self) -> String {
         self.lineage
             .lock()
@@ -593,7 +616,7 @@ impl request_keys::RequestKeyWrite for View {
 #[async_trait]
 impl retries::RetryRead for View {
     async fn read_retry(&self, task: &str) -> Result<Option<retries::Retry>> {
-        Ok(self.project.retries.get(task))
+        self.project.retries.get(task)
     }
     async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<retries::Retry>> {
         self.project.retries.due(now_ms, limit)
@@ -615,7 +638,7 @@ impl retries::RetryWrite for View {
         Ok(self.project.retries.delete(task))
     }
     fn get_retry(&self, task: &str) -> Result<Option<retries::Retry>> {
-        Ok(self.project.retries.get(task))
+        self.project.retries.get(task)
     }
     fn due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<retries::Retry>> {
         self.project.retries.due(now_ms, limit)

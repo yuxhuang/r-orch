@@ -124,6 +124,7 @@ struct Cursors {
 /// The file reference: one directory per project below `root`.
 pub struct FileStorage {
     root: PathBuf,
+    retry_blobs: Option<Arc<text::RetryBlobStore>>,
     writer: Arc<AsyncMutex<()>>,
     cursors: Arc<Mutex<Cursors>>,
 }
@@ -132,6 +133,7 @@ impl FileStorage {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
+            retry_blobs: None,
             writer: Arc::default(),
             cursors: Arc::default(),
         }
@@ -323,8 +325,13 @@ impl Storage for FileStorage {
         let dir = self.project_dir(&caller.project);
         let root = self.root.clone();
         let cursors = self.cursors.clone();
+        let retry_blobs = self.retry_blobs.clone();
         let session = blocking(move || {
             Ok(Session {
+                retry_text: text::RetryText {
+                    dir: dir.clone(),
+                    store: retry_blobs,
+                },
                 lineage: read_lineage(&root)?,
                 project: load(&dir, &caller.project)?,
                 caller,
@@ -340,12 +347,17 @@ impl Storage for FileStorage {
         let dir = self.project_dir(&caller.project);
         let root = self.root.clone();
         let cursors = self.cursors.clone();
+        let retry_blobs = self.retry_blobs.clone();
         // The guard moves into the blocking work: a caller that stops waiting
         // does not release the gate while the work still runs.
         let gate = self.writer.clone().lock_owned().await;
         blocking(move || {
             let _gate = gate;
             let mut session = Session {
+                retry_text: text::RetryText {
+                    dir: dir.clone(),
+                    store: retry_blobs,
+                },
                 lineage: read_lineage(&root)?,
                 project: load(&dir, &caller.project)?,
                 caller,
@@ -365,6 +377,7 @@ impl Storage for FileStorage {
 /// One project as of one moment: a read's private snapshot, or a write's working
 /// copy, which is dropped unless the work returned `Ok`.
 struct Session {
+    retry_text: text::RetryText,
     caller: Caller,
     /// The daemon's lineage as of this session's start.
     lineage: String,
@@ -748,19 +761,19 @@ impl RequestKeyWrite for Session {
 #[async_trait]
 impl RetryRead for Session {
     async fn read_retry(&self, task: &str) -> Result<Option<Retry>> {
-        Ok(self.project.retries.get(task))
+        self.project.retries.get(&self.retry_text, task)
     }
     async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>> {
-        self.project.retries.due(now_ms, limit)
+        self.project.retries.due(&self.retry_text, now_ms, limit)
     }
     async fn read_retries(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage> {
-        self.project.retries.page(after, limit)
+        self.project.retries.page(&self.retry_text, after, limit)
     }
 }
 
 impl RetryWrite for Session {
     fn put_retry(&mut self, retry: &Retry) -> Result<()> {
-        self.project.retries.put(retry)?;
+        self.project.retries.put(&self.retry_text, retry)?;
         self.dirty = true;
         Ok(())
     }
@@ -770,13 +783,13 @@ impl RetryWrite for Session {
         Ok(existed)
     }
     fn get_retry(&self, task: &str) -> Result<Option<Retry>> {
-        Ok(self.project.retries.get(task))
+        self.project.retries.get(&self.retry_text, task)
     }
     fn due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>> {
-        self.project.retries.due(now_ms, limit)
+        self.project.retries.due(&self.retry_text, now_ms, limit)
     }
     fn list_retries(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage> {
-        self.project.retries.page(after, limit)
+        self.project.retries.page(&self.retry_text, after, limit)
     }
 }
 
