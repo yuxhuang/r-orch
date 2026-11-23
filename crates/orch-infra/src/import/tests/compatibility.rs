@@ -246,3 +246,55 @@ fn json_depth_clamp_remains_64_when_the_requested_limit_is_higher() {
         ("depth", 64, 65)
     );
 }
+
+// C-V5. The event pass counts documents, and its scanner emits nothing for a stream
+// whose only content is a tab at the start of a line. 1.0's scanner rejects it, and a
+// file that does not scan is never a stream of no document.
+#[tokio::test]
+async fn a_config_that_does_not_scan_stops_before_its_documents_are_counted() {
+    for input in [
+        "\t\n",
+        " \n\t \n",
+        "\t",
+        "\n\t\n",
+        "# c\n\t# c2\n",
+        "\t# c\n",
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(temp.path());
+        std::fs::create_dir_all(paths.root()).unwrap();
+        std::fs::write(paths.config_path(), input).unwrap();
+        // The effective 1.0 reader refuses every one of these as a parse error.
+        FileConfigStore::new(paths.clone())
+            .read_merged()
+            .await
+            .unwrap_err();
+        let bytes = input.as_bytes();
+        let checked = check_yaml(bytes, Limits::YAML).unwrap_err();
+        let parsed = parse_yaml::<Value>(bytes, Limits::YAML).await.unwrap_err();
+        let decoded = decode_yaml::<Value>(bytes, Limits::YAML).await.unwrap_err();
+        for refusal in [checked, parsed, decoded] {
+            assert_eq!(refusal.rule, "parse", "{input:?}: {refusal}");
+            assert!(
+                !refusal.detail.contains("expected one document"),
+                "{input:?}"
+            );
+        }
+        assert_eq!(std::fs::read(paths.config_path()).unwrap(), bytes);
+    }
+    // Streams that scan and hold no document keep their own refusal.
+    for input in ["", "\n", " \n  \n", "# c\n", "  # c\r\n\r\n"] {
+        let refusal = check_yaml(input.as_bytes(), Limits::YAML).unwrap_err();
+        assert_eq!(
+            (refusal.rule, refusal.observed),
+            ("documents", 0),
+            "{input:?}"
+        );
+    }
+    // The byte bound still comes first.
+    let over = "\t".repeat(Limits::YAML.bytes + 1);
+    assert_eq!(
+        check_yaml(over.as_bytes(), Limits::YAML).unwrap_err().rule,
+        "bytes"
+    );
+}

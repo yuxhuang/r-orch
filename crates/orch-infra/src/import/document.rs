@@ -197,6 +197,15 @@ pub(crate) fn check_yaml(bytes: &[u8], limits: Limits) -> Result<()> {
             _ => {}
         }
     }
+    if documents == 0 {
+        // No event is not proof that the stream scans: this parser emits none for a
+        // stream whose only content is a tab at the start of a line, and 1.0's
+        // scanner refuses it (C-V5). Only a stream that 1.0 also scans is a stream
+        // of no document. Nothing was counted, so this reads no node a budget
+        // above could have bounded.
+        serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text)
+            .map_err(|e| Refusal::invalid("parse", e))?;
+    }
     if documents != 1 {
         return Err(Refusal {
             rule: "documents",
