@@ -452,10 +452,57 @@ fn invalid_stored_metadata_is_an_error_never_a_missing_row() {
         .unwrap();
     assert!(matches!(get_goal(&tx, "p", "g"), Err(EntityError::Sql(_))));
     tx.execute_batch("UPDATE counters SET value=-1").unwrap();
+    let EntityError::Counter(error) = create_goal(&tx, "p", &row("new")).unwrap_err() else {
+        panic!("negative counter must retain its typed classification");
+    };
     assert!(matches!(
-        create_goal(&tx, "p", &row("new")),
-        Err(EntityError::Sql(_))
+        *error,
+        super::super::SqliteError::CounterNegative { value: -1, .. }
     ));
+}
+
+#[test]
+fn nonpositive_surviving_position_refuses_create_and_move_without_mutation() {
+    for position in [0, -1] {
+        let mut conn = connection();
+        let tx = conn.transaction().unwrap();
+        create_goal(&tx, "p", &row("damaged")).unwrap();
+        let healthy = create_goal(&tx, "p", &row("healthy")).unwrap();
+        tx.execute(
+            "UPDATE goals SET position=?1 WHERE project_id='p' AND id='damaged'",
+            [position],
+        )
+        .unwrap();
+        let snapshot = || {
+            let rows: Vec<(String, i64, i64)> = tx
+                .prepare("SELECT id,revision,position FROM goals WHERE project_id='p' ORDER BY id")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let counter: i64 = tx
+                .query_row(
+                    "SELECT value FROM counters WHERE project_id='p' AND name='position:goal'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (rows, counter)
+        };
+        let before = snapshot();
+        assert!(matches!(
+            create_goal(&tx, "p", &row("new")),
+            Err(EntityError::Sql(_))
+        ));
+        assert_eq!(snapshot(), before);
+        // Move a valid row so validation must inspect the other surviving row.
+        assert!(matches!(
+            move_goal_to_end(&tx, "p", "healthy", healthy.revision),
+            Err(EntityError::Sql(_))
+        ));
+        assert_eq!(snapshot(), before);
+    }
 }
 
 #[test]
