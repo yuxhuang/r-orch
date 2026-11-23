@@ -536,7 +536,13 @@ async fn passive_lifecycle_events_contribute_their_usage() {
     ]))
     .await;
 
-    assert_eq!(collected.first().tokens.expect("tokens").total, 5);
+    assert_eq!(
+        collected.kinds(),
+        [AgentEventKind::Output, AgentEventKind::Done]
+    );
+    assert_eq!(collected.first().tokens, None);
+    assert_eq!(collected.first().data["text"], json!(""));
+    assert_eq!(collected.last().tokens.expect("tokens").total, 5);
 }
 
 #[tokio::test]

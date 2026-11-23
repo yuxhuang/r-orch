@@ -11,6 +11,8 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Storage groundwork
 
+- Retain Pi message-end and turn-end usage records as nonterminal metadata when output ends before the final completion.
+
 - Add the inactive attention port with fixed daemon facts, revisioned acknowledgements and resolution, bounded paging and retention, and isolated memory/file references; runtime evaluation and commands remain unwired.
 
 - Add an inactive SQLite task paging query with bounded pages and project-bound continuations; the running daemon still uses file storage.
