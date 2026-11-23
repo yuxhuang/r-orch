@@ -157,7 +157,8 @@ leave the operation unchanged; a callback error rolls back the entire unit of wo
 
 ### Additive v2 port: entities, paging and operational families (ADR 0017 decision 3; ADR 0020)
 
-Recorded from `crates/orch-core/src/store*` on `main` at `07b5f967`: every public trait, trait method, type,
+Recorded from `crates/orch-core/src/store*` as of `main` at `07b5f967` plus the three additions of issue 109
+(ADR 0020, "Added for issue 109" below): every public trait, trait method, type,
 constant and free function, and every public inherent method (the shared validators an adapter calls for parity
 are in the listings below, as one-line comments or as `fn` lines). The `test-support` fakes (`store::*::fake`) are
 not listed; they are the memory reference, not the contract. This is the contract of the
@@ -231,7 +232,7 @@ pub struct Record { pub entity: Entity, pub revision: Revision, pub position: u6
 
 // store::page
 pub struct Cursor(String);                    // Cursor::new refuses empty or over 512 bytes; as_str()
-pub enum Sort { Default, Id, Position, Name, Priority, CreatedAt, UpdatedAt }   // snake_case; Default is the default
+pub enum Sort { Default, Id, Position, Name, Priority, CreatedAt, UpdatedAt, Attempt }   // snake_case; Default is the default
 pub enum Filter {                             // serde: tag "kind", snake_case
     Tasks { status: Option<TaskStatus>, goal: Option<String> },
     Goals { status: Option<GoalStatus> },
@@ -239,6 +240,7 @@ pub enum Filter {                             // serde: tag "kind", snake_case
     Teams,
     Runs { task: Option<String>, agent: Option<String> },
     Messages { recipient: Option<String> },
+    PendingMessages { recipient: String, now: String },    // serde kind "pending_messages"; kind() = Message
     Context,
     Config,
     Templates,
@@ -259,15 +261,15 @@ trait BlobStore: Send + Sync {
 ```
 
 The sorts each family offers are the spec's table: tasks `Position`, `Priority`, `CreatedAt`, `UpdatedAt`; goals
-`CreatedAt`; agents and teams `Name`; every family `Default` and `Id`; a backend refuses any other combination as
-`InvalidPage`. A cursor is opaque, holds no snapshot, and is bound to its project, filter and sort.
+`CreatedAt`; agents and teams `Name`; every family `Default` and `Id`; `Attempt` only for runs of one task (below);
+a backend refuses any other combination as `InvalidPage`. A cursor is opaque, holds no snapshot, and is bound to its project, filter and sort.
 
 ```rust
 // store::retries (RetryRead on ReadSnapshot, RetryWrite on UnitOfWork)
 pub const MAX_DUE_RETRIES: usize = 1_000;
-pub const MAX_RETRY_ERROR_BYTES: usize = 64 * 1024;       // 65,536; today a refusal threshold, see "Approved" below
+pub const MAX_RETRY_ERROR_BYTES: usize = 64 * 1024;       // 65,536: the inline threshold, not a limit on the text
 pub struct Retry { pub task: String, pub attempt: u32 /* >= 1 */, pub due_at: i64 /* UTC ms, >= 0 */, pub error: String }
-                                              // Retry::validate(&self) -> Result<()>: attempt >= 1, due_at >= 0, error <= MAX_RETRY_ERROR_BYTES
+                                              // Retry::validate(&self) -> Result<()>: task not empty, attempt >= 1, due_at >= 0
 pub struct RetryCursor { pub due_at: i64, pub task: String }   // RetryCursor::after(&Retry); validate()
 pub struct RetryPage { pub rows: Vec<Retry>, pub next: Option<RetryCursor> }
 pub fn check_limit(limit: usize) -> Result<()>;           // 1..=MAX_DUE_RETRIES
@@ -287,7 +289,7 @@ trait RetryWrite: Send {
 
 Retries: one row per task and project, no cap and no drop. A due row has `due_at <= now_ms`. Due and complete reads
 return earliest deadline first, ties by task id compared as UTF-8 bytes; that is a read order and never dispatch
-order. The complete read follows `next` (exclusive keyset cursor; `Some` exactly when a row follows, so a walk never
+order. A read that would return a row whose long `error` cannot be resolved fails (below). The complete read follows `next` (exclusive keyset cursor; `Some` exactly when a row follows, so a walk never
 ends on an empty page); pages of one snapshot see one committed state, and a unit of work sees its own writes. Put
 replaces, where 1.0's enqueue kept the first row: a consumer that needs first-wins calls `get_retry` first, in the
 same unit of work. An unparsable 1.0 deadline is mapped to due by the importer, not by the port.
@@ -390,12 +392,12 @@ intents, attention and request keys. `orch_core::store::fake::FakeStorage` (feat
 reference, and `orch_infra::storage::v2` the file reference; both run the same shared conformance suites, and neither
 is wired into the daemon. The only `BlobStore` adapter in 1.1 is `orch_infra::blob::DiskBlobStore`.
 
-#### Approved for issue 109, not on `main` until its closing PR merges (ADR 0020)
+#### Added for issue 109 (ADR 0020)
 
-These three changes are decided and are recorded here so a consumer can build to them. Each is an addition: no
-signature above changes, and nothing is removed. Until the PR lands, the signatures above are the whole truth for
-the public traits, types, constants, free functions and methods of `orch_core::store` (the `test-support` fakes
-are not part of the contract and are not listed), and `main` still refuses a retry `error` over 65,536 bytes.
+These three changes are implemented by the change that carries this record, on the memory and file references. Each is
+an addition: no earlier signature changes, and nothing is removed. On `main` at `07b5f967` neither variant existed and
+a retry `error` over 65,536 bytes was refused. The `test-support` fakes are not part of the contract and are not
+listed.
 
 ```rust
 // store::page
@@ -411,28 +413,31 @@ pub enum Sort { /* ..., */ Attempt }                       // serde "attempt"
   not a date is compared as text and never parsed. `now` is the caller's captured `Clock::now_iso()`; the port reads
   no clock and adds no validation. The filter runs before the count, the cursor and the page bound, so a page fills
   with matches and `total` counts matches. A cursor binds the recipient, `now`, the sort and the project. Order is the
-  messages' default (`created_at`, `position`, id); the other sorts are those of `Filter::Messages`.
+  messages' default (`created_at`, `position`, id); the other sorts are those of `Filter::Messages` (`Default` and `Id`).
 - `Sort::Attempt` is offered only for `Filter::Runs { task: Some(_), .. }`. It orders by `Run.attempt` numerically,
   descending, then run id bytes ascending. For `Runs` with no task, for any other family and for any other
   filter it is `InvalidPage`, before any paging work. `Sort::Default` for runs is unchanged (`started_at`
   descending, then id). The spec's earlier `run_no` is this sort: `Run` has no such field.
-- `Retry.error` is the whole logical text. `MAX_RETRY_ERROR_BYTES` (65,536 UTF-8 bytes) becomes the inline
+- `Retry.error` is the whole logical text. `MAX_RETRY_ERROR_BYTES` (65,536 UTF-8 bytes) is the inline
   threshold and `Retry::validate` no longer refuses longer text; the other checks stay. Longer text is published to the
   blob store before the row that carries its hash is committed, and a read returns the original text byte for byte. A
   failed publication, or a missing or corrupt blob when writing, fails the write and keeps the previous row. A
-  reference that does not resolve on read is an error from every retry read and `get_retry`, `due_retries` and
-  `list_retries`, and never a shortened row. Rows, bounds, orders and first-wins handling are unchanged.
+  reference that does not resolve on read is an error from `read_retry`, `read_due_retries`, `read_retries`,
+  `get_retry`, `due_retries` and `list_retries` whenever the call would return that row, and never a shortened row.
+  Rows, bounds, orders and first-wins handling are unchanged.
 - Above one blob object the text is chunked. `DiskBlobStore` holds at most 67,108,864 bytes (64 MiB) per object, and
-  that bound stays. Text of 65,537 to 67,108,864 bytes inclusive is one object named by the row's hash (rows that
-  exist stay readable). Longer text keeps the SHA-256 of the whole value in the row, which no single object holds,
+  that bound stays. Text of 65,537 to 67,108,864 bytes inclusive is one object named by the row's hash. Longer text keeps the SHA-256 of the whole value in the row, which no single object holds,
   plus an ordered mapping to chunk objects of at most 67,108,864 bytes each, with one entry per position (identical
   chunks repeat). A chunk may split a UTF-8 character: the joined bytes are verified against the whole-value hash
   and only then decoded. A read verifies every object and the whole value; a missing, corrupt or reordered chunk is
   an error. A write publishes every object before it commits the row and mapping together, and a failure on a later
   chunk keeps the previous row readable even if the caller catches the error and commits other work. Objects an
   interrupted write leaves follow the blob store's lifecycle. The mapping's physical encoding is the adapters'
-  (`Retry`, `RetryRead` and `RetryWrite` keep the shape listed above); if the closing PR has to add a public type to
-  carry it, that PR updates this record.
+  (`Retry`, `RetryRead` and `RetryWrite` keep the shape listed above). The reference adapters record it as
+  `{sha256, chunks}`: the file reference's retry row holds an inline string, `{"sha256": H}` for one object, or
+  `{"sha256": H, "chunks": [...]}` above 67,108,864 bytes (hashes are 64 lower-case hex digits, and chunks are cut at
+  67,108,864 bytes). No public type carries it, so this record has no new type to list; the types that hold it are
+  private to each adapter, and T10 may choose another encoding that holds the same facts.
 
 ## 3. `orch_core::adapter`
 

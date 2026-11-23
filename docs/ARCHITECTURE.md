@@ -501,16 +501,16 @@ the entity, event, lease, retry, intent, request-key, attention and blob ports a
 later slices.
 
 Three contracts for its consumers are decided in
-[ADR 0020](decisions/0020-storage-consumer-contracts.md) and are not on `main` until
-the PR that closes issue 109 lands. `Filter::PendingMessages { recipient, now }` selects a
-recipient's unexpired pending messages before the page is cut, with 1.0's string
-comparison of the expiry (equality is pending). `Sort::Attempt`, offered only for one task's
-runs, orders by `Run.attempt` descending. A retry keeps its whole `error` text: inline up
-to 65,536 UTF-8 bytes, one blob object up to the blob store's 64 MiB object limit, and above
-that a whole-value hash with an ordered mapping to chunk objects. Until then `main`
-refuses a retry `error` over 65,536 bytes. These are reference-port contracts; the
-SQLite mapping, the callers and the import and restore paths remain with T10, T12, T21
-and T23.
+[ADR 0020](decisions/0020-storage-consumer-contracts.md) and implemented on the memory and file references.
+`Filter::PendingMessages { recipient, now }` selects a recipient's unexpired pending messages before the page is cut,
+with 1.0's string comparison of the expiry (equality is pending). `Sort::Attempt`, offered only for one task's runs,
+orders by `Run.attempt` descending, then by id. A retry keeps its whole `error` text: inline up to 65,536 UTF-8 bytes,
+one blob object up to the blob store's 64 MiB object limit, and above that a whole-value hash with an ordered mapping
+to chunk objects. The file reference holds the mapping in the retry row (`{"sha256": ...}`, or with a `chunks` list);
+the memory fake keeps whole strings by default and takes a blob store only for the tests that prove publication and
+damaged references. `main` at `07b5f967`, before this change, refused a retry `error` over 65,536 bytes and had
+neither variant. These are reference-port contracts; the SQLite mapping, the callers and the import and restore
+paths remain with T10, T12, T21 and T23.
 
 The inactive `orch_core::store::attention` operational port shares these buffered
 transactions and snapshots in both references. Fixed typed facts control item text;

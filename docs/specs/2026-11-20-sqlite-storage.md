@@ -178,9 +178,12 @@ store) in "T8 consumer-contract amendment (issue 109)" under "Storage port v2", 
 (`update`, `delete` and `move_to_end` take the expected revision), replaces `run_no` with `attempt` in the sorts table,
 and names the real test filters of R7, R117 and the caller part of R132. `docs/TRAITS-FROZEN.md` now records
 every public v2 trait, trait method, type, constant, free function and inherent method of `orch_core::store` on
-`main` (the `test-support` fakes are not listed). None of the three contracts is on `main` yet, and no test of them has been run. The third,
-whole retry text, includes the chunk mapping for text above one 64 MiB blob object (ADR 0020 decision 4). No
-independent review had read this revision when it was written.
+`main` (the `test-support` fakes are not listed) and, with this revision, the three additions. The same revision
+implements the three contracts on the memory fake and the file reference and registers their shared tests (named in
+"T8 consumer-contract amendment (issue 109)"); the SQLite adapter and every runtime caller remain with T10, T12, T13,
+T14, T21 and T23. The third, whole retry text, includes the chunk mapping for text above one 64 MiB blob object (ADR
+0020 decision 4). This spec records the test names and what each shows, not their results: a result is a receipt of
+the PR that carries the change. No independent review had read this revision when it was written.
 
 ## Source
 
@@ -455,7 +458,7 @@ holds them.
 | R94 | — | X | won't | Evidence, quarantine, uploads, text search, HTTP, TLS, tokens, enrolment, certificates, workers, the hub, landing, proposals, many projects per daemon, removing orch-peer, Postgres, an indexed scheduler, object storage, token budgets, outbound notification and Windows are out of scope (X). |
 | R95 | — | DL | won't | No tag and no version bump: cutting 1.1.0 is the owner's separate decision. |
 | R96 | An agent process shall not run its agent unless the run's pid and start time were committed first: the daemon shall create the process held, commit, then release it, and a held process whose daemon is gone shall exit without running the agent. | review finding (a stop between starting a process and recording it left an untracked agent on a workspace that recovery would hand to a second run) | must | `crates/orch-engine/tests/transactions.rs::a_stop_between_spawn_and_commit_runs_no_agent`, `crates/orch-infra` process test `held_process_exits_when_its_parent_is_gone`; both |
-| R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. | B7; review finding | must | `text_over_64_kib_round_trips_through_the_blob_store` in `storage_conformance` checks whole values on entity references; `storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store` in the `orch-infra` library pins file row hashes and disk bytes, with `inline_threshold_counts_utf8_bytes_and_preserves_empty_values`. Retry rows are not covered yet (they refuse text over 65,536 bytes on `main`): ADR 0020 requires the shared retry-suite scenarios of the PR that closes #109 (65,536 and 65,537 bytes, 67,108,864 and 67,108,865 bytes, a multibyte text, a character split across a chunk boundary, a retry with no run, and a failed publication, a failure on a later chunk, a missing blob and a corrupt blob each leaving the earlier row intact, and a missing, corrupt or reordered chunk refused on read), pending, with their names recorded when they land. SQLite backing assertions: T10; importer backing assertions: T21 (pending, no executable import filter yet); Linux |
+| R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. | B7; review finding | must | `text_over_64_kib_round_trips_through_the_blob_store` in `storage_conformance` checks whole values on entity references; `storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store` in the `orch-infra` library pins file row hashes and disk bytes, with `inline_threshold_counts_utf8_bytes_and_preserves_empty_values`. Retry rows were not covered on `main` at `07b5f967`, which refused text over 65,536 bytes; this change covers them by the tests that "T8 consumer-contract amendment (issue 109)" names (65,536 and 65,537 bytes in `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, registered as `memory_retries_v2`, `blob_memory_retries_v2` and `file_retries_v2`; and 67,108,864 and 67,108,865 bytes, a character split across a chunk boundary, a failed publication, a failure on a later chunk, a missing and a corrupt blob and chunk, a reordered chunk, and repeated chunks in `storage::v2::tests::retry_*` of the `orch-infra` library, each run with `-- <name> --exact` and required to execute one test; a retry with no run is in the first). SQLite backing assertions: T10; importer backing assertions: T21 (pending, no executable import filter yet); Linux |
 | R98 | Reads shall be served by a pool of `storage.read_connections` connections (default 4); a read that finds none free shall wait up to the admission deadline and then fail with `overloaded`, never open another connection. | B6; review finding | should | `sqlite_writer::reads_wait_for_a_free_connection_then_fail_overloaded`; both |
 | R99 | `orch import` shall account for every entry of the source `.orchestry/` and of each directory that "Import rules" has it list: each is imported, or left in place as "Import rules" lists, or named by the dry run and by the import's report as not imported; a directory it does not enter is one entry. Project prompt template files shall become `templates` rows, byte for byte. | N, S2, B2 | must | `import::every_source_path_is_accounted_for` (a corpus with an unknown file and an unknown directory), `::templates_are_imported_byte_for_byte`; both |
 | R100 | `orch db restore` shall refuse, changing nothing, while a process that the replaced state or the backup records as a run's is alive (pid and start time), naming each run and pid and which of the two records it. With `--stop-runs` it shall first stop the process groups that the replaced state records, which this daemon wrote in this data directory. It shall never signal a process because a backup records it: such a process keeps the restore refused until it has ended or the owner names its run with `--assume-stopped <run id>`. No waiting period shall stand in for either: a run's process in 1.1 keeps no deadline of its own (R42), so the passing of time never shows that an earlier holder has stopped. After a restore no lease of the backup shall be active: each is ended and its run closed as R41 closes a run whose process is gone, and the spool of the replaced state (R129) is set aside with it. | G9; the lease prototype and its review (a restore that frees every task at once lets a holder from the replaced state and a new one work on one task); the security re-review's condition S2-C2 (a pid and a start time do not show who wrote a backup); the review of the prototype's corrections, N1 (its waiting-period alternative holds only where a holder stops itself, which arrives in 1.5); AP14 | must | `crates/orch-cli/tests/restore_fencing.rs::restore_refuses_while_a_recorded_process_is_alive`, `::stop_runs_stops_only_what_the_replaced_state_records`, `::a_process_only_the_backup_records_is_never_signalled` (a fake process table records every call), `::assume_stopped_lets_the_restore_proceed_for_the_named_run`, `::restored_leases_are_ended`; both |
@@ -698,10 +701,10 @@ exists the rule is: wherever 1.0 saved a task, agent, goal or message.
 Removed with port v1: `StateStore` (replaced by leases, retries, counters and project settings), the rule that
 every YAML read resolves merge keys (only the importer reads YAML), and the reorder inside `save`.
 
-Retry reference boundary, as of `main` at `07b5f967`: the memory and file references accept error text up to
-65,536 bytes and refuse larger values without truncation. R97 is binding and ADR 0020 settles how it is met: a
-retry keeps its whole `error` (see "T8 consumer-contract amendment" below). The refusal is an implementation gap,
-not an exception, and it ends with the PR that closes #109.
+Retry reference boundary. On `main` at `07b5f967`, the baseline, the memory and file references accepted error text
+up to 65,536 bytes and refused larger values without truncation. R97 is binding and ADR 0020 settles how it is met: a
+retry keeps its whole `error` (see "T8 consumer-contract amendment" below). The refusal was an implementation gap,
+not an exception, and the change that carries this revision ends it on both references.
 The 1.0 enqueue was first-wins (call `get_retry` before put), malformed legacy
 retry deadlines count as due, and dispatch uses candidate order and agent rotation,
 not deadline order. T12/T14/T21 retain these contracts. Complete enumeration is
@@ -710,10 +713,11 @@ checked on both references by `the_complete_read_pages_every_row_including_futur
 `a_restore_keeps_every_retry_row` in `storage_contract/retries_v2.rs`.
 
 T8 consumer-contract amendment (issue 109, 2026-11-23; [ADR 0020](../decisions/0020-storage-consumer-contracts.md)).
-The three contracts below are decided. They are not on `main` until the PR that closes #109 lands, so until then
-`main` has neither new variant and still refuses a retry `error` over 65,536 bytes. They are reference-port
-contracts: nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or T23 at runtime.
-`docs/TRAITS-FROZEN.md` records them with the signatures that are on `main`.
+The three contracts below are decided and are implemented by the change that carries this revision, on the memory
+fake and the file reference. `main` at `07b5f967`, the baseline, has neither new variant and refuses a retry `error`
+over 65,536 bytes; that is what a reader of `main` before the change merges sees. They are reference-port contracts:
+nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or T23 at runtime.
+`docs/TRAITS-FROZEN.md` records them with the signatures of the port.
 
 - **Pending messages.** `Filter::PendingMessages { recipient: String, now: String }` selects a message whose status
   is `pending`, whose `to_agent_id` is `Some(recipient)` byte for byte (a broadcast with no recipient is never
@@ -723,9 +727,16 @@ contracts: nothing in them is wired into the daemon, and none accepts T10, T12, 
   clock. The filter runs before the count, the cursor and the page bound, so a page returns up to `limit`
   matches however many rejected rows precede them, and `total` counts matches only. A cursor binds the recipient,
   `now`, the sort and the project, so another `now` or recipient is refused. The order is the messages' default.
-  Tests required on both references and the SQLite adapter: exact recipient, status, expiry equality, an expired and
-  an unexpired row, a null recipient, an invalid expiry, a match after more than one page of rejected rows, the
-  count, a later commit that a snapshot walk does not see, the cursor's binding, and another project.
+  Tests, required on both references and on the SQLite adapter (T10): exact recipient, status, expiry equality, an
+  expired and an unexpired row, a null recipient, an invalid expiry, a match after more than one page of rejected
+  rows, the count, a later commit that a snapshot walk does not see, the cursor's binding, and another project. The
+  references carry them in `pending_messages_filter_status_recipient_and_lexical_expiry` (status, exact recipient
+  including case and prefix, a null-recipient broadcast, absent, equal, future, past and non-date expiries, an empty
+  `now`, the count, another project) and `pending_messages_page_matches_before_count_cursor_and_bound` (1,100
+  rejected rows before three matches, the count, a unit of work that sees its own writes, a snapshot walk that a
+  committed insert and a status change do not disturb, and a cursor refused for another recipient, another `now`,
+  another filter kind, another sort and another project). Each is registered as `memory_v2`, `queued_memory_v2` and
+  `file_v2`.
 - **Per-task run order.** `Sort::Attempt` is offered only for `Filter::Runs { task: Some(_), .. }`. It orders by
   `Run.attempt` as a number, descending (10 before 2 before 1, and `u32::MAX` first), and breaks ties by the run id's
   bytes ascending. It is refused as `InvalidPage` for `Runs` with no task, for any other family and for any other
@@ -733,15 +744,20 @@ contracts: nothing in them is wired into the daemon, and none accepts T10, T12, 
   The port's number is `Run.attempt`: `Run` has no `run_no`, and the schema's `run_no` (a per-task start order) and
   `attempt_no` columns are T10's. For an imported run whose 1.0 attempt repeats within its task (stored uncounted,
   "Import rules"), the adapter must still return and sort by the 1.0 number it returns as `Run.attempt`; which
-  column holds it is open for T10 and is not decided here. Tests: numeric order, ties, the other tasks, projects and
-  agents excluded, cursor and snapshot, and every refusal.
+  column holds it is open for T10 and is not decided here. Tests, in the same three registrations:
+  `run_attempt_order_is_numeric_task_scoped_and_keeps_default` (10 before 2 before 1, `u32::MAX` first, equal attempts
+  by id, another task and another project excluded, an `agent` filter, and `Sort::Default` unchanged),
+  `run_attempt_pages_keep_snapshot_and_bind_every_query_field` (a snapshot walk that a delete and an insert do not
+  disturb, the count, and a cursor refused for another task, another agent filter, another sort and another project)
+  and `run_attempt_sort_refuses_every_unscoped_or_other_family_filter` (`InvalidPage` for runs with no task, for
+  every other family and for `PendingMessages`, with or without a cursor).
 - **Whole retry text.** `Retry.error` is the complete logical text, including for a retry with no surviving run (R97,
   decision 7, ADR 0017 decision 11). Text of at most 65,536 UTF-8 bytes (bytes, not characters) may stay in the
   row. Longer text is published to the blob store, synced, before the row naming its hash is committed, and a read
   returns the original text byte for byte. A failed publication, or a missing or corrupt blob when writing, fails the
   write, and the previous row is exactly as it was. A reference that does not resolve on read is an error from every
-  retry read, never an empty, shortened or partial row. Nothing truncates. `Retry::validate` stops refusing long text
-  and keeps its other checks; the first-wins `get_retry` before `put_retry`, the orders, the 1..=1,000 bounds and the
+  retry read, never an empty, shortened or partial row. Nothing truncates. `Retry::validate` no longer refuses long
+  text and keeps its other checks; the first-wins `get_retry` before `put_retry`, the orders, the 1..=1,000 bounds and the
   absence of any cap on rows are unchanged. A capped diagnostic with the full text on the run row would amend R97
   and is the owner's to adopt; this amendment does not.
 
@@ -759,19 +775,44 @@ contracts: nothing in them is wired into the daemon, and none accepts T10, T12, 
   belongs to the adapters, not to this spec, and size alone never refuses a valid diagnostic. This is a decision of
   2026-11-23 and ships no measurement above 64 MiB.
 
-  Tests required on both references: inline at 65,536 bytes and a blob at 65,537; one object at 67,108,864 bytes
-  and chunks at 67,108,865; a multibyte text that crosses the 64 KiB line by bytes and not by characters, and one
-  whose character straddles a chunk boundary; a round trip with no run; replacement of a long error by a short one
-  and the reverse; a failed publication and a missing and a corrupt blob each leaving the earlier row intact; a
-  failure on a later chunk after an earlier chunk was published, with the earlier row readable after the caller
-  catches the error and commits other work; a missing, a corrupt and a reordered chunk each an error on every read
-  path; identical chunks at two positions; an existing one-object row read after the change; a check of the physical
-  backing (the objects and the mapping, not only the value read back); whole text through the point, due and
-  complete reads and a restore; and the unreferenced blob that a rolled-back write may leave for the sweep.
-  T10 repeats the physical checks on SQLite, T21 rebuilds an imported 1.0 error into the same representation, and T23
-  carries every reachable chunk, its order and the whole-value hash through backup, restore, export and import.
-- **Owners.** The PR that closes #109 implements the three on the memory fake and the file reference and registers
-  the shared tests on both. T10 owns the SQLite representation and the adapter registration. T12 owns the finish and
+  *The reference representation* (ADR 0020 decision 4 has the detail). The mapping is `{sha256, chunks}`: the SHA-256
+  of the whole UTF-8 value and the ordered, per-position list of chunk hashes. The file reference stores a retry's
+  `error` in its project document as an inline string, as `{"sha256": H}` for one object, or as
+  `{"sha256": H, "chunks": [...]}` above 67,108,864 bytes, and cuts chunks at 67,108,864 bytes. The memory fake is
+  *logical* by default (whole strings, no blob, no claim about backing) and *disk-backed* when built with
+  `FakeStorage::with_retry_blob_store`, which publishes through a `BlobStore` and keeps a hash and chunk list for any
+  text over 65,536 bytes. No public type of the port carries the mapping. The file reference and the disk-backed fake
+  publish each object and read it back before they stage the row, so a failed publication leaves the staged row untouched, and objects left by a
+  rolled-back unit or a replaced row are unreferenced until the blob store's sweep.
+
+  Tests required on both references, with the test that carries each item. The first two rows are the
+  conformance suite's `retry_suite`, registered as `memory_retries_v2` (logical fake), `blob_memory_retries_v2`
+  (disk-backed fake) and `file_retries_v2`; the rest are in `storage::v2::tests` of `orch-infra` and run the file
+  reference and the disk-backed fake unless noted.
+
+  | Required | Test |
+  |---|---|
+  | Inline at 65,536 bytes and a blob at 65,537; a multibyte text that crosses the 64 KiB line by bytes and not by characters; a round trip with no run (no task or run entity exists); a restore | `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` (conformance, 3 registrations; it also uses the `get_retry`-before-`put_retry` enqueue pattern inside one unit of work) |
+  | A rolled-back replacement and a committed one; a held snapshot that keeps the original | `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original` (conformance, 3 registrations) |
+  | The file reference's backing: no `blobs` directory for inline text; the complete bytes exist before the row does; the row holds `{"sha256": H}`; reopening returns the whole text on every read | `retry_text_boundary_is_backed_before_the_hash_row_and_reopens_whole` (file reference only) |
+  | One object at 67,108,864 bytes and chunks at 67,108,865; a character straddling the chunk boundary; the joined bytes equal the whole-value hash; a damaged tail, a missing tail and, on the file reference, a reordered mapping each an error | `retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified` |
+  | Identical chunks at two positions (the file reference's mapping has three entries) | `retry_repeated_chunks_reconstruct_every_occurrence_on_both_references` |
+  | A failure on a later chunk after an earlier one was published; the earlier row readable after the caller catches the error and commits other work; the earlier object still present | `retry_later_chunk_failure_keeps_prior_row_and_earlier_published_bytes` |
+  | A publication whose object is missing or corrupt on read-back, each leaving the earlier row intact even when the caller catches the error and commits | `retry_publication_refusal_preserves_prior_rows_even_when_caught_on_both_references` |
+  | A missing and a corrupt blob after commit each an error on `read_retry`, `read_due_retries`, `read_retries`, `get_retry`, `due_retries` and `list_retries`, with the document unchanged and an absent task still reading as none | `retry_missing_and_corrupt_blobs_fail_all_read_paths_on_both_references` |
+
+  Not covered by a named test in this change, and therefore open for the owner of the consumer or for a follow-up:
+  a long error replaced by a short one and the reverse as a separate scenario (the replacement test replaces a
+  65,537-byte error with a 140,000-byte one); a restore of text above 64 MiB; a reordered chunk on the disk-backed
+  fake (its mapping is private and only the file reference's document is edited); a missing or corrupt chunk of an
+  above-64 MiB text on every read path (the object-limit test checks the damaged tail on all three reads and the
+  missing tail on `read_retry` only); an assertion that a rolled-back unit leaves an unreferenced object for the sweep; and
+  an "existing one-object row" fixture (no such row existed on `main`, which refused the text, so the form is
+  exercised by the 65,537-byte and 67,108,864-byte cases). T10 repeats the physical checks on SQLite, T21 rebuilds
+  an imported 1.0 error into the same representation, and T23 carries every reachable chunk, its order and the
+  whole-value hash through backup, restore, export and import.
+- **Owners.** This change implements the three on the memory fake and the file reference and registers the shared
+  tests on both. T10 owns the SQLite representation and the adapter registration. T12 owns the finish and
   enqueue caller (get, then put, in one unit of work), the retry row written with the status and the lease release,
   and lease-bound finish and restart fencing (R36, R132). T13 owns generations, recovery and the Linux
   sleep and wake check (R41, R42). T14 owns `retry_pending` gating and candidate-order dispatch. T21 owns the

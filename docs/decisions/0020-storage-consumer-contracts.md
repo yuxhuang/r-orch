@@ -9,13 +9,15 @@
 - Amends: nothing in [0017](0017-sqlite-storage.md). It adds to the port that decision 3 defines, applies decisions 7
   and 11 to the retry row, and is the ADR that `docs/TRAITS-FROZEN.md` requires for its record of the landed v2
   port. It supersedes no accepted ADR.
-- Scope of the decision: contracts. The code that meets them, and the tests that prove them, are in the PR that
-  closes #109. Nothing here is wired into the running daemon, and no SQLite adapter exists for it yet.
+- Scope of the decision: contracts, and the memory and file references that meet them. The change that carries this
+  ADR implements decisions 1 to 4 in `orch-core`, the memory fake and the file reference and registers the shared
+  tests on both (decision 6 names them). Nothing here is wired into the running daemon, and no SQLite adapter carries
+  these contracts yet.
 
 ## Context
 
-Facts read from `main` at `07b5f967`, after the retry enumeration (#191) and the reference conformance
-reconciliation (#196) landed and #130 closed:
+Facts read from `main` at `07b5f967`, the baseline before this change, after the retry enumeration (#191) and the
+reference conformance reconciliation (#196) landed and #130 closed:
 
 - **Pending messages.** `Filter::Messages { recipient }` selects by recipient only. 1.0's
   `MessageStore::list_pending` (`crates/orch-infra/src/storage/message.rs`) returns a message only when its status
@@ -51,7 +53,7 @@ reconciliation (#196) landed and #130 closed:
    cursor and the bound, so a page fills with matches however many rejected rows precede them, and `total` counts
    matches. A cursor binds the recipient, the captured `now`, the sort and the project, so a cursor used with
    another `now` or recipient is refused. Order is the messages' default (`created_at`, `position`, id), and the
-   family's other sorts are as for `Filter::Messages`.
+   family's other sorts are as for `Filter::Messages` (`Default` and `Id`).
 2. **Per-task run order is `Sort::Attempt`, and only there.** Add `Sort::Attempt`. It is offered only with
    `Filter::Runs { task: Some(_), .. }` (an `agent` filter may accompany it) and orders by `Run.attempt`
    numerically, descending, then the run id's bytes ascending. It is refused as `InvalidPage` before any paging
@@ -66,8 +68,10 @@ reconciliation (#196) landed and #130 closed:
    the hash and returns the original text byte for byte. A failed publication, or a missing or corrupt blob at
    write time, fails the write and leaves the previous row exactly as it was. A reference that cannot be resolved
    at read time is an error on `read_retry`, `read_due_retries`, `read_retries`, `get_retry`, `due_retries` and
-   `list_retries`, never an empty, shortened or partial row. Nothing truncates, and `Retry::validate` stops
-   refusing long text (it keeps refusing an empty task, attempt 0 and a deadline before the epoch). The
+   `list_retries`, never an empty, shortened or partial row. A call fails when a row it would return cannot be
+   resolved; a row the call does not select (a future deadline in a due read, or a row past the limit) is not
+   resolved. Nothing truncates, and `Retry::validate` no longer refuses long text (it keeps refusing an empty task,
+   attempt 0 and a deadline before the epoch). The
    transaction-local first-wins rule, the due and complete read orders, the 1..=1,000 bounds, the millisecond unit
    and the absence of any cap on rows do not change.
 4. **Text above one blob object is split across ordered chunks.** This is the lead's decision of 2026-11-23, option A
@@ -89,19 +93,63 @@ reconciliation (#196) landed and #130 closed:
    committed together, atomically. If a later chunk fails after an earlier one was published, the previous row
    stays readable, including when the caller catches that error and commits other work in the same unit of work. An
    object left unreferenced by an interrupted or rolled-back write follows the blob store's existing lifecycle (a
-   sweep may remove it). The physical encoding of the mapping is the reference adapters' and T10's to choose; this
-   decision fixes what it must hold and when it is checked, not its bytes.
+   sweep may remove it). The physical encoding of the mapping is the adapters' to choose; this decision fixes what it
+   must hold and when it is checked. The reference adapters' choice is the next paragraph, and T10 may choose another
+   for SQLite so long as it holds the same facts.
+
+   **The reference mapping.** The mapping is `{sha256, chunks}`: `sha256` is the SHA-256 of the complete UTF-8 value and
+   `chunks` is the ordered list of the blob hashes that hold it, one entry per position, each the 64 lower-case hex
+   digits that `BlobHash` prints. The file reference cuts every 67,108,864 bytes from the start, so every chunk but the
+   last is exactly that size and the last is the remainder. The mapping adds no public type or constant to the port:
+   `Retry` and the retry traits keep the shape `docs/TRAITS-FROZEN.md` lists, and the type that holds the mapping is
+   private to each adapter.
+   - *File reference.* A retry row's `error` in the project's document is one of three shapes, chosen by length: a
+     JSON string (inline, at most 65,536 bytes); `{"sha256": H}` (one object, named `H`, which is also its content
+     hash); or `{"sha256": H, "chunks": [C1, C2, ...]}` (more than 67,108,864 bytes, `H` the whole-value hash and
+     each `Ci` an object in the project's blob store).
+   - *Memory fake.* `FakeStorage::default()` is the **logical** fake: it keeps the whole string in memory, never
+     publishes, and makes no claim about backing, publication order or damaged references. A test that needs those
+     builds the **disk-backed** fake with `FakeStorage::with_retry_blob_store(store, hash, chunk_bytes)` (feature
+     `test-support`), which publishes through the injected `BlobStore`, cuts at the `chunk_bytes` it is given and keeps
+     `{hash, chunks}` privately; the conformance fixture `blob_memory_backend` injects the disk adapter with
+     `MAX_BLOB_BYTES` as the chunk size. In that form every text over 65,536 bytes has a chunk list, which is one entry
+     when it fits one object.
+   - *Order of events.* In the file reference and the disk-backed fake, `put_retry` publishes every object and reads
+     each back and compares it before it stages the row, so a failed publication or a damaged object fails the call
+     and leaves the staged row as it was. The row commits with the unit of work. A unit of work that rolls back, or a
+     row that a later put replaces, leaves its objects unreferenced for the blob store's sweep.
 5. **The frozen record follows the landed port.** `docs/TRAITS-FROZEN.md` records every public v2 trait, trait
    method, type, constant, free function and inherent method of `orch_core::store` that is on `main` (the
    `test-support` fakes are not listed), including the `ReadSnapshot` and `UnitOfWork` supertraits and the expected
    revision that `update`, `delete` and `move_to_end` take, and the three additions above once they land. The 1.0
    traits stay active and unchanged until T25 removes the product file adapter.
 6. **Verification names follow the tests.** The spec's rows for R7, R117 and the caller part of R132 name the
-   bare filters the tests have, with the registrations each must select. A representative selection of them is
-   pending until the PR that closes #109 runs it. R8 to R15 and R97 keep the inventory that the #130 crosswalk
+   bare filters the tests have, with the registrations each must select, and the plan lists the 12 selections.
+   The shared scenarios of this change are registered once and run on each reference:
+   - the five consumer scenarios `pending_messages_filter_status_recipient_and_lexical_expiry`,
+     `pending_messages_page_matches_before_count_cursor_and_bound`,
+     `run_attempt_order_is_numeric_task_scoped_and_keeps_default`,
+     `run_attempt_pages_keep_snapshot_and_bind_every_query_field` and
+     `run_attempt_sort_refuses_every_unscoped_or_other_family_filter`, in `v2_consumers.rs`, registered as
+     `memory_v2`, `queued_memory_v2` and `file_v2` (3 registrations each);
+   - the two retry scenarios `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` and
+     `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original`, added to the retry suite, which now has
+     20 scenarios registered as `memory_retries_v2`, `blob_memory_retries_v2` (the disk-backed fake) and
+     `file_retries_v2`;
+   - the physical, fault and boundary checks in `storage::v2::tests` of `orch-infra`: the file reference's backing
+     (`retry_text_boundary_is_backed_before_the_hash_row_and_reopens_whole`), damaged and missing blobs
+     (`retry_missing_and_corrupt_blobs_fail_all_read_paths_on_both_references`), a refused or damaged publication
+     (`retry_publication_refusal_preserves_prior_rows_even_when_caught_on_both_references`), the 64 MiB object
+     boundary and chunk order (`retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified`), a later
+     chunk failing (`retry_later_chunk_failure_keeps_prior_row_and_earlier_published_bytes`) and repeated chunks
+     (`retry_repeated_chunks_reconstruct_every_occurrence_on_both_references`). The first runs the file reference
+     only; the other five each run the file reference and the disk-backed fake.
+
+   This ADR records the names and counts, not results: a run is a receipt of the PR that carries the change, and the
+   head it belongs to is that PR's manifest. R8 to R15 and R97 keep the inventory that the #130 crosswalk
    reconciled.
-7. **Who builds what.** The PR that closes #109 implements decisions 1 to 4 in `orch-core`, the memory fake and the
-   file reference, with the shared tests registered on both. T10 owns the SQLite representation of all three
+7. **Who builds what.** This change implements decisions 1 to 4 in `orch-core`, the memory fake and the file
+   reference, with the shared tests registered on both. T10 owns the SQLite representation of all three
    (the retry blob and chunk mapping, the `PendingMessages` statement, the attempt index) and the adapter registration of
    the shared suites. T12 owns the finish and enqueue caller and lease-bound finish, T14 the dispatch order, T21
    the legacy import (a whole 1.0 error, rebuilt into chunks when it needs them), and T23 the backup, restore and
@@ -160,5 +208,8 @@ reconciliation (#196) landed and #130 closed:
 - The chunk path is reference-port behaviour. This decision supplies no measurement above 64 MiB and no runtime
   evidence for any consumer, and it grants no publication or merge authority. The proof it requires is in the
   plan's "T8 consumer contracts (issue 109)".
-- Until the closing PR merges, `main` still refuses a long retry error and has neither variant. The spec and the
-  plan say so where they state the contract.
+- The baseline above is `main` at `07b5f967`: it refuses a retry error over 65,536 bytes and has neither variant.
+  This change replaces that with the reference behavior of decisions 1 to 4. A reader of `main` before it merges sees
+  the baseline, and the spec and the plan state the baseline wherever they state the contract.
+- The reference tests do not simulate a SQLite adapter, a daemon consumer, a 1.0 import, a restore of chunked
+  text or a sweep of the blob store, so none of those is accepted by them.
