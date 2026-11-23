@@ -541,6 +541,45 @@ port reads none):
 - The performers, recovery, the `intents.perform` job and the SQLite table
   (`intents` in the schema) are T13, T15 and T10's.
 
+T8c attention amendment (2026-11-22): `orch_core::store::attention` is an
+inactive operational port, registered by `memory_attention_v2` and
+`file_attention_v2` against one shared suite (R8, R81–R84, R131).
+
+- A session with the reserved empty `Caller.project` names daemon-wide attention
+  (`project_id = ''` in the schema): only `disk_floor` is allowed there. A
+  nonempty project session permits only `dispatch_off_with_work`; it never reads
+  or changes daemon rows or another project's rows. A health consumer explicitly
+  reads both scopes using separate sessions, which are separate snapshots.
+- Inputs are closed typed facts: disk subject (data directory or checked project
+  workspace id), free/floor bytes, waiting count and oldest waiting UTC-ms time.
+  Title, detail and remedy are kind-controlled prose; ids are rechecked for display.
+  No agent text, executable action or caller-supplied provenance is stored.
+- `open_attention(facts, at)` returns an existing open kind/subject unchanged,
+  including its facts and revision. Reopening after resolution allocates a fresh
+  monotonic scope-local id, bounded by SQLite's signed integer range and mapped
+  to decimal TEXT. Retention never reuses an id. Revisions begin at 1.
+- `ack_attention(id, expected, at)` records the first identity from
+  `Caller.principal` and UTC-ms time without resolving. `resolve_attention`
+  records the first closed kind-compatible reason/time. Both check the expected
+  revision, increment only on actual change and preserve first provenance on a
+  current-revision repeat. Invalid or backward times are refused without changes.
+- `read_attention`/`get_attention` read one id; snapshot `read_attention_page`
+  and transaction `attention_page` enumerate All/Open/Resolved rows in ascending
+  id order using pages of 1–1,000. Last-id cursors bind scope and filter and retain
+  no snapshot. `expire_attention(cutoff, limit)` removes at most 1,000 resolved
+  rows in id order with `resolved_at < cutoff`; equality and open items survive.
+  T15 computes the cutoff from the configured retention (default 90 days).
+- Both references buffer attention with all other writes for rollback and snapshot
+  isolation. File loads validate scope/facts and default absent legacy attention
+  to empty. Shared tests cover transitions, stale/caught errors, rollback, snapshots,
+  concurrency, paging beyond 1,000, isolation, fixed content and the restore fixture;
+  file tests cover reopen, legacy data, counters and corrupt/scope-invalid loads.
+- Authorization remains dispatcher-owned: only daemon work opens/resolves/expires;
+  acknowledgements require the local owner path under R54. SQLite (T10), runtime
+  evaluation/retention (T15/T19), protocol/authorization (T17/T18) and doctor/CLI
+  are unwired. These reference tests do not complete R81–R84's runtime acceptance
+  or durable backup/restore (T23), and do not release T8c integration.
+
 T8c request-keys amendment (2026-11-22): the port `orch_core::store::request_keys`
 adds `RequestKeyWrite` to `UnitOfWork`, with the same two references
 (`memory_request_keys_v2`, `file_request_keys_v2`) running one shared suite. It

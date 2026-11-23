@@ -4,13 +4,13 @@
 //! Authorization of operations belongs to the dispatcher, not to this port.
 //! Writes run a synchronous callback on the backend's writer, so no transaction
 //! can escape or wait for an external side effect. A callback error aborts it.
-//! Events, leases, intents, retries and request keys share the entity
-//! transaction and its project boundary. The remaining operational families
-//! arrive in later slices.
+//! Events, leases, intents, retries, request keys and attention share the entity
+//! transaction and its explicit scope boundary.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+pub mod attention;
 pub mod blob;
 pub mod entity;
 pub mod events;
@@ -88,6 +88,14 @@ pub enum StoreError {
     InvalidRetry(String),
     #[error("invalid request key: {0}")]
     InvalidRequestKey(String),
+    #[error("invalid attention: {0}")]
+    InvalidAttention(String),
+    #[error("stale attention revision for {id}: expected {expected:?}, actual {actual:?}")]
+    StaleAttentionRevision {
+        id: u64,
+        expected: Revision,
+        actual: Option<Revision>,
+    },
     #[error("storage counter exhausted")]
     CounterExhausted,
     #[error(transparent)]
@@ -99,7 +107,13 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// All reads share one committed state, including repeated page reads.
 #[async_trait]
 pub trait ReadSnapshot:
-    events::EventRead + intents::IntentRead + leases::LeaseRead + retries::RetryRead + Send + Sync
+    attention::AttentionRead
+    + events::EventRead
+    + intents::IntentRead
+    + leases::LeaseRead
+    + retries::RetryRead
+    + Send
+    + Sync
 {
     fn caller(&self) -> &Caller;
     async fn get(&self, kind: EntityKind, id: &str) -> Result<Option<Record>>;
@@ -111,7 +125,8 @@ pub trait ReadSnapshot:
 /// Errors leave that operation unchanged. Returning an error from `work`
 /// discards every operation, including positions and revision increments.
 pub trait UnitOfWork:
-    events::EventWrite
+    attention::AttentionWrite
+    + events::EventWrite
     + intents::IntentWrite
     + leases::LeaseWrite
     + request_keys::RequestKeyWrite
