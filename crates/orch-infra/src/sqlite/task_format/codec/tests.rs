@@ -494,3 +494,52 @@ fn all_reference_metadata_is_checked_before_any_slot_object_access() {
         matches!(metadata, Err(CodecError::Invalid { check:"reference metadata", locator }) if locator=="/feedback")
     );
 }
+
+#[test]
+fn typed_damage_is_checked_before_any_slot_object_access() {
+    use std::os::unix::fs::PermissionsExt;
+    let (temp, data) = crate::sqlite::test_data();
+    let store = DiskBlobStore::open(data.root()).unwrap();
+    let mut task = task();
+    task.description = "a".repeat(65537);
+    let encoded = encode(&store, &task).unwrap();
+    let hash = &encoded.refs["/description"][0].sha256;
+    let path = temp
+        .path()
+        .join("data/blobs/sha256")
+        .join(&hash[..2])
+        .join(&hash[2..4])
+        .join(hash);
+    let original: Value = serde_json::from_str(encoded.inline.as_ref().unwrap()).unwrap();
+    for (field, damage, check) in [
+        ("priority", Value::from("high"), "typed detail"),
+        ("status", Value::from("bogus"), "typed detail"),
+        ("attempts", Value::from(-1), "typed detail"),
+        (
+            "created_at",
+            Value::from("2026-11-20T10:00:00Z"),
+            "keys or timestamps",
+        ),
+    ] {
+        let mut value = original.clone();
+        value[field] = damage;
+        let mut broken = detail(&value.to_string());
+        broken.refs = encoded.refs.clone();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let control = decode(&store, &encoded);
+        let damaged = decode(&store, &broken);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            control,
+            Err(CodecError::Access {
+                kind: std::io::ErrorKind::PermissionDenied,
+                ..
+            })
+        ));
+        assert!(
+            matches!(damaged, Err(CodecError::Invalid { check: actual, .. }) if actual == check),
+            "{field}: {damaged:?}"
+        );
+    }
+    assert_eq!(decode(&store, &encoded).unwrap(), task);
+}

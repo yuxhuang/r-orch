@@ -183,8 +183,19 @@ pub(in crate::sqlite) fn decode(store: &DiskBlobStore, detail: &Detail) -> Resul
     if detail.refs.keys().cloned().collect::<BTreeSet<_>>() != used {
         return Err(invalid("reference locators", ""));
     }
-    // The root necessarily precedes JSON parsing. All slot metadata and exact
-    // reachability are now proven before opening any slot's object.
+    // Prove inline types and timestamps before transient slot access can hide
+    // their corruption. Referenced text is checked after reconstruction below.
+    let mut typed = value.clone();
+    for (locator, _) in &tags {
+        let slot = typed
+            .pointer_mut(locator)
+            .ok_or_else(|| invalid("text slot", locator))?;
+        *slot = Value::String(String::new());
+    }
+    let typed: Task = serde_json::from_value(typed).map_err(|_| invalid("typed detail", ""))?;
+    validate(&typed).map_err(|_| invalid("keys or timestamps", ""))?;
+    // The root necessarily precedes JSON parsing. Slot metadata, reachability
+    // and inline typed values are now proven before opening any slot's object.
     for (locator, tag) in tags {
         let bytes = reconstruct(
             store,
