@@ -100,3 +100,9 @@ mod leases;
     reason = "Internal task paging awaits T10 hydration and public cursor integration"
 )]
 mod task_page;
+
+#[allow(
+    dead_code,
+    reason = "internal request-key persistence awaits the combined T10 Storage adapter"
+)]
+mod request_keys;
