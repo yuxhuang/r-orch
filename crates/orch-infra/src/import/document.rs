@@ -198,12 +198,12 @@ pub(crate) fn check_yaml(bytes: &[u8], limits: Limits) -> Result<()> {
         }
     }
     if documents == 0 {
-        // No event is not proof that the stream scans: this parser emits none for a
-        // stream whose only content is a tab at the start of a line, and 1.0's
-        // scanner refuses it (C-V5). Only a stream that 1.0 also scans is a stream
-        // of no document. Nothing was counted, so this reads no node a budget
-        // above could have bounded.
-        serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text)
+        // Zero documents is not proof that the stream scans: this parser emits only
+        // stream events for a stream whose sole content is a tab at the start of a
+        // line, and 1.0's scanner refuses it (C-V5). Only a stream that 1.0 also
+        // scans is a stream of no document. `IgnoredAny` builds no tree and follows
+        // no alias, so this scan costs one linear pass whatever the stream holds.
+        serde_yaml_ng::from_str::<serde::de::IgnoredAny>(text)
             .map_err(|e| Refusal::invalid("parse", e))?;
     }
     if documents != 1 {

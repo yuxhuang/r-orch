@@ -275,10 +275,8 @@ async fn a_config_that_does_not_scan_stops_before_its_documents_are_counted() {
         let decoded = decode_yaml::<Value>(bytes, Limits::YAML).await.unwrap_err();
         for refusal in [checked, parsed, decoded] {
             assert_eq!(refusal.rule, "parse", "{input:?}: {refusal}");
-            assert!(
-                !refusal.detail.contains("expected one document"),
-                "{input:?}"
-            );
+            // `documents` would carry limit 1; a scan failure carries no budget.
+            assert_eq!((refusal.limit, refusal.observed), (0, 0), "{input:?}");
         }
         assert_eq!(std::fs::read(paths.config_path()).unwrap(), bytes);
     }
