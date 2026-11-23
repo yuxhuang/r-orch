@@ -806,6 +806,29 @@ preflight, path confinement, reports, writes, resume and live-copy verification 
 The v1 daemon remains file-backed.
 
 
+### T21 whole-source check slice
+
+`orch-infra::import::preflight` is the check that comes before every write (R112), built read-only and
+without a caller. It opens the source `.orchestry/` once without following a link, lists each directory of
+the "Import rules" table through the confined-directory module (a bounded listing, so the entry limit is
+met before a document is read), refuses a listed entry that is not the kind the table expects before any
+of its bytes is read (R103), applies the id rule (R104) and the fold-key rule for task ids and the names of
+`workspaces/` (R117), measures every document on the bytes that are then decoded (R109), streams each event
+file (R111), and asks of each recorded in-flight run only whether its process or process group exists
+(R119, through a probe that a test can replace). It reports at most 1,000 refusals and 1,000 notes, each
+path, rule and message escaped and cut, and it runs on a blocking thread that a flag can stop between reads.
+It creates, changes and removes nothing. The hostile-document corpus of "Import bounds" runs against it in
+a child process under a time and a resident-memory ceiling (`crates/orch-infra/tests/source_budget.rs`).
+
+Where the check goes beyond the spec's wording, it is stricter and says so: a `running` set of `state.json`
+that 1.0 would read as empty because one entry does not decode stops the check, because that set is what
+R119 asks about.
+
+Not in this slice: the `config.yml` and `_index.json` classes (C-V1 to C-V14, X-V1 to X-V14), which keep
+only the file-kind, byte, I/O and budget stops until the proof of issue 146 is accepted; every write (rows,
+blobs, `.orch-project`, the manifest), `orch import` and its dry-run report, `--resume`, the second reading
+of each file at the load, and any use of a copy of a live project. The check has no caller outside its tests.
+
 ### T21 reader compatibility evidence (issue 146)
 
 The inactive reader now pins ordinary config, blank event lines and damaged indexes
