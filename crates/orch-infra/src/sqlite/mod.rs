@@ -1,11 +1,25 @@
 //! SQLite connection setup and forward-only schema migrations (T9).
 //! The file backend remains the product backend until the T24 switch.
 mod connection;
+#[allow(
+    dead_code,
+    reason = "private entity helpers staged for the T10 adapter"
+)]
+mod entity;
 pub mod migrations;
 pub use connection::{ConnectionHandle, ConnectionRole, Synchronous, open_connection};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteError {
+    #[error("value cannot be represented losslessly in the SQLite schema: {0}")]
+    Unrepresentable(String),
+    #[error("goal operation failed: {operation}; savepoint rollback failed: {rollback}")]
+    OperationRollback {
+        operation: Box<SqliteError>,
+        rollback: rusqlite::Error,
+    },
+    #[error("goal transaction cannot commit after a failed operation rollback")]
+    TransactionAborted,
     #[error("storage admission deadline or queue bound reached")]
     Overloaded,
     #[error(transparent)]
@@ -68,6 +82,12 @@ fn test_data() -> (tempfile::TempDir, crate::data_dir::DataDir) {
     .unwrap();
     (temp, data)
 }
+
+#[allow(
+    dead_code,
+    reason = "internal goal persistence slice; full Storage and safety policy are not wired yet"
+)]
+mod goal_adapter;
 
 #[allow(
     dead_code,
