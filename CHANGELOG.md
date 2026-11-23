@@ -7,6 +7,8 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Storage groundwork
 
+- Retain Pi message-end and turn-end usage records as nonterminal metadata when output ends before the final completion.
+
 - Add an inactive SQLite task paging query with bounded pages and project-bound continuations; the running daemon still uses file storage.
 
 - Add internal SQLite transactions and snapshot reads for goals. The daemon continues to store goals in files.
