@@ -343,6 +343,126 @@ fn decoded_continuations_validate_every_tuple_component_before_querying() {
     }
 }
 
+// Keep the final ID text and every prefix scalar integer so only the arity
+// guard can reject these tuples. Truncating a row tuple drops its text ID and
+// can accidentally test scalar validation instead of the length check.
+fn wrong_length_tuples(width: usize) -> Vec<Vec<rusqlite::types::Value>> {
+    use rusqlite::types::Value;
+
+    (1..=width + 1)
+        .filter(|len| *len != width)
+        .map(|len| {
+            std::iter::repeat_n(Value::Integer(0), len - 1)
+                .chain([Value::Text("a".into())])
+                .collect()
+        })
+        .collect()
+}
+
+fn assert_decoded_wrong_length_is_refused(sort: Sort, width: usize) {
+    for values in wrong_length_tuples(width) {
+        assert!(
+            matches!(
+                Continuation::from_decoded(
+                    "p".into(),
+                    filter(),
+                    sort,
+                    values.clone(),
+                    "p",
+                    &filter(),
+                    sort,
+                ),
+                Err(StoreError::InvalidCursor)
+            ),
+            "sort={sort:?}, values={values:?}"
+        );
+    }
+}
+
+fn assert_query_wrong_length_is_refused(sort: Sort, width: usize) {
+    let root = tempfile::tempdir().unwrap();
+    let data = data(&root);
+    let mut db = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&data, &mut db).unwrap();
+    insert(&db, "p", &task("b", TaskStatus::Todo, 0, 0, None), 1);
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    let req = request(sort, 1);
+    for values in wrong_length_tuples(width) {
+        let forged = Continuation {
+            project: "p".into(),
+            filter: filter(),
+            sort,
+            values,
+        };
+        let rejected = pool
+            .read(deadline(), |tx| {
+                Ok(query(tx, "p", &filter(), &req, Some(&forged)))
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                rejected,
+                Err(task_page::Error::Page(StoreError::InvalidCursor))
+            ),
+            "sort={sort:?}, values={:?}, result={rejected:?}",
+            forged.values
+        );
+        // Rejection must return the only read slot without poisoning it.
+        let recovered = pool
+            .read(deadline(), |tx| Ok(query(tx, "p", &filter(), &req, None)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.ids, ["b"]);
+        assert_eq!(recovered.total, Some(1));
+    }
+}
+
+macro_rules! wrong_length_regressions {
+    ($decoded:ident, $query:ident, $sort:expr, $width:expr) => {
+        #[test]
+        fn $decoded() {
+            assert_decoded_wrong_length_is_refused($sort, $width);
+        }
+        #[test]
+        fn $query() {
+            assert_query_wrong_length_is_refused($sort, $width);
+        }
+    };
+}
+
+// Widths are literal contract expectations, independent of sort_keys().
+wrong_length_regressions!(
+    decoded_wrong_length_default,
+    query_wrong_length_default,
+    Sort::Default,
+    4
+);
+wrong_length_regressions!(decoded_wrong_length_id, query_wrong_length_id, Sort::Id, 1);
+wrong_length_regressions!(
+    decoded_wrong_length_position,
+    query_wrong_length_position,
+    Sort::Position,
+    2
+);
+wrong_length_regressions!(
+    decoded_wrong_length_priority,
+    query_wrong_length_priority,
+    Sort::Priority,
+    3
+);
+wrong_length_regressions!(
+    decoded_wrong_length_created_at,
+    query_wrong_length_created_at,
+    Sort::CreatedAt,
+    3
+);
+wrong_length_regressions!(
+    decoded_wrong_length_updated_at,
+    query_wrong_length_updated_at,
+    Sort::UpdatedAt,
+    3
+);
+
 #[test]
 fn decoded_continuations_refuse_mismatched_bindings_and_unsupported_sorts() {
     use rusqlite::types::Value;
