@@ -494,8 +494,9 @@ across a crash, lists that do not load everything, and a retried request that ru
     bytes stay for the sweep (R60). The owner of the attachment path concurred in the last. The format
     writes only the columns it projects from the detail: `review`, `legacy_proof` and `outputs` are never written
     from a `Task`. 1.0's recorded proof, which the spec's "Import rules" had sent to `legacy_proof`, is imported as
-    the task's `proof` in the detail and `legacy_proof` stays NULL; the lead's confirmation of that change to the
-    rule is pending.
+    the task's `proof` in the detail and `legacy_proof` stays NULL. The lead ruled on 2026-11-23 that this amendment
+    of the approved rule stands as documentation groundwork; the owner's merge of this text is the approval. The
+    importer implementation (T21) and live-copy access stay held.
 
 ## Alternatives considered
 

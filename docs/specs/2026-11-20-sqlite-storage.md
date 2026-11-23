@@ -1210,17 +1210,21 @@ the last naming row (R60).
 lead decided them on 2026-11-23, and the owner of the attachment path (T11) concurred in the removal after checking the
 schema, the blob adapter and R59 and R60. The lead also settled on 2026-11-23 what the stored-data error is and its
 class: `SqliteError::TaskCorrupt`, fatal under R140, with the writer rules of "When a Task read proves its data
-corrupt". Four points remain open. The owner's answer to O2 named the exact schema of this spec at 33 tables; the two
+corrupt". Three points remain open. The owner's answer to O2 named the exact schema of this spec at 33 tables; the two
 tables here widen it, and the owner's merge of this text is the approval. The structured classification that
 issue 127 asks for on the other entities (a goal, a lease, an event, a request key) is not settled here: this text
 defines the variant and the class for `Task` alone, and the mapping must not read it as a rule for another entity. The
 carrier of the "Blob helper change" is not decided: T11 owns it, but the mapping's scope is the SQLite source and
 tests, so either a small T11 PR lands the row-only registration first or the lead widens the mapping's scope by
-`crates/orch-infra/src/blob/references.rs` and its `blob_store` test. And the rule for 1.0's recorded proof is
-reconciled here and needs the lead's confirmation, because it changes the destination that "Import rules" gave it: that
-rule sent the proof to `legacy_proof`, while R19 keeps the column unused and this format keeps the proof in the detail
-(the only authority) for every task. The text now says that the proof goes to the detail and that `legacy_proof` stays
-NULL. The other way, an importer-owned `legacy_proof` copy preserved by format v1, would need that column's own
+`crates/orch-infra/src/blob/references.rs` and its `blob_store` test.
+
+The rule for 1.0's recorded proof is settled here. On 2026-11-23 the lead ruled that this text stands as documentation
+groundwork: it changes the destination that "Import rules" gave the proof, which was `legacy_proof`, to the detail
+(the only authority) for every task, while R19 keeps the column unused. The proof of a 1.0 task is the task's
+`proof` in the detail; an imported row has `legacy_proof = NULL`; ordinary `update` and `move_to_end` preserve the
+column byte for byte; and the detail carries the R97 representation of an oversized text. The owner's merge of this
+text is the approval of the amendment, as it is for the two tables. The T21 implementation and live-copy access stay
+held. The other way, an importer-owned `legacy_proof` copy preserved by format v1, would need that column's own
 encoding, a rule for a proof over 64 KiB (R97 covers imported text, and the column has no reference rows), and a
 decision on whether an export of a task created through the API carries the same copy; it adds a second copy that
 nothing reads in 1.1.
