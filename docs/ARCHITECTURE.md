@@ -445,7 +445,7 @@ All three names are the same program:
 | Crate | Modules |
 |---|---|
 | `orch-domain` | `task`, `agent`, `run`, `goal`, `team`, `message`, `state`, `config`, `global_config`, `events`, `error`, `transitions`, `scope`, `model_tiers`, `shop` (agent-shop + org-shop + default-agents) |
-| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity, event and lease port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
+| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity, event, lease, retry, intent, request-key and attention port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock, v2}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models`, `blob::{DiskBlobStore, BlobReferences}` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{agent, config, context, daemon, goal, init, msg, org, org_template, remote, rpc, run, status, task, team}`, `doctor`, `logs`, `tui` (`DaemonBackend`), `update`, `web`, `routing`, `tree`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
@@ -1612,3 +1612,54 @@ full origin and generation across viewer, editor and direct-field surfaces. Draf
 session and remains memory only. No frozen orch-core port, storage format or peer protocol changes.
 See [ADR 0003](decisions/0003-tui-focus-viewer-and-clipboard-boundaries.md), the
 [backend contract](../crates/orch-tui/BACKEND.md) and [operator guidance](RUNBOOK.md#copying-text-from-the-dashboard).
+
+The retry port also provides complete snapshot-paged enumeration for recovery and
+export (`RetryRead::read_retries`), alongside point and bounded due reads. Both
+memory and file references delegate through their existing project session;
+transaction-local `list_retries` sees its own writes. Pages use exclusive
+`(due_at, task)` byte ordering, include future rows, and have no total-row cap.
+
+---
+
+## 13. Roadmap and platform scope
+
+### Releases to 2.0
+
+One release per phase; each leaves a single-machine install working from one start command. The 1.1 contract is
+the [SQLite storage spec](specs/2026-11-20-sqlite-storage.md), its [plan](plans/2026-11-20-sqlite-storage.md) and
+[ADR 0017](decisions/0017-sqlite-storage.md); the later phases have no spec yet.
+
+| Release | Phase |
+|---|---|
+| 1.1 | Storage: SQLite replaces the file backend; a one-way import; `orch db`. |
+| 1.2 | Evidence as stored records, text search (SQLite FTS5), live log follow. |
+| 1.3 | HTTP/2 over TLS on loopback, with a token. |
+| 1.4 | Authentication: enrolment, client certificates, a project list per identity. |
+| 1.5 | Workers with fenced leases, a managed git hub, daemon-side landing, one daemon serving many projects (opt-in). |
+| 2.0 | `orch-peer` is removed. |
+
+### Linux only until 2.0
+
+By the owner's ruling of 2026-11-23, every release above, from 1.1 through 2.0, is developed, tested, gated and
+qualified on Linux only. GitHub's Linux CI is the gate, as before; the Linux development hosts and the Linux cold
+gate carry the rest. No macOS check, Darwin or APFS row, macOS peer or hardware proof, or macOS suspend test
+is required of any of these releases. The peer check on a second host is a Linux host.
+
+- **Linux sleep/wake stays.** The fenced-lease check of a supervised process through a real suspend and resume
+  of an isolated Linux host that the owner has authorized is not withdrawn (spec R42, issue 110). It is pending:
+  nothing has been recorded. The injected-clock test of the lease code proves renewal ordering only.
+- **Releases say so.** The README upgrade notes, the CHANGELOG and the release PR of each release through 2.0
+  state that it was qualified on Linux only and that macOS is untested until after 2.0.
+
+- **Product code is unchanged.** The macOS code paths described elsewhere in this document (for example the
+  complete-spawn exclusion domain under "Daemon process admission") stay; the ruling is about what is run and
+  required, not about what is compiled or removed.
+- **macOS findings are deferred, not lost.** A failure or gap that occurs only on macOS is a GitHub issue in the
+  [After 2.0](https://github.com/yuxhuang/r-orch/milestone/20) milestone, unless triage assigns another. A failure
+  that Linux shows too is an ordinary Linux failure.
+- **Earlier evidence stays.** Results taken on macOS before the ruling are kept as recorded and as what they
+  measured. They are not current acceptance rows.
+- **After 2.0** macOS compatibility is taken up as its own work. This page decides nothing about it.
+
+The rule for contributors is in [AGENTS.md](../AGENTS.md), non-negotiable 10; the record of the ruling is record K
+of the [storage spec](specs/2026-11-20-sqlite-storage.md).

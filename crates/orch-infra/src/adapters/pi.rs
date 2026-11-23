@@ -208,9 +208,30 @@ fn parse_rpc_event(line: &str, clock: &dyn Clock, state: &ParseState) -> Option<
     let event_type = parsed.get("type").and_then(Value::as_str).unwrap_or("");
 
     if PASSIVE_TYPES.contains(&event_type) {
-        // Passive, but `message_end`/`turn_end` carry the running usage.
-        return extract_tokens_from_message(&parsed).map(|tokens| ParsedPiEvent {
-            tokens: Some(tokens),
+        let tokens = extract_tokens_from_message(&parsed);
+        // Keep the original lifecycle record before terminal conversion can
+        // lose it. Nullable observation must not use the legacy zero-filling
+        // extractor, and native Pi reports usage inside an assistant message.
+        let carries_usage = matches!(event_type, "message_end" | "turn_end")
+            && (parsed.get("usage").is_some_and(Value::is_object)
+                || parsed.get("message").is_some_and(|message| {
+                    message.get("role").and_then(Value::as_str) == Some("assistant")
+                        && message.get("usage").is_some_and(Value::is_object)
+                }));
+        if tokens.is_none() && !carries_usage {
+            return None;
+        }
+        return Some(ParsedPiEvent {
+            // No legacy tokens or text: this metadata must not change the
+            // result, per-agent totals, or terminal/failure handling.
+            agent_event: carries_usage.then(|| {
+                AgentEvent::new(
+                    AgentEventKind::Output,
+                    timestamp,
+                    serde_json::json!({ "text": "", "raw": parsed }),
+                )
+            }),
+            tokens,
             ..Default::default()
         });
     }
@@ -828,6 +849,116 @@ mod tests {
             final_text: String::new(),
             last_tokens: None,
         }
+    }
+
+    #[test]
+    fn passive_usage_records_preserve_raw_without_legacy_tokens_or_text() {
+        let clock = orch_core::test_support::FixedClock::default();
+        for kind in ["message_end", "turn_end"] {
+            for usage in [
+                json!({"input": 17, "output": 0}),
+                json!({"output": 0}),
+                json!({}),
+                json!({"input": -1, "output": "invalid", "cacheRead": 9223372036854775808_u64}),
+            ] {
+                for nested in [false, true] {
+                    let raw = if nested {
+                        json!({"type": kind, "message": {"role": "assistant", "model": "synthetic-pi-model", "usage": usage}})
+                    } else {
+                        json!({"type": kind, "model": "synthetic-pi-model", "usage": usage})
+                    };
+                    let parsed =
+                        parse_rpc_event(&raw.to_string(), &clock, &state()).expect("record");
+                    let event = parsed.agent_event.expect("metadata event");
+                    assert_eq!(event.kind, AgentEventKind::Output);
+                    assert_eq!(event.data, json!({"text": "", "raw": raw}));
+                    assert_eq!(event.tokens, None);
+                    assert_eq!(event.error_kind, None);
+                    assert!(parsed.completion.is_none());
+                    assert!(parsed.final_text.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_or_nonobject_usage_does_not_create_metadata_events() {
+        let clock = orch_core::test_support::FixedClock::default();
+        for raw in [
+            json!({"type": "message_end"}),
+            json!({"type": "message_end", "usage": null}),
+            json!({"type": "turn_end", "usage": []}),
+            json!({"type": "message_end", "message": {"role": "user", "usage": {"input": 9}}}),
+            json!({"type": "message_end", "message": {"role": "toolResult", "usage": {"input": 9}}}),
+            json!({"type": "extension_ui_request", "usage": {"input": 9}}),
+            json!({"type": "agent_start", "usage": {"input": 9}}),
+            json!({"type": "brand_new", "usage": {"input": 9}}),
+        ] {
+            assert!(
+                parse_rpc_event(&raw.to_string(), &clock, &state())
+                    .and_then(|parsed| parsed.agent_event)
+                    .is_none(),
+                "{raw}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn message_end_usage_survives_a_later_stdout_failure() {
+        use orch_core::process::{ExitOutcome, ExitSignal};
+        use orch_core::test_support::FakeProcessManager;
+        use tokio::io::AsyncReadExt;
+
+        let fixture =
+            include_str!("../../../../fixtures/adapters/pi/interrupted-message-end.jsonl");
+        let pm = Arc::new(FakeProcessManager::new());
+        let io = ChildIo {
+            pid: 4243,
+            stdout: Some(Box::new(
+                std::io::Cursor::new(fixture.as_bytes()).chain(FailingReader),
+            )),
+            stderr: None,
+            stdin: None,
+            exit: ExitSignal::resolved(ExitOutcome {
+                code: Some(1),
+                signal: None,
+            }),
+            stderr_tail: Default::default(),
+        };
+        let mut events = pi_events(
+            io,
+            Arc::new(tokio::sync::Mutex::new(None)),
+            Arc::clone(&pm) as Arc<dyn ProcessManager>,
+            system_clock(),
+            CancellationToken::new(),
+        );
+        let event = events.next().await.expect("metadata").expect("event");
+        assert_eq!(event.kind, AgentEventKind::Output);
+        let raw: Value = serde_json::from_str(fixture.lines().next().unwrap()).unwrap();
+        assert_eq!(event.data, json!({"text": "", "raw": raw}));
+        assert_eq!(event.tokens, None);
+        let error = events.next().await.expect("error event").expect("event");
+        assert_eq!(error.kind, AgentEventKind::Error);
+        assert!(
+            error.data["message"]
+                .as_str()
+                .unwrap()
+                .contains("ECONNRESET")
+        );
+        let failure = events
+            .next()
+            .await
+            .expect("failure")
+            .expect_err("stream fails");
+        assert_eq!(failure.kind, AdapterErrorKind::ProcessCrash);
+        assert!(events.next().await.is_none());
+        for _ in 0..50 {
+            if !pm.killed_with_grace().is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(pm.killed_with_grace(), [(4243, TERMINAL_GRACE)]);
     }
 
     #[test]
