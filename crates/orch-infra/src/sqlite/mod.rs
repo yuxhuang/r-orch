@@ -11,6 +11,20 @@ pub use connection::{ConnectionHandle, ConnectionRole, Synchronous, open_connect
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteError {
+    #[error("SQLite counter {name} is missing for project {project} with existing rows")]
+    CounterMissing { project: String, name: &'static str },
+    #[error("SQLite counter {name} is negative ({value}) for project {project}")]
+    CounterNegative {
+        project: String,
+        name: &'static str,
+        value: i64,
+    },
+    #[error("SQLite counter {name} ({value}) is behind existing rows for project {project}")]
+    CounterBehind {
+        project: String,
+        name: &'static str,
+        value: i64,
+    },
     #[error("value cannot be represented losslessly in the SQLite schema: {0}")]
     Unrepresentable(String),
     #[error("goal operation failed: {operation}; savepoint rollback failed: {rollback}")]
@@ -26,6 +40,8 @@ pub enum SqliteError {
     Store(#[from] orch_core::store::StoreError),
     #[error("stored run event is damaged: {0}")]
     EventCorrupt(String),
+    #[error("stored lease data is damaged: {0}")]
+    LeaseCorrupt(String),
     #[error("SQLite writer is closed")]
     WriterClosed,
     #[error("SQLite connection and queue capacities must be greater than zero")]
@@ -100,3 +116,15 @@ mod leases;
     reason = "Internal task paging awaits T10 hydration and public cursor integration"
 )]
 mod task_page;
+
+#[allow(
+    dead_code,
+    reason = "internal attention mapping awaits T10 Storage composition"
+)]
+mod attention;
+
+#[allow(
+    dead_code,
+    reason = "internal request-key persistence awaits the combined T10 Storage adapter"
+)]
+mod request_keys;

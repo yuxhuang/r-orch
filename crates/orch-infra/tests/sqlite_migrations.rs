@@ -69,7 +69,7 @@ fn failed_migration_leaves_the_earlier_version() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = data(&tmp);
     let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-    migrate(&dir, &mut conn).unwrap();
+    apply_migrations(&dir, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
     let steps = [
         INITIAL_SCHEMA,
         "INSERT INTO daemon_config VALUES('rolled_back','x',1); THIS IS INVALID SQL;",
@@ -102,11 +102,11 @@ fn newer_schema_is_refused_with_both_versions() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = data(&tmp);
     let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-    migrate(&dir, &mut conn).unwrap();
-    conn.pragma_update(None, "user_version", 2).unwrap();
+    apply_migrations(&dir, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
+    conn.pragma_update(None, "user_version", 3).unwrap();
     let err = migrate(&dir, &mut conn).unwrap_err().to_string();
-    assert!(err.contains("database schema version 2"), "{err}");
-    assert!(err.contains("binary schema version 1"), "{err}");
+    assert!(err.contains("database schema version 3"), "{err}");
+    assert!(err.contains("binary schema version 2"), "{err}");
     assert!(open_connection(&dir, ConnectionRole::Reader, Synchronous::Normal).is_err());
 }
 
@@ -115,7 +115,7 @@ fn a_pending_migration_is_preceded_by_a_checked_copy() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = data(&tmp);
     let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-    migrate(&dir, &mut conn).unwrap();
+    apply_migrations(&dir, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
     project(&conn);
     apply_migrations(
         &dir,
@@ -174,7 +174,7 @@ fn the_start_is_refused_without_space_for_the_copy() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = data(&tmp);
     let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-    migrate(&dir, &mut conn).unwrap();
+    apply_migrations(&dir, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
     project(&conn);
     let err = apply_migrations(
         &dir,
@@ -208,7 +208,7 @@ fn a_copy_that_fails_its_check_stops_before_the_migration() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = data(&tmp);
     let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-    migrate(&dir, &mut conn).unwrap();
+    apply_migrations(&dir, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
     project(&conn);
     conn.execute_batch("PRAGMA ignore_check_constraints=ON; INSERT INTO tasks(project_id,id,title,description,status,priority,attempts,max_attempts,position,created_by_kind,created_at,updated_at,revision) VALUES('p','bad','x','x','done',1,0,3,1,'owner',0,0,1); PRAGMA ignore_check_constraints=OFF;").unwrap();
     let err = apply_migrations(
@@ -234,7 +234,7 @@ fn only_the_two_newest_copies_are_kept() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = data(&tmp);
     let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-    migrate(&dir, &mut conn).unwrap();
+    apply_migrations(&dir, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
     project(&conn);
     let steps = [INITIAL_SCHEMA, "SELECT 1", "SELECT 2", "SELECT 3"];
     for version in 2..=4 {
@@ -255,7 +255,7 @@ fn incomplete_copies_do_not_count_toward_retention_or_fail_committed_migrations(
     let tmp = tempfile::tempdir().unwrap();
     let dir = data(&tmp);
     let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-    migrate(&dir, &mut conn).unwrap();
+    apply_migrations(&dir, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
     project(&conn);
     let backups = dir.root().open_dir("backups").unwrap();
     let incomplete = backups.create_dir("pre-migration-v1-1").unwrap();
@@ -297,7 +297,7 @@ fn retention_failure_does_not_report_a_committed_migration_as_failed() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = data(&tmp);
     let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-    migrate(&dir, &mut conn).unwrap();
+    apply_migrations(&dir, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
     project(&conn);
     let steps = [INITIAL_SCHEMA, "SELECT 1", "SELECT 2", "SELECT 3"];
     apply_migrations(&dir, &mut conn, &steps[..2], plenty()).unwrap();
@@ -333,4 +333,220 @@ fn retention_failure_does_not_report_a_committed_migration_as_failed() {
         5
     );
     assert!(old.join("orch.db").exists());
+}
+
+// Include SQLite sidecars and backup entries, so a refusal must leave both
+// databases and both directory trees byte-for-byte unchanged.
+fn snapshot(root: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    fn visit(
+        root: &std::path::Path,
+        at: &std::path::Path,
+        out: &mut Vec<(std::path::PathBuf, Vec<u8>)>,
+    ) {
+        let mut entries: Vec<_> = std::fs::read_dir(at)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            if path.is_dir() {
+                out.push((relative, Vec::new()));
+                visit(root, &path, out);
+            } else {
+                out.push((relative, std::fs::read(path).unwrap()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(root, root, &mut out);
+    out
+}
+
+#[test]
+fn mismatched_migration_roots_refuse_before_copy_disk_floor_or_write() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let source_dir = data(&source);
+    let destination_dir = data(&destination);
+    let mut conn =
+        open_connection(&source_dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    apply_migrations(&source_dir, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
+    project(&conn);
+    let mut other = open_connection(
+        &destination_dir,
+        ConnectionRole::Writer,
+        Synchronous::Normal,
+    )
+    .unwrap();
+    migrate(&destination_dir, &mut other).unwrap();
+    project(&other);
+    let source_before = snapshot(source.path());
+    let destination_before = snapshot(destination.path());
+    for space in [
+        DiskSpace {
+            available: 0,
+            total: u64::MAX,
+        },
+        plenty(),
+    ] {
+        let error = apply_migrations(
+            &destination_dir,
+            &mut conn,
+            &[
+                INITIAL_SCHEMA,
+                "INSERT INTO daemon_config VALUES('wrong_root','x',1)",
+            ],
+            space,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, orch_infra::sqlite::SqliteError::Migration(_)),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("different data directory"),
+            "{error}"
+        );
+        assert_eq!(snapshot(source.path()), source_before);
+        assert_eq!(snapshot(destination.path()), destination_before);
+    }
+}
+
+#[test]
+fn mismatched_startup_roots_refuse_before_initial_schema_write() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let source_dir = data(&source);
+    let destination_dir = data(&destination);
+    let mut conn =
+        open_connection(&source_dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let source_before = snapshot(source.path());
+    let destination_before = snapshot(destination.path());
+    let error = migrate(&destination_dir, &mut conn).unwrap_err();
+    assert!(
+        error.to_string().contains("different data directory"),
+        "{error}"
+    );
+    assert_eq!(snapshot(source.path()), source_before);
+    assert_eq!(snapshot(destination.path()), destination_before);
+}
+
+#[test]
+fn matching_migration_root_copies_and_updates_only_its_own_database() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let source_dir = data(&source);
+    let _destination_dir = data(&destination);
+    let mut conn =
+        open_connection(&source_dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    apply_migrations(&source_dir, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
+    project(&conn);
+    let destination_before = snapshot(destination.path());
+    apply_migrations(
+        &source_dir,
+        &mut conn,
+        &[
+            INITIAL_SCHEMA,
+            "INSERT INTO daemon_config VALUES('right_root','ok',1)",
+        ],
+        plenty(),
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+    let backups: Vec<_> = std::fs::read_dir(source.path().join("data/backups"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(backups.len(), 1);
+    let copy = rusqlite::Connection::open_with_flags(
+        backups[0].join("orch.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        copy.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        copy.query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        copy.query_row::<i64, _, _>(
+            "SELECT count(*) FROM daemon_config WHERE key='right_root'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(snapshot(destination.path()), destination_before);
+}
+
+#[test]
+fn attention_migration_preserves_legacy_rows_and_checked_version_one_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    apply_migrations(&dir, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
+    project(&conn);
+    conn.execute("INSERT INTO attention(id,project_id,kind,subject_kind,subject_id,severity,title,opened_at,revision) VALUES('11','p','dispatch_off_with_work','dispatch','dispatch','warning','legacy',20,1)", []).unwrap();
+    apply_migrations(
+        &dir,
+        &mut conn,
+        &[
+            INITIAL_SCHEMA,
+            orch_infra::sqlite::migrations::ATTENTION_FACTS,
+        ],
+        plenty(),
+    )
+    .unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row::<Option<String>, _, _>(
+            "SELECT facts_json FROM attention WHERE id='11'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        conn.query_row::<i64, _, _>(
+            "SELECT value FROM counters WHERE project_id='p' AND name='attention:id'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        11
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join("data/backups"))
+            .unwrap()
+            .count(),
+        1
+    );
+    migrate(&dir, &mut conn).unwrap();
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join("data/backups"))
+            .unwrap()
+            .count(),
+        1
+    );
 }

@@ -16,6 +16,8 @@ pub(super) enum EntityError {
     Sql(#[from] rusqlite::Error),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Counter(Box<super::SqliteError>),
     /// The transaction can no longer promise operation-local rollback. The
     /// adapter must abort it, retaining both errors for failure classification.
     #[error("goal operation failed: {operation}; savepoint rollback failed: {rollback}")]
@@ -96,30 +98,51 @@ fn next_revision(row: &GoalRow) -> Result<Revision> {
 }
 
 // Internal counter namespace, shared by goal create and move only. Never use
-// MAX(position): deletions must not make an issued position available again.
+// MAX(position) to allocate: deletions must not make an issued position available again.
 const GOAL_POSITION: &str = "position:goal";
 
 fn next_position(tx: &Transaction<'_>, project: &str) -> Result<u64> {
-    let last: i64 = tx
+    let counter: Option<i64> = tx
         .query_row(
             "SELECT value FROM counters WHERE project_id=?1 AND name=?2",
             params![project, GOAL_POSITION],
             |r| r.get(0),
         )
-        .optional()?
-        .unwrap_or(0);
+        .optional()?;
+    let last = counter.unwrap_or(0);
     if last < 0 {
-        return Err(invalid(0, "negative goal position counter").into());
+        return Err(EntityError::Counter(Box::new(
+            super::SqliteError::CounterNegative {
+                project: project.into(),
+                name: GOAL_POSITION,
+                value: last,
+            },
+        )));
     }
     // Imported rows must seed this durable namespace. A missing/stale counter
     // is corruption, not permission to allocate an already issued position.
-    let inconsistent: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM goals WHERE project_id=?1 AND (position<=0 OR position>?2))",
-        params![project, last],
-        |r| r.get(0),
+    let (minimum, maximum): (Option<i64>, Option<i64>) = tx.query_row(
+        "SELECT MIN(position),MAX(position) FROM goals WHERE project_id=?1",
+        [project],
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    if inconsistent {
-        return Err(invalid(0, "goal position is past its durable counter").into());
+    if minimum.is_some_and(|position| position <= 0) {
+        return Err(invalid(0, "goal position must be positive").into());
+    }
+    if maximum.is_some_and(|position| position > last) {
+        let error = if counter.is_none() {
+            super::SqliteError::CounterMissing {
+                project: project.into(),
+                name: GOAL_POSITION,
+            }
+        } else {
+            super::SqliteError::CounterBehind {
+                project: project.into(),
+                name: GOAL_POSITION,
+                value: last,
+            }
+        };
+        return Err(EntityError::Counter(Box::new(error)));
     }
     let next = last.checked_add(1).ok_or(StoreError::CounterExhausted)?;
     Ok(next as u64)

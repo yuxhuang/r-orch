@@ -14,6 +14,7 @@ use orch_proto::{
     handshake::{Caller, CallerKind, SessionMode},
     ops::{Request, args::SubscribeArgs, results::SubscribeAck},
 };
+use std::os::unix::fs::DirBuilderExt;
 use std::{future::Future, time::Duration};
 use tokio::{sync::oneshot, task::JoinHandle};
 
@@ -64,7 +65,10 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join(".orchestry")).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.path().join(".orchestry"))
+        .unwrap();
     let project = Project::discover(dir.path(), None).unwrap();
     let (stream, mut peer) = fake_transport();
     let server = tokio::spawn(async move {

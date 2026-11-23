@@ -18,7 +18,7 @@ The repo is **public**.
 | `orch-peer` | Remote-peer protocol: links, mirrors, reconnect. |
 | `orch-cli` | clap command tree, human and `--json` rendering, serve mode, `orch web`, `orch mcp` (stdio MCP server, `src/mcp/`). Binaries live here. |
 | `orch-tui` | ratatui dashboard. |
-| `xtask` | Dev tooling: crate-graph. Run as `cargo xtask <cmd>`. |
+| `xtask` | Dev tooling: crate-graph, gate, fixture-gen, linux, changelog. Run as `cargo xtask <cmd>`. |
 
 Dependency direction is asserted by `cargo xtask crate-graph` (ARCHITECTURE §3.1).
 Authoritative docs:
@@ -30,7 +30,8 @@ Authoritative docs:
 | Something is broken at runtime | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
 | What users see and how they install | [README.md](README.md) |
 | How to use every feature, step by step | [docs/manual/](docs/manual/README.md) (regenerate the command reference and screenshots with `docs/manual/tools/`) |
-| What changed per release | [CHANGELOG.md](CHANGELOG.md) |
+| What changed per release | [CHANGELOG.md](CHANGELOG.md), assembled at release from fragments in `docs/changelog/unreleased/` |
+| Which releases lead to 2.0, and which platform they are built and qualified on | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §13 |
 | Why we chose X | [docs/decisions/](docs/decisions/) |
 | What a piece of work must do, and how we check it | [docs/specs/](docs/specs/) |
 | How and in what order we will build it | [docs/plans/](docs/plans/) |
@@ -66,6 +67,21 @@ Authoritative docs:
    and the reasoned-comment format of the two existing entries: why no replacement, what bounds the exposure.
    Until `SECURITY.md` exists, report a vulnerability you find to the owner privately (GitHub private
    vulnerability reporting or direct message), never in a public issue, PR title or PR body.
+10. **Linux only until 2.0.** By the owner's ruling of 2026-11-23, every release from 1.1 through 2.0 is
+    developed, tested, gated and qualified on Linux only: GitHub's Linux CI, Linux development hosts and the
+    Linux cold gate. No macOS check, Darwin or APFS row, macOS peer or hardware proof, or macOS suspend test
+    is required by a PR, a spec, a review or a release before 2.0, and none is run for them. The Linux
+    fenced-lease sleep/wake check stays: a supervised process through a real suspend and resume of an isolated
+    Linux host that the owner has authorized (spec R42, issue 110; pending, and nobody suspends a host without
+    the owner's permission). The injected-clock test proves renewal ordering only. A failure or gap
+    that occurs only on macOS is a GitHub issue in the
+    [After 2.0](https://github.com/yuxhuang/r-orch/milestone/20) milestone (unless triage assigns another),
+    not a blocker. A failure that Linux shows too is an ordinary Linux failure. This changes no code or CI and
+    removes no macOS code path; the second host for the peer check is a Linux host, and Linux CI, the review
+    rules and owner-only merges are unchanged. macOS compatibility is worked on after 2.0. Because macOS goes
+    unqualified, the README upgrade notes, the `CHANGELOG.md` entry and the release PR of every release through
+    2.0 say so (see Release). See ARCHITECTURE §13
+    and record K of the [SQLite storage spec](docs/specs/2026-11-20-sqlite-storage.md).
 
 ## Licensing
 
@@ -110,6 +126,23 @@ reviewed or merged.
    - Convention: squash for single-concern PRs (the squash title becomes the commit; make it a good one);
      merge commit for release PRs and multi-commit PRs whose commits are individually meaningful.
    - Never force-push `main`.
+
+### Independent PRs, stacks and trains
+
+- **Base on `main`.** Branch every PR from current `main`. Independent PRs stay independent and are qualified
+  together in a *train*: an ordered batch checked as one combined merge on a draft branch from green `main`, which
+  the owner then merges member by member, in that order. The draft is closed unmerged once `main` has the
+  recorded tree.
+- **Stack only for code.** Base a PR on another open PR only when the upper change needs the lower PR's code. Say
+  so in both PR bodies (`Depends on #N`). The whole stack enters one train, bottom to top (#171 then #175, #186
+  then #208). If any member is held, the whole stack waits.
+- **A changed head restarts the gate.** A new head (a push or a rebase) needs a delta review, fresh CI at that
+  head and a renewed lead recommendation. Evidence for the old head does not carry over.
+- **One writer for shared documents.** Within a wave of parallel work, one documentation writer owns the shared
+  specs, plans, ADRs and this file; builders own disjoint implementation paths, named in each task's scope. A
+  builder who needs a shared document changed asks the writer instead of editing it.
+- **Release notes never conflict.** A PR adds a changelog fragment, not a line in `CHANGELOG.md` (see
+  "Changelog fragments").
 
 **Merge policy.** The human owner merges by default. The owner may standing-delegate categories to the
 orchestrator; current delegation: docs-only, test-only, and CHANGELOG/plan-status PRs, once required checks are
@@ -290,9 +323,9 @@ worker (never write its real name in this repository), may replace GitHub's suit
 clean tree at the exact PR head before and after, the pinned tools and configuration, a warm target unique to the
 worktree, the lease, complete logs, per-step exit status and the named test and doc-test inventory, and the PR links
 that record. Without that record,
-GitHub's run is the evidence. When `<linux-host>` or the Mac is unavailable, rely on GitHub's CI for an ordinary PR and
-report any macOS check that did not run as not run. This does not waive a platform's cold `full` run for a goal or
-release, and it does not change a live rule (above).
+GitHub's run is the evidence. When `<linux-host>` is unavailable, rely on GitHub's CI for an ordinary PR and
+say which local check did not run. Through 2.0 no macOS check is run or reported as not run (rule 10). This does
+not waive the cold `full` run on Linux for a goal or release, and it does not change a live rule (above).
 
 #### The cooperative lease (status: Q5 approved; implemented)
 
@@ -315,6 +348,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo xtask crate-graph
 cargo deny check          # only if cargo-deny is installed; CI always runs it
+cargo xtask changelog check   # when the PR adds or edits a changelog fragment; CI does not run it yet
 ```
 
 `./xtask/gate.sh` (the `full` tier, cold) is for releases, for the once-per-goal run and for changes to layering,
@@ -322,8 +356,9 @@ process handling or security-relevant code. It is not a superset of CI's `check`
 step reports `ENV-LIMITED` and the run exits 3 instead of passing, so run `cargo deny check` yourself. `--warm` reuses
 your `target/` and is not a gate. It runs on macOS and Linux.
 
-Say in the PR which platform each check ran on (macOS, Linux CI, `Linux (Docker linux/amd64)`, or a combination). A
-failure that also occurs on the base commit is still a failure. Report it as one; it is not a pass.
+Say in the PR which platform each check ran on (Linux CI, a Linux host, `Linux (Docker linux/amd64)`, or a
+combination); through 2.0 a macOS result is neither required nor a gate (rule 10). A failure that also occurs on
+the base commit is still a failure. Report it as one; it is not a pass.
 
 ### Linux checks on macOS (Docker)
 
@@ -373,7 +408,7 @@ cargo xtask linux clean                          # delete this checkout's target
   and Linux CI runs all 7. Under another emulator the probes decide: a behaviour it lacks skips nothing, and a new
   one shows up as an ordinary failure (see Reporting). `run` neither probes nor skips. Where `$HOME` gets written,
   `./xtask/gate.sh` cannot pass in the container (its home-hygiene step, and its test step skips nothing): run the
-  gate on macOS or on native Linux.
+  gate on native Linux; a macOS run is not required before 2.0 (rule 10).
 - **Reporting.** The run prints the commit, the tree, whether the tree was dirty and the base image digest. In the
   PR, name the platform `Linux (Docker linux/amd64)`, never "Linux CI", with the commit it ran at, `dirty no`,
   whether the run was native or emulated, and the tests it skipped. A failure seen only in the container is still a
@@ -425,9 +460,10 @@ request that meets no plan trigger needs no spec. Read [docs/specs/README.md](do
 - Every requirement has an acceptance check: a named test or an exact command, and the platform it runs on.
 - Fill in the security checklist for anything that listens on a socket, crosses a process boundary or handles
   untrusted text before building, not at the review gate.
-- List the verification environment (what needs Linux, a second host, a terminal other than tmux, a browser,
-  owner permission) and ask about it in the first approval request. Terminal behaviour is verified in tmux (see
-  TUI end-to-end tests).
+- List the verification environment (what needs Linux, a second Linux host, a terminal other than tmux, a browser,
+  owner permission) and ask about it in the first approval request. Through 2.0 the platform of every row is
+  Linux (rule 10): no row waits for macOS, and a macOS-only gap is an issue, not an `env-limited` row.
+  Terminal behaviour is verified in tmux (see TUI end-to-end tests).
 - `status: draft -> approved -> done | superseded`. The owner approves the requirements before the build
   starts. The lead may approve them only where the owner's request says so; quote that line in the spec's
   Source. Review findings that are real requirements become new rows.
@@ -495,7 +531,7 @@ Docs ship in the same PR as the change. The PR template asks which row applied.
 | User-facing behaviour, flags, install, upgrade or rollback steps | `README.md` |
 | An operator-visible failure mode or a new error message | `docs/RUNBOOK.md` |
 | Crate boundaries, dependency edges, traits, concurrency or error model | `docs/ARCHITECTURE.md` (and keep `cargo xtask crate-graph` passing) |
-| Anything a user could notice | `CHANGELOG.md`, under `## [Unreleased]` |
+| Anything a user could notice | A changelog fragment in `docs/changelog/unreleased/` (never `CHANGELOG.md`; see below) |
 | Material from outside the project (copied, adapted or vendored) | `THIRD-PARTY-NOTICES.md` (and `NOTICE` only when required; see Licensing) |
 | A trait in `orch-core` listed in `docs/TRAITS-FROZEN.md` | Only via an ADR, then that file |
 | A choice someone will later ask "why?" about | An ADR |
@@ -503,8 +539,34 @@ Docs ship in the same PR as the change. The PR template asks which row applied.
 | Scope or sequencing of non-trivial work | A plan |
 | A wire format, on-disk layout or protocol | An ADR, plus a reference doc under `docs/` in the same PR. Never only in an agent's scratch state |
 
-CHANGELOG entries are one line, user-voiced, under Added / Changed / Deprecated / Removed / Fixed / Security.
-Pure refactors, tests and CI need no entry.
+### Changelog fragments
+
+A release note is one file per entry, so PRs never edit the same lines. Pure refactors, tests and CI need no
+entry. The byte-level contract is the [spec](docs/specs/2026-11-23-changelog-fragments.md); decision:
+[ADR 0021](docs/decisions/0021-changelog-fragments.md).
+
+1. Create `docs/changelog/unreleased/<slug>.<kind>.md` in the PR's first commit. `<slug>` is lowercase letters and
+   digits joined by `-`, usually the branch slug. `<kind>` is `added`, `changed`, `deprecated`, `removed`, `fixed`
+   or `security`. Two entries of one kind need two slugs.
+2. The file is one line, user-voiced ("You can now ...", not "Refactored ..."), at most 1,000 bytes, starting with
+   a letter or a backtick, ending in a newline. No PR number: it does not exist yet, and a commit to add it would
+   change the head. No heading, bullet or link-definition syntax at the start of the line.
+3. Do not edit `CHANGELOG.md` in a PR. Only the release PR does, through the assembler. `## [Unreleased]` still
+   holds the hand-written notes from before fragments; leave them, the assembler carries them into the next
+   release unchanged.
+4. Run `cargo xtask changelog check` before pushing. It validates every fragment and changes nothing.
+
+```
+printf '%s\n' 'Fix the client socket timeout so a slow daemon reply no longer ends a command early.' \
+  > docs/changelog/unreleased/socket-timeout.fixed.md
+cargo xtask changelog check
+```
+
+An agent that runs the `document-release` skill applies its CHANGELOG step to the fragments the branch adds or
+edits, never to `CHANGELOG.md`. The skill file under `skills/library/` ships to users' projects and stays generic.
+
+Fragments sit under `docs/` on purpose: a fragment-only change classifies as documentation-only (`cargo xtask gate
+select`), and a top-level directory would select the full suite.
 
 ## Rust coding standards
 
@@ -556,7 +618,8 @@ crates/<crate>/
 fixtures/<kind>/      # recorded and scripted inputs shared across crates
 skills/               # the skill library shipped with orch
 xtask/                # dev tooling, run as `cargo xtask <cmd>`
-docs/                 # ARCHITECTURE, RUNBOOK, TRAITS-FROZEN, specs/, plans/, decisions/
+docs/                 # ARCHITECTURE, RUNBOOK, TRAITS-FROZEN, specs/, plans/, decisions/,
+                      # changelog/unreleased/ (one fragment per release note)
                       # (reviews/ is historical)
 ```
 
@@ -588,9 +651,12 @@ docs/                 # ARCHITECTURE, RUNBOOK, TRAITS-FROZEN, specs/, plans/, de
 - **No real AI CLIs in tests.** Never exec `claude`, `codex`, `cursor-agent`, etc., and never read their config
   dirs. The gate's `no-real-cli` step puts shims on `PATH` and fails if any test reaches one.
 - **Run one crate:** `cargo test -p orch-peer`; one test: `cargo test -p orch-cli --test remote_peers <name>`.
-- **Portable by default.** Tests, fixtures and scripts run on macOS and Linux, or are marked Linux-only (and
-  then CI runs them). No GNU-only flags (`sed -i` without a suffix argument, `df -BG`, `date -Is`); no
-  `/proc` outside `#[cfg(target_os = "linux")]`. A test that fails on macOS is a bug to fix, not a "baseline".
+- **Portable by default.** Write tests, fixtures and scripts to run on macOS and Linux, or mark them Linux-only
+  (and then CI runs them). No GNU-only flags (`sed -i` without a suffix argument, `df -BG`, `date -Is`); no
+  `/proc` outside `#[cfg(target_os = "linux")]`. Through 2.0 only Linux is run and gated (rule 10): a test that
+  fails only on macOS is filed in the [After 2.0](https://github.com/yuxhuang/r-orch/milestone/20) milestone and
+  does not block a PR; it is not a "baseline" that excuses a Linux failure, and a failure that Linux shows too is
+  a bug to fix.
 - **Hermetic child processes.** A test that spawns a binary gives it its own temp root and a cleared or explicit
   environment. Runner variables (`CARGO_TARGET_DIR`, `TMPDIR`, wrapper `PATH`s) must not leak in. Keep
   scenario-heavy test files split by scenario group, so parallel work does not serialise on one file.
@@ -643,13 +709,25 @@ behaviour (hang-up, SIGHUP) stays on `portable-pty`, as in `crates/orch-cli/test
 ## Release
 
 1. Branch `chore/release-vX.Y.Z` from `main`. Do not use `release/vX.Y.Z`: the ruleset protects
-   `release/**`. Run the cold gate (`./xtask/gate.sh full`) on a platform it supports (see Verification tiers). Every
+   `release/**`. Run the cold gate (`./xtask/gate.sh full`) on Linux, the only platform required through 2.0 (see Verification tiers and rule 10). Every
    gate step must pass and the result must say `qualifying: yes`. Record the platform, the commit and the result in the PR.
 2. Set `workspace.package.version` in `Cargo.toml` (and let `Cargo.lock` update).
-3. In `CHANGELOG.md` rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add a fresh empty `## [Unreleased]`,
-   and update the compare links at the bottom.
+3. Assemble the release notes from the repository root, after step 2 (the version must equal `Cargo.toml`):
+   `cargo xtask changelog assemble --version X.Y.Z --date YYYY-MM-DD`. Add `--dry-run` first to print the section
+   without writing. The command renames `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and adds a fresh empty
+   `## [Unreleased]`. Under the new heading it puts the existing Unreleased text unchanged, then one `###` section
+   per kind from the fragments (Added, Changed, Deprecated, Removed, Fixed, Security, entries sorted by file
+   name). It repoints `[Unreleased]:` and adds `[X.Y.Z]:` as compare links, and deletes the fragments it consumed.
+   It refuses, changing nothing, on a malformed fragment, a version that is not newer than the last release or
+   does not match `Cargo.toml`, or nothing to release. Then edit the section by hand where needed: merge the
+   two `### Added` headings that the first assembly after the cutover can produce, and add the Linux-only
+   statement of step 4. Do not edit `CHANGELOG.md` by hand before assembling.
 4. Update README release notes (the "Upgrading" and "Known gaps" sections) if behaviour users must act on changed.
-5. Commit `chore(release): X.Y.Z`, open the PR, CI green, owner merges (merge commit, per the convention).
+   For every release from 1.1 through 2.0, whatever else changed, the README upgrade notes, the `CHANGELOG.md`
+   entry and the release PR each state that the release was qualified on Linux only and that macOS is untested
+   until after 2.0 (rule 10). Packaging, the Homebrew formula and the workflow are not changed for it.
+5. Commit `chore(release): X.Y.Z` with `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md` and the deleted fragments
+   together, open the PR, CI green, owner merges (merge commit, per the convention).
 6. On `main`: `git tag -a vX.Y.Z -m "vX.Y.Z"` then `git push origin vX.Y.Z`.
 7. Create the GitHub release with notes copied from the CHANGELOG section:
    `gh release create vX.Y.Z --title vX.Y.Z --notes-file <extract>`.
@@ -679,8 +757,8 @@ the evidence that a task is done before releasing the tasks that depend on it.
 
 **Implementer.** Reads: the task brief, the spec and plan, the crate's ARCHITECTURE section, neighbouring tests.
 Owns: code, tests and the doc updates from the duties table, in one PR. Must not skip: the green commands, the
-CHANGELOG line, a test that fails without the change, the commit and verify result in the PR, and `fast` after each
-round.
+changelog fragment, a test that fails without the change, the commit and verify result in the PR, and `fast` after
+each round.
 
 **Reviewer.** Read-only: does not edit, push or merge. Reads: the PR description, the diff, and the spec, plan
 and ADRs it cites. Owns: a findings list with severity (blocker / should-fix / nit). Must not skip: stating
@@ -689,11 +767,11 @@ that the spec and plan status lines are correct. A finding that is a missing req
 new row.
 
 **Tech writer.** Reads: the code and tests being documented, existing docs. Owns: README, RUNBOOK, ARCHITECTURE,
-CHANGELOG wording, plans and ADR clarity. Must not skip: verifying every command and message against the code.
+changelog fragment wording, plans and ADR clarity. Must not skip: verifying every command and message against the code.
 Document current behaviour only; no aspirational features.
 
 **Release.** Reads: the Release section, `CHANGELOG.md`, `git log <last-tag>..HEAD`. Owns: version bump, changelog
-cut, tag, GitHub release. Must not skip: the cold gate, tagging only from `main`, asking the owner before
+assembly, tag, GitHub release. Must not skip: the cold gate, tagging only from `main`, asking the owner before
 pushing a tag.
 
 ## Don'ts
@@ -709,4 +787,5 @@ pushing a tag.
 - Don't silence a lint without `reason = "..."` on the `#[allow]` (clippy enforces this), and don't skip hooks.
 - Don't wrap a broken repo script in an external harness; fix the script (see Broken tooling).
 - Don't create `release/**` branches; the ruleset protects them.
+- Don't edit `CHANGELOG.md` outside a release PR; write a changelog fragment.
 - Don't report a check as passed that did not run, ran only on another platform, or fails on the base commit too.

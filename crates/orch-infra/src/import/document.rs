@@ -197,6 +197,15 @@ pub(crate) fn check_yaml(bytes: &[u8], limits: Limits) -> Result<()> {
             _ => {}
         }
     }
+    if documents == 0 {
+        // Zero documents is not proof that the stream scans: this parser emits only
+        // stream events for a stream whose sole content is a tab at the start of a
+        // line, and 1.0's scanner refuses it (C-V5). Only a stream that 1.0 also
+        // scans is a stream of no document. `IgnoredAny` builds no tree and follows
+        // no alias, so this scan costs one linear pass whatever the stream holds.
+        serde_yaml_ng::from_str::<serde::de::IgnoredAny>(text)
+            .map_err(|e| Refusal::invalid("parse", e))?;
+    }
     if documents != 1 {
         return Err(Refusal {
             rule: "documents",
@@ -209,13 +218,20 @@ pub(crate) fn check_yaml(bytes: &[u8], limits: Limits) -> Result<()> {
 }
 
 /// Budget the bytes first, then use 1.0's real reader to preserve merge semantics.
+#[cfg(test)]
 pub(crate) async fn parse_yaml<T: DeserializeOwned>(
     reader: impl Read,
     limits: Limits,
 ) -> Result<T> {
     let bytes = read_bounded(reader, limits.bytes)?;
-    check_yaml(&bytes, limits)?;
-    let value = orch_core::definition_yaml::parse_yaml_bytes(Path::new("<source>"), &bytes)
+    decode_yaml(&bytes, limits).await
+}
+
+/// The same check and decode on bytes the caller already holds, so a caller that
+/// acquires a file off the async executor can still decode the bytes it measured.
+pub(crate) async fn decode_yaml<T: DeserializeOwned>(bytes: &[u8], limits: Limits) -> Result<T> {
+    check_yaml(bytes, limits)?;
+    let value = orch_core::definition_yaml::parse_yaml_bytes(Path::new("<source>"), bytes)
         .await
         .map_err(|e| Refusal::invalid("parse", e))?;
     serde_yaml_ng::from_value(value).map_err(|e| Refusal::invalid("type", e))
@@ -360,10 +376,16 @@ pub(crate) fn check_json(bytes: &[u8], limits: Limits) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn parse_json<T: DeserializeOwned>(reader: impl Read, limits: Limits) -> Result<T> {
     let bytes = read_bounded(reader, limits.bytes)?;
-    check_json(&bytes, limits)?;
-    T::deserialize(&mut serde_json::Deserializer::from_slice(&bytes))
+    decode_json(&bytes, limits)
+}
+
+/// The same check and decode on bytes the caller already holds.
+pub(crate) fn decode_json<T: DeserializeOwned>(bytes: &[u8], limits: Limits) -> Result<T> {
+    check_json(bytes, limits)?;
+    T::deserialize(&mut serde_json::Deserializer::from_slice(bytes))
         .map_err(|e| Refusal::invalid("type", e))
 }
 
