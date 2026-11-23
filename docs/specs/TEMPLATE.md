@@ -12,8 +12,8 @@ plan: [../plans/YYYY-MM-DD-<slug>.md](../plans/YYYY-MM-DD-<slug>.md) (or "to be 
 
 | Id | Requirement | Source | Priority | Acceptance check (test or command; platform) |
 |---|---|---|---|---|
-| R1 | When <trigger>, <component> shall <response>. | item 1 | must | `crates/<crate>/tests/<file>.rs::<test>`; Linux CI + macOS |
-| R2 | <component> shall <response>. | item 2 | should | `orch ... --json` returns `...`; macOS |
+| R1 | When <trigger>, <component> shall <response>. | item 1 | must | `crates/<crate>/tests/<file>.rs::<test>`; Linux CI |
+| R2 | <component> shall <response>. | item 2 | should | `orch ... --json` returns `...`; Linux |
 | R3 | — | item 3 | won't | Reason it is out of scope. |
 
 ## Non-goals

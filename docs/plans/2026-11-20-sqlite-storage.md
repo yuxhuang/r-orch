@@ -17,7 +17,13 @@ working, and the file backend works on `main` until the PR that removes it.
 Everything the spec lists as out of scope and as a non-goal. In this plan specifically: no tag and no version
 bump; no change to the dashboard beyond what the new protocol forces; no product code before the owner's
 approval gate (T7). Since the owner's decision of 2026-11-21 (the spec's record I): no measurement of event
-throughput or of latency, no performance tuning and no event fallback.
+throughput or of latency, no performance tuning and no event fallback. Since the owner's ruling of 2026-11-23
+(the spec's record K): every release from 1.1 through 2.0 is developed, tested and qualified on Linux only, so no
+task of this plan waits for a macOS result, and a macOS-only gap is an issue in the [After 2.0](https://github.com/yuxhuang/r-orch/milestone/20) milestone.
+The Linux sleep/wake check of spec R42 (a supervised process through a real suspend and resume of an isolated,
+authorized Linux host; issue 110) is not part of what is withdrawn. It is pending, and the release that ships 1.1
+and each later release says in the README upgrade notes, the CHANGELOG and the release PR that it was qualified
+on Linux only (spec R88 and R136).
 
 ## Context
 
@@ -189,8 +195,8 @@ adapter; the shared round trip alone does not prove that backing.
 |---|---|---|---|---|---|---|
 | T24 | The switch: the daemon opens the data directory and SQLite; `orch init` and the pointer file, read without following a link and accepted only as one project id; discovery; the two `orch-peer` changes; the README upgrade notes and the RUNBOOK entries for the switch. The file adapter stays selectable by tests only | R34, R89, R92, R107 (the pointer), R121 (the check at a start), R133 (`orch init`), R135 | `crates/orch-daemon/src/lifecycle.rs`, `crates/orch-daemon/src/discovery.rs`, `crates/orch-client/src/discovery.rs`, `crates/orch-cli/src/commands/init*`, `crates/orch-peer/src/`, `README.md`, `docs/RUNBOOK.md` | T12 to T23 | `cargo test --workspace`; `./xtask/gate.sh full`; `cargo test -p orch-cli --test project_pointer` | 23 |
 | T25 | Removal: the file backend and the 1.0 traits move to `orch-file-reference`; TRAITS-FROZEN §2 rewritten; the `crate-graph` rule | R16, R17 | `crates/orch-core/src/storage.rs`, `crates/orch-infra/src/storage/`, `crates/orch-file-reference/`, `docs/TRAITS-FROZEN.md`, `xtask/` | T24 | `cargo xtask crate-graph`; suite on both backends; the `git grep` of R16 | 24 |
-| T26 | Documentation: manual, RUNBOOK, ARCHITECTURE, README upgrade notes, CHANGELOG, `docs/storage.md` | R88, R136 | `docs/`, `README.md`, `CHANGELOG.md` | T24 | Fact check against the code at the candidate commit; `cargo test -p xtask`; the command that installs 1.0 beside 1.1 run as written (recorded check, spec R136) | 25 |
-| T27 | Proof: the importer on a copy of the live project; the peer check on a second host; the cold gate; the spec's Verification table; spec and plan `done` | R71, R89, R91, G1 to G6, G8 and G9 (G7 was retired on 2026-11-21) | `docs/specs/`, `docs/plans/`; records outside the repository | T25, T26 | `cargo xtask import-verify --source <copy> --record <dir>`; `./xtask/gate.sh full` on macOS and native Linux | 26 |
+| T26 | Documentation: manual, RUNBOOK, ARCHITECTURE, README upgrade notes, CHANGELOG, `docs/storage.md` | R88, R136 | `docs/`, `README.md`, `CHANGELOG.md` | T24 | Fact check against the code at the candidate commit; `cargo test -p xtask`; the command that installs 1.0 beside 1.1 run as written (recorded check on a Linux host, spec R136); the README upgrade notes and the CHANGELOG state that the release was qualified on Linux only and that macOS is untested until after 2.0 (spec R88, R136) | 25 |
+| T27 | Proof: the importer on a copy of the live project; the peer check on a second Linux host; the cold gate; the spec's Verification table; spec and plan `done` | R71, R89, R91, G1 to G6, G8 and G9 (G7 was retired on 2026-11-21) | `docs/specs/`, `docs/plans/`; records outside the repository | T25, T26 | `cargo xtask import-verify --source <copy> --record <dir>`; `./xtask/gate.sh full` on native Linux (the macOS run is withdrawn: the spec's record K); the Linux sleep/wake check of spec R42 is issue 110's and is not recorded | 26 |
 
 Docs travel with their change: each product PR adds its CHANGELOG line and the RUNBOOK entry for any new
 message; T26 writes what spans the stack.
@@ -339,7 +345,8 @@ written no independent review had read that revision or the one before it; five 
 Left for the owner or for a named owner by this revision, and chosen by nothing in it: the two
 questions about where a data set ends (the owner's); whether a start should recognise members moved
 with no marker after a loss of power (the spec states the limit and adds no check); which sync call
-macOS accepts for a directory (the builder's, in T15, T16 and T23, with the spec corrected there);
+macOS accepts for a directory (deferred to the After 2.0 milestone, issue 181; the Linux behaviour stays with the
+builder in T15, T16 and T23);
 a durable record of the numbers given (an open item of its own, resilience N10 of `3c50293`, which no
 other item closes); and when a finish file may be removed (item O8 of the red team's review of
 `196f9087`).
@@ -525,6 +532,7 @@ daemon is wired to this executor only after all of these exist.
 | T4 | dropped as an entry step by the owner on 2026-11-21. The first run of 2026-11-20 is recorded in [issue 98](https://github.com/yuxhuang/r-orch/issues/98) and is not delivered to `main` |
 | T4b | deferred by the owner on 2026-11-21; not run |
 | T10, first slice (writer and read pool) | implemented as an unwired foundation in PR 122 at `63edf0f9`, with its module tests; its Linux CI, independent reviews and the owner's merge are pending, as are the follow-ups of issue 127. The rest of T10 is pending behind T8b and T8c ("T10 split"). The deadline recheck and the bounded writer tests are in PR 154, which is open and pending its Linux CI, reviews and merge |
+| Linux-only scope (the spec's record K) | recorded on 2026-11-23 by one documentation PR that is pending its review and the owner's merge: the spec, this plan, ADR 0017, the lease prototype's spec, the spec TEMPLATE, ARCHITECTURE §13 and AGENTS.md carry it. Nothing was verified on a platform: no code and no CI changed. The first independent review blocked its first head on three points: the Linux sleep/wake check of R42 (issue 110) was withdrawn with the macOS one, R16, R88 and R136 still named macOS, and the branch conflicted with `main`. The text was corrected for them and re-synchronised with `main` keeping the rows of both sides; the corrected text awaits a second review |
 | T10, internal goal adapter | Goal reads, creates, updates, deletes and explicit moves use the executor. Module tests cover transactions, snapshots, reopen and file-reference behavior for supported inputs. Public conformance still requires timestamp and counter compatibility, imported position high-water marks, and text/blob handling. |
 | T2 to T27, except T4 and T4b | pending, as this table stood before 2026-11-21; this revision brings no other row up to date |
 
@@ -542,8 +550,12 @@ daemon is wired to this executor only after all of these exist.
   result, and neither is a run on a container that stands in for a host. Since 2026-11-21 none of those
   measurements is part of 1.1 (the spec's record I): T4b is not run and T16 measures nothing, so 1.1 states
   no performance result at all, and the order is what its tests prove.
-- A real suspend and resume on an isolated macOS machine (spec R42) is a recorded check that is still due;
-  the clock-seam test does not replace it.
+- A real suspend and resume on an isolated macOS machine (spec R42) was a recorded check. The owner's ruling of
+  2026-11-23 (the spec's record K) withdraws that macOS check for every release through 2.0 (the physical macOS
+  observation is issue 178), and the prototype's passes on macOS arm64 stay as history. The Linux check stays: a
+  supervised process through a real suspend and resume of an isolated Linux host that the owner has authorized,
+  tracked in issue 110 and pending. The clock-seam test injects the clock and proves renewal ordering only; it
+  does not stand for that check.
 - Processes (spec R100, R119): every test that could signal uses a fake process table that records each call,
   and asserts that a pid read from a source or a backup is never signalled.
 - A restore's steps (spec R138): a child process is stopped before and after every copy, sync and rename,
@@ -614,16 +626,19 @@ daemon is wired to this executor only after all of these exist.
 - Two ids on one workspace (spec R117, R118): the pair `tsk_Case` and `tsk_case` and a foreign directory and
   branch under the other spelling, each with a canary, are tested as the spec's vectors say: by T8 and T9
   for the storage, T21 for a 1.0 source, T23 for an export and a backup, T12 and T13 for prepare, reuse,
-  merge, cancel, failure and cleanup. R117's tests do not depend on the filesystem. R118's folding cases run
-  on a filesystem that folds case where the test has one (macOS) and through an injected listing on every
-  platform, and each says which it ran.
+  merge, cancel, failure and cleanup. R117's tests do not depend on the filesystem. R118 is accepted on Linux
+  through three paths, none inferred from another: the injected folding listing, the native exact-name,
+  device-and-inode and canary checks on the Linux filesystem the test uses, and the real folding branch wherever
+  that filesystem folds case. Each test says which paths it ran and which it did not and why. No folding
+  filesystem is required or provisioned (the spec's record K). At the time of this revision none of the R118 tests
+  exists, so every path is pending implementation in T12 and T13.
 - Hostile input (spec R109 to R116): the vectors of the spec's "Import bounds" are tested as written, each
   limit at its value and at one over. T21 owns the documents of a 1.0 source and T23 the export files. Every
   entry runs in a child process and must end with its stated refusal within 30 s and 512 MiB resident, with
   the source byte-identical and the destination as the spec says for that refusal. The product's own export
   must pass under the same limits that refuse the hostile ones.
 - `./xtask/gate.sh full`: T18, T23 and T24 (security-relevant and process handling), and once for the goal in T27,
-  on macOS and on native Linux. Every PR: `fast` after each commit, the pre-PR check before opening, Linux CI
+  on native Linux. Every PR: `fast` after each commit, the pre-PR check before opening, Linux CI
   green at the final head.
 - No dashboard behaviour changes, so no new tmux test; the existing ones must stay green through T17 and T24.
 
@@ -746,8 +761,8 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   it before any product task is released; this plan changes no task. Since 2026-11-21 the graph needs no
   task for T4b, and its events task waits for T10, T11 and T13 alone.
 - Two proofs are carried from the closure reviews and are not yet made: the command that installs 1.0
-  beside 1.1 (T26, spec R136), and the read-only lock against a 1.0 daemon on macOS and Linux (T9, spec
-  F9 and R31).
+  beside 1.1 (T26, spec R136, a recorded check on a Linux host), and the read-only lock against a 1.0 daemon on Linux (T9, spec
+  F9 and R31; the macOS half is not required before 2.0, record K).
 - T24 and T25 could be one PR if the wiring is small. They are planned as two so that the switch is reviewed
   as behaviour and the removal as a move.
 
@@ -805,6 +820,37 @@ generator and index-recovery corpus. This is document-level evidence only: whole
 preflight, path confinement, reports, writes, resume and live-copy verification remain T21 work.
 The v1 daemon remains file-backed.
 
+
+### T21 whole-source check slice
+
+`orch-infra::import::preflight` is the check that comes before every write (R112), built read-only and
+without a caller. It opens the source `.orchestry/` once without following a link, lists each directory of
+the "Import rules" table through the confined-directory module (a bounded listing, so the entry limit is
+met before a document is read), refuses a listed entry that is not the kind the table expects before any
+of its bytes is read (R103), applies the id rule (R104) and the fold-key rule for task ids and the names of
+`workspaces/` (R117), measures every document on the bytes that are then decoded (R109), streams each event
+file (R111), and asks of each recorded in-flight run only whether its process or process group exists
+(R119, through a probe that a test can replace). It reports at most 1,000 refusals and 1,000 notes, each
+path, rule and message escaped and cut, and it runs on a blocking thread that a flag can stop between reads.
+It creates, changes and removes nothing. The hostile-document corpus of "Import bounds" runs against it in
+a child process under a time and a resident-memory ceiling (`crates/orch-infra/tests/source_budget.rs`).
+
+Report paths are relative to the source `.orchestry/`; the layer that prints a report adds the prefix that
+the spec's "relative to the project" asks for. The check takes no lock: whoever calls it holds the 1.0 owner
+lock for as long as it relies on an answer (R119 means something only while no 1.0 daemon can rewrite
+`state.json`), and stops it by setting its cancel flag and awaiting the result, because dropping the future
+does not stop the blocking thread. The YAML decode runs on a runtime of the check's own, so a caller's
+blocking pool of one is enough. A task id of `.` or `..` stops the check (R104); template stems are not
+judged, because the spec has no rule for them (tracked, not decided here).
+
+Where the check goes beyond the spec's wording, it is stricter and says so: a `running` set of `state.json`
+that 1.0 would read as empty because one entry does not decode stops the check, because that set is what
+R119 asks about.
+
+Not in this slice: the `config.yml` and `_index.json` classes (C-V1 to C-V14, X-V1 to X-V14), which keep
+only the file-kind, byte, I/O and budget stops until the proof of issue 146 is accepted; every write (rows,
+blobs, `.orch-project`, the manifest), `orch import` and its dry-run report, `--resume`, the second reading
+of each file at the load, and any use of a copy of a live project. The check has no caller outside its tests.
 
 ### T21 reader compatibility evidence (issue 146)
 

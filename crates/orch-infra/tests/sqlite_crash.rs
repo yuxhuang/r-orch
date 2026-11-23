@@ -3,8 +3,9 @@
 //! SQLite COMMIT or power loss. Writer does not expose a mutable commit-hook seam.
 use orch_infra::data_dir::{DataDir, Holder, LockKind};
 use orch_infra::sqlite::{ConnectionRole, Lane, Synchronous, Writer, open_connection};
-use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::io::{self, Read, Write};
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -30,29 +31,40 @@ fn acquire(path: &Path) -> DataDir {
 struct OwnedChild(Child);
 
 impl OwnedChild {
-    fn kill_and_reap(&mut self) -> ExitStatus {
-        if self.0.try_wait().unwrap().is_none() {
+    fn kill_and_reap(&mut self) -> io::Result<ExitStatus> {
+        if self.0.try_wait()?.is_none() {
             // Child::kill targets this spawned child only, never a process group
             // or a pid read from disk/environment.
-            self.0.kill().unwrap();
+            self.0.kill()?;
         }
         let deadline = Instant::now() + LIMIT;
         loop {
-            if let Some(status) = self.0.try_wait().unwrap() {
-                return status;
+            if let Some(status) = self.0.try_wait()? {
+                return Ok(status);
             }
-            assert!(
-                Instant::now() < deadline,
-                "test child did not exit after kill"
-            );
-            std::thread::yield_now();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "test child did not exit after kill",
+                ));
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
         }
     }
 }
 
 impl Drop for OwnedChild {
     fn drop(&mut self) {
-        self.kill_and_reap();
+        if let Err(error) = self.kill_and_reap() {
+            if std::thread::panicking() {
+                // Even stderr can fail. Cleanup must not replace the first panic
+                // with a second panic and abort the entire integration binary.
+                let _ = writeln!(io::stderr(), "crash child cleanup failed: {error}");
+            } else {
+                panic!("crash child cleanup failed: {error}");
+            }
+        }
     }
 }
 
@@ -70,7 +82,9 @@ fn pause(stream: &mut UnixStream, boundary: u8) {
 fn writer_crash_child() {
     let root = std::env::var_os("WRITER_CRASH_ROOT").expect("child root missing");
     let boundary = std::env::var("WRITER_CRASH_BOUNDARY").unwrap();
-    let mut stream = UnixStream::connect(Path::new(&root).join("sync")).unwrap();
+    // Only this helper inherits the private socket endpoint as stdin. Clone the
+    // descriptor safely; no global cwd change or pathname-length limit is needed.
+    let mut stream = UnixStream::from(io::stdin().as_fd().try_clone_to_owned().unwrap());
     stream.set_read_timeout(Some(LIMIT)).unwrap();
     stream.set_write_timeout(Some(LIMIT)).unwrap();
     let data = acquire(&Path::new(&root).join("data"));
@@ -122,8 +136,11 @@ fn crash_at(boundary: &str, marker: u8) -> EntityRows {
         writer.run();
         setup.wait().unwrap();
     }
-    let listener = UnixListener::bind(temp.path().join("sync")).unwrap();
-    listener.set_nonblocking(true).unwrap();
+    // An unnamed pair stays confined to these two processes even when TMPDIR
+    // exceeds sockaddr_un's pathname limit. Readiness blocks with LIMIT instead
+    // of polling for a connection during delayed child startup.
+    let (mut stream, child_stream) = UnixStream::pair().unwrap();
+    stream.set_read_timeout(Some(LIMIT)).unwrap();
     let mut child = OwnedChild(
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "writer_crash_child", "--ignored", "--nocapture"])
@@ -140,36 +157,17 @@ fn crash_at(boundary: &str, marker: u8) -> EntityRows {
             .env("WRITER_CRASH_ROOT", temp.path())
             .env("WRITER_CRASH_BOUNDARY", boundary)
             .current_dir(temp.path())
-            .stdin(Stdio::null())
+            .stdin(Stdio::from(OwnedFd::from(child_stream)))
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + LIMIT;
-    let mut stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(
-                    child.0.try_wait().unwrap().is_none(),
-                    "child exited before connect"
-                );
-                assert!(Instant::now() < deadline, "child connect timed out");
-                std::thread::yield_now();
-            }
-            Err(e) => panic!("accept failed: {e}"),
-        }
-    };
-    // macOS accepts inherit the listener's nonblocking flag. Readiness below
-    // must block with a deadline, rather than race the child's first write.
-    stream.set_nonblocking(false).unwrap();
-    stream.set_read_timeout(Some(LIMIT)).unwrap();
     let mut observed = [0];
     stream.read_exact(&mut observed).unwrap();
     assert_eq!(observed, [marker], "wrong crash boundary");
     assert_eq!(
-        child.kill_and_reap().signal(),
+        child.kill_and_reap().unwrap().signal(),
         Some(9),
         "child was not killed"
     );

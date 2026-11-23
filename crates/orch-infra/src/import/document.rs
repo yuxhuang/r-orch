@@ -209,13 +209,20 @@ pub(crate) fn check_yaml(bytes: &[u8], limits: Limits) -> Result<()> {
 }
 
 /// Budget the bytes first, then use 1.0's real reader to preserve merge semantics.
+#[cfg(test)]
 pub(crate) async fn parse_yaml<T: DeserializeOwned>(
     reader: impl Read,
     limits: Limits,
 ) -> Result<T> {
     let bytes = read_bounded(reader, limits.bytes)?;
-    check_yaml(&bytes, limits)?;
-    let value = orch_core::definition_yaml::parse_yaml_bytes(Path::new("<source>"), &bytes)
+    decode_yaml(&bytes, limits).await
+}
+
+/// The same check and decode on bytes the caller already holds, so a caller that
+/// acquires a file off the async executor can still decode the bytes it measured.
+pub(crate) async fn decode_yaml<T: DeserializeOwned>(bytes: &[u8], limits: Limits) -> Result<T> {
+    check_yaml(bytes, limits)?;
+    let value = orch_core::definition_yaml::parse_yaml_bytes(Path::new("<source>"), bytes)
         .await
         .map_err(|e| Refusal::invalid("parse", e))?;
     serde_yaml_ng::from_value(value).map_err(|e| Refusal::invalid("type", e))
@@ -360,10 +367,16 @@ pub(crate) fn check_json(bytes: &[u8], limits: Limits) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn parse_json<T: DeserializeOwned>(reader: impl Read, limits: Limits) -> Result<T> {
     let bytes = read_bounded(reader, limits.bytes)?;
-    check_json(&bytes, limits)?;
-    T::deserialize(&mut serde_json::Deserializer::from_slice(&bytes))
+    decode_json(&bytes, limits)
+}
+
+/// The same check and decode on bytes the caller already holds.
+pub(crate) fn decode_json<T: DeserializeOwned>(bytes: &[u8], limits: Limits) -> Result<T> {
+    check_json(bytes, limits)?;
+    T::deserialize(&mut serde_json::Deserializer::from_slice(bytes))
         .map_err(|e| Refusal::invalid("type", e))
 }
 
