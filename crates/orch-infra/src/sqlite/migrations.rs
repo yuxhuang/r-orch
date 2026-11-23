@@ -80,6 +80,13 @@ pub fn apply_migrations(
     if version == steps.len() {
         return Ok(());
     }
+    // Refuse a known-lossy predecessor before any intermediate migration or
+    // checked copy. Keep the hook too: it is the migration's transactional guard.
+    if version > 0 && steps.iter().skip(version).any(|step| *step == TASK_FORMAT) {
+        refuse_lossy_tasks(conn).map_err(|error| {
+            SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
+        })?;
+    }
     let holds_project = version > 0
         && conn.query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |r| r.get(0))? > 0;
     if holds_project {
@@ -133,7 +140,7 @@ pub fn apply_migrations(
 
 // No predecessor task can recover ordered duplicates, absent lists, workspace
 // or proof. Do not fabricate a backfill from the value-keyed memberships.
-fn refuse_lossy_tasks(tx: &rusqlite::Transaction<'_>) -> rusqlite_migration::HookResult {
+fn refuse_lossy_tasks(tx: &Connection) -> rusqlite_migration::HookResult {
     let mut counts = Vec::new();
     for table in [
         "tasks",

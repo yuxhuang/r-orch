@@ -560,7 +560,8 @@ fn attention_migration_preserves_legacy_rows_and_checked_version_one_copy() {
 }
 
 #[test]
-fn task_format_migrates_a_populated_task_free_predecessor_and_keeps_its_copy() {
+fn the_task_format_migration_keeps_earlier_versions_and_applies_to_a_populated_predecessor_without_rows()
+ {
     use orch_infra::sqlite::migrations::ATTENTION_FACTS;
     let tmp = tempfile::tempdir().unwrap();
     let dir = data(&tmp);
@@ -668,7 +669,7 @@ fn task_format_migrates_a_populated_task_free_predecessor_and_keeps_its_copy() {
 }
 
 #[test]
-fn every_ambiguous_task_predecessor_table_refuses_before_any_schema_change() {
+fn a_predecessor_with_any_task_or_membership_row_is_refused_and_left_unchanged() {
     use orch_infra::sqlite::{SqliteError, migrations::ATTENTION_FACTS};
     let rows = [
         (
@@ -692,79 +693,88 @@ fn every_ambiguous_task_predecessor_table_refuses_before_any_schema_change() {
             "INSERT INTO task_attachments VALUES('p','private-id','private-name','private-hash')",
         ),
     ];
-    for (table, insert) in rows {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = data(&tmp);
-        let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-        apply_migrations(
-            &dir,
-            &mut conn,
-            &[INITIAL_SCHEMA, ATTENTION_FACTS],
-            plenty(),
-        )
-        .unwrap();
-        project(&conn);
-        conn.execute_batch(insert).unwrap();
-        let before: Vec<(String, String)> = conn
-            .prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
+    for version in [1, 2] {
+        for (table, insert) in rows {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = data(&tmp);
+            let mut conn =
+                open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+            apply_migrations(
+                &dir,
+                &mut conn,
+                &[INITIAL_SCHEMA, ATTENTION_FACTS][..version],
+                plenty(),
+            )
             .unwrap();
-        let error = migrate(&dir, &mut conn).unwrap_err();
-        assert!(matches!(error, SqliteError::Migration(_)), "{error}");
-        let message = error.to_string();
-        assert!(message.contains(&format!("{table}=1")), "{message}");
-        assert!(!message.contains("private-"), "{message}");
-        for name in [
-            "tasks",
-            "task_dependencies",
-            "task_labels",
-            "task_scopes",
-            "task_attachments",
-        ] {
-            assert!(message.contains(&format!("{name}=")), "{message}");
+            project(&conn);
+            conn.execute_batch(insert).unwrap();
+            let before: Vec<(String, String)> = conn
+                .prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for _ in 0..3 {
+                let error = migrate(&dir, &mut conn).unwrap_err();
+                assert!(matches!(error, SqliteError::Migration(_)), "{error}");
+                let message = error.to_string();
+                assert!(message.contains(&format!("{table}=1")), "{message}");
+                assert!(!message.contains("private-"), "{message}");
+                for name in [
+                    "tasks",
+                    "task_dependencies",
+                    "task_labels",
+                    "task_scopes",
+                    "task_attachments",
+                ] {
+                    assert!(message.contains(&format!("{name}=")), "{message}");
+                }
+                assert_eq!(
+                    conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                        .unwrap(),
+                    version as i64
+                );
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        "SELECT count(*) FROM schema_migrations",
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                    version as i64
+                );
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        &format!("SELECT count(*) FROM {table}"),
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                    1
+                );
+                let after: Vec<(String, String)> = conn
+                    .prepare(
+                        "SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name",
+                    )
+                    .unwrap()
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .unwrap()
+                    .collect::<Result<_, _>>()
+                    .unwrap();
+                assert_eq!(before, after);
+                assert_eq!(
+                    conn.query_row::<String, _, _>("PRAGMA integrity_check", [], |r| r.get(0))
+                        .unwrap(),
+                    "ok"
+                );
+            }
+            assert_eq!(
+                std::fs::read_dir(tmp.path().join("data/backups"))
+                    .unwrap()
+                    .count(),
+                0
+            );
         }
-        assert_eq!(
-            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            conn.query_row::<i64, _, _>("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            conn.query_row::<i64, _, _>(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-                .unwrap(),
-            1
-        );
-        let after: Vec<(String, String)> = conn
-            .prepare("SELECT name,sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY name")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(before, after);
-        assert_eq!(
-            conn.query_row::<String, _, _>("PRAGMA integrity_check", [], |r| r.get(0))
-                .unwrap(),
-            "ok"
-        );
-        let copies: Vec<_> = std::fs::read_dir(tmp.path().join("data/backups"))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        assert_eq!(copies.len(), 1);
-        let backup = rusqlite::Connection::open(copies[0].path().join("orch.db")).unwrap();
-        assert_eq!(
-            backup
-                .query_row::<i64, _, _>(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
-                .unwrap(),
-            1
-        );
     }
 }
