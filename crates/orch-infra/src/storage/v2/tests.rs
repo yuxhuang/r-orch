@@ -71,6 +71,63 @@ fn documents(root: &Path) -> Vec<std::path::PathBuf> {
     found
 }
 
+enum Corruption {
+    Parse(&'static str),
+    Invalid(&'static str),
+}
+
+fn assert_corruption(error: StoreError, path: &Path, expected: Corruption) {
+    match expected {
+        Corruption::Invalid(detail) => assert_document_error(error, path, detail),
+        Corruption::Parse(detail) => match error {
+            StoreError::Backend(orch_core::Error::Serde {
+                context,
+                path: reported,
+                source,
+            }) => {
+                assert_eq!(context, "cannot parse the storage document");
+                assert_eq!(reported.as_deref(), Some(path));
+                assert!(source.to_string().contains(detail), "{source}");
+            }
+            other => panic!("expected a parse error, got {other:?}"),
+        },
+    }
+}
+
+fn assert_parse_error(error: StoreError, document: &Path) {
+    match error {
+        StoreError::Backend(orch_core::Error::Serde {
+            context,
+            path,
+            source,
+        }) => {
+            assert_eq!(context, "cannot parse the storage document");
+            assert_eq!(path.as_deref(), Some(document));
+            assert!(source.to_string().contains("key must be a string"));
+        }
+        other => panic!("expected a parse error, got {other:?}"),
+    }
+}
+
+fn assert_backend_message(error: StoreError, expected: &str) {
+    match error {
+        StoreError::Backend(orch_core::Error::Domain(orch_domain::DomainError::Other(message))) => {
+            assert_eq!(message, expected);
+        }
+        other => panic!("expected a diagnostic for corrupt data, got {other:?}"),
+    }
+}
+
+fn assert_document_error(error: StoreError, document: &Path, detail: &str) {
+    assert_backend_message(
+        error,
+        &format!(
+            "{} is not a valid storage document: {detail}",
+            document.display()
+        ),
+    );
+}
+
 #[tokio::test]
 async fn rows_revisions_and_positions_survive_a_new_instance() {
     let root = root();
@@ -106,10 +163,7 @@ async fn a_document_that_does_not_parse_is_refused_and_left_as_it_was() {
     let [document] = documents(root.path()).try_into().unwrap();
     std::fs::write(&document, b"{ not json").unwrap();
 
-    assert!(matches!(
-        s.read(owner("p")).await,
-        Err(StoreError::Backend(_))
-    ));
+    assert_parse_error(s.read(owner("p")).await.err().unwrap(), &document);
     let write = s
         .write(
             owner("p"),
@@ -117,7 +171,7 @@ async fn a_document_that_does_not_parse_is_refused_and_left_as_it_was() {
             Box::new(|u| u.create(task("b")).map(|_| ())),
         )
         .await;
-    assert!(matches!(write, Err(StoreError::Backend(_))));
+    assert_parse_error(write.unwrap_err(), &document);
     assert_eq!(std::fs::read(&document).unwrap(), b"{ not json");
 }
 
@@ -132,10 +186,11 @@ async fn a_document_with_one_row_twice_is_refused() {
     let row = value["records"][0].clone();
     value["records"].as_array_mut().unwrap().push(row);
     std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
-    assert!(matches!(
-        s.read(owner("p")).await,
-        Err(StoreError::Backend(_))
-    ));
+    assert_document_error(
+        s.read(owner("p")).await.err().unwrap(),
+        &document,
+        "Task a appears twice",
+    );
 }
 
 #[tokio::test]
@@ -148,10 +203,11 @@ async fn a_row_past_its_counter_is_refused() {
         serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
     value["counters"]["task"] = 0.into();
     std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
-    assert!(matches!(
-        s.read(owner("p")).await,
-        Err(StoreError::Backend(_))
-    ));
+    assert_document_error(
+        s.read(owner("p")).await.err().unwrap(),
+        &document,
+        "Task a is past its counter",
+    );
 }
 
 async fn aborted(s: &FileStorage) -> Result<()> {
@@ -468,10 +524,11 @@ async fn a_lease_past_its_epoch_counter_is_refused() {
         serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
     value["leases"]["epochs"]["t"] = 0.into();
     std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
-    assert!(matches!(
-        s.read(owner("p")).await,
-        Err(StoreError::Backend(_))
-    ));
+    assert_document_error(
+        s.read(owner("p")).await.err().unwrap(),
+        &document,
+        "the lease of t is past its epoch counter",
+    );
 }
 
 #[tokio::test]
@@ -487,10 +544,11 @@ async fn two_leases_on_one_agent_are_refused() {
     value["leases"]["leases"]["t2"] = second;
     value["leases"]["epochs"]["t2"] = 1.into();
     std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
-    assert!(matches!(
-        s.read(owner("p")).await,
-        Err(StoreError::Backend(_))
-    ));
+    assert_document_error(
+        s.read(owner("p")).await.err().unwrap(),
+        &document,
+        "the lease of t2 shares an agent or a run",
+    );
 }
 
 #[tokio::test]
@@ -672,7 +730,9 @@ async fn a_failed_unit_of_work_keeps_no_intent_on_disk() {
     assert_eq!(add_intent(&s, stop_run("r1"), 2).await, 1);
 }
 
-async fn edited_intents(mutate: impl FnOnce(&mut serde_json::Value)) -> StoreError {
+async fn edited_intents(
+    mutate: impl FnOnce(&mut serde_json::Value),
+) -> (std::path::PathBuf, StoreError) {
     let root = root();
     let s = FileStorage::new(root.path());
     claim(&s, new_lease("t", "a", "r1")).await;
@@ -682,17 +742,18 @@ async fn edited_intents(mutate: impl FnOnce(&mut serde_json::Value)) -> StoreErr
         serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
     mutate(&mut value["intents"]);
     std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
-    FileStorage::new(root.path())
+    let error = FileStorage::new(root.path())
         .read(owner("p"))
         .await
         .err()
-        .expect("a document that is not the contract is refused")
+        .expect("a document that is not the contract is refused");
+    (document, error)
 }
 
 #[tokio::test]
 async fn a_hand_edited_intent_outside_the_contract_is_refused_on_read() {
     // A path where an id belongs, an id past the counter, a kind nobody defined.
-    for edit in [
+    let edits = [
         (|v: &mut serde_json::Value| v["rows"]["1"]["payload"]["run"] = "../escape".into())
             as fn(&mut serde_json::Value),
         |v| v["last"] = 0.into(),
@@ -700,8 +761,19 @@ async fn a_hand_edited_intent_outside_the_contract_is_refused_on_read() {
         |v| {
             v["rows"]["1"]["payload"]["pid"] = 42.into();
         },
-    ] {
-        assert!(matches!(edited_intents(edit).await, StoreError::Backend(_)));
+    ];
+    let expected = [
+        Corruption::Invalid(
+            "intent 1: invalid intent: an intent names one id of 1 to 128 bytes of A-Z a-z 0-9 . _ -, other than . and ..",
+        ),
+        Corruption::Invalid("intent 1 is past its counter"),
+        Corruption::Parse("unknown variant `process.kill`"),
+        Corruption::Parse("unknown field `pid`"),
+    ];
+    assert_eq!(edits.len(), expected.len());
+    for (edit, expected) in edits.into_iter().zip(expected) {
+        let (path, error) = edited_intents(edit).await;
+        assert_corruption(error, &path, expected);
     }
 }
 
@@ -852,7 +924,9 @@ async fn a_failed_unit_of_work_keeps_no_request_key_on_disk() {
     assert_eq!(check_key(&s, "failed", 2).await, KeyCheck::New);
 }
 
-async fn edited_request_keys(mutate: impl FnOnce(&mut serde_json::Value)) -> StoreError {
+async fn edited_request_keys(
+    mutate: impl FnOnce(&mut serde_json::Value),
+) -> (std::path::PathBuf, StoreError) {
     let root = root();
     let s = FileStorage::new(root.path());
     store_key(&s, "first", "r", 1).await;
@@ -862,16 +936,17 @@ async fn edited_request_keys(mutate: impl FnOnce(&mut serde_json::Value)) -> Sto
         serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
     mutate(&mut value["request_keys"]);
     std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
-    FileStorage::new(root.path())
+    let error = FileStorage::new(root.path())
         .read(owner("p"))
         .await
         .err()
-        .expect("a document that is not the contract is refused")
+        .expect("a document that is not the contract is refused");
+    (document, error)
 }
 
 #[tokio::test]
 async fn a_hand_edited_request_key_outside_the_contract_is_refused_on_read() {
-    for edit in [
+    let edits = [
         // A key outside the shape, a hash that is not a hash, an operation with a path in it.
         (|v: &mut serde_json::Value| v["rows"][0]["key"] = "short".into())
             as fn(&mut serde_json::Value),
@@ -885,11 +960,28 @@ async fn a_hand_edited_request_key_outside_the_contract_is_refused_on_read() {
         // A run without an epoch, and a field nobody defined.
         |v| v["rows"][0]["run"] = "r1".into(),
         |v| v["rows"][0]["pid"] = 42.into(),
-    ] {
-        assert!(matches!(
-            edited_request_keys(edit).await,
-            StoreError::Backend(_)
-        ));
+    ];
+    let expected = [
+        Corruption::Invalid(
+            "request key 0: invalid request key: a key is 16 to 128 characters of A-Z a-z 0-9 _ -",
+        ),
+        Corruption::Invalid(
+            "request key 0: invalid request key: a request hash is 64 lowercase hex digits",
+        ),
+        Corruption::Invalid(
+            "request key 0: invalid request key: an operation is 1 to 128 bytes of A-Z a-z 0-9 . _ -",
+        ),
+        Corruption::Invalid("request key 0 keeps a result over the bound"),
+        Corruption::Invalid("request key 0 does not expire an hour after it was stored"),
+        Corruption::Invalid("request key 1 is out of order or repeated"),
+        Corruption::Invalid("request key 1 is out of order or repeated"),
+        Corruption::Invalid("request key 0 has an impossible scope"),
+        Corruption::Parse("unknown field `pid`"),
+    ];
+    assert_eq!(edits.len(), expected.len());
+    for (edit, expected) in edits.into_iter().zip(expected) {
+        let (path, error) = edited_request_keys(edit).await;
+        assert_corruption(error, &path, expected);
     }
 }
 
@@ -1051,7 +1143,10 @@ async fn returned_blob_errors_preserve_the_committed_document() {
             u.update(described("kept", "x".repeat(65_537)), Revision::ONE)
         })
         .await;
-    assert!(matches!(result, Err(StoreError::Backend(_))));
+    assert_backend_message(
+        result.unwrap_err(),
+        "file reference text: not a regular file or expected directory: \"blobs\"",
+    );
     assert_eq!(std::fs::read(path).unwrap(), before);
     assert_eq!(get(&s, "p", "kept").await.unwrap().revision, Revision::ONE);
 }
@@ -1095,15 +1190,20 @@ async fn missing_corrupt_or_invalid_hashes_fail_without_rewriting_rows() {
             }
         }
         let before = std::fs::read(&path).unwrap();
-        assert!(
-            matches!(s.read(owner("p")).await, Err(StoreError::Backend(_))),
-            "{mode}"
-        );
-        assert!(
+        let detail = match mode {
+            "missing" => format!("no blob {hash}"),
+            "corrupt" => format!("blob {hash} does not hash to its name"),
+            "invalid" => "not a blob hash: 10 bytes, not 64".into(),
+            "duplicate" => "text slot is not null or appears twice".into(),
+            _ => unreachable!(),
+        };
+        let expected = format!("file reference text: {detail}");
+        assert_backend_message(s.read(owner("p")).await.err().unwrap(), &expected);
+        assert_backend_message(
             s.transaction(owner("p"), Lane::Entities, |u| u.create(task("new")))
                 .await
-                .is_err(),
-            "{mode}"
+                .unwrap_err(),
+            &expected,
         );
         assert_eq!(std::fs::read(path).unwrap(), before);
     }
@@ -1214,7 +1314,13 @@ async fn partial_blob_publication_leaves_no_rows_and_keeps_reusable_bytes() {
             }),
         )
         .await;
-    assert!(matches!(result, Err(StoreError::Backend(_))));
+    assert_backend_message(
+        result.unwrap_err(),
+        &format!(
+            "file reference text: not a regular file or expected directory: {:?}",
+            &second_hash[..2]
+        ),
+    );
     assert_eq!(std::fs::read(path).unwrap(), before);
     assert_eq!(
         blobs.get(&first_hash).unwrap(),
@@ -1431,4 +1537,187 @@ async fn attention_load_checks_the_session_scope_before_any_write() {
             .unwrap()
             .is_some()
     );
+}
+
+// Issue #130 / PR142: exercise the persisted reader, including both read and
+// write entry points, so a rejected document cannot be silently replaced.
+async fn rejected_external_row(
+    edit: impl FnOnce(&mut serde_json::Value, &crate::blob::DiskBlobStore),
+    detail: &str,
+) {
+    use crate::blob::DiskBlobStore;
+    use crate::data_dir::confined::ConfinedDir;
+    let root = root();
+    let s = FileStorage::new(root.path());
+    s.transaction(owner("p"), Lane::Entities, |u| {
+        u.create(described("t", "x".repeat(65_537)))
+    })
+    .await
+    .unwrap();
+    let path = document(&s, "p");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let dir = ConfinedDir::open(&s.project_dir("p")).unwrap();
+    let blobs = DiskBlobStore::open(&dir).unwrap();
+    edit(&mut json["records"][0], &blobs);
+    let before = serde_json::to_vec(&json).unwrap();
+    std::fs::write(&path, &before).unwrap();
+    drop(s);
+    let reopened = FileStorage::new(root.path());
+    let expected = format!("file reference text: {detail}");
+    assert_backend_message(reopened.read(owner("p")).await.err().unwrap(), &expected);
+    assert_backend_message(
+        reopened
+            .transaction(owner("p"), Lane::Entities, |u| u.create(task("new")))
+            .await
+            .unwrap_err(),
+        &expected,
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[tokio::test]
+async fn external_row_without_references_is_refused_without_rewriting() {
+    rejected_external_row(
+        |row, _| row["texts"] = serde_json::json!([]),
+        "external row has no text references",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn external_row_with_an_absent_pointer_is_refused_without_rewriting() {
+    rejected_external_row(
+        |row, _| row["texts"][0]["pointer"] = "/entity/value/absent".into(),
+        "missing text slot",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn external_row_with_an_invalid_pointer_is_refused_without_rewriting() {
+    rejected_external_row(
+        |row, _| row["texts"][0]["pointer"] = "entity/value/description".into(),
+        "missing text slot",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn external_row_with_a_non_null_target_is_refused_without_rewriting() {
+    rejected_external_row(
+        |row, _| row["row"]["entity"]["value"]["description"] = "inline".into(),
+        "text slot is not null or appears twice",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn external_row_with_correctly_hashed_non_utf8_bytes_is_refused_without_rewriting() {
+    rejected_external_row(
+        |row, blobs| {
+            row["texts"][0]["sha256"] = blobs.put(&[0xff]).unwrap().to_string().into();
+        },
+        "invalid utf-8 sequence of 1 bytes from index 0",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn external_row_with_invalid_hydrated_record_is_refused_without_rewriting() {
+    rejected_external_row(
+        |row, _| row["row"]["position"] = "invalid".into(),
+        "invalid type: string \"invalid\", expected u64",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn escaped_object_keys_and_nonzero_array_indexes_reopen_with_exact_values() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    let mut agent = make_agent();
+    agent.id = "agent".into();
+    for (index, key) in ["z/first~", "~1", "a/b"].into_iter().enumerate() {
+        agent
+            .config
+            .env
+            .get_or_insert_with(Default::default)
+            .insert(key.into(), format!("{index}é").repeat(30_000));
+    }
+    let mut task = make_task();
+    task.id = "task".into();
+    task.proof = Some(orch_domain::TaskProof {
+        files_changed: vec![
+            "zero".into(),
+            "one".repeat(30_000),
+            "two".into(),
+            "three".repeat(20_000),
+        ],
+        ..Default::default()
+    });
+    let expected = s
+        .transaction(owner("p"), Lane::Entities, move |u| {
+            Ok(vec![
+                u.create(Entity::Agent(Box::new(agent)))?,
+                u.create(Entity::Task(Box::new(task)))?,
+            ])
+        })
+        .await
+        .unwrap();
+    drop(s);
+    let reopened = FileStorage::new(root.path());
+    let read = reopened.read(owner("p")).await.unwrap();
+    let agent = read.get(EntityKind::Agent, "agent").await.unwrap().unwrap();
+    let Entity::Agent(agent) = agent.entity else {
+        panic!("expected agent")
+    };
+    assert_eq!(
+        agent
+            .config
+            .env
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        vec!["z/first~", "~1", "a/b"]
+    );
+    for record in expected {
+        assert_eq!(
+            read.get(record.entity.kind(), record.entity.id())
+                .await
+                .unwrap(),
+            Some(record)
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_inline_record_preserves_parse_error_path_and_variant_diagnostic() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    create(&s, "p", "a").await;
+    let path = document(&s, "p");
+    let mut json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    json["records"][0]["position"] = "invalid".into();
+    let before = serde_json::to_vec(&json).unwrap();
+    std::fs::write(&path, &before).unwrap();
+    match s.read(owner("p")).await.err().unwrap() {
+        StoreError::Backend(orch_core::Error::Serde {
+            context,
+            path: reported,
+            source,
+        }) => {
+            assert_eq!(context, "cannot parse the storage document");
+            assert_eq!(reported.as_deref(), Some(path.as_path()));
+            assert!(
+                source
+                    .to_string()
+                    .contains("data did not match any variant of untagged enum StoredRecord")
+            );
+        }
+        other => panic!("expected an inline parse error, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
