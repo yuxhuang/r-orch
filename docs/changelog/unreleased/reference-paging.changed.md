@@ -1,0 +1,1 @@
+Align the inactive memory and file storage references with the SQLite list order: a task's runs list by attempt (newest attempt first) and a goal with an empty update time lists before one with none; the daemon continues to use file storage.

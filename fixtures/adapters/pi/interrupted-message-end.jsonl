@@ -1,0 +1,2 @@
+{"type":"message_end","message":{"role":"assistant","model":"synthetic-pi-model","usage":{"input":17,"output":0,"cacheRead":4},"content":[{"type":"text","text":"synthetic completed message"}]}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"unfinished next message"}}

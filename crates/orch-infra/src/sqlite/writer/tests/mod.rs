@@ -1,10 +1,93 @@
 use super::*;
 use crate::sqlite::{ConnectionRole, SqliteError, Synchronous, open_connection, test_data};
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-/// Bound for every wait in this module: a regression must fail with a name, not hang.
+/// Receipt deadline; the outer process deadline also bounds run() and scoped joins.
 const BOUND: Duration = Duration::from_secs(10);
+
+// A close-on-unwind guard cannot stop a worker that regresses to ignoring close,
+// nor interrupt a stuck callback/commit. Contain each scenario in its own process:
+// Rust must join scoped threads on unwind, but the parent can kill and reap that
+// entire process. The child creates no subprocesses. Its temp data is under a
+// parent-owned directory, so killing it cannot leak fixtures or lock holders.
+const SCENARIO_BOUND: Duration = Duration::from_secs(20);
+const CHILD_SCENARIO: &str = "ORCH_WRITER_TEST_SCENARIO";
+
+struct ScenarioChild(Child);
+
+impl Drop for ScenarioChild {
+    fn drop(&mut self) {
+        // Child::kill only targets the child we own. Kill is harmless if it
+        // already exited; wait reaps it before the parent removes its fixtures.
+        let _ = self.0.kill();
+        self.0.wait().expect("reap writer scenario child");
+    }
+}
+
+fn scenario_output(path: &Path) -> String {
+    let mut output = String::new();
+    File::open(path)
+        .unwrap()
+        .take(64 * 1024)
+        .read_to_string(&mut output)
+        .unwrap();
+    output
+}
+
+#[track_caller]
+fn in_scenario_child(name: &str) -> bool {
+    if std::env::var(CHILD_SCENARIO).as_deref() == Ok(name) {
+        return true;
+    }
+    let root = tempfile::tempdir().unwrap();
+    // Keep nested libtest summaries out of the outer gate's test inventory.
+    // A regular file avoids a pipe filling and blocking the child's failure path.
+    let output_path = root.path().join("scenario.log");
+    let output = File::create(&output_path).unwrap();
+    let mut child = ScenarioChild(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .env(CHILD_SCENARIO, name)
+            .env("HOME", root.path())
+            .env("TMPDIR", root.path())
+            .env("XDG_CONFIG_HOME", root.path())
+            .env("XDG_DATA_HOME", root.path())
+            .env("XDG_RUNTIME_DIR", root.path())
+            .env(
+                "ORCHESTRY_GLOBAL_CONFIG_PATH",
+                root.path().join("global.yml"),
+            )
+            .env("ORCH_DATA_HOME", root.path().join("daemons"))
+            .stdout(output.try_clone().unwrap())
+            .stderr(output)
+            .spawn()
+            .expect("spawn writer scenario child"),
+    );
+    let deadline = Instant::now() + SCENARIO_BOUND;
+    loop {
+        if let Some(status) = child.0.try_wait().expect("poll writer scenario child") {
+            assert!(
+                status.success(),
+                "{name}: scenario failed: {status}\n{}",
+                scenario_output(&output_path)
+            );
+            return false;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{name}: scenario exceeded {SCENARIO_BOUND:?}; killing stuck worker\n{}",
+            scenario_output(&output_path)
+        );
+        // Poll process liveness only; no correctness oracle depends on this delay.
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
 
 trait WaitBounded<T> {
     fn wait_bounded(self) -> Result<T>;
@@ -20,8 +103,8 @@ impl<T> WaitBounded<T> for WriteReceipt<T> {
     }
 }
 
-/// Closes admission when a scoped test body unwinds, so the scope's implicit join
-/// of the worker thread cannot hang behind a failed assertion.
+/// Closes admission on unwind so a working executor can finish its scoped join.
+/// The process deadline covers a regressed worker that ignores closure.
 struct CloseOnDrop<'a>(&'a WriterHandle);
 
 impl Drop for CloseOnDrop<'_> {
@@ -37,6 +120,9 @@ fn count(conn: &rusqlite::Connection) -> i64 {
 
 #[test]
 fn writes_run_one_at_a_time_on_one_connection() {
+    if !in_scenario_child("sqlite::writer::tests::writes_run_one_at_a_time_on_one_connection") {
+        return;
+    }
     let (_temp, data) = test_data();
     let (writer, handle) = Writer::open(&data, Synchronous::Normal, 32).unwrap();
     let setup = handle
@@ -80,6 +166,11 @@ fn writes_run_one_at_a_time_on_one_connection() {
 
 #[test]
 fn body_and_commit_errors_keep_nothing_and_writer_continues() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::body_and_commit_errors_keep_nothing_and_writer_continues",
+    ) {
+        return;
+    }
     let (_temp, data) = test_data();
     let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
     std::thread::scope(|scope| {
@@ -121,6 +212,11 @@ fn body_and_commit_errors_keep_nothing_and_writer_continues() {
 
 #[test]
 fn claims_precede_queued_work_and_other_lanes_use_deadlines() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::claims_precede_queued_work_and_other_lanes_use_deadlines",
+    ) {
+        return;
+    }
     // A manually advanced arrival clock tests ordering, never a latency budget.
     let start = Instant::now();
     let mut queue = Schedule::new(8);
@@ -143,6 +239,11 @@ fn claims_precede_queued_work_and_other_lanes_use_deadlines() {
 
 #[test]
 fn bounded_queue_and_single_pending_event_transaction() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::bounded_queue_and_single_pending_event_transaction",
+    ) {
+        return;
+    }
     let (_temp, data) = test_data();
     assert!(Writer::open(&data, Synchronous::Normal, 0).is_err());
     let (writer, handle) = Writer::open(&data, Synchronous::Normal, 2).unwrap();
@@ -173,6 +274,11 @@ fn bounded_queue_and_single_pending_event_transaction() {
 
 #[test]
 fn expired_queued_request_never_runs_and_close_drains_accepted_work() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::expired_queued_request_never_runs_and_close_drains_accepted_work",
+    ) {
+        return;
+    }
     let (_temp, data) = test_data();
     let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
     let (sent, received) = mpsc::channel();
@@ -199,6 +305,11 @@ fn expired_queued_request_never_runs_and_close_drains_accepted_work() {
 
 #[test]
 fn a_panicking_transaction_rolls_back_and_closes_the_worker() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::a_panicking_transaction_rolls_back_and_closes_the_worker",
+    ) {
+        return;
+    }
     let (_temp, data) = test_data();
     let conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
     conn.execute_batch("CREATE TABLE sample(id INTEGER) STRICT")
@@ -228,6 +339,11 @@ fn a_panicking_transaction_rolls_back_and_closes_the_worker() {
 
 #[test]
 fn executor_runs_claims_first_and_dropped_receipts_still_commit() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::executor_runs_claims_first_and_dropped_receipts_still_commit",
+    ) {
+        return;
+    }
     let (_temp, data) = test_data();
     let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
     let (sent, received) = mpsc::channel();
@@ -254,6 +370,11 @@ fn executor_runs_claims_first_and_dropped_receipts_still_commit() {
 
 #[test]
 fn a_deadline_that_passes_behind_active_work_withdraws_the_request() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::a_deadline_that_passes_behind_active_work_withdraws_the_request",
+    ) {
+        return;
+    }
     let (_temp, data) = test_data();
     let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
     let (started_tx, started_rx) = mpsc::channel();
@@ -289,6 +410,11 @@ fn a_deadline_that_passes_behind_active_work_withdraws_the_request() {
 
 #[test]
 fn dropping_the_last_handle_closes_admission_and_drains() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::dropping_the_last_handle_closes_admission_and_drains",
+    ) {
+        return;
+    }
     let (_temp, data) = test_data();
     let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
     let clone = handle.clone();
@@ -328,6 +454,11 @@ fn tx_state_is_autocommit(connection: &ConnectionHandle<'_>) -> bool {
 
 #[test]
 fn a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body",
+    ) {
+        return;
+    }
     let (_temp, data) = test_data();
     let mut connection =
         open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
@@ -370,6 +501,9 @@ fn a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body() {
 
 #[test]
 fn a_withdrawn_request_is_never_committed() {
+    if !in_scenario_child("sqlite::writer::tests::a_withdrawn_request_is_never_committed") {
+        return;
+    }
     // A second connection holds the write lock, so the worker's BEGIN IMMEDIATE
     // waits inside SQLite. The deadline passes during that wait; the request
     // must be refused and must not commit once the lock frees.

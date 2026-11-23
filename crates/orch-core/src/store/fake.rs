@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use orch_domain::{GoalStatus, TaskStatus};
 use tokio::sync::Mutex as AsyncMutex;
 
+use super::attention::*;
 use super::*;
 
 type Rows = BTreeMap<(EntityKind, String), Record>;
@@ -18,8 +19,11 @@ type Rows = BTreeMap<(EntityKind, String), Record>;
 #[derive(Clone, Default)]
 struct Project {
     rows: Rows,
+    attention: attention::fake::AttentionState,
     events: events::fake::EventState,
+    intents: intents::fake::IntentState,
     leases: leases::fake::LeaseState,
+    request_keys: request_keys::fake::KeyState,
     retries: retries::fake::RetryState,
     positions: BTreeMap<EntityKind, u64>,
 }
@@ -192,7 +196,7 @@ impl View {
             .rows
             .values()
             .filter(|row| matches_filter(&row.entity, filter))
-            .map(|row| (sort_key(row, request.sort), row.clone()))
+            .map(|row| (sort_key(row, request.sort, filter), row.clone()))
             .collect();
         let total = request.with_count.then_some(rows.len() as u64);
         rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -362,7 +366,7 @@ fn validate_sort(kind: EntityKind, sort: Sort) -> Result<()> {
     }
 }
 
-fn sort_key(row: &Record, sort: Sort) -> Key {
+fn sort_key(row: &Record, sort: Sort, filter: &Filter) -> Key {
     use Part::*;
     let mut key = match (sort, &row.entity) {
         (Sort::Id, _) => vec![],
@@ -405,6 +409,9 @@ fn sort_key(row: &Record, sort: Sort) -> Key {
         ],
         (_, Entity::Agent(_)) => vec![Position(row.position)],
         (_, Entity::Team(v)) => vec![Text(v.created_at.clone())],
+        (_, Entity::Run(v)) if matches!(filter, Filter::Runs { task: Some(_), .. }) => {
+            vec![Number(-i64::from(v.attempt))]
+        }
         (_, Entity::Run(v)) => vec![Newest(Reverse(Some(v.started_at.clone())))],
         (_, Entity::Message(v)) => vec![Text(v.created_at.clone()), Position(row.position)],
         (_, Entity::Context(_) | Entity::Config(_) | Entity::Template(_)) => vec![],
@@ -505,12 +512,101 @@ impl events::EventWrite for View {
 }
 
 #[async_trait]
+impl intents::IntentRead for View {
+    async fn read_intent(&self, id: u64) -> Result<Option<intents::Intent>> {
+        Ok(self.project.intents.get(id))
+    }
+    async fn read_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<intents::Intent>> {
+        self.project.intents.pending(after, limit)
+    }
+}
+
+impl intents::IntentWrite for View {
+    fn add_intent(
+        &mut self,
+        payload: &intents::IntentPayload,
+        now_ms: i64,
+    ) -> Result<intents::Intent> {
+        payload.validate()?;
+        if let Some(run) = payload.run() {
+            // The lease of that run, as this unit of work sees it, under the
+            // current lineage; a task principal must be its holder.
+            let lease = self
+                .project
+                .leases
+                .all()
+                .into_iter()
+                .find(|lease| lease.run == run)
+                .ok_or(StoreError::StaleEpoch)?;
+            self.project.leases.check(
+                &self.caller,
+                &self.lineage,
+                leases::fake::By::Task(&lease.task),
+                &lease.lineage,
+                lease.epoch,
+            )?;
+        }
+        self.project.intents.add(payload, now_ms)
+    }
+    fn finish_intent(&mut self, id: u64, now_ms: i64) -> Result<intents::FinishOutcome> {
+        self.project.intents.finish(id, now_ms)
+    }
+    fn delete_finished_intents(&mut self, now_ms: i64, max_rows: usize) -> Result<usize> {
+        self.project.intents.delete_finished(now_ms, max_rows)
+    }
+    fn get_intent(&self, id: u64) -> Result<Option<intents::Intent>> {
+        Ok(self.project.intents.get(id))
+    }
+    fn list_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<intents::Intent>> {
+        self.project.intents.pending(after, limit)
+    }
+}
+
+impl request_keys::RequestKeyWrite for View {
+    fn check_request_key(
+        &self,
+        scope: &request_keys::RequestScope,
+        op: &str,
+        req_sha256: &str,
+        now_ms: i64,
+    ) -> Result<request_keys::KeyCheck> {
+        scope.check_caller(&self.caller)?;
+        self.project
+            .request_keys
+            .check(scope, op, req_sha256, now_ms)
+    }
+    fn store_request_key(
+        &mut self,
+        scope: &request_keys::RequestScope,
+        op: &str,
+        req_sha256: &str,
+        result: &str,
+        now_ms: i64,
+    ) -> Result<()> {
+        scope.check_caller(&self.caller)?;
+        self.project
+            .request_keys
+            .store(scope, op, req_sha256, result, now_ms)
+    }
+    fn delete_expired_request_keys(&mut self, now_ms: i64, max_rows: usize) -> Result<usize> {
+        self.project.request_keys.delete_expired(now_ms, max_rows)
+    }
+}
+
+#[async_trait]
 impl retries::RetryRead for View {
     async fn read_retry(&self, task: &str) -> Result<Option<retries::Retry>> {
         Ok(self.project.retries.get(task))
     }
     async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<retries::Retry>> {
         self.project.retries.due(now_ms, limit)
+    }
+    async fn read_retries(
+        &self,
+        after: Option<&retries::RetryCursor>,
+        limit: usize,
+    ) -> Result<retries::RetryPage> {
+        self.project.retries.page(after, limit)
     }
 }
 
@@ -526,5 +622,74 @@ impl retries::RetryWrite for View {
     }
     fn due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<retries::Retry>> {
         self.project.retries.due(now_ms, limit)
+    }
+    fn list_retries(
+        &self,
+        after: Option<&retries::RetryCursor>,
+        limit: usize,
+    ) -> Result<retries::RetryPage> {
+        self.project.retries.page(after, limit)
+    }
+}
+
+#[async_trait]
+impl AttentionRead for View {
+    async fn read_attention(&self, id: u64) -> Result<Option<Attention>> {
+        Ok(self.project.attention.get(id))
+    }
+    async fn read_attention_page(
+        &self,
+        filter: AttentionFilter,
+        after: Option<&AttentionCursor>,
+        limit: usize,
+    ) -> Result<AttentionPage> {
+        self.project
+            .attention
+            .page(&self.caller.project, filter, after, limit)
+    }
+}
+impl AttentionWrite for View {
+    fn get_attention(&self, id: u64) -> Result<Option<Attention>> {
+        Ok(self.project.attention.get(id))
+    }
+    fn attention_page(
+        &self,
+        filter: AttentionFilter,
+        after: Option<&AttentionCursor>,
+        limit: usize,
+    ) -> Result<AttentionPage> {
+        self.project
+            .attention
+            .page(&self.caller.project, filter, after, limit)
+    }
+    fn open_attention(&mut self, facts: &AttentionFacts, at: i64) -> Result<Attention> {
+        let row = self
+            .project
+            .attention
+            .open(&self.caller.project, facts, at)?;
+        Ok(row)
+    }
+    fn ack_attention(&mut self, id: u64, expected: Revision, at: i64) -> Result<Attention> {
+        let identity = match &self.caller.principal {
+            Principal::Owner { identity }
+            | Principal::Worker { identity }
+            | Principal::Task { identity, .. } => identity,
+        };
+        let row = self.project.attention.ack(id, expected, identity, at)?;
+        Ok(row)
+    }
+    fn resolve_attention(
+        &mut self,
+        id: u64,
+        expected: Revision,
+        reason: ResolutionReason,
+        at: i64,
+    ) -> Result<Attention> {
+        let row = self.project.attention.resolve(id, expected, reason, at)?;
+        Ok(row)
+    }
+    fn expire_attention(&mut self, cutoff: i64, limit: usize) -> Result<usize> {
+        let count = self.project.attention.expire(cutoff, limit)?;
+        Ok(count)
     }
 }

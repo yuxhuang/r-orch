@@ -8,6 +8,7 @@ use orch_daemon::testing::DaemonHarness;
 use orch_domain::{OrchestratorEventType, RetryEntry, RunStatus, TaskStatus};
 use orch_infra::process::gate::ProcessSpawnAdmission;
 use serde_json::json;
+use std::os::unix::fs::DirBuilderExt;
 use std::sync::{Arc, Mutex};
 use support::{DEADLINE, Raw, ok, shell_agent, task};
 use tokio::sync::Notify;
@@ -30,7 +31,10 @@ impl SpawnAdmission for HeldAdmission {
 
 async fn stop_launch(explicit: bool, max_attempts: u32) {
     let root = tempfile::tempdir().unwrap();
-    std::fs::create_dir(root.path().join(".orchestry")).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.path().join(".orchestry"))
+        .unwrap();
     let daemon = DaemonHarness::builder()
         .maintenance_timer(false)
         .start_in(root.path())

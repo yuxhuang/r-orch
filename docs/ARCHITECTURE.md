@@ -346,8 +346,9 @@ Every writer, remote peer callbacks included, is owned by the daemon's coordinat
 Two things in this diagram were wrong in earlier revisions, and both are now enforced rather than described.
 
 **1. `orch-engine` does depend on `orch-infra`.** An earlier revision said "engine depends on core, NOT on
-infra". The edge is real. `ENGINE_INFRA_SITES` allows **14** files under `crates/orch-engine/src/` to name
-`orch_infra`: **10** source files and **4** files under `orchestrator/tests/`. The check matches any mention of
+infra". The edge is real. `ENGINE_INFRA_SITES` allows **15** files under `crates/orch-engine/src/` to name
+`orch_infra`: **10** source files and **5** test files — **4** under `orchestrator/tests/` and **1**,
+`orchestrator/claim_v2/tests.rs`, under `orchestrator/claim_v2/`. The check matches any mention of
 `orch_infra` in a file, doc comments and in-file `#[cfg(test)]` modules included.
 
 | Site | What it names | Why it is acceptable |
@@ -366,6 +367,7 @@ infra". The edge is real. `ENGINE_INFRA_SITES` allows **14** files under `crates
 | `orchestrator/tests/remote.rs` | `FileRemoteStore`, `Paths`, `FileConfigStore`, `storage::lock::acquire_lock` | Remote lifecycle tests use the real registry and status files and stale-lock guards. |
 | `orchestrator/tests/skills.rs` | `DEFAULT_SYSTEM_TEMPLATE`, `DEFAULT_USER_TEMPLATE` | A test asserting the dispatch templates are the real ones. |
 | `orchestrator/tests/token_eco.rs` | `DEFAULT_USER_TEMPLATE` | A test asserting that a normal-mode agent with only a custom system template still renders the real default user template. |
+| `orchestrator/claim_v2/tests.rs` | `storage::v2::FileStorage` | The `#[cfg(test)]` test module of the reservation commit. It assembles the file reference storage to check commit, rollback and approval refusal there; keeping it beside the code preserves access to the private rollback seam. This exception covers only this test module. |
 
 **What actually holds is narrower: every service's injected stores, clock and ID generator are `orch-core`
 trait objects (`Arc<dyn …>`), and the only concrete infra types a service constructor or builder accepts are
@@ -445,7 +447,7 @@ All three names are the same program:
 | Crate | Modules |
 |---|---|
 | `orch-domain` | `task`, `agent`, `run`, `goal`, `team`, `message`, `state`, `config`, `global_config`, `events`, `error`, `transitions`, `scope`, `model_tiers`, `shop` (agent-shop + org-shop + default-agents) |
-| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity, event and lease port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
+| `orch-core` | `storage` (v1 traits), `store` (additive v2 entity, event, lease, retry, intent, request-key and attention port), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
 | `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock, v2}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models`, `blob::{DiskBlobStore, BlobReferences}` |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{agent, config, context, daemon, goal, init, msg, org, org_template, remote, rpc, run, status, task, team}`, `doctor`, `logs`, `tui` (`DaemonBackend`), `update`, `web`, `routing`, `tree`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
@@ -497,6 +499,15 @@ by one rename with the rows; the daemon lineage is one file at its root, and
 The remaining operational families, large-text storage in the blob store and SQLite
 are subsequent slices. The daemon and all v1 storage traits still use the existing
 file implementation; this additive module changes no runtime storage path.
+
+The inactive `orch_core::store::attention` operational port shares these buffered
+transactions and snapshots in both references. Fixed typed facts control item text;
+open rows are unique by kind/subject, acknowledgement preserves caller identity,
+and explicit resolution and retention preserve revisions and monotonic ids. Pages
+are bounded and ordered by id. Empty-project daemon disk attention is separate
+from nonempty-project dispatch attention; health consumers explicitly read two
+scopes, with two snapshots. The dispatcher owns authorization; no evaluator,
+maintenance timer, SQLite mapping or CLI caller is activated by this port.
 
 The additive `orch_core::store::blob::BlobStore` port is synchronous and names
 bytes by a parsed content hash. Its inactive `orch_infra::blob::DiskBlobStore`
@@ -1167,9 +1178,11 @@ not written by a dashboard broadcast subscriber.
 
 [ADR 0017](decisions/0017-sqlite-storage.md) decision 6 gives SQLite one task that performs every write, one
 transaction at a time, and a pool of read-only connections. `crates/orch-infra/src/sqlite/{writer,read_pool}.rs`
-is that executor and pool as an independent foundation (plan T10, first slice). Nothing else uses it yet: it is
-not behind `Storage`, the daemon still runs on the file backend, and the mutex model of §6.1 is unchanged. This
-is a blocking, thread-based design, not tokio: the engine has no async adapter around it yet.
+is that executor and pool as an independent foundation (plan T10, first slice). The internal goal adapter borrows both. It groups goal changes in a writer transaction and reads a consistent
+snapshot through the pool. Each goal operation uses the project supplied by its caller. A failed savepoint
+rollback invalidates the write callback. Timestamps must round-trip as millisecond UTC strings, and revisions
+and positions must fit a positive signed SQLite integer. The daemon uses file storage and the mutex model of
+§6.1. The executor runs on a dedicated thread.
 
 **Trust.** Both types run owned or borrowed closures written by the storage adapter, which must already have
 checked the caller and the project. Neither is an endpoint for client-supplied SQL, and neither has an
@@ -1211,7 +1224,36 @@ clients <── WriteReceipt::wait() ──────────────�
   timeout returns its SQL error to the receipt, not `Overloaded`, even when the deadline has passed. Classifying
   that failure belongs to the retry work (R128, issue 127).
 - **Receipts.** `wait` blocks and returns the closure's result. Dropping a receipt does not cancel the work: an
-  accepted transaction still commits. Do not call `wait` on an async runtime thread; nothing adapts it yet.
+  accepted transaction still commits. Do not call `wait` on an async runtime thread. The internal event adapter
+  (`sqlite/events/adapter.rs`) adapts it for event writes and prunes: `write_async` and `prune_async` queue the
+  request with the caller's deadline, wait for the receipt on a blocking-pool thread, and answer at the deadline.
+  A request still waiting then is withdrawn and answered `Overloaded`, and never commits (spec R128). One whose body
+  had already started is answered with an error that says its outcome is unknown, since the commit is no longer
+  ours to stop. Retrying such a request is safe for the stored rows only: an append is `ON CONFLICT DO NOTHING` per
+  sequence number, so the repeat adds nothing already there, and a prune can be repeated. It is not safe for
+  accounting. The repeat answers only what it did itself (an append reports `stored: 0, skipped: n`, a prune its
+  own `deleted`), so the counts of the attempt whose answer was lost never reach the caller, and a caller that
+  adds the answer to `events_pruned_count` (spec R62) under-counts. Do not derive counters from the answer of a
+  retry. The blocking thread ends when the writer answers or drops the request. The synchronous `write` and
+  `prune` stay for tests and threads that may block. Lease submissions are not adapted yet.
+  Known limits, all unreachable while nothing calls the adapter and all tracked in issue 127 for the daemon
+  wiring:
+  - *Cancellation does not withdraw.* If the caller drops the future before its deadline (an outer timeout, a
+    client disconnect), the request stays queued and commits later with nobody to answer. Wiring must either add a
+    withdraw-on-drop guard or accept that cancellation is not refusal.
+  - *Misuse panics after admission.* `write_async` queues the request before it spawns the wait and arms the
+    timer. Called outside a Tokio runtime, or on one without the time driver, it panics after admission and the
+    write still commits. It needs a runtime with the time driver enabled.
+  - *A failed wait task is not settled.* If the blocking wait itself fails (the runtime shuts down or the task
+    panics) the request is neither withdrawn nor reported as of unknown outcome; it may still commit while the
+    caller is told only that the wait failed.
+  - *Withdrawn requests keep their queue slot* until the writer reaches them. During a long stall, repeated
+    timed-out retries can fill the bounded queue and make every lane, claims included, refuse new work. Back off
+    between retries until the writer drains them; removing a withdrawn entry on the writer side needs `writer.rs`
+    and waits for PR 188.
+  - *Dropping the runtime blocks* until the writer has reached every parked wait (700 ms in one probe with the
+    writer stalled for that long). Shutdown must drain the writer before the runtime is dropped, or use
+    `Runtime::shutdown_timeout`.
 - **Close.** `WriterHandle::close` stops admission, is idempotent, and lets the worker drain what it accepted.
   Dropping the last `WriterHandle` clone does the same, including on an early return or an unwind. `submit` after
   close returns `WriterClosed`. Closures captured by a refused or abandoned job are dropped outside the queue lock.
@@ -1601,3 +1643,54 @@ full origin and generation across viewer, editor and direct-field surfaces. Draf
 session and remains memory only. No frozen orch-core port, storage format or peer protocol changes.
 See [ADR 0003](decisions/0003-tui-focus-viewer-and-clipboard-boundaries.md), the
 [backend contract](../crates/orch-tui/BACKEND.md) and [operator guidance](RUNBOOK.md#copying-text-from-the-dashboard).
+
+The retry port also provides complete snapshot-paged enumeration for recovery and
+export (`RetryRead::read_retries`), alongside point and bounded due reads. Both
+memory and file references delegate through their existing project session;
+transaction-local `list_retries` sees its own writes. Pages use exclusive
+`(due_at, task)` byte ordering, include future rows, and have no total-row cap.
+
+---
+
+## 13. Roadmap and platform scope
+
+### Releases to 2.0
+
+One release per phase; each leaves a single-machine install working from one start command. The 1.1 contract is
+the [SQLite storage spec](specs/2026-11-20-sqlite-storage.md), its [plan](plans/2026-11-20-sqlite-storage.md) and
+[ADR 0017](decisions/0017-sqlite-storage.md); the later phases have no spec yet.
+
+| Release | Phase |
+|---|---|
+| 1.1 | Storage: SQLite replaces the file backend; a one-way import; `orch db`. |
+| 1.2 | Evidence as stored records, text search (SQLite FTS5), live log follow. |
+| 1.3 | HTTP/2 over TLS on loopback, with a token. |
+| 1.4 | Authentication: enrolment, client certificates, a project list per identity. |
+| 1.5 | Workers with fenced leases, a managed git hub, daemon-side landing, one daemon serving many projects (opt-in). |
+| 2.0 | `orch-peer` is removed. |
+
+### Linux only until 2.0
+
+By the owner's ruling of 2026-11-23, every release above, from 1.1 through 2.0, is developed, tested, gated and
+qualified on Linux only. GitHub's Linux CI is the gate, as before; the Linux development hosts and the Linux cold
+gate carry the rest. No macOS check, Darwin or APFS row, macOS peer or hardware proof, or macOS suspend test
+is required of any of these releases. The peer check on a second host is a Linux host.
+
+- **Linux sleep/wake stays.** The fenced-lease check of a supervised process through a real suspend and resume
+  of an isolated Linux host that the owner has authorized is not withdrawn (spec R42, issue 110). It is pending:
+  nothing has been recorded. The injected-clock test of the lease code proves renewal ordering only.
+- **Releases say so.** The README upgrade notes, the CHANGELOG and the release PR of each release through 2.0
+  state that it was qualified on Linux only and that macOS is untested until after 2.0.
+
+- **Product code is unchanged.** The macOS code paths described elsewhere in this document (for example the
+  complete-spawn exclusion domain under "Daemon process admission") stay; the ruling is about what is run and
+  required, not about what is compiled or removed.
+- **macOS findings are deferred, not lost.** A failure or gap that occurs only on macOS is a GitHub issue in the
+  [After 2.0](https://github.com/yuxhuang/r-orch/milestone/20) milestone, unless triage assigns another. A failure
+  that Linux shows too is an ordinary Linux failure.
+- **Earlier evidence stays.** Results taken on macOS before the ruling are kept as recorded and as what they
+  measured. They are not current acceptance rows.
+- **After 2.0** macOS compatibility is taken up as its own work. This page decides nothing about it.
+
+The rule for contributors is in [AGENTS.md](../AGENTS.md), non-negotiable 10; the record of the ruling is record K
+of the [storage spec](specs/2026-11-20-sqlite-storage.md).

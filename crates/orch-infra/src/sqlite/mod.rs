@@ -1,17 +1,47 @@
 //! SQLite connection setup and forward-only schema migrations (T9).
 //! The file backend remains the product backend until the T24 switch.
 mod connection;
+#[allow(
+    dead_code,
+    reason = "private entity helpers staged for the T10 adapter"
+)]
+mod entity;
 pub mod migrations;
 pub use connection::{ConnectionHandle, ConnectionRole, Synchronous, open_connection};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteError {
+    #[error("SQLite counter {name} is missing for project {project} with existing rows")]
+    CounterMissing { project: String, name: &'static str },
+    #[error("SQLite counter {name} is negative ({value}) for project {project}")]
+    CounterNegative {
+        project: String,
+        name: &'static str,
+        value: i64,
+    },
+    #[error("SQLite counter {name} ({value}) is behind existing rows for project {project}")]
+    CounterBehind {
+        project: String,
+        name: &'static str,
+        value: i64,
+    },
+    #[error("value cannot be represented losslessly in the SQLite schema: {0}")]
+    Unrepresentable(String),
+    #[error("goal operation failed: {operation}; savepoint rollback failed: {rollback}")]
+    OperationRollback {
+        operation: Box<SqliteError>,
+        rollback: rusqlite::Error,
+    },
+    #[error("goal transaction cannot commit after a failed operation rollback")]
+    TransactionAborted,
     #[error("storage admission deadline or queue bound reached")]
     Overloaded,
     #[error(transparent)]
     Store(#[from] orch_core::store::StoreError),
     #[error("stored run event is damaged: {0}")]
     EventCorrupt(String),
+    #[error("stored lease data is damaged: {0}")]
+    LeaseCorrupt(String),
     #[error("SQLite writer is closed")]
     WriterClosed,
     #[error("SQLite connection and queue capacities must be greater than zero")]
@@ -71,6 +101,30 @@ fn test_data() -> (tempfile::TempDir, crate::data_dir::DataDir) {
 
 #[allow(
     dead_code,
+    reason = "internal goal persistence slice; full Storage and safety policy are not wired yet"
+)]
+mod goal_adapter;
+
+#[allow(
+    dead_code,
     reason = "Internal lease adapter awaits T10 Storage integration; issue 127 holds production wiring"
 )]
 mod leases;
+
+#[allow(
+    dead_code,
+    reason = "Internal task paging awaits T10 hydration and public cursor integration"
+)]
+mod task_page;
+
+#[allow(
+    dead_code,
+    reason = "internal attention mapping awaits T10 Storage composition"
+)]
+mod attention;
+
+#[allow(
+    dead_code,
+    reason = "internal request-key persistence awaits the combined T10 Storage adapter"
+)]
+mod request_keys;

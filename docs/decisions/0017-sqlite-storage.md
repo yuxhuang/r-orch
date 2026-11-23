@@ -9,6 +9,12 @@
   decision 8 and its consequence that the operation boundary is "not a transaction upgrade"; and the storage
   section of `docs/TRAITS-FROZEN.md` (§2: the ten storage traits and their three rules). Everything else in 0012
   stands: one daemon owns state, no client opens it, nothing starts a daemon on its own, exit 7.
+- Platform scope, 2026-11-23 (the spec's record K): every release from 1.1 through 2.0 is developed, tested and
+  qualified on Linux only, and macOS compatibility follows 2.0 (the [After 2.0](https://github.com/yuxhuang/r-orch/milestone/20) milestone). No decision below
+  changes. A sentence below that names macOS as a place a check still has to run is withdrawn, and one that
+  records what a macOS run measured, or what the product does on macOS, is history and stays. The real-suspend
+  check of decision 16 stays for Linux (an isolated, authorized Linux host; spec R42, issue 110) and is
+  pending.
 - Decisions 1 to 6 and 14 restate decisions the owner already took in the goal and are binding. Decisions 7 to 13
   and 15 to 25 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
   the owner's to rule (the spec's AP13); no record shows that the owner set them.
@@ -219,6 +225,12 @@ across a crash, lists that do not load everything, and a retried request that ru
     calls `move_to_end` at exactly the call sites where 1.0's `save` reordering is observable (the list is
     deliverable B). Agent rotation is therefore the same as 1.0 and is now a line of engine code that a test
     names.
+    The default orders of two lists are decided as follows (spec, "Run and goal default order"). A run list whose
+    filter names a task, alone or beside an agent, is ordered by the run's numeric `attempt` descending, then by id;
+    every other run list keeps the original `started_at` text descending, then id; the explicit sort `id` is the id
+    ascending with any filter. A goal list is ordered by status rank; presence of `updated_at`, a present value first
+    and a present empty text counting as present; the original `updated_at` text descending; `position`; id. Text is
+    compared by its original UTF-8 bytes, and a cursor continues the same key.
 
 16. **A restore starts a new generation and a new lineage; no pair of lineage and epoch is issued twice.** The
     owner decided this on 2026-11-20 (the spec's AP11) and amended gate line 9 to match. The lineage is a
@@ -630,6 +642,10 @@ across a crash, lists that do not load everything, and a retried request that ru
   hold for events. Since 2026-11-21 they are not measured in release 1.1 and no fallback is built. Release 1.1
   then ships one event path, with the first run's miss of the first budget on macOS on record (issue 98) and
   with `metrics.get` as the only watch on the waits.
+- The numeric attempt order of a task-filtered run list, and a present empty goal `updated_at` ordering before an absent
+  one, are the contract of the memory and file references too. A separate change aligns both and strengthens the shared
+  scenarios; it lands in the same train as this text, and the SQLite registration of the shared suites follows it.
+  Whether a reference meets the contract is shown by that change's own checks, not by this text.
 - `docs/TRAITS-FROZEN.md` §2, ARCHITECTURE §1, §2.1, §5.1 to §5.3 and §6.1, and the RUNBOOK's storage
   procedures change. The stable-sort rule stays: the scheduler still sorts in memory.
 - Backups become a product duty: database, blobs and repositories as one restorable point. A restore

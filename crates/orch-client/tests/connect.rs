@@ -8,18 +8,19 @@ use orch_proto::handshake::{
 };
 use orch_proto::ndjson::{FrameReader, write_frame};
 use std::fs;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-/// A short project root under /tmp (macOS socket paths are at most 104 bytes).
+/// A short project root under the runner's temp directory (Unix socket paths are bounded).
 fn project_dir() -> tempfile::TempDir {
-    let dir = tempfile::Builder::new()
-        .prefix("cc-")
-        .tempdir_in("/tmp")
+    let dir = tempfile::Builder::new().prefix("cc-").tempdir().unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.path().join(".orchestry"))
         .unwrap();
-    fs::create_dir(dir.path().join(".orchestry")).unwrap();
     dir
 }
 
@@ -43,6 +44,37 @@ fn bind(path: &Path) -> UnixListener {
     let listener = UnixListener::bind(path).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     listener
+}
+
+/// Bound even a server that never receives a connection after client preflight fails.
+async fn join_server<T>(
+    mut server: tokio::task::JoinHandle<T>,
+) -> Result<T, tokio::time::error::Elapsed> {
+    match tokio::time::timeout(std::time::Duration::from_secs(2), &mut server).await {
+        Ok(result) => Ok(result.unwrap()),
+        Err(error) => {
+            server.abort();
+            let _ = server.await;
+            Err(error)
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn failed_client_preflight_does_not_leave_the_server_waiting_for_accept() {
+    let dir = project_dir();
+    let socket = dir.path().join("s");
+    let server = answer(bind(&socket), welcome);
+    let stopped = server.abort_handle();
+    fs::set_permissions(
+        dir.path().join(".orchestry"),
+        fs::Permissions::from_mode(0o775),
+    )
+    .unwrap();
+    let error = connect_err(&config(dir.path(), Some(socket))).await;
+    assert!(matches!(error, ClientError::InvalidArguments(_)), "{error}");
+    assert!(join_server(server).await.is_err());
+    assert!(stopped.is_finished());
 }
 
 async fn connect_err(config: &ClientConfig) -> ClientError {
@@ -77,10 +109,7 @@ fn assert_no_daemon(error: &ClientError, root: &Path, detail: &str) {
 
 #[tokio::test]
 async fn no_project_is_not_initialized_exit_3() {
-    let dir = tempfile::Builder::new()
-        .prefix("cc-")
-        .tempdir_in("/tmp")
-        .unwrap();
+    let dir = tempfile::Builder::new().prefix("cc-").tempdir().unwrap();
     let error = connect_err(&config(dir.path(), None)).await;
     assert_eq!(error.exit_code(), 3);
     assert!(error.render(false).contains("Run: orch init"), "{error}");
@@ -176,7 +205,7 @@ async fn garbage_handshake_is_handshake_failed() {
     });
     let error = connect_err(&config(dir.path(), Some(socket))).await;
     assert_no_daemon(&error, dir.path(), "handshake failed");
-    server.await.unwrap();
+    join_server(server).await.unwrap();
 }
 
 /// `connect` succeeded, so a listener is alive: a connection dropped before
@@ -204,7 +233,7 @@ async fn connection_closed_after_accept_before_any_reply_is_busy_not_absence() {
             .await
             .unwrap_or_else(|e| panic!("read_hello_first={read_hello_first}: {e}"));
         assert_eq!(client.welcome.pid, 42);
-        server.await.unwrap();
+        join_server(server).await.unwrap();
     }
 }
 
@@ -259,7 +288,7 @@ async fn version_skew_in_either_direction_names_both_versions_and_the_restart() 
             ..welcome(hello)
         });
         let error = connect_err(&config(dir.path(), Some(socket))).await;
-        server.await.unwrap();
+        join_server(server).await.unwrap();
         assert_eq!(error.exit_code(), 7);
         let root = dir.path().canonicalize().unwrap();
         let detail = format!(
@@ -289,7 +318,7 @@ async fn incompatible_welcome_with_equal_versions_is_handshake_failed() {
         ..welcome(hello)
     });
     let error = connect_err(&config(dir.path(), Some(socket))).await;
-    server.await.unwrap();
+    join_server(server).await.unwrap();
     assert_no_daemon(&error, dir.path(), "handshake failed");
 }
 
@@ -306,7 +335,7 @@ async fn the_hello_carries_the_resolved_identity_and_mode() {
         .with_frontend(CallerKind::Mcp)
         .with_mode(SessionMode::ReadOnly);
     let client = Client::connect(&cfg).await.unwrap();
-    let hello = server.await.unwrap();
+    let hello = join_server(server).await.unwrap();
     let session = hello.hello.session_identity().unwrap();
     assert_eq!(session.caller.kind, CallerKind::Mcp);
     assert_eq!(

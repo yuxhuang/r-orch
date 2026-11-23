@@ -6,6 +6,7 @@ mod support;
 use orch_daemon::{DaemonError, testing::DaemonHarness};
 use orch_infra::process::gate::{SpawnObservation, SpawnObserver, SpawnSite, SpawnStage};
 use serde_json::json;
+use std::os::unix::fs::DirBuilderExt;
 use std::sync::{Arc, Condvar, Mutex};
 use support::{DEADLINE, Raw};
 use tokio::sync::Notify;
@@ -50,7 +51,10 @@ async fn incomplete_stop_retains_ownership_until_detached_spawn_work_finishes() 
     // successor can use the same directory after the first drain completes.
     let project = tempfile::tempdir().unwrap();
     let root = project.path().canonicalize().unwrap();
-    std::fs::create_dir(root.join(".orchestry")).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.join(".orchestry"))
+        .unwrap();
     let daemon = DaemonHarness::builder()
         .maintenance_timer(false)
         .start_in(&root)

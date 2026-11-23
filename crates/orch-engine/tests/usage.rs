@@ -308,6 +308,54 @@ async fn a_run_that_fails_after_reporting_usage_keeps_it_including_zero() {
 }
 
 #[tokio::test]
+async fn codex_native_counters_reach_the_observer_without_double_counting() {
+    let report = r#"{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":20,"reasoning_output_tokens":7,"total_tokens":120}}"#;
+    let (rig, recorder) = run_scripted("codex", &[report, report], 0, TaskStatus::Done).await;
+    let (run_id, usage) = recorder.only();
+    assert_eq!(
+        counters(&usage),
+        [Some(100), Some(20), Some(7), Some(60), None]
+    );
+    // The legacy record still uses its existing extractor: the native detail
+    // fields do not add a second copy of tokens already in input and output.
+    assert_eq!(
+        rig.runs.peek(&run_id).expect("run").tokens,
+        Some(TokenUsage {
+            input: 100,
+            output: 20,
+            reasoning: 0,
+            cache_read: 0,
+            cache_write: 0,
+            total: 120
+        })
+    );
+}
+
+#[tokio::test]
+async fn codex_native_zero_and_absence_reach_the_observer_on_success_and_failure() {
+    for (kind, code, status) in [
+        ("turn.completed", 0, TaskStatus::Done),
+        ("turn.failed", 1, TaskStatus::Failed),
+    ] {
+        for (fields, expected) in [
+            (
+                r#""cached_input_tokens":0,"reasoning_output_tokens":0"#,
+                [None, None, Some(0), Some(0), None],
+            ),
+            ("", [None; 5]),
+        ] {
+            let report = format!(
+                r#"{{"type":"{kind}","usage":{{{fields}}},"error":{{"message":"synthetic failure"}}}}"#
+            );
+            let (rig, recorder) = run_scripted("codex", &[&report], code, status).await;
+            let (run_id, usage) = recorder.only();
+            assert_eq!(counters(&usage), expected, "{report}");
+            assert_eq!(rig.runs.peek(&run_id).expect("run").tokens, None);
+        }
+    }
+}
+
+#[tokio::test]
 async fn usage_survives_a_nonzero_exit_that_the_done_event_forgives() {
     // The adapter treats a `result` as completion whatever the exit code says,
     // so this run succeeds; the counts must be the same either way.
@@ -384,4 +432,25 @@ async fn without_an_observer_a_run_is_recorded_exactly_as_before() {
     let run = rig.runs.snapshot().pop().expect("a run");
     assert_eq!(run.status, RunStatus::Succeeded);
     assert_eq!(run.tokens.expect("tokens").input, 200);
+}
+
+#[tokio::test]
+async fn pi_wrapper_usage_reaches_the_observer_before_an_interrupted_exit() {
+    // Top-level usage is the existing observer's Pi carrier. Native nested
+    // message usage is retained by the adapter; its observation belongs to T20.
+    let (rig, recorder) = run_scripted(
+        "pi",
+        &[
+            r#"{"type":"message_end","model":"synthetic-pi-model","usage":{"input":17,"output":0,"cacheRead":4}}"#,
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"unfinished"}}"#,
+        ],
+        1,
+        TaskStatus::Failed,
+    ).await;
+    let (run_id, usage) = recorder.only();
+    let run = rig.runs.peek(&run_id).expect("run");
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.tokens, None, "metadata does not invent legacy tokens");
+    assert_eq!(counters(&usage), [Some(17), Some(0), None, Some(4), None]);
+    assert_eq!(usage.model.as_deref(), Some("synthetic-pi-model"));
 }
