@@ -433,3 +433,24 @@ async fn without_an_observer_a_run_is_recorded_exactly_as_before() {
     assert_eq!(run.status, RunStatus::Succeeded);
     assert_eq!(run.tokens.expect("tokens").input, 200);
 }
+
+#[tokio::test]
+async fn pi_wrapper_usage_reaches_the_observer_before_an_interrupted_exit() {
+    // Top-level usage is the existing observer's Pi carrier. Native nested
+    // message usage is retained by the adapter; its observation belongs to T20.
+    let (rig, recorder) = run_scripted(
+        "pi",
+        &[
+            r#"{"type":"message_end","model":"synthetic-pi-model","usage":{"input":17,"output":0,"cacheRead":4}}"#,
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"unfinished"}}"#,
+        ],
+        1,
+        TaskStatus::Failed,
+    ).await;
+    let (run_id, usage) = recorder.only();
+    let run = rig.runs.peek(&run_id).expect("run");
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.tokens, None, "metadata does not invent legacy tokens");
+    assert_eq!(counters(&usage), [Some(17), Some(0), None, Some(4), None]);
+    assert_eq!(usage.model.as_deref(), Some("synthetic-pi-model"));
+}
