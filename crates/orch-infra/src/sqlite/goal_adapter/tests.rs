@@ -3,6 +3,7 @@ use crate::sqlite::{ConnectionRole, Synchronous, Writer, migrations, open_connec
 use crate::storage::v2::FileStorage;
 use orch_core::store::{Caller, EntityKind, Principal, StorageExt, StoreError};
 use orch_domain::GoalStatus;
+use rusqlite::OptionalExtension;
 use std::time::Duration;
 
 struct Close<'a>(&'a WriterHandle);
@@ -349,7 +350,7 @@ fn invalid_timestamp_and_exhausted_or_unseeded_counters_consume_nothing() {
             .unwrap()
             .wait()
             .unwrap_err();
-        assert!(matches!(error, SqliteError::Sql(_)));
+        assert!(matches!(error, SqliteError::CounterMissing { .. }));
         handle
             .submit(Lane::Entities, None, |tx| {
                 tx.execute(
@@ -553,4 +554,142 @@ fn unrepresentable_stored_timestamp_does_not_partially_move_a_goal() {
             .unwrap();
         handle.close();
     });
+}
+
+#[test]
+fn timestamp_endpoints_match_core_and_round_trip_both_fields() {
+    assert_eq!(jiff::Timestamp::MAX.as_millisecond(), 253_402_207_200_999);
+    for (ms, text) in [
+        (-62_167_219_200_000, "0000-01-01T00:00:00.000Z"),
+        (-1, "1969-12-31T23:59:59.999Z"),
+        (0, "1970-01-01T00:00:00.000Z"),
+        (253_402_207_200_999, "9999-12-30T22:00:00.999Z"),
+    ] {
+        assert_eq!(
+            timestamp(ms).unwrap_or_else(|e| panic!("ms={ms}: {e}")),
+            text
+        );
+        assert_eq!(
+            timestamp(ms).unwrap(),
+            orch_core::clock::iso_from_epoch_ms(ms)
+        );
+        assert_eq!(orch_core::clock::epoch_ms_from_iso(text), Some(ms));
+        assert_eq!(milliseconds(text).unwrap(), ms);
+        let payload = Goal {
+            created_at: text.into(),
+            updated_at: Some(text.into()),
+            ..goal("endpoint")
+        };
+        let row = encode(&payload).unwrap();
+        assert_eq!((row.created_at, row.updated_at), (ms, Some(ms)));
+        assert_eq!(decode(row).unwrap().entity, Entity::Goal(Box::new(payload)));
+    }
+}
+
+#[test]
+fn timestamps_outside_common_canonical_range_are_unrepresentable() {
+    for ms in [i64::MIN, -62_167_219_200_001, 253_402_207_201_000, i64::MAX] {
+        assert!(matches!(
+            timestamp(ms),
+            Err(SqliteError::Unrepresentable(_))
+        ));
+        let mut row = encode(&goal("created")).unwrap();
+        row.created_at = ms;
+        assert!(matches!(decode(row), Err(SqliteError::Unrepresentable(_))));
+        let mut row = encode(&goal("updated")).unwrap();
+        row.updated_at = Some(ms);
+        assert!(matches!(decode(row), Err(SqliteError::Unrepresentable(_))));
+    }
+    // Jiff accepts this expanded negative year; core writes it as -001.
+    for text in [
+        "-000001-12-31T23:59:59.999Z",
+        "-001-12-31T23:59:59.999Z",
+        "+010000-01-01T00:00:00.000Z",
+    ] {
+        for updated in [false, true] {
+            let mut payload = goal("outside");
+            if updated {
+                payload.updated_at = Some(text.into());
+            } else {
+                payload.created_at = text.into();
+            }
+            assert!(
+                matches!(encode(&payload), Err(SqliteError::Unrepresentable(_))),
+                "{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn damaged_position_counters_are_typed_and_refused_without_mutation() {
+    for damaged in [None, Some(-1_i64), Some(0), Some(1)] {
+        let (_temp, data) = test_data();
+        setup(&data);
+        let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+        let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+        std::thread::scope(|scope| {
+            let _close = Close(&handle);
+            scope.spawn(move || writer.run());
+            let adapter = GoalAdapter::new(&handle, &pool);
+            adapter
+                .write("p".into(), deadline(), |u| {
+                    u.create(goal("first"))?;
+                    u.create(goal("second"))?;
+                    Ok(())
+                })
+                .unwrap()
+                .wait()
+                .unwrap();
+            handle.submit(Lane::Entities, None, move |tx| {
+                tx.execute("DELETE FROM counters WHERE project_id='p' AND name='position:goal'", [])?;
+                if let Some(value) = damaged {
+                    tx.execute("INSERT INTO counters(project_id,name,value) VALUES('p','position:goal',?1)", [value])?;
+                }
+                Ok(())
+            }).unwrap().wait().unwrap();
+            // Catch both errors inside a successful writer transaction: neither
+            // operation may alter the row, revision or durable high-water mark.
+            adapter.write("p".into(), deadline(), move |u| {
+                let before = u.get("first")?.unwrap();
+                for result in [u.create(goal("refused")), u.move_to_end("first", before.revision)] {
+                    let error = result.unwrap_err();
+                    match damaged {
+                        None => assert!(matches!(error, SqliteError::CounterMissing { project, name: "position:goal" } if project == "p")),
+                        Some(value) if value < 0 => assert!(matches!(error, SqliteError::CounterNegative { project, name: "position:goal", value: -1 } if project == "p")),
+                        Some(value) => assert!(matches!(error, SqliteError::CounterBehind { project, name: "position:goal", value: actual } if project == "p" && actual == value)),
+                    }
+                }
+                assert_eq!(u.get("first")?.unwrap(), before);
+                assert!(u.get("refused")?.is_none());
+                let actual: Option<i64> = u.read.tx.query_row(
+                    "SELECT value FROM counters WHERE project_id='p' AND name='position:goal'", [], |r| r.get(0)
+                ).optional()?;
+                assert_eq!(actual, damaged);
+                Ok(())
+            }).unwrap().wait().unwrap();
+            assert_eq!(
+                adapter
+                    .write("q".into(), deadline(), |u| u.create(goal("independent")))
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .position,
+                1
+            );
+            handle.submit(Lane::Entities, None, |tx| {
+                tx.execute("INSERT INTO counters(project_id,name,value) VALUES('p','position:goal',2) ON CONFLICT(project_id,name) DO UPDATE SET value=2", [])?;
+                Ok(())
+            }).unwrap().wait().unwrap();
+            assert_eq!(
+                adapter
+                    .write("p".into(), deadline(), |u| u.create(goal("after")))
+                    .unwrap()
+                    .wait()
+                    .unwrap()
+                    .position,
+                3
+            );
+        });
+    }
 }

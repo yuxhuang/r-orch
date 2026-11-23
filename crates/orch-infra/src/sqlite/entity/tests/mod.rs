@@ -452,9 +452,12 @@ fn invalid_stored_metadata_is_an_error_never_a_missing_row() {
         .unwrap();
     assert!(matches!(get_goal(&tx, "p", "g"), Err(EntityError::Sql(_))));
     tx.execute_batch("UPDATE counters SET value=-1").unwrap();
+    let EntityError::Counter(error) = create_goal(&tx, "p", &row("new")).unwrap_err() else {
+        panic!("negative counter must retain its typed classification");
+    };
     assert!(matches!(
-        create_goal(&tx, "p", &row("new")),
-        Err(EntityError::Sql(_))
+        *error,
+        super::super::SqliteError::CounterNegative { value: -1, .. }
     ));
 }
 
