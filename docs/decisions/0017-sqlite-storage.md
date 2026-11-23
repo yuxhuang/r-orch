@@ -436,7 +436,8 @@ across a crash, lists that do not load everything, and a retried request that ru
     and merged with one that is already there, and it is removed only when its gap rows can no longer be
     lost with the power. And the classes cover every connection: corruption
     seen by a read, a checkpoint, a query or a backup fails the writer, other failures there are counted
-    and do not, and checkpoints that keep failing or a backlog that stays are reported (R140).
+    and do not, and checkpoints that keep failing or a backlog that stays are reported (R140). Proven logical
+    corruption of a live task (decision 26) is in the same fatal class.
 
 24. **`orch db query` reads fixed views under an authorizer; a backup stays in the data directory.** The
     command has its own read-only connection, an authorizer that denies by default, and run-time limits; it
@@ -466,9 +467,20 @@ across a crash, lists that do not load everything, and a retried request that ru
     still, named by a tagged JSON object that no text can equal and by ordered rows; a detail that is itself over
     65,536 bytes is stored the same way. A write publishes its objects first and installs every row in one
     savepoint, so a failure, caught or not, leaves the old row and its references readable. A read in the
-    selecting snapshot answers the typed stored-data error of R140 for an unknown format, a missing or
-    malformed detail, a projection that disagrees or a broken reference, and never rebuilds a task from
-    unordered sets. Timestamps stay the canonical millisecond strings that the goal adapter accepts. The migration
+    selecting snapshot answers `SqliteError::TaskCorrupt { task, check, locator }`, a variant that this decision
+    adds, for an unknown format, a missing or malformed detail, a projection that disagrees or a broken
+    reference, and never rebuilds a task from unordered sets. The error holds the task id, a bounded check code
+    and a bounded locator, and no value, key, path or backend message, and it is classified before any public
+    conversion. R140 had no stored-data error; the lead's decision of the same day extends its failure policy to
+    this one: proven corruption of live task data is fatal, because reopening a healthy connection reads the
+    same damaged task and cannot repair it. A live read, a page, a snapshot, a unit of work or a verification,
+    query, backup or export that validates tasks returns the failure, discards partial results and trips the
+    shared writer failure state until a restart; an absent task, a caller's or revision refusal, an admission
+    timeout and a transient read or object-access failure stay ordinary, and corruption found only in an external
+    import, backup or export file refuses that operation and leaves the writer usable. On the writer a fatal
+    cause is latched even when the callback catches it, and aborts the transaction; a failed rollback is
+    classified in both causes, a fatal one on either side wins, any failed savepoint rollback forbids the enclosing
+    commit, and an ordinary failure rolled back to its savepoint may be caught. Timestamps stay the canonical millisecond strings that the goal adapter accepts. The migration
     backfills nothing and refuses a populated predecessor atomically (the spec's "Task format v1 (SQLite)"). The
     optional `Task` fields, `proof` and `workspace_mode` among them, are absent for `None`; a present `proof` always
     carries `files_changed`. A write follows three rules of the lead's decision of the same day: `create` derives the
@@ -663,6 +675,10 @@ across a crash, lists that do not load everything, and a retried request that ru
   value and would change what a task says. Rejected: the conformance suite compares equal values.
 - **A prefix or a marker string in the native text columns for a referenced text.** A marker aliases user text,
   and a prefix keeps bytes that R97 moved out. Rejected for an explicit tag in the detail.
+- **Return `TaskCorrupt` to the caller as an ordinary error and reopen the connection.** It is the class of a failed
+  pooled read. Rejected: reopening a healthy connection reproduces the same damaged task and cannot repair it, so the
+  writer would go on mutating, granting claims and checkpointing beside data that it knows is damaged. A transient
+  failure, which a reopen can cure, is kept ordinary.
 
 ## Consequences
 
@@ -723,3 +739,8 @@ across a crash, lists that do not load everything, and a retried request that ru
   take. Everything that names an object (the sweep, `orch db verify`, a backup, an export and an import) reads
   `task_blob_refs` as well as `task_attachments` and `runs`, and owes the reconstruction of a split text
   (the plan's "T10 task mapping (format v1)").
+- One damaged task stops the project's writes. A read that proves it corrupt fails the writer, and a restart that
+  reads the same task fails it again until the task's data is repaired or the database is restored from a backup. The
+  failure is reported from memory by `orch status` and `orch doctor` with the task, the check and the locator, and it is
+  not an attention item. The shared failure state that does this is part of what remains of T10 and is held with
+  issue 127; the writer on `main` does not have it.
