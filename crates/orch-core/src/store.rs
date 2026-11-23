@@ -4,9 +4,9 @@
 //! Authorization of operations belongs to the dispatcher, not to this port.
 //! Writes run a synchronous callback on the backend's writer, so no transaction
 //! can escape or wait for an external side effect. A callback error aborts it.
-//! Events, leases, intents and retries share the entity transaction and
-//! its project boundary. The remaining operational families arrive in later
-//! slices.
+//! Events, leases, intents, retries and request keys share the entity
+//! transaction and its project boundary. The remaining operational families
+//! arrive in later slices.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,7 @@ pub mod fake;
 pub mod intents;
 pub mod leases;
 pub mod page;
+pub mod request_keys;
 pub mod retries;
 
 pub use entity::{ConfigEntry, Entity, EntityKind, Record, Revision, TemplateEntry};
@@ -85,6 +86,8 @@ pub enum StoreError {
     InvalidIntent(String),
     #[error("invalid retry: {0}")]
     InvalidRetry(String),
+    #[error("invalid request key: {0}")]
+    InvalidRequestKey(String),
     #[error("storage counter exhausted")]
     CounterExhausted,
     #[error(transparent)]
@@ -108,7 +111,12 @@ pub trait ReadSnapshot:
 /// Errors leave that operation unchanged. Returning an error from `work`
 /// discards every operation, including positions and revision increments.
 pub trait UnitOfWork:
-    events::EventWrite + intents::IntentWrite + leases::LeaseWrite + retries::RetryWrite + Send
+    events::EventWrite
+    + intents::IntentWrite
+    + leases::LeaseWrite
+    + request_keys::RequestKeyWrite
+    + retries::RetryWrite
+    + Send
 {
     fn caller(&self) -> &Caller;
     fn get(&self, kind: EntityKind, id: &str) -> Result<Option<Record>>;

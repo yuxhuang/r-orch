@@ -6,6 +6,7 @@ use std::path::Path;
 use orch_core::store::events::{EventGap, SequencedEvent};
 use orch_core::store::intents::{DONE_RETENTION_MS, FinishOutcome, IntentPayload};
 use orch_core::store::leases::{ClaimOutcome, Lease, NewLease};
+use orch_core::store::request_keys::{KEY_TTL_MS, KeyCheck, RequestScope};
 use orch_core::store::retries::Retry;
 use orch_core::store::*;
 use orch_core::test_support::{assert_hermetic, make_agent, make_task};
@@ -701,6 +702,194 @@ async fn a_hand_edited_intent_outside_the_contract_is_refused_on_read() {
         },
     ] {
         assert!(matches!(edited_intents(edit).await, StoreError::Backend(_)));
+    }
+}
+
+const REQ: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+fn key_scope(n: &str) -> RequestScope {
+    RequestScope::of(&owner("p"), &format!("{n:_<16}")).unwrap()
+}
+
+async fn store_key(s: &FileStorage, n: &str, result: &str, now: i64) {
+    let scope = key_scope(n);
+    let result = result.to_string();
+    s.transaction(owner("p"), Lane::Entities, move |u| {
+        u.store_request_key(&scope, "task.update", REQ, &result, now)
+    })
+    .await
+    .unwrap();
+}
+
+async fn check_key(s: &FileStorage, n: &str, now: i64) -> KeyCheck {
+    let scope = key_scope(n);
+    s.transaction(owner("p"), Lane::Entities, move |u| {
+        u.check_request_key(&scope, "task.update", REQ, now)
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn request_keys_and_their_results_survive_a_new_instance() {
+    let root = root();
+    let first = FileStorage::new(root.path());
+    store_key(&first, "kept", "first", 1_000).await;
+    store_key(&first, "big", &"x".repeat(65_537), 1_000).await;
+    drop(first);
+
+    let second = FileStorage::new(root.path());
+    assert_eq!(
+        check_key(&second, "kept", 1_001).await,
+        KeyCheck::Replay("first".into())
+    );
+    assert_eq!(
+        check_key(&second, "big", 1_001).await,
+        KeyCheck::ReplayWithoutResult
+    );
+    // The expiry is the stored time plus the hour, not a time of this instance.
+    assert_eq!(
+        check_key(&second, "kept", 1_000 + KEY_TTL_MS - 1).await,
+        KeyCheck::Replay("first".into())
+    );
+    assert_eq!(
+        check_key(&second, "kept", 1_000 + KEY_TTL_MS).await,
+        KeyCheck::New
+    );
+    let deleted = second
+        .transaction(owner("p"), Lane::Maintenance, |u| {
+            u.delete_expired_request_keys(1_000 + KEY_TTL_MS, 10)
+        })
+        .await
+        .unwrap();
+    assert_eq!(deleted, 2);
+    drop(second);
+    let third = FileStorage::new(root.path());
+    assert_eq!(check_key(&third, "kept", 1_001).await, KeyCheck::New);
+}
+
+#[tokio::test]
+async fn a_document_from_before_request_keys_reads_as_an_empty_set() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    create(&s, "p", "t1").await;
+    let [document] = documents(root.path()).try_into().unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
+    assert!(
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("request_keys")
+            .is_some()
+    );
+    std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
+
+    let reopened = FileStorage::new(root.path());
+    assert_eq!(check_key(&reopened, "any", 1).await, KeyCheck::New);
+    assert!(get(&reopened, "p", "t1").await.is_some());
+    store_key(&reopened, "any", "r", 1).await;
+    assert_eq!(
+        check_key(&reopened, "any", 2).await,
+        KeyCheck::Replay("r".into())
+    );
+}
+
+#[tokio::test]
+async fn request_key_operations_that_change_nothing_do_not_rewrite_the_document() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    store_key(&s, "live", "first", 1_000).await;
+    let [document] = documents(root.path()).try_into().unwrap();
+    // A commit replaces the file, so a new inode shows a rewrite.
+    let inode =
+        |path: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(path).unwrap());
+    let before = (inode(&document), std::fs::read(&document).unwrap());
+    let live = key_scope("live");
+    s.write(
+        owner("p"),
+        Lane::Entities,
+        Box::new(move |u| {
+            // Lookups, an expiry call with nothing due, and refusals that the
+            // callback catches change no row.
+            assert_eq!(
+                u.check_request_key(&live, "task.update", REQ, 2_000)?,
+                KeyCheck::Replay("first".into())
+            );
+            assert_eq!(u.delete_expired_request_keys(2_000, 10)?, 0);
+            u.store_request_key(&live, "task.update", REQ, "again", 2_000)
+                .unwrap_err();
+            u.store_request_key(&live, "bad op", REQ, "x", 2_000)
+                .unwrap_err();
+            u.delete_expired_request_keys(2_000, 0).unwrap_err();
+            Ok(())
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        (inode(&document), std::fs::read(&document).unwrap()),
+        before
+    );
+}
+
+#[tokio::test]
+async fn a_failed_unit_of_work_keeps_no_request_key_on_disk() {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    create(&s, "p", "t1").await;
+    let [document] = documents(root.path()).try_into().unwrap();
+    let before = std::fs::read(&document).unwrap();
+    let scope = key_scope("failed");
+    let failed = s
+        .transaction(owner("p"), Lane::Entities, move |u| {
+            u.store_request_key(&scope, "task.update", REQ, "lost", 1)?;
+            Err::<(), _>(StoreError::CounterExhausted)
+        })
+        .await;
+    assert!(matches!(failed, Err(StoreError::CounterExhausted)));
+    assert_eq!(std::fs::read(&document).unwrap(), before);
+    assert_eq!(check_key(&s, "failed", 2).await, KeyCheck::New);
+}
+
+async fn edited_request_keys(mutate: impl FnOnce(&mut serde_json::Value)) -> StoreError {
+    let root = root();
+    let s = FileStorage::new(root.path());
+    store_key(&s, "first", "r", 1).await;
+    store_key(&s, "second", "r", 1).await;
+    let [document] = documents(root.path()).try_into().unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&document).unwrap()).unwrap();
+    mutate(&mut value["request_keys"]);
+    std::fs::write(&document, serde_json::to_vec(&value).unwrap()).unwrap();
+    FileStorage::new(root.path())
+        .read(owner("p"))
+        .await
+        .err()
+        .expect("a document that is not the contract is refused")
+}
+
+#[tokio::test]
+async fn a_hand_edited_request_key_outside_the_contract_is_refused_on_read() {
+    for edit in [
+        // A key outside the shape, a hash that is not a hash, an operation with a path in it.
+        (|v: &mut serde_json::Value| v["rows"][0]["key"] = "short".into())
+            as fn(&mut serde_json::Value),
+        |v| v["rows"][0]["req_sha256"] = "ABC".into(),
+        |v| v["rows"][0]["op"] = "../escape".into(),
+        // A result over the bound, an expiry that is not an hour on, a repeated row.
+        |v| v["rows"][0]["result"] = "x".repeat(65_537).into(),
+        |v| v["rows"][0]["expires_at"] = 5.into(),
+        |v| v["rows"][1] = v["rows"][0].clone(),
+        |v| v["rows"].as_array_mut().unwrap().reverse(),
+        // A run without an epoch, and a field nobody defined.
+        |v| v["rows"][0]["run"] = "r1".into(),
+        |v| v["rows"][0]["pid"] = 42.into(),
+    ] {
+        assert!(matches!(
+            edited_request_keys(edit).await,
+            StoreError::Backend(_)
+        ));
     }
 }
 

@@ -40,6 +40,11 @@ mod intents_v2;
 intents_v2::intent_suite!(memory_intents_v2, crate::v2_operations::memory_backend);
 intents_v2::intent_suite!(file_intents_v2, crate::v2_file::operations_backend);
 
+#[path = "storage_contract/request_keys_v2.rs"]
+mod request_keys_v2;
+request_keys_v2::request_key_suite!(memory_request_keys_v2, crate::v2_operations::memory_backend);
+request_keys_v2::request_key_suite!(file_request_keys_v2, crate::v2_file::operations_backend);
+
 #[path = "storage_contract/retries_v2.rs"]
 mod retries_v2;
 retries_v2::retry_suite!(memory_retries_v2, crate::v2_operations::memory_backend);
