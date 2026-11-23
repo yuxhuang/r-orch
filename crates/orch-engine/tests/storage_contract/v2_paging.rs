@@ -2,6 +2,28 @@
 
 use super::*;
 
+async fn assert_size_one_pages(s: &dyn Storage, filter: &Filter, sort: Sort, expected: &[&str]) {
+    let mut cursor = None;
+    for (index, id) in expected.iter().enumerate() {
+        let page = list(
+            s,
+            owner("p"),
+            filter,
+            &PageRequest {
+                limit: 1,
+                cursor,
+                sort,
+                with_count: true,
+            },
+        )
+        .await;
+        assert_eq!(ids(&page), [*id], "page {index}, {filter:?}, {sort:?}");
+        assert_eq!(page.total, Some(expected.len() as u64));
+        assert_eq!(page.next_cursor.is_some(), index + 1 < expected.len());
+        cursor = page.next_cursor;
+    }
+}
+
 pub async fn page_bounds_defaults_and_optional_count(b: Backend) {
     let s = b.storage.as_ref();
     s.write(
@@ -373,11 +395,18 @@ pub async fn declared_secondary_sorts_use_values_then_tie_breakers(b: Backend) {
         ids(&list(s, owner("p"), &Filter::Teams, &PageRequest::default()).await),
         ["a", "b", "z"]
     );
+    // Insert absence before present-empty and reverse IDs within timestamp ties:
+    // presence precedes position, while position precedes ID within a tie.
     for (id, updated, status) in [
         ("missing", None, GoalStatus::Active),
-        ("new", Some("z"), GoalStatus::Active),
+        ("z-empty", Some(""), GoalStatus::Active),
+        ("a-empty", Some(""), GoalStatus::Active),
         ("old", Some("a"), GoalStatus::Active),
-        ("paused", Some("z"), GoalStatus::Paused),
+        ("z-new", Some("z"), GoalStatus::Active),
+        ("a-new", Some("z"), GoalStatus::Active),
+        ("paused", Some("zz"), GoalStatus::Paused),
+        ("achieved", Some("zzz"), GoalStatus::Achieved),
+        ("abandoned", Some("zzzz"), GoalStatus::Abandoned),
     ] {
         create(
             s,
@@ -390,49 +419,81 @@ pub async fn declared_secondary_sorts_use_values_then_tie_breakers(b: Backend) {
         )
         .await;
     }
-    assert_eq!(
-        ids(&list(
-            s,
-            owner("p"),
-            &Filter::Goals { status: None },
-            &PageRequest::default()
-        )
-        .await),
-        ["new", "old", "missing", "paused"]
-    );
-    assert_eq!(
-        ids(&list(
-            s,
-            owner("p"),
-            &Filter::Goals {
-                status: Some(GoalStatus::Paused)
+    for (filter, sort, expected) in [
+        (
+            Filter::Goals { status: None },
+            Sort::Default,
+            vec![
+                "z-new",
+                "a-new",
+                "old",
+                "z-empty",
+                "a-empty",
+                "missing",
+                "paused",
+                "achieved",
+                "abandoned",
+            ],
+        ),
+        (
+            Filter::Goals {
+                status: Some(GoalStatus::Active),
             },
-            &PageRequest::default()
-        )
-        .await),
-        ["paused"]
-    );
-    assert_eq!(
-        ids(&list(
-            s,
-            owner("p"),
-            &Filter::Goals { status: None },
-            &PageRequest {
-                sort: Sort::CreatedAt,
-                ..Default::default()
-            }
-        )
-        .await),
-        ["missing", "new", "old", "paused"]
-    );
+            Sort::Default,
+            vec!["z-new", "a-new", "old", "z-empty", "a-empty", "missing"],
+        ),
+        (
+            Filter::Goals {
+                status: Some(GoalStatus::Paused),
+            },
+            Sort::Default,
+            vec!["paused"],
+        ),
+        (
+            Filter::Goals { status: None },
+            Sort::CreatedAt,
+            vec![
+                "missing",
+                "z-empty",
+                "a-empty",
+                "old",
+                "z-new",
+                "a-new",
+                "paused",
+                "achieved",
+                "abandoned",
+            ],
+        ),
+        (
+            Filter::Goals { status: None },
+            Sort::Id,
+            vec![
+                "a-empty",
+                "a-new",
+                "abandoned",
+                "achieved",
+                "missing",
+                "old",
+                "paused",
+                "z-empty",
+                "z-new",
+            ],
+        ),
+    ] {
+        assert_size_one_pages(s, &filter, sort, &expected).await;
+    }
 }
 
 pub async fn message_and_run_filters_stay_within_their_family(b: Backend) {
     let s = b.storage.as_ref();
-    for (id, task_id, agent_id, time) in [
-        ("z", "t1", "a1", "a"),
-        ("b", "t1", "a2", "b"),
-        ("a", "t2", "a1", "b"),
+    // Numeric attempts disagree with timestamp, insertion and ID orders. The
+    // attempt tie must use ID, even when both position and timestamp oppose it.
+    for (id, task_id, agent_id, attempt, time) in [
+        ("z-ten", "t1", "a1", 10, "b"),
+        ("a-two", "t1", "a1", 2, "z"),
+        ("b-ten", "t1", "a1", 10, "a"),
+        ("other-agent", "t1", "a2", 20, "c"),
+        ("other-task", "t2", "a1", 30, "d"),
     ] {
         create(
             s,
@@ -440,27 +501,62 @@ pub async fn message_and_run_filters_stay_within_their_family(b: Backend) {
             Entity::Run(Box::new(Run {
                 task_id: task_id.into(),
                 agent_id: agent_id.into(),
+                attempt,
                 ..run(id, time)
             })),
         )
         .await;
     }
-    let all = Filter::Runs {
-        task: None,
-        agent: None,
-    };
-    assert_eq!(
-        ids(&list(s, owner("p"), &all, &PageRequest::default()).await),
-        ["a", "b", "z"]
-    );
-    let selected = Filter::Runs {
-        task: Some("t1".into()),
-        agent: Some("a1".into()),
-    };
-    assert_eq!(
-        ids(&list(s, owner("p"), &selected, &PageRequest::default()).await),
-        ["z"]
-    );
+    for (task, agent, sort, expected) in [
+        (
+            Some("t1"),
+            Some("a1"),
+            Sort::Default,
+            vec!["b-ten", "z-ten", "a-two"],
+        ),
+        (
+            Some("t1"),
+            None,
+            Sort::Default,
+            vec!["other-agent", "b-ten", "z-ten", "a-two"],
+        ),
+        (
+            Some("t1"),
+            Some("a1"),
+            Sort::Id,
+            vec!["a-two", "b-ten", "z-ten"],
+        ),
+        (
+            Some("t1"),
+            None,
+            Sort::Id,
+            vec!["a-two", "b-ten", "other-agent", "z-ten"],
+        ),
+        (
+            None,
+            Some("a1"),
+            Sort::Default,
+            vec!["a-two", "other-task", "z-ten", "b-ten"],
+        ),
+        (
+            None,
+            None,
+            Sort::Default,
+            vec!["a-two", "other-task", "other-agent", "z-ten", "b-ten"],
+        ),
+        (
+            None,
+            None,
+            Sort::Id,
+            vec!["a-two", "b-ten", "other-agent", "other-task", "z-ten"],
+        ),
+    ] {
+        let filter = Filter::Runs {
+            task: task.map(str::to_owned),
+            agent: agent.map(str::to_owned),
+        };
+        assert_size_one_pages(s, &filter, sort, &expected).await;
+    }
     for (id, recipient, time) in [
         ("z", Some("a"), "b"),
         ("a", None, "a"),
