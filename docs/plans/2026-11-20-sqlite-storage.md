@@ -626,6 +626,45 @@ Remaining consumer obligations, before activation:
 
 These consumer obligations are pending, not delivered by the goal boundary slice.
 
+### T10 task mapping (format v1)
+
+The inactive SQLite adapter holds goals, leases, run events, request keys and task paging. A task needs the format of the
+spec's "Task format v1 (SQLite)" before its mapping is built: the first migration has no place for a whole `Task`, and
+its R97 text rule has no discriminator for a referenced task text. The lead chose a numbered migration that adds
+`task_details` and `task_blob_refs` over a versioned envelope in a reserved column (ADR 0017 decision 26). This
+section is the plan for that slice and for what other tasks owe it. It changes no row of the task table above.
+
+**Order.** This documentation lands, reviewed, before product code: the spec, this plan and ADR 0017 are the only files
+of its PR. The mapping slice then branches from `main` with the documentation in its history and builds the
+code and tests named in R141. It stays one bounded PR; if it would pass about 3,000 changed lines the split is
+(a) the codec, the migration and inline text, then (b) the references and the physical R97 tests, each leaving `main`
+working. The public cursor wiring and the other entity families keep their own slices, and the mapping hands the
+hydration seam to the slice that wires the public task page, whose tests check the real boundary.
+
+**Obligations, by task.**
+
+| Task | Owes | Check |
+|---|---|---|
+| T10, task mapping | Create, update, delete and move for `Task`; the migration (next free number); hydration in the selecting snapshot or unit of work; the physical R97 mapping; the shared entity suites registered on SQLite for tasks | R141's named tests; `cargo test -p orch-infra --test sqlite_task_format --test sqlite_migrations`; the shared suites on the three references and SQLite |
+| T10, retry mapping | Its own mapping of `retry_queue.error` with the same thresholds and split, and none of this format's tables | The issue 109 tests; independent of R141 |
+| T11 | Nothing new: the blob adapter and `BlobReferences::register` are used as they are | `blob_store` unchanged |
+| T12 | Nothing new: a consumer reads a `Task` through the port and never through these tables | the T12 tests |
+| T15 | `blobs.sweep` counts `task_blob_refs.sha256` as a naming row | `maintenance::a_referenced_blob_is_never_deleted`, extended for a task text and a split text |
+| T21 | One codec for every task row; list order, repeats and `Option` presence as the 1.0 document says; the decision and the record for a non-canonical timestamp; text over 64 KiB as references; no path or hash made from an attachment name | an importer test per case, and the R97 importer test the spec still lists as pending |
+| T22 | `orch db verify` runs the format's read checks for every task and finds orphan references and details; the views `diag_task_details` (without `detail`) and `diag_task_blob_refs` | the schema's view-listing test; `db_commands` |
+| T23 | A backup and a restore carry every object a reference row names, in one point; an export carries both tables and the objects; an import reconstructs every text and checks its hash | `db_backup_restore`, `db_export_import`; a restore that finds a missing, short or reordered chunk refuses |
+| T27 | Records the named checks as run, with counts, on Linux, and rejects an empty or ignored selection | the verification table |
+
+**Holds that stay.** The file runtime stays until the switch (T24). Nothing here releases a writer-dependent slice, wires
+the daemon or the public cursor, or consumes an unmerged slice: the #109 retry mapping, the attention migration and the
+public cursor slices are used only after they have merged. The independent code review and, for the
+covered surfaces, the security review, the exact-head hosted Linux check and test with a clean merge state, the
+lead's recommendation and the owner's merge apply to the mapping PR as to every PR.
+
+**Open before code.** The `Principal` to `created_by_kind` mapping on `create`; what a task that leaves `done` does to
+`landing_state`; the attachment path owner's agreement that `delete` removes the task's `task_attachments` rows. All
+three are listed in the spec's section; none changes the format.
+
 ## Status
 
 | Item | State (implemented / verified on <platform> / pending) |
@@ -637,6 +676,7 @@ These consumer obligations are pending, not delivered by the goal boundary slice
 | Linux-only scope (the spec's record K) | recorded on 2026-11-23 by one documentation PR that is pending its review and the owner's merge: the spec, this plan, ADR 0017, the lease prototype's spec, the spec TEMPLATE, ARCHITECTURE §13 and AGENTS.md carry it. Nothing was verified on a platform: no code and no CI changed. The first independent review blocked its first head on three points: the Linux sleep/wake check of R42 (issue 110) was withdrawn with the macOS one, R16, R88 and R136 still named macOS, and the branch conflicted with `main`. The text was corrected for them and re-synchronised with `main` keeping the rows of both sides; the corrected text awaits a second review |
 | T10, internal lease adapter (issue 127 N1 to N4) | The damaged-epoch error, the lane mapping and the optional request deadline are merged (#211, #232) and their tests pass on Linux at `af0d43acd` (38 module tests). The spec's "Lease adapter contracts" records them. Unwired: only the module's tests call the adapter, and the daemon uses files. This documentation is pending its Linux CI, its review and the owner's merge. Pending behind it: T12's start and finish transactions, T13's cancel, pause and permanent-failure transactions, T15's lease expiry, T22's `orch db verify`, the R128 and R140 classification, and the SQLite registration of the shared lease suites. Issue 127 is not closed |
 | T10, internal goal adapter | Goal reads, creates, updates, deletes and explicit moves use the executor. Module tests cover transactions, snapshots, reopen and file-reference behavior for supported inputs. Public conformance still requires timestamp and counter compatibility, imported position high-water marks, and text/blob handling. |
+| T10, task format v1 | defined in the spec, this plan and ADR 0017 decision 26 by one documentation PR; nothing is implemented, built or tested for it. The mapping, its R141 tests and the importer and backup obligations are pending, and no check was run on any platform. |
 | T2 to T27, except T4 and T4b | pending, as this table stood before 2026-11-21; this revision brings no other row up to date |
 
 ## Test plan

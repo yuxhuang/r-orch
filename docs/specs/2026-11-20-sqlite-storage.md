@@ -444,7 +444,7 @@ holds them.
 | R94 | — | X | won't | Evidence, quarantine, uploads, text search, HTTP, TLS, tokens, enrolment, certificates, workers, the hub, landing, proposals, many projects per daemon, removing orch-peer, Postgres, an indexed scheduler, object storage, token budgets, outbound notification and Windows are out of scope (X). |
 | R95 | — | DL | won't | No tag and no version bump: cutting 1.1.0 is the owner's separate decision. |
 | R96 | An agent process shall not run its agent unless the run's pid and start time were committed first: the daemon shall create the process held, commit, then release it, and a held process whose daemon is gone shall exit without running the agent. | review finding (a stop between starting a process and recording it left an untracked agent on a workspace that recovery would hand to a second run) | must | `crates/orch-engine/tests/transactions.rs::a_stop_between_spawn_and_commit_runs_no_agent`, `crates/orch-infra` process test `held_process_exits_when_its_parent_is_gone`; both |
-| R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. | B7; review finding | must | `text_over_64_kib_round_trips_through_the_blob_store` in `storage_conformance` checks whole values on entity references; `storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store` in the `orch-infra` library pins file row hashes and disk bytes, with `inline_threshold_counts_utf8_bytes_and_preserves_empty_values`. SQLite backing assertions: T10; importer backing assertions: T21 (pending, no executable import filter yet); Linux |
+| R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. | B7; review finding | must | `text_over_64_kib_round_trips_through_the_blob_store` in `storage_conformance` checks whole values on entity references; `storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store` in the `orch-infra` library pins file row hashes and disk bytes, with `inline_threshold_counts_utf8_bytes_and_preserves_empty_values`. SQLite backing assertions for tasks: R141's `sqlite_task_format` tests (T10; the other text-bearing rows keep their own mappings and are not covered by them); importer backing assertions: T21 (pending, no executable import filter yet); Linux |
 | R98 | Reads shall be served by a pool of `storage.read_connections` connections (default 4); a read that finds none free shall wait up to the admission deadline and then fail with `overloaded`, never open another connection. | B6; review finding | should | `sqlite_writer::reads_wait_for_a_free_connection_then_fail_overloaded`; both |
 | R99 | `orch import` shall account for every entry of the source `.orchestry/` and of each directory that "Import rules" has it list: each is imported, or left in place as "Import rules" lists, or named by the dry run and by the import's report as not imported; a directory it does not enter is one entry. Project prompt template files shall become `templates` rows, byte for byte. | N, S2, B2 | must | `import::every_source_path_is_accounted_for` (a corpus with an unknown file and an unknown directory), `::templates_are_imported_byte_for_byte`; both |
 | R100 | `orch db restore` shall refuse, changing nothing, while a process that the replaced state or the backup records as a run's is alive (pid and start time), naming each run and pid and which of the two records it. With `--stop-runs` it shall first stop the process groups that the replaced state records, which this daemon wrote in this data directory. It shall never signal a process because a backup records it: such a process keeps the restore refused until it has ended or the owner names its run with `--assume-stopped <run id>`. No waiting period shall stand in for either: a run's process in 1.1 keeps no deadline of its own (R42), so the passing of time never shows that an earlier holder has stopped. After a restore no lease of the backup shall be active: each is ended and its run closed as R41 closes a run whose process is gone, and the spool of the replaced state (R129) is set aside with it. | G9; the lease prototype and its review (a restore that frees every task at once lets a holder from the replaced state and a new one work on one task); the security re-review's condition S2-C2 (a pid and a start time do not show who wrote a backup); the review of the prototype's corrections, N1 (its waiting-period alternative holds only where a holder stops itself, which arrives in 1.5); AP14 | must | `crates/orch-cli/tests/restore_fencing.rs::restore_refuses_while_a_recorded_process_is_alive`, `::stop_runs_stops_only_what_the_replaced_state_records`, `::a_process_only_the_backup_records_is_never_signalled` (a fake process table records every call), `::assume_stopped_lets_the_restore_proceed_for_the_named_run`, `::restored_leases_are_ended`; both |
@@ -488,6 +488,7 @@ holds them.
 | R138 | `orch db restore` shall change the data directory only by the steps of "`orch db` commands" ("How a restore replaces the state"), in their order: (1) before anything is written, the checks of R76, R78, R100 and R117, and free space of at least the backup's size by its manifest above the disk floor (B11); (2) the whole restored state built under a scratch name in the data directory: the database, copied and checked against the manifest and then given, in one transaction, its new lineage and generation (R77) with every lease of the backup ended and its run closed (R100), and with it the blobs, the repositories, an empty spool and the `generation` file, all of it synced and the database closed with no log left, and then the closed database file read once more, with nothing but staged members beside it, to hold that lineage, that generation and no active lease, and its SHA-256 taken before and after that reading and found the same; (3) a marker, `restore-in-progress`, that names the scratch directory, the directory for the replaced state, the direction `forward`, the SHA-256 of the staged database, and for each member of the state (the database, its `-wal` and its `-shm`, the blobs, the repositories, the spool and the `generation` file) whether the replaced state holds it and whether the staged state holds it; the directory for the replaced state shall be created and synced before the marker, and every version of the marker, the change of direction included, shall be published whole, by a temporary file created exclusively, 0600, written, synced and renamed onto the marker's name, with the directory synced, and never by writing in place; (4) every member of the replaced state moved aside, a `-wal` or `-shm` that only it holds included, and only when none is left at a live name the staged members moved in, by renames inside the data directory in the stated order, with the directory that a member left and the directory that it entered both synced after each; (5) the final layout checked (every staged member at its live name, every replaced member aside, no `-wal` or `-shm` at a live name, the bytes of the database at its live name hashing to the SHA-256 that the marker holds, and the `generation` file holding the marker's generation) and only then the marker removed, last. That check shall read files and shall not open the database with SQLite. While the marker exists no command, `--continue` and `--abandon` included, shall open a database at a live name with SQLite, so that no step of this program leaves a `-wal` or a `-shm` there and a stop inside the final check leaves nothing behind: the check is run again from its start. While the marker exists the daemon and every offline command except `orch db restore --continue` and `orch db restore --abandon` shall refuse to start, change nothing, exit 1 and name the marker and both commands. `--continue` shall finish the steps from whatever a stop left and give the state that an uninterrupted restore gives. It shall tell what is left from the marker's list of members and from where each member lies, shall finish moving every replaced member aside before it moves any staged member in, and shall never take the absence of a member that was not staged to mean that a staged member was moved in. A layout that the steps cannot have left, among them a `-wal` or `-shm` at a live name beside a staged member that was moved in, shall change nothing, keep the marker and be refused, exit 1. While the direction is `forward`, once the scratch directory has been removed the restore is complete but for the marker: `--continue` shall check the final layout and remove the marker and do nothing else, and `--abandon` shall be refused. That refusal holds under `forward` only. `--abandon` shall publish the direction `back`, as every version of the marker is published, before its first rename, put every part of the replaced state back byte for byte, and then remove the scratch directory, the empty directory for the replaced state and the marker, in that order. Under the direction `back`, `--abandon` shall first test whether the abandonment has reached its end, before any other check of the layout and before any rule on the scratch directory: every replaced member at its live name, no other member at a live name, and the directory for the replaced state empty or absent. When that holds it shall remove what is left of the scratch directory, unread, whether that is all of it, a part of it or nothing, then the directory for the replaced state if it is there, then the marker, and shall do nothing else; `--continue` stays refused under `back`. Either may itself be stopped and run again, and from every state that a stop of these steps can leave with the marker standing at least one of the two shall run to its end. What this requirement promises for a stop is promised for a stop of the process; after a loss of power it holds as far as the syncs had reached the medium, and the rest is the manual recovery ("What a sync promises"). A stop, a failed copy or a full disk before the marker shall leave the live state unchanged; a scratch directory without a marker shall be removed, unread, by the next command or start, and so shall a temporary marker file and an empty directory for the replaced state that have no marker. A marker that fails its check is still a marker: nothing shall start, both commands shall refuse and change nothing, and the refusal shall name the manual recovery that the RUNBOOK is to give. At no step shall a database stand at its live name with a backup's leases active, or beside blobs, repositories, a `-wal` or a `-shm` of the other state, without the marker. R117's clause for a workspace that already stands is not built before the fifth point of AP14 is ruled, and nothing here decides it. | The resilience review F1 (a restore stopped between its replacements left a database beside the other state's blobs with the lock released, and nothing stopped a start); the resilience review of `a914e78`, N1 to N3 (the marker was written in place, so a stop left one that no command could read; one directory of two was synced after a rename; an abandonment after the scratch directory was gone had nowhere to put a part); the security review of `a914e78`, S-R1381 (a continuation that read a missing staged `-wal` as moved in could leave a new database beside the old log); the resilience review of `3c50293`, N8 (the last check opened the database, and a stop inside it left a `-wal` at a live name that both commands refused), N9 with the security review's note on the same case (an abandonment stopped after it had removed the scratch directory was refused by both commands) and N12 (what a sync of the marker promises after a loss of power); G3, G9 | must | `db_backup_restore::a_restore_killed_at_every_step_leaves_a_refused_or_complete_state` (a child is stopped before and after every copy, sync, rename and removal and at each read of the final check; afterwards either the live state is unchanged, or the marker stands and a start is refused, or the restore is complete; and where the marker stands, `--continue` or `--abandon`, as the table of stops says, then runs to its end, so that a state which both commands refuse fails this test unless that table calls it unexpected), `::a_continued_restore_equals_an_uninterrupted_one` and `::an_abandoned_restore_leaves_the_replaced_state_byte_identical` (each also stopped at every step of its own), `::a_marker_is_whole_after_a_stop_at_each_step_of_its_publication` (between the create, the write, the sync, the rename and the directory's sync, for `forward` and for the change to `back`), `::a_restore_stopped_between_the_database_and_its_wal_and_shm_continues_and_abandons` (the replaced state has a `-wal` and a `-shm` and the staged state has none; stopped before and after each of the three renames), `::continue_moves_every_replaced_member_aside_before_it_moves_one_in`, `::an_unexpected_layout_keeps_the_marker_and_is_refused` (among its cases a `-wal` at a live name beside a database that was moved in), `::the_final_layout_and_lineage_are_checked_before_the_marker_is_removed`, `::abandon_is_refused_under_forward_once_the_scratch_directory_is_gone`, `::an_abandonment_stopped_in_its_cleanup_is_finished_by_abandon` (stopped with a part of the scratch directory removed, with all of it removed, and with the directory for the replaced state removed as well; each ends with no marker and the replaced state byte for byte, and `--continue` is refused throughout), `::a_restore_stopped_inside_its_final_check_is_finished_by_continue` (stopped at each read; the check has left no file, and `--continue` ends as an uninterrupted restore does), `::nothing_opens_the_live_database_while_the_marker_exists` (no `-wal` or `-shm` appears at a live name during a restore, a continuation, an abandonment or a refused start), `::the_staged_database_file_alone_holds_the_new_lineage_and_its_hash_is_in_the_marker`, `::continue_and_abandon_run_again_change_nothing_more`, `::a_marker_that_fails_its_check_refuses_every_command_and_changes_nothing`, `::a_leftover_temporary_marker_is_removed_unread`, `::restore_refuses_without_space` (free space one byte under the need; nothing is written), `::a_failed_copy_while_staging_changes_nothing`, `::the_staged_database_has_the_new_lineage_and_no_active_lease_before_the_swap`, `crates/orch-daemon/tests/daemon_data_dir.rs::a_start_is_refused_while_a_restore_marker_exists`, `crates/orch-cli/tests/db_offline.rs::offline_commands_refuse_while_a_restore_marker_exists`; both |
 | R139 | `orch daemon stop`, and a signal that asks the daemon to stop, shall end the daemon within a bound and in this order: (1) admission closes: a new request is answered `shutting_down`, no claim is granted, and the maintenance timer starts no job; (2) the transaction in progress commits or rolls back, and a job in progress queues nothing more (R26); (3) the collectors hand over what they hold, and the writer takes what is queued in the order of its lanes until the drain's deadline; (4) at the deadline a transaction that is still being retried (R128) is rolled back and given up: a request is answered and never committed afterwards, a finish stays in its spool (R129), and then, once the writer has ended its last transaction and takes no other and no event is given a number any more, for every run with events handed over and not committed the first and the last of their numbers (R61 gives a number at handover) are recorded in `spool/events-at-stop`, from which the next start writes that run's row of `run_event_gaps` (R61) before the run's events are numbered further and before admission opens; (5) reads still open are interrupted, a checkpoint call in progress is left to return and no other is started; (6) the lock is released last, by the process ending. The file holds the lineage; one of another lineage, or one that fails its check, is removed and counted, as R129 says of a finish file. Every version of the file shall be published whole: written to a temporary file created exclusively, 0600, in `spool/`, synced, renamed onto `spool/events-at-stop`, and `spool/` synced. A stop that finds a record of this lineage already there shall publish the ranges of that record together with its own and shall never overwrite or drop a range that an earlier stop recorded. A start shall write the gap rows of every recorded range in one transaction, shall write no second row for a range that a gap row already covers and no row over a number that a committed event of that run holds, cutting a recorded range to the numbers that neither holds, and shall remove the file only once that transaction is durable against a loss of power under the settings in force (R126): it was committed with `synchronous = FULL`, or a checkpoint that started after it has succeeded with no frame of the log left (R137, `copied_all`). A commit at `synchronous = NORMAL` alone is not that. A start that ends before that point shall leave the file as it was. Events that are neither committed nor recorded there, because that write failed as well, shall be named by run in the stop's report, as R129 names a finish. The stop shall end at its bound whatever is still in progress, and that shall lose nothing that is committed, spooled or recorded. What is said here of a stop that is killed is said of a stop of the process: after a loss of power the record can be absent or fail its check, and its ranges are then lost, with a count at most ("What a sync promises"). Proposed and not measured: 10 s for the drain, counted from the request; 5 s more for the reads and the checkpoint call; 20 s for the whole stop. This requirement covers a stop that was asked for and changes nothing in what a stop does to a run's process. | The resilience review F2 (the answers to O5 and D4 name a bounded shutdown, and no requirement stated its order, its bound or what becomes of queued events); the resilience review of `a914e78`, N4 and N5 (a record removed before its gap row was synced lost the gap, and a second stop overwrote the first record); the resilience review of `3c50293`, N11 and N12 (nothing said that the ranges are taken after the writer's last commit, so a gap row could cover an event that exists; and the record is synced by this program and not by SQLite); O5, D4 | must | `crates/orch-daemon/tests/daemon_storage_failure.rs::stop_is_bounded_while_the_writer_retries` (a second connection holds the write lock; fake clock), `::stop_follows_its_order` (each step is recorded), `crates/orch-engine/tests/run_events.rs::events_queued_at_stop_are_committed_or_left_as_a_gap`, `::a_gap_recorded_at_stop_is_written_at_the_next_start_before_new_numbers`, `::events_neither_committed_nor_recorded_are_named_by_the_stop`, `::a_second_stop_keeps_the_ranges_of_the_first` (the first record is not yet consumed), `::the_stop_record_is_removed_only_after_its_gap_rows_are_durable` (the removal is refused to a fake that reports the commit as not yet synced), `::a_start_repeated_after_a_kill_writes_each_gap_once`, `::a_start_that_fails_leaves_the_stop_record_unchanged`, `::a_stop_record_is_whole_after_a_kill_at_each_step_of_its_publication`, `::the_ranges_of_a_stop_are_taken_after_the_writers_last_transaction` (a commit is made to land as late as the order allows; no recorded range holds a committed number), `::no_gap_row_covers_a_committed_event` (a record is planted whose range holds committed numbers; the rows written cover the other numbers only); both |
 | R140 | The failure policy shall cover every connection that the daemon holds on the live database, by the table of "Writer lanes" ("When another connection fails"). `SQLITE_CORRUPT` or `SQLITE_NOTADB` on any of them (a pooled read, the checkpoint connection, the query connection of R130, the connection a backup or an export reads through) shall fail the writer at once, as R128's fatal class does, with the connection and the result named, and no checkpoint shall be called afterwards. A corrupt backup, export or import file is that command's own refusal and is not this. Any other failed result on those connections shall be returned or recorded where it occurred and counted by kind of connection, the connection shall be opened afresh, and the writer shall not fail for it. `daemon.status`, `orch status` and `orch doctor` (exit 1) shall report, from memory: three checkpoint calls in a row that ended `busy` or `failed` (R137); a backlog that has stayed over R127's 256 MiB for more than 5 minutes, with the backlog, the time, the age of the oldest read and the last call's outcome; three failed reads in a row on the pool; and the last failed backup, export or query with its result. A report shall end when its condition does. The counts and the times are proposals that no measurement backs. | The resilience review F3 (R128 classed the writer's transactions alone: corruption first seen by a checkpoint was a recorded figure while the writer went on committing, and a checkpoint that failed every time showed only when the disk floor tripped); D4 | must | `sqlite_writer::a_corrupt_result_on_the_checkpoint_connection_fails_the_writer`, `::a_corrupt_result_on_a_read_connection_fails_the_writer`, `::a_corrupt_result_on_the_query_or_backup_connection_fails_the_writer` (the result is injected at the connection named), `::other_failures_off_the_writer_are_counted_and_do_not_fail_it`, `crates/orch-daemon/tests/daemon_storage_failure.rs::three_failed_checkpoints_in_a_row_are_reported`, `::a_backlog_over_its_ceiling_for_five_minutes_is_reported` (fake clock), `::a_report_ends_with_its_condition`, `crates/orch-cli/tests/db_backup_restore.rs::a_corrupt_backup_file_fails_the_command_and_not_the_writer`; both |
+| R141 | A `Task` shall be stored, read, updated, moved and deleted in the SQLite format of "Task format v1 (SQLite)": the detail is the authority and every projection (the `tasks` row, the memberships, the reference rows, the `blobs` rows and the revision) is derived from it in the same operation; every text over 65,536 UTF-8 bytes is behind blob objects, split at 67,108,864 bytes, named by an explicit tag and by project-scoped reference rows; every read hydrates in the selecting snapshot or unit of work and checks the format, the identity, the decoded types, each projection, the membership sets and every referenced size and hash, and answers the typed stored-data error of R140 on a mismatch; and a failed operation, a failure that the caller catches included, leaves the old row and its references readable. | The lead's decision on the task mapping (2026-11-23); R97; R140; issue 127 | must | `crates/orch-infra/tests/sqlite_task_format.rs`: `a_task_round_trips_every_field_with_order_repeats_and_presence`, `signed_priority_and_unsigned_counters_keep_their_extremes`, `timestamps_must_be_canonical_utc_milliseconds`, `the_threshold_counts_utf8_bytes_for_every_text_slot` (title, description, feedback, workspace, label, scope pattern, attachment name, each proof field, a `files_changed` element, a review output; 65,536 inline and 65,537 behind one object, by direct SQL and on disk, with the vectors of the spec), `text_at_64_mib_is_one_object_and_one_byte_more_is_two`, `a_character_split_by_a_chunk_boundary_round_trips`, `repeated_chunks_keep_every_ordinal`, `many_small_values_move_the_detail_behind_root_references`, `oversized_keys_are_unrepresentable_and_change_nothing`, `a_missing_corrupt_reordered_or_short_chunk_is_a_stored_data_error`, `a_tag_without_rows_and_rows_without_a_tag_are_stored_data_errors`, `projection_drift_in_each_native_column_and_membership_is_a_stored_data_error`, `an_unknown_format_or_a_missing_detail_is_a_stored_data_error`, `a_failed_chunk_or_sql_step_leaves_the_old_row_and_references_readable_even_when_caught`, `update_preserves_every_column_the_task_format_does_not_own`, `revisions_and_positions_use_checked_counters`, `move_changes_only_position_and_revision`, `delete_removes_the_row_detail_references_memberships_and_attachment_rows`, `snapshot_and_unit_of_work_hydrate_one_state`, `page_order_and_binary_id_ties_match_the_reference_on_the_native_path`; `crates/orch-infra/tests/sqlite_migrations.rs`: `the_task_format_migration_keeps_earlier_versions_and_applies_to_a_populated_predecessor_without_rows`, `a_predecessor_with_any_task_or_membership_row_is_refused_and_left_unchanged`; the shared entity suites registered on SQLite. Importer and backup tests (T21, T23) are listed in "Task format v1 (SQLite)" and are not yet written; Linux |
 
 For the implemented R8–R15 and R97 reference checks, the acceptance cells above
 name Cargo substring filters, not Rust module paths prefixed by the test binary's
@@ -777,7 +778,7 @@ checked on both references by `the_complete_read_pages_every_row_including_futur
 ## Schema for 1.1
 
 The starting point is the 2.0 sketch attached to the goal: 50 tables and one FTS5 index. Times are UTC
-milliseconds; the API keeps ISO-8601 strings. Recommendation for O2: 1.1 creates 33 tables.
+milliseconds; the API keeps ISO-8601 strings. Recommendation for O2: 1.1 creates 33 tables in its first migration; the task-format migration adds two more (difference 9).
 
 | Group | Created in 1.1 |
 |---|---|
@@ -814,7 +815,7 @@ empty outside tests.
 - `project_id` in every primary key outside the daemon-wide group.
 - `leases`: `worker_id`, `epoch`, `lineage`, `state`, `offered_at`, `branch`, `base_sha`, `fetch_ref`.
 
-**Differences from the sketch**, approved with O2, which the owner answered as recommended:
+**Differences from the sketch**, 1 to 8 approved with O2, which the owner answered as recommended, and 9 added after it by the lead's decision on the task mapping:
 
 | # | Difference | Reason |
 |---|---|---|
@@ -826,6 +827,7 @@ empty outside tests.
 | 6 | Constants 1.1 writes into columns that only later phases vary: `leases.worker_id` and `runs.worker_id` are the built-in local worker identity; `leases.state` is `active`; `runs.counted` is 1 with `attempt_no` set; `tasks.created_by_kind` is `owner`, `agent` (a session in agent context; `created_by_run_id` set when that task holds a lease) or `daemon`, and `import` for imported tasks. | The sketch declares these `NOT NULL` or checks them, so 1.1 must say what it stores. `import` is a fourth value of `created_by_kind`: 1.0 did not record who created a task. |
 | 7 | `tasks` gains a unique index over `(project_id, id COLLATE NOCASE)`. | Two task ids that differ only in the case of ASCII letters are one workspace and one branch on a filesystem that folds case (R117, F14). `NOCASE` folds the 26 ASCII letters and nothing else. The primary key stays the exact id, so every lookup is exact to the byte and no id is changed. An export holds only the automatic indexes ("Import bounds"), so it is the destination's index that judges an imported row. |
 | 8 | `leases` gains `lineage TEXT NOT NULL`, and `daemon_config` holds the current lineage. | The owner's answer to AP11: a lease is fenced by the pair of lineage and epoch (R77, R132). The sketch has the epoch alone. Adding the column later would be a migration of a table every claim writes. |
+| 9 | A numbered migration adds `task_details` and `task_blob_refs` ("Task format v1 (SQLite)"). | The lead's decision on the task mapping (2026-11-23): `Task` has fields, shapes and text sizes that no column of the first migration holds, and R97 needs reachability rows for the objects behind a text. The two tables widen the answer to O2, whose condition named the exact schema of this spec; the owner's merge of this text approves them. |
 
 Rows the daemon keeps without a table of their own: the generation, the restore lineage and the saved
 dispatch state in `daemon_config`; each maintenance job's times under `maintenance/<job>` in `daemon_config`; 1.0's totals in
@@ -847,6 +849,281 @@ Nonpositive surviving row positions remain invalid stored metadata. Signed exhau
 `CounterExhausted`. Delete preserves the high-water mark. An empty namespace permits bootstrap; after
 all rows are deleted, loss of its counter cannot be distinguished from a new family. Surviving row
 maxima validate metadata and never reconstruct the allocation history.
+
+### Task format v1 (SQLite)
+
+Status: decided by the lead as option A of the task-mapping decision (2026-11-23, Mid, stance 0.5): approved for a
+bounded implementation, not yet built. The owner's merge of the PR that carries this text ratifies it, as for the
+rest of this spec. The SQLite adapter is internal and inactive; the daemon uses file storage until T24. This
+section is the only definition of how a `Task` is stored. The SQLite task mapping (a part of T10), the importer
+(T21) and backup, restore and export (T23) follow it, and none may invent a second layout.
+
+**Why the schema alone cannot hold a `Task`.** `Task` (`crates/orch-domain/src/task.rs`) has fields and shapes
+that the first migration's `tasks` row and membership tables have no place for, and the reference stores the
+whole typed value and compares it for equality:
+
+- `workspace`, `proof`, `review_criteria`, `review_results` and the optional `scope` and `attachments` have no
+  column. The `review`, `legacy_proof` and `outputs` columns are reserved for later phases (R19) and format v1
+  neither reads nor writes them.
+- `labels`, `depends_on` and `scope` are ordered and may repeat a value; `task_labels`, `task_dependencies`
+  and `task_scopes` are keyed by value, so they keep neither order nor repeats, and zero rows cannot tell an
+  absent `scope` from an empty one. `Option<Vec<_>>` keeps that difference in the domain and the file reference.
+- A `task_attachments` row needs a content hash; a task's `attachments` is a list of names that may name no
+  stored file. A name alone gives no path to open and no hash to invent.
+- R97 needs every text over 64 KiB behind the blob store, and a blob object holds at most 64 MiB.
+
+**Authority.** One record, the *detail*, holds the complete typed `Task` and is the only authority for it. The
+`tasks` row, the three membership tables and the blob reference rows are *projections*: each is derived, in the
+same operation and from the same typed value, and is checked against the detail on every read. A projection never
+supplies a value that the detail lacks, and a read never rebuilds the detail from projections.
+
+**Tables.** One numbered, forward-only migration adds two tables. Its number is the next one unused on the
+integration base, and it is never chosen by this text: another slice may claim a number first, so the PR takes the
+next free one and `schema_migrations` stays contiguous (the adapter already refuses a database where it is not).
+
+```sql
+CREATE TABLE task_details (
+  project_id TEXT NOT NULL, task_id TEXT NOT NULL,
+  format INTEGER NOT NULL CHECK (format >= 1),
+  detail TEXT,
+  detail_bytes INTEGER NOT NULL CHECK (detail_bytes >= 0),
+  detail_sha256 TEXT NOT NULL,
+  PRIMARY KEY (project_id, task_id),
+  CHECK ((detail IS NULL AND detail_bytes > 65536)
+      OR (detail IS NOT NULL AND detail_bytes <= 65536 AND length(CAST(detail AS BLOB)) = detail_bytes))
+) STRICT;
+
+CREATE TABLE task_blob_refs (
+  project_id TEXT NOT NULL, task_id TEXT NOT NULL,
+  locator TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  sha256 TEXT NOT NULL,
+  size INTEGER NOT NULL CHECK (size BETWEEN 1 AND 67108864),
+  PRIMARY KEY (project_id, task_id, locator, ordinal)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX task_blob_refs_by_hash ON task_blob_refs (project_id, sha256);
+```
+
+`format` is 1. A reader that finds another number, or a row whose `detail` and `detail_bytes` disagree, reports
+stored-data corruption (below); no reader guesses at a later format. `detail_sha256` and `detail_bytes` always
+describe the serialized detail bytes, whether they are in `detail` or behind references. `task_blob_refs` is the
+project-scoped reachability index: every object that a task's detail or text names has one row, and
+`(project_id, sha256)` finds every task that names an object. This migration adds two tables to the 33 that the
+first migration creates (difference 9 above).
+
+**The detail.** One JSON object with the domain's own field names, `goalId` included, written compactly in the
+domain's field order: `id`, `title`, `description`, `status`, `priority`, `assignee`, `labels`, `depends_on`,
+`created_at`, `updated_at`, `attempts`, `max_attempts`, `workspace_mode`, `workspace`, `proof`, `review_criteria`,
+`review_results`, `scope`, `feedback`, `goalId`, `attachments`.
+
+- Presence is meaning. A key for an `Option` field is absent for `None` and present for `Some`, so `scope: []`,
+  `review_criteria: []` and `feedback: ""` are kept apart from their absence. `labels`, `depends_on`, `proof.files_changed` and
+  the scalar fields are always present. Order and repeats are kept exactly (`["b","a","b"]` stays so).
+- The decoder is stricter than the domain's serde, which this section does not rely on: serde accepts an unknown
+  key and reads `null` as `None` (both checked against the domain crate) and refuses only a duplicate key. The
+  format refuses all three, a missing required key, a wrong type, an integer that does not fit its type
+  (`priority` is `i64`, `attempts` and `max_attempts` are `u32`) and a number written with a fraction or an
+  exponent, because each would drop or change data silently.
+- `priority` is a signed 64-bit integer from `-9223372036854775808` to `9223372036854775807`. It is stored natively
+  as the same integer, so its order is numeric.
+- The enumerations (`status`, `workspace_mode`, a criterion) are their snake-case words. A word the binary does
+  not know is stored-data corruption, never a default.
+- Real output of the domain's serde for a task with an absent `attachments`, an empty `scope` and a repeated
+  label, which the format keeps as it is (a `{"$blob":…}` slot below replaces a string only when it is over the
+  threshold):
+
+```
+{"id":"tsk_Sample01","title":"Sample","description":"","status":"todo","priority":-3,"labels":["b","a","b"],"depends_on":["tsk_Dep2","tsk_Dep1"],"created_at":"2026-11-20T10:00:00.000Z","updated_at":"2026-11-20T10:00:00.000Z","attempts":0,"max_attempts":3,"workspace_mode":"worktree","workspace":"w","proof":{"files_changed":[]},"review_criteria":[],"scope":[],"feedback":"","goalId":"goal_1"}
+```
+
+**Text values (R97).** The size of a text value is its length in UTF-8 bytes, counted on the original value. It
+applies to every string of the detail, nested ones included: a title, a description, feedback, a workspace, a
+label, a scope pattern, an attachment name, a dependency, any proof field and each element of `files_changed`, and the `output`
+of a review result.
+
+| Size of the value | Where it lives |
+|---|---|
+| 0 to 65,536 bytes | Inline: a JSON string in its slot. 65,536 stays inline. |
+| 65,537 to 67,108,864 bytes | One blob object holding the value's bytes. The slot is a tag (below). |
+| Over 67,108,864 bytes | Split at 67,108,864-byte offsets into K objects, K = ceil(size / 67,108,864): every object but the last holds exactly 67,108,864 bytes and the last holds 1 to 67,108,864. A split can fall inside a multi-byte character. |
+
+A string slot never holds anything but a JSON string or the tag, so no user text can be mistaken for a reference:
+
+```
+{"$blob":{"sha256":"<64 lower-case hex digits>","bytes":<N>,"chunks":<K>}}
+```
+
+`sha256` and `bytes` are those of the complete original UTF-8 value, and `chunks` is K as above (1 for a value of up to 67,108,864 bytes). The tag has exactly
+these three members and nothing else. Anywhere but a string slot, an object of this shape is a type error.
+
+Each tag has K rows in `task_blob_refs`. Their `locator` is the RFC 6901 JSON Pointer of the slot in the detail
+(`/description`, `/review_results/2/output`, `/labels/7`, with `~0` and `~1` escaping as the file reference does),
+their `ordinal` runs 0 to K-1 without a gap, and each row holds that object's `sha256` and `size`. For K = 1 the object's hash is the value's.
+A value that repeats a chunk repeats the row: the same hash may stand at two ordinals, and two slots with equal text name one
+object. Every object also has its `blobs` row (`storage_location = 'disk'`, the same `size`), registered as the
+blob store's reference helper registers a prompt, so verification, the sweep, a backup and an export all find it.
+
+Vectors (the text is the byte `a`, repeated; hashes computed with SHA-256 over those bytes):
+
+| Bytes | Slot | `task_blob_refs` rows (ordinal, size, `sha256`) |
+|---|---|---|
+| 65,536 | inline string | none |
+| 65,537 | tag, `chunks` 1, `sha256` `008ffc88d3c96a9f307524eb361e47c5222a887fc45fa0c1fb8d429c5c23b430` | 0, 65,537, same hash |
+| 67,108,864 | tag, `chunks` 1, `sha256` `fae972222d455a2eaee1661ad9625502ec3bfc5ec38b87a6eec5afd5107331b5` | 0, 67,108,864, same hash |
+| 67,108,865 | tag, `chunks` 2, `sha256` `0ed59c6929ac1c013be3a95779b6edf64fd7d9858e28fc246964c5bddce58ba2` | 0, 67,108,864, `fae97222…31b5`; 1, 1, `ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb` |
+| 134,217,728 | tag, `chunks` 2, `sha256` `3510b7e066e76c8f7c306693c97204824d0c8f92ae6fc8a4c0dd657abf424a1b` | 0 and 1, 67,108,864 each, both `fae97222…31b5` (one object, two rows) |
+
+A value of 67,108,863 `a` bytes followed by `é` (two bytes, 67,108,865 in all, whole `sha256`
+`dfe3c4a85fd6bd7047064e244afd38b700e98bf0f1b2fab53d9905e2467d5120`) splits inside the character: chunk 0 is the
+67,108,863 `a` bytes and the first byte of `é` (67,108,864 bytes,
+`18afcd915bf7c60ef9da9ead13bef131856420e9312ae8aa25d1238d21789d48`) and chunk 1 is the second byte of `é` alone (1
+byte, `9e8e8c37a53bac77a653d590b783b2508e8ed2fed040a278bf4f4703bbd5d82d`). Only the assembled bytes are decoded as
+UTF-8.
+
+**The detail's own size.** After every text over the threshold became a tag, the detail is serialized. If those
+bytes exceed 65,536 (many small values: a long label list, a long `files_changed`), the whole serialized detail is
+stored as a referenced value of its own: `task_details.detail` is NULL, `detail_bytes` and `detail_sha256` describe
+the bytes, and `task_blob_refs` holds its K rows at locator `''` (the empty pointer, the document itself) split by
+the same rule. No other value is moved to make it fit, so the same task always has the same layout.
+
+**Fields that are keys.** `id`, `goalId`, `assignee`, `created_at` and `updated_at` are copied into native key and sort
+columns and must be inline and at most 65,536 bytes. A task with one over the bound is refused as `Unrepresentable`
+before any write, because an oversized key cannot be kept out of its projection. Every other string, `title`,
+`description` and `feedback` included, may be referenced.
+
+**Time.** `created_at` and `updated_at` are stored in the detail as the exact strings and projected to UTC
+milliseconds. Format v1 accepts only the canonical form `YYYY-MM-DDTHH:MM:SS.sssZ` in the range of the goal
+adapter's staged limits ("Staged SQLite goal timestamp and position limits"): a string is accepted only if it parses as an instant and
+the core formatter, given the milliseconds, returns the same bytes. Any other spelling (second precision, an
+offset, an expanded year, a month 13) is `Unrepresentable`, the operation changes nothing and nothing is
+normalized. Reading checks the same equality between the detail's string and the column. This keeps the native
+order equal to the file reference's bytewise order on every value the format accepts. What the importer does with a
+1.0 value that is not canonical is T21's decision to record in "Import rules"; format v1 does not widen the form.
+
+**Projections.** One operation writes all of them from the typed task. A read checks every row of the table
+against the same derivation.
+
+| Where | Value | Rule |
+|---|---|---|
+| `tasks.id`, `task_details.task_id`, detail `id` | the task id | Equal to the byte; the unique index of difference 7 and `IdAlias` apply as for any task |
+| `tasks.goal_id` | `goalId` | NULL when absent |
+| `tasks.title`, `tasks.description` | the text | The text itself when inline. When the detail holds a tag for it, the empty string, because the columns are NOT NULL. |
+| `tasks.feedback` | `feedback` | NULL when absent; the text when inline; NULL when the detail holds a tag |
+| `tasks.status` | `status` | The snake-case word |
+| `tasks.priority` | `priority` | Signed integer, ordered numerically |
+| `tasks.assignee_agent_id` | `assignee` | NULL when absent |
+| `tasks.attempts`, `tasks.max_attempts` | the `u32` values | As integers |
+| `tasks.workspace_mode` | `workspace_mode` | The word, or NULL when absent |
+| `tasks.awaiting_approval` | `labels` | 1 when some label equals `awaiting-approval` exactly, else 0 |
+| `tasks.created_at`, `tasks.updated_at` | the two strings | UTC milliseconds, as under "Time" |
+| `tasks.revision`, `tasks.position` | the port | Native. `create` stores revision 1; `update`, `delete` and `move_to_end` check the caller's expected revision. `position` comes from the project-local counter of the task family (`position:task`, the namespace T10 agrees, as `position:goal` is for goals) |
+| `task_dependencies`, `task_labels`, `task_scopes` | `depends_on`, `labels`, `scope` | The distinct values of each (below) |
+
+The three native text columns hold a copy for diagnostics and for the equality check only. Whether a text is
+inline is decided by the detail's tag and never by the column, so the empty string a column holds beside a tag
+means nothing and cannot be mistaken for user text. The columns that the task format does not own are never
+written from a `Task`: `review`, `legacy_proof`, `outputs`, `created_by_kind`, `created_by_run_id`,
+`accepted_by`, `accepted_at`, `accepted_run_id`, `landing_state`, `landed_commit`, `landed_into`, `landed_at`,
+`landing_attempts`, `landing_conflict_paths`, `attention_reason` and `attention_since`.
+`update` and `move_to_end` preserve each of them byte for byte. `create` sets `created_by_kind` and
+`created_by_run_id` as difference 6 says. A write whose resulting status is `done` sets `landing_state` to
+`skipped` when it is NULL and leaves `landed` alone (B13, and the `CHECK` on `done`); format v1 never sets
+`accepted_run_id`.
+
+**Memberships.** Each of the three tables holds the *distinct* values of its list, inserted in the same operation. They
+are indexes for the dependents lookup (`task_dependents`) and for filters, and carry no order, repeat or
+presence. A value over 65,536 bytes is not indexed: an oversized value stays in the detail behind its tag and has
+no membership row, and the check on read derives the expected set by the same rule (distinct values of 65,536
+bytes or fewer). The distinct sets, and nothing else, are compared on read; the lists come from the detail.
+`task_attachments` is not a projection of the task: format v1 never inserts or changes a row of it, and it never
+reads one to hydrate. Names are carried in the detail alone. Rows made through the attachment path
+(R59) belong to that path; `delete` removes the task's rows with the task, because a row has no meaning without
+it, and the objects they named follow R60.
+
+**Writing.** `create`, `update`, `move_to_end` and `delete` each run inside the caller's unit of work and are
+atomic as one operation:
+
+1. Refuse, before any object is published, what needs no write: a stale revision, an id alias, a value that is
+   `Unrepresentable`, an exhausted counter.
+2. Publish every object the new value needs through the blob adapter (R58: write, sync, rename), and check
+   that each returned hash is the one computed. The objects of a value are published in order, and all of them
+   before any row names one.
+3. In one savepoint, write the `tasks` row (revision, position), the detail, the reference rows, the membership
+   rows and the `blobs` rows (which clear `unreferenced_since` and require an equal size), replacing a
+   task's old detail, reference and membership rows whole.
+4. On any error roll the savepoint back and return it. The old row and its references stay readable and unchanged,
+   even when the caller catches the error and commits other work in the same unit of work (R7). Objects already
+   published stay on disk unreferenced and follow R60.
+
+Checked arithmetic applies to the revision and the position counter; exhaustion is refused with no change. The
+operation runs whole when it needs more than 1,000 rows, and is counted by `writer_txn_over_bound_total` (R27). Publishing inside the unit of
+work holds the one writer for the time the files take; a text over 64 KiB is rare by R97's own premise, and
+moving publication before the writer is an optimization only after a measurement asks for it.
+`move_to_end` changes only `position` and `revision` of the row: the detail, the references, the memberships and
+`updated_at` are untouched and no object is read or written. `delete` removes the row, the detail, the
+references, the memberships and the task's `task_attachments` rows in one operation and adds no intent for a blob
+file; unreferenced objects are the sweep's (R60).
+
+**Reading.** Every read of a task, a `get` and each element of a page, runs on the selecting snapshot or on the
+unit of work that asked: the row, the detail, the references, the memberships and the `blobs` rows come from one
+state. The page's order and filters are served by the native columns, as the task paging leaf already does (status rank,
+`updated_at` descending, `position`, then the binary `id`), and each id is then hydrated in the same snapshot. A
+read checks, in this order, and stops at the first failure:
+
+1. the `tasks` row, a `task_details` row with `format` 1 and the same project and task id, and the detail's own `id`;
+2. the detail bytes: inline, or the reconstruction from the root references; their length and SHA-256 against
+   `detail_bytes` and `detail_sha256`;
+3. a strict decode of the detail into typed values (the rules above);
+4. every native projection of the table above against the typed value, including the milliseconds against the strings;
+5. the three distinct membership sets against the lists;
+6. for every tag and for the root: the rows exist for exactly that locator, the ordinals are `0..K-1` with no gap or
+   duplicate, K equals `chunks` (or the length that `detail_bytes` implies), each object's `blobs` row exists with the
+   same size and location `disk`, the sizes are the split of the value's size, and no row stands at a locator
+   that has no tag;
+7. every object read through the blob adapter (which checks its bytes against its name), its length against the row,
+   the concatenation's length and SHA-256 against the tag, and one UTF-8 decode of the whole.
+
+Any failure is the adapter's typed stored-data error of R140 and issue 127, a structured variant that is classified
+before any backend message is read. It names the task id, the failed check and the locator, and never text content
+or a path (R101). A page that meets one such task fails whole and returns no partial page. A read of an object
+that a snapshot's rows name does not race the sweep, which waits 7 days after the last naming row (R60).
+
+**Migration and compatibility.**
+
+- A new database gets the tables with the migration. A database made by an earlier migration is moved forward by
+  that one migration in one transaction and the pre-migration copy of R124. Earlier migrations and their checksums are untouched, and the
+  test starts from a populated predecessor.
+- The migration backfills nothing. No row of the earlier shape can be rebuilt without loss: the schema has no home for
+  `workspace`, `proof`, the review lists or attachment names, no order or repeat, and no way to tell an absent list from an
+  empty one. If any `tasks` row exists in the predecessor, or any row of `task_dependencies`, `task_labels`,
+  `task_scopes` or `task_attachments`, the migration stops before its first change with a diagnostic naming the
+  tables and their counts (no row content), leaves the database as it was (apart from the copy R124 already
+  makes) and reports `SqliteError::Migration`. No such row exists outside tests: 1.0 has no SQLite storage and the adapter is
+  unwired on `main`.
+- The file reference keeps its own encoding (JSON pointers and a null slot, `storage::v2::tests`). Both backends
+  return equal typed `Task` values for the same input; their physical layouts are not compared with each other.
+- Retry diagnostics (`retry_queue.error`) have their own mapping, which the issue 109 work defines and which uses the
+  same two thresholds and the same split. It shares none of this section's tables or tags. One internal helper for
+  splitting, hashing and reassembling is recommended for both mappings; the format does not require it.
+
+**What each later task owes.**
+
+| Task | Obligation |
+|---|---|
+| T10 | The mapping above for `Task`, with the R141 tests; register the shared entity suites (`text_over_64_kib_round_trips_through_the_blob_store` and the task-id fold scenarios) on SQLite; keep the mapping behind the internal adapter. Other entities and the public cursor stay with their own slices. |
+| T15 | `blobs.sweep` counts `task_blob_refs.sha256` as a naming row for the 7-day rule (R60), beside `runs.prompt_sha256`, `task_attachments.sha256` and the retry mapping. |
+| T21 | Build each task through the same codec as the port, never by inserting rows. Keep list order, repeats and `Option` presence exactly as the 1.0 document says. Decide and record what a non-canonical timestamp does (above). A task text over 64 KiB becomes the references above, as R97 says for imported text, and a source document is at most 1 MiB, so an import never needs a split. |
+| T22 | `orch db verify` runs the read checks above for every task, and reports an object, a reference row or a detail with no task. Two diagnostic views are owed: `diag_task_details` lists every column except `detail` (which can be large and duplicates `diag_tasks`), and `diag_task_blob_refs` lists its columns. |
+| T23 | A backup copies the database and every object that a `task_blob_refs` or `blobs` row names, in one restorable point, and a restore verifies each object's name, size and order. An export carries both tables as rows, in the export's own chunking of blob bytes (a different thing from the 64 MiB split here), and an import verifies each text's reconstruction and whole hash and reproduces every row. `blob.delete` intents are untouched. |
+| T27 | Records the named checks of R141 as run, rejecting an empty or ignored selection. |
+
+**Open in this section.** (1) The mapping from a `Principal` to `created_by_kind` on `create` is not defined by this
+spec: the proposal is `Owner` to `owner`, a task principal to `agent` with its run, `Worker` to `daemon`, and `import`
+through an importer-only path that T21 defines; the builder confirms it with the lead before coding. (2) A task that
+leaves `done`: format v1 leaves `landing_state` as it is, since the spec says only that completion sets it. (3) Removing the
+task's `task_attachments` rows on `delete` needs the attachment path's owner to agree. (4) The owner's answer to O2
+named the exact schema of this spec at 33 tables; the two tables here widen it and the merge of this text is the
+approval. None blocks the documentation PR; (1) and (2) must be settled before the code that writes them.
 
 ## Transactions and intents
 

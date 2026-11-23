@@ -16,7 +16,7 @@
   check of decision 16 stays for Linux (an isolated, authorized Linux host; spec R42, issue 110) and is
   pending.
 - Decisions 1 to 6 and 14 restate decisions the owner already took in the goal and are binding. Decisions 7 to 13
-  and 15 to 25 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
+  and 15 to 26 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
   the owner's to rule (the spec's AP13); no record shows that the owner set them.
 - The owner's answers (2026-11-20 and 2026-11-21): every point of the spec is answered as recommended,
   except AP13, which is answered in its direction; the spec's "Owner's answers" has a row for every id and
@@ -452,6 +452,25 @@ across a crash, lists that do not load everything, and a retried request that ru
     are fixed for its kind (R131). A request key never applies to a credential operation, and authorization
     comes before a stored result is looked up (R134).
 
+26. **A task is one typed detail record with derived projections, and its large text is behind explicit
+    references.** Added 2026-11-23, after the owner's answers, by the lead's decision on the task mapping (option
+    A of two); the owner's merge of this text ratifies it. The first migration's `tasks` row and its membership
+    tables cannot hold the domain's `Task`: `workspace`, `proof`, the review lists and the optional `scope` and
+    `attachments` have no column, the membership tables are keyed by value and so lose order, repeats and the
+    difference between an absent and an empty list, and a text over 64 KiB needs references that a NOT NULL
+    text column cannot discriminate. One numbered forward-only migration adds `task_details` (the complete typed
+    task as strict JSON, the only authority) and `task_blob_refs` (project-scoped reachability and chunk
+    rows). The `tasks` columns, the distinct membership sets and the `blobs` rows are derived from the same
+    value in the same operation and are checked against the detail on every read. A text up to 65,536 UTF-8 bytes
+    stays inline; a longer one becomes one blob object, or objects of 67,108,864 bytes when it is longer
+    still, named by a tagged JSON object that no text can equal and by ordered rows; a detail that is itself over
+    65,536 bytes is stored the same way. A write publishes its objects first and installs every row in one
+    savepoint, so a failure, caught or not, leaves the old row and its references readable. A read in the
+    selecting snapshot answers the typed stored-data error of R140 for an unknown format, a missing or
+    malformed detail, a projection that disagrees or a broken reference, and never rebuilds a task from
+    unordered sets. Timestamps stay the canonical millisecond strings that the goal adapter accepts. The migration
+    backfills nothing and refuses a populated predecessor atomically (the spec's "Task format v1 (SQLite)").
+
 ## Alternatives considered
 
 - **Keep files and add indexes, a journal and file locks.** Each 2.0 need (atomic claim, fencing, paging,
@@ -626,6 +645,19 @@ across a crash, lists that do not load everything, and a retried request that ru
 - **Skip or set aside a source file the import cannot read.** The import always finishes, and a task can be
   missing from 1.1 unnoticed. The spec's AP17 puts it to the owner.
 
+- **A versioned envelope inside an existing column** (`outputs` or `legacy_proof`, or the opaque `review`).
+  It avoids a migration and costs the meaning of a column that later phases own, a second reader for each
+  phase, and a harder move later; it also leaves the reachability of objects to a scan of JSON. Rejected: the
+  columns are reserved (R19) and a new table is cheaper than a competing meaning.
+- **Only the missing fields in a side record, native rows authoritative for the rest.** Two authorities for
+  one task: a row and its side record could each be right and still disagree, and order and repeats of a list
+  would still need a place. Rejected for the single authority of decision 26.
+- **Normalizing on write** (sorted or deduplicated lists, an absent list read as empty, a truncated or
+  second-precision timestamp widened). It would make the reference and the adapter differ on the same typed
+  value and would change what a task says. Rejected: the conformance suite compares equal values.
+- **A prefix or a marker string in the native text columns for a referenced text.** A marker aliases user text,
+  and a prefix keeps bytes that R97 moved out. Rejected for an explicit tag in the detail.
+
 ## Consequences
 
 - A multi-entity operation is atomic across a crash, which 1.0 never was. The crash-point tests become possible
@@ -680,3 +712,8 @@ across a crash, lists that do not load everything, and a retried request that ru
 - The data directory lives outside the project, so moving a project directory no longer moves its state. The
   pointer file and the record under the data home are what let the daemon find it again instead of offering a
   second import. `<project>/.orchestry/` must stay in place: it is still the handshake's project identity.
+- A task costs two more tables and a stricter reader than the domain's serde, and a second write of the same
+  text is deduplicated by hash. A write that publishes a large text holds the one writer for the time the files
+  take. Everything that names an object (the sweep, `orch db verify`, a backup, an export and an import) reads
+  `task_blob_refs` as well as `task_attachments` and `runs`, and owes the reconstruction of a split text
+  (the plan's "T10 task mapping (format v1)").
