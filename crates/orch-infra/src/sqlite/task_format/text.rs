@@ -5,14 +5,14 @@ use serde::{Deserialize, Serialize};
 /// The tag is an object in a string slot; arbitrary user strings cannot alias it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Tag {
+pub(in crate::sqlite) struct Tag {
     #[serde(rename = "$blob")]
     pub reference: Reference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Reference {
+pub(in crate::sqlite) struct Reference {
     pub sha256: String,
     pub bytes: u64,
     pub chunks: u64,
@@ -21,20 +21,22 @@ pub(super) struct Reference {
 /// One ordinal at one locator, including repeated references to the same hash.
 /// The SQL owner adds project, task and RFC 6901 locator to each row.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Chunk {
+pub(in crate::sqlite) struct Chunk {
     pub ordinal: u64,
     pub sha256: String,
     pub size: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum TextError {
+pub(in crate::sqlite) enum TextError {
     #[error("task text is not large enough for indirect storage")]
     Inline,
+    #[error("task object access failed: {0:?}")]
+    Access(std::io::ErrorKind),
     #[error(transparent)]
     Publish(#[from] BlobError),
     /// The adapter adds the task id and its known locator at the R140 boundary.
-    /// Never carry blob errors here: they may include filesystem diagnostics.
+    /// Never carry raw blob errors on reads: they may include filesystem diagnostics.
     #[error("stored task text failed {0}")]
     Corrupt(&'static str),
 }
@@ -44,7 +46,10 @@ type Result<T> = std::result::Result<T, TextError>;
 /// Publish complete immutable objects before the caller installs any rows.
 /// On failure, objects already published remain unreachable for the normal sweep.
 /// Split bytes, not characters: only reconstruction decodes UTF-8.
-pub(super) fn publish(store: &DiskBlobStore, bytes: &[u8]) -> Result<(Reference, Vec<Chunk>)> {
+pub(in crate::sqlite) fn publish(
+    store: &DiskBlobStore,
+    bytes: &[u8],
+) -> Result<(Reference, Vec<Chunk>)> {
     if bytes.len() <= INLINE_TEXT_MAX_BYTES {
         return Err(TextError::Inline);
     }
@@ -74,7 +79,7 @@ pub(super) fn publish(store: &DiskBlobStore, bytes: &[u8]) -> Result<(Reference,
 /// Validate structure before opening any object. Lengths from stored rows never
 /// determine an allocation: grow only from objects that the blob adapter verified.
 /// The caller separately verifies the `blobs` rows in the selecting transaction.
-pub(super) fn reconstruct(
+pub(in crate::sqlite) fn reconstruct(
     store: &DiskBlobStore,
     reference: &Reference,
     rows: &[Chunk],
@@ -108,9 +113,13 @@ pub(super) fn reconstruct(
             .sha256
             .parse::<BlobHash>()
             .map_err(|_| TextError::Corrupt("chunk hash syntax"))?;
-        let part = store
-            .get(&hash)
-            .map_err(|_| TextError::Corrupt("chunk object"))?;
+        let part = store.get(&hash).map_err(|error| match error {
+            BlobError::Io(error)
+            | BlobError::Confined(crate::data_dir::confined::ConfinedError::Io(error)) => {
+                TextError::Access(error.kind())
+            }
+            _ => TextError::Corrupt("chunk object"),
+        })?;
         if part.len() as u64 != row.size {
             return Err(TextError::Corrupt("chunk object size"));
         }
@@ -122,7 +131,7 @@ pub(super) fn reconstruct(
     Ok(bytes)
 }
 
-pub(super) fn reconstruct_text(
+pub(in crate::sqlite) fn reconstruct_text(
     store: &DiskBlobStore,
     reference: &Reference,
     rows: &[Chunk],
