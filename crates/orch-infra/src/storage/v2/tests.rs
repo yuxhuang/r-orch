@@ -1825,6 +1825,155 @@ fn retry_blob_path(dir: &Path, bytes: &[u8]) -> std::path::PathBuf {
         .join(hash)
 }
 
+struct RetryAsyncReadGuard {
+    store: crate::blob::DiskBlobStore,
+    executor: std::thread::ThreadId,
+    armed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl orch_core::store::blob::BlobStore for RetryAsyncReadGuard {
+    type Hash = crate::blob::BlobHash;
+    type Error = crate::blob::BlobError;
+    fn put(&self, bytes: &[u8]) -> std::result::Result<Self::Hash, Self::Error> {
+        self.store.put(bytes)
+    }
+    fn get(&self, hash: &Self::Hash) -> std::result::Result<Vec<u8>, Self::Error> {
+        if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+            assert_ne!(
+                std::thread::current().id(),
+                self.executor,
+                "blob read on async executor"
+            );
+        }
+        self.store.get(hash)
+    }
+    fn remove(&self, hash: &Self::Hash) -> std::result::Result<bool, Self::Error> {
+        self.store.remove(hash)
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn retry_selection_does_not_resolve_excluded_damaged_rows_on_both_references() {
+    use crate::blob::DiskBlobStore;
+    use crate::data_dir::confined::ConfinedDir;
+    for memory in [false, true] {
+        let root = root();
+        let dir = root.path().join("p-70");
+        std::fs::create_dir(&dir).unwrap();
+        let store = DiskBlobStore::open(&ConfinedDir::open(&dir).unwrap()).unwrap();
+        let armed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let storage = retry_backing(
+            memory,
+            root.path(),
+            RetryAsyncReadGuard {
+                store,
+                executor: std::thread::current().id(),
+                armed: armed.clone(),
+            },
+        );
+        let healthy = Retry {
+            error: "h".repeat(65_537),
+            ..retry("healthy", 1, 10)
+        };
+        let damaged = Retry {
+            error: "d".repeat(65_537),
+            ..retry("damaged", 1, 20)
+        };
+        let rows = [healthy.clone(), damaged.clone()];
+        storage
+            .transaction(owner("p"), Lane::Entities, move |u| {
+                for row in &rows {
+                    u.put_retry(row)?;
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let snap = storage.read(owner("p")).await.unwrap();
+        std::fs::remove_file(retry_blob_path(&dir, damaged.error.as_bytes())).unwrap();
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Deadline and page bounds must select before any excluded text is hydrated.
+        assert_eq!(
+            snap.read_due_retries(10, 10).await.unwrap().as_slice(),
+            std::slice::from_ref(&healthy)
+        );
+        assert_eq!(
+            snap.read_due_retries(20, 1).await.unwrap().as_slice(),
+            std::slice::from_ref(&healthy)
+        );
+        let page = snap.read_retries(None, 1).await.unwrap();
+        assert_eq!(page.rows.as_slice(), std::slice::from_ref(&healthy));
+        assert_eq!(
+            page.next,
+            Some(orch_core::store::retries::RetryCursor::after(&healthy))
+        );
+        assert!(snap.read_retry("damaged").await.is_err());
+        assert_eq!(
+            snap.read_retry("healthy").await.unwrap(),
+            Some(healthy.clone())
+        );
+        assert!(snap.read_retries(page.next.as_ref(), 1).await.is_err());
+        armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        storage
+            .transaction(owner("p"), Lane::Entities, move |u| {
+                assert_eq!(
+                    u.due_retries(10, 10)?.as_slice(),
+                    std::slice::from_ref(&healthy)
+                );
+                assert_eq!(
+                    u.due_retries(20, 1)?.as_slice(),
+                    std::slice::from_ref(&healthy)
+                );
+                let page = u.list_retries(None, 1)?;
+                assert_eq!(page.rows.as_slice(), std::slice::from_ref(&healthy));
+                assert_eq!(
+                    page.next,
+                    Some(orch_core::store::retries::RetryCursor::after(&healthy))
+                );
+                assert!(u.get_retry("damaged").is_err());
+                assert!(u.list_retries(page.next.as_ref(), 1).is_err());
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn retry_stored_text_unknown_fields_are_refused_for_single_and_chunked_objects() {
+    for chunked in [false, true] {
+        let root = root();
+        let storage = FileStorage::new(root.path());
+        storage
+            .transaction(owner("p"), Lane::Entities, |u| {
+                u.put_retry(&retry("t", 1, 10))
+            })
+            .await
+            .unwrap();
+        let path = root.path().join("p-70/state.json");
+        let mut doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut text = serde_json::json!({"sha256": "a".repeat(64), "extra": 1});
+        if chunked {
+            text["chunks"] = serde_json::json!(["b".repeat(64)]);
+        }
+        doc["retries"]["rows"]["t"]["error"] = text;
+        let before = serde_json::to_vec(&doc).unwrap();
+        std::fs::write(&path, &before).unwrap();
+        let reopened = FileStorage::new(root.path());
+        let error = reopened
+            .read(owner("p"))
+            .await
+            .err()
+            .expect("malformed mapping must fail at load");
+        assert_corruption(
+            error,
+            &path,
+            Corruption::Parse("did not match any variant of untagged enum StoredText"),
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}
+
 #[tokio::test]
 async fn retry_missing_and_corrupt_blobs_fail_all_read_paths_on_both_references() {
     use crate::blob::DiskBlobStore;

@@ -632,18 +632,37 @@ impl request_keys::RequestKeyWrite for View {
 #[async_trait]
 impl retries::RetryRead for View {
     async fn read_retry(&self, task: &str) -> Result<Option<retries::Retry>> {
-        self.project.retries.get(task)
+        let rows = self.project.retries.clone();
+        let task = task.to_owned();
+        retry_read(move || rows.get(&task)).await
     }
     async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<retries::Retry>> {
-        self.project.retries.due(now_ms, limit)
+        let rows = self.project.retries.clone();
+        retry_read(move || rows.due(now_ms, limit)).await
     }
     async fn read_retries(
         &self,
         after: Option<&retries::RetryCursor>,
         limit: usize,
     ) -> Result<retries::RetryPage> {
-        self.project.retries.page(after, limit)
+        let rows = self.project.retries.clone();
+        let after = after.cloned();
+        retry_read(move || rows.page(after.as_ref(), limit)).await
     }
+}
+
+// A disk-backed fake resolves retry blobs synchronously; keep that work off
+// the executor while retaining the snapshot's cloned state.
+async fn retry_read<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work).await.map_err(|error| {
+        StoreError::Backend(crate::Error::Io {
+            context: "cannot join memory reference retry read".into(),
+            path: None,
+            source: std::io::Error::other(error),
+        })
+    })?
 }
 
 impl retries::RetryWrite for View {

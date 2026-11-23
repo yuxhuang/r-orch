@@ -761,13 +761,21 @@ impl RequestKeyWrite for Session {
 #[async_trait]
 impl RetryRead for Session {
     async fn read_retry(&self, task: &str) -> Result<Option<Retry>> {
-        self.project.retries.get(&self.retry_text, task)
+        let rows = self.project.retries.clone();
+        let text = self.retry_text.clone();
+        let task = task.to_owned();
+        blocking(move || rows.get(&text, &task)).await
     }
     async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>> {
-        self.project.retries.due(&self.retry_text, now_ms, limit)
+        let rows = self.project.retries.clone();
+        let text = self.retry_text.clone();
+        blocking(move || rows.due(&text, now_ms, limit)).await
     }
     async fn read_retries(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage> {
-        self.project.retries.page(&self.retry_text, after, limit)
+        let rows = self.project.retries.clone();
+        let text = self.retry_text.clone();
+        let after = after.cloned();
+        blocking(move || rows.page(&text, after.as_ref(), limit)).await
     }
 }
 

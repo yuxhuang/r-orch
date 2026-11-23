@@ -709,6 +709,14 @@ pub async fn a_restore_keeps_every_retry_row(fixture: Fixture) {
 
 // No run or task entity exists: the retry owns the complete diagnostic.
 pub async fn retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run(fixture: Fixture) {
+    // Model two enqueue calls; the production caller remains T12's responsibility.
+    fn enqueue(u: &mut dyn UnitOfWork, row: &Retry) -> Result<bool> {
+        if u.get_retry(&row.task)?.is_some() {
+            return Ok(false);
+        }
+        u.put_retry(row)?;
+        Ok(true)
+    }
     let s = fixture.storage.clone();
     let mut inline = retry("inline", 1, 10);
     inline.error = "é".repeat(32_768);
@@ -721,11 +729,8 @@ pub async fn retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run(fix
     s.transaction(caller(P), Lane::Entities, move |u| {
         for row in &rows {
             assert!(u.get_retry(&row.task)?.is_none());
-            u.put_retry(row)?;
-            // T12 enqueue is get-before-put; a repeated enqueue keeps the first.
-            if u.get_retry(&row.task)?.is_none() {
-                u.put_retry(&retry(&row.task, 9, 99))?;
-            }
+            assert!(enqueue(u, row)?);
+            assert!(!enqueue(u, &retry(&row.task, 9, 99))?);
             assert_eq!(u.get_retry(&row.task)?, Some(row.clone()));
         }
         assert_eq!(u.due_retries(i64::MAX, 10)?, rows);
