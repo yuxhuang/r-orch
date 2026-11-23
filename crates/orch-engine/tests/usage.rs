@@ -366,6 +366,22 @@ async fn observation_leaves_the_legacy_token_record_unchanged() {
 }
 
 #[tokio::test]
+async fn opencode_tool_step_usage_reaches_the_observer_without_a_terminal_message() {
+    let line = include_str!("../../../fixtures/adapters/opencode/interrupted-tool-step.jsonl");
+    let (rig, recorder) = run_scripted("opencode", &[line.trim()], 1, TaskStatus::Failed).await;
+    let (run_id, usage) = recorder.only();
+    let run = rig.runs.peek(&run_id).expect("run");
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.tokens, None, "intermediate usage is not a legacy total");
+    assert_eq!(
+        counters(&usage),
+        [Some(400), Some(100), Some(0), Some(40), Some(0)]
+    );
+    assert_eq!(usage.model.as_deref(), Some("synthetic/model"));
+    assert_eq!(usage.adapter_version, None);
+}
+
+#[tokio::test]
 async fn without_an_observer_a_run_is_recorded_exactly_as_before() {
     let processes = ScriptedProcessManager::new(4713);
     let rig = Rig::new(
