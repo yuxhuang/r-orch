@@ -31,6 +31,7 @@ Authoritative docs:
 | What users see and how they install | [README.md](README.md) |
 | How to use every feature, step by step | [docs/manual/](docs/manual/README.md) (regenerate the command reference and screenshots with `docs/manual/tools/`) |
 | What changed per release | [CHANGELOG.md](CHANGELOG.md) |
+| Which releases lead to 2.0, and which platform they are built and qualified on | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §13 |
 | Why we chose X | [docs/decisions/](docs/decisions/) |
 | What a piece of work must do, and how we check it | [docs/specs/](docs/specs/) |
 | How and in what order we will build it | [docs/plans/](docs/plans/) |
@@ -66,6 +67,21 @@ Authoritative docs:
    and the reasoned-comment format of the two existing entries: why no replacement, what bounds the exposure.
    Until `SECURITY.md` exists, report a vulnerability you find to the owner privately (GitHub private
    vulnerability reporting or direct message), never in a public issue, PR title or PR body.
+10. **Linux only until 2.0.** By the owner's ruling of 2026-11-23, every release from 1.1 through 2.0 is
+    developed, tested, gated and qualified on Linux only: GitHub's Linux CI, Linux development hosts and the
+    Linux cold gate. No macOS check, Darwin or APFS row, macOS peer or hardware proof, or macOS suspend test
+    is required by a PR, a spec, a review or a release before 2.0, and none is run for them. The Linux
+    fenced-lease sleep/wake check stays: a supervised process through a real suspend and resume of an isolated
+    Linux host that the owner has authorized (spec R42, issue 110; pending, and nobody suspends a host without
+    the owner's permission). The injected-clock test proves renewal ordering only. A failure or gap
+    that occurs only on macOS is a GitHub issue in the
+    [After 2.0](https://github.com/yuxhuang/r-orch/milestone/20) milestone (unless triage assigns another),
+    not a blocker. A failure that Linux shows too is an ordinary Linux failure. This changes no code or CI and
+    removes no macOS code path; the second host for the peer check is a Linux host, and Linux CI, the review
+    rules and owner-only merges are unchanged. macOS compatibility is worked on after 2.0. Because macOS goes
+    unqualified, the README upgrade notes, the `CHANGELOG.md` entry and the release PR of every release through
+    2.0 say so (see Release). See ARCHITECTURE §13
+    and record K of the [SQLite storage spec](docs/specs/2026-11-20-sqlite-storage.md).
 
 ## Licensing
 
@@ -290,9 +306,9 @@ worker (never write its real name in this repository), may replace GitHub's suit
 clean tree at the exact PR head before and after, the pinned tools and configuration, a warm target unique to the
 worktree, the lease, complete logs, per-step exit status and the named test and doc-test inventory, and the PR links
 that record. Without that record,
-GitHub's run is the evidence. When `<linux-host>` or the Mac is unavailable, rely on GitHub's CI for an ordinary PR and
-report any macOS check that did not run as not run. This does not waive a platform's cold `full` run for a goal or
-release, and it does not change a live rule (above).
+GitHub's run is the evidence. When `<linux-host>` is unavailable, rely on GitHub's CI for an ordinary PR and
+say which local check did not run. Through 2.0 no macOS check is run or reported as not run (rule 10). This does
+not waive the cold `full` run on Linux for a goal or release, and it does not change a live rule (above).
 
 #### The cooperative lease (status: Q5 approved; implemented)
 
@@ -322,8 +338,9 @@ process handling or security-relevant code. It is not a superset of CI's `check`
 step reports `ENV-LIMITED` and the run exits 3 instead of passing, so run `cargo deny check` yourself. `--warm` reuses
 your `target/` and is not a gate. It runs on macOS and Linux.
 
-Say in the PR which platform each check ran on (macOS, Linux CI, `Linux (Docker linux/amd64)`, or a combination). A
-failure that also occurs on the base commit is still a failure. Report it as one; it is not a pass.
+Say in the PR which platform each check ran on (Linux CI, a Linux host, `Linux (Docker linux/amd64)`, or a
+combination); through 2.0 a macOS result is neither required nor a gate (rule 10). A failure that also occurs on
+the base commit is still a failure. Report it as one; it is not a pass.
 
 ### Linux checks on macOS (Docker)
 
@@ -373,7 +390,7 @@ cargo xtask linux clean                          # delete this checkout's target
   and Linux CI runs all 7. Under another emulator the probes decide: a behaviour it lacks skips nothing, and a new
   one shows up as an ordinary failure (see Reporting). `run` neither probes nor skips. Where `$HOME` gets written,
   `./xtask/gate.sh` cannot pass in the container (its home-hygiene step, and its test step skips nothing): run the
-  gate on macOS or on native Linux.
+  gate on native Linux; a macOS run is not required before 2.0 (rule 10).
 - **Reporting.** The run prints the commit, the tree, whether the tree was dirty and the base image digest. In the
   PR, name the platform `Linux (Docker linux/amd64)`, never "Linux CI", with the commit it ran at, `dirty no`,
   whether the run was native or emulated, and the tests it skipped. A failure seen only in the container is still a
@@ -425,9 +442,10 @@ request that meets no plan trigger needs no spec. Read [docs/specs/README.md](do
 - Every requirement has an acceptance check: a named test or an exact command, and the platform it runs on.
 - Fill in the security checklist for anything that listens on a socket, crosses a process boundary or handles
   untrusted text before building, not at the review gate.
-- List the verification environment (what needs Linux, a second host, a terminal other than tmux, a browser,
-  owner permission) and ask about it in the first approval request. Terminal behaviour is verified in tmux (see
-  TUI end-to-end tests).
+- List the verification environment (what needs Linux, a second Linux host, a terminal other than tmux, a browser,
+  owner permission) and ask about it in the first approval request. Through 2.0 the platform of every row is
+  Linux (rule 10): no row waits for macOS, and a macOS-only gap is an issue, not an `env-limited` row.
+  Terminal behaviour is verified in tmux (see TUI end-to-end tests).
 - `status: draft -> approved -> done | superseded`. The owner approves the requirements before the build
   starts. The lead may approve them only where the owner's request says so; quote that line in the spec's
   Source. Review findings that are real requirements become new rows.
@@ -588,9 +606,12 @@ docs/                 # ARCHITECTURE, RUNBOOK, TRAITS-FROZEN, specs/, plans/, de
 - **No real AI CLIs in tests.** Never exec `claude`, `codex`, `cursor-agent`, etc., and never read their config
   dirs. The gate's `no-real-cli` step puts shims on `PATH` and fails if any test reaches one.
 - **Run one crate:** `cargo test -p orch-peer`; one test: `cargo test -p orch-cli --test remote_peers <name>`.
-- **Portable by default.** Tests, fixtures and scripts run on macOS and Linux, or are marked Linux-only (and
-  then CI runs them). No GNU-only flags (`sed -i` without a suffix argument, `df -BG`, `date -Is`); no
-  `/proc` outside `#[cfg(target_os = "linux")]`. A test that fails on macOS is a bug to fix, not a "baseline".
+- **Portable by default.** Write tests, fixtures and scripts to run on macOS and Linux, or mark them Linux-only
+  (and then CI runs them). No GNU-only flags (`sed -i` without a suffix argument, `df -BG`, `date -Is`); no
+  `/proc` outside `#[cfg(target_os = "linux")]`. Through 2.0 only Linux is run and gated (rule 10): a test that
+  fails only on macOS is filed in the [After 2.0](https://github.com/yuxhuang/r-orch/milestone/20) milestone and
+  does not block a PR; it is not a "baseline" that excuses a Linux failure, and a failure that Linux shows too is
+  a bug to fix.
 - **Hermetic child processes.** A test that spawns a binary gives it its own temp root and a cleared or explicit
   environment. Runner variables (`CARGO_TARGET_DIR`, `TMPDIR`, wrapper `PATH`s) must not leak in. Keep
   scenario-heavy test files split by scenario group, so parallel work does not serialise on one file.
@@ -643,12 +664,15 @@ behaviour (hang-up, SIGHUP) stays on `portable-pty`, as in `crates/orch-cli/test
 ## Release
 
 1. Branch `chore/release-vX.Y.Z` from `main`. Do not use `release/vX.Y.Z`: the ruleset protects
-   `release/**`. Run the cold gate (`./xtask/gate.sh full`) on a platform it supports (see Verification tiers). Every
+   `release/**`. Run the cold gate (`./xtask/gate.sh full`) on Linux, the only platform required through 2.0 (see Verification tiers and rule 10). Every
    gate step must pass and the result must say `qualifying: yes`. Record the platform, the commit and the result in the PR.
 2. Set `workspace.package.version` in `Cargo.toml` (and let `Cargo.lock` update).
 3. In `CHANGELOG.md` rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add a fresh empty `## [Unreleased]`,
    and update the compare links at the bottom.
 4. Update README release notes (the "Upgrading" and "Known gaps" sections) if behaviour users must act on changed.
+   For every release from 1.1 through 2.0, whatever else changed, the README upgrade notes, the `CHANGELOG.md`
+   entry and the release PR each state that the release was qualified on Linux only and that macOS is untested
+   until after 2.0 (rule 10). Packaging, the Homebrew formula and the workflow are not changed for it.
 5. Commit `chore(release): X.Y.Z`, open the PR, CI green, owner merges (merge commit, per the convention).
 6. On `main`: `git tag -a vX.Y.Z -m "vX.Y.Z"` then `git push origin vX.Y.Z`.
 7. Create the GitHub release with notes copied from the CHANGELOG section:
