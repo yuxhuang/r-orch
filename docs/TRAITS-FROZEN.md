@@ -157,7 +157,10 @@ leave the operation unchanged; a callback error rolls back the entire unit of wo
 
 ### Additive v2 port: entities, paging and operational families (ADR 0017 decision 3; ADR 0020)
 
-Recorded from `crates/orch-core/src/store*` on `main` at `07b5f967`. This is the contract of the
+Recorded from `crates/orch-core/src/store*` on `main` at `07b5f967`: every public trait, trait method, type,
+constant and free function, and every public inherent method (the shared validators an adapter calls for parity
+are in the listings below, as one-line comments or as `fn` lines). The `test-support` fakes (`store::*::fake`) are
+not listed; they are the memory reference, not the contract. This is the contract of the
 spec's "Storage port v2", the amendments in it and ADR 0020. The v1 traits of the table above stay active, with
 their three rules, until T25 removes the product file adapter; nothing in this section is wired into the running
 daemon. Every operation below uses the enclosing caller's project (a key cannot select another), and none of them
@@ -264,6 +267,7 @@ The sorts each family offers are the spec's table: tasks `Position`, `Priority`,
 pub const MAX_DUE_RETRIES: usize = 1_000;
 pub const MAX_RETRY_ERROR_BYTES: usize = 64 * 1024;       // 65,536; today a refusal threshold, see "Approved" below
 pub struct Retry { pub task: String, pub attempt: u32 /* >= 1 */, pub due_at: i64 /* UTC ms, >= 0 */, pub error: String }
+                                              // Retry::validate(&self) -> Result<()>: attempt >= 1, due_at >= 0, error <= MAX_RETRY_ERROR_BYTES
 pub struct RetryCursor { pub due_at: i64, pub task: String }   // RetryCursor::after(&Retry); validate()
 pub struct RetryPage { pub rows: Vec<Retry>, pub next: Option<RetryCursor> }
 pub fn check_limit(limit: usize) -> Result<()>;           // 1..=MAX_DUE_RETRIES
@@ -295,6 +299,7 @@ pub enum IntentKind { ProcessStart, ProcessStop, WorkspaceRemove, BlobDelete }  
 pub enum IntentPayload {                      // serde tag "kind", deny_unknown_fields
     ProcessStart { run: String }, ProcessStop { run: String }, WorkspaceRemove { task: String }, BlobDelete { hash: String },
 }                                             // kind(), run(), validate()
+pub fn check_bound(value: usize) -> Result<()>;           // 1..=MAX_ROWS; the bound both backends apply to reads and deletions
 pub struct Intent { pub id: u64, pub payload: IntentPayload, pub created_at: i64, pub done_at: Option<i64> }
 pub enum FinishOutcome { Finished, AlreadyDone }
 trait IntentRead: Send + Sync {
@@ -313,6 +318,15 @@ trait IntentWrite: Send {
 pub const KEY_TTL_MS: i64 = 3_600_000;   pub const MAX_RESULT_BYTES: usize = 64 * 1024;   pub const MAX_ROWS: usize = 1_000;
 pub const MIN_KEY_BYTES: usize = 16;   pub const MAX_KEY_BYTES: usize = 128;   pub const MAX_OP_BYTES: usize = 128;
 pub struct RequestScope { /* identity, project, run, epoch, key */ }       // RequestScope::of(&Caller, key) -> Result<Self>
+                                              // identity() -> &str, project() -> &str, run() -> &str ("" for owner or worker),
+                                              // epoch() -> u64 (0 for owner or worker), key() -> &str,
+                                              // check_caller(&Caller) -> Result<()>: refuses a scope built for another caller
+// The shape checks both backends make before they read or change anything:
+pub fn check_key(key: &str) -> Result<()>;                // MIN_KEY_BYTES..=MAX_KEY_BYTES of A-Z a-z 0-9 _ -
+pub fn check_request(op: &str, req_sha256: &str, now_ms: i64) -> Result<()>;   // op 1..=MAX_OP_BYTES of A-Z a-z 0-9 . _ -; 64 lowercase hex; check_now
+pub fn check_now(now_ms: i64) -> Result<()>;              // UTC milliseconds, not before the epoch
+pub fn expires_at(now_ms: i64) -> Result<i64>;            // checked now_ms + KEY_TTL_MS
+pub fn check_bound(value: usize) -> Result<()>;           // 1..=MAX_ROWS, the bound on one expiry call
 pub enum KeyCheck { New, Replay(String), ReplayWithoutResult, Mismatch }
 trait RequestKeyWrite: Send {
     fn check_request_key(&self, scope: &RequestScope, op: &str, req_sha256: &str, now_ms: i64) -> Result<KeyCheck>;
@@ -327,13 +341,23 @@ pub enum DiskSubject { DataDirectory, ProjectWorkspaces { project: String } }
 pub enum AttentionFacts {
     DiskFloor { subject: DiskSubject, free_bytes: u64, floor_bytes: u64 },
     DispatchOffWithWork { waiting_tasks: u64, oldest_waiting_at: i64 },
-}
+}                                             // kind() -> AttentionKind, validate(&self, project: &str, at: i64) -> Result<()>
+                                              // (scope and facts, checked before even a duplicate-open lookup),
+                                              // subject_id() -> String (the uniqueness key within kind and scope),
+                                              // severity() -> Severity, title() -> &'static str,
+                                              // detail() -> Result<String>, remedy() -> Result<&'static str> (both recheck ids)
 pub struct Acknowledgement { pub identity: String, pub at: i64 }
 pub enum ResolutionReason { DiskSpaceRecovered, DispatchEnabled, NoDispatchableWork }
+                                              // validate(self, kind: AttentionKind) -> Result<()>: refuses a reason of another kind
 pub struct Resolution { pub reason: ResolutionReason, pub at: i64 }
 pub struct Attention { pub id: u64, pub facts: AttentionFacts, pub opened_at: i64,
                        pub acknowledgement: Option<Acknowledgement>, pub resolution: Option<Resolution>, pub revision: Revision }
-pub enum AttentionFilter { All, Open, Resolved }   pub struct AttentionCursor { /* project, filter, last id */ }
+                                              // check_transition_time(&self, at: i64) -> Result<()>: refuses a time before the last of opened, acknowledged, resolved
+pub enum AttentionFilter { All, Open, Resolved }   // matches(self, &Attention) -> bool
+pub struct AttentionCursor { /* project, filter, last id */ }   // after(project: &str, filter, id: u64) -> Self; check(&self, project, filter) -> Result<u64>
+pub fn check_id(id: &str) -> Result<()>;                  // 1..=128 of A-Z a-z 0-9 _ -
+pub fn check_time(at: i64) -> Result<()>;                 // UTC milliseconds, not before the epoch
+pub fn check_limit(limit: usize) -> Result<()>;           // 1..=MAX_ATTENTION_PAGE (store::attention's; retries has its own)
 pub struct AttentionPage { pub items: Vec<Attention>, pub next: Option<AttentionCursor> }
 trait AttentionRead: Send + Sync {
     async fn read_attention(&self, id: u64) -> Result<Option<Attention>>;
@@ -369,8 +393,9 @@ is wired into the daemon. The only `BlobStore` adapter in 1.1 is `orch_infra::bl
 #### Approved for issue 109, not on `main` until its closing PR merges (ADR 0020)
 
 These three changes are decided and are recorded here so a consumer can build to them. Each is an addition: no
-signature above changes, and nothing is removed. Until the PR lands, the signatures above are the whole truth, and
-`main` still refuses a retry `error` over 65,536 bytes.
+signature above changes, and nothing is removed. Until the PR lands, the signatures above are the whole truth for
+the public traits, types, constants, free functions and methods of `orch_core::store` (the `test-support` fakes
+are not part of the contract and are not listed), and `main` still refuses a retry `error` over 65,536 bytes.
 
 ```rust
 // store::page

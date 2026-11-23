@@ -91,10 +91,11 @@ reconciliation (#196) landed and #130 closed:
    object left unreferenced by an interrupted or rolled-back write follows the blob store's existing lifecycle (a
    sweep may remove it). The physical encoding of the mapping is the reference adapters' and T10's to choose; this
    decision fixes what it must hold and when it is checked, not its bytes.
-5. **The frozen record follows the landed port.** `docs/TRAITS-FROZEN.md` records every v2 signature that is on
-   `main`, including the `ReadSnapshot` and `UnitOfWork` supertraits and the expected revision that `update`,
-   `delete` and `move_to_end` take, and the three additions above once they land. The 1.0 traits stay active and
-   unchanged until T25 removes the product file adapter.
+5. **The frozen record follows the landed port.** `docs/TRAITS-FROZEN.md` records every public v2 trait, trait
+   method, type, constant, free function and inherent method of `orch_core::store` that is on `main` (the
+   `test-support` fakes are not listed), including the `ReadSnapshot` and `UnitOfWork` supertraits and the expected
+   revision that `update`, `delete` and `move_to_end` take, and the three additions above once they land. The 1.0
+   traits stay active and unchanged until T25 removes the product file adapter.
 6. **Verification names follow the tests.** The spec's rows for R7, R117 and the caller part of R132 name the
    bare filters the tests have, with the registrations each must select. A representative selection of them is
    pending until the PR that closes #109 runs it. R8 to R15 and R97 keep the inventory that the #130 crosswalk

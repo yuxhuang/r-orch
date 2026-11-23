@@ -176,8 +176,9 @@ adds three contracts to the port (`Filter::PendingMessages`, `Sort::Attempt` and
 store) in "T8 consumer-contract amendment (issue 109)" under "Storage port v2", in
 [ADR 0020](../decisions/0020-storage-consumer-contracts.md). It corrects the spelling of the entity operations
 (`update`, `delete` and `move_to_end` take the expected revision), replaces `run_no` with `attempt` in the sorts table,
-and names the real test filters of R7, R117 and the caller part of R132. `docs/TRAITS-FROZEN.md` now records every v2
-signature on `main`. None of the three contracts is on `main` yet, and no test of them has been run. The third,
+and names the real test filters of R7, R117 and the caller part of R132. `docs/TRAITS-FROZEN.md` now records
+every public v2 trait, trait method, type, constant, free function and inherent method of `orch_core::store` on
+`main` (the `test-support` fakes are not listed). None of the three contracts is on `main` yet, and no test of them has been run. The third,
 whole retry text, includes the chunk mapping for text above one 64 MiB blob object (ADR 0020 decision 4). No
 independent review had read this revision when it was written.
 
