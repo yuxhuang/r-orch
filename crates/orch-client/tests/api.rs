@@ -19,6 +19,7 @@ use orch_proto::ops::{Request, results};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::future::Future;
+use std::os::unix::fs::DirBuilderExt;
 use tokio::io::{BufReader, DuplexStream, ReadHalf, WriteHalf};
 use tokio::task::JoinHandle;
 
@@ -45,7 +46,10 @@ where
     Fut: Future<Output = ()> + Send + 'static,
 {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join(".orchestry")).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.path().join(".orchestry"))
+        .unwrap();
     let project = Project::discover(dir.path(), None).unwrap();
     let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
     let task = tokio::spawn(async move {
