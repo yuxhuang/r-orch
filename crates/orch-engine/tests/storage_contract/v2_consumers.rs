@@ -262,10 +262,7 @@ pub async fn run_attempt_order_is_numeric_task_scoped_and_keeps_default(b: Backe
     .await;
     assert_eq!(ids(&filtered), ["max", "ten-a", "ten-z", "two", "one"]);
     let default = list(s, owner("p"), &filter, &PageRequest::default()).await;
-    assert_eq!(
-        ids(&default),
-        ["one", "two", "ten-a", "ten-z", "max", "other-agent"]
-    );
+    assert_eq!(ids(&default), ids(&page));
     let all = list(
         s,
         owner("p"),
@@ -273,7 +270,18 @@ pub async fn run_attempt_order_is_numeric_task_scoped_and_keeps_default(b: Backe
         &PageRequest::default(),
     )
     .await;
-    assert_eq!(ids(&all)[0], "other-task");
+    assert_eq!(
+        ids(&all),
+        [
+            "other-task",
+            "one",
+            "two",
+            "ten-a",
+            "ten-z",
+            "max",
+            "other-agent"
+        ]
+    );
 }
 
 pub async fn run_attempt_pages_keep_snapshot_and_bind_every_query_field(b: Backend) {

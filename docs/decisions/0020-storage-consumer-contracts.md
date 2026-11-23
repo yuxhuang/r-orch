@@ -26,7 +26,7 @@ reference conformance reconciliation (#196) landed and #130 closed:
   message whose expiry equals the clock is still pending, and an expiry that is not a date is compared as text,
   never parsed. A consumer that filtered a page client-side could miss every match on a page of rejected rows.
 - **Per-task run order.** The port's `Sort` has no run order. The runs list defaults to `started_at` descending then
-  id. The spec's table promised "per task: `run_no`", but `Run` has no `run_no`: it carries `attempt: u32`, and the
+  id (PR #225 later made the default of a task-filtered list the numeric attempt order; see decision 2). The spec's table promised "per task: `run_no`", but `Run` has no `run_no`: it carries `attempt: u32`, and the
   schema's `run_no` and `attempt_no` columns are T10's.
 - **Retry text.** `Retry::validate` refuses an `error` over 65,536 bytes
   (`crates/orch-core/src/store/retries.rs`). The spec's R97 requires text over 64 KiB, written through the API or
@@ -54,11 +54,14 @@ reference conformance reconciliation (#196) landed and #130 closed:
    matches. A cursor binds the recipient, the captured `now`, the sort and the project, so a cursor used with
    another `now` or recipient is refused. Order is the messages' default (`created_at`, `position`, id), and the
    family's other sorts are as for `Filter::Messages` (`Default` and `Id`).
-2. **Per-task run order is `Sort::Attempt`, and only there.** Add `Sort::Attempt`. It is offered only with
+2. **Per-task run order has an explicit sort, `Sort::Attempt`.** Add `Sort::Attempt`. It is offered only with
    `Filter::Runs { task: Some(_), .. }` (an `agent` filter may accompany it) and orders by `Run.attempt`
    numerically, descending, then the run id's bytes ascending. It is refused as `InvalidPage` before any paging
-   work for `Runs` with no task, for every other family and for every other filter. `Sort::Default` for runs is
-   unchanged (`started_at` descending, then id), so no existing caller changes. The spec's `run_no` in the sorts
+   work for `Runs` with no task, for every other family and for every other filter. The default of a run list whose
+   filter names a task is the same key, but it is not decided here: PR #225 and the spec's "Run and goal default
+   order" (the lead's decision of 2026-11-23) settled it, so `Attempt` is the explicit form of the order that list
+   already has by default, and the two are different sorts for a cursor. `Sort::Default` for a run list with no task
+   stays `started_at` descending, then id, so no caller of an untasked list changes. The spec's `run_no` in the sorts
    table is corrected to this: the port's number is `Run.attempt`, not a schema column.
 3. **A retry owns its whole `error` text.** This is the lead's decision of 2026-11-23, option A of the two put to
    it, taken under goal decision 7, R97 and ADR 0017 decision 11. `Retry` keeps its shape, and
@@ -188,8 +191,8 @@ reference conformance reconciliation (#196) landed and #130 closed:
   text. Superseded by the paging design that read `message.rs`.
 - **Order runs by the run id.** Ids are text, so `run_10` sorts before `run_2`. Rejected: no lexical stand-in for a
   number.
-- **Reuse `started_at` for a per-task order, or add a `run_no` to `Run`.** The first is the default and answers a
-  different question (newest first, equal times by id). The second changes the domain type and the wire for a
+- **Reuse `started_at` for a per-task order, or add a `run_no` to `Run`.** The first is the order of every run list with no
+  task and answers a different question (newest first, equal times by id). The second changes the domain type and the wire for a
   number the schema may derive. Neither is needed.
 - **Option B for retry text: a capped diagnostic with the whole text kept elsewhere.** It would waive R97 for one
   field, needs an express owner amendment, and must keep the full text for a retry whose run row is gone, with its
@@ -213,7 +216,7 @@ reference conformance reconciliation (#196) landed and #130 closed:
   that match them exhaustively must handle them. The 1.1 protocol is not published yet, so no frozen wire changes.
 - A SQLite adapter must keep lexical semantics for both the expiry comparison and the attempt tie-break: the
   statement compares text under the binary collation, and an index that orders `attempt` descending then id
-  ascending serves `Sort::Attempt`. For imported runs whose 1.0 attempt repeats within a task (the spec's
+  ascending serves `Sort::Attempt` and the same key as the default of a task-filtered run list. For imported runs whose 1.0 attempt repeats within a task (the spec's
   `attempt_no` uncounted case), T10 must serve the 1.0 number that the entity returns as `Run.attempt`, with the id
   breaking ties. Which column holds it is T10's.
 - Retry rows may now reference blobs, and above 64 MiB many of them. A backup, a restore and an export must carry

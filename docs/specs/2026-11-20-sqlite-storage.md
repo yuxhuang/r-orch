@@ -185,6 +185,12 @@ T14, T21 and T23. The third, whole retry text, includes the chunk mapping for te
 0020 decision 4). This spec records the test names and what each shows, not their results: a result is a receipt of
 the PR that carries the change. No independent review had read this revision when it was written.
 
+This revision also carries two sets of wording that alter no rule. After the landing of PR #225 (squash `af0d43acd`) it
+names what that PR carried, tells the task-filtered run default from the explicit sort `Sort::Attempt`, and says why the
+default of that list is not a 1.0 order ("Storage port v2", the table of default orders and "Run and goal default
+order"; issue 228). It also states how an importer names a template and what stops the import when a template name or
+body is not UTF-8 ("Import rules", "Import problem classes", R99; issue 192).
+
 ## Source
 
 Verbatim excerpts of the owner's request as recorded in the goal "orch 2.0 phase 1: SQLite storage (release
@@ -460,7 +466,7 @@ holds them.
 | R96 | An agent process shall not run its agent unless the run's pid and start time were committed first: the daemon shall create the process held, commit, then release it, and a held process whose daemon is gone shall exit without running the agent. | review finding (a stop between starting a process and recording it left an untracked agent on a workspace that recovery would hand to a second run) | must | `crates/orch-engine/tests/transactions.rs::a_stop_between_spawn_and_commit_runs_no_agent`, `crates/orch-infra` process test `held_process_exits_when_its_parent_is_gone`; both |
 | R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. | B7; review finding | must | `text_over_64_kib_round_trips_through_the_blob_store` in `storage_conformance` checks whole values on entity references; `storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store` in the `orch-infra` library pins file row hashes and disk bytes, with `inline_threshold_counts_utf8_bytes_and_preserves_empty_values`. Retry rows were not covered on `main` at `07b5f967`, which refused text over 65,536 bytes; this change covers them by the tests that "T8 consumer-contract amendment (issue 109)" names (65,536 and 65,537 bytes in `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, registered as `memory_retries_v2`, `blob_memory_retries_v2` and `file_retries_v2`; and 67,108,864 and 67,108,865 bytes, a character split across a chunk boundary, a failed publication, a failure on a later chunk, a missing and a corrupt blob and chunk, a reordered chunk, repeated chunks, a rollback that leaves published bytes unreferenced and a one-object row of the documented form in `storage::v2::tests::retry_*` of the `orch-infra` library, each run with `-- <name> --exact` and required to execute one test; a retry with no run is in the first, a restore of 67,108,865 bytes with no run is in `retry_chunked_text_survives_restore_without_a_run`, and a reordered chunk of the disk-backed fake is in the private unit test `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read`). SQLite backing assertions: T10; importer backing assertions: T21 (pending, no executable import filter yet); Linux |
 | R98 | Reads shall be served by a pool of `storage.read_connections` connections (default 4); a read that finds none free shall wait up to the admission deadline and then fail with `overloaded`, never open another connection. | B6; review finding | should | `sqlite_writer::reads_wait_for_a_free_connection_then_fail_overloaded`; both |
-| R99 | `orch import` shall account for every entry of the source `.orchestry/` and of each directory that "Import rules" has it list: each is imported, or left in place as "Import rules" lists, or named by the dry run and by the import's report as not imported; a directory it does not enter is one entry. Project prompt template files shall become `templates` rows, byte for byte. | N, S2, B2 | must | `import::every_source_path_is_accounted_for` (a corpus with an unknown file and an unknown directory), `::templates_are_imported_byte_for_byte`; both |
+| R99 | `orch import` shall account for every entry of the source `.orchestry/` and of each directory that "Import rules" has it list: each is imported, or left in place as "Import rules" lists, or named by the dry run and by the import's report as not imported; a directory it does not enter is one entry. Project prompt template files shall become `templates` rows, byte for byte. | N, S2, B2 | must | `import::every_source_path_is_accounted_for` (a corpus with an unknown file and an unknown directory), `::templates_are_imported_byte_for_byte`, `::a_template_that_is_not_utf8_text_is_refused_before_any_write` (prospective: the issue 192 importer caller writes it, and no such test is on `main`); both |
 | R100 | `orch db restore` shall refuse, changing nothing, while a process that the replaced state or the backup records as a run's is alive (pid and start time), naming each run and pid and which of the two records it. With `--stop-runs` it shall first stop the process groups that the replaced state records, which this daemon wrote in this data directory. It shall never signal a process because a backup records it: such a process keeps the restore refused until it has ended or the owner names its run with `--assume-stopped <run id>`. No waiting period shall stand in for either: a run's process in 1.1 keeps no deadline of its own (R42), so the passing of time never shows that an earlier holder has stopped. After a restore no lease of the backup shall be active: each is ended and its run closed as R41 closes a run whose process is gone, and the spool of the replaced state (R129) is set aside with it. | G9; the lease prototype and its review (a restore that frees every task at once lets a holder from the replaced state and a new one work on one task); the security re-review's condition S2-C2 (a pid and a start time do not show who wrote a backup); the review of the prototype's corrections, N1 (its waiting-period alternative holds only where a holder stops itself, which arrives in 1.5); AP14 | must | `crates/orch-cli/tests/restore_fencing.rs::restore_refuses_while_a_recorded_process_is_alive`, `::stop_runs_stops_only_what_the_replaced_state_records`, `::a_process_only_the_backup_records_is_never_signalled` (a fake process table records every call), `::assume_stopped_lets_the_restore_proceed_for_the_named_run`, `::restored_leases_are_ended`; both |
 | R101 | No path component below the data directory, below the data home's `projects/`, in a backup or in an export shall be taken from an id, a key, a name or a path that a request, an import source, a backup's manifest or a database row supplied: each shall be a fixed name, 64 lower-case hex digits of a SHA-256 the daemon computed, the leading two hex digits of such a hash as a shard directory, or a name the daemon generated, as "Filesystem names" lists them. A run's event file shall be named by the whole hash defined there, and a hash read from a row shall select a file only after it parses as 64 lower-case hex digits. A name found in a hashed directory that has not its form shall be reported by `orch db verify` and never opened or deleted. | security review S2 (the layout `blobs/events/ab/<run id>` left the data directory for the run id `../../../../outside-canary`) | must | In 1.1, R129's tests of the finish file, the one file that 1.1 names from a run id: `crates/orch-infra/tests/fs_names.rs::the_finish_file_name_is_the_whole_hash_for_any_run_id`, `crates/orch-engine/tests/leases.rs::a_finish_is_spooled_and_removed_under_its_hash_name_for_any_run_id` and `::recovery_reaches_a_spooled_finish_under_its_hash_name_for_any_run_id` (the finish-file vectors of "Filesystem names": traversal-shaped and absolute run ids, one holding a NUL, one holding a separator, `..`, and the two ids split at another point; an outside canary is unchanged through the write, the recovery and the removal). `crates/orch-infra/tests/event_files.rs::the_file_name_is_the_whole_hash_for_any_run_id` (the same inputs on the event file's name and path) and `::read_tail_and_prune_reach_only_the_hashed_file` are due only with the event fallback, which 1.1 does not build (R63). Also `crates/orch-infra/tests/blob_store.rs::a_hash_that_is_not_64_hex_digits_is_refused_and_touches_nothing`, `maintenance::a_stray_name_in_the_blob_tree_is_reported_and_not_deleted`; `git grep -nE 'std::fs::\|tokio::fs::\|PathBuf' crates/orch-infra/src/blob crates/orch-infra/src/import crates/orch-infra/src/sqlite/backup*` prints nothing, so that only the module of R102 builds a name below a root; both |
 | R102 | Every create, open, rename and delete of a file below the data directory, below the data home's `projects/`, in a backup and in an import source, and every write of `.orch-project` and of the authored files in the project directory, shall go through one module that reaches its file by directory descriptors opened from its root, one name at a time and following no link. The module shall refuse a name that is empty, `.`, `..` or holds a separator or a NUL; shall create a file exclusively with mode 0600 below the data directory (0644 for `.orch-project`) and a directory with 0700; shall judge an entry by the descriptor it has just opened, never by an earlier look at the name; and shall refuse, with a typed error and no change inside or outside the root, a symbolic link and an entry that is neither a regular file nor, where the layout expects one, a directory. A file with more than one hard link shall be refused in an import source, in a backup being restored, and wherever a file is opened to be appended to or changed in place. The files SQLite opens itself and the socket are the exceptions that "Filesystem names" states. | security review S2 | must | `crates/orch-infra/tests/confined_dir.rs::a_symlink_at_any_level_is_refused_and_not_followed`, `::a_name_that_is_not_one_component_is_refused`, `::a_hard_link_is_refused_for_append_and_in_untrusted_trees`, `::a_fifo_and_a_socket_are_refused_without_blocking` (the test has a time limit), `::an_entry_swapped_after_the_listing_is_judged_by_its_descriptor`, `::rename_replaces_a_planted_link_and_never_follows_it`, `::rename_and_delete_stay_inside_the_root` (outside canary), `::new_files_are_exclusive_and_0600` (permissive umask), `blob_store::a_planted_link_in_the_blob_tree_is_refused`, `event_files::a_planted_link_is_refused_on_append_read_and_prune` (needs an event file: due only with the event fallback, which 1.1 does not build, R63); both |
@@ -721,17 +727,63 @@ from the caller's clock; the port reads none.
   T15's.
 
 Each list has a fixed set of sorts. The default sort of a list is its 1.0 order, served by an index, and
-deliverable B confirms each line. Every list also offers the sort `id`, whose values never change (R49):
+deliverable B confirms each line, with two exceptions that the lead's decision of 2026-11-23 made on purpose. The
+default of a run list whose filter names a task (numeric `attempt` descending) is not a 1.0 order. The way a goal's
+absent `updated_at` is told from a present empty one is not 1.0's either: 1.0 sorted an absent value as the empty text.
+Both are settled in "Run and goal default order" below. Every list also offers the sort `id`, whose values never
+change (R49):
 
 | List | Default order | Other sorts |
 |---|---|---|
 | tasks | status rank, `updated_at` descending, `position` | `position`, `priority`, `created_at`, `updated_at` |
 | agents | `position` | `name` |
-| goals | status rank, `updated_at` descending, `position` | `created_at` |
+| goals | status rank, a present `updated_at` before an absent one (a present empty text is present), the original `updated_at` text descending, `position`, `id` ("Run and goal default order" below) | `created_at` |
 | messages | `created_at`, `position` | none. `Filter::PendingMessages` (ADR 0020) lists with this default order |
 | context entries | `key` | none |
 | teams | `created_at`, `id` (1.0's order came from the filesystem and was not a contract) | `name` |
-| runs | `started_at` descending, `id` (1.0 broke equal start times by directory order, which was not a contract) | per task: `attempt` (`Sort::Attempt`: `Run.attempt` numerically descending, then id bytes ascending; only for `Filter::Runs` with a task, ADR 0020). `Run` has no `run_no` field |
+| runs | `started_at` descending, `id` (1.0 broke equal start times by directory order, which was not a contract); when the filter names a task, with or without an `agent` filter beside it: `attempt` numerically descending, then `id` ("Run and goal default order" below) | when the filter names a task: `attempt` (`Sort::Attempt`, below). `Run` has no `run_no` field |
+
+**Run and goal default order.** These two rows are settled by the lead's decision of 2026-11-23.
+
+- *Run key.* The default order of runs depends on the filter and on nothing else. A filter that names a task, alone or
+  beside an `agent`, selects the numeric `attempt` of the run, descending, then the identity by bytes. A list with no
+  task in its filter (all runs, or one agent's) keeps the original text of `started_at`, descending, then the identity
+  by bytes. The explicit sort `id` is always the identity ascending, with any filter. A page's cursor continues the key
+  of the order that produced it, so a task-filtered page resumes by attempt. The explicit sort `Sort::Attempt` (ADR
+  0020; "Per-task run order" under "T8 consumer-contract amendment") orders by this same key and is offered only when
+  the filter names a task, so for such a list the default and `Attempt` list the same rows in the same order. They
+  are still two sorts, and a cursor binds the sort as it was requested. For a list with no task `Attempt` is refused
+  as `InvalidPage`, and the default is the `started_at` key.
+- *Attempts in numeric order.* For one task's runs, attempts 2, 10 and 10 are listed 10, 10, 2, the two tens in the
+  byte order of their ids, whatever the order of creation; a text order would put 2 first. The value is the run's
+  `attempt`; it is never taken from `attempt_no`, from `position` or from `run_no`. How SQLite stores and indexes it is
+  the migration's (T10).
+- *Goal key.* The default key compares, in turn: the status rank (active, paused, achieved, abandoned); the presence of
+  `updated_at`, a present value first and a present empty text counting as present; the original text of `updated_at`,
+  descending; `position` ascending; and the identity by bytes. A goal with an absent `updated_at` is therefore never
+  tied with one whose `updated_at` is the empty text, and an absent value is never read as the empty text. The cursor
+  resumes the same key.
+- *Text is compared as written.* A time that a list orders by is compared by the bytes of the original string. Two
+  strings of one instant are two keys, an opaque string is a key, and an offset string does not sort by its instant.
+- *One contract for the references and SQLite.* The memory reference, the file reference and the SQLite adapter shall
+  implement the run key and the goal key above and pass the same shared scenarios in
+  `crates/orch-engine/tests/storage_contract/v2_paging.rs`: `message_and_run_filters_stay_within_their_family` and
+  `declared_secondary_sorts_use_values_then_tie_breakers`. Each walks size-one pages to the exhausted cursor and checks
+  the total count. The run scenario uses attempts 2, 10 and 10 whose timestamps, insertion order and ids disagree with
+  the attempt order, rows of another task and of another agent, and the task-and-agent, task-only, agent-only,
+  unfiltered and explicit `id` queries. The goal scenario mixes every status with an absent, an empty and a non-empty
+  `updated_at`, equal texts whose positions and ids disagree with each other, and the status-filtered, `created_at` and
+  `id` queries.
+- *Contract and qualification are different things.* The text of this section is the contract. That a reference meets
+  it is shown only by those two scenarios passing on it, and that SQLite meets it only by the registration of the same
+  scenarios on SQLite passing. PR #225 (squash `af0d43acd`, 2026-11-23) carried the reference code, the strengthened
+  scenarios and the first text of this section together. The memory fake, its queued variant and the file reference meet
+  the contract: the two scenarios are registered once and run as `memory_v2`, `queued_memory_v2` and `file_v2`
+  (three registrations each), and hosted Linux check and test succeeded on the head of PR #225 and on the cumulative
+  `main` push. A reference that disagrees with this section is a defect of the reference. The goal rule needed a code
+  change in the file reference only: the memory fake already told a present empty `updated_at` from an absent one,
+  and the run key changed in both. Nothing here shows SQLite. T10 registers the same two scenarios on SQLite, and
+  until they pass there this section is only the contract that SQLite has to meet.
 
 The engine calls `move_to_end` only at the call sites deliverable B lists as observable. Until that list
 exists the rule is: wherever 1.0 saved a task, agent, goal or message.
@@ -778,13 +830,16 @@ nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or
 - **Per-task run order.** `Sort::Attempt` is offered only for `Filter::Runs { task: Some(_), .. }`. It orders by
   `Run.attempt` as a number, descending (10 before 2 before 1, and `u32::MAX` first), and breaks ties by the run id's
   bytes ascending. It is refused as `InvalidPage` for `Runs` with no task, for any other family and for any other
-  filter, before paging. `Sort::Default` for runs stays `started_at` descending then id, so no caller changes.
+  filter, before paging. It is the explicit form of an order that the default already gives: `Sort::Default` for a run
+  list whose filter names a task is the same key ("Run and goal default order" above, PR #225), while `Sort::Default`
+  for a run list with no task stays `started_at` descending then id, so no caller of an untasked list changes.
   The port's number is `Run.attempt`: `Run` has no `run_no`, and the schema's `run_no` (a per-task start order) and
   `attempt_no` columns are T10's. For an imported run whose 1.0 attempt repeats within its task (stored uncounted,
   "Import rules"), the adapter must still return and sort by the 1.0 number it returns as `Run.attempt`; which
   column holds it is open for T10 and is not decided here. Tests, in the same three registrations:
   `run_attempt_order_is_numeric_task_scoped_and_keeps_default` (10 before 2 before 1, `u32::MAX` first, equal attempts
-  by id, another task and another project excluded, an `agent` filter, and `Sort::Default` unchanged),
+  by id, another task and another project excluded, an `agent` filter, `Sort::Default` for the task-filtered list equal
+  to the `Sort::Attempt` order, and `Sort::Default` for a list with no task still `started_at` descending),
   `run_attempt_pages_keep_snapshot_and_bind_every_query_field` (a snapshot walk that a delete and an insert do not
   disturb, the count, and a cursor refused for another task, another agent filter, another sort and another project)
   and `run_attempt_sort_refuses_every_unscoped_or_other_family_filter` (`InvalidPage` for runs with no task, for
@@ -2212,7 +2267,7 @@ The new operations are in no MCP allowlist.
 
   | Class | The import |
   |---|---|
-  | A document it cannot read: it does not parse, or does not fit its type | Stops, naming the file |
+  | A document it cannot read: it does not parse, or does not fit its type; a template whose name or bytes are not UTF-8 | Stops, naming the file |
   | An input or output error while a source file is read, after an interrupted read has been tried again | Stops, naming the file. Never read as a missing file or as `index_unreadable` |
   | A `config.yml` whose stream holds no document (the budget row below), or whose one document is not a mapping (the first row) (R70) | Stops, naming the file and saying that 1.0 read it as its defaults (F18). Drafted from the defaults of T21-C1 and T21-C2; for a scalar or a sequence the stop is not new |
   | No `config.yml` (R70) | Goes on as the empty mapping; no problem is listed |
@@ -2244,7 +2299,7 @@ The new operations are in no MCP allowlist.
   | `state.json` | Retry rows and counters; in-flight entries closed | Unused |
   | `config.yml` | Settings, and `legacy.config` for unknown keys (R70) | Unused |
   | `attachments/<task>/` | Blobs and `task_attachments` rows; the directory is matched to a task and each file to the task's list by listed name, and the original file name is a column | Unused |
-  | `templates/*.md` | `templates` rows named by the file stem, byte for byte; a file over 64 KiB stops the import by name | Unused. As in 1.0 the engine does not read them (F11); `orch init` stores the `default` row where 1.0 wrote the file |
+  | `templates/*.md` | `templates` rows named by the file stem, byte for byte; the stem is the entry's name without its last three bytes `.md` and may be empty; a stem or a file that is not UTF-8 stops the import as a file it cannot read; a file over 64 KiB stops the import by name | Unused. As in 1.0 the engine does not read them (F11); `orch init` stores the `default` row where 1.0 wrote the file |
   | `workspace-exclude`, `.gitignore` | Not imported | Used in place: authored files of the project directory, which `orch init` still writes |
   | `workspaces/` | Not imported; listed one level for its names alone, which R117 compares with the task ids; no entry opened or entered | Used in place (AP6), found by task id as R106 says, and only once R118 has shown the directory to be that task's |
   | `remotes.yml`, `remotes/`, `peer-id` | Not imported | orch-peer's own files, used in place |

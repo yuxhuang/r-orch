@@ -1,0 +1,1 @@
+One file per release note: `<slug>.<kind>.md`, one line. See AGENTS.md, "Changelog fragments", and the contract in `docs/specs/2026-11-23-changelog-fragments.md`. Keep this file when assembling releases.

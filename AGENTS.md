@@ -18,7 +18,7 @@ The repo is **public**.
 | `orch-peer` | Remote-peer protocol: links, mirrors, reconnect. |
 | `orch-cli` | clap command tree, human and `--json` rendering, serve mode, `orch web`, `orch mcp` (stdio MCP server, `src/mcp/`). Binaries live here. |
 | `orch-tui` | ratatui dashboard. |
-| `xtask` | Dev tooling: crate-graph. Run as `cargo xtask <cmd>`. |
+| `xtask` | Dev tooling: crate-graph, gate, fixture-gen, linux, changelog. Run as `cargo xtask <cmd>`. |
 
 Dependency direction is asserted by `cargo xtask crate-graph` (ARCHITECTURE §3.1).
 Authoritative docs:
@@ -30,7 +30,7 @@ Authoritative docs:
 | Something is broken at runtime | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
 | What users see and how they install | [README.md](README.md) |
 | How to use every feature, step by step | [docs/manual/](docs/manual/README.md) (regenerate the command reference and screenshots with `docs/manual/tools/`) |
-| What changed per release | [CHANGELOG.md](CHANGELOG.md) |
+| What changed per release | [CHANGELOG.md](CHANGELOG.md), assembled at release from fragments in `docs/changelog/unreleased/` |
 | Which releases lead to 2.0, and which platform they are built and qualified on | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §13 |
 | Why we chose X | [docs/decisions/](docs/decisions/) |
 | What a piece of work must do, and how we check it | [docs/specs/](docs/specs/) |
@@ -126,6 +126,23 @@ reviewed or merged.
    - Convention: squash for single-concern PRs (the squash title becomes the commit; make it a good one);
      merge commit for release PRs and multi-commit PRs whose commits are individually meaningful.
    - Never force-push `main`.
+
+### Independent PRs, stacks and trains
+
+- **Base on `main`.** Branch every PR from current `main`. Independent PRs stay independent and are qualified
+  together in a *train*: an ordered batch checked as one combined merge on a draft branch from green `main`, which
+  the owner then merges member by member, in that order. The draft is closed unmerged once `main` has the
+  recorded tree.
+- **Stack only for code.** Base a PR on another open PR only when the upper change needs the lower PR's code. Say
+  so in both PR bodies (`Depends on #N`). The whole stack enters one train, bottom to top (#171 then #175, #186
+  then #208). If any member is held, the whole stack waits.
+- **A changed head restarts the gate.** A new head (a push or a rebase) needs a delta review, fresh CI at that
+  head and a renewed lead recommendation. Evidence for the old head does not carry over.
+- **One writer for shared documents.** Within a wave of parallel work, one documentation writer owns the shared
+  specs, plans, ADRs and this file; builders own disjoint implementation paths, named in each task's scope. A
+  builder who needs a shared document changed asks the writer instead of editing it.
+- **Release notes never conflict.** A PR adds a changelog fragment, not a line in `CHANGELOG.md` (see
+  "Changelog fragments").
 
 **Merge policy.** The human owner merges by default. The owner may standing-delegate categories to the
 orchestrator; current delegation: docs-only, test-only, and CHANGELOG/plan-status PRs, once required checks are
@@ -331,6 +348,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo xtask crate-graph
 cargo deny check          # only if cargo-deny is installed; CI always runs it
+cargo xtask changelog check   # when the PR adds or edits a changelog fragment; CI does not run it yet
 ```
 
 `./xtask/gate.sh` (the `full` tier, cold) is for releases, for the once-per-goal run and for changes to layering,
@@ -513,7 +531,7 @@ Docs ship in the same PR as the change. The PR template asks which row applied.
 | User-facing behaviour, flags, install, upgrade or rollback steps | `README.md` |
 | An operator-visible failure mode or a new error message | `docs/RUNBOOK.md` |
 | Crate boundaries, dependency edges, traits, concurrency or error model | `docs/ARCHITECTURE.md` (and keep `cargo xtask crate-graph` passing) |
-| Anything a user could notice | `CHANGELOG.md`, under `## [Unreleased]` |
+| Anything a user could notice | A changelog fragment in `docs/changelog/unreleased/` (never `CHANGELOG.md`; see below) |
 | Material from outside the project (copied, adapted or vendored) | `THIRD-PARTY-NOTICES.md` (and `NOTICE` only when required; see Licensing) |
 | A trait in `orch-core` listed in `docs/TRAITS-FROZEN.md` | Only via an ADR, then that file |
 | A choice someone will later ask "why?" about | An ADR |
@@ -521,8 +539,34 @@ Docs ship in the same PR as the change. The PR template asks which row applied.
 | Scope or sequencing of non-trivial work | A plan |
 | A wire format, on-disk layout or protocol | An ADR, plus a reference doc under `docs/` in the same PR. Never only in an agent's scratch state |
 
-CHANGELOG entries are one line, user-voiced, under Added / Changed / Deprecated / Removed / Fixed / Security.
-Pure refactors, tests and CI need no entry.
+### Changelog fragments
+
+A release note is one file per entry, so PRs never edit the same lines. Pure refactors, tests and CI need no
+entry. The byte-level contract is the [spec](docs/specs/2026-11-23-changelog-fragments.md); decision:
+[ADR 0021](docs/decisions/0021-changelog-fragments.md).
+
+1. Create `docs/changelog/unreleased/<slug>.<kind>.md` in the PR's first commit. `<slug>` is lowercase letters and
+   digits joined by `-`, usually the branch slug. `<kind>` is `added`, `changed`, `deprecated`, `removed`, `fixed`
+   or `security`. Two entries of one kind need two slugs.
+2. The file is one line, user-voiced ("You can now ...", not "Refactored ..."), at most 1,000 bytes, starting with
+   a letter or a backtick, ending in a newline. No PR number: it does not exist yet, and a commit to add it would
+   change the head. No heading, bullet or link-definition syntax at the start of the line.
+3. Do not edit `CHANGELOG.md` in a PR. Only the release PR does, through the assembler. `## [Unreleased]` still
+   holds the hand-written notes from before fragments; leave them, the assembler carries them into the next
+   release unchanged.
+4. Run `cargo xtask changelog check` before pushing. It validates every fragment and changes nothing.
+
+```
+printf '%s\n' 'Fix the client socket timeout so a slow daemon reply no longer ends a command early.' \
+  > docs/changelog/unreleased/socket-timeout.fixed.md
+cargo xtask changelog check
+```
+
+An agent that runs the `document-release` skill applies its CHANGELOG step to the fragments the branch adds or
+edits, never to `CHANGELOG.md`. The skill file under `skills/library/` ships to users' projects and stays generic.
+
+Fragments sit under `docs/` on purpose: a fragment-only change classifies as documentation-only (`cargo xtask gate
+select`), and a top-level directory would select the full suite.
 
 ## Rust coding standards
 
@@ -574,7 +618,8 @@ crates/<crate>/
 fixtures/<kind>/      # recorded and scripted inputs shared across crates
 skills/               # the skill library shipped with orch
 xtask/                # dev tooling, run as `cargo xtask <cmd>`
-docs/                 # ARCHITECTURE, RUNBOOK, TRAITS-FROZEN, specs/, plans/, decisions/
+docs/                 # ARCHITECTURE, RUNBOOK, TRAITS-FROZEN, specs/, plans/, decisions/,
+                      # changelog/unreleased/ (one fragment per release note)
                       # (reviews/ is historical)
 ```
 
@@ -667,13 +712,22 @@ behaviour (hang-up, SIGHUP) stays on `portable-pty`, as in `crates/orch-cli/test
    `release/**`. Run the cold gate (`./xtask/gate.sh full`) on Linux, the only platform required through 2.0 (see Verification tiers and rule 10). Every
    gate step must pass and the result must say `qualifying: yes`. Record the platform, the commit and the result in the PR.
 2. Set `workspace.package.version` in `Cargo.toml` (and let `Cargo.lock` update).
-3. In `CHANGELOG.md` rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add a fresh empty `## [Unreleased]`,
-   and update the compare links at the bottom.
+3. Assemble the release notes from the repository root, after step 2 (the version must equal `Cargo.toml`):
+   `cargo xtask changelog assemble --version X.Y.Z --date YYYY-MM-DD`. Add `--dry-run` first to print the section
+   without writing. The command renames `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD` and adds a fresh empty
+   `## [Unreleased]`. Under the new heading it puts the existing Unreleased text unchanged, then one `###` section
+   per kind from the fragments (Added, Changed, Deprecated, Removed, Fixed, Security, entries sorted by file
+   name). It repoints `[Unreleased]:` and adds `[X.Y.Z]:` as compare links, and deletes the fragments it consumed.
+   It refuses, changing nothing, on a malformed fragment, a version that is not newer than the last release or
+   does not match `Cargo.toml`, or nothing to release. Then edit the section by hand where needed: merge the
+   two `### Added` headings that the first assembly after the cutover can produce, and add the Linux-only
+   statement of step 4. Do not edit `CHANGELOG.md` by hand before assembling.
 4. Update README release notes (the "Upgrading" and "Known gaps" sections) if behaviour users must act on changed.
    For every release from 1.1 through 2.0, whatever else changed, the README upgrade notes, the `CHANGELOG.md`
    entry and the release PR each state that the release was qualified on Linux only and that macOS is untested
    until after 2.0 (rule 10). Packaging, the Homebrew formula and the workflow are not changed for it.
-5. Commit `chore(release): X.Y.Z`, open the PR, CI green, owner merges (merge commit, per the convention).
+5. Commit `chore(release): X.Y.Z` with `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md` and the deleted fragments
+   together, open the PR, CI green, owner merges (merge commit, per the convention).
 6. On `main`: `git tag -a vX.Y.Z -m "vX.Y.Z"` then `git push origin vX.Y.Z`.
 7. Create the GitHub release with notes copied from the CHANGELOG section:
    `gh release create vX.Y.Z --title vX.Y.Z --notes-file <extract>`.
@@ -703,8 +757,8 @@ the evidence that a task is done before releasing the tasks that depend on it.
 
 **Implementer.** Reads: the task brief, the spec and plan, the crate's ARCHITECTURE section, neighbouring tests.
 Owns: code, tests and the doc updates from the duties table, in one PR. Must not skip: the green commands, the
-CHANGELOG line, a test that fails without the change, the commit and verify result in the PR, and `fast` after each
-round.
+changelog fragment, a test that fails without the change, the commit and verify result in the PR, and `fast` after
+each round.
 
 **Reviewer.** Read-only: does not edit, push or merge. Reads: the PR description, the diff, and the spec, plan
 and ADRs it cites. Owns: a findings list with severity (blocker / should-fix / nit). Must not skip: stating
@@ -713,11 +767,11 @@ that the spec and plan status lines are correct. A finding that is a missing req
 new row.
 
 **Tech writer.** Reads: the code and tests being documented, existing docs. Owns: README, RUNBOOK, ARCHITECTURE,
-CHANGELOG wording, plans and ADR clarity. Must not skip: verifying every command and message against the code.
+changelog fragment wording, plans and ADR clarity. Must not skip: verifying every command and message against the code.
 Document current behaviour only; no aspirational features.
 
 **Release.** Reads: the Release section, `CHANGELOG.md`, `git log <last-tag>..HEAD`. Owns: version bump, changelog
-cut, tag, GitHub release. Must not skip: the cold gate, tagging only from `main`, asking the owner before
+assembly, tag, GitHub release. Must not skip: the cold gate, tagging only from `main`, asking the owner before
 pushing a tag.
 
 ## Don'ts
@@ -733,4 +787,5 @@ pushing a tag.
 - Don't silence a lint without `reason = "..."` on the `#[allow]` (clippy enforces this), and don't skip hooks.
 - Don't wrap a broken repo script in an external harness; fix the script (see Broken tooling).
 - Don't create `release/**` branches; the ruleset protects them.
+- Don't edit `CHANGELOG.md` outside a release PR; write a changelog fragment.
 - Don't report a check as passed that did not run, ran only on another platform, or fails on the base commit too.

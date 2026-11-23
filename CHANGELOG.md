@@ -1,7 +1,7 @@
 # Changelog
 
 All notable user-visible changes. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning:
-[SemVer](https://semver.org/spec/v2.0.0.html). Add entries under `[Unreleased]` in the PR that makes the change.
+[SemVer](https://semver.org/spec/v2.0.0.html). Write entries as fragments in `docs/changelog/unreleased/` (see AGENTS.md); assemble them with `cargo xtask changelog assemble` at release.
 
 ## [Unreleased]
 
@@ -32,7 +32,6 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - Add the inactive confined disk blob adapter and transactional prompt/attachment references, with content hashes, verified reads and byte publication before row linkage.
 
 - Add inactive SQLite schema, numbered migrations with checked pre-migration copies, private data-directory locks and confined file operations for the 1.1 storage adapter. The running daemon continues to use file storage.
-- Add inactive storage-port contracts for the 1.1 consumers: a filter for an agent's pending messages applied before paging, a per-task run order by attempt, and whole retry error text that moves to blob objects above 64 KiB and to ordered chunks above 64 MiB (ADR 0020). Only the memory and file reference ports carry them; no daemon consumer is activated and the daemon continues to use file storage.
 
 ### Development tooling
 

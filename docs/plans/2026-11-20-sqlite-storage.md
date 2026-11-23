@@ -349,7 +349,7 @@ them.
 
 | Owner | Obligation | Source |
 |---|---|---|
-| T10 | SQLite representation: the retry blob and chunk mapping (publish first, whole text, whole-value hash and ordered chunks above 64 MiB, unchanged row on a missing or corrupt blob or chunk), SQLite parity for the physical checks above, the pending-message statement (`status`, exact recipient, `expires_at IS NULL OR expires_at >= ?now`, text comparison, filter before count and cursor), an index for `Sort::Attempt` (attempt descending, id ascending; the existing task page helper under `crates/orch-infra/src/sqlite/` handles tasks only and answers `Sort::Attempt` with `InvalidPage`), adapter registration of the retry, message and run scenarios (the five consumer scenarios and the three retry scenarios), the full-scope tie order of `delete_expired_request_keys` for rows that share an expiry (equal-expiry rows are not ordered by any reference test; tracked in issue 127), and an independent due-read test: after the enlarged complete-read restore, compare the first 1,000 expected rows of a due read at `i64::MAX` through its own SQL statement (the reference queries share a loader, so the walk does not prove it). Update the crosswalk's expected registrations when SQLite joins | ADR 0020; issue 109 (N-a); issue 127 (PR 171 N1); crosswalk |
+| T10 | SQLite representation: the retry blob and chunk mapping (publish first, whole text, whole-value hash and ordered chunks above 64 MiB, unchanged row on a missing or corrupt blob or chunk), SQLite parity for the physical checks above, the pending-message statement (`status`, exact recipient, `expires_at IS NULL OR expires_at >= ?now`, text comparison, filter before count and cursor), an index for `Sort::Attempt` (attempt descending, id ascending; it also serves the default of a run list whose filter names a task, which is the same key; the existing task page helper under `crates/orch-infra/src/sqlite/` handles tasks only and answers `Sort::Attempt` with `InvalidPage`), adapter registration of the retry, message and run scenarios (the five consumer scenarios and the three retry scenarios), the full-scope tie order of `delete_expired_request_keys` for rows that share an expiry (equal-expiry rows are not ordered by any reference test; tracked in issue 127), and an independent due-read test: after the enlarged complete-read restore, compare the first 1,000 expected rows of a due read at `i64::MAX` through its own SQL statement (the reference queries share a loader, so the walk does not prove it). Update the crosswalk's expected registrations when SQLite joins | ADR 0020; issue 109 (N-a); issue 127 (PR 171 N1); crosswalk |
 | T17, T18 | Derive a principal's kind from its persisted identity: the request-key scope has no kind field, so an owner and a worker session of one identity and project share a scope and a task principal differs from them only by its run and epoch | The spec's request-keys amendment (issue 109, PR 171 N4) |
 | T12 | `put_retry` after `get_retry` (1.0 enqueue was first-wins) in one unit of work (the shared scenario only models two enqueue calls with that guard); a finish that writes the retry row, the task status and the lease release together; lease-bound finish and restart fencing (R36, R132, run through issue 110); a finish of a long error whole | ADR 0020; R35, R36 |
 | T13 | Generations and recovery (R41) and the Linux sleep and wake fencing check (R42, issue 110, pending) | R41, R42 |
@@ -359,8 +359,10 @@ them.
 | T27 | The second-host peer check on Linux (R89) and the recorded named checks of the crosswalk, rejecting an empty or ignored selection | R89 |
 
 Follow-ups kept with their owners from the review of #191 (none is a contract waiver): N-a above (T10), N-b the
-retry entry in `CHANGELOG.md`'s existing "Storage groundwork" section that says no daemon consumer is activated
-(done in this change), N-c `docs/ARCHITECTURE.md`'s store module inventory names `blob` (done in this change).
+move of the retry entry into `CHANGELOG.md`'s existing "Storage groundwork" section with the statement that no daemon
+consumer is activated (not done in this change: a pull request no longer edits `CHANGELOG.md`, so it stays
+open for the release PR's hand edit of the legacy `[Unreleased]` text; this change adds no fragment, because the inactive port contracts
+change nothing a user can notice), N-c `docs/ARCHITECTURE.md`'s store module inventory names `blob` (done in this change).
 
 Request-key follow-ups of PR 171 (issue 109 comment of 2026-11-23), dispositions in the spec's request-keys amendment:
 N1, the tie order of rows with equal expiry on SQLite, stays with T10 and issue 127. N2 is met in the reference: the
@@ -368,6 +370,34 @@ persisted epoch ceiling is the `i64::MAX` that `RequestScope::of` applies, and t
 field while a row denies one. N3 is a writer's note, not a change: the persisted check needs the one-hour TTL, so a
 change of `KEY_TTL_MS` migrates or reconciles earlier rows in the same change. N4 is met by a corrected test comment
 and the T17 and T18 obligation above. N5 is met: a negative time is refused on the lookup path as on the store path.
+
+### Reference order
+
+The default orders of runs and goals are settled in the spec's "Run and goal default order": a run list whose filter
+names a task (alone or beside an agent) is ordered by numeric `attempt` descending, every other run list by `started_at`
+text descending, then the id; a goal list by status rank, presence of `updated_at` (a present empty text before an
+absent one), the original `updated_at` text descending, `position`, then the id.
+
+PR #225 (squash `af0d43acd`, 2026-11-23) carried the reference code and the first text of this paragraph together. The
+memory fake, its queued variant and the file reference meet the orders: the shared scenarios
+`message_and_run_filters_stay_within_their_family` and `declared_secondary_sorts_use_values_then_tie_breakers` are
+registered once and run as `memory_v2`, `queued_memory_v2` and `file_v2` (three registrations each), and hosted Linux
+check and test succeeded on the head of PR #225 and on the cumulative `main` push. The goal rule changed code in the
+file reference only, because the memory fake already told a present empty `updated_at` from an absent one.
+
+The explicit sort `Sort::Attempt` (T8 consumer contracts, above) is a separate addition of the change that carries this
+revision, not of PR #225. For a run list whose filter names a task it orders by the same key as the default, so the two
+list the same rows in the same order; with no task it is refused and the default is the `started_at` key.
+
+None of this shows SQLite. T10 registers the same two scenarios, with the five consumer scenarios, on SQLite, and the
+orders are shown there only when those registrations pass.
+
+The two shared scenarios are `message_and_run_filters_stay_within_their_family` and
+`declared_secondary_sorts_use_values_then_tie_breakers`, in
+`crates/orch-engine/tests/storage_contract/v2_paging.rs`. Each is registered under `memory_v2`, `queued_memory_v2`
+and `file_v2` and is run by the crosswalk's rule (list, then run with
+`cargo test -p orch-engine --test storage_conformance -- <filter>`, three passing registrations each). T10 registers
+both on SQLite only after that PR has landed, and updates the expected registrations then.
 
 ### Switch, removal, proof
 
@@ -1042,8 +1072,9 @@ the spec's "relative to the project" asks for. The check takes no lock: whoever 
 lock for as long as it relies on an answer (R119 means something only while no 1.0 daemon can rewrite
 `state.json`), and stops it by setting its cancel flag and awaiting the result, because dropping the future
 does not stop the blocking thread. The YAML decode runs on a runtime of the check's own, so a caller's
-blocking pool of one is enough. A task id of `.` or `..` stops the check (R104); template stems are not
-judged, because the spec has no rule for them (tracked, not decided here).
+blocking pool of one is enough. A task id of `.` or `..` stops the check (R104); a template stem is stored as it is when it
+is UTF-8 and stops the check when it is not (issue 192). The check on `main` does not yet refuse one, nor a template
+body that is not UTF-8; the first importer caller of issue 192 adds both refusals, and the spec's R99 names its test.
 
 Where the check goes beyond the spec's wording, it is stricter and says so: a `running` set of `state.json`
 that 1.0 would read as empty because one entry does not decode stops the check, because that set is what

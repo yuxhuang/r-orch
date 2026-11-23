@@ -432,7 +432,7 @@ impl Session {
             .rows
             .values()
             .filter(|row| matches(&row.entity, filter))
-            .map(|row| (key(row, request.sort), row))
+            .map(|row| (key(row, request.sort, filter), row))
             .collect();
         let total = request.with_count.then_some(rows.len() as u64);
         rows.sort_by(|a, b| a.0.cmp(&b.0));

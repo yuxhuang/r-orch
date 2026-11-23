@@ -425,8 +425,11 @@ pub enum Sort { /* ..., */ Attempt }                       // serde "attempt"
   messages' default (`created_at`, `position`, id); the other sorts are those of `Filter::Messages` (`Default` and `Id`).
 - `Sort::Attempt` is offered only for `Filter::Runs { task: Some(_), .. }`. It orders by `Run.attempt` numerically,
   descending, then run id bytes ascending. For `Runs` with no task, for any other family and for any other
-  filter it is `InvalidPage`, before any paging work. `Sort::Default` for runs is unchanged (`started_at`
-  descending, then id). The spec's earlier `run_no` is this sort: `Run` has no such field.
+  filter it is `InvalidPage`, before any paging work. The `Sort::Default` of a run list whose filter names a
+  task (alone or beside an `agent`) is the same key (PR #225; the spec's "Run and goal default order"), so the default and
+  `Attempt` list the same rows in the same order and are two sorts for a cursor. For a run list with no task,
+  `Sort::Default` is `started_at` text descending, then id. The spec's earlier `run_no` is this sort: `Run` has no such
+  field.
 - `Retry.error` is the whole logical text. `MAX_RETRY_ERROR_BYTES` (65,536 UTF-8 bytes) is the inline
   threshold and `Retry::validate` no longer refuses longer text; the other checks stay. Longer text is published to the
   blob store before the row that carries its hash is committed, and a read returns the original text byte for byte. A
