@@ -623,13 +623,17 @@ async fn read_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::DirBuilderExt;
 
     #[cfg(target_os = "macos")]
     async fn closed_peer() -> (tempfile::TempDir, Project, UnixStream) {
         use tokio::io::AsyncReadExt;
 
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join(".orchestry")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.path().join(".orchestry"))
+            .unwrap();
         let project = Project::discover(root.path(), None).unwrap();
         let listener = tokio::net::UnixListener::bind(root.path().join("s")).unwrap();
         let mut client = UnixStream::connect(root.path().join("s")).await.unwrap();
@@ -681,7 +685,10 @@ mod tests {
     #[tokio::test]
     async fn kernel_uid_mismatch_is_rejected_before_any_bytes() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join(".orchestry")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.path().join(".orchestry"))
+            .unwrap();
         let project = Project::discover(root.path(), None).unwrap();
         let (client, server) = UnixStream::pair().unwrap();
         let uid = nix::unistd::geteuid().as_raw();
@@ -699,7 +706,10 @@ mod tests {
     #[test]
     fn lost_peer_credential_after_connect_is_busy_not_absence() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join(".orchestry")).unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(root.path().join(".orchestry"))
+            .unwrap();
         let project = Project::discover(root.path(), None).unwrap();
         let uid = nix::unistd::geteuid().as_raw();
         let lost = std::io::Error::from(std::io::ErrorKind::NotConnected);

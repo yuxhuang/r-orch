@@ -144,6 +144,24 @@ impl RunUsage {
                 &["cacheWrite", "cache_write", "cache_creation_input_tokens"],
             ],
             "opencode" => [&["input"], &["output"], &["reasoning"], &[], &[]],
+            // Codex includes cached input in input_tokens and reasoning output
+            // in output_tokens. Keep these detail counters as reported; never
+            // add them to, or subtract them from, the input/output totals.
+            "codex" => [
+                &["input_tokens", "inputTokens"],
+                &["output_tokens", "outputTokens"],
+                &[
+                    "reasoning_output_tokens",
+                    "reasoning_tokens",
+                    "reasoningTokens",
+                ],
+                &[
+                    "cached_input_tokens",
+                    "cache_read_input_tokens",
+                    "cacheReadTokens",
+                ],
+                &["cache_creation_input_tokens", "cacheWriteTokens"],
+            ],
             _ => [
                 &["input_tokens", "inputTokens"],
                 &["output_tokens", "outputTokens"],
@@ -284,6 +302,119 @@ mod tests {
             }}),
         );
         assert_eq!(counters(&usage), [Some(0); 5]);
+    }
+
+    #[test]
+    fn codex_native_counters_preserve_overlap_and_snapshot_semantics() {
+        // Cached input is included in input, and reasoning output in output.
+        // Neither the subtotals nor a provider total change the reported totals.
+        let output = json!({"type":"turn.completed", "usage":{
+            "input_tokens":100, "cached_input_tokens":60,
+            "output_tokens":20, "reasoning_output_tokens":7, "total_tokens":120
+        }});
+        let mut usage = observed("codex", output.clone());
+        let expected = [Some(100), Some(20), Some(7), Some(60), None];
+        assert_eq!(counters(&usage), expected);
+        usage.observe_output("codex", &output);
+        assert_eq!(counters(&usage), expected);
+        usage.observe_output("codex", &json!({"type":"turn.failed", "usage":{}}));
+        assert_eq!(counters(&usage), expected);
+        usage.observe_output(
+            "codex",
+            &json!({"type":"turn.failed", "usage":{
+                "cached_input_tokens":0, "reasoning_output_tokens":0
+            }}),
+        );
+        assert_eq!(
+            counters(&usage),
+            [Some(100), Some(20), Some(0), Some(0), None]
+        );
+    }
+
+    #[test]
+    fn codex_native_zero_and_absence_are_distinct_without_input_or_output() {
+        for kind in ["turn.completed", "turn.failed", "error"] {
+            assert_eq!(
+                counters(&observed(
+                    "codex",
+                    json!({"type":kind, "usage":{
+                        "cached_input_tokens":0, "reasoning_output_tokens":0
+                    }})
+                )),
+                [None, None, Some(0), Some(0), None]
+            );
+            assert_eq!(
+                counters(&observed("codex", json!({"type":kind, "usage":{}}))),
+                [None; 5]
+            );
+        }
+    }
+
+    #[test]
+    fn codex_native_counters_validate_signed_integer_range() {
+        for value in [
+            json!(null),
+            json!(-1),
+            json!(1.5),
+            json!(1.0),
+            json!("3"),
+            json!(true),
+            json!(u64::MAX),
+        ] {
+            assert_eq!(
+                counters(&observed(
+                    "codex",
+                    json!({"type":"turn.completed", "usage":{
+                        "cached_input_tokens":value, "reasoning_output_tokens":value
+                    }})
+                )),
+                [None; 5],
+                "{value}"
+            );
+        }
+        assert_eq!(
+            counters(&observed(
+                "codex",
+                json!({"type":"turn.completed", "usage":{
+                    "cached_input_tokens":i64::MAX, "reasoning_output_tokens":i64::MAX
+                }})
+            )),
+            [None, None, Some(i64::MAX), Some(i64::MAX), None]
+        );
+    }
+
+    #[test]
+    fn codex_native_aliases_take_first_valid_value_and_are_adapter_specific() {
+        let output = json!({"type":"turn.completed", "usage":{
+            "cached_input_tokens":0, "cache_read_input_tokens":9, "cacheReadTokens":10,
+            "reasoning_output_tokens":0, "reasoning_tokens":8, "reasoningTokens":11
+        }});
+        assert_eq!(
+            counters(&observed("codex", output)),
+            [None, None, Some(0), Some(0), None]
+        );
+        let usage = json!({"cached_input_tokens":null, "cache_read_input_tokens":9,
+            "reasoning_output_tokens":-1, "reasoningTokens":8});
+        assert_eq!(
+            counters(&observed(
+                "codex",
+                json!({"type":"turn.completed", "usage":usage})
+            )),
+            [None, None, Some(8), Some(9), None]
+        );
+        for adapter in ["claude", "cursor", "grok"] {
+            let kind = if adapter == "grok" { "end" } else { "result" };
+            assert_eq!(
+                counters(&observed(
+                    adapter,
+                    json!({"type":kind, "usage":{
+                        "cached_input_tokens":6, "reasoning_output_tokens":4
+                    }})
+                )),
+                [None; 5],
+                "{adapter}"
+            );
+        }
     }
 
     #[test]

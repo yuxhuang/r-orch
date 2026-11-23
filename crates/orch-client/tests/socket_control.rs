@@ -6,16 +6,17 @@ use orch_proto::handshake::{
 };
 use orch_proto::ndjson::{FrameReader, write_frame};
 use std::fs;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::PermissionsExt;
 use tokio::io::BufReader;
 use tokio::net::UnixListener;
 
 fn fixture() -> (tempfile::TempDir, UnixListener, ClientConfig) {
-    let dir = tempfile::Builder::new()
-        .prefix("cs-")
-        .tempdir_in("/tmp")
+    let dir = tempfile::Builder::new().prefix("cs-").tempdir().unwrap();
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.path().join(".orchestry"))
         .unwrap();
-    fs::create_dir(dir.path().join(".orchestry")).unwrap();
     let socket = dir.path().join("s");
     let listener = UnixListener::bind(&socket).unwrap();
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
@@ -193,7 +194,10 @@ async fn accepted_stop_deadline_has_its_own_diagnosis() {
         std::future::pending::<()>().await;
     });
     let stopping = tokio::spawn(async move { orch_client::stop(&cfg).await });
-    observed.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), observed)
+        .await
+        .expect("client must reach the scripted handshake before its deadline")
+        .unwrap();
     // Let the client read acceptance before advancing only Tokio's clock.
     for _ in 0..100 {
         tokio::task::yield_now().await;
@@ -256,7 +260,10 @@ async fn completed_reply_with_owner_guard_still_held_times_out() {
         closed.send(()).unwrap();
     });
     let stopping = tokio::spawn(async move { orch_client::stop(&cfg).await });
-    observed.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), observed)
+        .await
+        .expect("client must reach the scripted handshake before its deadline")
+        .unwrap();
     tokio::time::pause();
     tokio::time::advance(std::time::Duration::from_secs(31)).await;
     let error = stopping.await.unwrap().unwrap_err();

@@ -28,7 +28,7 @@ pub enum Synchronous {
 /// ```
 pub struct ConnectionHandle<'a> {
     connection: Connection,
-    _directory: &'a DataDir,
+    directory: &'a DataDir,
 }
 impl Deref for ConnectionHandle<'_> {
     type Target = Connection;
@@ -37,6 +37,17 @@ impl Deref for ConnectionHandle<'_> {
     }
 }
 impl ConnectionHandle<'_> {
+    // Identity is stronger than path equality: only the guard that opened this
+    // connection may own its migration copies and disk-space decision.
+    pub(super) fn ensure_directory(&self, data: &DataDir) -> Result<()> {
+        if !std::ptr::eq(self.directory, data) {
+            return Err(SqliteError::Migration(
+                "connection belongs to a different data directory".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The transaction's borrow keeps this handle and its directory lock alive.
     pub fn transaction(&mut self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
         self.connection.transaction()
@@ -95,7 +106,7 @@ pub fn open_connection(
     configure(&mut conn, role, sync)?;
     Ok(ConnectionHandle {
         connection: conn,
-        _directory: data,
+        directory: data,
     })
 }
 
