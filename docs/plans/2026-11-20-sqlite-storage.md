@@ -265,7 +265,7 @@ ignored. Each of the three entity registrations is `memory_v2`, `queued_memory_v
 | R117, schema | `cargo test -p orch-infra --test sqlite_schema -- task_ids_are_unique_under_ascii_case_only_within_a_project` | one test |
 | R132, caller fields | `caller_selects_the_project_and_keeps_the_principal` (a task principal's lineage and epoch come back unchanged from both entry points) | 3 entity references |
 | Consumer contracts (ADR 0020 decisions 1 and 2) | `pending_messages_filter_status_recipient_and_lexical_expiry`, `pending_messages_page_matches_before_count_cursor_and_bound`, `run_attempt_order_is_numeric_task_scoped_and_keeps_default`, `run_attempt_pages_keep_snapshot_and_bind_every_query_field`, `run_attempt_sort_refuses_every_unscoped_or_other_family_filter` | 3 entity references each, 15 in all |
-| Whole retry text, conformance (decision 3) | `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original` | 3 retry references each: `memory_retries_v2`, `blob_memory_retries_v2`, `file_retries_v2` |
+| Whole retry text, conformance (decisions 3 and 4) | `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original`, `retry_chunked_text_survives_restore_without_a_run` | 3 retry references each: `memory_retries_v2`, `blob_memory_retries_v2`, `file_retries_v2` |
 
 The importer-side R117 rule has an existing unit test in `orch-infra`'s library:
 `import::preflight::tests::two_task_ids_that_differ_only_in_case_are_refused_before_any_write`. The command-level import, export and restore tests that R117 names, and the lineage tests
@@ -279,9 +279,10 @@ and exited 0; the receipt is private to the task, the PR's manifest names the he
 the gate repeats them there. The spellings were also checked against the test sources and against a listing of the
 conformance suite on `07b5f967`. A selection that matches zero tests, or ignores one, fails verification.
 
-The last row of the table above is two scenarios of the retry suite. The suite has 20 scenarios on each of its three
-registrations; the two new ones, `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` and
-`retry_whole_text_replacement_rolls_back_and_snapshots_keep_original`, are the first two it registers in
+The last row of the table above is three scenarios of the retry suite. The suite has 21 scenarios on each of its three
+registrations (63 tests); the three new ones, `retry_chunked_text_survives_restore_without_a_run`,
+`retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` and
+`retry_whole_text_replacement_rolls_back_and_snapshots_keep_original`, are the first three it registers in
 `storage_contract/retries_v2.rs`, and `blob_memory_retries_v2` is a registration that did not exist on `main`. The
 #130 crosswalk table above does not list the retry suite, so its inventory is unchanged.
 
@@ -289,8 +290,13 @@ registrations; the two new ones, `retry_whole_text_round_trips_at_the_utf8_bound
 accepted only with these focused Linux checks on both references. Each check is one named test; the integration task
 records its commit, count and platform, and an empty or ignored selection fails it. The tests are in two places:
 the retry suite of `storage_conformance` (`-p orch-engine --test storage_conformance -- <filter>`, 3 registrations
-each) and the `orch-infra` library (`-p orch-infra --lib -- storage::v2::tests::<name> --exact`, which must execute
-one test). "Both" in the last column means the file reference and the disk-backed fake.
+each), the `orch-infra` library (`-p orch-infra --lib -- storage::v2::tests::<name> --exact`, which must execute
+one test) and one private unit test of `orch-core`
+(`-p orch-core --features test-support --lib -- store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read --exact`,
+which must execute one test; the module exists only with the `test-support` feature). "Both" in the last column
+means the file reference and the disk-backed fake. The memory fake is *logical* by default (whole strings) and
+*disk-backed* with `FakeStorage::with_retry_blob_store`; a check about publication or damage is carried only by the
+disk-backed form and the file reference.
 
 | Check | What it shows | Test | References |
 |---|---|---|---|
@@ -298,18 +304,30 @@ one test). "Both" in the last column means the file reference and the disk-backe
 | 67,108,864 and 67,108,865 bytes | One object at the limit; chunks and a whole-value hash one byte above it | `retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified` | both |
 | A character split across a chunk boundary | The joined bytes decode only after the whole-value hash matches | same test (the 67,108,865-byte text ends in a two-byte character cut by the boundary) | both |
 | A retry with no run | The whole text is the retry's own, never the run's | `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` | the 3 retry registrations |
+| A text above one blob object, then a restore | A fixture lineage switch (`restore_to_lineage`: leases end, counters stay) leaves the 67,108,865-byte text whole on `read_retry`, `read_due_retries` and a complete walk; it is not a backup copy | `retry_chunked_text_survives_restore_without_a_run` | the 3 retry registrations (the logical fake keeps a whole string) |
 | Failure on a later chunk after an earlier chunk was published | The previous row reads back whole, also after the caller catches the error and commits other work | `retry_later_chunk_failure_keeps_prior_row_and_earlier_published_bytes` | both |
 | A publication refused or damaged at read-back | The previous row stays whole when the caller catches the error and commits | `retry_publication_refusal_preserves_prior_rows_even_when_caught_on_both_references` | both |
 | A missing and a corrupt blob after commit | An error on `read_retry`, `read_due_retries`, `read_retries`, `get_retry`, `due_retries` and `list_retries`; the document is unchanged | `retry_missing_and_corrupt_blobs_fail_all_read_paths_on_both_references` | both |
-| A missing, a corrupt and a reordered chunk | A read error, never a partial value (damaged tail on all three reads, missing tail on `read_retry`, reorder on the file reference only) | `retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified` | both, as stated |
+| A missing and a corrupt chunk of a text above one object | The tail chunk damaged, then removed: an error on the same six reads each time, with the file restored between | `retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified` | both |
+| A reordered chunk mapping | An error ("reconstructed retry does not hash") on the same six reads when two chunk entries of the file reference's document are swapped; for the disk-backed fake the private mapping is swapped and `get`, `due` and `page` of its private retry state, which every port read calls, each fail | the object-limit test (file reference only); `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read` (disk-backed fake's private state, with a reversible text-name double for its blob store: it proves the whole-value hash guard, not hashing or damage) | as stated |
 | Identical chunks at two positions | The mapping keeps both positions (the file reference's has three entries) | `retry_repeated_chunks_reconstruct_every_occurrence_on_both_references` | both |
-| Rollback of a replacement | A rolled-back replacement and a held snapshot keep the original | `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original` | the 3 retry registrations |
+| Replacement, long and short | A rolled-back replacement and a held snapshot keep the original; then long to short and short to long each read back | `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original` | the 3 retry registrations |
+| Rollback of a unit that published | The earlier row stays, the rolled-back task reads as none, and the published 65,537-byte object is still on disk at its hash path with no row naming it (the sweep is not exercised) | `retry_rollback_keeps_published_bytes_without_a_reference_on_both_backed_references` | both |
+| An existing single-object row | A hand-made `{"sha256": H}` row (65,538 bytes of two-byte characters; no earlier release wrote one) reads whole on `read_retry`, `read_due_retries` and `read_retries` after a reopen, the reads leave the document's bytes unchanged, an extra field in the request-key collection wrapper does not prevent the reopen, and a stored request key still replays | `retry_existing_single_object_encoding_and_wrapper_extensions_remain_readable` | file only |
 | Physical backing | The objects exist, and the file reference's document holds `{"sha256": H}` or `{"sha256": H, "chunks": [...]}`; the disk-backed fake's objects are read from the blob store, its mapping is private | the boundary, object-limit, later-chunk and repeated-chunk tests above | as stated |
 
-Not proved by a named test in this change: an existing one-object row (none existed on `main`, which refused the
-text; the form is read back by the 65,537-byte and 67,108,864-byte cases), a long error replaced by a short one and
-the reverse as its own scenario, a restore of text above 64 MiB, a reordered chunk on the disk-backed fake, a missing
-or corrupt chunk of an above-64 MiB text on every read path, and an unreferenced object left by a rolled-back unit.
+Selections and expected counts. Each conformance filter above must select 3 tests and each `-- <name> --exact`
+selection of `orch-infra` or `orch-core` exactly 1, with none failed or ignored. When the whole suites are run at the
+head that completes this change, the expected totals are 328 tests for `storage_conformance` (the retry suite is 63 of
+them) and 53 for `cargo test -p orch-infra --lib -- storage::v2::tests`; a later test changes these numbers. These are
+the numbers to expect, not results: a result is a receipt of the PR, which names its head, and the runs of a head
+that was not the final one prove nothing about it.
+
+Not proved by any test of this change: the SQLite representation (T10); the blob store's sweep (the rollback test
+shows that published bytes survive, not that the sweep later removes them, and its object is a single object, not a
+chunk); a missing or corrupt chunk on the logical fake, which has none; a crash between publication and commit; a
+restore that copies files, because the restore of the chunked scenario is the fixture's lineage switch (T23); and a 1.0
+import (T21). The single-object row is a documented-form fixture and not a row an earlier release wrote.
 
 This is reference-port proof only. It gives no measurement above 64 MiB beyond these boundaries and accepts none of
 T10, T12, T21 or T23. T10 repeats the physical checks on SQLite. T21 rebuilds an imported 1.0 error into the same
@@ -325,7 +343,8 @@ them.
 
 | Owner | Obligation | Source |
 |---|---|---|
-| T10 | SQLite representation: the retry blob and chunk mapping (publish first, whole text, whole-value hash and ordered chunks above 64 MiB, unchanged row on a missing or corrupt blob or chunk), SQLite parity for the physical checks above, the pending-message statement (`status`, exact recipient, `expires_at IS NULL OR expires_at >= ?now`, text comparison, filter before count and cursor), an index for `Sort::Attempt` (attempt descending, id ascending; the existing task page helper under `crates/orch-infra/src/sqlite/` handles tasks only and answers `Sort::Attempt` with `InvalidPage`), adapter registration of the retry, message and run scenarios (the five consumer scenarios and the two retry scenarios), and an independent due-read test: after the enlarged complete-read restore, compare the first 1,000 expected rows of a due read at `i64::MAX` through its own SQL statement (the reference queries share a loader, so the walk does not prove it). Update the crosswalk's expected registrations when SQLite joins | ADR 0020; issue 109 (N-a); crosswalk |
+| T10 | SQLite representation: the retry blob and chunk mapping (publish first, whole text, whole-value hash and ordered chunks above 64 MiB, unchanged row on a missing or corrupt blob or chunk), SQLite parity for the physical checks above, the pending-message statement (`status`, exact recipient, `expires_at IS NULL OR expires_at >= ?now`, text comparison, filter before count and cursor), an index for `Sort::Attempt` (attempt descending, id ascending; the existing task page helper under `crates/orch-infra/src/sqlite/` handles tasks only and answers `Sort::Attempt` with `InvalidPage`), adapter registration of the retry, message and run scenarios (the five consumer scenarios and the three retry scenarios), the full-scope tie order of `delete_expired_request_keys` for rows that share an expiry (equal-expiry rows are not ordered by any reference test; tracked in issue 127), and an independent due-read test: after the enlarged complete-read restore, compare the first 1,000 expected rows of a due read at `i64::MAX` through its own SQL statement (the reference queries share a loader, so the walk does not prove it). Update the crosswalk's expected registrations when SQLite joins | ADR 0020; issue 109 (N-a); issue 127 (PR 171 N1); crosswalk |
+| T17, T18 | Derive a principal's kind from its persisted identity: the request-key scope has no kind field, so an owner and a worker session of one identity and project share a scope and a task principal differs from them only by its run and epoch | The spec's request-keys amendment (issue 109, PR 171 N4) |
 | T12 | `put_retry` after `get_retry` (1.0 enqueue was first-wins) in one unit of work; a finish that writes the retry row, the task status and the lease release together; lease-bound finish and restart fencing (R36, R132, run through issue 110); a finish of a long error whole | ADR 0020; R35, R36 |
 | T13 | Generations and recovery (R41) and the Linux sleep and wake fencing check (R42, issue 110, pending) | R41, R42 |
 | T14 | `retry_pending` gating per task; dispatch in candidate order and agent rotation, never due-row order | retries module |
@@ -336,6 +355,13 @@ them.
 Follow-ups kept with their owners from the review of #191 (none is a contract waiver): N-a above (T10), N-b the
 retry entry in `CHANGELOG.md`'s existing "Storage groundwork" section that says no daemon consumer is activated
 (done in this change), N-c `docs/ARCHITECTURE.md`'s store module inventory names `blob` (done in this change).
+
+Request-key follow-ups of PR 171 (issue 109 comment of 2026-11-23), dispositions in the spec's request-keys amendment:
+N1, the tie order of rows with equal expiry on SQLite, stays with T10 and issue 127. N2 is met in the reference: the
+persisted epoch ceiling is the `i64::MAX` that `RequestScope::of` applies, and the collection wrapper ignores an unknown
+field while a row denies one. N3 is a writer's note, not a change: the persisted check needs the one-hour TTL, so a
+change of `KEY_TTL_MS` migrates or reconciles earlier rows in the same change. N4 is met by a corrected test comment
+and the T17 and T18 obligation above. N5 is met: a negative time is refused on the lookup path as on the store path.
 
 ### Switch, removal, proof
 

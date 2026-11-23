@@ -512,6 +512,12 @@ damaged references. `main` at `07b5f967`, before this change, refused a retry `e
 neither variant. These are reference-port contracts; the SQLite mapping, the callers and the import and restore
 paths remain with T10, T12, T21 and T23.
 
+The file reference checks its persisted request-key rows when it loads a document: the epoch is at most `i64::MAX`
+(the ceiling `RequestScope::of` applies), the expiry is exactly one hour after creation, a row refuses an unknown field
+and the collection that holds the rows ignores one. Because the check needs the one-hour TTL, a change of `KEY_TTL_MS`
+must migrate or reconcile the rows already stored. The order in which rows with an equal expiry are deleted is not
+visible through the port and is proved on SQLite by T10 (issue 127).
+
 The inactive `orch_core::store::attention` operational port shares these buffered
 transactions and snapshots in both references. Fixed typed facts control item text;
 open rows are unique by kind/subject, acknowledgement preserves caller identity,

@@ -321,7 +321,7 @@ pub const KEY_TTL_MS: i64 = 3_600_000;   pub const MAX_RESULT_BYTES: usize = 64 
 pub const MIN_KEY_BYTES: usize = 16;   pub const MAX_KEY_BYTES: usize = 128;   pub const MAX_OP_BYTES: usize = 128;
 pub struct RequestScope { /* identity, project, run, epoch, key */ }       // RequestScope::of(&Caller, key) -> Result<Self>
                                               // identity() -> &str, project() -> &str, run() -> &str ("" for owner or worker),
-                                              // epoch() -> u64 (0 for owner or worker), key() -> &str,
+                                              // epoch() -> u64 (0 for owner or worker, otherwise 1..=i64::MAX), key() -> &str,
                                               // check_caller(&Caller) -> Result<()>: refuses a scope built for another caller
 // The shape checks both backends make before they read or change anything:
 pub fn check_key(key: &str) -> Result<()>;                // MIN_KEY_BYTES..=MAX_KEY_BYTES of A-Z a-z 0-9 _ -
@@ -391,6 +391,13 @@ nothing) are in the spec's amendments for leases,
 intents, attention and request keys. `orch_core::store::fake::FakeStorage` (feature `test-support`) is the memory
 reference, and `orch_infra::storage::v2` the file reference; both run the same shared conformance suites, and neither
 is wired into the daemon. The only `BlobStore` adapter in 1.1 is `orch_infra::blob::DiskBlobStore`.
+
+The file reference also fixes what a persisted request-key document may hold (the spec's T8c request-keys amendment).
+It adds no signature. A stored row's epoch is at most `i64::MAX`, the ceiling `RequestScope::of` applies, and its
+`expires_at` is exactly `created_at + KEY_TTL_MS`, so a change to `KEY_TTL_MS` must migrate or reconcile the stored
+rows in the same change. A row denies an unknown field and the collection that holds the rows ignores one. A negative
+`now_ms` is refused on `check_request_key` as on `store_request_key`. The tie order of rows with an equal expiry in
+`delete_expired_request_keys` is not observable through the port; T10 proves it on SQLite under issue 127.
 
 #### Added for issue 109 (ADR 0020)
 

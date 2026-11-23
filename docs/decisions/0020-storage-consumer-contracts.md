@@ -132,18 +132,29 @@ reference conformance reconciliation (#196) landed and #130 closed:
      `run_attempt_pages_keep_snapshot_and_bind_every_query_field` and
      `run_attempt_sort_refuses_every_unscoped_or_other_family_filter`, in `v2_consumers.rs`, registered as
      `memory_v2`, `queued_memory_v2` and `file_v2` (3 registrations each);
-   - the two retry scenarios `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` and
-     `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original`, added to the retry suite, which now has
-     20 scenarios registered as `memory_retries_v2`, `blob_memory_retries_v2` (the disk-backed fake) and
-     `file_retries_v2`;
+   - the three retry scenarios `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`,
+     `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original` (which also replaces a long text by a short
+     one and a short one by a long one) and `retry_chunked_text_survives_restore_without_a_run` (a 67,108,865-byte
+     text and a fixture restore to a new lineage), added to the retry suite, which now has 21 scenarios registered as
+     `memory_retries_v2`, `blob_memory_retries_v2` (the disk-backed fake) and `file_retries_v2`;
    - the physical, fault and boundary checks in `storage::v2::tests` of `orch-infra`: the file reference's backing
      (`retry_text_boundary_is_backed_before_the_hash_row_and_reopens_whole`), damaged and missing blobs
      (`retry_missing_and_corrupt_blobs_fail_all_read_paths_on_both_references`), a refused or damaged publication
      (`retry_publication_refusal_preserves_prior_rows_even_when_caught_on_both_references`), the 64 MiB object
-     boundary and chunk order (`retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified`), a later
-     chunk failing (`retry_later_chunk_failure_keeps_prior_row_and_earlier_published_bytes`) and repeated chunks
-     (`retry_repeated_chunks_reconstruct_every_occurrence_on_both_references`). The first runs the file reference
-     only; the other five each run the file reference and the disk-backed fake.
+     boundary, a damaged or missing tail chunk on all six retry reads and a reordered file mapping on all six
+     (`retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified`), a later chunk failing
+     (`retry_later_chunk_failure_keeps_prior_row_and_earlier_published_bytes`), repeated chunks
+     (`retry_repeated_chunks_reconstruct_every_occurrence_on_both_references`), published bytes that survive a
+     rollback with no row naming them (`retry_rollback_keeps_published_bytes_without_a_reference_on_both_backed_references`)
+     and a hand-made one-object row read after a reopen
+     (`retry_existing_single_object_encoding_and_wrapper_extensions_remain_readable`). The backing test and the
+     one-object test run the file reference only; the other six each run the file reference and the disk-backed fake;
+   - one private unit test in `orch-core`, `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read`
+     (feature `test-support`). The disk-backed fake's chunk mapping is private, so a reordered mapping cannot be made
+     through its port; the test swaps two chunks of that mapping and requires `get`, `due` and `page` of its private
+     retry state, which all six port reads call, to fail the whole-value hash. Its blob store is a reversible
+     text-name double, so it proves that guard and not SHA-256 or a damaged object, which the tests above do with
+     the real `DiskBlobStore`.
 
    This ADR records the names and counts, not results: a run is a receipt of the PR that carries the change, and the
    head it belongs to is that PR's manifest. R8 to R15 and R97 keep the inventory that the #130 crosswalk
@@ -211,5 +222,14 @@ reference conformance reconciliation (#196) landed and #130 closed:
 - The baseline above is `main` at `07b5f967`: it refuses a retry error over 65,536 bytes and has neither variant.
   This change replaces that with the reference behavior of decisions 1 to 4. A reader of `main` before it merges sees
   the baseline, and the spec and the plan state the baseline wherever they state the contract.
-- The reference tests do not simulate a SQLite adapter, a daemon consumer, a 1.0 import, a restore of chunked
-  text or a sweep of the blob store, so none of those is accepted by them.
+- The reference tests do not simulate a SQLite adapter, a daemon consumer, a 1.0 import, a restore that copies files
+  or a sweep of the blob store, so none of those is accepted by them. The chunked-text scenario's restore is the
+  fixture's lineage switch, and a rolled-back unit's unreferenced bytes are shown to survive the rollback, not to be
+  swept. The logical memory fake proves the port's logical rules only; publication and damaged references are proved
+  by the file reference and the disk-backed fake, and a one-object row is a hand-made fixture of the documented form,
+  because no earlier release wrote one.
+- The request-key references have the dispositions of the follow-ups of PR 171 in the spec's request-keys amendment:
+  a stored row's epoch is at most `i64::MAX`, the ceiling of `RequestScope::of`; the collection wrapper of the file
+  document ignores an unknown field and a row denies one; the persisted check needs the one-hour TTL, so a change of
+  `KEY_TTL_MS` migrates or reconciles earlier rows in the same change; and the tie order of rows with an equal expiry
+  is a SQLite proof owned by T10 under issue 127. None of these adds a public type or a signature.

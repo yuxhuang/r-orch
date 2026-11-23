@@ -458,7 +458,7 @@ holds them.
 | R94 | — | X | won't | Evidence, quarantine, uploads, text search, HTTP, TLS, tokens, enrolment, certificates, workers, the hub, landing, proposals, many projects per daemon, removing orch-peer, Postgres, an indexed scheduler, object storage, token budgets, outbound notification and Windows are out of scope (X). |
 | R95 | — | DL | won't | No tag and no version bump: cutting 1.1.0 is the owner's separate decision. |
 | R96 | An agent process shall not run its agent unless the run's pid and start time were committed first: the daemon shall create the process held, commit, then release it, and a held process whose daemon is gone shall exit without running the agent. | review finding (a stop between starting a process and recording it left an untracked agent on a workspace that recovery would hand to a second run) | must | `crates/orch-engine/tests/transactions.rs::a_stop_between_spawn_and_commit_runs_no_agent`, `crates/orch-infra` process test `held_process_exits_when_its_parent_is_gone`; both |
-| R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. | B7; review finding | must | `text_over_64_kib_round_trips_through_the_blob_store` in `storage_conformance` checks whole values on entity references; `storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store` in the `orch-infra` library pins file row hashes and disk bytes, with `inline_threshold_counts_utf8_bytes_and_preserves_empty_values`. Retry rows were not covered on `main` at `07b5f967`, which refused text over 65,536 bytes; this change covers them by the tests that "T8 consumer-contract amendment (issue 109)" names (65,536 and 65,537 bytes in `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, registered as `memory_retries_v2`, `blob_memory_retries_v2` and `file_retries_v2`; and 67,108,864 and 67,108,865 bytes, a character split across a chunk boundary, a failed publication, a failure on a later chunk, a missing and a corrupt blob and chunk, a reordered chunk, and repeated chunks in `storage::v2::tests::retry_*` of the `orch-infra` library, each run with `-- <name> --exact` and required to execute one test; a retry with no run is in the first). SQLite backing assertions: T10; importer backing assertions: T21 (pending, no executable import filter yet); Linux |
+| R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. | B7; review finding | must | `text_over_64_kib_round_trips_through_the_blob_store` in `storage_conformance` checks whole values on entity references; `storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store` in the `orch-infra` library pins file row hashes and disk bytes, with `inline_threshold_counts_utf8_bytes_and_preserves_empty_values`. Retry rows were not covered on `main` at `07b5f967`, which refused text over 65,536 bytes; this change covers them by the tests that "T8 consumer-contract amendment (issue 109)" names (65,536 and 65,537 bytes in `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, registered as `memory_retries_v2`, `blob_memory_retries_v2` and `file_retries_v2`; and 67,108,864 and 67,108,865 bytes, a character split across a chunk boundary, a failed publication, a failure on a later chunk, a missing and a corrupt blob and chunk, a reordered chunk, repeated chunks, a rollback that leaves published bytes unreferenced and a one-object row of the documented form in `storage::v2::tests::retry_*` of the `orch-infra` library, each run with `-- <name> --exact` and required to execute one test; a retry with no run is in the first, a restore of 67,108,865 bytes with no run is in `retry_chunked_text_survives_restore_without_a_run`, and a reordered chunk of the disk-backed fake is in the private unit test `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read`). SQLite backing assertions: T10; importer backing assertions: T21 (pending, no executable import filter yet); Linux |
 | R98 | Reads shall be served by a pool of `storage.read_connections` connections (default 4); a read that finds none free shall wait up to the admission deadline and then fail with `overloaded`, never open another connection. | B6; review finding | should | `sqlite_writer::reads_wait_for_a_free_connection_then_fail_overloaded`; both |
 | R99 | `orch import` shall account for every entry of the source `.orchestry/` and of each directory that "Import rules" has it list: each is imported, or left in place as "Import rules" lists, or named by the dry run and by the import's report as not imported; a directory it does not enter is one entry. Project prompt template files shall become `templates` rows, byte for byte. | N, S2, B2 | must | `import::every_source_path_is_accounted_for` (a corpus with an unknown file and an unknown directory), `::templates_are_imported_byte_for_byte`; both |
 | R100 | `orch db restore` shall refuse, changing nothing, while a process that the replaced state or the backup records as a run's is alive (pid and start time), naming each run and pid and which of the two records it. With `--stop-runs` it shall first stop the process groups that the replaced state records, which this daemon wrote in this data directory. It shall never signal a process because a backup records it: such a process keeps the restore refused until it has ended or the owner names its run with `--assume-stopped <run id>`. No waiting period shall stand in for either: a run's process in 1.1 keeps no deadline of its own (R42), so the passing of time never shows that an earlier holder has stopped. After a restore no lease of the backup shall be active: each is ended and its run closed as R41 closes a run whose process is gone, and the spool of the replaced state (R129) is set aside with it. | G9; the lease prototype and its review (a restore that frees every task at once lets a holder from the replaced state and a new one work on one task); the security re-review's condition S2-C2 (a pid and a start time do not show who wrote a backup); the review of the prototype's corrections, N1 (its waiting-period alternative holds only where a holder stops itself, which arrives in 1.5); AP14 | must | `crates/orch-cli/tests/restore_fencing.rs::restore_refuses_while_a_recorded_process_is_alive`, `::stop_runs_stops_only_what_the_replaced_state_records`, `::a_process_only_the_backup_records_is_never_signalled` (a fake process table records every call), `::assume_stopped_lets_the_restore_proceed_for_the_named_run`, `::restored_leases_are_ended`; both |
@@ -678,6 +678,30 @@ from the caller's clock; the port reads none.
   (R74), and the only reader is the writer, in the transaction of the change.
   Rows are not exported or imported (R114). A restore ends leases but deletes no
   key; epochs are not reused, so a later run never matches an earlier one's rows.
+- A negative `now_ms` is refused as `InvalidRequestKey` on the lookup path as it is on the store path, and the lookup
+  changes nothing (`input_outside_the_shapes_is_refused_and_changes_nothing`, registered as `memory_request_keys_v2` and `file_request_keys_v2`).
+- The scope has no principal-kind field. An owner session and a worker session of one identity and project share a
+  scope (run empty, epoch 0), and a task principal differs from them only by its run and epoch. The dispatcher
+  derives a principal's kind from its persisted identity (T17, T18).
+- Persisted rows of the file reference are checked on load as the port would have written them: sorted by identity,
+  run, epoch and key without a repeat; a key, operation and hash of the port's shapes; a result within the bound; an
+  identity that is not empty; a run that is empty exactly when the epoch is 0; an epoch of at most `i64::MAX`, the
+  ceiling `RequestScope::of` applies to a task principal, so that a stored row never names an epoch that no scope can;
+  and `expires_at` exactly `created_at + 3,600,000`. A document that fails any of these is refused whole, with its path and the
+  reason (`a_hand_edited_request_key_outside_the_contract_is_refused_on_read` names the cases, including an epoch above
+  `i64::MAX`, which is refused as an impossible scope).
+- Unknown fields in that document. A request-key row denies them: a field the row does not define refuses the
+  document. The collection that holds the rows ignores a field it does not know, so a document that carries an extra
+  field there still loads (`retry_existing_single_object_encoding_and_wrapper_extensions_remain_readable`); the type
+  has no place for such a field, so a rewrite of the document writes only `rows` and does not keep it.
+- TTL compatibility. The persisted check above requires an expiry of exactly one hour after creation, so the one-hour
+  `KEY_TTL_MS` is part of what the reference document accepts. A change of the TTL must migrate or reconcile the rows
+  already stored (or version the check) in the same change; otherwise a document that holds an earlier row is refused
+  on load. No such change is made or planned in 1.1, and no migration exists.
+- Several rows may share one expiry. `delete_expired_request_keys` removes them earliest expiry first and ties by
+  scope, an order the port does not let a caller see. The reference tests do not prove that order on SQLite: the
+  full-scope tie order in the SQLite adapter is T10's, tracked in
+  [issue 127](https://github.com/yuxhuang/r-orch/issues/127) (issue 109, PR 171 follow-up N1).
 - `state = 'in_flight'` and `commit_seq` stay unwritten in 1.1. The SQLite table
   (`request_keys` in the schema) and the `request_keys.expire` job are T10's and
   T15's.
@@ -785,32 +809,41 @@ nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or
   publish each object and read it back before they stage the row, so a failed publication leaves the staged row untouched, and objects left by a
   rolled-back unit or a replaced row are unreferenced until the blob store's sweep.
 
-  Tests required on both references, with the test that carries each item. The first two rows are the
-  conformance suite's `retry_suite`, registered as `memory_retries_v2` (logical fake), `blob_memory_retries_v2`
-  (disk-backed fake) and `file_retries_v2`; the rest are in `storage::v2::tests` of `orch-infra` and run the file
-  reference and the disk-backed fake unless noted.
+  Tests required on both references, with the test that carries each item. The first three rows are scenarios of the
+  conformance suite's `retry_suite` (21 scenarios), registered as `memory_retries_v2` (logical fake),
+  `blob_memory_retries_v2` (disk-backed fake) and `file_retries_v2`, so 3 registrations each. The next six rows are in
+  `storage::v2::tests` of `orch-infra` and run the file reference and the disk-backed fake unless noted. The last row
+  is a private unit test of `orch-core`. The logical fake keeps whole strings and has no object to damage, so a row
+  that is about publication or damaged references is never carried by it.
 
   | Required | Test |
   |---|---|
   | Inline at 65,536 bytes and a blob at 65,537; a multibyte text that crosses the 64 KiB line by bytes and not by characters; a round trip with no run (no task or run entity exists); a restore | `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` (conformance, 3 registrations; it also uses the `get_retry`-before-`put_retry` enqueue pattern inside one unit of work) |
-  | A rolled-back replacement and a committed one; a held snapshot that keeps the original | `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original` (conformance, 3 registrations) |
+  | A text of 67,108,865 bytes (one above one blob object), stored with no run entity, then a fixture restore to a new lineage (`restore_to_lineage`: it ends leases, switches the lineage and keeps counters; it is not a backup copy); `read_retry`, `read_due_retries` and a complete walk return it whole | `retry_chunked_text_survives_restore_without_a_run` (conformance, 3 registrations; on the logical fake the text is a whole string, so only the two backed registrations exercise chunks) |
+  | A rolled-back replacement and a committed one; a held snapshot that keeps the original; then a replacement of the long text by a short one (9 bytes), read by `read_retry`, `read_due_retries` and a complete walk, and of that by a long one (80,000 bytes), read by `read_retry` | `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original` (conformance, 3 registrations) |
   | The file reference's backing: no `blobs` directory for inline text; the complete bytes exist before the row does; the row holds `{"sha256": H}`; reopening returns the whole text on every read | `retry_text_boundary_is_backed_before_the_hash_row_and_reopens_whole` (file reference only) |
-  | One object at 67,108,864 bytes and chunks at 67,108,865; a character straddling the chunk boundary; the joined bytes equal the whole-value hash; a damaged tail, a missing tail and, on the file reference, a reordered mapping each an error | `retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified` |
+  | One object at 67,108,864 bytes and chunks at 67,108,865; a character straddling the chunk boundary; the joined bytes equal the whole-value hash; a damaged tail and then a missing tail each an error on all six reads (`read_retry`, `read_due_retries`, `read_retries`, `get_retry`, `due_retries`, `list_retries`), on both references; on the file reference, a reordered mapping an error on the same six reads | `retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified` |
   | Identical chunks at two positions (the file reference's mapping has three entries) | `retry_repeated_chunks_reconstruct_every_occurrence_on_both_references` |
   | A failure on a later chunk after an earlier one was published; the earlier row readable after the caller catches the error and commits other work; the earlier object still present | `retry_later_chunk_failure_keeps_prior_row_and_earlier_published_bytes` |
   | A publication whose object is missing or corrupt on read-back, each leaving the earlier row intact even when the caller catches the error and commits | `retry_publication_refusal_preserves_prior_rows_even_when_caught_on_both_references` |
   | A missing and a corrupt blob after commit each an error on `read_retry`, `read_due_retries`, `read_retries`, `get_retry`, `due_retries` and `list_retries`, with the document unchanged and an absent task still reading as none | `retry_missing_and_corrupt_blobs_fail_all_read_paths_on_both_references` |
+  | A rolled-back unit that published a 65,537-byte text: the earlier row stays, the rolled-back task reads as none, and the published bytes are still on disk at their hash path with no row naming them | `retry_rollback_keeps_published_bytes_without_a_reference_on_both_backed_references` |
+  | A row that holds the single-object form `{"sha256": H}` (made by hand in the document, from a 65,538-byte text of two-byte characters put in the blob store; no earlier release wrote one) reads whole on all three snapshot reads after a reopen; the document is not rewritten by the reads; an extra field in the document's request-key collection wrapper does not prevent the reopen, and a request key stored before it still replays | `retry_existing_single_object_encoding_and_wrapper_extensions_remain_readable` (file reference only) |
+  | The disk-backed fake's private mapping, with two of its three chunks swapped: `get`, `due` and `page` of its private retry state, which every one of the six port reads calls, each fail with "reconstructed retry does not hash". Its blob store is a reversible text-name double (the content names the object), so the test proves the whole-value hash guard and not hashing or damage; the physical checks above use the real `DiskBlobStore` and SHA-256 | `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read` in `orch-core` (requires the `test-support` feature) |
 
-  Not covered by a named test in this change, and therefore open for the owner of the consumer or for a follow-up:
-  a long error replaced by a short one and the reverse as a separate scenario (the replacement test replaces a
-  65,537-byte error with a 140,000-byte one); a restore of text above 64 MiB; a reordered chunk on the disk-backed
-  fake (its mapping is private and only the file reference's document is edited); a missing or corrupt chunk of an
-  above-64 MiB text on every read path (the object-limit test checks the damaged tail on all three reads and the
-  missing tail on `read_retry` only); an assertion that a rolled-back unit leaves an unreferenced object for the sweep; and
-  an "existing one-object row" fixture (no such row existed on `main`, which refused the text, so the form is
-  exercised by the 65,537-byte and 67,108,864-byte cases). T10 repeats the physical checks on SQLite, T21 rebuilds
-  an imported 1.0 error into the same representation, and T23 carries every reachable chunk, its order and the
-  whole-value hash through backup, restore, export and import.
+  Not covered by any test of this change, and therefore open for the owner of the consumer or for a follow-up: the
+  SQLite representation of any of these rows (T10 repeats the physical checks on SQLite); the blob store's sweep
+  itself (the rollback test shows the unreferenced bytes survive the rollback, not that the sweep later removes them;
+  its row holds one object of 65,537 bytes, not a chunk); a missing or corrupt chunk on the logical fake (it has none);
+  a hardware or process crash between publication and commit; a restore that copies files (the restore of the
+  chunked-text scenario is the fixture's lineage switch, not a backup, and T23 carries every reachable chunk, its order
+  and the whole-value hash through backup, restore, export and import); and a 1.0 import (T21 rebuilds an imported 1.0
+  error into the same representation). The single-object row of the last-but-one table row is a fixture of the
+  documented encoding, not a row an earlier release wrote, because `main` at `07b5f967` refused the text.
+  The file reference's reordered mapping is made by editing its document, and the disk-backed fake's mapping is
+  private, so its reorder is proved by the unit test and not through the port. The expected counts of the runs that
+  select these tests are in the plan's "T8 consumer contracts (issue 109)", and a result is a receipt of the PR that
+  carries the change, not a statement of this spec.
 - **Owners.** This change implements the three on the memory fake and the file reference and registers the shared
   tests on both. T10 owns the SQLite representation and the adapter registration. T12 owns the finish and
   enqueue caller (get, then put, in one unit of work), the retry row written with the status and the lease release,
