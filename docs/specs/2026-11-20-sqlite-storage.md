@@ -507,7 +507,9 @@ The contract of deliverable F. Rust signatures are fixed by the port PR and reco
 | `renew_lease`, `release_lease` | Renew takes `(task, lineage, epoch, now_ms)` and sets the same checked millisecond deadline as claim; release takes `(task, lineage, epoch)` without a clock input. Both refuse with `StaleEpoch` unless lineage and epoch are the lease's (R132). |
 | `append_events(run, lineage, epoch, batch)` | Refused with `StaleEpoch` unless lineage and epoch are the lease's. Inserts with "ignore if `(run, seq)` exists". Returns `{ stored, skipped }`. `record_event_gap(run, after_seq, dropped)` records a loss keyed by `(project_id, run_id, after_seq)`. Replaying an identical count is a no-op; a conflicting count returns `InvalidEvents` and writes nothing, even if the caller catches the error and commits. |
 | `read_events(run, after_seq, limit)`, `read_events_tail(run, count)`, `prune_events(run, max_rows)` | Range read, tail read, and a bounded delete that reports whether the run is finished. |
-| `put_retry`, `due_retries(now, limit)`, `delete_retry` | The retry table; one row per task; no cap. |
+| `put_retry`, `get_retry` / `read_retry`, `delete_retry` | One project-local row per task: `task`, `attempt` (at least 1), `due_at` (nonnegative UTC milliseconds), `error` (opaque text). Put replaces the whole row; get is a point read. |
+| `due_retries(now, limit)` / `read_due_retries` | Rows with `due_at <= now`, ordered by deadline then UTF-8 task bytes; explicit limit 1..=1,000. This read order is not scheduler dispatch order. |
+| `list_retries(after, limit)` / `read_retries` | Complete enumeration, including future rows, in the same order. Keyset cursor `(due_at, task)` is exclusive; pages are 1..=1,000 and `next` exists exactly when more rows remain. There is no total cap or deletion. One read snapshot gives one committed view throughout a walk; a unit of work sees its own writes. A cursor can outlive its row but switching snapshots does not preserve an atomic walk. |
 | `add_intent(payload, now_ms)`, `pending_intents(after, limit)`, `finish_intent(id, now_ms)`, `delete_finished_intents(now_ms, max_rows)` | Side effects (R28); the T8c intents amendment below states the typed payloads, the lease boundary and the retention. |
 | `check_request_key(scope, op, hash)`, `store_request_key(scope, op, hash, result)` | Return `New`, `Replay(result)`, `ReplayWithoutResult` or `Mismatch`. |
 | `open_attention`, `ack_attention`, `resolve_attention` | The attention queue; `open` is a no-op when an open item exists for the subject. |
@@ -676,6 +678,17 @@ exists the rule is: wherever 1.0 saved a task, agent, goal or message.
 
 Removed with port v1: `StateStore` (replaced by leases, retries, counters and project settings), the rule that
 every YAML read resolves merge keys (only the importer reads YAML), and the reorder inside `save`.
+
+Retry reference boundary: the current memory/file references accept error text up to
+65,536 bytes and refuse larger values without truncation. R97 remains binding:
+API/imported larger text must round-trip whole through blobs; this reference limit
+is not an exception. T10/T12/T21 own the remaining mapping and consumer work (#109).
+The 1.0 enqueue was first-wins (call `get_retry` before put), malformed legacy
+retry deadlines count as due, and dispatch uses candidate order and agent rotation,
+not deadline order. T12/T14/T21 retain these contracts. Complete enumeration is
+checked on both references by `the_complete_read_pages_every_row_including_future_ones_in_read_order`,
+`a_snapshot_walk_ignores_commits_made_between_its_pages`, and
+`a_restore_keeps_every_retry_row` in `storage_contract/retries_v2.rs`.
 
 ## Schema for 1.1
 

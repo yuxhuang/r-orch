@@ -5,6 +5,10 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ## [Unreleased]
 
+### Added
+
+- Storage reference snapshots can enumerate every retry, including future work, in ordered pages without dropping rows.
+
 ### Storage groundwork
 
 - Add the inactive attention port with fixed daemon facts, revisioned acknowledgements and resolution, bounded paging and retention, and isolated memory/file references; runtime evaluation and commands remain unwired.
