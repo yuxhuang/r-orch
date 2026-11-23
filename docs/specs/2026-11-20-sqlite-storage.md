@@ -755,6 +755,23 @@ Rows the daemon keeps without a table of their own: the generation, the restore 
 dispatch state in `daemon_config`; each maintenance job's times under `maintenance/<job>` in `daemon_config`; 1.0's totals in
 `counters`; `run_cap`, `preapproval`, the retention settings and `legacy.config` in `project_config`.
 
+### Staged SQLite goal timestamp and position limits
+
+The internal goal adapter remains inactive; the daemon uses file storage. Both goal timestamp fields
+accept only canonical UTC millisecond strings from `0000-01-01T00:00:00.000Z` through
+`9999-12-30T22:00:00.999Z`, inclusive. The lower bound follows the core formatter's canonical year
+spelling; the upper bound is Jiff's parser ceiling. Alternate spellings, expanded or negative years,
+and out-of-range stored milliseconds yield `Unrepresentable`. This restriction does not widen the
+public storage port contract or establish completed SQLite conformance.
+
+Goal create and move allocate only from the durable project-local `position:goal` counter. They refuse
+missing counters when rows survive (`CounterMissing`), negative counters (`CounterNegative`), and
+counters below any surviving position (`CounterBehind`), without changing rows or consuming positions.
+Nonpositive surviving row positions remain invalid stored metadata. Signed exhaustion remains
+`CounterExhausted`. Delete preserves the high-water mark. An empty namespace permits bootstrap; after
+all rows are deleted, loss of its counter cannot be distinguished from a new family. Surviving row
+maxima validate metadata and never reconstruct the allocation history.
+
 ## Transactions and intents
 
 | Operation | Lane | In the one transaction | Intents written with it |

@@ -11,6 +11,20 @@ pub use connection::{ConnectionHandle, ConnectionRole, Synchronous, open_connect
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteError {
+    #[error("SQLite counter {name} is missing for project {project} with existing rows")]
+    CounterMissing { project: String, name: &'static str },
+    #[error("SQLite counter {name} is negative ({value}) for project {project}")]
+    CounterNegative {
+        project: String,
+        name: &'static str,
+        value: i64,
+    },
+    #[error("SQLite counter {name} ({value}) is behind existing rows for project {project}")]
+    CounterBehind {
+        project: String,
+        name: &'static str,
+        value: i64,
+    },
     #[error("value cannot be represented losslessly in the SQLite schema: {0}")]
     Unrepresentable(String),
     #[error("goal operation failed: {operation}; savepoint rollback failed: {rollback}")]
@@ -102,3 +116,9 @@ mod leases;
     reason = "Internal task paging awaits T10 hydration and public cursor integration"
 )]
 mod task_page;
+
+#[allow(
+    dead_code,
+    reason = "internal request-key persistence awaits the combined T10 Storage adapter"
+)]
+mod request_keys;

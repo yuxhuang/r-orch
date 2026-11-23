@@ -593,3 +593,79 @@ fn snapshot_read_failure_reaches_the_pool_as_a_sql_error_not_a_backend_string() 
         ));
     });
 }
+
+#[test]
+fn claim_write_failure_inside_the_savepoint_keeps_its_sqlite_code_and_commits_nothing() {
+    use rusqlite::ffi::ErrorCode::ConstraintViolation;
+    // Both writes of the claim's savepoint: the counter upsert runs first, so a
+    // failing `leases` insert also proves the counter is rolled back with it.
+    for table in ["task_epochs", "leases"] {
+        executor(|writer, readers| {
+            exec(
+                writer,
+                match table {
+                    "task_epochs" => {
+                        "CREATE TRIGGER refuse_claim BEFORE INSERT ON task_epochs BEGIN SELECT RAISE(ABORT,'synthetic'); END"
+                    }
+                    _ => {
+                        "CREATE TRIGGER refuse_claim BEFORE INSERT ON leases BEGIN SELECT RAISE(ABORT,'synthetic'); END"
+                    }
+                },
+            );
+            // Through the adapter: the job fails, so the receipt carries the code.
+            let adapter = LeaseAdapter {
+                writer,
+                readers,
+                caller: owner("p"),
+                clock: &ClockAt(0),
+            };
+            let receipt = adapter.claim(None, new("t", "a", "r")).unwrap().wait();
+            assert_eq!(sql_code(receipt), ConstraintViolation, "{table}");
+            // The helper itself must hand the executor `LeaseError::Sql`, not a
+            // typed `StoreError`, which the executor would commit.
+            let direct = writer
+                .submit(Lane::Claims, None, |tx| {
+                    Ok(matches!(
+                        claim_lease(tx, &owner("p"), &new("t", "a", "r"), 0),
+                        Err(LeaseError::Sql(_))
+                    ))
+                })
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert!(direct, "{table}: claim write failure lost its SQL error");
+            assert_eq!(lease_state(readers), (vec![], 0, 0), "{table}");
+        });
+    }
+}
+
+#[test]
+fn statement_level_failure_in_a_composed_lease_job_is_rolled_back_by_the_executor() {
+    use rusqlite::ffi::ErrorCode::ConstraintViolation;
+    executor(|writer, readers| {
+        // RAISE(ABORT) fails the statement and leaves the transaction open, so
+        // only the executor dropping it can remove the earlier writes.
+        exec(
+            writer,
+            "CREATE TRIGGER abort_renew BEFORE UPDATE ON leases BEGIN SELECT RAISE(ABORT,'synthetic'); END",
+        );
+        let receipt = writer
+            .submit(Lane::Claims, None, |tx| {
+                let who = owner("p");
+                tx.execute(
+                    "INSERT INTO daemon_config(key,value,revision) VALUES('outer','x',1)",
+                    [],
+                )?;
+                let ClaimOutcome::Granted(lease) = claim_lease(tx, &who, &new("t", "a", "r"), 0)?
+                else {
+                    unreachable!()
+                };
+                renew_lease(tx, &who, "t", &lease.lineage, lease.epoch, 9)?;
+                Ok(())
+            })
+            .unwrap()
+            .wait();
+        assert_eq!(sql_code(receipt), ConstraintViolation);
+        assert_eq!(lease_state(readers), (vec![], 0, 0));
+    });
+}
