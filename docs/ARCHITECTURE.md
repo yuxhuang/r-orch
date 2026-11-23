@@ -346,8 +346,9 @@ Every writer, remote peer callbacks included, is owned by the daemon's coordinat
 Two things in this diagram were wrong in earlier revisions, and both are now enforced rather than described.
 
 **1. `orch-engine` does depend on `orch-infra`.** An earlier revision said "engine depends on core, NOT on
-infra". The edge is real. `ENGINE_INFRA_SITES` allows **14** files under `crates/orch-engine/src/` to name
-`orch_infra`: **10** source files and **4** files under `orchestrator/tests/`. The check matches any mention of
+infra". The edge is real. `ENGINE_INFRA_SITES` allows **15** files under `crates/orch-engine/src/` to name
+`orch_infra`: **10** source files and **5** test files — **4** under `orchestrator/tests/` and **1**,
+`orchestrator/claim_v2/tests.rs`, under `orchestrator/claim_v2/`. The check matches any mention of
 `orch_infra` in a file, doc comments and in-file `#[cfg(test)]` modules included.
 
 | Site | What it names | Why it is acceptable |
@@ -366,6 +367,7 @@ infra". The edge is real. `ENGINE_INFRA_SITES` allows **14** files under `crates
 | `orchestrator/tests/remote.rs` | `FileRemoteStore`, `Paths`, `FileConfigStore`, `storage::lock::acquire_lock` | Remote lifecycle tests use the real registry and status files and stale-lock guards. |
 | `orchestrator/tests/skills.rs` | `DEFAULT_SYSTEM_TEMPLATE`, `DEFAULT_USER_TEMPLATE` | A test asserting the dispatch templates are the real ones. |
 | `orchestrator/tests/token_eco.rs` | `DEFAULT_USER_TEMPLATE` | A test asserting that a normal-mode agent with only a custom system template still renders the real default user template. |
+| `orchestrator/claim_v2/tests.rs` | `storage::v2::FileStorage` | The `#[cfg(test)]` test module of the reservation commit. It assembles the file reference storage to check commit, rollback and approval refusal there; keeping it beside the code preserves access to the private rollback seam. This exception covers only this test module. |
 
 **What actually holds is narrower: every service's injected stores, clock and ID generator are `orch-core`
 trait objects (`Arc<dyn …>`), and the only concrete infra types a service constructor or builder accepts are
