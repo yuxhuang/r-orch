@@ -69,13 +69,18 @@ Authoritative docs:
    vulnerability reporting or direct message), never in a public issue, PR title or PR body.
 10. **Linux only until 2.0.** By the owner's ruling of 2026-11-23, every release from 1.1 through 2.0 is
     developed, tested, gated and qualified on Linux only: GitHub's Linux CI, Linux development hosts and the
-    Linux cold gate. No macOS check, Darwin or APFS row, macOS peer or hardware proof and physical suspend test
-    is required by a PR, a spec, a review or a release before 2.0, and none is run for them. A failure or gap
+    Linux cold gate. No macOS check, Darwin or APFS row, macOS peer or hardware proof, or macOS suspend test
+    is required by a PR, a spec, a review or a release before 2.0, and none is run for them. The Linux
+    fenced-lease sleep/wake check stays: a supervised process through a real suspend and resume of an isolated
+    Linux host that the owner has authorized (spec R42, issue 110; pending, and nobody suspends a host without
+    the owner's permission). The injected-clock test proves renewal ordering only. A failure or gap
     that occurs only on macOS is a GitHub issue in the
     [After 2.0](https://github.com/yuxhuang/r-orch/milestone/20) milestone (unless triage assigns another),
     not a blocker. A failure that Linux shows too is an ordinary Linux failure. This changes no code or CI and
     removes no macOS code path; the second host for the peer check is a Linux host, and Linux CI, the review
-    rules and owner-only merges are unchanged. macOS compatibility is worked on after 2.0. See ARCHITECTURE §13
+    rules and owner-only merges are unchanged. macOS compatibility is worked on after 2.0. Because macOS goes
+    unqualified, the README upgrade notes, the `CHANGELOG.md` entry and the release PR of every release through
+    2.0 say so (see Release). See ARCHITECTURE §13
     and record K of the [SQLite storage spec](docs/specs/2026-11-20-sqlite-storage.md).
 
 ## Licensing
@@ -385,7 +390,7 @@ cargo xtask linux clean                          # delete this checkout's target
   and Linux CI runs all 7. Under another emulator the probes decide: a behaviour it lacks skips nothing, and a new
   one shows up as an ordinary failure (see Reporting). `run` neither probes nor skips. Where `$HOME` gets written,
   `./xtask/gate.sh` cannot pass in the container (its home-hygiene step, and its test step skips nothing): run the
-  gate on macOS or on native Linux.
+  gate on native Linux; a macOS run is not required before 2.0 (rule 10).
 - **Reporting.** The run prints the commit, the tree, whether the tree was dirty and the base image digest. In the
   PR, name the platform `Linux (Docker linux/amd64)`, never "Linux CI", with the commit it ran at, `dirty no`,
   whether the run was native or emulated, and the tests it skipped. A failure seen only in the container is still a
@@ -665,6 +670,9 @@ behaviour (hang-up, SIGHUP) stays on `portable-pty`, as in `crates/orch-cli/test
 3. In `CHANGELOG.md` rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`, add a fresh empty `## [Unreleased]`,
    and update the compare links at the bottom.
 4. Update README release notes (the "Upgrading" and "Known gaps" sections) if behaviour users must act on changed.
+   For every release from 1.1 through 2.0, whatever else changed, the README upgrade notes, the `CHANGELOG.md`
+   entry and the release PR each state that the release was qualified on Linux only and that macOS is untested
+   until after 2.0 (rule 10). Packaging, the Homebrew formula and the workflow are not changed for it.
 5. Commit `chore(release): X.Y.Z`, open the PR, CI green, owner merges (merge commit, per the convention).
 6. On `main`: `git tag -a vX.Y.Z -m "vX.Y.Z"` then `git push origin vX.Y.Z`.
 7. Create the GitHub release with notes copied from the CHANGELOG section:

@@ -1627,8 +1627,14 @@ the [SQLite storage spec](specs/2026-11-20-sqlite-storage.md), its [plan](plans/
 
 By the owner's ruling of 2026-11-23, every release above, from 1.1 through 2.0, is developed, tested, gated and
 qualified on Linux only. GitHub's Linux CI is the gate, as before; the Linux development hosts and the Linux cold
-gate carry the rest. No macOS check, Darwin or APFS row, macOS peer or hardware proof and physical suspend test
+gate carry the rest. No macOS check, Darwin or APFS row, macOS peer or hardware proof, or macOS suspend test
 is required of any of these releases. The peer check on a second host is a Linux host.
+
+- **Linux sleep/wake stays.** The fenced-lease check of a supervised process through a real suspend and resume
+  of an isolated Linux host that the owner has authorized is not withdrawn (spec R42, issue 110). It is pending:
+  nothing has been recorded. The injected-clock test of the lease code proves renewal ordering only.
+- **Releases say so.** The README upgrade notes, the CHANGELOG and the release PR of each release through 2.0
+  state that it was qualified on Linux only and that macOS is untested until after 2.0.
 
 - **Product code is unchanged.** The macOS code paths described elsewhere in this document (for example the
   complete-spawn exclusion domain under "Daemon process admission") stay; the ruling is about what is run and
