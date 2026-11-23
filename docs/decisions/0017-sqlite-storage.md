@@ -491,7 +491,11 @@ across a crash, lists that do not load everything, and a retried request that ru
     creator columns once from the caller's `Principal` (`Owner` is `owner`, `Worker` is `daemon`, `Task` is `agent` with
     its fenced run; the importer records `import`), a write that leaves `done` preserves `landing_state`, and a
     revision-checked `delete` removes the task's `task_attachments` rows in its savepoint while its blob registrations and
-    bytes stay for the sweep (R60). The owner of the attachment path concurred in the last.
+    bytes stay for the sweep (R60). The owner of the attachment path concurred in the last. The format
+    writes only the columns it projects from the detail: `review`, `legacy_proof` and `outputs` are never written
+    from a `Task`. 1.0's recorded proof, which the spec's "Import rules" had sent to `legacy_proof`, is imported as
+    the task's `proof` in the detail and `legacy_proof` stays NULL; the lead's confirmation of that change to the
+    rule is pending.
 
 ## Alternatives considered
 
@@ -670,7 +674,8 @@ across a crash, lists that do not load everything, and a retried request that ru
 - **A versioned envelope inside an existing column** (`outputs` or `legacy_proof`, or the opaque `review`).
   It avoids a migration and costs the meaning of a column that later phases own, a second reader for each
   phase, and a harder move later; it also leaves the reachability of objects to a scan of JSON. Rejected: the
-  columns are reserved (R19) and a new table is cheaper than a competing meaning.
+  `outputs` and `legacy_proof` columns are kept for later phases (R19), `review` is named in no list, and a new
+  table is cheaper than a competing meaning.
 - **Only the missing fields in a side record, native rows authoritative for the rest.** Two authorities for
   one task: a row and its side record could each be right and still disagree, and order and repeats of a list
   would still need a place. Rejected for the single authority of decision 26.

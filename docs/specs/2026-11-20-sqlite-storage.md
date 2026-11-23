@@ -863,8 +863,10 @@ that the first migration's `tasks` row and membership tables have no place for, 
 whole typed value and compares it for equality:
 
 - `workspace`, `proof`, `review_criteria`, `review_results` and the optional `scope` and `attachments` have no
-  column. The `review`, `legacy_proof` and `outputs` columns are reserved for later phases (R19) and format v1
-  neither reads nor writes them.
+  column. A task's `proof`, 1.0's recorded proof included, is held by the detail alone. The `legacy_proof` and
+  `outputs` columns are kept for later phases (R19), and the schema's `review` column is named in no list of this
+  spec; format v1 neither reads nor writes any of the three, and nothing in 1.1 writes `legacy_proof` (the
+  import rule for proof is in "Import rules").
 - `labels`, `depends_on` and `scope` are ordered and may repeat a value; `task_labels`, `task_dependencies`
   and `task_scopes` are keyed by value, so they keep neither order nor repeats, and zero rows cannot tell an
   absent `scope` from an empty one. `Option<Vec<_>>` keeps that difference in the domain and the file reference.
@@ -1048,7 +1050,9 @@ means nothing and cannot be mistaken for user text. The columns that the task fo
 written from a `Task`: `review`, `legacy_proof`, `outputs`, `created_by_kind`, `created_by_run_id`,
 `accepted_by`, `accepted_at`, `accepted_run_id`, `landing_state`, `landed_commit`, `landed_into`, `landed_at`,
 `landing_attempts`, `landing_conflict_paths`, `attention_reason` and `attention_since`.
-`update` and `move_to_end` preserve each of them byte for byte. Three rules cover the creator columns, the landing record and the attachment rows:
+`update` and `move_to_end` preserve each of them byte for byte. No path of 1.1 writes `legacy_proof`: a task's proof,
+whether it was created through the API or read from a 1.0 document, is the `proof` of its detail and has no second
+copy, so the column is NULL in every database that 1.1 creates. Three rules cover the creator columns, the landing record and the attachment rows:
 
 - **Creator.** An authorized native `create` derives `created_by_kind` and `created_by_run_id` exactly once, from the
   `Principal` of the storage caller (`crates/orch-core/src/store.rs`), after the existing authorization and fencing
@@ -1188,7 +1192,7 @@ the last naming row (R60).
 | T10 | The mapping above for `Task`, with the R141 tests; register the shared entity suites (`text_over_64_kib_round_trips_through_the_blob_store` and the task-id fold scenarios) on SQLite; keep the mapping behind the internal adapter; `SqliteError::TaskCorrupt` and its classification before any public conversion (R140, R141), on the writer that the T10 integration latches. Other entities and the public cursor stay with their own slices. |
 | T11 | Row-only registration of an already-published disk object, crate-visible, in `crates/orch-infra/src/blob/references.rs` ("Blob helper change" above). The rest of the blob adapter is used as it is. |
 | T15 | `blobs.sweep` counts `task_blob_refs.sha256` as a naming row for the 7-day rule (R60), beside `runs.prompt_sha256`, `task_attachments.sha256` and the retry mapping. A task's `delete` removes its naming rows and keeps its blobs, so an object it named becomes eligible only after seven days with no naming row at all, and a hash that another task, run or project still names is kept. |
-| T21 | Build each task through the same codec as the port, never by inserting rows. Keep list order, repeats and `Option` presence exactly as the 1.0 document says. Record `import` and NULL as the creator of a legacy task of unknown origin, on the owner-authorized path and through the same codec. Decide and record what a non-canonical timestamp does (above). A task text over 64 KiB becomes the references above, as R97 says for imported text, and a source document is at most 1 MiB, so an import never needs a split. A source or an export that is itself corrupt refuses the import and leaves the live writer usable (R140). |
+| T21 | Build each task through the same codec as the port, never by inserting rows. Keep list order, repeats and `Option` presence exactly as the 1.0 document says; 1.0's recorded proof (the document's `proof` key) is the task's `proof` in the detail, and the importer leaves `legacy_proof` NULL (a second copy would need its own layout for a text over 64 KiB, R97, which format v1 does not define). Record `import` and NULL as the creator of a legacy task of unknown origin, on the owner-authorized path and through the same codec. Decide and record what a non-canonical timestamp does (above). A task text over 64 KiB becomes the references above, as R97 says for imported text, and a source document is at most 1 MiB, so an import never needs a split. A source or an export that is itself corrupt refuses the import and leaves the live writer usable (R140). |
 | T22 | `orch db verify` runs the read checks above for every task, and reports an object, a reference row or a detail with no task. A check of the live database that proves a task corrupt is `TaskCorrupt` and fails the writer (R140), as any other live read does; a check of a backup or an export file refuses that command alone. Two diagnostic views are owed: `diag_task_details` lists every column except `detail` (which can be large and duplicates `diag_tasks`), and `diag_task_blob_refs` lists its columns. |
 | T23 | A backup copies the database and every object that a `task_blob_refs` or `blobs` row names, in one restorable point, and a restore verifies each object's name, size and order. An export carries both tables as rows, in the export's own chunking of blob bytes (a different thing from the 64 MiB split here), and an import verifies each text's reconstruction and whole hash and reproduces every row. A backup or an export that reads a live task and proves it corrupt is `TaskCorrupt` and fails the writer; a corrupt backup, export or import file refuses the command and leaves the writer usable (R140). `blob.delete` intents are untouched. |
 | T27 | Records the named checks of R141 as run, rejecting an empty or ignored selection. |
@@ -1198,13 +1202,20 @@ the last naming row (R60).
 lead decided them on 2026-11-23, and the owner of the attachment path (T11) concurred in the removal after checking the
 schema, the blob adapter and R59 and R60. The lead also settled on 2026-11-23 what the stored-data error is and its
 class: `SqliteError::TaskCorrupt`, fatal under R140, with the writer rules of "When a Task read proves its data
-corrupt". Three points remain open. The owner's answer to O2 named the exact schema of this spec at 33 tables; the two
+corrupt". Four points remain open. The owner's answer to O2 named the exact schema of this spec at 33 tables; the two
 tables here widen it, and the owner's merge of this text is the approval. The structured classification that
 issue 127 asks for on the other entities (a goal, a lease, an event, a request key) is not settled here: this text
-defines the variant and the class for `Task` alone, and the mapping must not read it as a rule for another entity. And
-the carrier of the "Blob helper change" is not decided: T11 owns it, but the mapping's scope is the SQLite source and
+defines the variant and the class for `Task` alone, and the mapping must not read it as a rule for another entity. The
+carrier of the "Blob helper change" is not decided: T11 owns it, but the mapping's scope is the SQLite source and
 tests, so either a small T11 PR lands the row-only registration first or the lead widens the mapping's scope by
-`crates/orch-infra/src/blob/references.rs` and its `blob_store` test.
+`crates/orch-infra/src/blob/references.rs` and its `blob_store` test. And the rule for 1.0's recorded proof is
+reconciled here and needs the lead's confirmation, because it changes the destination that "Import rules" gave it: that
+rule sent the proof to `legacy_proof`, while R19 keeps the column unused and this format keeps the proof in the detail
+(the only authority) for every task. The text now says that the proof goes to the detail and that `legacy_proof` stays
+NULL. The other way, an importer-owned `legacy_proof` copy preserved by format v1, would need that column's own
+encoding, a rule for a proof over 64 KiB (R97 covers imported text, and the column has no reference rows), and a
+decision on whether an export of a task created through the API carries the same copy; it adds a second copy that
+nothing reads in 1.1.
 
 ## Transactions and intents
 
@@ -2438,7 +2449,9 @@ The new operations are in no MCP allowlist.
   the import shows it and asks again. Every entry that passes, claimed entries included,
   is closed as 1.0's startup recovery closes one whose process is gone, in the database only (R105, AP14).
   A closed remote run is not attached again, and a late outcome for it changes nothing (R120).
-- Tasks that are `done` get `landing_state = 'skipped'`; 1.0's recorded proof goes to `legacy_proof`.
+- Tasks that are `done` get `landing_state = 'skipped'`. 1.0's recorded proof, the `proof` key of the task document,
+  is imported as the task's `proof` in its detail, like every other field of the task, and is not copied anywhere
+  else: the `legacy_proof` column stays NULL (R19; "Task format v1 (SQLite)").
 - `config.yml`: R70. If the unknown keys exceed 64 KiB the import stops and names them by size. What the
   file holds decides the rest, and the six cases are kept apart because 1.0's effective reader ran the
   project on its defaults alone in four of them and on the mapping's keys over its defaults in a fifth,
