@@ -284,3 +284,5 @@ fn legacy_rows_without_typed_facts_are_preserved_and_refused() {
         1
     );
 }
+
+mod stored_validation;
