@@ -171,6 +171,10 @@ const ENGINE_INFRA_SITES: &[(&str, &str)] = &[
         "rehydrating remote runs at startup reads the persisted RemoteAgentDirectory snapshot, as message_service.rs does",
     ),
     (
+        "orchestrator/claim_v2/tests.rs",
+        "file-reference scenario assembly for reservation commit, rollback and approval refusal",
+    ),
+    (
         "orchestrator/tests/harness.rs",
         "test assembly wires the explicit RemoteAgentDirectory to TaskService",
     ),
