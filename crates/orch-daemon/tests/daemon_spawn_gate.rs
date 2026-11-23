@@ -38,6 +38,12 @@ fn cancel_and_stop_survive_overlapping_bare_name_diagnostics() {
     for dir in [&home, &bin, &project.join(".orchestry")] {
         std::fs::create_dir_all(dir).unwrap();
     }
+    // This positive fixture must be private even under a group-writable umask.
+    std::fs::set_permissions(
+        root.path().join("project/.orchestry"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let claude = bin.join("claude");
     std::fs::write(
         &claude,
@@ -237,6 +243,12 @@ fn held_diagnostic_keeps_control_and_owned_drain_available() {
     for dir in [&home, &bin, &project.join(".orchestry")] {
         std::fs::create_dir_all(dir).unwrap();
     }
+    // This positive fixture must be private even under a group-writable umask.
+    std::fs::set_permissions(
+        root.path().join("project/.orchestry"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let claude = bin.join("claude");
     std::fs::write(
         &claude,
@@ -529,6 +541,12 @@ fn stop_with_both_live_agent_and_live_probe() {
     for dir in [&home, &bin, &project.join(".orchestry")] {
         std::fs::create_dir_all(dir).unwrap();
     }
+    // This positive fixture must be private even under a group-writable umask.
+    std::fs::set_permissions(
+        root.path().join("project/.orchestry"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let claude = bin.join("claude");
     std::fs::write(
         &claude,
@@ -695,6 +713,12 @@ fn pause_while_queued_prevents_late_launch() {
     for dir in [&home, &bin, &project.join(".orchestry")] {
         std::fs::create_dir_all(dir).unwrap();
     }
+    // This positive fixture must be private even under a group-writable umask.
+    std::fs::set_permissions(
+        root.path().join("project/.orchestry"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let claude = bin.join("claude");
     std::fs::write(
         &claude,
@@ -854,6 +878,12 @@ fn forwarded_effort_cancellation_drops_both_preparations_before_release() {
     ] {
         std::fs::create_dir_all(dir).unwrap();
     }
+    // This positive fixture must be private even under a group-writable umask.
+    std::fs::set_permissions(
+        root.path().join("project/.orchestry"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
     let script = root.path().join("bin/opencode");
     std::fs::write(
         &script,
