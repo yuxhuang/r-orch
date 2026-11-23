@@ -362,8 +362,13 @@ across a crash, lists that do not load everything, and a retried request that ru
     expansion whether an alias stands as a value or under a merge key; an explicit YAML tag is refused. The
     numbers are those of 1.0's own guarded reader where it has them (1 MiB, 64 aliases, 200,000 expanded
     nodes), so that a document 1.0 wrote always passes and aliases and merge keys are still resolved as 1.0
-    resolved them; three rules are new and stricter (tags, depth 64, expanded bytes 4 MiB) and the spec's
-    point AP15 puts them to the owner. An import checks its whole source, as its dry run does, before it
+    resolved them; four rules are stricter than 1.0's reader. Three are new (tags, depth 64, expanded bytes
+    4 MiB), and the spec's point AP15 puts them to the owner. The fourth is that a stream holds exactly one
+    document: 1.0's reader allows at most one and reads a `config.yml` whose stream holds none as its
+    defaults (the spec's fact F18). This decision said "three rules" until 2026-11-22 and was wrong in
+    that. Whether such a `config.yml` is refused, with a statement that 1.0 read it, or is imported as the
+    empty mapping is the spec's point T21-C1; the owner has not answered it, and the spec drafts the
+    refusal from that point's default. An import checks its whole source, as its dry run does, before it
     writes anything. An export is a SQLite file and is read as a hostile one, with the settings SQLite
     documents for that case: its header is checked before SQLite opens it; the connection is its own,
     read-only and immutable, in defensive mode, with the schema untrusted, triggers, views and extension

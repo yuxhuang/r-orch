@@ -120,7 +120,12 @@ event/lease contracts and their memory reference, followed by retries, intents,
 request keys and attention. The file reference carries the event and lease
 families too (registered beside the memory reference); SQLite wiring follows
 T9/T10. The T8c event and lease slice does not complete T8 or release
-the engine's dependency on the full operational port. The v1 runtime stays active.
+the engine's dependency on the full operational port. The T8c intents slice
+(typed `process.start`, `process.stop`, `workspace.remove` and `blob.delete`
+payloads, project-local ids, bounded pending reads, idempotent completion and
+7-day retention, with the same memory and file references) follows the same
+rule; request keys, attention and the retry enumeration are later slices.
+The v1 runtime stays active.
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|
@@ -138,7 +143,7 @@ the engine's dependency on the full operational port. The v1 runtime stays activ
 | T19 | Attention queue with its two kinds; the disk floor | R81 to R85, R131 | `crates/orch-engine/src/attention*`, `crates/orch-engine/src/disk_floor*`, `crates/orch-cli/` | T15, T17 | `cargo test -p orch-engine --test attention --test disk_floor`; `cargo test -p orch-cli --test attention` | 18 |
 | T20 | Usage for every run, with the model and the agent CLI version | R86, R87 | `crates/orch-engine/src/orchestrator/`, `crates/orch-infra/src/adapters/` | T12 | `cargo test -p orch-engine --test usage` | 19 |
 | T21a | The seeded fixture generator split out of T21 as a preparatory slice: `cargo xtask fixture-gen` scripts the real 1.0 file backend in a private temporary directory from a fixed seed, with a deterministic clock and ids; `--check` compares exact file sets and bytes with the checked-in `fixtures/storage/generated/` and changes nothing. One small scenario is checked in; large corpora for R66 and the importer's results stay in T21 | R90 | `xtask/src/fixture_gen*`, `xtask/src/main.rs`, `xtask/Cargo.toml`, `xtask/src/crate_graph.rs`, `xtask/tests/fixture_gen.rs`, `fixtures/storage/generated/` | T2 | `cargo xtask fixture-gen --check`; `cargo test -p xtask --test fixture_gen` | 20 (first slice) |
-| T21 | `orch import` from a 1.0 directory: dry run, bounds, resume; the source read by listing through the confined-directory module, the id rule, and nothing done outside the database; the seeded fixture generator's further scenarios (T21a owns `xtask/src/fixture_gen.rs` and its first scenario; T21 extends it) and the hand-written hostile-source corpus (links, special files, traversal-shaped ids and names, a live canary process, a canary child left in the process group of a leader that has gone, two task ids that differ only in case, and a workspace with a canary under another spelling of a task's id). The check, before the first write, that no two task ids of the source have one fold key and that no name listed in `workspaces/` folds onto a task's id without being it; `workspaces/` is listed for its names alone. The source-budget pass of the spec's "Import bounds": every document measured for bytes, depth, nodes, aliases, expansion and tags before anything is built from it, on 1.0's own guarded reader (`orch_core::definition_yaml`) where that already holds the limit; event lines read as a bounded stream; the check of the whole source before the first write; and the hostile-document corpus (the review's depth and alias documents, merge-key bombs, tags, each limit and one over), run in a child process under a time and a memory ceiling | R64 to R70, R90, R99, R103 to R105, R109 to R112, R116 (a 1.0 source), R117 (a 1.0 source), R119, R121 (the record), R122, R123, R125 | `crates/orch-infra/src/import/`, `crates/orch-cli/src/commands/import*`, `xtask/src/fixture_gen.rs`, `fixtures/storage/`, `crates/orch-infra/tests/source_budget.rs`, `crates/orch-cli/tests/import_hostile.rs` | T10, T11, T2 | `cargo test -p orch-cli --test import --test import_hostile`; `cargo test -p orch-infra --test source_budget`; `cargo xtask fixture-gen --check` | 20 |
+| T21 | `orch import` from a 1.0 directory: dry run, bounds, resume; the source read by listing through the confined-directory module, the id rule, and nothing done outside the database; the seeded fixture generator's further scenarios (T21a owns `xtask/src/fixture_gen.rs` and its first scenario; T21 extends it) and the hand-written hostile-source corpus (links, special files, traversal-shaped ids and names, a live canary process, a canary child left in the process group of a leader that has gone, two task ids that differ only in case, and a workspace with a canary under another spelling of a task's id). The check, before the first write, that no two task ids of the source have one fold key and that no name listed in `workspaces/` folds onto a task's id without being it; `workspaces/` is listed for its names alone. The source-budget pass of the spec's "Import bounds": every document measured for bytes, depth, nodes, aliases, expansion and tags before anything is built from it, on 1.0's own guarded reader (`orch_core::definition_yaml`) where that already holds the limit; event lines read as a bounded stream; the check of the whole source before the first write; and the hostile-document corpus (the review's depth and alias documents, merge-key bombs, tags, each limit and one over), run in a child process under a time and a memory ceiling. The six cases of `config.yml` and the classes of an `_index.json` that the spec's "Import rules" tabulate, with the statements of what 1.0 did with a refused file and the vectors C-V1 to C-V14 and X-V1 to X-V14 as tests; neither path gets a caller before the owner has merged the contract text that carries them ("T21 config and index contract") | R64 to R70, R90, R99, R103 to R105, R109 to R112, R116 (a 1.0 source), R117 (a 1.0 source), R119, R121 (the record), R122, R123, R125 | `crates/orch-infra/src/import/`, `crates/orch-cli/src/commands/import*`, `xtask/src/fixture_gen.rs`, `fixtures/storage/`, `crates/orch-infra/tests/source_budget.rs`, `crates/orch-cli/tests/import_hostile.rs` | T10, T11, T2 | `cargo test -p orch-cli --test import --test import_hostile`; `cargo test -p orch-infra --test source_budget`; `cargo xtask fixture-gen --check` | 20 |
 | T22 | `orch db` with the daemon running: status, verify, query, prune | R72 to R74, R79, R121 (status), R130 | `crates/orch-daemon/src/ops/`, `crates/orch-cli/src/commands/db*` | T10, T16, T17 | `cargo test -p orch-cli --test db_commands` | 21 |
 | T23 | Backup, restore, vacuum, export, and import from an export file; a backup is written and read through the confined-directory module, its manifest's names are checked against the layout and never opened, and an export's names, ids and paths are stored as data. Before an export's database is published and before a restore changes anything, the check of the spec's R117: no two task ids of one fold key, no directory in the project's `workspaces/` that the tasks brought may not own, and a backup's database refused when it lacks the index. The export format of the spec's "Import bounds" (blob bytes in chunks, a manifest, tables only) and its hostile reader: the header checked before SQLite opens the file, a read-only immutable connection with the schema untrusted, triggers, views and extensions off, run-time limits, a heap limit, an authorizer and a progress handler, `quick_check` first, the schema compared and never adopted, rows copied by fixed statements into a database built by the product's own migrations under a scratch name and published by a rename; and the hostile-export corpus, made by altering the bytes of an export the product wrote, run in a child process under the same ceilings. A restore replaces the state as the spec's R138 says: the whole state staged under a scratch name with its new lineage and generation and its leases ended, a synced marker, renames in a fixed order, `--continue` and `--abandon`, a refusal to start anything while the marker exists, and a check of free space that counts the backup; tested by stopping a child at every step | R75 to R80, R100, R108, R101 and R102 (backups), R105 and R107 (export), R113 to R115, R116 (an export), R67 (no resume for an export), R117 (an export, a restore), R124 (restoring the copy), R125 (an export), R132 (a restore), R133 (the confirmation), R138 | `crates/orch-infra/src/sqlite/backup*`, `crates/orch-infra/src/import/export*`, `crates/orch-cli/src/commands/db*`, `crates/orch-cli/tests/export_hostile.rs` (the `limits` and `hooks` features of `rusqlite` that this task uses are on since T9, ADR 0017 decision 19) | T21, T22 | `cargo test -p orch-cli --test db_backup_restore --test db_export_import --test export_hostile --test restore_fencing --test db_offline`; `./xtask/gate.sh full` (security-relevant) | 22 |
 
@@ -455,23 +460,29 @@ change once more, and that read is limited to it.
 ### T10 split: the independent writer and read-pool foundation
 
 T10's row stays as written, and so does its completion rule: T10 is done only when its whole row is. A first slice
-that needs no port v2 type is delivered as its own PR (PR 122) so that the later slices review against it.
+that needs no port v2 type is delivered as its own PR (PR 122) so that the later slices review against it. A second
+executor slice, the deadline recheck after `BEGIN IMMEDIATE` and the bounded writer tests, is delivered as PR 154,
+which is open and pending its review and merge.
 
 **What the foundation is.** The writer executor and the read pool, in `crates/orch-infra/src/sqlite/writer.rs`
 and `read_pool.rs`, with their module tests. It uses T9's data directory and connection setup and nothing from T8.
-It is wired to nothing: not to `Storage`, not to the daemon. Its behaviour and limits are in
+The internal goal adapter now uses the executor. The daemon still uses file storage. The executor’s behaviour and limits are in
 [ARCHITECTURE.md §6.6](../ARCHITECTURE.md#66-sqlite-writer-and-read-pool-foundation-not-wired). Of the spec it
 covers R24 (one writer, `BEGIN IMMEDIATE`, read-only readers), R25 (a snapshot per read), R98 (pool size, bounded
-wait, no extra connection) and the order of R26's lanes. Nothing else of R26 and nothing of R27, R28, R126 to R128,
-R130, R137, R139 or R140.
+wait, no extra connection) and the order of R26's lanes. Of R128 it covers one case only, from PR 154: a request
+whose deadline passes while `BEGIN IMMEDIATE` waits for the write reservation is refused before its body runs and
+never commits. Nothing else of R26 and nothing else of R27, R28, R126 to R128, R130, R137, R139 or R140.
 
 **Module tests.** Unit tests under `crates/orch-infra/src/sqlite/writer/tests/mod.rs` and
 `read_pool/tests/mod.rs`. They are not the `sqlite_writer` and `sqlite_crash` integration tests that T10's
-"Verify" column names; those and the SQLite run of the conformance suite remain T10's.
+"Verify" column names; those and the SQLite run of the conformance suite remain T10's. Every receipt wait in the
+`writer` module gives up after 10 s, and a scoped test closes admission when its body unwinds so that the join of the
+worker cannot hang behind a failed assertion: a regression fails by name instead of hanging. `a_withdrawn_request_is_never_committed` covers a deadline that
+passes during the `BEGIN IMMEDIATE` wait only. It is not the oracle of R128's retry case.
 
 | Module | Tests |
 |---|---|
-| `writer` (9) | `writes_run_one_at_a_time_on_one_connection`, `body_and_commit_errors_keep_nothing_and_writer_continues`, `claims_precede_queued_work_and_other_lanes_use_deadlines`, `bounded_queue_and_single_pending_event_transaction`, `expired_queued_request_never_runs_and_close_drains_accepted_work`, `a_panicking_transaction_rolls_back_and_closes_the_worker`, `executor_runs_claims_first_and_dropped_receipts_still_commit`, `a_deadline_that_passes_behind_active_work_withdraws_the_request`, `dropping_the_last_handle_closes_admission_and_drains` |
+| `writer` (11) | `writes_run_one_at_a_time_on_one_connection`, `body_and_commit_errors_keep_nothing_and_writer_continues`, `claims_precede_queued_work_and_other_lanes_use_deadlines`, `bounded_queue_and_single_pending_event_transaction`, `expired_queued_request_never_runs_and_close_drains_accepted_work`, `a_panicking_transaction_rolls_back_and_closes_the_worker`, `executor_runs_claims_first_and_dropped_receipts_still_commit`, `a_deadline_that_passes_behind_active_work_withdraws_the_request`, `dropping_the_last_handle_closes_admission_and_drains`, `a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body`, `a_withdrawn_request_is_never_committed` |
 | `read_pool` (7) | `a_read_snapshot_does_not_see_a_later_commit`, `exhaustion_waits_until_deadline_and_never_opens_an_extra_reader`, `error_and_panic_release_the_slot_and_end_the_snapshot`, `a_waiting_reader_uses_the_released_slot_before_its_deadline`, `a_free_slot_is_usable_when_a_waiter_reacquires_after_its_deadline`, `a_failed_read_discards_its_connection_local_state`, `a_lease_left_in_a_transaction_is_discarded` |
 
 **Dependencies of the full T10.** The SQLite adapter of port v2 needs T9 and the whole of T8:
@@ -482,8 +493,7 @@ R130, R137, R139 or R140.
   request keys and attention. Its first slice, the events and the leases, is not enough. The time unit of the
   operational port and the database's must be reconciled deliberately.
 
-Until T8b and T8c are accepted, T10 maps no port operation, and T12 stays dependent on a completed T8 and a
-completed T10.
+The public SQLite port awaits accepted T8b and T8c. T12 depends on completion of T8 and T10.
 
 **What remains of T10 after the foundation.** The adapter of the Storage v2 port and its conformance run on SQLite;
 bulk identities and the 1,000-row or 20 ms cut (R27); event aggregation into one transaction (R26); intents
@@ -491,9 +501,11 @@ bulk identities and the 1,000-row or 20 ms cut (R27); event aggregation into one
 connection, its backlog, outcomes and the expiry of long reads (R126, R127, R137); the authorizer and query
 connection (R130); and shutdown integration (R139). The review conditions of the foundation that belong to the
 adapter are tracked in [issue 127](https://github.com/yuxhuang/r-orch/issues/127): detecting transaction control
-in a callback, rechecking a request's expiry after `BEGIN IMMEDIATE`, non-blocking receipt waits on async
-threads, bounded claim production, writer tests that fail in bounded time instead of hanging, and fatal-state handling
-that keeps queue locks free of callbacks. The daemon is wired to this executor only after those exist.
+in a callback, non-blocking receipt waits on async threads, bounded claim production, and fatal-state handling
+that keeps queue locks free of callbacks. PR 154 delivers two items of that list, the recheck of a request's expiry
+after `BEGIN IMMEDIATE` and writer tests that fail in bounded time. Both are pending its merge. The retry case of
+R128, in which a request answered `overloaded` cannot commit later, is still owed at the adapter integration. The
+daemon is wired to this executor only after all of these exist.
 
 ## Status
 
@@ -502,7 +514,8 @@ that keeps queue locks free of callbacks. The daemon is wired to this executor o
 | T1 | first-review text (`f5637805`) implemented in PR 1, `fast` on macOS, and merged to `main` by the owner on 2026-11-21; this corrected text, with the review corrections and the owner's answers, implemented in a follow-up PR that is pending its reviews and the owner's merge. The spec is not approved by either. Since then: the corrected text (`34b3b4d`) reached `main` on 2026-11-22 (UTC) through that follow-up PR, and the deferral of 2026-11-21 (the spec's record I) is implemented in a further documentation PR that is pending its review and its merge. This revision changes no document's status (`draft`, `proposed`) |
 | T4 | dropped as an entry step by the owner on 2026-11-21. The first run of 2026-11-20 is recorded in [issue 98](https://github.com/yuxhuang/r-orch/issues/98) and is not delivered to `main` |
 | T4b | deferred by the owner on 2026-11-21; not run |
-| T10, first slice (writer and read pool) | implemented as an unwired foundation in PR 122 at `63edf0f9`, with its module tests; its Linux CI, independent reviews and the owner's merge are pending, as are the follow-ups of issue 127. The rest of T10 is pending behind T8b and T8c ("T10 split") |
+| T10, first slice (writer and read pool) | implemented as an unwired foundation in PR 122 at `63edf0f9`, with its module tests; its Linux CI, independent reviews and the owner's merge are pending, as are the follow-ups of issue 127. The rest of T10 is pending behind T8b and T8c ("T10 split"). The deadline recheck and the bounded writer tests are in PR 154, which is open and pending its Linux CI, reviews and merge |
+| T10, internal goal adapter | Goal reads, creates, updates, deletes and explicit moves use the executor. Module tests cover transactions, snapshots, reopen and file-reference behavior for supported inputs. Public conformance still requires timestamp and counter compatibility, imported position high-water marks, and text/blob handling. |
 | T2 to T27, except T4 and T4b | pending, as this table stood before 2026-11-21; this revision brings no other row up to date |
 
 ## Test plan
@@ -633,6 +646,10 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
 - The owner has answered all 38 ids of the spec (O1 to O10, AP1 to AP20, D1 to D8): 37 as recommended, and
   AP13 in its direction. No id is pending. The spec's "Owner's answers" gives the record for each and
   what each answer does not settle. An answer is not a proof, a review or a delivery.
+- Five points were added to the spec on 2026-11-22 and are not answered: T21-C1, T21-C2, T21-X1, T21-X2
+  and T21-O1 (the spec's record J). The spec drafts the first four from their defaults and the fifth from
+  a proposal, and T21 builds no caller on the `config.yml` path or on the index reconciliation before the
+  owner has merged that text ("T21 config and index contract").
 - A third thing is the owner's and lies outside the answers: the word on using the live copy for T4c (AP8).
 - Two things are still the owner's inside those answers. The numbers and results of AP13 (T4b), which the
   owner deferred on 2026-11-21 with the measurement (the spec's record I), so that nothing in 1.1 waits for
@@ -723,6 +740,52 @@ format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
   F9 and R31).
 - T24 and T25 could be one PR if the wiring is small. They are planned as two so that the switch is reviewed
   as behaviour and the removal as a move.
+
+### T21 config and index contract (issue 146)
+
+The compatibility evidence on the bounded reader ([issue 146](https://github.com/yuxhuang/r-orch/issues/146))
+left two questions to the spec owner before the reader gets a caller: what the import does with a `config.yml`
+that 1.0 ran on its defaults, and what it does with an index array that holds an entry without a string
+identity, or one identity twice. The spec now carries the contract for both: R65, R70, R109, R110, R122 and
+R123, the tables under "Import rules" ("Order", `config.yml`, "Import problem classes"), the row of the
+document count in "Compatibility with 1.0", and the vectors C-V1 to C-V14 and X-V1 to X-V14 with a test name
+each. It also corrects three statements of the spec and one of ADR 0017 decision 21 that were wrong in fact
+for an empty `config.yml` (the spec's fact F18).
+
+The decision is still open in one sense, and this plan does not close it. Five points were put to the owner
+on 2026-11-22 (the spec's T21-C1, T21-C2, T21-X1, T21-X2 and T21-O1) and none is answered. The text is
+drafted from the default that each of the first four carried, which keeps a stop that the spec or the reader
+already had, and from
+a proposal for the fifth, which carried none: what a key that `config.yml` does not set imports as, and so
+whether a project with no such key gets `run_cap` 6 or none. The spec owner recommends another answer than
+the default on three of the four. The owner ratifies the drafted rows by merging the PR that carries them,
+and an explicit answer replaces a default through a new contract PR before T21 builds on it.
+
+What follows for T21, and nothing here is built by this text:
+
+1. T21 gives the `config.yml` path and the index reconciliation no caller before the owner has merged that
+   PR. The rest of T21 is not held by it.
+2. With the wiring, T21 implements the whole-array examination of an index (the reader returns at the first
+   problem today, which names the class by the order of the entries), the name `index_duplicate`, the
+   statements of what 1.0 did with a file, and the tests of the C-V and X-V vectors. X-V13 is a unit test of
+   the `import` module, where a reader can be injected. The statement for `index_duplicate` gives both of
+   1.0's cases and claims neither (the spec's F19 and R122): 1.0 used the index as it stood only where
+   every entry was a complete entity of the directory's type, and otherwise rebuilt it. The import stops
+   on identities alone in both cases, and T21 adds no decoding of an entry as its entity type. X-V5's test
+   runs 1.0's own reader beside the import, on disposable copies, to show the two cases.
+3. Three things the vectors pin are unverified until then: whether the bounded pass counts a bare `---` as
+   one document (C-V6); the bounded reader's refusal of a stream of no document for an agent, a goal and a
+   team (C-V11); and what 1.0's reader does with a repeated identity in each directory that has an index,
+   which is read from the code and was run once outside the repository (X-V5).
+4. The evidence of issue 146 is on `main` since 2026-11-22: its tests, the section "T21 reader compatibility
+   evidence" of this plan, and a record of its own, `docs/internal/import-reader-compatibility.md`. This
+   contract changes none of the three. T21 brings the record and that section up to date with this
+   contract, or folds the record into this plan, in the PR that does the wiring. Two of their statements
+   are then out of date. They say that the spec owner must reconcile R109 with the compatibility table
+   before the first caller; this section and the spec rows it names are that reconciliation, once the
+   owner has merged them. And the record's row on damaged indexes says that decoded duplicates survive
+   1.0's reader. That is so for the test type of one field that the test uses. In a real directory an
+   array of identities alone does not decode, and 1.0 rebuilds it (the spec's F19).
 
 ### T21 bounded reader slice
 

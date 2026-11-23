@@ -1,13 +1,31 @@
 //! SQLite connection setup and forward-only schema migrations (T9).
 //! The file backend remains the product backend until the T24 switch.
 mod connection;
+#[allow(
+    dead_code,
+    reason = "private entity helpers staged for the T10 adapter"
+)]
+mod entity;
 pub mod migrations;
 pub use connection::{ConnectionHandle, ConnectionRole, Synchronous, open_connection};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteError {
+    #[error("value cannot be represented losslessly in the SQLite schema: {0}")]
+    Unrepresentable(String),
+    #[error("goal operation failed: {operation}; savepoint rollback failed: {rollback}")]
+    OperationRollback {
+        operation: Box<SqliteError>,
+        rollback: rusqlite::Error,
+    },
+    #[error("goal transaction cannot commit after a failed operation rollback")]
+    TransactionAborted,
     #[error("storage admission deadline or queue bound reached")]
     Overloaded,
+    #[error(transparent)]
+    Store(#[from] orch_core::store::StoreError),
+    #[error("stored run event is damaged: {0}")]
+    EventCorrupt(String),
     #[error("SQLite writer is closed")]
     WriterClosed,
     #[error("SQLite connection and queue capacities must be greater than zero")]
@@ -37,6 +55,11 @@ pub enum SqliteError {
 }
 pub type Result<T> = std::result::Result<T, SqliteError>;
 
+#[allow(
+    dead_code,
+    reason = "event integration is internal until the combined storage adapter lands"
+)]
+pub(crate) mod events;
 mod read_pool;
 mod writer;
 pub use read_pool::ReadPool;
@@ -59,6 +82,12 @@ fn test_data() -> (tempfile::TempDir, crate::data_dir::DataDir) {
     .unwrap();
     (temp, data)
 }
+
+#[allow(
+    dead_code,
+    reason = "internal goal persistence slice; full Storage and safety policy are not wired yet"
+)]
+mod goal_adapter;
 
 #[allow(
     dead_code,

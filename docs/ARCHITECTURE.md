@@ -1167,9 +1167,11 @@ not written by a dashboard broadcast subscriber.
 
 [ADR 0017](decisions/0017-sqlite-storage.md) decision 6 gives SQLite one task that performs every write, one
 transaction at a time, and a pool of read-only connections. `crates/orch-infra/src/sqlite/{writer,read_pool}.rs`
-is that executor and pool as an independent foundation (plan T10, first slice). Nothing else uses it yet: it is
-not behind `Storage`, the daemon still runs on the file backend, and the mutex model of §6.1 is unchanged. This
-is a blocking, thread-based design, not tokio: the engine has no async adapter around it yet.
+is that executor and pool as an independent foundation (plan T10, first slice). The internal goal adapter borrows both. It groups goal changes in a writer transaction and reads a consistent
+snapshot through the pool. Each goal operation uses the project supplied by its caller. A failed savepoint
+rollback invalidates the write callback. Timestamps must round-trip as millisecond UTC strings, and revisions
+and positions must fit a positive signed SQLite integer. The daemon uses file storage and the mutex model of
+§6.1. The executor runs on a dedicated thread.
 
 **Trust.** Both types run owned or borrowed closures written by the storage adapter, which must already have
 checked the caller and the project. Neither is an endpoint for client-supplied SQL, and neither has an
@@ -1201,9 +1203,15 @@ clients <── WriteReceipt::wait() ──────────────�
   `Claims` job first. Otherwise it takes the job with the earliest deadline, which is its arrival plus the lane's
   wait budget (entities 200 ms, events 1 s, maintenance 5 s), and the earlier arrival wins a tie. The budgets are
   priorities, not timeouts and not measured results (ADR 0017 decision 9).
-- **Request deadline.** `submit` takes an optional `Instant`. The worker checks it just before `BEGIN`: a request
-  that has expired never begins and returns `Overloaded`. A deadline does not stop a transaction already running
-  and does not bound the busy wait inside `BEGIN IMMEDIATE`.
+- **Request deadline.** `submit` takes an optional `Instant`. The worker checks it twice: just before `BEGIN`, and
+  again once `BEGIN IMMEDIATE` has obtained the write reservation. A request found expired at either check returns
+  `Overloaded` before its closure runs. At the second check the transaction is dropped, which rolls it back and
+  releases the reservation, so a request that expired while it waited for another connection's write lock never
+  commits (spec R128). The deadline is an admission check, not an interrupt. It does not shorten the busy wait
+  inside `BEGIN IMMEDIATE`, which runs for up to the 5 s busy timeout whatever the deadline, and it does not stop a
+  closure or a `COMMIT` that has started: both can finish after the deadline. A `BEGIN` that is still busy at the
+  timeout returns its SQL error to the receipt, not `Overloaded`, even when the deadline has passed. Classifying
+  that failure belongs to the retry work (R128, issue 127).
 - **Receipts.** `wait` blocks and returns the closure's result. Dropping a receipt does not cancel the work: an
   accepted transaction still commits. Do not call `wait` on an async runtime thread; nothing adapts it yet.
 - **Close.** `WriterHandle::close` stops admission, is idempotent, and lets the worker drain what it accepted.
