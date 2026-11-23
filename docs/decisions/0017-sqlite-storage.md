@@ -481,7 +481,9 @@ across a crash, lists that do not load everything, and a retried request that ru
     cause is latched even when the callback catches it, and aborts the transaction; a failed rollback is
     classified in both causes, a fatal one on either side wins, any failed savepoint rollback forbids the enclosing
     commit, and an ordinary failure rolled back to its savepoint may be caught. Timestamps stay the canonical millisecond strings that the goal adapter accepts. The migration
-    backfills nothing and refuses a populated predecessor atomically (the spec's "Task format v1 (SQLite)"). The
+    backfills nothing. A populated predecessor is refused before any copy or intermediate migration, and again in the
+    migration's own transaction, so a refused start changes nothing and repeats without growing the copies (the spec's
+    "Task format v1 (SQLite)"). The
     optional `Task` fields, `proof` and `workspace_mode` among them, are absent for `None`; a present `proof` always
     carries `files_changed`. A write follows three rules of the lead's decision of the same day: `create` derives the
     creator columns once from the caller's `Principal` (`Owner` is `owner`, `Worker` is `daemon`, `Task` is `agent` with
