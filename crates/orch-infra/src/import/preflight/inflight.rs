@@ -1,7 +1,7 @@
 //! `state.json` and the runs it says are at work (R119).
 use super::PreflightError;
 use super::check::Check;
-use super::names::{escape, relative};
+use super::names::{escape, relative, short};
 use super::probe::{Found, ask};
 use super::report::Confirmation;
 use crate::import::document::Limits;
@@ -89,22 +89,26 @@ impl Check<'_> {
                     self.report.assumed_stopped.push(run);
                     self.counts().in_flight_to_close += 1;
                 } else {
-                    let alias = escape(OsStr::new(&remote.alias));
-                    self.refuse(
+                    self.refuse_safe(
                         path,
                         "in_flight_remote",
-                        None,
-                        None,
-                        &format!("run {run} of task {task} is recorded on peer {alias}"),
+                        format!(
+                            "recorded on peer {}; run {}; task {}",
+                            short(&remote.alias),
+                            short(&entry.run_id),
+                            short(&entry.task_id)
+                        ),
                     );
                 }
                 continue;
             }
             let found: Found = ask(self.probe, entry.pid);
             let detail = format!(
-                "run {run} of task {task}, pid {}: {}",
+                "pid {}: {}; run {}; task {}",
                 entry.pid,
-                found.describe()
+                found.describe(),
+                short(&entry.run_id),
+                short(&entry.task_id)
             );
             if !found.any() {
                 if assumed {
@@ -120,7 +124,7 @@ impl Check<'_> {
                 });
                 self.counts().in_flight_to_close += 1;
             } else {
-                self.refuse(path, "in_flight_live", None, None, &detail);
+                self.refuse_safe(path, "in_flight_live", detail);
             }
         }
         for run in self.options.assume_stopped.clone() {

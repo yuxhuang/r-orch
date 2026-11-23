@@ -17,7 +17,6 @@ use std::io::{self, Read};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::runtime::Handle;
 
 /// "Import bounds": an attachment and a template.
 const ATTACHMENT_BYTES: u64 = 67_108_864;
@@ -217,8 +216,14 @@ pub(super) fn run(
     project: &Path,
     options: &Options,
     probe: &dyn ProcessProbe,
-    runtime: &Handle,
 ) -> Result<Report, PreflightError> {
+    // The guarded legacy YAML reader parks its parse on a blocking thread and awaits it.
+    // This thread is itself a worker of the caller's blocking pool, so a pool of one would
+    // wait for itself. The decode therefore runs on a runtime of its own, whose blocking
+    // pool the caller cannot exhaust.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(PreflightError::Io)?;
     let root = ConfinedDir::open(project).map_err(source_error)?;
     let orch = match root.open_dir(".orchestry") {
         Ok(dir) => dir,
@@ -230,13 +235,13 @@ pub(super) fn run(
     let mut check = Check {
         options,
         probe,
-        runtime,
+        runtime: &runtime,
         report: Report::default(),
         listed: 0,
         tasks: BTreeMap::new(),
     };
     if let Some(plan) = check.plan(&orch)? {
-        check.execute(&orch, plan)?;
+        check.examine(&orch, plan)?;
     }
     check.report.counts.entries = check.listed;
     Ok(check.report)
@@ -245,7 +250,7 @@ pub(super) fn run(
 pub(super) struct Check<'a> {
     pub(super) options: &'a Options,
     pub(super) probe: &'a dyn ProcessProbe,
-    runtime: &'a Handle,
+    runtime: &'a tokio::runtime::Runtime,
     pub(super) report: Report,
     listed: u64,
     /// One fold key for each task id of the listing (R117): fold key to the id.
@@ -282,13 +287,18 @@ impl Check<'_> {
         });
     }
 
-    pub(super) fn note(
-        &mut self,
-        path: &str,
-        rule: &'static str,
-        observed: Option<String>,
-        detail: &str,
-    ) {
+    /// A finding whose text the caller has already escaped and bounded part by part.
+    pub(super) fn refuse_safe(&mut self, path: &str, rule: &'static str, detail: String) {
+        self.report.refusals.push(Finding {
+            path: path.to_owned(),
+            rule,
+            limit: None,
+            observed: None,
+            detail,
+        });
+    }
+
+    fn note(&mut self, path: &str, rule: &'static str, observed: Option<String>, detail: &str) {
         self.report.notes.push(Finding {
             path: path.to_owned(),
             rule,
@@ -374,9 +384,16 @@ impl Check<'_> {
             Listed::Names(names) => names,
             Listed::TooMany => return Ok(None),
             Listed::Skipped => {
-                return Err(PreflightError::Io(io::Error::other(
-                    "the source directory could not be listed",
-                )));
+                // The cause was recorded as a finding; the check cannot go on without it.
+                let cause = self
+                    .report
+                    .refusals
+                    .listed
+                    .last()
+                    .map_or_else(String::new, |f| f.detail.clone());
+                return Err(PreflightError::Io(io::Error::other(format!(
+                    "the source directory could not be listed: {cause}"
+                ))));
             }
         };
         let mut plan = Plan {
@@ -546,7 +563,7 @@ impl Check<'_> {
         false
     }
 
-    fn execute(&mut self, orch: &ConfinedDir, plan: Plan) -> Result<(), PreflightError> {
+    fn examine(&mut self, orch: &ConfinedDir, plan: Plan) -> Result<(), PreflightError> {
         for (store, level) in &plan.stores {
             self.store(*store, level)?;
         }
@@ -595,6 +612,18 @@ impl Check<'_> {
                         continue;
                     }
                     if store == Store::Tasks {
+                        // R104: `workspaces/<task id>` is the one place an id still names a
+                        // directory, and these two would name the directory itself or its parent.
+                        if matches!(stem, b"." | b"..") {
+                            self.refuse(
+                                &path,
+                                "id",
+                                None,
+                                None,
+                                "a task id may not be `.` or `..`",
+                            );
+                            continue;
+                        }
                         self.register_task(stem, &path);
                     }
                     self.document(store, &level.dir, name, stem, &path)?;

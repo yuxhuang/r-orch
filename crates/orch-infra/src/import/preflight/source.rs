@@ -20,6 +20,7 @@ pub(super) enum Kind {
     Socket,
     CharDevice,
     BlockDevice,
+    Other,
 }
 
 impl Kind {
@@ -33,6 +34,7 @@ impl Kind {
             Self::Fifo => Some("a FIFO"),
             Self::Socket => Some("a socket"),
             Self::CharDevice | Self::BlockDevice => Some("a device"),
+            Self::Other => Some("a special file"),
         }
     }
     pub(super) fn why_not_directory(self) -> Option<&'static str> {
@@ -43,6 +45,7 @@ impl Kind {
             Self::Fifo => Some("a FIFO"),
             Self::Socket => Some("a socket"),
             Self::CharDevice | Self::BlockDevice => Some("a device"),
+            Self::Other => Some("a special file"),
         }
     }
 }
@@ -63,13 +66,14 @@ pub(super) fn kind(dir: &ConfinedDir, name: &OsStr) -> io::Result<Kind> {
             SFlag::S_IFSOCK => Kind::Socket,
             SFlag::S_IFCHR => Kind::CharDevice,
             SFlag::S_IFBLK => Kind::BlockDevice,
-            _ => Kind::Fifo,
+            SFlag::S_IFIFO => Kind::Fifo,
+            _ => Kind::Other,
         },
     )
 }
 
 /// The names of one directory level, sorted by bytes. `over` says that the listing had
-/// more entries than the caller's budget allowed; no more than `budget + 1` names are
+/// more entries than the caller's budget allowed; no more than `budget` names are
 /// kept, however long the directory is.
 #[derive(Debug)]
 pub(super) struct Listing {

@@ -820,6 +820,14 @@ path, rule and message escaped and cut, and it runs on a blocking thread that a 
 It creates, changes and removes nothing. The hostile-document corpus of "Import bounds" runs against it in
 a child process under a time and a resident-memory ceiling (`crates/orch-infra/tests/source_budget.rs`).
 
+Report paths are relative to the source `.orchestry/`; the layer that prints a report adds the prefix that
+the spec's "relative to the project" asks for. The check takes no lock: whoever calls it holds the 1.0 owner
+lock for as long as it relies on an answer (R119 means something only while no 1.0 daemon can rewrite
+`state.json`), and stops it by setting its cancel flag and awaiting the result, because dropping the future
+does not stop the blocking thread. The YAML decode runs on a runtime of the check's own, so a caller's
+blocking pool of one is enough. A task id of `.` or `..` stops the check (R104); template stems are not
+judged, because the spec has no rule for them (tracked, not decided here).
+
 Where the check goes beyond the spec's wording, it is stricter and says so: a `running` set of `state.json`
 that 1.0 would read as empty because one entry does not decode stops the check, because that set is what
 R119 asks about.

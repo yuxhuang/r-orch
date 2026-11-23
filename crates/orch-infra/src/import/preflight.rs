@@ -7,7 +7,14 @@
 //! (R109), event files are streamed (R111), ids and the task and workspace names are
 //! checked together (R104, R117), and recorded in-flight runs are asked about with the
 //! existence test that delivers nothing (R119). All of it is blocking work, so it runs
-//! on a blocking thread, and a flag stops it between reads.
+//! on a blocking thread, and a flag stops it between reads. Report paths are relative to
+//! the source `.orchestry/`; the layer that prints them adds the prefix the spec's
+//! "relative to the project" asks for.
+//!
+//! A caller holds the 1.0 owner lock for as long as it relies on an answer of this
+//! check (R119 means something only while no 1.0 daemon can rewrite `state.json`), and
+//! stops a check by setting `Options::cancel` and awaiting the result: dropping the
+//! future does not stop the blocking thread.
 //!
 //! Left to the slices that wire what they depend on, and listed here so that nothing
 //! reads this module as a finished importer:
@@ -73,8 +80,7 @@ pub async fn preflight(
     options: Options,
     probe: Arc<dyn ProcessProbe>,
 ) -> Result<Report, PreflightError> {
-    let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || check::run(&project, &options, probe.as_ref(), &runtime))
+    tokio::task::spawn_blocking(move || check::run(&project, &options, probe.as_ref()))
         .await
         .map_err(|e| PreflightError::Io(std::io::Error::other(e)))?
 }

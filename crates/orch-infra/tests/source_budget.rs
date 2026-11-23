@@ -28,6 +28,8 @@ fn worker() {
         return;
     };
     let report = tokio::runtime::Builder::new_multi_thread()
+        // The check's own work must not need more stack than this, whatever the input nests.
+        .thread_stack_size(256 * 1024)
         .enable_all()
         .build()
         .unwrap()

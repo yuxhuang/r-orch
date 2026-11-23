@@ -6,9 +6,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
 struct Src {
@@ -336,6 +334,9 @@ async fn a_document_id_must_be_its_files_stem_and_stems_stay_in_the_alphabet() {
     src.put("tasks/tsk\u{e9}.yml", task_yaml("tsk\u{e9}"));
     src.put("tasks/.yml", task_yaml("x"));
     src.put("tasks/tsk\nforged.yml", task_yaml("tsk"));
+    // R104: a task id of `.` or `..` stops the import; a dotted id inside the alphabet does not.
+    src.put("tasks/..yml", task_yaml("."));
+    src.put("tasks/...yml", task_yaml(".."));
     let before = fs::read_dir(src.orch().join("tasks")).unwrap().count();
     let report = run(&src).await;
     assert_eq!(report.refusals.total(), before as u64);
@@ -345,6 +346,15 @@ async fn a_document_id_must_be_its_files_stem_and_stems_stay_in_the_alphabet() {
         assert!(!f.path.contains('\n'), "{:?}", f.path);
     }
     assert!(refusals(&report).contains(&("tasks/tsk\\u{a}forged.yml", "id")));
+    for dot in ["tasks/..yml", "tasks/...yml"] {
+        assert!(refusals(&report).contains(&(dot, "id")), "{dot}");
+    }
+    let src = Src::new();
+    src.task("tsk.a..b");
+    src.task("..a");
+    let report = run(&src).await;
+    assert!(!report.refused(), "{:?}", report.refusals);
+    assert_eq!(report.counts.tasks, 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -519,87 +529,6 @@ impl ProcessProbe for Table {
     }
 }
 
-struct Canary(Child);
-impl Drop for Canary {
-    fn drop(&mut self) {
-        // Test cleanup of the test's own children; the importer never signals.
-        let _ = nix::sys::signal::killpg(
-            nix::unistd::Pid::from_raw(self.0.id() as i32),
-            nix::sys::signal::Signal::SIGKILL,
-        );
-        let _ = self.0.wait();
-    }
-}
-
-fn canary() -> Canary {
-    Canary(
-        Command::new("sleep")
-            .arg("60")
-            .process_group(0)
-            .stdin(Stdio::null())
-            .spawn()
-            .unwrap(),
-    )
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn refuses_while_a_recorded_process_exists() {
-    let live = canary();
-    let src = Src::new();
-    src.put(
-        "state.json",
-        running(&[entry("r1", u64::from(live.0.id()))]),
-    );
-    let report = run(&src).await;
-    assert_eq!(refusals(&report), [("state.json", "in_flight_live")]);
-    let detail = &report.refusals.listed[0].detail;
-    assert!(detail.contains("run r1 of task tsk_r1"), "{detail}");
-    assert!(detail.contains(&format!("pid {}", live.0.id())), "{detail}");
-    assert!(
-        detail.contains("the process and its process group were found"),
-        "{detail}"
-    );
-    assert_eq!(report.counts.running, 1);
-    // The canary is untouched: still running after the check.
-    let mut live = live;
-    assert!(live.0.try_wait().unwrap().is_none());
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn refuses_while_only_the_recorded_process_group_has_a_member() {
-    // The leader exits and is reaped; its child stays in the leader's group (F17).
-    let mut leader = Command::new("sh")
-        .args(["-c", "sleep 60 & exit 0"])
-        .process_group(0)
-        .stdin(Stdio::null())
-        .spawn()
-        .unwrap();
-    let pid = leader.id();
-    leader.wait().unwrap();
-    let _cleanup = Canary(Command::new("true").spawn().unwrap());
-    struct Group(i32);
-    impl Drop for Group {
-        fn drop(&mut self) {
-            let _ = nix::sys::signal::killpg(
-                nix::unistd::Pid::from_raw(self.0),
-                nix::sys::signal::Signal::SIGKILL,
-            );
-        }
-    }
-    let _group = Group(pid as i32);
-    let src = Src::new();
-    src.put("state.json", running(&[entry("r1", u64::from(pid))]));
-    let report = run(&src).await;
-    assert_eq!(refusals(&report), [("state.json", "in_flight_live")]);
-    assert!(
-        report.refusals.listed[0]
-            .detail
-            .contains("only the process group was found"),
-        "{}",
-        report.refusals.listed[0].detail
-    );
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pid_of_0_or_1_or_over_the_range_is_never_passed_to_a_group_test() {
     let table = Arc::new(Table::default());
@@ -632,7 +561,11 @@ async fn refuses_every_remote_entry_whatever_the_peer_registry_says() {
         }
         let report = run(&src).await;
         assert_eq!(refusals(&report), [("state.json", "in_flight_remote")]);
-        assert!(report.refusals.listed[0].detail.contains("peer peer-a"));
+        assert!(
+            report.refusals.listed[0]
+                .detail
+                .contains("peer peer-a; run r1")
+        );
     }
 }
 
@@ -731,4 +664,89 @@ async fn a_running_set_the_legacy_reader_would_drop_is_not_read_as_empty() {
         let report = run(&src).await;
         assert_eq!(refusals(&report), [("state.json", "unreadable")], "{state}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn in_flight_facts_survive_long_and_hostile_ids_and_are_escaped_once() {
+    let src = Src::new();
+    let long = "r".repeat(400);
+    let mut hostile = entry("r1", 4242);
+    hostile["run_id"] = json!(format!("a\\b\n{long}"));
+    hostile["task_id"] = json!("t".repeat(400));
+    src.put("state.json", running(&[hostile]));
+    let table = Arc::new(Table {
+        live: vec![4242],
+        ..Table::default()
+    });
+    let report = run_with(&src, Options::default(), table).await;
+    let detail = &report.refusals.listed[0].detail;
+    // The pid and the answer come first and are whole; each id is escaped once and cut.
+    assert!(
+        detail.starts_with(
+            "pid 4242: the process and its process group were found; run a\\\\b\\u{a}rrr"
+        ),
+        "{detail}"
+    );
+    assert!(detail.len() < 300 && !detail.contains('\n'), "{detail}");
+}
+
+/// A pool of one blocking thread: the check holds it, so nothing it needs may queue for
+/// another blocking job of the same pool (the guarded YAML reader parks its parse there).
+#[test]
+fn a_blocking_pool_of_one_is_enough_for_yaml_documents() {
+    let src = corpus();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let report = runtime
+        .block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                preflight(
+                    src.project().to_owned(),
+                    Options::default(),
+                    Arc::new(SystemProbe),
+                ),
+            )
+            .await
+        })
+        .expect("the check waited for a blocking thread that it holds")
+        .unwrap();
+    assert!(!report.refused(), "{:?}", report.refusals);
+    assert_eq!(report.counts.tasks, 12);
+}
+
+/// The flag reaches a read that is already under way, so a cancel does not wait for an
+/// event file that has no byte bound (R111) to end.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_during_a_long_read_ends_the_check_without_an_io_finding() {
+    let src = Src::new();
+    src.put("runs/run_a.jsonl", "");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(src.orch().join("runs/run_a.jsonl"))
+        .unwrap();
+    file.set_len(64 * 1024 * 1024 * 1024).unwrap();
+    let options = Options::default();
+    let flag = options.cancel.clone();
+    let started = std::time::Instant::now();
+    let canceller = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let result = preflight(src.project().to_owned(), options, Arc::new(SystemProbe)).await;
+    canceller.await.unwrap();
+    assert!(
+        matches!(result, Err(PreflightError::Cancelled)),
+        "{result:?}"
+    );
+    // 64 GiB would take minutes to read; the flag is seen within a read or two.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
 }

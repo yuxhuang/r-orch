@@ -41,8 +41,15 @@ pub(super) fn escape(name: &OsStr) -> String {
     out
 }
 
-fn cut(mut text: String) -> String {
-    let mut end = MAX_TEXT;
+fn cut(text: String) -> String {
+    cut_at(text, MAX_TEXT)
+}
+
+fn cut_at(mut text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -51,7 +58,13 @@ fn cut(mut text: String) -> String {
     text
 }
 
-/// A path relative to the project, one escaped component at a time, joined by `/`.
+/// An identity inside a longer sentence: escaped once and cut to 64 bytes, so that the
+/// facts around it (pid, what was found) are never pushed out of a bounded message.
+pub(super) fn short(text: &str) -> String {
+    cut_at(escape(OsStr::new(text)), 64)
+}
+
+/// A path relative to the source `.orchestry/`, one escaped component at a time, joined by `/`.
 pub(super) fn relative(parts: &[&OsStr]) -> String {
     let mut text = String::new();
     for (i, part) in parts.iter().enumerate() {
@@ -108,6 +121,7 @@ mod tests {
 
     #[test]
     fn the_alphabet_is_exact() {
+        // `.` and `..` are inside the alphabet; R104 refuses them for task ids only.
         for good in ["tsk_a-1.b", "..", "A"] {
             assert!(is_id(good.as_bytes()), "{good}");
         }
