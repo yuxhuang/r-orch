@@ -394,6 +394,7 @@ fn sql_code(error: LeaseError) -> rusqlite::ffi::ErrorCode {
             .sqlite_error_code()
             .unwrap_or_else(|| panic!("SQLite error lost its code: {error:?}")),
         LeaseError::Store(error) => panic!("SQL failure became a typed refusal: {error:?}"),
+        LeaseError::Corrupt(detail) => panic!("SQL failure became a damage report: {detail}"),
     }
 }
 
