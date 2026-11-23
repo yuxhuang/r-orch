@@ -513,8 +513,9 @@ mod unchanged_writes {
 
     impl Fixture {
         fn document(&self) -> PathBuf {
-            // `p1` in hex: a project id is never a path.
-            self.root.path().join("p-7031").join("state.json")
+            self.storage
+                .project_dir("p1")
+                .join(crate::storage::v2::DOCUMENT)
         }
 
         /// The document's inode and bytes.
@@ -627,6 +628,7 @@ mod unchanged_writes {
                     60,
                 )?;
                 assert_eq!(u.open_attention(&facts(), 70)?.id, 3);
+                assert_eq!(u.open_attention(&facts(), 75)?.id, 3);
                 u.ack_attention(resolved.id, resolved.revision, 80)?;
                 u.resolve_attention(
                     resolved.id,
