@@ -117,6 +117,12 @@ mod task_page;
 
 #[allow(
     dead_code,
+    reason = "internal attention mapping awaits T10 Storage composition"
+)]
+mod attention;
+
+#[allow(
+    dead_code,
     reason = "internal request-key persistence awaits the combined T10 Storage adapter"
 )]
 mod request_keys;

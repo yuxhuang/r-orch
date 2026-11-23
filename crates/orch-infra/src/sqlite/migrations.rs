@@ -12,7 +12,8 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
-pub const SCHEMA_VERSION: usize = 1;
+pub const SCHEMA_VERSION: usize = 2;
+pub const ATTENTION_FACTS: &str = include_str!("migrations/002_attention_facts.sql");
 pub const INITIAL_SCHEMA: &str = include_str!("schema.sql");
 
 #[derive(Debug, Clone, Copy)]
@@ -38,7 +39,12 @@ fn capacity_bytes(blocks: impl Into<u64>, block: u64) -> u64 {
 
 pub fn migrate(data: &DataDir, conn: &mut ConnectionHandle<'_>) -> Result<()> {
     conn.ensure_directory(data)?;
-    apply_migrations(data, conn, &[INITIAL_SCHEMA], DiskSpace::read(data)?)
+    apply_migrations(
+        data,
+        conn,
+        &[INITIAL_SCHEMA, ATTENTION_FACTS],
+        DiskSpace::read(data)?,
+    )
 }
 
 /// A migration set is trusted SQL shipped with the binary, never request input.
