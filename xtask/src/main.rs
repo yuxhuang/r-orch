@@ -1,5 +1,6 @@
 //! Dev tooling for r-orch. `cargo xtask <command>`.
 
+mod changelog;
 mod crate_graph;
 mod fixture_gen;
 mod gate;
@@ -22,6 +23,8 @@ struct Cli {
 enum Task {
     /// Assert the crate layering from ARCHITECTURE §3.1.
     CrateGraph,
+    /// Validate fragments or assemble release notes.
+    Changelog(changelog::ChangelogArgs),
     /// Generate the synthetic 1.0 import corpus, or with --check compare it with the checked-in tree.
     FixtureGen(fixture_gen::FixtureGenArgs),
     /// Run the Linux checks from macOS in a linux/amd64 Docker container (AGENTS.md).
@@ -35,6 +38,7 @@ fn main() -> Result<()> {
     let repo_root = repo_root()?;
 
     match cli.command {
+        Task::Changelog(args) => changelog::run(&std::env::current_dir()?, args),
         Task::CrateGraph => crate_graph::run(&repo_root),
         Task::FixtureGen(args) => fixture_gen::run(&repo_root, args),
         Task::Linux(args) => linux::run(&repo_root, args),
