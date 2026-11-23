@@ -477,11 +477,17 @@ fn a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body() {
         }
     };
     let ran = std::cell::Cell::new(false);
-    let outcome = execute(&mut connection, Some(limit), clock, |tx| {
-        ran.set(true);
-        tx.execute("INSERT INTO sample VALUES(1)", [])?;
-        Ok(())
-    });
+    let outcome = execute(
+        &mut connection,
+        &FailureState::new(),
+        Some(limit),
+        clock,
+        |tx| {
+            ran.set(true);
+            tx.execute("INSERT INTO sample VALUES(1)", [])?;
+            Ok(())
+        },
+    );
     assert!(matches!(outcome, Err(SqliteError::Overloaded)));
     assert_eq!(reads.get(), 2, "deadline read before and after BEGIN");
     assert!(
@@ -491,10 +497,16 @@ fn a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body() {
     assert!(tx_state_is_autocommit(&connection), "reservation released");
     assert_eq!(count(&connection), 0);
     // Without a deadline the same path commits, so the refusal came from the recheck.
-    execute(&mut connection, None, Instant::now, |tx| {
-        tx.execute("INSERT INTO sample VALUES(2)", [])?;
-        Ok(())
-    })
+    execute(
+        &mut connection,
+        &FailureState::new(),
+        None,
+        Instant::now,
+        |tx| {
+            tx.execute("INSERT INTO sample VALUES(2)", [])?;
+            Ok(())
+        },
+    )
     .unwrap();
     assert_eq!(count(&connection), 1);
 }
