@@ -811,11 +811,11 @@ impl AttentionWrite for Session {
             .page(&self.caller.project, filter, after, limit)
     }
     fn open_attention(&mut self, facts: &AttentionFacts, at: i64) -> Result<Attention> {
-        let row = self
+        let (row, written) = self
             .project
             .attention
             .open(&self.caller.project, facts, at)?;
-        self.dirty = true;
+        self.dirty |= written;
         Ok(row)
     }
     fn ack_attention(&mut self, id: u64, expected: Revision, at: i64) -> Result<Attention> {
@@ -824,8 +824,8 @@ impl AttentionWrite for Session {
             | orch_core::store::Principal::Worker { identity }
             | orch_core::store::Principal::Task { identity, .. } => identity,
         };
-        let row = self.project.attention.ack(id, expected, identity, at)?;
-        self.dirty = true;
+        let (row, written) = self.project.attention.ack(id, expected, identity, at)?;
+        self.dirty |= written;
         Ok(row)
     }
     fn resolve_attention(
@@ -835,13 +835,13 @@ impl AttentionWrite for Session {
         reason: ResolutionReason,
         at: i64,
     ) -> Result<Attention> {
-        let row = self.project.attention.resolve(id, expected, reason, at)?;
-        self.dirty = true;
+        let (row, written) = self.project.attention.resolve(id, expected, reason, at)?;
+        self.dirty |= written;
         Ok(row)
     }
     fn expire_attention(&mut self, cutoff: i64, limit: usize) -> Result<usize> {
         let count = self.project.attention.expire(cutoff, limit)?;
-        self.dirty = true;
+        self.dirty |= count > 0;
         Ok(count)
     }
 }
