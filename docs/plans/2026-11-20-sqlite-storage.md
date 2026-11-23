@@ -645,12 +645,12 @@ hydration seam to the slice that wires the public task page, whose tests check t
 
 | Task | Owes | Check |
 |---|---|---|
-| T10, task mapping | Create, update, delete and move for `Task`; the migration (next free number); hydration in the selecting snapshot or unit of work; the physical R97 mapping; the shared entity suites registered on SQLite for tasks | R141's named tests; `cargo test -p orch-infra --test sqlite_task_format --test sqlite_migrations`; the shared suites on the three references and SQLite |
+| T10, task mapping | Create, update, delete and move for `Task`; the migration (next free number); hydration in the selecting snapshot or unit of work; the physical R97 mapping; the creator, `landing_state` and attachment-row rules of the spec; the shared entity suites registered on SQLite for tasks | R141's named tests; `cargo test -p orch-infra --test sqlite_task_format --test sqlite_migrations`; the shared suites on the three references and SQLite |
 | T10, retry mapping | Its own mapping of `retry_queue.error` with the same thresholds and split, and none of this format's tables | The issue 109 tests; independent of R141 |
 | T11 | Nothing new: the blob adapter and `BlobReferences::register` are used as they are | `blob_store` unchanged |
 | T12 | Nothing new: a consumer reads a `Task` through the port and never through these tables | the T12 tests |
 | T15 | `blobs.sweep` counts `task_blob_refs.sha256` as a naming row | `maintenance::a_referenced_blob_is_never_deleted`, extended for a task text and a split text |
-| T21 | One codec for every task row; list order, repeats and `Option` presence as the 1.0 document says; the decision and the record for a non-canonical timestamp; text over 64 KiB as references; no path or hash made from an attachment name | an importer test per case, and the R97 importer test the spec still lists as pending |
+| T21 | One codec for every task row; list order, repeats and `Option` presence as the 1.0 document says; the decision and the record for a non-canonical timestamp; `import` and NULL as the creator of a legacy task; text over 64 KiB as references; no path or hash made from an attachment name | an importer test per case, and the R97 importer test the spec still lists as pending |
 | T22 | `orch db verify` runs the format's read checks for every task and finds orphan references and details; the views `diag_task_details` (without `detail`) and `diag_task_blob_refs` | the schema's view-listing test; `db_commands` |
 | T23 | A backup and a restore carry every object a reference row names, in one point; an export carries both tables and the objects; an import reconstructs every text and checks its hash | `db_backup_restore`, `db_export_import`; a restore that finds a missing, short or reordered chunk refuses |
 | T27 | Records the named checks as run, with counts, on Linux, and rejects an empty or ignored selection | the verification table |
@@ -661,9 +661,16 @@ public cursor slices are used only after they have merged. The independent code 
 covered surfaces, the security review, the exact-head hosted Linux check and test with a clean merge state, the
 lead's recommendation and the owner's merge apply to the mapping PR as to every PR.
 
-**Open before code.** The `Principal` to `created_by_kind` mapping on `create`; what a task that leaves `done` does to
-`landing_state`; the attachment path owner's agreement that `delete` removes the task's `task_attachments` rows. All
-three are listed in the spec's section; none changes the format.
+**Settled before code.** The lead decided three write rules on 2026-11-23, and the owner of the attachment path (T11)
+concurred in the third; the spec's section states them and the mapping slice implements them with the tests R141
+names. (1) `create` derives `created_by_kind` and `created_by_run_id` once from the caller's `Principal`: `Owner` is
+`owner`, `Worker` is `daemon`, `Task` is `agent` with the authenticated, fenced run; the importer (T21) records `import`
+separately. (2) A write that leaves `done` preserves `landing_state` byte for byte; completion sets `skipped` only
+over NULL. (3) A revision-checked `delete` removes the task's `task_attachments` rows for the exact project and task in
+its own savepoint, and keeps the `blobs` registrations and object bytes for the sweep (R60). The same text corrects the
+presence rule: `proof` and `workspace_mode` are optional, and `files_changed` is required only inside a present `proof`.
+The mapping slice consumes this correction before it writes any of these columns. What remains open is the owner's
+approval of the two tables (O2), given by the merge.
 
 ## Status
 

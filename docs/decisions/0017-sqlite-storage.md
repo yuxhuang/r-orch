@@ -469,7 +469,13 @@ across a crash, lists that do not load everything, and a retried request that ru
     selecting snapshot answers the typed stored-data error of R140 for an unknown format, a missing or
     malformed detail, a projection that disagrees or a broken reference, and never rebuilds a task from
     unordered sets. Timestamps stay the canonical millisecond strings that the goal adapter accepts. The migration
-    backfills nothing and refuses a populated predecessor atomically (the spec's "Task format v1 (SQLite)").
+    backfills nothing and refuses a populated predecessor atomically (the spec's "Task format v1 (SQLite)"). The
+    optional `Task` fields, `proof` and `workspace_mode` among them, are absent for `None`; a present `proof` always
+    carries `files_changed`. A write follows three rules of the lead's decision of the same day: `create` derives the
+    creator columns once from the caller's `Principal` (`Owner` is `owner`, `Worker` is `daemon`, `Task` is `agent` with
+    its fenced run; the importer records `import`), a write that leaves `done` preserves `landing_state`, and a
+    revision-checked `delete` removes the task's `task_attachments` rows in its savepoint while its blob registrations and
+    bytes stay for the sweep (R60). The owner of the attachment path concurred in the last.
 
 ## Alternatives considered
 
