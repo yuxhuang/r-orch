@@ -109,6 +109,8 @@ Stop every old orch process for a project, including MCP servers held by editors
 - Daemon: when it finds that it no longer owns the project lock, the daemon also writes one fixed line (two spaces, then `⚠ ownership lost`) to its standard error (the capped `daemon.log` of a detached daemon), once and on a best-effort basis, next to `ownership: LOST` in `orch daemon status`. The line does not stop the daemon and does not stop another process from writing; see [Lost ownership](docs/manual/18-daemon.md#status).
 
 ### Fixed
+
+- Preserve typed attention facts in SQLite and enumerate decimal attention IDs in numeric order, including bounded expiry.
 - OpenCode effort compatibility probes yield while waiting for spawn admission and can be cancelled before a diagnostic holder returns. Explicit daemon starts show only payload-free spawn warnings by default on stderr or the private detached log; explicit logging filters, including `RUST_LOG=off`, still apply.
 - On macOS, queued daemon launches now yield before taking the project boundary, so a held diagnostic spawn does not block reads, task cancellation or goal pause. Private-log warnings distinguish waiting from entered spawn; shutdown retains ownership through late diagnostic cleanup.
 - Live updates cannot overtake the daemon's subscription acknowledgement; a dashboard prompt-mode change also picks up changes made elsewhere while its answer was pending, even if its own change was refused.

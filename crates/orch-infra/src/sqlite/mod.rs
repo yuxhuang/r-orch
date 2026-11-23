@@ -100,3 +100,9 @@ mod leases;
     reason = "Internal task paging awaits T10 hydration and public cursor integration"
 )]
 mod task_page;
+
+#[allow(
+    dead_code,
+    reason = "internal attention mapping awaits T10 Storage composition"
+)]
+mod attention;

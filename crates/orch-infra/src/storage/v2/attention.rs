@@ -315,6 +315,21 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_persisted_open_subjects_are_refused() {
+        let mut table = AttentionRows::default();
+        let row = table.open("p1", &facts(), 20).unwrap();
+        let mut second = row;
+        second.id = 2;
+        table.rows.insert(2, second);
+        table.issued = 2;
+        let bytes = serde_json::to_vec(&table).unwrap();
+        let loaded: AttentionRows = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            matches!(loaded.validate("p1"), Err(StoreError::InvalidAttention(message)) if message == "duplicate open subject")
+        );
+    }
+
+    #[test]
     fn allocation_and_revision_overflow_leave_the_table_unchanged() {
         let mut table = AttentionRows {
             issued: i64::MAX as u64,
