@@ -27,7 +27,7 @@ Ran on: <!-- macOS / Linux / Linux (Docker linux/amd64) / CI only. Name any chec
 - [ ] README
 - [ ] RUNBOOK
 - [ ] ARCHITECTURE
-- [ ] CHANGELOG (Unreleased)
+- [ ] Changelog fragment (docs/changelog/unreleased/)
 - [ ] Spec / plan (status line; the spec Verification table if this completes the work)
 - [ ] none, because:
 
