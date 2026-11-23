@@ -225,6 +225,12 @@ across a crash, lists that do not load everything, and a retried request that ru
     calls `move_to_end` at exactly the call sites where 1.0's `save` reordering is observable (the list is
     deliverable B). Agent rotation is therefore the same as 1.0 and is now a line of engine code that a test
     names.
+    The default orders of two lists are decided as follows (spec, "Run and goal default order"). A run list whose
+    filter names a task, alone or beside an agent, is ordered by the run's numeric `attempt` descending, then by id;
+    every other run list keeps the original `started_at` text descending, then id; the explicit sort `id` is the id
+    ascending with any filter. A goal list is ordered by status rank; presence of `updated_at`, a present value first
+    and a present empty text counting as present; the original `updated_at` text descending; `position`; id. Text is
+    compared by its original UTF-8 bytes, and a cursor continues the same key.
 
 16. **A restore starts a new generation and a new lineage; no pair of lineage and epoch is issued twice.** The
     owner decided this on 2026-11-20 (the spec's AP11) and amended gate line 9 to match. The lineage is a
@@ -636,6 +642,10 @@ across a crash, lists that do not load everything, and a retried request that ru
   hold for events. Since 2026-11-21 they are not measured in release 1.1 and no fallback is built. Release 1.1
   then ships one event path, with the first run's miss of the first budget on macOS on record (issue 98) and
   with `metrics.get` as the only watch on the waits.
+- The numeric attempt order of a task-filtered run list, and a present empty goal `updated_at` ordering before an absent
+  one, are the contract of the memory and file references too. A separate change aligns both and strengthens the shared
+  scenarios; it lands in the same train as this text, and the SQLite registration of the shared suites follows it.
+  Whether a reference meets the contract is shown by that change's own checks, not by this text.
 - `docs/TRAITS-FROZEN.md` §2, ARCHITECTURE §1, §2.1, §5.1 to §5.3 and §6.1, and the RUNBOOK's storage
   procedures change. The stable-sort rule stays: the scheduler still sorts in memory.
 - Backups become a product duty: database, blobs and repositories as one restorable point. A restore

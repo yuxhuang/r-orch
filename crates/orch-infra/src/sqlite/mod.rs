@@ -40,6 +40,8 @@ pub enum SqliteError {
     Store(#[from] orch_core::store::StoreError),
     #[error("stored run event is damaged: {0}")]
     EventCorrupt(String),
+    #[error("stored lease data is damaged: {0}")]
+    LeaseCorrupt(String),
     #[error("SQLite writer is closed")]
     WriterClosed,
     #[error("SQLite connection and queue capacities must be greater than zero")]

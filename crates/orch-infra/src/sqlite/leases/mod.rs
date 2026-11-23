@@ -10,10 +10,14 @@ use rusqlite::{OptionalExtension, Row, Transaction, params};
 /// ordinary outcomes a caller may handle; `Sql` is an engine failure that must
 /// reach the writer's classification and end the transaction, so it is never
 /// flattened into a backend string inside a callback that then returns `Ok`.
+/// `Corrupt` is a stored value outside its column's contract (no SQLite result
+/// code): like `Sql` it ends the job rather than being offered as a refusal,
+/// and unlike `StoreError::CounterExhausted` it says the data is damaged.
 #[derive(Debug)]
 pub(crate) enum LeaseError {
     Store(StoreError),
     Sql(rusqlite::Error),
+    Corrupt(String),
 }
 
 impl From<StoreError> for LeaseError {
@@ -35,6 +39,7 @@ impl From<LeaseError> for crate::sqlite::SqliteError {
         match error {
             LeaseError::Store(error) => Self::Store(error),
             LeaseError::Sql(error) => Self::Sql(error),
+            LeaseError::Corrupt(detail) => Self::LeaseCorrupt(detail),
         }
     }
 }
@@ -169,10 +174,19 @@ pub(crate) fn claim_lease(
         )
         .optional()?
         .unwrap_or(1);
-    let next = epoch
-        .checked_add(1)
-        .filter(|_| epoch > 0)
-        .ok_or(StoreError::CounterExhausted)?;
+    // `task_epochs.next_epoch` is the epoch the next claim issues: 1 for a task
+    // with no run, else one more than the largest epoch issued (spec "Import":
+    // `next_epoch` is one more than the largest; `orch db verify`: every epoch
+    // is below its task's `next_epoch`). Zero or a negative value is damage, not
+    // exhaustion: granting it would issue epoch 0 or, through `as u64`, a huge
+    // one. Nothing has been written yet, so the refusal changes no row.
+    if epoch < 1 {
+        return Err(LeaseError::Corrupt(format!(
+            "task_epochs.next_epoch is {epoch} for task {}; it must be at least 1",
+            new.task
+        )));
+    }
+    let next = epoch.checked_add(1).ok_or(StoreError::CounterExhausted)?;
     // rusqlite's Savepoint requires &mut Connection, while the executor lends
     // &Transaction. A fixed, internal name is safe: this synchronous operation
     // never calls another lease operation inside its savepoint.
@@ -243,5 +257,7 @@ pub(crate) fn release_lease(
 mod tests;
 
 mod adapter;
+#[cfg(test)]
+mod contract_tests;
 #[cfg(test)]
 mod executor_tests;

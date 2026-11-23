@@ -12,7 +12,7 @@ pub(super) enum Part {
     Int(i64),
     Position(u64),
     Text(String),
-    /// Larger text first; an absent value is the empty text (1.0 goals).
+    /// Larger text first.
     Newest(Reverse<String>),
 }
 
@@ -94,7 +94,7 @@ fn newest(text: &str) -> Part {
 
 /// The row's place in the sort. The id is always last, so keys are unique and
 /// a cursor can name the exact row it stopped after.
-pub(super) fn key(row: &Record, sort: Sort) -> Key {
+pub(super) fn key(row: &Record, sort: Sort, filter: &Filter) -> Key {
     use Part::{Int, Position, Text};
     let position = Position(row.position);
     let mut key = match (&row.entity, sort) {
@@ -108,6 +108,7 @@ pub(super) fn key(row: &Record, sort: Sort) -> Key {
         (Entity::Task(t), Sort::UpdatedAt) => vec![newest(&t.updated_at), position],
         (Entity::Goal(g), Sort::Default) => vec![
             Int(goal_rank(g.status)),
+            Int(i64::from(g.updated_at.is_none())),
             newest(g.updated_at.as_deref().unwrap_or("")),
             position,
         ],
@@ -116,6 +117,9 @@ pub(super) fn key(row: &Record, sort: Sort) -> Key {
         (Entity::Agent(a), Sort::Name) => vec![Text(a.name.clone()), position],
         (Entity::Team(t), Sort::Default) => vec![Text(t.created_at.clone())],
         (Entity::Team(t), Sort::Name) => vec![Text(t.name.clone())],
+        (Entity::Run(r), Sort::Default) if matches!(filter, Filter::Runs { task: Some(_), .. }) => {
+            vec![Int(-i64::from(r.attempt))]
+        }
         (Entity::Run(r), Sort::Default) => vec![newest(&r.started_at)],
         (Entity::Message(m), Sort::Default) => vec![Text(m.created_at.clone()), position],
         (Entity::Context(_) | Entity::Config(_) | Entity::Template(_), Sort::Default) => vec![],
