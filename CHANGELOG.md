@@ -7,6 +7,8 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 
 ### Storage groundwork
 
+- Add the inactive attention port with fixed daemon facts, revisioned acknowledgements and resolution, bounded paging and retention, and isolated memory/file references; runtime evaluation and commands remain unwired.
+
 - Add an inactive SQLite task paging query with bounded pages and project-bound continuations; the running daemon still uses file storage.
 
 - Add internal SQLite transactions and snapshot reads for goals. The daemon continues to store goals in files.
