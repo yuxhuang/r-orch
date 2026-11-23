@@ -174,3 +174,62 @@ impl RetryState {
         Ok(RetryPage { rows, next })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An exact, reversible content name is enough for this private order proof;
+    // disk-backed port tests separately use real SHA-256 and its object bound.
+    struct TextBlobs;
+    impl BlobStore for TextBlobs {
+        type Hash = String;
+        type Error = std::io::Error;
+        fn put(&self, bytes: &[u8]) -> std::io::Result<String> {
+            String::from_utf8(bytes.to_vec()).map_err(std::io::Error::other)
+        }
+        fn get(&self, hash: &String) -> std::io::Result<Vec<u8>> {
+            Ok(hash.as_bytes().to_vec())
+        }
+        fn remove(&self, _: &String) -> std::io::Result<bool> {
+            Ok(false)
+        }
+    }
+    fn name(bytes: &[u8]) -> String {
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    #[test]
+    fn reordered_retry_chunks_fail_every_memory_retry_read() {
+        let mut state = RetryState::with_blob_store(TextBlobs, name, 32_768);
+        let row = Retry {
+            task: "t".into(),
+            attempt: 1,
+            due_at: 0,
+            error: format!("{}{}", "a".repeat(32_768), "b".repeat(32_769)),
+        };
+        state.put(&row).unwrap();
+        assert_eq!(state.get("t").unwrap(), Some(row));
+        state
+            .rows
+            .get_mut("t")
+            .unwrap()
+            .backing
+            .as_mut()
+            .unwrap()
+            .chunks
+            .swap(0, 1);
+        for error in [
+            state.get("t").unwrap_err(),
+            state.due(i64::MAX, 1).unwrap_err(),
+            state.page(None, 1).unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("reconstructed retry does not hash"),
+                "{error}"
+            );
+        }
+    }
+}

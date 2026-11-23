@@ -316,7 +316,7 @@ pub async fn a_key_is_not_shared_across_identity_project_run_or_epoch(fixture: F
         me(),
         owner(P, "someone-else"),
         owner("other", "owner"),
-        // A task principal is not an owner of the same identity, whatever the key.
+        // These task scopes also carry a run and an epoch.
         task_principal(P, "r1", 1),
         task_principal(P, "r2", 1),
         task_principal(P, "r1", 2),
@@ -477,6 +477,9 @@ pub async fn input_outside_the_shapes_is_refused_and_changes_nothing(fixture: Fi
                 "{req}"
             );
             assert!(is_invalid(u.store_request_key(&scope, OP, req, "x", T0)));
+        }
+        for now in [-1, i64::MIN] {
+            assert!(is_invalid(u.check_request_key(&scope, OP, &hash('a'), now)));
         }
         // Time is UTC milliseconds from the epoch, and the expiry must fit.
         for now in [-1, i64::MIN, i64::MAX, i64::MAX - HOUR + 1] {

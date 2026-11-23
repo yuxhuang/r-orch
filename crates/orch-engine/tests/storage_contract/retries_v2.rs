@@ -790,6 +790,34 @@ pub async fn retry_whole_text_replacement_rolls_back_and_snapshots_keep_original
         [original.clone()]
     );
     assert_eq!(walk(snapshot.as_ref(), 1).await.1, [original]);
+    let short = retry("t1", 3, 30);
+    put(s.as_ref(), P, vec![short.clone()]).await;
+    assert_eq!(get(s.as_ref(), P, "t1").await, Some(short.clone()));
+    let snap = s.read(caller(P)).await.unwrap();
+    assert_eq!(
+        snap.read_due_retries(i64::MAX, 1).await.unwrap(),
+        [short.clone()]
+    );
+    assert_eq!(walk(snap.as_ref(), 1).await.1, [short]);
+    let mut long = retry("t1", 4, 40);
+    long.error = "long".repeat(20_000);
+    put(s.as_ref(), P, vec![long.clone()]).await;
+    assert_eq!(get(s.as_ref(), P, "t1").await, Some(long));
+}
+
+pub async fn retry_chunked_text_survives_restore_without_a_run(fixture: Fixture) {
+    let s = fixture.storage.clone();
+    let mut row = retry("chunked", 1, 10);
+    row.error = "x".repeat(64 * 1024 * 1024 + 1);
+    put(s.as_ref(), P, vec![row.clone()]).await;
+    fixture.restore.restore_to_lineage("chunked-restore").await;
+    let snap = s.read(caller(P)).await.unwrap();
+    assert_eq!(snap.read_retry("chunked").await.unwrap(), Some(row.clone()));
+    assert_eq!(
+        snap.read_due_retries(i64::MAX, 1).await.unwrap(),
+        [row.clone()]
+    );
+    assert_eq!(walk(snap.as_ref(), 1).await.1, [row]);
 }
 
 struct BlobMemoryFixture {
@@ -837,6 +865,7 @@ macro_rules! retry_suite {
                     }
                 };
             }
+            case!(retry_chunked_text_survives_restore_without_a_run);
             case!(retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run);
             case!(retry_whole_text_replacement_rolls_back_and_snapshots_keep_original);
             case!(a_task_has_one_row_and_a_put_replaces_it_whole);

@@ -769,6 +769,7 @@ async fn a_hand_edited_intent_outside_the_contract_is_refused_on_read() {
         Corruption::Invalid("intent 1 is past its counter"),
         Corruption::Parse("unknown variant `process.kill`"),
         Corruption::Parse("unknown field `pid`"),
+        Corruption::Invalid("request key 0 has an impossible scope"),
     ];
     assert_eq!(edits.len(), expected.len());
     for (edit, expected) in edits.into_iter().zip(expected) {
@@ -960,6 +961,10 @@ async fn a_hand_edited_request_key_outside_the_contract_is_refused_on_read() {
         // A run without an epoch, and a field nobody defined.
         |v| v["rows"][0]["run"] = "r1".into(),
         |v| v["rows"][0]["pid"] = 42.into(),
+        |v| {
+            v["rows"][0]["run"] = "r1".into();
+            v["rows"][0]["epoch"] = (i64::MAX as u64 + 1).into();
+        },
     ];
     let expected = [
         Corruption::Invalid(
@@ -977,6 +982,7 @@ async fn a_hand_edited_request_key_outside_the_contract_is_refused_on_read() {
         Corruption::Invalid("request key 1 is out of order or repeated"),
         Corruption::Invalid("request key 0 has an impossible scope"),
         Corruption::Parse("unknown field `pid`"),
+        Corruption::Invalid("request key 0 has an impossible scope"),
     ];
     assert_eq!(edits.len(), expected.len());
     for (edit, expected) in edits.into_iter().zip(expected) {
@@ -2032,14 +2038,15 @@ async fn retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified(
                 assert_eq!(combined, expected.error.as_bytes());
                 let tail = &expected.error.as_bytes()[max..];
                 let path = retry_blob_path(&dir, tail);
-                std::fs::write(&path, b"damaged tail").unwrap();
-                assert!(snap.read_retry("large").await.is_err());
-                assert!(snap.read_due_retries(i64::MAX, 1).await.is_err());
-                assert!(snap.read_retries(None, 1).await.is_err());
-                std::fs::write(&path, tail).unwrap();
-                std::fs::remove_file(&path).unwrap();
-                assert!(snap.read_retry("large").await.is_err());
-                std::fs::write(&path, tail).unwrap();
+                for corrupt in [true, false] {
+                    if corrupt {
+                        std::fs::write(&path, b"damaged tail").unwrap();
+                    } else {
+                        std::fs::remove_file(&path).unwrap();
+                    }
+                    assert_retry_reads_fail(storage.as_ref(), snap.as_ref(), "large").await;
+                    std::fs::write(&path, tail).unwrap();
+                }
                 if !memory {
                     let path = dir.join("state.json");
                     let mut document: serde_json::Value =
@@ -2051,18 +2058,13 @@ async fn retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified(
                     chunks.swap(0, 1);
                     std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
                     let reopened = FileStorage::new(root.path());
-                    let error = reopened
-                        .read(owner("p"))
-                        .await
-                        .unwrap()
-                        .read_retry("large")
-                        .await
-                        .unwrap_err()
-                        .to_string();
+                    let snap = reopened.read(owner("p")).await.unwrap();
+                    let error = snap.read_retry("large").await.unwrap_err().to_string();
                     assert!(
                         error.contains("reconstructed retry does not hash"),
                         "{error}"
                     );
+                    assert_retry_reads_fail(&reopened, snap.as_ref(), "large").await;
                 }
             } else {
                 assert_eq!(blobs.get(&hash).unwrap(), expected.error.as_bytes());
@@ -2179,4 +2181,102 @@ async fn retry_repeated_chunks_reconstruct_every_occurrence_on_both_references()
             assert_eq!(chunks[1], chunks[0]);
         }
     }
+}
+
+async fn assert_retry_reads_fail(storage: &dyn Storage, snap: &dyn ReadSnapshot, task: &str) {
+    assert!(snap.read_retry(task).await.is_err());
+    assert!(snap.read_due_retries(i64::MAX, 10).await.is_err());
+    assert!(snap.read_retries(None, 10).await.is_err());
+    let task = task.to_owned();
+    storage
+        .transaction(owner("p"), Lane::Entities, move |u| {
+            assert!(u.get_retry(&task).is_err());
+            assert!(u.due_retries(i64::MAX, 10).is_err());
+            assert!(u.list_retries(None, 10).is_err());
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn retry_rollback_keeps_published_bytes_without_a_reference_on_both_backed_references() {
+    use crate::blob::DiskBlobStore;
+    use crate::data_dir::confined::ConfinedDir;
+    for memory in [false, true] {
+        let root = root();
+        let dir = root.path().join("p-70");
+        std::fs::create_dir(&dir).unwrap();
+        let store = DiskBlobStore::open(&ConfinedDir::open(&dir).unwrap()).unwrap();
+        let storage = retry_backing(memory, root.path(), store);
+        let old = retry("keep", 1, 10);
+        let previous = old.clone();
+        storage
+            .transaction(owner("p"), Lane::Entities, move |u| u.put_retry(&previous))
+            .await
+            .unwrap();
+        let row = Retry {
+            error: "x".repeat(65_537),
+            ..retry("lost", 1, 20)
+        };
+        let bytes = row.error.as_bytes().to_vec();
+        let result = storage
+            .transaction(owner("p"), Lane::Entities, move |u| {
+                u.put_retry(&row)?;
+                Err::<(), _>(StoreError::CounterExhausted)
+            })
+            .await;
+        assert!(matches!(result, Err(StoreError::CounterExhausted)));
+        let snap = storage.read(owner("p")).await.unwrap();
+        assert_eq!(snap.read_retries(None, 10).await.unwrap().rows, [old]);
+        assert_eq!(snap.read_retry("lost").await.unwrap(), None);
+        assert_eq!(std::fs::read(retry_blob_path(&dir, &bytes)).unwrap(), bytes);
+    }
+}
+
+#[tokio::test]
+async fn retry_existing_single_object_encoding_and_wrapper_extensions_remain_readable() {
+    use crate::blob::{BlobHash, DiskBlobStore};
+    use crate::data_dir::confined::ConfinedDir;
+    let root = root();
+    let storage = FileStorage::new(root.path());
+    store_key(&storage, "first", "r", 1).await;
+    storage
+        .transaction(owner("p"), Lane::Entities, |u| {
+            u.put_retry(&retry("legacy", 1, 10))
+        })
+        .await
+        .unwrap();
+    let dir = storage.project_dir("p");
+    let path = dir.join("state.json");
+    let bytes = "é".repeat(32_769).into_bytes();
+    let blobs = DiskBlobStore::open(&ConfinedDir::open(&dir).unwrap()).unwrap();
+    let hash = blobs.put(&bytes).unwrap();
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    doc["retries"]["rows"]["legacy"]["error"] = serde_json::json!({"sha256": hash.to_string()});
+    doc["request_keys"]["future-wrapper-field"] = serde_json::json!({"ignored":true});
+    std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let reopened = FileStorage::new(root.path());
+    let snap = reopened.read(owner("p")).await.unwrap();
+    let expected = Retry {
+        error: String::from_utf8(bytes).unwrap(),
+        ..retry("legacy", 1, 10)
+    };
+    assert_eq!(
+        snap.read_retry("legacy").await.unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(
+        snap.read_due_retries(i64::MAX, 10).await.unwrap(),
+        [expected.clone()]
+    );
+    assert_eq!(snap.read_retries(None, 10).await.unwrap().rows, [expected]);
+    assert_eq!(BlobHash::of("é".repeat(32_769).as_bytes()), hash);
+    assert_eq!(
+        check_key(&reopened, "first", 1).await,
+        KeyCheck::Replay("r".into())
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
