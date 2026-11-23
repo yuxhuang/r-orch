@@ -123,15 +123,15 @@ pub(super) fn classify(path: &str, graph: &Graph) -> (Reason, BTreeSet<String>) 
         };
     }
     if path == "docs/specs/2026-11-20-sqlite-storage.md" {
-        return if graph.contains("orch-infra") {
+        return if graph.contains("orch-infra") && graph.contains("orch-cli") {
             (
                 reason(
                     path,
                     Class::Coupled,
-                    "orch-infra",
-                    "import_index_reference reads the SQLite spec problem-class table",
+                    "orch-cli,orch-infra",
+                    "import_index_reference reads the SQLite spec problem-class table; concurrent_index requires the orch-cli binary",
                 ),
-                BTreeSet::from(["orch-infra".into()]),
+                BTreeSet::from(["orch-cli".into(), "orch-infra".into()]),
             )
         } else {
             (
@@ -139,7 +139,11 @@ pub(super) fn classify(path: &str, graph: &Graph) -> (Reason, BTreeSet<String>) 
                     path,
                     Class::Error,
                     "all",
-                    "document coupling names a missing orch-infra member",
+                    if graph.contains("orch-infra") {
+                        "document coupling names a missing orch-cli member"
+                    } else {
+                        "document coupling names a missing orch-infra member"
+                    },
                 ),
                 BTreeSet::new(),
             )

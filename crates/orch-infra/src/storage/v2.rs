@@ -31,6 +31,7 @@
 //! lease past its epoch counter or sharing an agent or a run, not for two task
 //! ids with one fold key, two rows at one position, or events of no known run.
 
+mod attention;
 mod events;
 mod intents;
 mod leases;
@@ -47,13 +48,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use orch_core::Error;
+use orch_core::store::attention::*;
 use orch_core::store::events::{
     AppendResult, EventGap, EventRead, EventWrite, PruneResult, SequencedEvent,
 };
 use orch_core::store::intents::{FinishOutcome, Intent, IntentPayload, IntentRead, IntentWrite};
 use orch_core::store::leases::{ClaimOutcome, Lease, LeaseRead, LeaseWrite, NewLease};
 use orch_core::store::request_keys::{KeyCheck, RequestKeyWrite, RequestScope};
-use orch_core::store::retries::{Retry, RetryRead, RetryWrite};
+use orch_core::store::retries::{Retry, RetryCursor, RetryPage, RetryRead, RetryWrite};
 use orch_core::store::{
     Caller, Cursor, Entity, EntityKind, Filter, Lane, Page, PageRequest, ReadSnapshot, Record,
     Result, Revision, Sort, Storage, StoreError, UnitOfWork, WriteWork,
@@ -80,6 +82,7 @@ struct Project {
     /// The last position handed out per family. Never lowered, so a deletion
     /// does not free a position.
     counters: BTreeMap<EntityKind, u64>,
+    attention: attention::AttentionRows,
     events: Events,
     intents: Intents,
     leases: Leases,
@@ -89,6 +92,8 @@ struct Project {
 
 #[derive(Serialize, Deserialize)]
 struct Document {
+    #[serde(default)]
+    attention: attention::AttentionRows,
     counters: BTreeMap<EntityKind, u64>,
     records: Vec<text::StoredRecord>,
     #[serde(default)]
@@ -159,7 +164,13 @@ impl FileStorage {
                 if !entry.file_name().to_string_lossy().starts_with("p-") || !dir.is_dir() {
                     continue;
                 }
-                let mut project = load(&dir)?;
+                // Restore has no Caller; attention validates only the scope class.
+                let scope = if entry.file_name() == "p-" {
+                    ""
+                } else {
+                    "project"
+                };
+                let mut project = load(&dir, scope)?;
                 if !project.leases.is_empty() {
                     project.leases.end_all();
                     persist(&dir, &project)?;
@@ -215,7 +226,7 @@ fn corrupt(path: &Path, detail: impl std::fmt::Display) -> StoreError {
     )))
 }
 
-fn load(dir: &Path) -> Result<Project> {
+fn load(dir: &Path, scope: &str) -> Result<Project> {
     let path = dir.join(DOCUMENT);
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -226,12 +237,14 @@ fn load(dir: &Path) -> Result<Project> {
     let mut project = Project {
         rows: BTreeMap::new(),
         counters: document.counters,
+        attention: document.attention,
         events: document.events,
         intents: document.intents,
         leases: document.leases,
         request_keys: document.request_keys,
         retries: document.retries,
     };
+    project.attention.validate(scope)?;
     project
         .intents
         .validate()
@@ -269,6 +282,7 @@ fn persist(dir: &Path, project: &Project) -> Result<()> {
             .values()
             .map(|row| text::StoredRecord::encode(dir, row))
             .collect::<Result<_>>()?,
+        attention: project.attention.clone(),
         events: project.events.clone(),
         intents: project.intents.clone(),
         leases: project.leases.clone(),
@@ -312,7 +326,7 @@ impl Storage for FileStorage {
         let session = blocking(move || {
             Ok(Session {
                 lineage: read_lineage(&root)?,
-                project: load(&dir)?,
+                project: load(&dir, &caller.project)?,
                 caller,
                 dirty: false,
                 cursors,
@@ -333,7 +347,7 @@ impl Storage for FileStorage {
             let _gate = gate;
             let mut session = Session {
                 lineage: read_lineage(&root)?,
-                project: load(&dir)?,
+                project: load(&dir, &caller.project)?,
                 caller,
                 dirty: false,
                 cursors,
@@ -405,7 +419,7 @@ impl Session {
             .rows
             .values()
             .filter(|row| matches(&row.entity, filter))
-            .map(|row| (key(row, request.sort), row))
+            .map(|row| (key(row, request.sort, filter), row))
             .collect();
         let total = request.with_count.then_some(rows.len() as u64);
         rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -739,6 +753,9 @@ impl RetryRead for Session {
     async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>> {
         self.project.retries.due(now_ms, limit)
     }
+    async fn read_retries(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage> {
+        self.project.retries.page(after, limit)
+    }
 }
 
 impl RetryWrite for Session {
@@ -757,5 +774,74 @@ impl RetryWrite for Session {
     }
     fn due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>> {
         self.project.retries.due(now_ms, limit)
+    }
+    fn list_retries(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage> {
+        self.project.retries.page(after, limit)
+    }
+}
+
+#[async_trait]
+impl AttentionRead for Session {
+    async fn read_attention(&self, id: u64) -> Result<Option<Attention>> {
+        Ok(self.project.attention.get(id))
+    }
+    async fn read_attention_page(
+        &self,
+        filter: AttentionFilter,
+        after: Option<&AttentionCursor>,
+        limit: usize,
+    ) -> Result<AttentionPage> {
+        self.project
+            .attention
+            .page(&self.caller.project, filter, after, limit)
+    }
+}
+impl AttentionWrite for Session {
+    fn get_attention(&self, id: u64) -> Result<Option<Attention>> {
+        Ok(self.project.attention.get(id))
+    }
+    fn attention_page(
+        &self,
+        filter: AttentionFilter,
+        after: Option<&AttentionCursor>,
+        limit: usize,
+    ) -> Result<AttentionPage> {
+        self.project
+            .attention
+            .page(&self.caller.project, filter, after, limit)
+    }
+    fn open_attention(&mut self, facts: &AttentionFacts, at: i64) -> Result<Attention> {
+        let (row, written) = self
+            .project
+            .attention
+            .open(&self.caller.project, facts, at)?;
+        self.dirty |= written;
+        Ok(row)
+    }
+    fn ack_attention(&mut self, id: u64, expected: Revision, at: i64) -> Result<Attention> {
+        let identity = match &self.caller.principal {
+            orch_core::store::Principal::Owner { identity }
+            | orch_core::store::Principal::Worker { identity }
+            | orch_core::store::Principal::Task { identity, .. } => identity,
+        };
+        let (row, written) = self.project.attention.ack(id, expected, identity, at)?;
+        self.dirty |= written;
+        Ok(row)
+    }
+    fn resolve_attention(
+        &mut self,
+        id: u64,
+        expected: Revision,
+        reason: ResolutionReason,
+        at: i64,
+    ) -> Result<Attention> {
+        let (row, written) = self.project.attention.resolve(id, expected, reason, at)?;
+        self.dirty |= written;
+        Ok(row)
+    }
+    fn expire_attention(&mut self, cutoff: i64, limit: usize) -> Result<usize> {
+        let count = self.project.attention.expire(cutoff, limit)?;
+        self.dirty |= count > 0;
+        Ok(count)
     }
 }

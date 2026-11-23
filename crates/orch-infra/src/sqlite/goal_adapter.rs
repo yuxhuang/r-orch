@@ -136,6 +136,7 @@ fn classify(error: EntityError) -> SqliteError {
     match error {
         EntityError::Sql(error) => SqliteError::Sql(error),
         EntityError::Store(error) => SqliteError::Store(error),
+        EntityError::Counter(error) => *error,
         EntityError::Rollback {
             operation,
             rollback,
@@ -146,10 +147,17 @@ fn classify(error: EntityError) -> SqliteError {
     }
 }
 
+// The common canonical range of Jiff's strict parser and the core formatter:
+// 0000-01-01T00:00:00.000Z through Timestamp::MAX at millisecond precision.
+// Negative years use different spellings in the two formatters. Refuse them
+// rather than returning a string that the core clock would not have written.
 fn timestamp(ms: i64) -> Result<String> {
-    jiff::Timestamp::from_millisecond(ms)
-        .map(|time| format!("{time:.3}"))
-        .map_err(|_| SqliteError::Unrepresentable("goal timestamp outside API range".into()))
+    if !(-62_167_219_200_000..=jiff::Timestamp::MAX.as_millisecond()).contains(&ms) {
+        return Err(SqliteError::Unrepresentable(
+            "goal timestamp outside common canonical range".into(),
+        ));
+    }
+    Ok(orch_core::clock::iso_from_epoch_ms(ms))
 }
 
 fn milliseconds(text: &str) -> Result<i64> {

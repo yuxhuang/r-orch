@@ -49,3 +49,8 @@ request_keys_v2::request_key_suite!(file_request_keys_v2, crate::v2_file::operat
 mod retries_v2;
 retries_v2::retry_suite!(memory_retries_v2, crate::v2_operations::memory_backend);
 retries_v2::retry_suite!(file_retries_v2, crate::v2_file::operations_backend);
+
+#[path = "storage_contract/attention_v2.rs"]
+mod attention_v2;
+attention_v2::attention_suite!(memory_attention_v2, crate::v2_operations::memory_backend);
+attention_v2::attention_suite!(file_attention_v2, crate::v2_file::operations_backend);

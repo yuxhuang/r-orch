@@ -521,21 +521,21 @@ fn root_documents_select_no_tests_tv21() {
 const SQLITE_SPEC: &str = "docs/specs/2026-11-20-sqlite-storage.md";
 
 #[test]
-fn sqlite_spec_selects_only_its_importer_consumer() {
+fn sqlite_spec_selects_importer_and_its_cli_runtime() {
     let fixture = Fixture::new();
     let changes = modified(&[SQLITE_SPEC]);
     let value = fixture.select(&changes);
-    selected(&value, "packages", &["orch-infra"]);
+    selected(&value, "packages", &["orch-cli", "orch-infra"]);
     reasons(&value, &[(SQLITE_SPEC, "coupled")]);
     let reason = &value["reasons"][0];
-    assert_eq!(reason["selects"], "orch-infra");
+    assert_eq!(reason["selects"], "orch-cli,orch-infra");
     assert!(
         reason["why"]
             .as_str()
             .unwrap()
             .contains("import_index_reference")
     );
-    // GRAPH includes two reverse dependents of infra; neither consumes this input.
+    // The unrelated infra-dependent sentinel must remain excluded.
     let output = fixture.selection(&changes, fixture.metadata().as_bytes(), "github");
     assert!(output.status.success(), "{}", diagnostic(&output));
     assert_eq!(
@@ -557,7 +557,7 @@ fn sqlite_spec_selects_only_its_importer_consumer() {
 fn sqlite_spec_unions_with_prose_and_source_closure() {
     let fixture = Fixture::new();
     let value = fixture.select(&modified(&[SQLITE_SPEC, "docs/RUNBOOK.md"]));
-    selected(&value, "packages", &["orch-infra"]);
+    selected(&value, "packages", &["orch-cli", "orch-infra"]);
     reasons(
         &value,
         &[(SQLITE_SPEC, "coupled"), ("docs/RUNBOOK.md", "doc")],
@@ -566,7 +566,13 @@ fn sqlite_spec_unions_with_prose_and_source_closure() {
     selected(
         &value,
         "packages",
-        &["orch-build-user", "orch-dev-user", "orch-infra", "orch-mid"],
+        &[
+            "orch-build-user",
+            "orch-cli",
+            "orch-dev-user",
+            "orch-infra",
+            "orch-mid",
+        ],
     );
     reasons(
         &value,
@@ -592,7 +598,7 @@ fn sqlite_spec_deletion_rename_and_copy_retain_the_consumer() {
         format!("C100\0docs/new-spec.md\0{SQLITE_SPEC}\0"),
     ] {
         let value = fixture.select(change.as_bytes());
-        selected(&value, "packages", &["orch-infra"]);
+        selected(&value, "packages", &["orch-cli", "orch-infra"]);
         assert!(
             value["reasons"]
                 .as_array()
@@ -632,6 +638,35 @@ fn sqlite_spec_missing_consumer_fails_closed() {
             .contains("missing orch-infra member")
     );
 }
+#[test]
+fn sqlite_spec_missing_cli_runtime_fails_closed() {
+    let fixture = Fixture::new();
+    let mut metadata: Value = serde_json::from_str(&fixture.metadata()).unwrap();
+    let packages = metadata["packages"].as_array_mut().unwrap();
+    packages.retain(|p| p["name"] != "orch-cli");
+    for package in packages.iter_mut() {
+        package["dependencies"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|d| d["name"] != "orch-cli");
+    }
+    let members: Vec<_> = packages.iter().map(|p| p["id"].clone()).collect();
+    metadata["workspace_members"] = json!(members);
+    metadata["workspace_default_members"] = json!(members);
+    let value = parse(fixture.selection(
+        &modified(&[SQLITE_SPEC]),
+        metadata.to_string().as_bytes(),
+        "json",
+    ));
+    fail_closed(&value, "error");
+    reasons(&value, &[(SQLITE_SPEC, "error")]);
+    assert!(
+        value["reasons"][0]["why"]
+            .as_str()
+            .unwrap()
+            .contains("missing orch-cli member")
+    );
+}
 
 #[test]
 fn git_current_base_spec_only_commit_selects_importer_and_prose_does_not() {
@@ -641,7 +676,7 @@ fn git_current_base_spec_only_commit_selects_importer_and_prose_does_not() {
         "Cargo.toml",
         "[workspace]\nmembers = [\"crates/*\"]\nresolver = \"3\"\n",
     );
-    for name in ["orch-infra", "infra-dependent-sentinel"] {
+    for name in ["orch-infra", "orch-cli", "infra-dependent-sentinel"] {
         let dependency = if name == "infra-dependent-sentinel" {
             "[dependencies]\norch-infra = { path = \"../orch-infra\" }\n"
         } else {
@@ -672,7 +707,7 @@ fn git_current_base_spec_only_commit_selects_importer_and_prose_does_not() {
     );
     assert!(fixture.git(&["status", "--porcelain"]).is_empty());
     let value = fixture.select_git(&base);
-    selected(&value, "packages", &["orch-infra"]);
+    selected(&value, "packages", &["orch-cli", "orch-infra"]);
     reasons(&value, &[(SQLITE_SPEC, "coupled")]);
     let base = fixture.git(&["rev-parse", "HEAD"]);
     fixture.write("README.md", "Unrelated prose edit.\n");
@@ -1248,11 +1283,20 @@ fn hostile_base_argument_cannot_become_a_git_option_or_shell_program_tv37() {
 
 #[test]
 fn selected_packages_build_current_cli_before_infra_path_exec() {
+    build_current_cli_before_infra_path_exec("crates/orch-cli/src/main.rs");
+}
+
+#[test]
+fn sqlite_spec_selection_builds_current_cli_before_infra_path_exec_on_cold_target() {
+    build_current_cli_before_infra_path_exec(SQLITE_SPEC);
+}
+
+fn build_current_cli_before_infra_path_exec(changed_path: &str) {
     // D31 thin probe only. No product orch, real AI CLI, registry or shared
     // helper is used. Mac/native Linux and actual concurrent_index are separate
     // validation obligations. No gate/timing claim follows from this fixture.
     let fixture = Fixture::new();
-    let value = fixture.select(&modified(&["crates/orch-cli/src/main.rs"]));
+    let value = fixture.select(&modified(&[changed_path]));
     selected(&value, "packages", &["orch-cli", "orch-infra"]);
     fixture.write(
         "Cargo.toml",

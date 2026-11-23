@@ -120,21 +120,21 @@ fn stale_tokens_and_each_holder_field_are_refused_without_writes() {
     for c in callers {
         assert!(matches!(
             renew_lease(&tx, &c, "a", &l.lineage, 1, 7),
-            Err(StoreError::StaleEpoch)
+            Err(LeaseError::Store(StoreError::StaleEpoch))
         ));
         assert!(matches!(
             release_lease(&tx, &c, "a", &l.lineage, 1),
-            Err(StoreError::StaleEpoch)
+            Err(LeaseError::Store(StoreError::StaleEpoch))
         ));
     }
     for (lineage, epoch) in [("wrong", 1), (&*l.lineage, 0), (&*l.lineage, u64::MAX)] {
         assert!(matches!(
             renew_lease(&tx, &who, "a", lineage, epoch, 7),
-            Err(StoreError::StaleEpoch)
+            Err(LeaseError::Store(StoreError::StaleEpoch))
         ));
         assert!(matches!(
             release_lease(&tx, &who, "a", lineage, epoch),
-            Err(StoreError::StaleEpoch)
+            Err(LeaseError::Store(StoreError::StaleEpoch))
         ));
     }
     assert_eq!(tx.total_changes(), before);
@@ -155,11 +155,11 @@ fn current_database_lineage_fences_even_a_matching_old_holder() {
     let before = tx.total_changes();
     assert!(matches!(
         renew_lease(&tx, &holder(&who, &l), "a", &l.lineage, 1, 7),
-        Err(StoreError::StaleEpoch)
+        Err(LeaseError::Store(StoreError::StaleEpoch))
     ));
     assert!(matches!(
         release_lease(&tx, &who, "a", &l.lineage, 1),
-        Err(StoreError::StaleEpoch)
+        Err(LeaseError::Store(StoreError::StaleEpoch))
     ));
     assert_eq!(tx.total_changes(), before);
 }
@@ -202,7 +202,7 @@ fn release_retains_epoch_and_lost_streak_across_reopen_without_task_rows() {
         );
         assert!(matches!(
             release_lease(&tx, &who, "t", &l.lineage, 1),
-            Err(StoreError::StaleEpoch)
+            Err(LeaseError::Store(StoreError::StaleEpoch))
         ));
         tx.commit().unwrap();
     }
@@ -250,14 +250,14 @@ fn clock_and_sqlite_counter_overflow_change_nothing() {
     let before = tx.total_changes();
     assert!(matches!(
         claim_lease(&tx, &who, &new("t", "a", "r"), i64::MAX),
-        Err(StoreError::CounterExhausted)
+        Err(LeaseError::Store(StoreError::CounterExhausted))
     ));
     assert_eq!(tx.total_changes(), before);
     let l = grant(&tx, &who, new("t", "a", "r"), 0);
     let before = tx.total_changes();
     assert!(matches!(
         renew_lease(&tx, &who, "t", &l.lineage, 1, i64::MAX),
-        Err(StoreError::CounterExhausted)
+        Err(LeaseError::Store(StoreError::CounterExhausted))
     ));
     assert_eq!(tx.total_changes(), before);
     release_lease(&tx, &who, "t", &l.lineage, 1).unwrap();
@@ -266,7 +266,7 @@ fn clock_and_sqlite_counter_overflow_change_nothing() {
     let before = tx.total_changes();
     assert!(matches!(
         claim_lease(&tx, &who, &new("t", "a", "r2"), 0),
-        Err(StoreError::CounterExhausted)
+        Err(LeaseError::Store(StoreError::CounterExhausted))
     ));
     assert_eq!(tx.total_changes(), before);
 }
@@ -364,4 +364,98 @@ fn serialized_sqlite_claims_have_one_winner_for_task_agent_and_run() {
             }
         }
     }
+}
+
+fn denies(db: &mut Connection, table: &'static str, update: bool, delete: bool, read: bool) {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    db.authorizer(Some(move |context: AuthContext<'_>| match context.action {
+        AuthAction::Read { table_name, .. } if read && table_name == table => Authorization::Deny,
+        AuthAction::Update { table_name, .. } if update && table_name == table => {
+            Authorization::Deny
+        }
+        AuthAction::Delete { table_name } if delete && table_name == table => Authorization::Deny,
+        _ => Authorization::Allow,
+    }))
+    .unwrap();
+}
+
+fn site<'a>(
+    db: &'a mut Connection,
+    (table, update, delete, read): (&'static str, bool, bool, bool),
+) -> Transaction<'a> {
+    denies(db, table, update, delete, read);
+    db.transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap()
+}
+
+fn sql_code(error: LeaseError) -> rusqlite::ffi::ErrorCode {
+    match error {
+        LeaseError::Sql(error) => error
+            .sqlite_error_code()
+            .unwrap_or_else(|| panic!("SQLite error lost its code: {error:?}")),
+        LeaseError::Store(error) => panic!("SQL failure became a typed refusal: {error:?}"),
+        LeaseError::Corrupt(detail) => panic!("SQL failure became a damage report: {detail}"),
+    }
+}
+
+#[test]
+fn sql_failures_keep_their_sqlite_code_at_every_lease_site() {
+    use rusqlite::ffi::ErrorCode::AuthorizationForStatementDenied as Denied;
+    let mut db = db();
+    let who = owner("p");
+    let tx = db
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .unwrap();
+    let lease = grant(&tx, &who, new("t", "a", "r"), 0);
+    tx.commit().unwrap();
+    // Each site is read or written through a transaction that SQLite refuses
+    // part of; the structured code must survive instead of a backend string.
+    let tx = site(&mut db, ("leases", false, false, true));
+    assert_eq!(sql_code(get_lease(&tx, &who, "t").unwrap_err()), Denied);
+    assert_eq!(
+        sql_code(get_agent_lease(&tx, &who, "a").unwrap_err()),
+        Denied
+    );
+    assert_eq!(sql_code(list_leases(&tx, &who).unwrap_err()), Denied);
+    drop(tx);
+    // Pre-savepoint claim read: the task and agent lookups pass, the epoch read fails.
+    let tx = site(&mut db, ("task_epochs", false, false, true));
+    assert_eq!(
+        sql_code(claim_lease(&tx, &who, &new("u", "b", "s"), 0).unwrap_err()),
+        Denied
+    );
+    drop(tx);
+    let tx = site(&mut db, ("daemon_config", false, false, true));
+    assert_eq!(
+        sql_code(claim_lease(&tx, &who, &new("u", "b", "s"), 0).unwrap_err()),
+        Denied
+    );
+    assert_eq!(
+        sql_code(renew_lease(&tx, &who, "t", &lease.lineage, 1, 5).unwrap_err()),
+        Denied
+    );
+    drop(tx);
+    let tx = site(&mut db, ("leases", true, false, false));
+    assert_eq!(
+        sql_code(renew_lease(&tx, &who, "t", &lease.lineage, 1, 5).unwrap_err()),
+        Denied
+    );
+    drop(tx);
+    let tx = site(&mut db, ("leases", false, true, false));
+    assert_eq!(
+        sql_code(release_lease(&tx, &who, "t", &lease.lineage, 1).unwrap_err()),
+        Denied
+    );
+    drop(tx);
+    // Typed refusals stay refusals and the conversion keeps both classes apart.
+    use crate::sqlite::SqliteError;
+    assert!(matches!(
+        SqliteError::from(LeaseError::Store(StoreError::StaleEpoch)),
+        SqliteError::Store(StoreError::StaleEpoch)
+    ));
+    let sql = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(11), None);
+    assert!(matches!(
+        SqliteError::from(LeaseError::Sql(sql)),
+        SqliteError::Sql(error) if error.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::DatabaseCorrupt)
+    ));
 }

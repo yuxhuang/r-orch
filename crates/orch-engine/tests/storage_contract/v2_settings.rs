@@ -43,6 +43,65 @@ async fn refused(
 
 pub async fn settings_and_templates_are_keyed_rows_listed_by_their_exact_key(b: Backend) {
     let s = b.storage.as_ref();
+    // R99: template names are opaque UTF-8 strings. These are T-V4–T-V12,
+    // including every T-V11 variant, plus a storage-only embedded NUL key.
+    // This explicit byte-order oracle is independent of the backend's sort.
+    let exact_keys = [
+        "".to_owned(),            // T-V4
+        "\u{1b}[0m".to_owned(),   // T-V10
+        " sp ace ".to_owned(),    // T-V6
+        ".".to_owned(),           // T-V5
+        "..".to_owned(),          // T-V5
+        "A".to_owned(),           // T-V7
+        "a".to_owned(),           // T-V7
+        "a\0b".to_owned(),        // storage only, no filename analogue
+        "a\nb".to_owned(),        // T-V9
+        "a\\b".to_owned(),        // T-V11e
+        "e\u{301}".to_owned(),    // T-V8, decomposed
+        "x".repeat(252),          // T-V12
+        "\u{7f}".to_owned(),      // T-V11a
+        "\u{85}".to_owned(),      // T-V11b
+        "é".to_owned(),           // T-V8, composed
+        "\u{202e}rtl".to_owned(), // T-V11c
+        "\u{feff}x".to_owned(),   // T-V11d
+    ];
+    // Reverse insertion makes position order disagree with exact key order.
+    for key in exact_keys.iter().rev() {
+        create(s, owner("utf8"), template(key, key)).await;
+    }
+    for key in &exact_keys {
+        assert_eq!(
+            get(s, owner("utf8"), EntityKind::Template, key)
+                .await
+                .unwrap()
+                .entity,
+            template(key, key),
+            "exact template lookup {key:?}"
+        );
+    }
+    let mut cursor = None;
+    // A bounded walk fails on an extra/repeated page instead of looping forever.
+    for (index, key) in exact_keys.iter().enumerate() {
+        let page = list(
+            s,
+            owner("utf8"),
+            &Filter::Templates,
+            &PageRequest {
+                sort: Sort::Id,
+                limit: 1,
+                cursor: cursor.take(),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(ids(&page), [key.as_str()], "template page {index}");
+        if index + 1 == exact_keys.len() {
+            assert_eq!(page.next_cursor, None, "last template page terminates");
+        } else {
+            cursor = Some(page.next_cursor.expect("another exact key remains"));
+        }
+    }
+
     // Written out of order, in pairs that byte order and a case-folding order
     // would split differently: `Run_Cap` and `run_cap` are two rows, and so
     // are `é` and `É`. Only task ids fold (R117).
