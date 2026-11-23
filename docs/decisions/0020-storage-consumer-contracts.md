@@ -70,7 +70,10 @@ reference conformance reconciliation (#196) landed and #130 closed:
    at read time is an error on `read_retry`, `read_due_retries`, `read_retries`, `get_retry`, `due_retries` and
    `list_retries`, never an empty, shortened or partial row. A call fails when a row it would return cannot be
    resolved; a row the call does not select (a future deadline in a due read, or a row past the limit) is not
-   resolved. Nothing truncates, and `Retry::validate` no longer refuses long text (it keeps refusing an empty task,
+   resolved, so a damaged row outside the selection never fails a read that does not return it. The three async
+   snapshot reads of the file reference and the disk-backed fake do that resolution (blob reads of up to 64 MiB an
+   object) on the blocking boundary, on a clone of the snapshot's retry state and never on the executor; a cancelled
+   join is a typed storage error. Nothing truncates, and `Retry::validate` no longer refuses long text (it keeps refusing an empty task,
    attempt 0 and a deadline before the epoch). The
    transaction-local first-wins rule, the due and complete read orders, the 1..=1,000 bounds, the millisecond unit
    and the absence of any cap on rows do not change.
@@ -106,7 +109,8 @@ reference conformance reconciliation (#196) landed and #130 closed:
    - *File reference.* A retry row's `error` in the project's document is one of three shapes, chosen by length: a
      JSON string (inline, at most 65,536 bytes); `{"sha256": H}` (one object, named `H`, which is also its content
      hash); or `{"sha256": H, "chunks": [C1, C2, ...]}` (more than 67,108,864 bytes, `H` the whole-value hash and
-     each `Ci` an object in the project's blob store).
+     each `Ci` an object in the project's blob store). A stored mapping with any other field, single or chunked, fails
+     the load of the document as a parse error and leaves it unchanged.
    - *Memory fake.* `FakeStorage::default()` is the **logical** fake: it keeps the whole string in memory, never
      publishes, and makes no claim about backing, publication order or damaged references. A test that needs those
      builds the **disk-backed** fake with `FakeStorage::with_retry_blob_store(store, hash, chunk_bytes)` (feature
@@ -145,10 +149,16 @@ reference conformance reconciliation (#196) landed and #130 closed:
      (`retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified`), a later chunk failing
      (`retry_later_chunk_failure_keeps_prior_row_and_earlier_published_bytes`), repeated chunks
      (`retry_repeated_chunks_reconstruct_every_occurrence_on_both_references`), published bytes that survive a
-     rollback with no row naming them (`retry_rollback_keeps_published_bytes_without_a_reference_on_both_backed_references`)
-     and a hand-made one-object row read after a reopen
-     (`retry_existing_single_object_encoding_and_wrapper_extensions_remain_readable`). The backing test and the
-     one-object test run the file reference only; the other six each run the file reference and the disk-backed fake;
+     rollback with no row naming them (`retry_rollback_keeps_published_bytes_without_a_reference_on_both_backed_references`),
+     a hand-made one-object row read after a reopen
+     (`retry_existing_single_object_encoding_and_wrapper_extensions_remain_readable`), selection before resolution
+     (`retry_selection_does_not_resolve_excluded_damaged_rows_on_both_references`: a healthy row and a damaged row past
+     the deadline or the limit; due reads at a fixed `now` and at limit 1 succeed on every snapshot and unit-of-work
+     read, the damaged row's point read and the page that reaches it fail, and, on a current-thread runtime, a guard
+     on the blob store fails a snapshot read that touches a blob on the executor thread) and a hand-edited single or
+     chunked mapping with an extra field
+     (`retry_stored_text_unknown_fields_are_refused_for_single_and_chunked_objects`). The backing, one-object and
+     unknown-field tests run the file reference only; the other seven each run the file reference and the disk-backed fake;
    - one private unit test in `orch-core`, `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read`
      (feature `test-support`). The disk-backed fake's chunk mapping is private, so a reordered mapping cannot be made
      through its port; the test swaps two chunks of that mapping and requires `get`, `due` and `page` of its private
@@ -215,7 +225,8 @@ reference conformance reconciliation (#196) landed and #130 closed:
   `state.get`, export) can now fail on one damaged row. Whether recovery then skips,
   repairs or stops is T12's and T13's decision, and it is never silent.
 - T21 can import any 1.0 retry error whole. T12 must call `get_retry` before `put_retry` to keep 1.0's first-wins
-  enqueue, and T14 must keep dispatching in candidate order and not due-row order.
+  enqueue (the shared round-trip scenario models two enqueue calls with that guard and does not test a production
+  caller), and T14 must keep dispatching in candidate order and not due-row order.
 - The chunk path is reference-port behaviour. This decision supplies no measurement above 64 MiB and no runtime
   evidence for any consumer, and it grants no publication or merge authority. The proof it requires is in the
   plan's "T8 consumer contracts (issue 109)".

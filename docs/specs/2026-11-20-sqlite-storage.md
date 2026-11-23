@@ -780,7 +780,9 @@ nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or
   row. Longer text is published to the blob store, synced, before the row naming its hash is committed, and a read
   returns the original text byte for byte. A failed publication, or a missing or corrupt blob when writing, fails the
   write, and the previous row is exactly as it was. A reference that does not resolve on read is an error from every
-  retry read, never an empty, shortened or partial row. Nothing truncates. `Retry::validate` no longer refuses long
+  retry read, never an empty, shortened or partial row. A read resolves only the rows it returns, so a damaged row that a
+  due read's deadline or a page's limit excludes does not fail it, and the file reference and the disk-backed fake
+  run the three async snapshot reads' blob I/O on the blocking boundary, off the executor. Nothing truncates. `Retry::validate` no longer refuses long
   text and keeps its other checks; the first-wins `get_retry` before `put_retry`, the orders, the 1..=1,000 bounds and the
   absence of any cap on rows are unchanged. A capped diagnostic with the full text on the run row would amend R97
   and is the owner's to adopt; this amendment does not.
@@ -811,14 +813,14 @@ nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or
 
   Tests required on both references, with the test that carries each item. The first three rows are scenarios of the
   conformance suite's `retry_suite` (21 scenarios), registered as `memory_retries_v2` (logical fake),
-  `blob_memory_retries_v2` (disk-backed fake) and `file_retries_v2`, so 3 registrations each. The next six rows are in
+  `blob_memory_retries_v2` (disk-backed fake) and `file_retries_v2`, so 3 registrations each. The next ten rows are in
   `storage::v2::tests` of `orch-infra` and run the file reference and the disk-backed fake unless noted. The last row
   is a private unit test of `orch-core`. The logical fake keeps whole strings and has no object to damage, so a row
   that is about publication or damaged references is never carried by it.
 
   | Required | Test |
   |---|---|
-  | Inline at 65,536 bytes and a blob at 65,537; a multibyte text that crosses the 64 KiB line by bytes and not by characters; a round trip with no run (no task or run entity exists); a restore | `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` (conformance, 3 registrations; it also uses the `get_retry`-before-`put_retry` enqueue pattern inside one unit of work) |
+  | Inline at 65,536 bytes and a blob at 65,537; a multibyte text that crosses the 64 KiB line by bytes and not by characters; a round trip with no run (no task or run entity exists); a restore | `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` (conformance, 3 registrations; it models two enqueue calls with a first-wins `get_retry` guard inside one unit of work, and the production caller stays T12's) |
   | A text of 67,108,865 bytes (one above one blob object), stored with no run entity, then a fixture restore to a new lineage (`restore_to_lineage`: it ends leases, switches the lineage and keeps counters; it is not a backup copy); `read_retry`, `read_due_retries` and a complete walk return it whole | `retry_chunked_text_survives_restore_without_a_run` (conformance, 3 registrations; on the logical fake the text is a whole string, so only the two backed registrations exercise chunks) |
   | A rolled-back replacement and a committed one; a held snapshot that keeps the original; then a replacement of the long text by a short one (9 bytes), read by `read_retry`, `read_due_retries` and a complete walk, and of that by a long one (80,000 bytes), read by `read_retry` | `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original` (conformance, 3 registrations) |
   | The file reference's backing: no `blobs` directory for inline text; the complete bytes exist before the row does; the row holds `{"sha256": H}`; reopening returns the whole text on every read | `retry_text_boundary_is_backed_before_the_hash_row_and_reopens_whole` (file reference only) |
@@ -829,6 +831,8 @@ nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or
   | A missing and a corrupt blob after commit each an error on `read_retry`, `read_due_retries`, `read_retries`, `get_retry`, `due_retries` and `list_retries`, with the document unchanged and an absent task still reading as none | `retry_missing_and_corrupt_blobs_fail_all_read_paths_on_both_references` |
   | A rolled-back unit that published a 65,537-byte text: the earlier row stays, the rolled-back task reads as none, and the published bytes are still on disk at their hash path with no row naming them | `retry_rollback_keeps_published_bytes_without_a_reference_on_both_backed_references` |
   | A row that holds the single-object form `{"sha256": H}` (made by hand in the document, from a 65,538-byte text of two-byte characters put in the blob store; no earlier release wrote one) reads whole on all three snapshot reads after a reopen; the document is not rewritten by the reads; an extra field in the document's request-key collection wrapper does not prevent the reopen, and a request key stored before it still replays | `retry_existing_single_object_encoding_and_wrapper_extensions_remain_readable` (file reference only) |
+  | A healthy row and a damaged row (blob removed) whose deadline is later or that sits past the limit: `read_due_retries` at a fixed `now` and at limit 1, `read_retries` for the first page, and `due_retries` and `list_retries` in a unit of work, return the healthy row; `read_retry`/`get_retry` of the damaged row and the page that reaches it fail; on a current-thread runtime a blob store guard fails a snapshot read that touches a blob on the executor thread | `retry_selection_does_not_resolve_excluded_damaged_rows_on_both_references` (both references) |
+  | A hand-edited retry row whose stored text mapping, single (`{"sha256": H, ...}`) or chunked, carries an extra field: the document fails to load as a parse error and its bytes are unchanged | `retry_stored_text_unknown_fields_are_refused_for_single_and_chunked_objects` (file reference only) |
   | The disk-backed fake's private mapping, with two of its three chunks swapped: `get`, `due` and `page` of its private retry state, which every one of the six port reads calls, each fail with "reconstructed retry does not hash". Its blob store is a reversible text-name double (the content names the object), so the test proves the whole-value hash guard and not hashing or damage; the physical checks above use the real `DiskBlobStore` and SHA-256 | `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read` in `orch-core` (requires the `test-support` feature) |
 
   Not covered by any test of this change, and therefore open for the owner of the consumer or for a follow-up: the

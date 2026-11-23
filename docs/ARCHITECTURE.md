@@ -508,7 +508,9 @@ orders by `Run.attempt` descending, then by id. A retry keeps its whole `error` 
 one blob object up to the blob store's 64 MiB object limit, and above that a whole-value hash with an ordered mapping
 to chunk objects. The file reference holds the mapping in the retry row (`{"sha256": ...}`, or with a `chunks` list);
 the memory fake keeps whole strings by default and takes a blob store only for the tests that prove publication and
-damaged references. `main` at `07b5f967`, before this change, refused a retry `error` over 65,536 bytes and had
+damaged references. A retry read resolves only the rows it returns, so a damaged row outside a due read's deadline or a
+page's limit does not fail it; the file reference refuses a stored mapping with an unknown field on load; and the async
+retry reads of both references do their blob I/O on the blocking boundary. `main` at `07b5f967`, before this change, refused a retry `error` over 65,536 bytes and had
 neither variant. These are reference-port contracts; the SQLite mapping, the callers and the import and restore
 paths remain with T10, T12, T21 and T23.
 

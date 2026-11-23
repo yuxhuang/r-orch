@@ -289,7 +289,9 @@ trait RetryWrite: Send {
 
 Retries: one row per task and project, no cap and no drop. A due row has `due_at <= now_ms`. Due and complete reads
 return earliest deadline first, ties by task id compared as UTF-8 bytes; that is a read order and never dispatch
-order. A read that would return a row whose long `error` cannot be resolved fails (below). The complete read follows `next` (exclusive keyset cursor; `Some` exactly when a row follows, so a walk never
+order. A read that would return a row whose long `error` cannot be resolved fails (below); a row it does not select is not
+resolved, and the three async `RetryRead` methods of the file reference and the disk-backed fake read blobs on the
+blocking boundary, not on the executor (behaviour, not a signature). The complete read follows `next` (exclusive keyset cursor; `Some` exactly when a row follows, so a walk never
 ends on an empty page); pages of one snapshot see one committed state, and a unit of work sees its own writes. Put
 replaces, where 1.0's enqueue kept the first row: a consumer that needs first-wins calls `get_retry` first, in the
 same unit of work. An unparsable 1.0 deadline is mapped to due by the importer, not by the port.
@@ -443,7 +445,7 @@ pub enum Sort { /* ..., */ Attempt }                       // serde "attempt"
   (`Retry`, `RetryRead` and `RetryWrite` keep the shape listed above). The reference adapters record it as
   `{sha256, chunks}`: the file reference's retry row holds an inline string, `{"sha256": H}` for one object, or
   `{"sha256": H, "chunks": [...]}` above 67,108,864 bytes (hashes are 64 lower-case hex digits, and chunks are cut at
-  67,108,864 bytes). No public type carries it, so this record has no new type to list; the types that hold it are
+  67,108,864 bytes); a stored mapping with any other field is refused when the document loads. No public type carries it, so this record has no new type to list; the types that hold it are
   private to each adapter, and T10 may choose another encoding that holds the same facts.
 
 ## 3. `orch_core::adapter`
