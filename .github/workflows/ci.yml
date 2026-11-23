@@ -145,9 +145,9 @@ jobs:
     needs: changes
     if: github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all')
     runs-on: ubuntu-latest
-    # Existing provisional ceiling; folded-job headroom is UNMEASURED.
-    # TV51/53 measure duration; <=20-minute PR target still stands. No retry.
-    timeout-minutes: 30
+    # Six Linux main runs peaked at 29m42s (test) and 28m46s (ambient).
+    # The 40-minute ceiling adds headroom; the <=20-minute PR target remains.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -194,7 +194,7 @@ jobs:
   ambient:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     env:
       # concurrent_index reads this from its package cwd, so keep it absolute.
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci-ambient
