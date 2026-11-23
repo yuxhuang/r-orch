@@ -127,8 +127,15 @@ payloads, project-local ids, bounded pending reads, idempotent completion and
 rule. The T8c request-keys slice (a whole-scope key found by identity, project,
 run, epoch and key, `New`/`Replay`/`ReplayWithoutResult`/`Mismatch`, one-hour
 UTC-millisecond expiry, results over 64 KiB not kept, bounded expiry deletion,
-with the same two references) is stacked on the intents slice; attention and the
-retry enumeration are later slices. The v1 runtime stays active.
+with the same two references) is stacked on the intents slice. The attention
+slice is stacked on the request-key slice: fixed typed facts, unique open rows,
+revisioned acknowledgements/resolutions, bounded paging and resolved retention
+share both references and their transactions. Empty daemon scope and nonempty
+project scope remain isolated; consumers read daemon health explicitly in a second
+snapshot. Its shared suite is registered on both references; file tests also cover
+legacy/reopen and scope-invalid loads. SQLite, evaluation/maintenance, authorization
+and CLI remain later tasks. Retry enumeration and final combined acceptance remain
+separate slices. The v1 runtime stays active.
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
 |---|---|---|---|---|---|---|

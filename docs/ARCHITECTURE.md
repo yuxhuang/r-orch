@@ -498,6 +498,15 @@ The remaining operational families, large-text storage in the blob store and SQL
 are subsequent slices. The daemon and all v1 storage traits still use the existing
 file implementation; this additive module changes no runtime storage path.
 
+The inactive `orch_core::store::attention` operational port shares these buffered
+transactions and snapshots in both references. Fixed typed facts control item text;
+open rows are unique by kind/subject, acknowledgement preserves caller identity,
+and explicit resolution and retention preserve revisions and monotonic ids. Pages
+are bounded and ordered by id. Empty-project daemon disk attention is separate
+from nonempty-project dispatch attention; health consumers explicitly read two
+scopes, with two snapshots. The dispatcher owns authorization; no evaluator,
+maintenance timer, SQLite mapping or CLI caller is activated by this port.
+
 The additive `orch_core::store::blob::BlobStore` port is synchronous and names
 bytes by a parsed content hash. Its inactive `orch_infra::blob::DiskBlobStore`
 implementation uses `data_dir::confined::ConfinedDir` for every file operation.

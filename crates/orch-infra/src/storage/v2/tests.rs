@@ -1381,3 +1381,54 @@ async fn retry_operations_that_change_nothing_do_not_rewrite_the_document() {
     .unwrap();
     assert_eq!(inode(&document), before);
 }
+
+#[tokio::test]
+async fn attention_load_checks_the_session_scope_before_any_write() {
+    use orch_core::store::attention::{AttentionFacts, DiskSubject};
+    let root = root();
+    let storage = FileStorage::new(root.path());
+    storage
+        .transaction(owner(""), Lane::Maintenance, |u| {
+            u.open_attention(
+                &AttentionFacts::DiskFloor {
+                    subject: DiskSubject::DataDirectory,
+                    free_bytes: 1,
+                    floor_bytes: 100,
+                },
+                20,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let daemon = storage.project_dir("").join("state.json");
+    let project = storage.project_dir("p");
+    std::fs::create_dir_all(&project).unwrap();
+    let document = project.join("state.json");
+    let bytes = std::fs::read(&daemon).unwrap();
+    std::fs::write(&document, &bytes).unwrap();
+    assert!(matches!(
+        storage.read(owner("p")).await,
+        Err(StoreError::InvalidAttention(_))
+    ));
+    assert!(matches!(
+        storage
+            .transaction(owner("p"), Lane::Entities, |u| {
+                u.create(task("must_not_commit"))?;
+                Ok(())
+            })
+            .await,
+        Err(StoreError::InvalidAttention(_))
+    ));
+    assert_eq!(std::fs::read(&document).unwrap(), bytes);
+    assert!(
+        storage
+            .read(owner(""))
+            .await
+            .unwrap()
+            .read_attention(1)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}

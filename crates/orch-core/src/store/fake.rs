@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use orch_domain::{GoalStatus, TaskStatus};
 use tokio::sync::Mutex as AsyncMutex;
 
+use super::attention::*;
 use super::*;
 
 type Rows = BTreeMap<(EntityKind, String), Record>;
@@ -18,6 +19,7 @@ type Rows = BTreeMap<(EntityKind, String), Record>;
 #[derive(Clone, Default)]
 struct Project {
     rows: Rows,
+    attention: attention::fake::AttentionState,
     events: events::fake::EventState,
     intents: intents::fake::IntentState,
     leases: leases::fake::LeaseState,
@@ -610,5 +612,67 @@ impl retries::RetryWrite for View {
     }
     fn due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<retries::Retry>> {
         self.project.retries.due(now_ms, limit)
+    }
+}
+
+#[async_trait]
+impl AttentionRead for View {
+    async fn read_attention(&self, id: u64) -> Result<Option<Attention>> {
+        Ok(self.project.attention.get(id))
+    }
+    async fn read_attention_page(
+        &self,
+        filter: AttentionFilter,
+        after: Option<&AttentionCursor>,
+        limit: usize,
+    ) -> Result<AttentionPage> {
+        self.project
+            .attention
+            .page(&self.caller.project, filter, after, limit)
+    }
+}
+impl AttentionWrite for View {
+    fn get_attention(&self, id: u64) -> Result<Option<Attention>> {
+        Ok(self.project.attention.get(id))
+    }
+    fn attention_page(
+        &self,
+        filter: AttentionFilter,
+        after: Option<&AttentionCursor>,
+        limit: usize,
+    ) -> Result<AttentionPage> {
+        self.project
+            .attention
+            .page(&self.caller.project, filter, after, limit)
+    }
+    fn open_attention(&mut self, facts: &AttentionFacts, at: i64) -> Result<Attention> {
+        let row = self
+            .project
+            .attention
+            .open(&self.caller.project, facts, at)?;
+        Ok(row)
+    }
+    fn ack_attention(&mut self, id: u64, expected: Revision, at: i64) -> Result<Attention> {
+        let identity = match &self.caller.principal {
+            Principal::Owner { identity }
+            | Principal::Worker { identity }
+            | Principal::Task { identity, .. } => identity,
+        };
+        let row = self.project.attention.ack(id, expected, identity, at)?;
+        Ok(row)
+    }
+    fn resolve_attention(
+        &mut self,
+        id: u64,
+        expected: Revision,
+        reason: ResolutionReason,
+        at: i64,
+    ) -> Result<Attention> {
+        let row = self.project.attention.resolve(id, expected, reason, at)?;
+        Ok(row)
+    }
+    fn expire_attention(&mut self, cutoff: i64, limit: usize) -> Result<usize> {
+        let count = self.project.attention.expire(cutoff, limit)?;
+        Ok(count)
     }
 }
