@@ -76,14 +76,12 @@ pub(in crate::sqlite) fn publish(
     ))
 }
 
-/// Validate structure before opening any object. Lengths from stored rows never
-/// determine an allocation: grow only from objects that the blob adapter verified.
-/// The caller separately verifies the `blobs` rows in the selecting transaction.
-pub(in crate::sqlite) fn reconstruct(
-    store: &DiskBlobStore,
+/// Validate every row without reading an object, so proven metadata damage
+/// cannot be masked by a transient object access error at an earlier locator.
+pub(in crate::sqlite) fn validate_chunks(
     reference: &Reference,
     rows: &[Chunk],
-) -> Result<Vec<u8>> {
+) -> Result<BlobHash> {
     let whole = reference
         .sha256
         .parse::<BlobHash>()
@@ -107,6 +105,18 @@ pub(in crate::sqlite) fn reconstruct(
             .parse::<BlobHash>()
             .map_err(|_| TextError::Corrupt("chunk hash syntax"))?;
     }
+    Ok(whole)
+}
+
+/// Validate structure before opening any object. Lengths from stored rows never
+/// determine an allocation: grow only from objects that the blob adapter verified.
+/// The caller separately verifies the `blobs` rows in the selecting transaction.
+pub(in crate::sqlite) fn reconstruct(
+    store: &DiskBlobStore,
+    reference: &Reference,
+    rows: &[Chunk],
+) -> Result<Vec<u8>> {
+    let whole = validate_chunks(reference, rows)?;
     let mut bytes = Vec::new();
     for row in rows {
         let hash = row

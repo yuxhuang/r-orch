@@ -149,9 +149,10 @@ pub(in crate::sqlite) fn decode(store: &DiskBlobStore, detail: &Detail) -> Resul
     if detail.inline.is_none() {
         used.insert(String::new());
     }
+    let mut tags = Vec::new();
     for locator in slots(&value)? {
         let slot = value
-            .pointer_mut(&locator)
+            .pointer(&locator)
             .ok_or_else(|| invalid("text slot", &locator))?;
         if let Some(text) = slot.as_str() {
             if text.len() > INLINE_TEXT_MAX_BYTES {
@@ -166,24 +167,40 @@ pub(in crate::sqlite) fn decode(store: &DiskBlobStore, detail: &Detail) -> Resul
             }
             let tag: Tag = serde_json::from_value(slot.clone())
                 .map_err(|_| invalid("reference tag", &locator))?;
-            let bytes = reconstruct(
-                store,
+            text::validate_chunks(
                 &tag.reference,
                 detail
                     .refs
                     .get(&locator)
                     .map(Vec::as_slice)
                     .unwrap_or_default(),
-                &locator,
-            )?;
-            *slot = Value::String(
-                String::from_utf8(bytes).map_err(|_| invalid("text UTF-8", &locator))?,
-            );
-            used.insert(locator);
+            )
+            .map_err(|_| invalid("reference metadata", &locator))?;
+            used.insert(locator.clone());
+            tags.push((locator, tag));
         }
     }
     if detail.refs.keys().cloned().collect::<BTreeSet<_>>() != used {
         return Err(invalid("reference locators", ""));
+    }
+    // The root necessarily precedes JSON parsing. All slot metadata and exact
+    // reachability are now proven before opening any slot's object.
+    for (locator, tag) in tags {
+        let bytes = reconstruct(
+            store,
+            &tag.reference,
+            detail
+                .refs
+                .get(&locator)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            &locator,
+        )?;
+        let slot = value
+            .pointer_mut(&locator)
+            .ok_or_else(|| invalid("text slot", &locator))?;
+        *slot =
+            Value::String(String::from_utf8(bytes).map_err(|_| invalid("text UTF-8", &locator))?);
     }
     let task: Task = serde_json::from_value(value).map_err(|_| invalid("typed detail", ""))?;
     validate(&task).map_err(|_| invalid("keys or timestamps", ""))?;
