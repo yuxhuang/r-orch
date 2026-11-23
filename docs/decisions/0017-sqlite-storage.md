@@ -9,6 +9,12 @@
   decision 8 and its consequence that the operation boundary is "not a transaction upgrade"; and the storage
   section of `docs/TRAITS-FROZEN.md` (§2: the ten storage traits and their three rules). Everything else in 0012
   stands: one daemon owns state, no client opens it, nothing starts a daemon on its own, exit 7.
+- Platform scope, 2026-11-23 (the spec's record K): every release from 1.1 through 2.0 is developed, tested and
+  qualified on Linux only, and macOS compatibility follows 2.0 (the [After 2.0](https://github.com/yuxhuang/r-orch/milestone/20) milestone). No decision below
+  changes. A sentence below that names macOS as a place a check still has to run is withdrawn, and one that
+  records what a macOS run measured, or what the product does on macOS, is history and stays. The real-suspend
+  check of decision 16 stays for Linux (an isolated, authorized Linux host; spec R42, issue 110) and is
+  pending.
 - Decisions 1 to 6 and 14 restate decisions the owner already took in the goal and are binding. Decisions 7 to 13
   and 15 to 25 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
   the owner's to rule (the spec's AP13); no record shows that the owner set them.

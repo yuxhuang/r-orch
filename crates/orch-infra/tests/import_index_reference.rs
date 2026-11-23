@@ -872,3 +872,253 @@ async fn a_changed_payload_or_membership_is_caught() {
         }
     }
 }
+
+// X-V5 / F19: use each real directory's entity type, rather than the one-field
+// test type in import::tests::compatibility. These are legacy reference checks;
+// the integrated importer's identical refusal of both inputs remains with T21.
+mod typed_duplicates {
+    use super::*;
+    use orch_core::storage::{ContextEntry, ContextStore};
+    use orch_core::test_support::FixedClock;
+    use orch_domain::{Agent, Goal, Message, Task};
+    use orch_infra::storage::index::ItemFormat;
+    use orch_infra::storage::{FileContextStore, IndexManager};
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+    use serde_json::{Value, json};
+    use std::sync::Arc;
+
+    const TIME: &str = "2026-01-01T00:00:00.000Z";
+
+    // Construct and serialize real entities: no simplified stand-in type can
+    // accidentally accept an identity-only object as a complete legacy entry.
+    fn entity<T: DeserializeOwned + Serialize>(directory: &str, identity: &str) -> Value {
+        let value = match directory {
+            "tasks" => json!({
+                "id": identity, "title": identity, "description": "synthetic task",
+                "status": "todo", "priority": 2, "created_at": TIME,
+                "updated_at": TIME, "attempts": 0, "max_attempts": 3
+            }),
+            "agents" => json!({
+                "id": identity, "name": identity, "adapter": "shell", "config": {},
+                "status": "idle", "stats": {"tasks_completed": 0, "tasks_failed": 0,
+                    "total_runs": 0, "total_runtime_ms": 0}
+            }),
+            "goals" => json!({
+                "id": identity, "title": identity, "description": "synthetic goal",
+                "status": "active", "created_at": TIME, "updated_at": TIME
+            }),
+            "messages" => json!({
+                "id": identity, "channel": "broadcast", "from_agent_id": "cli",
+                "to_agent_id": null, "subject": identity, "body": "synthetic message",
+                "created_at": TIME, "status": "pending"
+            }),
+            "context" => json!({
+                "key": identity, "value": identity, "created_at": TIME, "updated_at": TIME
+            }),
+            _ => panic!("not an indexed legacy directory: {directory}"),
+        };
+        serde_json::to_value(serde_json::from_value::<T>(value).unwrap()).unwrap()
+    }
+
+    async fn check<T>(directory: &str, format: ItemFormat, complete: bool)
+    where
+        T: DeserializeOwned + Serialize + Send + Sync,
+    {
+        let source = tempfile::tempdir().unwrap();
+        assert_hermetic(source.path());
+        let relative = format!(".orchestry/{directory}");
+        let dir = source.path().join(&relative);
+        std::fs::create_dir_all(&dir).unwrap();
+        let files: Vec<Value> = ["a", "b", "c"]
+            .into_iter()
+            .map(|id| entity::<T>(directory, id))
+            .collect();
+        for (id, value) in ["a", "b", "c"].into_iter().zip(&files) {
+            let (extension, bytes) = match format {
+                ItemFormat::Yaml => ("yml", serde_yaml_ng::to_string(value).unwrap()),
+                ItemFormat::Json => ("json", serde_json::to_string(value).unwrap()),
+            };
+            std::fs::write(dir.join(format!("{id}.{extension}")), bytes).unwrap();
+        }
+        let identity = if directory == "context" { "key" } else { "id" };
+        let input = if complete {
+            // Deliberately non-id order, with a real unlisted file a. Neither
+            // sorting, deduplication nor rebuilding may pass this assertion.
+            json!([files[2], files[1], files[1]])
+        } else {
+            json!([{identity: "b"}, {identity: "b"}])
+        };
+        let bytes = serde_json::to_vec(&input).unwrap();
+        std::fs::write(dir.join("_index.json"), &bytes).unwrap();
+        let before = snapshot(source.path());
+        let copy = tempfile::tempdir().unwrap();
+        assert_hermetic(copy.path());
+        copy_tree(source.path(), copy.path());
+        let manager = IndexManager::<T>::new(copy.path().join(&relative), format);
+        let read = serde_json::to_value(manager.read_index().await.unwrap()).unwrap();
+        let published = std::fs::read(manager.index_path()).unwrap();
+        if complete {
+            assert_eq!(
+                read, input,
+                "{directory}: preserve physical duplicate order"
+            );
+            assert_eq!(
+                published, bytes,
+                "{directory}: do not rewrite a typed index"
+            );
+            assert_eq!(snapshot(copy.path()), before);
+        } else {
+            // Rebuild enumeration order is unspecified. Assert exact typed
+            // membership, including the two files hidden by the damaged index.
+            let mut rebuilt: Vec<Value> = serde_json::from_value(read).unwrap();
+            rebuilt.sort_by(|a, b| a[identity].as_str().cmp(&b[identity].as_str()));
+            assert_eq!(rebuilt, files, "{directory}: rebuild all entity files once");
+            assert_ne!(published, bytes, "{directory}: publish the rebuilt index");
+            let mut cached: Vec<Value> = serde_json::from_slice(&published).unwrap();
+            cached.sort_by(|a, b| a[identity].as_str().cmp(&b[identity].as_str()));
+            assert_eq!(cached, files, "{directory}: persist the complete rebuild");
+            let after = snapshot(copy.path());
+            for (name, value) in &before {
+                if name != &format!("{relative}/_index.json") {
+                    assert_eq!(after.get(name), Some(value), "entity bytes changed: {name}");
+                }
+            }
+        }
+        assert_eq!(
+            snapshot(source.path()),
+            before,
+            "read only the disposable copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn tasks_identity_only_duplicates_rebuild_all_files() {
+        check::<Task>("tasks", ItemFormat::Yaml, false).await;
+    }
+
+    #[tokio::test]
+    async fn tasks_complete_duplicates_keep_physical_order_and_hide_unlisted_files() {
+        check::<Task>("tasks", ItemFormat::Yaml, true).await;
+    }
+
+    #[tokio::test]
+    async fn agents_identity_only_duplicates_rebuild_all_files() {
+        check::<Agent>("agents", ItemFormat::Yaml, false).await;
+    }
+
+    #[tokio::test]
+    async fn agents_complete_duplicates_keep_physical_order_and_hide_unlisted_files() {
+        check::<Agent>("agents", ItemFormat::Yaml, true).await;
+    }
+
+    #[tokio::test]
+    async fn goals_identity_only_duplicates_rebuild_all_files() {
+        check::<Goal>("goals", ItemFormat::Yaml, false).await;
+    }
+
+    #[tokio::test]
+    async fn goals_complete_duplicates_keep_physical_order_and_hide_unlisted_files() {
+        check::<Goal>("goals", ItemFormat::Yaml, true).await;
+    }
+
+    #[tokio::test]
+    async fn messages_identity_only_duplicates_rebuild_all_files() {
+        check::<Message>("messages", ItemFormat::Json, false).await;
+    }
+
+    #[tokio::test]
+    async fn messages_complete_duplicates_keep_physical_order_and_hide_unlisted_files() {
+        check::<Message>("messages", ItemFormat::Json, true).await;
+    }
+
+    #[tokio::test]
+    async fn context_identity_only_duplicates_rebuild_all_files() {
+        check::<ContextEntry>("context", ItemFormat::Json, false).await;
+    }
+
+    #[tokio::test]
+    async fn context_complete_duplicates_keep_physical_order_and_hide_unlisted_files() {
+        check::<ContextEntry>("context", ItemFormat::Json, true).await;
+    }
+
+    #[tokio::test]
+    async fn context_list_rebuilds_in_memory_and_startup_publishes_the_rebuild() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_hermetic(temp.path());
+        let dir = temp.path().join(".orchestry/context");
+        std::fs::create_dir_all(&dir).unwrap();
+        for key in ["c", "a", "b"] {
+            let entry = entity::<ContextEntry>("context", key);
+            std::fs::write(
+                dir.join(format!("{key}.json")),
+                serde_json::to_vec(&entry).unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("_index.json"), br#"[{"key":"b"},{"key":"b"}]"#).unwrap();
+        let before = snapshot(temp.path());
+        let store = FileContextStore::new(Paths::new(temp.path()), Arc::new(FixedClock::new()));
+        let listed = store.list().await.unwrap();
+        let keys: Vec<_> = listed.iter().map(|entry| entry.key.as_str()).collect();
+        assert_eq!(keys, ["a", "b", "c"]);
+        assert_eq!(
+            snapshot(temp.path()),
+            before,
+            "list rebuild must not publish"
+        );
+        store.ensure_index().await.unwrap();
+        let published: Vec<ContextEntry> =
+            serde_json::from_slice(&std::fs::read(dir.join("_index.json")).unwrap()).unwrap();
+        let mut keys: Vec<_> = published.iter().map(|entry| entry.key.as_str()).collect();
+        keys.sort();
+        assert_eq!(keys, ["a", "b", "c"], "startup publishes all files once");
+        let after = snapshot(temp.path());
+        for (path, bytes) in before
+            .iter()
+            .filter(|(path, _)| !path.ends_with("_index.json"))
+        {
+            assert_eq!(
+                after.get(path),
+                Some(bytes),
+                "startup changed entity {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn context_list_keeps_duplicate_keys_and_projection_uses_last_value_without_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        assert_hermetic(temp.path());
+        let dir = temp.path().join(".orchestry/context");
+        std::fs::create_dir_all(&dir).unwrap();
+        let b = entity::<ContextEntry>("context", "b");
+        let mut last_b = b.clone();
+        last_b["value"] = json!("last b");
+        let input = json!([entity::<ContextEntry>("context", "c"), b, last_b]);
+        std::fs::write(dir.join("_index.json"), serde_json::to_vec(&input).unwrap()).unwrap();
+        let before = snapshot(temp.path());
+        let store = FileContextStore::new(Paths::new(temp.path()), Arc::new(FixedClock::new()));
+        let listed: Vec<_> = store
+            .list()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.key, e.value))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                ("b".into(), "b".into()),
+                ("b".into(), "last b".into()),
+                ("c".into(), "c".into())
+            ]
+        );
+        let projected: Vec<_> = store.get_all().await.unwrap().into_iter().collect();
+        assert_eq!(
+            projected,
+            [("b".into(), "last b".into()), ("c".into(), "c".into())]
+        );
+        assert_eq!(snapshot(temp.path()), before);
+    }
+}

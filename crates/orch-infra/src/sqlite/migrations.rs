@@ -37,17 +37,20 @@ fn capacity_bytes(blocks: impl Into<u64>, block: u64) -> u64 {
 }
 
 pub fn migrate(data: &DataDir, conn: &mut ConnectionHandle<'_>) -> Result<()> {
+    conn.ensure_directory(data)?;
     apply_migrations(data, conn, &[INITIAL_SCHEMA], DiskSpace::read(data)?)
 }
 
 /// A migration set is trusted SQL shipped with the binary, never request input.
 /// Disk space is supplied by the startup probe; tests use synthetic capacity.
+/// The directory must be the same guard used to open the connection.
 pub fn apply_migrations(
     data: &DataDir,
     conn: &mut ConnectionHandle<'_>,
     steps: &[&str],
     space: DiskSpace,
 ) -> Result<()> {
+    conn.ensure_directory(data)?;
     let conn = conn.for_migration();
     let version = conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))? as usize;
     if version > steps.len() {
