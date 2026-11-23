@@ -12,11 +12,11 @@ on:
   schedule:
     - cron: '17 6 * * 1'
 
-# One run per ref. A newer PR push makes the older run irrelevant; on main a
-# push and the weekly schedule share the ref, so there we let both finish.
+# Group by event and ref so weekly runs stay independent of main pushes.
+# Newer PR and main pushes cancel superseded runs; weekly runs finish.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 permissions:
   contents: read
