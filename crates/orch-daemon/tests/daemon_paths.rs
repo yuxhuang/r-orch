@@ -12,6 +12,7 @@ use orch_daemon::{DaemonError, select_project_root};
 use orch_proto::{BINARY_VERSION, LOCAL_PROTOCOL};
 use serde_json::json;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use support::{Raw, hello, ok, project_id};
 
@@ -19,7 +20,10 @@ use support::{Raw, hello, ok, project_id};
 fn project() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    std::fs::create_dir(root.join(".orchestry")).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.join(".orchestry"))
+        .unwrap();
     (dir, root)
 }
 
@@ -125,7 +129,10 @@ async fn a_non_utf8_root_is_selected_served_and_echoed_losslessly() {
         );
         return;
     }
-    std::fs::create_dir(odd.join(".orchestry")).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(odd.join(".orchestry"))
+        .unwrap();
     assert_eq!(select_project_root(Some(&odd), &odd).unwrap(), odd);
 
     let daemon = DaemonHarness::builder().start_in(&odd).await.unwrap();
