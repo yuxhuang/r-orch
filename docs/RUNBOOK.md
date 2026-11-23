@@ -1734,9 +1734,12 @@ Verifier zero can describe a failed or interrupted suite: preserve the original
 producer command/job failure. Only this verified redacted export is uploaded.
 Missing final receipt/inventory fails retention acceptance; bounded static phase
 progress after timeout/cancel/runner loss cannot replace it. No arbitrary loss
-can guarantee log delivery. The existing 30-minute job ceiling is provisional,
-with unmeasured headroom; the <=20-minute PR target remains. Record real durations
-in TV51/53 before proposing changes. Do not rerun failures away.
+can guarantee log delivery. The test and ambient jobs have a 40-minute ceiling.
+A six-run Linux main sample peaked at 29m42s for test and 28m46s for ambient,
+leaving only 18s and 74s under the previous 30-minute ceiling. This bounded
+sample motivates the added headroom; it does not establish the <=20-minute PR
+performance target. Continue recording real durations in TV51/53.
+Do not rerun failures away.
 
 PR code executes static plus one suite; docs-only executes build/static without
 tests. Main forces all and retains a separate unwrapped ordinary ambient suite.

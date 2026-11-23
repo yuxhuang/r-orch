@@ -314,6 +314,137 @@ mod tests {
         assert!(table.validate("p1").is_err());
     }
 
+    #[tokio::test]
+    async fn reopen_preserves_typed_scopes_and_numeric_history() {
+        let root = tempfile::tempdir().unwrap();
+        orch_core::test_support::assert_hermetic(root.path());
+        let storage = FileStorage::new(root.path());
+        let history = storage
+            .transaction(caller(), Lane::Maintenance, |u| {
+                let mut rows = Vec::new();
+                for id in 1..=11 {
+                    let row = u.open_attention(&facts(), 20)?;
+                    assert_eq!(row.id, id);
+                    let row = u.ack_attention(id, row.revision, 30)?;
+                    rows.push(u.resolve_attention(
+                        id,
+                        row.revision,
+                        ResolutionReason::DispatchEnabled,
+                        40,
+                    )?);
+                }
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        let daemon = Caller {
+            project: String::new(),
+            ..caller()
+        };
+        let disks = storage
+            .transaction(daemon.clone(), Lane::Maintenance, |u| {
+                let mut rows = Vec::new();
+                for subject in [
+                    DiskSubject::DataDirectory,
+                    DiskSubject::ProjectWorkspaces {
+                        project: "p1".into(),
+                    },
+                ] {
+                    rows.push(u.open_attention(
+                        &AttentionFacts::DiskFloor {
+                            subject,
+                            free_bytes: 1,
+                            floor_bytes: i64::MAX as u64,
+                        },
+                        20,
+                    )?);
+                }
+                Ok(rows)
+            })
+            .await
+            .unwrap();
+        drop(storage);
+        let storage = FileStorage::new(root.path());
+        let snap = storage.read(caller()).await.unwrap();
+        let mut cursor = None;
+        let mut loaded = Vec::new();
+        loop {
+            let p = snap
+                .read_attention_page(AttentionFilter::All, cursor.as_ref(), 3)
+                .await
+                .unwrap();
+            loaded.extend(p.items);
+            cursor = p.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(loaded, history);
+        let global = storage.read(daemon).await.unwrap();
+        assert_eq!(
+            global
+                .read_attention_page(AttentionFilter::All, None, 3)
+                .await
+                .unwrap()
+                .items,
+            disks
+        );
+        assert!(
+            storage
+                .read(Caller {
+                    project: "p2".into(),
+                    ..caller()
+                })
+                .await
+                .unwrap()
+                .read_attention(1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        storage
+            .transaction(caller(), Lane::Maintenance, |u| {
+                assert_eq!(u.expire_attention(40, 3)?, 0);
+                for first in [1, 4, 7, 10] {
+                    assert_eq!(u.expire_attention(41, 3)?, if first == 10 { 2 } else { 3 });
+                    for id in first..=(first + 2).min(11) {
+                        assert!(u.get_attention(id)?.is_none());
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(storage);
+        let storage = FileStorage::new(root.path());
+        storage
+            .transaction(caller(), Lane::Maintenance, |u| {
+                assert_eq!(u.open_attention(&facts(), 50)?.id, 12);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            snap.read_attention(11).await.unwrap(),
+            Some(history[10].clone())
+        );
+    }
+
+    #[test]
+    fn duplicate_persisted_open_subjects_are_refused() {
+        let mut table = AttentionRows::default();
+        let row = table.open("p1", &facts(), 20).unwrap();
+        let mut second = row;
+        second.id = 2;
+        table.rows.insert(2, second);
+        table.issued = 2;
+        let bytes = serde_json::to_vec(&table).unwrap();
+        let loaded: AttentionRows = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            matches!(loaded.validate("p1"), Err(StoreError::InvalidAttention(message)) if message == "duplicate open subject")
+        );
+    }
+
     #[test]
     fn allocation_and_revision_overflow_leave_the_table_unchanged() {
         let mut table = AttentionRows {

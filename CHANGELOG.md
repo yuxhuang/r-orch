@@ -1,7 +1,7 @@
 # Changelog
 
 All notable user-visible changes. Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning:
-[SemVer](https://semver.org/spec/v2.0.0.html). Add entries under `[Unreleased]` in the PR that makes the change.
+[SemVer](https://semver.org/spec/v2.0.0.html). Write entries as fragments in `docs/changelog/unreleased/` (see AGENTS.md); assemble them with `cargo xtask changelog assemble` at release.
 
 ## [Unreleased]
 
@@ -15,6 +15,8 @@ All notable user-visible changes. Format: [Keep a Changelog](https://keepachange
 - Retain Pi message-end and turn-end usage records as nonterminal metadata when output ends before the final completion.
 
 - Add the inactive attention port with fixed daemon facts, revisioned acknowledgements and resolution, bounded paging and retention, and isolated memory/file references; runtime evaluation and commands remain unwired.
+
+- Add the inactive SQLite attention mapping: typed facts in numbered migration 2 and numeric ID order for pages and expiry; the running daemon still uses file storage.
 
 - Add an inactive SQLite task paging query with bounded pages and project-bound continuations; the running daemon still uses file storage.
 

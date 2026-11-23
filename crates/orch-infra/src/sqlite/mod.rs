@@ -42,6 +42,8 @@ pub enum SqliteError {
     EventCorrupt(String),
     #[error("stored intent is damaged: {0}")]
     IntentCorrupt(&'static str),
+    #[error("stored lease data is damaged: {0}")]
+    LeaseCorrupt(String),
     #[error("SQLite writer is closed")]
     WriterClosed,
     #[error("SQLite connection and queue capacities must be greater than zero")]
@@ -116,6 +118,12 @@ mod leases;
     reason = "Internal task paging awaits T10 hydration and public cursor integration"
 )]
 mod task_page;
+
+#[allow(
+    dead_code,
+    reason = "internal attention mapping awaits T10 Storage composition"
+)]
+mod attention;
 
 #[allow(
     dead_code,

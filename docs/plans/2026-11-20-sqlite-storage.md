@@ -240,6 +240,24 @@ acceptance still requires the accepted operational integration and issue 109's
 consumer dispositions. macOS is tracked in After 2.0 under the owner's Linux-only
 direction through 2.0.
 
+### Reference order
+
+The default orders of runs and goals are settled in the spec's "Run and goal default order": a run list whose filter
+names a task (alone or beside an agent) is ordered by numeric `attempt` descending, every other run list by `started_at`
+text descending, then the id; a goal list by status rank, presence of `updated_at` (a present empty text before an
+absent one), the original `updated_at` text descending, `position`, then the id.
+
+The change that makes the memory and file references meet them and strengthens the shared scenarios is its own small PR,
+reviewed and qualified on its own. It lands in the same train as this paragraph. This plan records the contract; whether
+a reference meets it is shown by that PR's exact-head hosted Linux check and test, not by this text.
+
+The two shared scenarios are `message_and_run_filters_stay_within_their_family` and
+`declared_secondary_sorts_use_values_then_tie_breakers`, in
+`crates/orch-engine/tests/storage_contract/v2_paging.rs`. Each is registered under `memory_v2`, `queued_memory_v2`
+and `file_v2` and is run by the crosswalk's rule (list, then run with
+`cargo test -p orch-engine --test storage_conformance -- <filter>`, three passing registrations each). T10 registers
+both on SQLite only after that PR has landed, and updates the expected registrations then.
+
 ### Switch, removal, proof
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
@@ -963,3 +981,15 @@ T8 reference acceptance is separate from runtime acceptance: T12 owns Linux
 restart/recovery and lease-bound finish, T13 owns Linux sleep/wake fencing and
 second-host peer verification, and T23 owns durable restore including a new lineage.
 macOS compatibility is deferred to After 2.0 and is not a release gate.
+
+### T10 attention mapping (#183)
+
+Implement the spec's migration-2 facts JSON and numeric TEXT-ID queries as an
+internal SQLite module; T10 composes it once into Storage. Verify reopen of both
+kinds and disk subjects, scope isolation, bounded pages and strict expiry across
+9/10/11. References retain the same scenarios. I2/N1/N2 reference coverage and
+N3/N4 consumer follow-ups remain separately accountable under issue 183.
+Reference no-op writes are tracked in [#204](https://github.com/yuxhuang/r-orch/issues/204);
+T19 observation wording in [#205](https://github.com/yuxhuang/r-orch/issues/205);
+T15/T19 clock handling in [#206](https://github.com/yuxhuang/r-orch/issues/206).
+[ADR 0019](../decisions/0019-sqlite-storage-attention.md) records the mapping.

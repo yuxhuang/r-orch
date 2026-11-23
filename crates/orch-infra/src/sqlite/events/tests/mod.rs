@@ -864,3 +864,4 @@ fn a_large_batch_is_stored_whole_and_read_back_in_bounded_pages() {
 }
 
 mod adapter;
+mod async_waits;
