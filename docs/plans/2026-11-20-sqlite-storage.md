@@ -183,6 +183,54 @@ external rows need the new reference reader. This reference-only encoding does
 not migrate production files. R97's SQLite blob integration remains with its
 adapter; the shared round trip alone does not prove that backing.
 
+### T8 reference verification crosswalk (issue 130)
+
+Run each bare filter in R8–R15 with
+`cargo test -p orch-engine --test storage_conformance -- <filter>`.
+First list it with the same command plus `--list`: require the named scenario
+under every expected registration below, then run it and require that many
+passing tests, zero failed and zero ignored. Cargo exits successfully for zero
+matches; that is a failed verification. `--exact` requires the full listed test
+name, for example `file_leases_v2::one_of_many_concurrent_claims_wins`, and must
+execute exactly one test. Do not prefix a filter with `storage_conformance::`.
+
+| Requirements | Bare filters | Expected registrations per filter |
+|---|---|---|
+| R8, R11 | `revisions_and_positions_for_every_entity_family`, `stale_revision_is_refused_and_changes_nothing`, `deletion_never_reuses_a_position` | 3: `memory_v2`, `queued_memory_v2`, `file_v2` |
+| R9 | `page_bounds_defaults_and_optional_count` | Same 3 entity references |
+| R10 | `cursor_walk_is_stable_under_inserts_and_deletes`, `cursor_is_bound_to_project_filter_and_sort` | Same 3 entity references |
+| R12 | `one_of_many_concurrent_claims_wins`, `an_agent_holds_at_most_one_active_lease` | 2: `memory_leases_v2`, `file_leases_v2` |
+| R13 renew/release | `epochs_only_grow`, `a_stale_epoch_is_refused`, `release_ends_the_lease_and_keeps_the_epoch_counter` | Same 2 lease references |
+| R13 append, R14 | `stale_lineage_epoch_missing_lease_and_task_mismatch_change_nothing`, `duplicate_counts_first_bytes_and_range_tail_order`, `transaction_error_rolls_back_append_gap_prune_and_entities` | 2: `memory_events_v2`, `file_events_v2` |
+| R15 | `caller_selects_the_project_and_keeps_the_principal`, `settings_and_templates_belong_to_their_project` | Same 3 entity references |
+| R97 whole text | `text_over_64_kib_round_trips_through_the_blob_store` | Same 3 entity references; this alone cannot observe blob backing |
+
+PR142's file-specific R97 proof is the same-named test in
+`cargo test -p orch-infra --lib -- storage::v2::tests::` (one match for its full
+name), plus `inline_threshold_counts_utf8_bytes_and_preserves_empty_values`.
+It asserts a null persisted text slot, the SHA-256 in its reference, actual disk
+blob bytes, and whole values after reopening by get and list. The threshold is
+65,536 UTF-8 bytes, not characters. The reference follow-up tests pin empty
+references, absent/invalid pointers, non-null targets, correctly hashed non-UTF-8
+bytes, invalid hydrated records, RFC6901 key escaping and array indexes above
+zero. Corrupt JSON must retain `Error::Serde`, the document path and its cause;
+semantic row corruption must retain the named diagnostic. The untagged inline
+record decoder currently reports a variant mismatch rather than field detail;
+this test records that limitation without changing the reference format.
+
+These are reference checks on Linux, not acceptance of the SQLite backend.
+T10 must register the shared entity, event and lease suites on SQLite and assert
+actual SQLite row hashes plus disk bytes for R97. Separate SQLite unit scenarios
+are useful but do not replace those registrations. T12 owns stale-epoch finish
+and runtime restart/renewal proof; T16 consumes SQLite event conformance. T21 owns
+R97 import backing (the proposed import test does not exist yet). T27 records
+those actual named checks and rejects empty or ignored selections. T25 retains
+the file reference as a dev-only dependency. The frozen-trait and sort decisions
+remain with issue 109; none is changed by this name reconciliation. Full T8
+acceptance still requires the accepted operational integration and issue 109's
+consumer dispositions. macOS is tracked in After 2.0 under the owner's Linux-only
+direction through 2.0.
+
 ### Switch, removal, proof
 
 | Id | Task | Covers | Scope (paths) | Depends on | Verify | PR |
