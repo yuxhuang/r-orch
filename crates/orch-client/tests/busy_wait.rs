@@ -9,6 +9,7 @@ use orch_proto::handshake::{
 };
 use orch_proto::ndjson::{FrameReader, write_frame};
 use std::fs;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,11 +47,11 @@ struct FakeDaemon {
 impl FakeDaemon {
     /// Connection `n` gets `script(n)` (0-based).
     fn start(script: impl Fn(usize) -> Answer + Send + 'static) -> Self {
-        let dir = tempfile::Builder::new()
-            .prefix("cb-")
-            .tempdir_in("/tmp")
+        let dir = tempfile::Builder::new().prefix("cb-").tempdir().unwrap();
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(dir.path().join(".orchestry"))
             .unwrap();
-        fs::create_dir(dir.path().join(".orchestry")).unwrap();
         let socket = dir.path().join("s");
         let listener = UnixListener::bind(&socket).unwrap();
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
@@ -272,11 +273,11 @@ async fn a_hung_daemon_times_out_once_within_the_handshake_deadline() {
 
 #[tokio::test]
 async fn an_absent_daemon_still_fails_at_once() {
-    let dir = tempfile::Builder::new()
-        .prefix("cb-")
-        .tempdir_in("/tmp")
+    let dir = tempfile::Builder::new().prefix("cb-").tempdir().unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.path().join(".orchestry"))
         .unwrap();
-    fs::create_dir(dir.path().join(".orchestry")).unwrap();
     let missing = dir.path().join("s");
     let (result, elapsed) = timed_connect(&config(dir.path(), Some(missing.clone()))).await;
     let error = result.err().expect("no socket must fail");

@@ -7,11 +7,15 @@ use orch_proto::handshake::{
 use orch_proto::ndjson::{FrameReader, write_frame};
 use orch_proto::path::WirePath;
 use std::fs;
+use std::os::unix::fs::DirBuilderExt;
 use tokio::io::{AsyncWriteExt, BufReader};
 
 fn project() -> (tempfile::TempDir, Project) {
     let dir = tempfile::tempdir().unwrap();
-    fs::create_dir(dir.path().join(".orchestry")).unwrap();
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.path().join(".orchestry"))
+        .unwrap();
     let p = Project::discover(dir.path(), None).unwrap();
     (dir, p)
 }
