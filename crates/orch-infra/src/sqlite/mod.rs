@@ -94,3 +94,9 @@ mod goal_adapter;
     reason = "Internal lease adapter awaits T10 Storage integration; issue 127 holds production wiring"
 )]
 mod leases;
+
+#[allow(
+    dead_code,
+    reason = "Internal task paging awaits T10 hydration and public cursor integration"
+)]
+mod task_page;
