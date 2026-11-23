@@ -578,6 +578,18 @@ mod tests {
         })
         .await
         .expect("listener status published");
+        // The immediate startup orphan sweep also writes _controllers.json
+        // and publishes Remote. Join that phase before checking its delivery;
+        // observing the file alone can precede the after-release publication.
+        let controllers = engine.paths.remotes_dir().join("_controllers.json");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !tokio::fs::try_exists(&controllers).await.unwrap() {
+                tokio::task::yield_now().await;
+            }
+            boundary.run(false, async {}).await;
+        })
+        .await
+        .expect("startup orphan sweep committed");
         let socket = tokio::net::TcpStream::connect(&addr).await.unwrap();
         // The listener publication itself is a real peer persistence phase.
         let event = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -592,24 +604,34 @@ mod tests {
         })
         .await
         .expect("remote invalidation");
-        assert_eq!((event.subscription, event.seq), (1, 1));
-        let EventBody::Change {
-            store: Store::Remote,
-            id: None,
-            kind: ChangeKind::Updated,
-            commit_seq,
-        } = event.body
-        else {
-            panic!("expected remote store-wide change, got {:?}", event.body);
-        };
-        assert!(commit_seq > baseline);
-        assert!(lock(&records).iter().any(|r| r.commit_seq == commit_seq
-            && r.source == CommitSource::Peer
-            && !r.store_set_uncertain));
-        assert!(
-            output.pop().is_none(),
-            "tasks-only subscriber gets no remote event"
-        );
+        let mut events = vec![event];
+        while let Some(frame) = output.pop() {
+            events.push(
+                serde_json::from_slice::<EventFrame>(&frame.bytes)
+                    .unwrap()
+                    .ev,
+            );
+        }
+        for (index, event) in events.into_iter().enumerate() {
+            assert_eq!(
+                (event.subscription, event.seq),
+                (1, index as u64 + 1),
+                "only the Remote subscriber receives contiguous startup events"
+            );
+            let EventBody::Change {
+                store: Store::Remote,
+                id: None,
+                kind: ChangeKind::Updated,
+                commit_seq,
+            } = event.body
+            else {
+                panic!("expected remote store-wide change, got {:?}", event.body);
+            };
+            assert!(commit_seq > baseline);
+            assert!(lock(&records).iter().any(|r| r.commit_seq == commit_seq
+                && r.source == CommitSource::Peer
+                && !r.store_set_uncertain));
+        }
         // Measure the unchanged idle worker cadence (fixture ruling section 26).
         use orch_peer::codec::{read_frame, write_frame};
         use orch_peer::protocol::{Frame, PROTOCOL};

@@ -704,6 +704,28 @@ after `BEGIN IMMEDIATE` and writer tests that fail in bounded time. Both are pen
 R128, in which a request answered `overloaded` cannot commit later, is still owed at the adapter integration. The
 daemon is wired to this executor only after all of these exist.
 
+### Goal boundary slice and remaining allocation consumers
+
+The inactive goal adapter checks both timestamp fields against the staged canonical range in the
+spec's "Staged SQLite goal timestamp and position limits" section. Its entity allocator checks the
+project-local `position:goal` counter on create and move, preserves it on delete, and refuses missing,
+negative or behind counters. Focused tests cover bootstrap, caught refusals, nonpositive surviving
+positions during create/move, signed exhaustion, reopen and deleted highest positions. This does not
+complete the public adapter or conformance; the daemon still uses file storage.
+
+Remaining consumer obligations, before activation:
+
+- T21 initializes each imported ordered family's high-water mark transactionally and preserves larger
+  durable marks. Import/export must carry marks for emptied families: `MAX(position)` loses deleted
+  issued positions and is not counter recovery. Export integration remains with T23.
+- T22 verification checks positive row positions, nonnegative family counters, counter presence for
+  nonempty families, and every surviving position against its matching counter.
+- T10 agrees on exact family namespaces and integrates task, agent, message and other entity families.
+  This patch validates goal allocation only. Lease epochs retain T12/T13/T23 ownership and event
+  sequences retain their separate adapter checks.
+
+These consumer obligations are pending, not delivered by the goal boundary slice.
+
 ## Status
 
 | Item | State (implemented / verified on <platform> / pending) |
