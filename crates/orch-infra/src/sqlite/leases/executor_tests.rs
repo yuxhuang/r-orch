@@ -6,7 +6,7 @@ use orch_core::Clock;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use std::time::{Duration, Instant};
 
-struct ClockAt(i64);
+pub(super) struct ClockAt(pub(super) i64);
 impl Clock for ClockAt {
     fn now_ms(&self) -> i64 {
         self.0
@@ -15,11 +15,17 @@ impl Clock for ClockAt {
         orch_core::clock::iso_from_epoch_ms(self.0)
     }
 }
-fn deadline() -> Instant {
+pub(super) fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(5)
 }
 
-fn executor(test: impl FnOnce(&WriterHandle, &ReadPool<'_>)) {
+pub(super) fn executor(test: impl FnOnce(&WriterHandle, &ReadPool<'_>)) {
+    executor_with_data(|writer, readers, _| test(writer, readers));
+}
+
+pub(super) fn executor_with_data(
+    test: impl FnOnce(&WriterHandle, &ReadPool<'_>, &crate::data_dir::DataDir),
+) {
     let (_temp, data) = test_data();
     let conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
     conn.execute_batch(include_str!("../schema.sql")).unwrap();
@@ -34,7 +40,7 @@ fn executor(test: impl FnOnce(&WriterHandle, &ReadPool<'_>)) {
             }
         }
         let _close = Close(&handle);
-        test(&handle, &pool);
+        test(&handle, &pool, &data);
     });
 }
 
@@ -48,7 +54,7 @@ fn receipts_preserve_typed_outcomes_and_project_bound_reads() {
             clock: &ClockAt(-1),
         };
         let lease = match adapter
-            .claim(new("t", "a", "r"))
+            .claim(None, new("t", "a", "r"))
             .unwrap()
             .wait()
             .unwrap()
@@ -60,7 +66,7 @@ fn receipts_preserve_typed_outcomes_and_project_bound_reads() {
         assert_eq!(lease.expires_at, LEASE_MS - 1);
         assert_eq!(
             adapter
-                .claim(new("t", "b", "s"))
+                .claim(None, new("t", "b", "s"))
                 .unwrap()
                 .wait()
                 .unwrap()
@@ -69,7 +75,7 @@ fn receipts_preserve_typed_outcomes_and_project_bound_reads() {
         );
         assert!(matches!(
             adapter
-                .renew("t".into(), "wrong".into(), 1)
+                .renew(None, "t".into(), "wrong".into(), 1)
                 .unwrap()
                 .wait()
                 .unwrap(),
@@ -100,7 +106,7 @@ fn receipts_preserve_typed_outcomes_and_project_bound_reads() {
         };
         assert_eq!(
             holder
-                .renew("t".into(), lease.lineage.clone(), 1)
+                .renew(None, "t".into(), lease.lineage.clone(), 1)
                 .unwrap()
                 .wait()
                 .unwrap()
@@ -109,7 +115,7 @@ fn receipts_preserve_typed_outcomes_and_project_bound_reads() {
             LEASE_MS + 100
         );
         holder
-            .release("t".into(), lease.lineage.clone(), 1)
+            .release(None, "t".into(), lease.lineage.clone(), 1)
             .unwrap()
             .wait()
             .unwrap()
@@ -123,7 +129,7 @@ fn receipts_preserve_typed_outcomes_and_project_bound_reads() {
         );
         assert_eq!(
             holder
-                .claim(new("t", "a", "r2"))
+                .claim(None, new("t", "a", "r2"))
                 .unwrap()
                 .wait()
                 .unwrap()
@@ -150,7 +156,11 @@ fn pooled_snapshot_stays_fixed_while_writer_commits() {
         adapter
             .snapshot(deadline(), |tx, c| {
                 assert!(list_leases(tx, c)?.is_empty());
-                adapter.claim(new("t", "a", "r")).unwrap().wait().unwrap()?;
+                adapter
+                    .claim(None, new("t", "a", "r"))
+                    .unwrap()
+                    .wait()
+                    .unwrap()?;
                 assert!(list_leases(tx, c)?.is_empty());
                 Ok(())
             })
@@ -369,7 +379,7 @@ fn imported_high_water_issues_once_then_returns_typed_exhaustion() {
             clock: &ClockAt(i64::MAX - LEASE_MS),
         };
         let lease = match adapter
-            .claim(new("t", "a", "r"))
+            .claim(None, new("t", "a", "r"))
             .unwrap()
             .wait()
             .unwrap()
@@ -381,13 +391,17 @@ fn imported_high_water_issues_once_then_returns_typed_exhaustion() {
         assert_eq!(lease.epoch, (i64::MAX - 1) as u64);
         assert_eq!(lease.expires_at, i64::MAX);
         adapter
-            .release("t".into(), lease.lineage, lease.epoch)
+            .release(None, "t".into(), lease.lineage, lease.epoch)
             .unwrap()
             .wait()
             .unwrap()
             .unwrap();
         assert!(matches!(
-            adapter.claim(new("t", "a", "r2")).unwrap().wait().unwrap(),
+            adapter
+                .claim(None, new("t", "a", "r2"))
+                .unwrap()
+                .wait()
+                .unwrap(),
             Err(StoreError::CounterExhausted)
         ));
         adapter
@@ -417,7 +431,7 @@ fn sql_code(result: crate::sqlite::Result<impl std::fmt::Debug>) -> rusqlite::ff
     }
 }
 
-fn exec(writer: &WriterHandle, sql: &'static str) {
+pub(super) fn exec(writer: &WriterHandle, sql: &'static str) {
     writer
         .submit(Lane::Claims, None, move |tx| {
             tx.execute_batch(sql)?;
@@ -428,7 +442,7 @@ fn exec(writer: &WriterHandle, sql: &'static str) {
         .unwrap();
 }
 
-fn lease_state(readers: &ReadPool<'_>) -> (Vec<Lease>, i64, i64) {
+pub(super) fn lease_state(readers: &ReadPool<'_>) -> (Vec<Lease>, i64, i64) {
     readers
         .read(deadline(), |tx| {
             Ok((
@@ -455,7 +469,7 @@ fn sqlite_initiated_rollback_in_renew_and_release_reaches_the_receipt_typed_and_
             clock: &ClockAt(0),
         };
         let lease = match adapter
-            .claim(new("t", "a", "r"))
+            .claim(None, new("t", "a", "r"))
             .unwrap()
             .wait()
             .unwrap()
@@ -475,12 +489,12 @@ fn sqlite_initiated_rollback_in_renew_and_release_reaches_the_receipt_typed_and_
             ..adapter
         };
         let receipt = renew
-            .renew("t".into(), lease.lineage.clone(), lease.epoch)
+            .renew(None, "t".into(), lease.lineage.clone(), lease.epoch)
             .unwrap()
             .wait();
         assert_eq!(sql_code(receipt), ConstraintViolation);
         let receipt = renew
-            .release("t".into(), lease.lineage.clone(), lease.epoch)
+            .release(None, "t".into(), lease.lineage.clone(), lease.epoch)
             .unwrap()
             .wait();
         assert_eq!(sql_code(receipt), ConstraintViolation);
@@ -488,7 +502,7 @@ fn sqlite_initiated_rollback_in_renew_and_release_reaches_the_receipt_typed_and_
         // The writer survived: ordinary typed refusals still arrive as outcomes.
         assert!(matches!(
             renew
-                .renew("t".into(), "wrong".into(), 1)
+                .renew(None, "t".into(), "wrong".into(), 1)
                 .unwrap()
                 .wait()
                 .unwrap(),
@@ -507,7 +521,7 @@ fn claim_read_failure_before_the_savepoint_is_a_typed_receipt_error_and_commits_
             caller: owner("p"),
             clock: &ClockAt(0),
         };
-        let receipt = adapter.claim(new("t", "a", "r")).unwrap().wait();
+        let receipt = adapter.claim(None, new("t", "a", "r")).unwrap().wait();
         assert!(
             matches!(&receipt, Err(crate::sqlite::SqliteError::Sql(e)) if e.to_string().contains("task_epochs")),
             "{receipt:?}"
