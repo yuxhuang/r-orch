@@ -196,7 +196,7 @@ impl View {
             .rows
             .values()
             .filter(|row| matches_filter(&row.entity, filter))
-            .map(|row| (sort_key(row, request.sort), row.clone()))
+            .map(|row| (sort_key(row, request.sort, filter), row.clone()))
             .collect();
         let total = request.with_count.then_some(rows.len() as u64);
         rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -366,7 +366,7 @@ fn validate_sort(kind: EntityKind, sort: Sort) -> Result<()> {
     }
 }
 
-fn sort_key(row: &Record, sort: Sort) -> Key {
+fn sort_key(row: &Record, sort: Sort, filter: &Filter) -> Key {
     use Part::*;
     let mut key = match (sort, &row.entity) {
         (Sort::Id, _) => vec![],
@@ -409,6 +409,9 @@ fn sort_key(row: &Record, sort: Sort) -> Key {
         ],
         (_, Entity::Agent(_)) => vec![Position(row.position)],
         (_, Entity::Team(v)) => vec![Text(v.created_at.clone())],
+        (_, Entity::Run(v)) if matches!(filter, Filter::Runs { task: Some(_), .. }) => {
+            vec![Number(-i64::from(v.attempt))]
+        }
         (_, Entity::Run(v)) => vec![Newest(Reverse(Some(v.started_at.clone())))],
         (_, Entity::Message(v)) => vec![Text(v.created_at.clone()), Position(row.position)],
         (_, Entity::Context(_) | Entity::Config(_) | Entity::Template(_)) => vec![],
