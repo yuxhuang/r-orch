@@ -1179,8 +1179,16 @@ the last naming row (R60).
   the same way with no copy added. Migration 003 repeats the same check in its own transaction, before its first
   schema or ledger change, as the guard that holds even if the check before it is bypassed. No such row exists
   outside tests: 1.0 has no SQLite storage and the adapter is unwired on `main`.
-- The file reference keeps its own encoding (JSON pointers and a null slot, `storage::v2::tests`). Both backends
-  return equal typed `Task` values for the same input; their physical layouts are not compared with each other.
+- The file reference keeps its own encoding (JSON pointers and a null slot, `storage::v2::tests`). The two backends
+  return equal typed `Task` values for every input that the file reference accepts, which means every text of at most
+  67,108,864 bytes: the reference passes a text over 65,536 bytes whole to `DiskBlobStore::put`
+  (`storage/v2/text.rs`), and that refuses more than `MAX_BLOB_BYTES`, 67,108,864 bytes (`blob/store.rs`), with the
+  error `file reference text: blob is over the 67108864 byte limit`. The split into K >= 2 objects is a SQLite-only
+  behaviour: a text of 67,108,865 bytes or more is stored by format v1 and refused by the reference. The reference
+  is not extended; the split is checked only on SQLite, by the tests of R141 in `sqlite_task_format` that name 64 MiB,
+  a character cut by a chunk boundary and repeated chunks. No shared entity suite (`storage_contract`) holds a text
+  over 67,108,864 bytes, and none may be added until the reference accepts one. Their physical layouts are not
+  compared with each other.
 - Retry diagnostics (`retry_queue.error`) have their own mapping, which the issue 109 work defines and which uses the
   same two thresholds and the same split. It shares none of this section's tables or tags. One internal helper for
   splitting, hashing and reassembling is recommended for both mappings; the format does not require it.
@@ -1189,7 +1197,7 @@ the last naming row (R60).
 
 | Task | Obligation |
 |---|---|
-| T10 | The mapping above for `Task`, with the R141 tests; register the shared entity suites (`text_over_64_kib_round_trips_through_the_blob_store` and the task-id fold scenarios) on SQLite; keep the mapping behind the internal adapter; `SqliteError::TaskCorrupt` and its classification before any public conversion (R140, R141), on the writer that the T10 integration latches. Other entities and the public cursor stay with their own slices. |
+| T10 | The mapping above for `Task`, with the R141 tests; register the shared entity suites (`text_over_64_kib_round_trips_through_the_blob_store`, whose largest text is 1 MiB and 3 bytes, and the task-id fold scenarios) on SQLite, with no shared scenario over 67,108,864 bytes (the split of K >= 2 has SQLite-only tests); keep the mapping behind the internal adapter; `SqliteError::TaskCorrupt` and its classification before any public conversion (R140, R141), on the writer that the T10 integration latches. Other entities and the public cursor stay with their own slices. |
 | T11 | Row-only registration of an already-published disk object, crate-visible, in `crates/orch-infra/src/blob/references.rs` ("Blob helper change" above). The rest of the blob adapter is used as it is. |
 | T15 | `blobs.sweep` counts `task_blob_refs.sha256` as a naming row for the 7-day rule (R60), beside `runs.prompt_sha256`, `task_attachments.sha256` and the retry mapping. A task's `delete` removes its naming rows and keeps its blobs, so an object it named becomes eligible only after seven days with no naming row at all, and a hash that another task, run or project still names is kept. |
 | T21 | Build each task through the same codec as the port, never by inserting rows. Keep list order, repeats and `Option` presence exactly as the 1.0 document says; 1.0's recorded proof (the document's `proof` key) is the task's `proof` in the detail, and the importer leaves `legacy_proof` NULL (a second copy would need its own layout for a text over 64 KiB, R97, which format v1 does not define). Record `import` and NULL as the creator of a legacy task of unknown origin, on the owner-authorized path and through the same codec. Decide and record what a non-canonical timestamp does (above). A task text over 64 KiB becomes the references above, as R97 says for imported text, and a source document is at most 1 MiB, so an import never needs a split. A source or an export that is itself corrupt refuses the import and leaves the live writer usable (R140). |

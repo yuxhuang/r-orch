@@ -482,7 +482,7 @@ across a crash, lists that do not load everything, and a retried request that ru
     import, backup or export file refuses that operation and leaves the writer usable. On the writer a fatal
     cause is latched even when the callback catches it, and aborts the transaction; a failed rollback is
     classified in both causes, a fatal one on either side wins, any failed savepoint rollback forbids the enclosing
-    commit, and an ordinary failure rolled back to its savepoint may be caught. Timestamps stay the canonical millisecond strings that the goal adapter accepts. The migration
+    commit, and an ordinary failure rolled back to its savepoint may be caught. Timestamps stay the canonical millisecond strings that the goal adapter accepts. The file reference and SQLite return equal tasks for every input that the reference accepts, a text of at most 67,108,864 bytes; the split of a larger text is SQLite-only, because the reference's blob store refuses more than that, and only SQLite tests it. The migration
     backfills nothing. A populated predecessor is refused before any copy or intermediate migration, and again in the
     migration's own transaction, so a refused start changes nothing and repeats without growing the copies (the spec's
     "Task format v1 (SQLite)"). The
