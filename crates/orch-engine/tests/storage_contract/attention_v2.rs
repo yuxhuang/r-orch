@@ -121,6 +121,16 @@ pub async fn caught_stale_or_invalid_transitions_change_nothing(f: Fixture) {
         assert!(
             u.open_attention(
                 &AttentionFacts::DispatchOffWithWork {
+                    waiting_tasks: 1,
+                    oldest_waiting_at: 31,
+                },
+                30
+            )
+            .is_err()
+        );
+        assert!(
+            u.open_attention(
+                &AttentionFacts::DispatchOffWithWork {
                     waiting_tasks: 0,
                     oldest_waiting_at: 10
                 },
@@ -355,6 +365,7 @@ pub async fn fixed_facts_reject_external_text_and_wrong_scope(f: Fixture) {
 
 pub async fn restore_keeps_acknowledgements_resolutions_and_counters(f: Fixture) {
     let s = f.storage.clone();
+    let daemon = open(s.as_ref(), "", disk(), 20).await;
     let row = open(s.as_ref(), "p1", dispatch(), 20).await;
     let expected = s
         .transaction(caller("p1"), Lane::Maintenance, move |u| {
@@ -369,6 +380,22 @@ pub async fn restore_keeps_acknowledgements_resolutions_and_counters(f: Fixture)
         .await
         .unwrap();
     f.restore.restore_to_lineage("restored").await;
+    assert_eq!(get(s.as_ref(), "", daemon.id).await, Some(daemon.clone()));
+    assert!(get(s.as_ref(), "p2", daemon.id).await.is_none());
+    let next_daemon = open(
+        s.as_ref(),
+        "",
+        AttentionFacts::DiskFloor {
+            subject: DiskSubject::ProjectWorkspaces {
+                project: "p1".into(),
+            },
+            free_bytes: 1,
+            floor_bytes: 10,
+        },
+        50,
+    )
+    .await;
+    assert!(next_daemon.id > daemon.id);
     assert_eq!(
         get(s.as_ref(), "p1", expected.id).await,
         Some(expected.clone())
@@ -452,6 +479,49 @@ pub async fn disk_subjects_are_distinct_and_invalid_ack_ids_change_nothing(f: Fi
     .unwrap();
 }
 
+pub async fn numeric_pages_and_bounded_expiry_cross_nine_ten_eleven(f: Fixture) {
+    let s = f.storage;
+    s.transaction(caller("p1"), Lane::Maintenance, |u| {
+        for id in 1..=11 {
+            let row = u.open_attention(&dispatch(), 20)?;
+            assert_eq!(row.id, id);
+            u.resolve_attention(id, row.revision, ResolutionReason::DispatchEnabled, 30)?;
+        }
+        let mut cursor = None;
+        let mut ids = Vec::new();
+        loop {
+            let p = u.attention_page(AttentionFilter::Resolved, cursor.as_ref(), 3)?;
+            ids.extend(p.items.iter().map(|r| r.id));
+            cursor = p.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(ids, (1..=11).collect::<Vec<_>>());
+        let after = AttentionCursor::after("p1", AttentionFilter::All, 9);
+        assert_eq!(
+            u.attention_page(AttentionFilter::All, Some(&after), 1)?
+                .items[0]
+                .id,
+            10
+        );
+        assert_eq!(u.expire_attention(30, 3)?, 0);
+        for first in [1, 4, 7, 10] {
+            assert_eq!(u.expire_attention(31, 3)?, if first == 10 { 2 } else { 3 });
+            for id in first..=(first + 2).min(11) {
+                assert!(u.get_attention(id)?.is_none());
+            }
+            if first < 10 {
+                assert!(u.get_attention(first + 3)?.is_some());
+            }
+        }
+        assert_eq!(u.open_attention(&dispatch(), 40)?.id, 12);
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
 macro_rules! attention_suite {
     ($module:ident, $factory:path) => {
         mod $module {
@@ -463,6 +533,7 @@ macro_rules! attention_suite {
                     }
                 };
             }
+            case!(numeric_pages_and_bounded_expiry_cross_nine_ten_eleven);
             case!(duplicate_open_ack_and_resolve_are_revisioned);
             case!(daemon_disk_and_project_dispatch_are_separate_scopes);
             case!(caught_stale_or_invalid_transitions_change_nothing);
