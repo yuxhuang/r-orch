@@ -1,5 +1,10 @@
 //! Fixed-size read-only snapshot pool. It borrows the locked data directory;
 //! no connection can escape a callback or outlive its exclusive directory guard.
+//!
+//! Every read reports to the shared `FailureState` (R140): a fatal result on any
+//! pooled connection fails the writer at once, and a read whose callback
+//! observed one returns the refusal instead of its partial result.
+use super::writer::failure::{FailureSource, FailureState};
 use super::{ConnectionHandle, ConnectionRole, Result, SqliteError, Synchronous, open_connection};
 use crate::data_dir::DataDir;
 use rusqlite::Transaction;
@@ -13,6 +18,7 @@ pub struct ReadPool<'a> {
     // connection must be reopened, not permission to grow the pool.
     free: Mutex<Vec<Option<ConnectionHandle<'a>>>>,
     available: Condvar,
+    state: FailureState,
 }
 
 impl<'a> ReadPool<'a> {
@@ -21,6 +27,16 @@ impl<'a> ReadPool<'a> {
     /// Open only after schema setup. Size is storage.read_connections; never
     /// open an extra connection when all configured slots are checked out.
     pub fn open(data: &'a DataDir, sync: Synchronous, size: usize) -> Result<Self> {
+        Self::open_with_state(data, sync, size, FailureState::new())
+    }
+
+    /// Share the writer's `FailureState`, so that a fatal read fails the writer.
+    pub fn open_with_state(
+        data: &'a DataDir,
+        sync: Synchronous,
+        size: usize,
+        state: FailureState,
+    ) -> Result<Self> {
         if size == 0 {
             return Err(SqliteError::InvalidCapacity);
         }
@@ -33,7 +49,13 @@ impl<'a> ReadPool<'a> {
             sync,
             free: Mutex::new(free),
             available: Condvar::new(),
+            state,
         })
+    }
+
+    /// The state this pool reports to. A callback captures it to report what it catches.
+    pub fn failure_state(&self) -> &FailureState {
+        &self.state
     }
 
     /// Admission waits only until the supplied deadline. The deferred read
@@ -45,6 +67,7 @@ impl<'a> ReadPool<'a> {
         read: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
         let mut lease = self.acquire(deadline)?;
+        let observed = self.state.fatal_observations();
         let result = (|| {
             if lease.connection.is_none() {
                 lease.connection = Some(open_connection(
@@ -62,12 +85,25 @@ impl<'a> ReadPool<'a> {
             transaction.commit()?;
             Ok(value)
         })();
-        if result.is_err() {
-            // A pooled failure is returned to its caller. Reopen this slot on
-            // its next use; shared fatal/error reporting is added by T10's
-            // failure-policy slice, before this is connected to Storage.
+        if let Err(error) = &result {
+            // The error is classified here, before the caller converts it. The
+            // connection is opened afresh on its next use, fatal or not.
+            self.state.observe(FailureSource::Reader, error);
             lease.connection.take();
         }
+        // A fatal observation since this read began, its own callback's or a
+        // concurrent one: a value that the callback returned may come from
+        // damaged data, so none is returned. A read's own error stays its answer.
+        let result = match result {
+            Ok(value) if self.state.fatal_observations() != observed => {
+                match self.state.ensure_available() {
+                    Err(refusal) => Err(refusal),
+                    Ok(()) => Ok(value),
+                }
+            }
+            other => other,
+        };
+        self.state.pool_read_finished(result.as_ref().err());
         result
     }
 

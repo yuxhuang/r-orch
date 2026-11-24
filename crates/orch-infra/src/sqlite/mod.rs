@@ -27,7 +27,7 @@ pub enum SqliteError {
     },
     #[error("value cannot be represented losslessly in the SQLite schema: {0}")]
     Unrepresentable(String),
-    #[error("goal operation failed: {operation}; savepoint rollback failed: {rollback}")]
+    #[error("operation failed: {operation}; rollback failed: {rollback}")]
     OperationRollback {
         operation: Box<SqliteError>,
         rollback: rusqlite::Error,
@@ -36,6 +36,10 @@ pub enum SqliteError {
     TransactionAborted,
     #[error("storage admission deadline or queue bound reached")]
     Overloaded,
+    /// The shared failure state is latched (R128, R140): the writer refuses every
+    /// mutation, no claim is granted and no checkpoint is called until a restart.
+    #[error("storage_unavailable: {0}")]
+    StorageUnavailable(Failure),
     #[error(transparent)]
     Store(#[from] orch_core::store::StoreError),
     #[error("stored run event is damaged: {0}")]
@@ -81,6 +85,9 @@ pub(crate) mod events;
 mod read_pool;
 mod writer;
 pub use read_pool::ReadPool;
+pub use writer::failure::{
+    Class, Failure, FailureSource, FailureState, FatalCause, Observation, Role, classify,
+};
 pub use writer::{Lane, WriteReceipt, Writer, WriterHandle};
 
 #[cfg(test)]

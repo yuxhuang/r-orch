@@ -1,23 +1,33 @@
 //! Trusted transaction executor, not a client-facing arbitrary SQL endpoint.
 //! This independent foundation is not wired into `Storage` or the daemon yet.
-//! Retry/fatal policy and bulk/event aggregation belong to the adapter integration.
+//! Bulk/event aggregation and the retry policy of R128 belong to the adapter integration.
 //!
 //! What this executor enforces: one writing connection, claims first and then the
 //! earliest deadline, a bounded queue, a request deadline checked before BEGIN and
 //! again once BEGIN IMMEDIATE holds the reservation, rollback of a failed or
 //! panicking body, and admission closure on `close` or on dropping the last handle.
 //!
+//! It also owns the shared fatal state (`FailureState`, issue 127, R128, R140):
+//! the result of BEGIN, the body, commit and rollback is classified before it
+//! reaches a receipt; a fatal cause latches the state, even one that the body
+//! caught before returning success; a latched state refuses every later
+//! mutation (every lane, claims included) and a body that returned success after
+//! a fatal cause, or after a failed savepoint rollback, is rolled back, never
+//! committed. The read pool and the checkpoint job report to the same state.
+//!
 //! What it does not enforce, and the adapter integration must (issue 127, R128,
-//! R130, R140): a callback is trusted not to issue COMMIT, BEGIN, SAVEPOINT
+//! R130): a callback is trusted not to issue COMMIT, BEGIN, SAVEPOINT
 //! control or external side effects, and nothing here detects that it did, or
-//! that a failed rollback left the connection outside autocommit; a failed
-//! `BEGIN`/commit/rollback is returned to its receipt, not classified, retried or
-//! made a shared fatal state (`storage_unavailable`) that other connections can
-//! also set; and the producer invariants of R26 (bounded claim production, event
-//! coalescing) are the producer's. Blocking `WriteReceipt::wait` must not be called on
-//! an async runtime thread.
+//! that a failed rollback left the connection outside autocommit; a callback that
+//! catches an error must report it with `FailureState::observe` before it goes
+//! on; the retry of R128's retryable class and its 60 s and second-`IOERR` fatal
+//! rules are not built; and the producer invariants of R26 (bounded claim
+//! production, event coalescing) are the producer's. Blocking `WriteReceipt::wait`
+//! must not be called on an async runtime thread.
+pub(super) mod failure;
 use super::{ConnectionHandle, ConnectionRole, Result, SqliteError, Synchronous, open_connection};
 use crate::data_dir::DataDir;
+use failure::{FailureSource, FailureState};
 use rusqlite::Transaction;
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
@@ -105,23 +115,68 @@ impl<T> Schedule<T> {
 /// the two reads without timing luck.
 fn execute<T>(
     connection: &mut ConnectionHandle<'_>,
+    state: &FailureState,
     deadline: Option<Instant>,
     now: impl Fn() -> Instant,
     work: impl FnOnce(&Transaction<'_>) -> Result<T>,
 ) -> Result<T> {
+    // A latched state refuses every lane, also what was queued before the failure.
+    state.ensure_available()?;
     let expired = || deadline.is_some_and(|limit| now() >= limit);
     if expired() {
         return Err(SqliteError::Overloaded);
     }
+    state.begin_transaction();
     // T9 configures this connection for BEGIN IMMEDIATE.
-    let transaction = connection.transaction()?;
+    let transaction = match connection.transaction() {
+        Ok(transaction) => transaction,
+        Err(error) => return Err(observed(state, error.into())),
+    };
     if expired() {
         // Dropping the transaction rolls back and releases the reservation.
         return Err(SqliteError::Overloaded);
     }
-    let value = work(&transaction)?;
-    transaction.commit()?;
-    Ok(value)
+    let value = match work(&transaction) {
+        Ok(value) => value,
+        Err(error) => {
+            state.observe(FailureSource::Writer, &error);
+            return Err(abandon(state, transaction, error));
+        }
+    };
+    // The body may have caught a fatal cause or a failed savepoint rollback and
+    // returned success; so may another connection, since BEGIN.
+    if let Some(error) = state.transaction_must_abort() {
+        return Err(abandon(state, transaction, error));
+    }
+    match transaction.commit() {
+        Ok(()) => Ok(value),
+        Err(error) => Err(observed(state, error.into())),
+    }
+}
+
+fn observed(state: &FailureState, error: SqliteError) -> SqliteError {
+    state.observe(FailureSource::Writer, &error);
+    error
+}
+
+/// Roll back, classifying the rollback's own result independently of `error`.
+/// A failed rollback keeps both causes in one `OperationRollback`.
+fn abandon(state: &FailureState, transaction: Transaction<'_>, error: SqliteError) -> SqliteError {
+    // SQLite can end the transaction itself (RAISE(ROLLBACK), a failed statement
+    // under some conflict clauses): there is then nothing left to roll back.
+    if transaction.is_autocommit() {
+        return error;
+    }
+    match transaction.rollback() {
+        Ok(()) => error,
+        Err(rollback) => observed(
+            state,
+            SqliteError::OperationRollback {
+                operation: Box::new(error),
+                rollback,
+            },
+        ),
+    }
 }
 
 type Job = Box<dyn FnOnce(&mut ConnectionHandle<'_>) + Send>;
@@ -148,6 +203,7 @@ pub struct Writer<'a> {
 #[derive(Clone)]
 pub struct WriterHandle {
     admission: Arc<Admission>,
+    state: FailureState,
 }
 
 // Only client handles own Admission. The worker owns Shared separately, so
@@ -193,10 +249,21 @@ impl<T> WriteReceipt<T> {
 }
 
 impl<'a> Writer<'a> {
+    /// A writer with a failure state of its own. Share one state with the read
+    /// pool and the checkpoint job through `open_with_state`.
     pub fn open(
         data: &'a DataDir,
         sync: Synchronous,
         capacity: usize,
+    ) -> Result<(Self, WriterHandle)> {
+        Self::open_with_state(data, sync, capacity, FailureState::new())
+    }
+
+    pub fn open_with_state(
+        data: &'a DataDir,
+        sync: Synchronous,
+        capacity: usize,
+        state: FailureState,
     ) -> Result<(Self, WriterHandle)> {
         if capacity == 0 {
             return Err(SqliteError::InvalidCapacity);
@@ -213,6 +280,7 @@ impl<'a> Writer<'a> {
             admission: Arc::new(Admission {
                 shared: Arc::clone(&shared),
             }),
+            state,
         };
         Ok((Self { connection, shared }, handle))
     }
@@ -270,6 +338,11 @@ impl Drop for Writer<'_> {
 }
 
 impl WriterHandle {
+    /// The state this writer shares. A callback captures a clone to report what it catches.
+    pub fn failure_state(&self) -> FailureState {
+        self.state.clone()
+    }
+
     /// Queue one trusted, atomic transaction. The adapter must validate caller
     /// and project before producing this closure. Capacity bounds transactions,
     /// not their captured bytes; bulk row/time bounds and event coalescing are
@@ -285,9 +358,12 @@ impl WriterHandle {
         T: Send + 'static,
         F: FnOnce(&Transaction<'_>) -> Result<T> + Send + 'static,
     {
+        // Refuse at the door once latched: nothing is queued behind a failed writer.
+        self.state.ensure_available()?;
         let (response, receiver) = mpsc::sync_channel(1);
+        let state = self.state.clone();
         let job: Job = Box::new(move |connection| {
-            let _ = response.send(execute(connection, deadline, Instant::now, work));
+            let _ = response.send(execute(connection, &state, deadline, Instant::now, work));
         });
         let mut state = self
             .admission
