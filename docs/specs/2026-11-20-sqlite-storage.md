@@ -1973,8 +1973,9 @@ The proposed name of its variant is `FatalCause::RollbackLeftTransactionOpen`; t
 and the meaning and the report below are the rule.
 
 - *Both halves are needed.* A rollback that fails while the connection is back outside a transaction is not this cause:
-  its own result is classified as any other result (R128, R140) and the writer goes on. A rollback that succeeds is
-  not this cause either.
+  its own result is classified as any other result (R128, R140), so the writer goes on unless that result is itself
+  fatal (`SQLITE_CORRUPT`, `SQLITE_NOTADB` or a second `SQLITE_IOERR` in a row). A rollback that succeeds is not this
+  cause either.
 - *What follows is R128's, and nothing more.* The cause is latched in the shared failure state like every other fatal
   cause: every mutation is refused with `storage_unavailable`, no claim is granted, no checkpoint is called, runs
   stay supervised and their finishes are spooled (R129), and `daemon.status`, `orch status` and `orch doctor` (exit 1)

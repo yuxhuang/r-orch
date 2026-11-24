@@ -747,8 +747,8 @@ to R128's fatal class, and the resynchronised PR 188 delivers it:
 - When an explicit top-level rollback fails and the connection is still inside a transaction, the cause is latched
   in PR 249's shared state, as `storage_unavailable`, before the executor stops serving the connection. The writer
   may end its thread or stay to refuse; either way every queued and later request is answered `storage_unavailable`,
-  never `WriterClosed` and never a SQLite error. A rollback error with the connection outside a transaction latches
-  nothing.
+  never `WriterClosed` and never a SQLite error. A rollback error with the connection outside a transaction is not this
+  cause and latches nothing for it; its result is classified as any other (R128, R140).
 - The latch is checked before `TransactionAborted` is returned.
 - The commit hook is armed only around the executor's own COMMIT, so that PR 249's commit is not refused, and both
   hooks are removed before the connection is dropped (a freed hook closure crashes the process when SQLite rolls
@@ -1082,10 +1082,11 @@ credit for R142, R140, issue 127 or any gate line.
 - A failed top-level rollback (spec R128, record L): a connection whose `ROLLBACK` is refused (a test authorizer
   stands for it) ends a request in an error. The cause is latched; the next request on each lane, a claim and a
   checkpoint are answered `storage_unavailable`; the report names the writer connection and the cause; and after the
-  process stops the file holds no row of the failed request. A rollback that returns an injected error while the
-  connection is outside a transaction latches nothing, and the writer serves the next request. With the latch set
-  and the transaction ended by SQLite (a `RAISE(ROLLBACK)` trigger), the answer is `storage_unavailable` and not
-  `TransactionAborted`, and a write made after the latch is not durable. A callback panic is not mapped.
+  process stops the file holds no row of the failed request. A rollback that returns an injected ordinary (non-fatal)
+  error while the connection is outside a transaction latches nothing for this cause, and the writer serves the next
+  request. With the latch set and the transaction ended by SQLite (a `RAISE(ROLLBACK)` trigger), the answer is
+  `storage_unavailable` and not `TransactionAborted`, and a write made after the latch is not durable. A callback
+  panic is not mapped.
 - Other connections (spec R137, R140): a result is injected at the checkpoint, read, query and backup
   connections in turn. Corruption fails the writer from each; other failures are counted and reported at
   their thresholds and do not fail it; each outcome of a checkpoint call is produced from injected counts,
