@@ -30,6 +30,68 @@ pub(crate) struct Continuation {
     values: Vec<Value>,
 }
 
+impl Continuation {
+    /// Validate decoded fields before accepting a continuation. The integrator
+    /// must bound and authenticate the public token and derive `project` from
+    /// the authorized caller; this checks its decoded binding and seek shape.
+    pub(crate) fn from_decoded(
+        decoded_project: String,
+        decoded_filter: Filter,
+        decoded_sort: Sort,
+        values: Vec<Value>,
+        project: &str,
+        filter: &Filter,
+        sort: Sort,
+    ) -> Result<Self, StoreError> {
+        validate_continuation(
+            &decoded_project,
+            &decoded_filter,
+            decoded_sort,
+            &values,
+            project,
+            filter,
+            sort,
+        )?;
+        Ok(Self {
+            project: decoded_project,
+            filter: decoded_filter,
+            sort: decoded_sort,
+            values,
+        })
+    }
+}
+
+fn validate_continuation(
+    decoded_project: &str,
+    decoded_filter: &Filter,
+    decoded_sort: Sort,
+    values: &[Value],
+    project: &str,
+    filter: &Filter,
+    sort: Sort,
+) -> Result<(), StoreError> {
+    if decoded_project != project
+        || decoded_filter != filter
+        || decoded_sort != sort
+        || !matches!(filter, Filter::Tasks { .. })
+    {
+        return Err(StoreError::InvalidCursor);
+    }
+    let keys = sort_keys(sort).map_err(|_| StoreError::InvalidCursor)?;
+    // Every supported sort ends in a text ID; preceding keys are integer
+    // columns or the computed integer status rank. Check arity before
+    // inspecting or indexing values.
+    if values.len() != keys.len()
+        || !matches!(values.last(), Some(Value::Text(_)))
+        || !values[..values.len() - 1]
+            .iter()
+            .all(|value| matches!(value, Value::Integer(_)))
+    {
+        return Err(StoreError::InvalidCursor);
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(crate) struct TaskIdPage {
     pub(crate) ids: Vec<String>,
@@ -38,6 +100,32 @@ pub(crate) struct TaskIdPage {
 }
 
 const RANK: &str = "CASE status WHEN 'in_progress' THEN 0 WHEN 'retrying' THEN 1 WHEN 'review' THEN 2 WHEN 'todo' THEN 3 WHEN 'done' THEN 4 WHEN 'failed' THEN 5 WHEN 'cancelled' THEN 6 ELSE 7 END";
+
+fn sort_keys(sort: Sort) -> Result<&'static [(&'static str, bool)], StoreError> {
+    Ok(match sort {
+        Sort::Default => &[
+            (RANK, false),
+            ("updated_at", true),
+            ("position", false),
+            ("id", false),
+        ],
+        Sort::Id => &[("id", false)],
+        Sort::Position => &[("position", false), ("id", false)],
+        Sort::Priority => &[("priority", false), ("position", false), ("id", false)],
+        Sort::CreatedAt => &[("created_at", false), ("position", false), ("id", false)],
+        Sort::UpdatedAt => &[("updated_at", true), ("position", false), ("id", false)],
+        Sort::Attempt => {
+            return Err(StoreError::InvalidPage(
+                "Attempt is not offered for Task".into(),
+            ));
+        }
+        Sort::Name => {
+            return Err(StoreError::InvalidPage(
+                "Name is not offered for Task".into(),
+            ));
+        }
+    })
+}
 
 /// Borrow an already-open transaction: count and IDs share its snapshot.
 /// Call on the read executor thread, or inside a writer callback. A supplied
@@ -57,26 +145,17 @@ pub(crate) fn query(
     let Filter::Tasks { status, goal } = filter else {
         return Err(StoreError::InvalidPage("task filter required".into()).into());
     };
-    let keys: Vec<(&str, bool)> = match request.sort {
-        Sort::Default => vec![
-            (RANK, false),
-            ("updated_at", true),
-            ("position", false),
-            ("id", false),
-        ],
-        Sort::Id => vec![("id", false)],
-        Sort::Position => vec![("position", false), ("id", false)],
-        Sort::Priority => vec![("priority", false), ("position", false), ("id", false)],
-        Sort::CreatedAt => vec![("created_at", false), ("position", false), ("id", false)],
-        Sort::UpdatedAt => vec![("updated_at", true), ("position", false), ("id", false)],
-        Sort::Name => {
-            return Err(StoreError::InvalidPage("Name is not offered for Task".into()).into());
-        }
-    };
-    if let Some(after) = after
-        && (after.project != project || after.filter != *filter || after.sort != request.sort)
-    {
-        return Err(StoreError::InvalidCursor.into());
+    let keys = sort_keys(request.sort)?;
+    if let Some(after) = after {
+        validate_continuation(
+            &after.project,
+            &after.filter,
+            after.sort,
+            &after.values,
+            project,
+            filter,
+            request.sort,
+        )?;
     }
     let mut predicate = "project_id = ?".to_owned();
     let mut args = vec![Value::Text(project.to_owned())];

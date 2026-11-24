@@ -165,9 +165,9 @@ fn walk(error: &SqliteError, out: &mut Observation) {
         // The error that a latched state answers with: already latched.
         StorageUnavailable(_) => Class::Ordinary,
         // R140 names SQLITE_CORRUPT, SQLITE_NOTADB and `TaskCorrupt` as fatal.
-        // The two stored-data errors below are not among them. The Task
+        // The three stored-data errors below are not among them. The Task
         // integration adds the `TaskCorrupt` arm here.
-        EventCorrupt(_) | LeaseCorrupt(_) => Class::Ordinary,
+        EventCorrupt(_) | IntentCorrupt(_) | LeaseCorrupt(_) => Class::Ordinary,
         CounterMissing { .. }
         | CounterNegative { .. }
         | CounterBehind { .. }

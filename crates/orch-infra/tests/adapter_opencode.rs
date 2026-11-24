@@ -206,11 +206,11 @@ async fn step_finish_with_reason_stop_becomes_done_and_recomputes_the_total() {
 }
 
 #[tokio::test]
-async fn step_finish_with_reason_tool_calls_is_skipped() {
+async fn step_finish_with_reason_tool_calls_without_usage_is_skipped() {
     let collected = run(Script::lines([
         json!({
             "type": "step_finish",
-            "part": { "reason": "tool-calls", "tokens": { "total": 500, "input": 400, "output": 100 } },
+            "part": { "reason": "tool-calls" },
         })
         .to_string(),
         json!({ "type": "text", "part": { "text": "next step" } }).to_string(),
@@ -219,6 +219,65 @@ async fn step_finish_with_reason_tool_calls_is_skipped() {
 
     assert_eq!(collected.events.len(), 1);
     assert_eq!(collected.kinds(), [AgentEventKind::Output]);
+}
+
+#[tokio::test]
+async fn tool_step_usage_survives_missing_final_message_without_becoming_done() {
+    let line = include_str!("../../../fixtures/adapters/opencode/interrupted-tool-step.jsonl");
+    for script in [
+        Script::new().stdout(line).exit(0),
+        Script::new().stdout(line).exit(1),
+        Script::new().stdout(line).killed_by(9),
+    ] {
+        let collected = run(script).await;
+        assert_eq!(collected.kinds(), [AgentEventKind::Output]);
+        let event = collected.first();
+        assert_eq!(event.tokens, None, "do not change legacy terminal totals");
+        assert_eq!(event.data["text"], "");
+        assert!(event.data.get("result").is_none());
+        let mut usage = orch_core::RunUsage::default();
+        usage.observe_event("opencode", event);
+        assert_eq!(usage.tokens_input, Some(400));
+        assert_eq!(usage.tokens_output, Some(100));
+        assert_eq!(usage.tokens_reasoning, Some(0));
+        assert_eq!(usage.tokens_cache_read, Some(40));
+        assert_eq!(usage.tokens_cache_write, Some(0));
+        assert_eq!(usage.model.as_deref(), Some("synthetic/model"));
+        // A usage carrier must not suppress a nonzero exit as a Done would.
+        if let Some(error) = &collected.error {
+            assert_eq!(error.message, "OpenCode process exited with code 1");
+        }
+    }
+    let failed = run(Script::new().stdout(line).exit(1)).await;
+    assert_eq!(
+        failed.error_message(),
+        "OpenCode process exited with code 1"
+    );
+}
+
+#[tokio::test]
+async fn tool_step_usage_preserves_partial_zero_and_invalid_counters() {
+    let collected = run(Script::lines([json!({
+        "type": "step_finish", "model": "synthetic/outer-model",
+        "text": "not an assistant message", "result": "not a result",
+        "part": {"reason": "tool-calls", "tokens": {
+            "output": 0, "input": -1, "reasoning": "3",
+            "cache": {"read": 1.5, "write": 9_223_372_036_854_775_808_u64}
+        }}
+    })
+    .to_string()]))
+    .await;
+    assert_eq!(collected.kinds(), [AgentEventKind::Output]);
+    assert_eq!(collected.first().data["text"], "");
+    assert!(collected.first().data.get("result").is_none());
+    let mut usage = orch_core::RunUsage::default();
+    usage.observe_event("opencode", collected.first());
+    assert_eq!(usage.tokens_input, None);
+    assert_eq!(usage.tokens_output, Some(0));
+    assert_eq!(usage.tokens_reasoning, None);
+    assert_eq!(usage.tokens_cache_read, None);
+    assert_eq!(usage.tokens_cache_write, None);
+    assert_eq!(usage.model.as_deref(), Some("synthetic/outer-model"));
 }
 
 #[tokio::test]

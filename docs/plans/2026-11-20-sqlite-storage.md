@@ -160,7 +160,7 @@ separate slices. The v1 runtime stays active.
 | T20 | Usage for every run, with the model and the agent CLI version | R86, R87 | `crates/orch-engine/src/orchestrator/`, `crates/orch-infra/src/adapters/` | T12 | `cargo test -p orch-engine --test usage` | 19 |
 | T21a | The seeded fixture generator split out of T21 as a preparatory slice: `cargo xtask fixture-gen` scripts the real 1.0 file backend in a private temporary directory from a fixed seed, with a deterministic clock and ids; `--check` compares exact file sets and bytes with the checked-in `fixtures/storage/generated/` and changes nothing. One small scenario is checked in; large corpora for R66 and the importer's results stay in T21 | R90 | `xtask/src/fixture_gen*`, `xtask/src/main.rs`, `xtask/Cargo.toml`, `xtask/src/crate_graph.rs`, `xtask/tests/fixture_gen.rs`, `fixtures/storage/generated/` | T2 | `cargo xtask fixture-gen --check`; `cargo test -p xtask --test fixture_gen` | 20 (first slice) |
 | T21 | `orch import` from a 1.0 directory: dry run, bounds, resume; the source read by listing through the confined-directory module, the id rule, and nothing done outside the database; the seeded fixture generator's further scenarios (T21a owns `xtask/src/fixture_gen.rs` and its first scenario; T21 extends it) and the hand-written hostile-source corpus (links, special files, traversal-shaped ids and names, a live canary process, a canary child left in the process group of a leader that has gone, two task ids that differ only in case, and a workspace with a canary under another spelling of a task's id). The check, before the first write, that no two task ids of the source have one fold key and that no name listed in `workspaces/` folds onto a task's id without being it; `workspaces/` is listed for its names alone. The source-budget pass of the spec's "Import bounds": every document measured for bytes, depth, nodes, aliases, expansion and tags before anything is built from it, on 1.0's own guarded reader (`orch_core::definition_yaml`) where that already holds the limit; event lines read as a bounded stream; the check of the whole source before the first write; and the hostile-document corpus (the review's depth and alias documents, merge-key bombs, tags, each limit and one over), run in a child process under a time and a memory ceiling. The six cases of `config.yml` and the classes of an `_index.json` that the spec's "Import rules" tabulate, with the statements of what 1.0 did with a refused file and the vectors C-V1 to C-V14 and X-V1 to X-V14 as tests; neither path gets a caller before the owner has merged the contract text that carries them ("T21 config and index contract") | R64 to R70, R90, R99, R103 to R105, R109 to R112, R116 (a 1.0 source), R117 (a 1.0 source), R119, R121 (the record), R122, R123, R125, R97 (imported text over 64 KiB) | `crates/orch-infra/src/import/`, `crates/orch-cli/src/commands/import*`, `xtask/src/fixture_gen.rs`, `fixtures/storage/`, `crates/orch-infra/tests/source_budget.rs`, `crates/orch-cli/tests/import_hostile.rs` | T10, T11, T2 | `cargo test -p orch-cli --test import --test import_hostile`; `cargo test -p orch-infra --test source_budget`; `cargo xtask fixture-gen --check` | 20 |
-| T22 | `orch db` with the daemon running: status, verify, query, prune | R72 to R74, R79, R121 (status), R130 | `crates/orch-daemon/src/ops/`, `crates/orch-cli/src/commands/db*` | T10, T16, T17 | `cargo test -p orch-cli --test db_commands` | 21 |
+| T22 | `orch db` with the daemon running: status, verify (including that every `task_epochs.next_epoch` is at least 1), query, prune | R72 to R74, R79, R121 (status), R130 | `crates/orch-daemon/src/ops/`, `crates/orch-cli/src/commands/db*` | T10, T16, T17 | `cargo test -p orch-cli --test db_commands` | 21 |
 | T23 | Backup, restore, vacuum, export, and import from an export file; a backup is written and read through the confined-directory module, its manifest's names are checked against the layout and never opened, and an export's names, ids and paths are stored as data. Before an export's database is published and before a restore changes anything, the check of the spec's R117: no two task ids of one fold key, no directory in the project's `workspaces/` that the tasks brought may not own, and a backup's database refused when it lacks the index. The export format of the spec's "Import bounds" (blob bytes in chunks, a manifest, tables only) and its hostile reader: the header checked before SQLite opens the file, a read-only immutable connection with the schema untrusted, triggers, views and extensions off, run-time limits, a heap limit, an authorizer and a progress handler, `quick_check` first, the schema compared and never adopted, rows copied by fixed statements into a database built by the product's own migrations under a scratch name and published by a rename; and the hostile-export corpus, made by altering the bytes of an export the product wrote, run in a child process under the same ceilings. A restore replaces the state as the spec's R138 says: the whole state staged under a scratch name with its new lineage and generation and its leases ended, a synced marker, renames in a fixed order, `--continue` and `--abandon`, a refusal to start anything while the marker exists, and a check of free space that counts the backup; tested by stopping a child at every step | R75 to R80, R100, R108, R101 and R102 (backups), R105 and R107 (export), R113 to R115, R116 (an export), R67 (no resume for an export), R117 (an export, a restore), R124 (restoring the copy), R125 (an export), R132 (a restore), R133 (the confirmation), R138 | `crates/orch-infra/src/sqlite/backup*`, `crates/orch-infra/src/import/export*`, `crates/orch-cli/src/commands/db*`, `crates/orch-cli/tests/export_hostile.rs` (the `limits` and `hooks` features of `rusqlite` that this task uses are on since T9, ADR 0017 decision 19) | T21, T22 | `cargo test -p orch-cli --test db_backup_restore --test db_export_import --test export_hostile --test restore_fencing --test db_offline`; `./xtask/gate.sh full` (security-relevant) | 22 |
 
 T8 is split to keep each PR below about 3,000 changed lines. T8a introduces the
@@ -234,11 +234,142 @@ are useful but do not replace those registrations. T12 owns stale-epoch finish
 and runtime restart/renewal proof; T16 consumes SQLite event conformance. T21 owns
 R97 import backing (the proposed import test does not exist yet). T27 records
 those actual named checks and rejects empty or ignored selections. T25 retains
-the file reference as a dev-only dependency. R7/R117/R132-caller name alignment
-and the frozen-trait and sort decisions remain with issue 109; none is changed by this name reconciliation. Full T8
-acceptance still requires the accepted operational integration and issue 109's
-consumer dispositions. macOS is tracked in After 2.0 under the owner's Linux-only
-direction through 2.0.
+the file reference as a dev-only dependency. The name alignment for R7, R117
+and the caller part of R132, the frozen-trait record and the pending-message,
+run-order and retry-text decisions belong to issue 109 and are in "T8 consumer
+contracts (issue 109)" below; this name reconciliation changes none of them. Full
+T8 acceptance still requires the accepted operational integration and issue
+109's consumer dispositions. macOS is tracked in After 2.0 under the owner's
+Linux-only direction through 2.0.
+
+### T8 consumer contracts (issue 109)
+
+[ADR 0020](../decisions/0020-storage-consumer-contracts.md) records the decisions, and the spec's "T8 consumer-contract
+amendment (issue 109)" states the contract. They add `Filter::PendingMessages { recipient, now }`,
+`Sort::Attempt` (per task only) and whole `Retry.error` text through the blob store (as ordered chunks above one 64 MiB
+object), and
+`docs/TRAITS-FROZEN.md` records the landed v2 signatures beside them. `main` at `07b5f967` has none of the three. The
+change that carries this section implements them on the memory fake and the file reference and registers the shared
+tests on both; the SQLite representation and every runtime caller stay with the owners in the table at the end of
+this section. A test result is a receipt of that change's PR, not a statement of this plan.
+
+**Verification names for R7, R117 and the caller part of R132.** Use the same procedure as the crosswalk above: list
+the bare filter, require every registration, run it, and require that many passing tests with none failed or
+ignored. Each of the three entity registrations is `memory_v2`, `queued_memory_v2` and `file_v2`.
+
+| Requirement | Bare filters (actual test names) | Expected registrations per filter |
+|---|---|---|
+| R7 | `unit_of_work_keeps_nothing_after_an_error`, `a_failed_unit_of_work_keeps_no_setting_or_template_row_or_position` | 3 entity references |
+| R7, writer process crash | `cargo test -p orch-infra --test sqlite_crash -- kill_before_commit_keeps_nothing` (also `kill_at_body_return_commit_boundary_keeps_nothing` and `kill_after_commit_receipt_keeps_all_changes`) | one test each; this is the production writer's process-crash boundary, not the SQLite adapter's port-level run, which T10 registers |
+| R117 | `two_task_ids_that_differ_only_in_case_are_refused`, `task_ascii_aliases_are_refused_without_rewriting_ids`, `task_lookups_stay_exact_to_the_byte`, `only_task_ids_fold_and_only_the_ascii_letters` | 3 entity references |
+| R117, schema | `cargo test -p orch-infra --test sqlite_schema -- task_ids_are_unique_under_ascii_case_only_within_a_project` | one test |
+| R132, caller fields | `caller_selects_the_project_and_keeps_the_principal` (a task principal's lineage and epoch come back unchanged from both entry points) | 3 entity references |
+| Consumer contracts (ADR 0020 decisions 1 and 2) | `pending_messages_filter_status_recipient_and_lexical_expiry`, `pending_messages_page_matches_before_count_cursor_and_bound`, `run_attempt_order_is_numeric_task_scoped_and_keeps_default`, `run_attempt_pages_keep_snapshot_and_bind_every_query_field`, `run_attempt_sort_refuses_every_unscoped_or_other_family_filter` | 3 entity references each, 15 in all |
+| Whole retry text, conformance (decisions 3 and 4) | `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original`, `retry_chunked_text_survives_restore_without_a_run` | 3 retry references each: `memory_retries_v2`, `blob_memory_retries_v2`, `file_retries_v2` |
+
+The importer-side R117 rule has an existing unit test in `orch-infra`'s library:
+`import::preflight::tests::two_task_ids_that_differ_only_in_case_are_refused_before_any_write`. The command-level import, export and restore tests that R117 names, and the lineage tests
+of R132 (`leases`, `restore_fencing`), do not exist yet and stay with T21, T12, T13 and T23.
+
+The R7, R117 and R132 rows above are the 12 selections the integration task lists (`--list`) and then runs, each
+required to select its expected count with none failed or ignored: the seven conformance filters (3 registrations
+each), the three `sqlite_crash` selections, the `sqlite_schema` selection and the importer's unit test (one test
+each). The integration task ran them once on Linux, before the head was frozen, and each selected its expected count
+and exited 0; the receipt is private to the task, the PR's manifest names the head it belongs to, and a reviewer or
+the gate repeats them there. The spellings were also checked against the test sources and against a listing of the
+conformance suite on `07b5f967`. A selection that matches zero tests, or ignores one, fails verification.
+
+The last row of the table above is three scenarios of the retry suite. The suite has 21 scenarios on each of its three
+registrations (63 tests); the three new ones, `retry_chunked_text_survives_restore_without_a_run`,
+`retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` and
+`retry_whole_text_replacement_rolls_back_and_snapshots_keep_original`, are the first three it registers in
+`storage_contract/retries_v2.rs`, and `blob_memory_retries_v2` is a registration that did not exist on `main`. The
+#130 crosswalk table above does not list the retry suite, so its inventory is unchanged.
+
+**Retry text above one blob object (ADR 0020 decision 4).** The reference implementation meets this mapping and is
+accepted only with these focused Linux checks on both references. Each check is one named test; the integration task
+records its commit, count and platform, and an empty or ignored selection fails it. The tests are in two places:
+the retry suite of `storage_conformance` (`-p orch-engine --test storage_conformance -- <filter>`, 3 registrations
+each), the `orch-infra` library (`-p orch-infra --lib -- storage::v2::tests::<name> --exact`, which must execute
+one test) and one private unit test of `orch-core`
+(`-p orch-core --features test-support --lib -- store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read --exact`,
+which must execute one test; the module exists only with the `test-support` feature). "Both" in the last column
+means the file reference and the disk-backed fake. The memory fake is *logical* by default (whole strings) and
+*disk-backed* with `FakeStorage::with_retry_blob_store`; a check about publication or damage is carried only by the
+disk-backed form and the file reference.
+
+| Check | What it shows | Test | References |
+|---|---|---|---|
+| 65,536 and 65,537 bytes | Inline, then one blob object named by the row's hash | `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` (conformance); `retry_text_boundary_is_backed_before_the_hash_row_and_reopens_whole` (backing) | the 3 retry registrations; file only |
+| 67,108,864 and 67,108,865 bytes | One object at the limit; chunks and a whole-value hash one byte above it | `retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified` | both |
+| A character split across a chunk boundary | The joined bytes decode only after the whole-value hash matches | same test (the 67,108,865-byte text ends in a two-byte character cut by the boundary) | both |
+| A retry with no run | The whole text is the retry's own, never the run's | `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` | the 3 retry registrations |
+| A text above one blob object, then a restore | A fixture lineage switch (`restore_to_lineage`: leases end, counters stay) leaves the 67,108,865-byte text whole on `read_retry`, `read_due_retries` and a complete walk; it is not a backup copy | `retry_chunked_text_survives_restore_without_a_run` | the 3 retry registrations (the logical fake keeps a whole string) |
+| Failure on a later chunk after an earlier chunk was published | The previous row reads back whole, also after the caller catches the error and commits other work | `retry_later_chunk_failure_keeps_prior_row_and_earlier_published_bytes` | both |
+| A publication refused or damaged at read-back | The previous row stays whole when the caller catches the error and commits | `retry_publication_refusal_preserves_prior_rows_even_when_caught_on_both_references` | both |
+| A missing and a corrupt blob after commit | An error on `read_retry`, `read_due_retries`, `read_retries`, `get_retry`, `due_retries` and `list_retries`; the document is unchanged | `retry_missing_and_corrupt_blobs_fail_all_read_paths_on_both_references` | both |
+| A missing and a corrupt chunk of a text above one object | The tail chunk damaged, then removed: an error on the same six reads each time, with the file restored between | `retry_object_limit_is_not_a_diagnostic_cap_and_chunk_order_is_verified` | both |
+| A reordered chunk mapping | An error ("reconstructed retry does not hash") on the same six reads when two chunk entries of the file reference's document are swapped; for the disk-backed fake the private mapping is swapped and `get`, `due` and `page` of its private retry state, which every port read calls, each fail | the object-limit test (file reference only); `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read` (disk-backed fake's private state, with a reversible text-name double for its blob store: it proves the whole-value hash guard, not hashing or damage) | as stated |
+| Identical chunks at two positions | The mapping keeps both positions (the file reference's has three entries) | `retry_repeated_chunks_reconstruct_every_occurrence_on_both_references` | both |
+| Replacement, long and short | A rolled-back replacement and a held snapshot keep the original; then long to short and short to long each read back | `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original` | the 3 retry registrations |
+| Rollback of a unit that published | The earlier row stays, the rolled-back task reads as none, and the published 65,537-byte object is still on disk at its hash path with no row naming it (the sweep is not exercised) | `retry_rollback_keeps_published_bytes_without_a_reference_on_both_backed_references` | both |
+| An existing single-object row | A hand-made `{"sha256": H}` row (65,538 bytes of two-byte characters; no earlier release wrote one) reads whole on `read_retry`, `read_due_retries` and `read_retries` after a reopen, the reads leave the document's bytes unchanged, an extra field in the request-key collection wrapper does not prevent the reopen, and a stored request key still replays | `retry_existing_single_object_encoding_and_wrapper_extensions_remain_readable` | file only |
+| Selection before resolution | A healthy row plus a damaged row (blob removed) with a later deadline or past the limit: due reads at a fixed `now` and at limit 1 and the first page succeed on the snapshot and the unit of work; the damaged row's point read and the page that reaches it fail; on a current-thread runtime a blob-store guard fails a snapshot read that reads a blob on the executor thread (the three async reads run on the blocking boundary) | `retry_selection_does_not_resolve_excluded_damaged_rows_on_both_references` | both |
+| An unknown field in a stored text | A hand-edited single or chunked mapping with an extra field fails the document's load as a parse error and its bytes are unchanged | `retry_stored_text_unknown_fields_are_refused_for_single_and_chunked_objects` | file only |
+| Physical backing | The objects exist, and the file reference's document holds `{"sha256": H}` or `{"sha256": H, "chunks": [...]}`; the disk-backed fake's objects are read from the blob store, its mapping is private | the boundary, object-limit, later-chunk and repeated-chunk tests above | as stated |
+
+Selections and expected counts. Each conformance filter above must select 3 tests and each `-- <name> --exact`
+selection of `orch-infra` or `orch-core` exactly 1, with none failed or ignored. When the whole suites are run at the
+head that completes this change, the expected totals are 332 tests for `storage_conformance` (the retry suite is 63 of
+them) and 55 for `cargo test -p orch-infra --lib -- storage::v2::tests`; a later test changes these numbers. These are
+the numbers to expect, not results: a result is a receipt of the PR, which names its head, and the runs of a head
+that was not the final one prove nothing about it.
+
+Not proved by any test of this change: the SQLite representation (T10); the blob store's sweep (the rollback test
+shows that published bytes survive, not that the sweep later removes them, and its object is a single object, not a
+chunk); a missing or corrupt chunk on the logical fake, which has none; a crash between publication and commit; a
+restore that copies files, because the restore of the chunked scenario is the fixture's lineage switch (T23); and a 1.0
+import (T21). The single-object row is a documented-form fixture and not a row an earlier release wrote. The executor guard covers the
+three async snapshot reads only; it says nothing of a daemon path. Mutation checks to run on the final head, whose results
+are the PR's receipts: resolving every row before the filter and the limit in either reference fails the selection test;
+removing the unknown-field refusal of the stored mapping fails the unknown-field test; calling a blocking retry read
+directly in an async method fails the guard.
+
+This is reference-port proof only. It gives no measurement above 64 MiB beyond these boundaries and accepts none of
+T10, T12, T21 or T23. T10 repeats the physical checks on SQLite. T21 rebuilds an imported 1.0 error into the same
+representation. T23 carries every reachable chunk, in order, with the whole-value hash, through backup, restore,
+export and import. The memory fake comes in two forms because `orch-core` cannot depend on `orch-infra`: the default
+`FakeStorage` is logical (whole strings, no blob, no claim about backing or publication), and
+`FakeStorage::with_retry_blob_store` takes the real blob port (the disk adapter in the conformance fixture) so that
+publication, a missing blob and a corrupt blob can be exercised. The logical fake proves the port's logical rules;
+only the disk-backed fake and the file reference prove publication and damage.
+
+**What each consumer keeps.** The reference tests prove the port, not the runtime, and no row below is accepted by
+them.
+
+| Owner | Obligation | Source |
+|---|---|---|
+| T10 | SQLite representation: the retry blob and chunk mapping (publish first, whole text, whole-value hash and ordered chunks above 64 MiB, unchanged row on a missing or corrupt blob or chunk), SQLite parity for the physical checks above, the pending-message statement (`status`, exact recipient, `expires_at IS NULL OR expires_at >= ?now`, text comparison, filter before count and cursor), an index for `Sort::Attempt` (attempt descending, id ascending; it also serves the default of a run list whose filter names a task, which is the same key; the existing task page helper under `crates/orch-infra/src/sqlite/` handles tasks only and answers `Sort::Attempt` with `InvalidPage`), adapter registration of the retry, message and run scenarios (the five consumer scenarios and the three retry scenarios), the full-scope tie order of `delete_expired_request_keys` for rows that share an expiry (equal-expiry rows are not ordered by any reference test; tracked in issue 127), and an independent due-read test: after the enlarged complete-read restore, compare the first 1,000 expected rows of a due read at `i64::MAX` through its own SQL statement (the reference queries share a loader, so the walk does not prove it). Update the crosswalk's expected registrations when SQLite joins | ADR 0020; issue 109 (N-a); issue 127 (PR 171 N1); crosswalk |
+| T17, T18 | Derive a principal's kind from its persisted identity: the request-key scope has no kind field, so an owner and a worker session of one identity and project share a scope and a task principal differs from them only by its run and epoch | The spec's request-keys amendment (issue 109, PR 171 N4) |
+| T12 | `put_retry` after `get_retry` (1.0 enqueue was first-wins) in one unit of work (the shared scenario only models two enqueue calls with that guard); a finish that writes the retry row, the task status and the lease release together; lease-bound finish and restart fencing (R36, R132, run through issue 110); a finish of a long error whole | ADR 0020; R35, R36 |
+| T13 | Generations and recovery (R41) and the Linux sleep and wake fencing check (R42, issue 110, pending) | R41, R42 |
+| T14 | `retry_pending` gating per task; dispatch in candidate order and agent rotation, never due-row order | retries module |
+| T21 | A 1.0 retry deadline that does not parse becomes due, and the dry run counts it; the whole 1.0 error is imported (R97), rebuilt into the same chunk representation when it exceeds one blob object | R65, R69, R97 |
+| T23 | Durable restore with a new lineage, with the open point AP14 (a backup's workspace names); a whole retry export and import round trip including blob-backed text and every reachable chunk, its order and the whole-value hash, through backup, restore, export and import | R117, R132, R138 |
+| T27 | The second-host peer check on Linux (R89) and the recorded named checks of the crosswalk, rejecting an empty or ignored selection | R89 |
+
+Follow-ups kept with their owners from the review of #191 (none is a contract waiver): N-a above (T10), N-b the
+move of the retry entry into `CHANGELOG.md`'s existing "Storage groundwork" section with the statement that no daemon
+consumer is activated (not done in this change: a pull request no longer edits `CHANGELOG.md`, so it stays
+open for the release PR's hand edit of the legacy `[Unreleased]` text; this change adds no fragment, because the inactive port contracts
+change nothing a user can notice), N-c `docs/ARCHITECTURE.md`'s store module inventory names `blob` (done in this change).
+
+Request-key follow-ups of PR 171 (issue 109 comment of 2026-11-23), dispositions in the spec's request-keys amendment:
+N1, the tie order of rows with equal expiry on SQLite, stays with T10 and issue 127. N2 is met in the reference: the
+persisted epoch ceiling is the `i64::MAX` that `RequestScope::of` applies, and the collection wrapper ignores an unknown
+field while a row denies one. N3 is a writer's note, not a change: the persisted check needs the one-hour TTL, so a
+change of `KEY_TTL_MS` migrates or reconciles earlier rows in the same change. N4 is met by a corrected test comment
+and the T17 and T18 obligation above. N5 is met: a negative time is refused on the lookup path as on the store path.
 
 ### Reference order
 
@@ -247,9 +378,19 @@ names a task (alone or beside an agent) is ordered by numeric `attempt` descendi
 text descending, then the id; a goal list by status rank, presence of `updated_at` (a present empty text before an
 absent one), the original `updated_at` text descending, `position`, then the id.
 
-The change that makes the memory and file references meet them and strengthens the shared scenarios is its own small PR,
-reviewed and qualified on its own. It lands in the same train as this paragraph. This plan records the contract; whether
-a reference meets it is shown by that PR's exact-head hosted Linux check and test, not by this text.
+PR #225 (squash `af0d43acd`, 2026-11-23) carried the reference code and the first text of this paragraph together. The
+memory fake, its queued variant and the file reference meet the orders: the shared scenarios
+`message_and_run_filters_stay_within_their_family` and `declared_secondary_sorts_use_values_then_tie_breakers` are
+registered once and run as `memory_v2`, `queued_memory_v2` and `file_v2` (three registrations each), and hosted Linux
+check and test succeeded on the head of PR #225 and on the cumulative `main` push. The goal rule changed code in the
+file reference only, because the memory fake already told a present empty `updated_at` from an absent one.
+
+The explicit sort `Sort::Attempt` (T8 consumer contracts, above) is a separate addition of the change that carries this
+revision, not of PR #225. For a run list whose filter names a task it orders by the same key as the default, so the two
+list the same rows in the same order; with no task it is refused and the default is the `started_at` key.
+
+None of this shows SQLite. T10 registers the same two scenarios, with the five consumer scenarios, on SQLite, and the
+orders are shown there only when those registrations pass.
 
 The two shared scenarios are `message_and_run_filters_stay_within_their_family` and
 `declared_secondary_sorts_use_values_then_tie_breakers`, in
@@ -583,15 +724,28 @@ The public SQLite port awaits accepted T8b and T8c. T12 depends on completion of
 
 **What remains of T10 after the foundation.** The adapter of the Storage v2 port and its conformance run on SQLite;
 bulk identities and the 1,000-row or 20 ms cut (R27); event aggregation into one transaction (R26); intents
-(R28); retry that replays safely and one shared fatal policy by failure class (R128, R140); the checkpoint
+(R28); retry that replays safely and one shared fatal policy by failure class (R128, R140), which includes the latch of a
+fatal cause that a callback catches, the classification of both causes of a failed rollback, and proven `Task` corruption
+(R140, R141); the checkpoint
 connection, its backlog, outcomes and the expiry of long reads (R126, R127, R137); the authorizer and query
 connection (R130); and shutdown integration (R139). The review conditions of the foundation that belong to the
 adapter are tracked in [issue 127](https://github.com/yuxhuang/r-orch/issues/127): detecting transaction control
 in a callback, non-blocking receipt waits on async threads, bounded claim production, and fatal-state handling
 that keeps queue locks free of callbacks. PR 154 delivers two items of that list, the recheck of a request's expiry
-after `BEGIN IMMEDIATE` and writer tests that fail in bounded time. Both are pending its merge. The retry case of
+after `BEGIN IMMEDIATE` and writer tests that fail in bounded time. Both landed on `main` in `8afcbe02` (2026-11-22). The retry case of
 R128, in which a request answered `overloaded` cannot commit later, is still owed at the adapter integration. The
 daemon is wired to this executor only after all of these exist.
+
+**Lease adapter contracts (issue 127 N1 to N4).** #211 and #232 merged the damaged-epoch error, the lane
+mapping and the optional request deadline of the internal SQLite lease adapter, and the spec's "Lease
+adapter contracts" records them with their tests. They are unwired: only the module's tests call the
+adapter. What stays owed, by owner: the engine's start (lane 1) and finish (lane 2) transactions, which
+call the composed lease helpers (T12), and its cancel, pause and permanent-failure transactions, which call
+them on lane 2 (T13); `leases.expire` on lane 1 (T15);
+the `next_epoch` check of `orch db verify` (T22); the structured fatal classification of R128 and R140,
+and the registration of the shared lease suites on SQLite (T10). Open: whether a damaged counter should
+fail the writer, which neither R128 nor R140 says today. Issue 127 stays open until the owner lands these
+rows and the pieces it still names.
 
 ### Goal boundary slice and remaining allocation consumers
 
@@ -615,6 +769,221 @@ Remaining consumer obligations, before activation:
 
 These consumer obligations are pending, not delivered by the goal boundary slice.
 
+### T10 task mapping (format v1)
+
+The inactive SQLite adapter holds goals, leases, run events, request keys and task paging. A task needs the format of the
+spec's "Task format v1 (SQLite)" before its mapping is built: the first migration has no place for a whole `Task`, and
+its R97 text rule has no discriminator for a referenced task text. The lead chose a numbered migration that adds
+`task_details` and `task_blob_refs` over a versioned envelope in a reserved column (ADR 0017 decision 26). This
+section is the plan for that slice and for what other tasks owe it. It changes no row of the task table above.
+
+**Order.** This documentation lands, reviewed, before product code: the spec, this plan and ADR 0017 are the only files
+of its PR. The mapping slice then branches from `main` with the documentation in its history and builds the
+code and tests named in R141. It stays one bounded PR; if it would pass about 3,000 changed lines the split is
+(a) the codec, the migration and inline text, then (b) the references and the physical R97 tests, each leaving `main`
+working. The public cursor wiring and the other entity families keep their own slices, and the mapping hands the
+hydration seam to the slice that wires the public task page, whose tests check the real boundary.
+
+**Obligations, by task.**
+
+| Task | Owes | Check |
+|---|---|---|
+| T10, task mapping | Create, update, delete and move for `Task`; the migration (next free number); hydration in the selecting snapshot or unit of work; the physical R97 mapping; the creator, `landing_state` and attachment-row rules of the spec; the structured `SqliteError::TaskCorrupt`, fatal under R140, classified before any public conversion; the shared entity suites registered on SQLite for tasks | R141's named tests (the corruption ones among them); `cargo test -p orch-infra --test sqlite_task_format --test sqlite_migrations`; the shared suites on the three references and SQLite, none holding a text over 67,108,864 bytes (the file reference refuses one; the split of K >= 2 is checked only by `sqlite_task_format`) |
+| T10, retry mapping | Its own mapping of `retry_queue.error` with the same thresholds and split, and none of this format's tables | The issue 109 tests; independent of R141 |
+| T11 | One change in T11's own file, `crates/orch-infra/src/blob/references.rs`: row-only registration of an object that is already published, callable from `crate::sqlite` (a `pub(crate)` method of `BlobReferences`, or `register` split so that its upsert is `pub(crate)` and the `put` stays out of it). The `blobs` row is the one `register` writes for a prompt (`storage_location = 'disk'`, the object's own size, `unreferenced_since` cleared, refused when an existing row disagrees on size or location), and the method never calls `DiskBlobStore::put`. `register` itself, `store_prompt`, `store_attachment` and the two loaders keep their behaviour. At `07bc81124` `register` is a private method (visible only inside the `references` module) that calls `put` before its upsert, so the mapping cannot call it and could only reach it by publishing every object a second time after the spec's step 2 (a second hash and sync of each object, interleaved with row writes). The blob adapter (`DiskBlobStore::put`, `get`) is otherwise used as it is. The owner is T11; which PR carries the change is open (below) | the existing `blob_store` tests unchanged, plus one new test, not yet written, that row-only registration writes the same row as a prompt's, publishes nothing, and refuses a size or location that disagrees |
+| T12 | Nothing new: a consumer reads a `Task` through the port and never through these tables | the T12 tests |
+| T15 | `blobs.sweep` counts `task_blob_refs.sha256` as a naming row | `maintenance::a_referenced_blob_is_never_deleted`, extended for a task text and a split text |
+| T21 | One codec for every task row; list order, repeats and `Option` presence as the 1.0 document says; the decision and the record for a non-canonical timestamp; `import` and NULL as the creator of a legacy task; 1.0's recorded proof as the task's `proof` in the detail, with `legacy_proof` left NULL; text over 64 KiB as references; no path or hash made from an attachment name | an importer test per case (one asserts that an imported proof reads back through the port and that `legacy_proof` is NULL), and the R97 importer test the spec still lists as pending |
+| T22 | `orch db verify` runs the format's read checks for every task and finds orphan references and details; a live task proved corrupt is `TaskCorrupt` and fails the writer, a corrupt backup or export file refuses the command alone; the views `diag_task_details` (without `detail`) and `diag_task_blob_refs` | the schema's view-listing test; `db_commands` |
+| T23 | A backup and a restore carry every object a reference row names, in one point; an export carries both tables and the objects; an import reconstructs every text and checks its hash; a backup or an export of a live source that proves a task corrupt fails the writer, a corrupt artifact refuses the command and leaves the writer usable | `db_backup_restore`, `db_export_import`; a restore that finds a missing, short or reordered chunk refuses |
+| T27 | Records the named checks as run, with counts, on Linux, and rejects an empty or ignored selection | the verification table |
+
+**Holds that stay.** The file runtime stays until the switch (T24). Nothing here releases a writer-dependent slice, wires
+the daemon or the public cursor, or consumes an unmerged slice: the #109 retry mapping, the attention migration and the
+public cursor slices are used only after they have merged. The independent code review and, for the
+covered surfaces, the security review, the exact-head hosted Linux check and test with a clean merge state, the
+lead's recommendation and the owner's merge apply to the mapping PR as to every PR.
+
+**Settled before code.** The lead decided three write rules on 2026-11-23, and the owner of the attachment path (T11)
+concurred in the third; the spec's section states them and the mapping slice implements them with the tests R141
+names. (1) `create` derives `created_by_kind` and `created_by_run_id` once from the caller's `Principal`: `Owner` is
+`owner`, `Worker` is `daemon`, `Task` is `agent` with the authenticated, fenced run; the importer (T21) records `import`
+separately. (2) A write that leaves `done` preserves `landing_state` byte for byte; completion sets `skipped` only
+over NULL. (3) A revision-checked `delete` removes the task's `task_attachments` rows for the exact project and task in
+its own savepoint, and keeps the `blobs` registrations and object bytes for the sweep (R60). The same text corrects the
+presence rule: `proof` and `workspace_mode` are optional, and `files_changed` is required only inside a present `proof`.
+The mapping slice consumes this correction before it writes any of these columns. Three points remain open: the owner's
+approval of the two tables (O2), given by the merge; the structured classification of the other entities, which issue 127 holds;
+and the carrier of the T11 change in the table above: the mapping's scope is the SQLite source and tests, and
+`crates/orch-infra/src/blob/references.rs` is outside it. Either a small T11 PR with the row-only registration lands first, or the lead
+widens the mapping's scope by that one file and its `blob_store` test. The mapping's references slice (b) cannot write its
+`blobs` rows until one of the two exists. The rule for 1.0's recorded proof is settled as documentation groundwork: the spec's
+"Import rules" sends it to the detail and no longer to `legacy_proof`, the lead ruled on 2026-11-23 that this amendment of the
+approved rule stands, and the owner's merge of this text approves it; the T21 implementation and live-copy access stay held.
+
+**Task corruption, settled before code.** The lead decided on 2026-11-23 what "the typed stored-data error of R140" is. The mapping
+adds `SqliteError::TaskCorrupt { task, check, locator }`: the id the caller asked for, a bounded check code and a bounded
+structural locator, never a value, a raw stored key, a path or a backend message. It is classified before any public
+conversion or diagnostic, and proven logical corruption of live `Task` data is fatal under R140: a present row whose detail is
+missing, an unsupported stored version, an invalid encoding or identity, projection or membership drift, or a proven
+missing or invalid referenced object, found by a live `get`, a page or list, a snapshot or unit-of-work read, or a live
+verification, query, backup or export that validates tasks, returns the failure, discards partial results and trips the
+shared writer failure state until a restart. An absent task, a caller's validation or revision refusal and an admission
+timeout stay ordinary, a transient read or object-access failure alone does not prove corruption (the connection rules of
+R140 apply), and corruption found only in an external import, backup or export artifact refuses that operation and leaves
+the writer usable. On the writer, a fatal cause is latched even if the callback catches it and returns success, and the
+enclosing transaction aborts; an `OperationRollback` is classified in both of its causes, a fatal one on either side wins,
+any failed savepoint rollback forbids the enclosing commit, and an ordinary failure rolled back to its savepoint may be
+caught while unrelated work commits. The writer on `main` does not yet classify or latch (issue 127), so the mapping's
+error integration waits for the shared failure state of the T10 integration and this text releases no code.
+
+### T10 entity format (Agent, Team, Run, Context, Config, Template, Goal)
+
+The task mapping above settles how a `Task` is stored. The other seven families that the entity port holds have the
+same kind of gap (the spec's "Entity format v1 (SQLite)" lists it family by family), and the lead decided on
+2026-11-23 to extend the task format to them as option A of two, in two decisions: Agent, Team and Run, then Context,
+Config, Template and Goal (ADR 0017 decisions 27 and 28). The rejected option wrote a versioned envelope into columns
+that already have a meaning (`agents.config`, `runs.local`, the `value` and `body` columns) and still needed
+metadata, a migration and a second reader. This section is the plan for those two slices. It changes no row of the
+task table above and no line of "T10 task mapping (format v1)".
+
+**Order.** The sequence is fixed and each step waits for the one before it:
+
+1. The task format's documentation, then the task mapping with the shared codec and its migration (the plan's "T10 task
+   mapping (format v1)").
+2. This documentation (the spec, this plan and ADR 0017), written before any code of steps 3 and 4. The first slice's
+   pull request carries it in one commit after the codec's, because the documentation was integrated onto the frozen code.
+3. Agent, Team and Run: one slice, with the first migration of the format (the two tables and the rebuild of `agents`,
+   `teams`, `team_members` and `runs`). It reuses the verified codec of step 1 and does not copy it. Its first delivered
+   slice is an inactive byte codec for the three families, with the R97 tags, the chunked texts and the root reference,
+   and with no table, migration or SQL ("First slice: the byte codec" below); the migration, the SQL operations and the
+   hydration are the next slice. It is not the split named below, because the codec already covers the references.
+4. Context, Config, Template and Goal: one slice, with the second migration (the rebuild of four tables, no new table),
+   reusing the codec and the tables of step 3, and the goal adapter's existing helpers once, without replaying them.
+
+One owner holds the migration registry across steps 1, 3 and 4. A number is allocated on the verified integration base in
+sequence and never reserved by a document; earlier migrations stay byte for byte. Each slice is one bounded PR of about
+3,000 changed lines or fewer; if it would be more, the split is the codec and migration with inline text first, then
+the references and the physical R97 tests, each leaving `main` working. A stack is made only for a real code dependency
+and the whole stack is qualified. The public cursor wiring is not part of either slice: it belongs to its own slice, after PRs 186 and 208 have
+landed. The retry mapping (issue 109) and the attention slice (issue 183) are consumed only after a positive
+owner-landing receipt for each exists.
+
+**Obligations, by task.**
+
+| Task | Owes | Check |
+|---|---|---|
+| T10, Agent, Team and Run | Create, update, delete and move for the three families; the migration; ordinal-keyed members; a numeric `attempt` order for one task's runs; the claim tuple left to the claim path; the prompt slot as a tag, and the prompt helper changed to store and load a prompt through the tag and chunk rows (the helper at the base stores one object of at most 64 MiB); hydration in the selecting snapshot or unit of work; the physical R97 mapping; the shared entity suites registered on SQLite | R142's named tests; `cargo test -p orch-infra --test sqlite_agent_team_run_format --test sqlite_migrations`; the shared suites on SQLite and both references |
+| T10, Context, Config, Template and Goal | The same for the four families; context provenance bound from the caller; the lexical orders on original bytes across indirect keys; positions for context, config and templates; the goal's integration and publication columns kept | R143's named tests; the same commands with `sqlite_context_config_template_goal_format` |
+| T11 | Nothing new: the blob adapter (one object of at most 64 MiB) is used as it is; its prompt helper is changed by T10, not here | `blob_store` unchanged |
+| T12 | The claim path is the only writer of a run's claim tuple, and consumes a run through the port | the T12 tests |
+| T15 | `blobs.sweep` counts `entity_blob_refs.sha256`; `context.expire` is a separate job | `maintenance::a_referenced_blob_is_never_deleted`, extended for each family |
+| T21 | One codec for every entity, never rows inserted by hand; list order, repeats and presence as 1.0 says; the claim tuple of an imported run stays the importer's own rule; position high-water marks initialized and a larger one kept; a time kept as it is | an importer test per case, and the R97 importer test the spec still lists as pending |
+| T22 | `orch db verify` runs the read checks for every entity and finds orphan references, member rows and details; views of the two tables | the schema's view-listing test; `db_commands` |
+| T23 | A backup and a restore carry every object a reference row names, in one point; an export carries both tables, the counters and the positions of emptied families; an import reconstructs every text and checks its hash | `db_backup_restore`, `db_export_import`; a restore that finds a missing, short or reordered chunk refuses |
+| T27 | Records the named checks as run, with counts, on Linux, and rejects an empty or ignored selection | the verification table |
+
+**Holds that stay.** The file runtime stays until the switch (T24). Nothing here wires the daemon or the public cursor,
+releases a slice that depends on the writer, or consumes an unmerged slice. Every hold of the task mapping carries over:
+the typed stored-data error of R140 and issue 127, issues 149, 152, 166, 167, 203 and 209, the signed, time, revision and cursor
+bounds, the writer policy, checkpoint and backlog rules, the contracts of `Send`, the shared conformance suites on SQLite
+and on both references, and the combined crash proof. The first complete frozen storage head goes to the combined crash proof of
+issue 149 and to the check of transaction-local intent reads and retention of issue 167 before any writer-dependent
+work is released. Independent code review
+and, for the covered surfaces, security review, the exact-head hosted Linux check and test with a clean merge state, the
+lead's recommendation and the owner's merge apply to each PR. No release.
+
+**Evidence before code.** The verified documentation commit and its base; the actual codec and the migration head that the
+step builds on, by fetching and checking them, not by a task's status; positive owner-landing receipts for any slice it
+consumes.
+
+**Open before code.** The list "Derived, to be confirmed" and the open points of the spec's "Entity format v1
+(SQLite)": the new column names and the digest columns for an indirect key; the member names of `runs.local`; the size
+of a prompt (whether one over 64 MiB can occur; if not, it is refused instead of chunked); and what T21 keeps of
+`local`'s record of a repeated 1.0 attempt. None changes the format; the first two are settled in the PR that needs them
+and written into the spec before it merges. The run and goal orders are settled; see "Reference order" above.
+
+**First slice: the byte codec (Agent, Team and Run).** The first slice of step 3 is implemented, inactive, in
+`crates/orch-infra/src/sqlite/agent_team_run` (on the corrected head `cae0ca499`: a 502-line module, a 730-line test module
+with 22 tests and a six-line registration in `sqlite/mod.rs`; on the first head `5c3ff60eb`: 561 lines, 568 lines with 15
+tests and the same six lines), in draft PR 251, stacked on the Task codec of PR 226. Nothing calls it, and the daemon still uses file storage. What it is:
+
+- `encode_agent`, `encode_team` and `encode_run` turn the typed domain value into the Task codec's `Detail` record (the
+  JSON inline when it is at most 65,536 bytes, otherwise the same JSON behind root references at locator `''`), and
+  `decode_agent`, `decode_team` and `decode_run` read one back. It reuses `Detail` and the Task codec's text helpers
+  (`publish`, `validate_chunks`, `reconstruct`) and adds no dependency. The strict duplicate-key JSON reader is not
+  written twice: the lead approved on 2026-11-23 (option A) that this module use the Task codec's `UniqueValue`, whose
+  declaration is widened to `pub(in crate::sqlite)` and nothing else of the Task codec changes. The reader keeps
+  integer and floating-point numbers apart, represents `null` explicitly and refuses a repeated key at every depth. What
+  stays in each family is its own driver: the Agent, Team and Run decoder still refuses `null`, a fraction and an
+  exponent spelling (an integer-valued float included) at every place that takes a number, and checks the typed values
+  before it reads a slot object. The approval covers the shared reader only while the family drivers stay separate;
+  a generic driver would be a new decision. The corrected head `cae0ca499` carries this; the module shrank by 59 lines because the local reader was removed.
+- Every string of the three families is an R97 slot: identities, names, times, nested strings, list elements and the
+  names and values of `env`. Numbers and booleans are not. `env` is an array of `[name, value]` pairs. A run's `prompt` is
+  always a tag, an empty one included, naming one zero-byte object. Encoding publishes the objects it needs to the blob
+  store and returns the chunk rows in the `Detail`; it installs no reference row and no `blobs` row, so those objects stay
+  unreferenced, and follow R60, until a caller's transaction registers them.
+- The decoder refuses an unknown or missing key, a `null`, a duplicate key, a wrong type, an integer outside its type, a
+  fraction or an exponent, an inline text over 65,536 bytes, an inline prompt, a reference with inconsistent metadata,
+  rows at a locator that has no tag, and an `env` name that repeats, also when one of the two was behind a tag. It checks
+  the typed inline values and every reference's metadata before it reads any slot object, after it has reconstructed a
+  detail that is itself behind root references, so a damaged inline value or damaged metadata is `Invalid` even when an
+  object is missing or unreadable. An object that cannot be read for an I/O reason (permission denied, for one) is
+  `Access`, not corruption. Neither error holds a value or a path; both name a locator, and an `Invalid` one a check. The classification of either
+  as the typed stored-data error of R140 belongs to the mapping and to issue 127; the module's `FormatError` is internal.
+- The SQL caller owns what the codec does not: the format number, the native projections, the project-scoped reference and
+  `blobs` rows, revision and position, and every check that needs a transaction or a snapshot.
+
+**What was run.** Linux, by the author, from their logs, in this order. The tests first failed to compile (23 errors)
+before the module existed. A first run of the module tests then passed 3 tests; a focused build failed on a borrow error
+in a test, and its fix gave 11 passed. The author's focused run, `cargo test -p orch-infra --lib sqlite::agent_team_run
+--offline -- --test-threads=1`, then passed 15 tests, 0 failed, 0 ignored. After it, a first `cargo clippy` run failed on
+three collapsible `if` statements, they were fixed in the module, and a second `cargo clippy` run on `orch-infra` with
+warnings denied finished without errors. The fix was committed as `5c3ff60eb`. The author's focused run is not logged
+after the lint fix, so the 15 passed of that run cover the tree before it, not `5c3ff60eb`; the head's own results follow. `cargo fmt --check` and `git diff --check`
+are reported by the author to pass, and their logs are not among the records read for this text. The author's `fast` run on the exact head
+`5c3ff60eb` (tree `d3e10509`, clean, unmoved) then passed: 5,470 passed, 0 failed, 7 ignored, all eight steps passing,
+among them the 15 module tests of this slice and the 19 `task_format` tests. Its process exit was 3 by design, because the
+evidence a local `fast` run exports is never qualifying (`qualifying: no`); that is not a failed test and not a gate
+result. The 15 module tests also passed (0 failed, 0 ignored) on `5c3ff60eb` in two focused runs by others: the writer
+of this text ran them with a private home and a build output inside the checkout, and the code reviewer ran them on the
+same head. The writer also ran `import_index_reference` (22 passed, 0 failed) and the changelog check (exit 0) on the
+documentation's tree. The 15 tests are those of `5c3ff60eb`. They are module tests of the library, which R142 does not name:
+`complete_values_preserve_absence_empty_false_order_and_unsigned_limits`,
+`empty_capabilities_are_omitted_and_empty_prompt_is_one_zero_byte_object`,
+`strict_agent_decoder_rejects_unknown_duplicate_null_missing_and_nonintegers`,
+`every_nested_string_uses_original_byte_limits_and_oversized_ids_roundtrip`,
+`aggregate_detail_is_indirect_even_when_every_string_is_small`, `team_and_run_nested_slots_preserve_exact_values`,
+`malformed_detail_and_references_are_refused_with_bounded_diagnostics`,
+`inline_enum_and_counter_damage_is_proven_before_missing_slot_access`,
+`environment_pairs_refuse_duplicates_wrong_shapes_null_and_unknown_nested_fields`,
+`team_and_run_reject_unknown_missing_null_and_wrong_nested_types`,
+`prompt_sizes_short_inline_limit_and_one_more_always_name_verified_objects`,
+`split_utf8_prompt_and_exact_object_limit_reconstruct_from_the_manifest`,
+`repeated_slot_hashes_keep_distinct_locators_and_env_names_are_checked_after_reconstruction`,
+`permission_errors_stay_ordinary_until_metadata_or_inline_types_prove_corruption` and
+`all_statuses_empty_and_present_zero_tokens_remain_distinct`. The split at 67,108,864 bytes is exercised on the prompt only.
+
+The corrected head `cae0ca499` (tree `d54e3c69`, parent `3a7434527`) keeps these 15 unchanged and adds seven, 22 in all, in
+answer to the code review's I1 (test sensitivity): `short_prompt_manifest_damage_is_refused`,
+`oversize_inline_text_inside_indirect_root_is_refused`, `aggregate_exact_boundary`, `inline_prompt_without_refs_is_refused`,
+`oversized_inline_root_is_refused_even_when_all_slots_fit`, `tokens_unknown_fields_are_refused` and
+`shared_reader_keeps_null_fraction_exponent_and_nested_duplicate_refusals`. On Linux, by the fact-checker of this
+documentation, focused runs on that head passed: `agent_team_run` 22 passed, 0 failed, 0 ignored; `task_format` 19 passed, 0
+failed, 0 ignored; and `import_index_reference` 22 passed, 0 failed, 0 ignored. The code's author reports the same 22 and 19, a
+wider `sqlite::` filter at 150 passed and 0 failed, clippy with warnings denied, `cargo fmt --check` and `git diff --check`
+clean, and a `fast` run still in progress when the head was frozen; the author's runs are the author's own. No `fast` or hosted
+result of `cae0ca499` is recorded in this text yet; they are pending.
+
+**What is not done, and still held.** No `sqlite_agent_team_run_format.rs`, no migration test, no migration and no table;
+no native projection, revision, position, claim tuple, hydration in the selecting snapshot or unit of work, create, update,
+delete or move; no prompt-helper change; no Storage method; no shared entity suite registered on SQLite; no importer,
+backup or export work; nothing for Context, Config, Template or Goal. Pending for the slice's final head: independent
+code and security reviews, hosted Linux check and test SUCCESS and CLEAN on that exact head, the lead's recommendation
+and the owner's merge. The slice releases none of the holds listed above; it is not a Storage acceptance and gives no
+credit for R142, R140, issue 127 or any gate line.
+
 ## Status
 
 | Item | State (implemented / verified on <platform> / pending) |
@@ -622,9 +991,12 @@ These consumer obligations are pending, not delivered by the goal boundary slice
 | T1 | first-review text (`f5637805`) implemented in PR 1, `fast` on macOS, and merged to `main` by the owner on 2026-11-21; this corrected text, with the review corrections and the owner's answers, implemented in a follow-up PR that is pending its reviews and the owner's merge. The spec is not approved by either. Since then: the corrected text (`34b3b4d`) reached `main` on 2026-11-22 (UTC) through that follow-up PR, and the deferral of 2026-11-21 (the spec's record I) is implemented in a further documentation PR that is pending its review and its merge. This revision changes no document's status (`draft`, `proposed`) |
 | T4 | dropped as an entry step by the owner on 2026-11-21. The first run of 2026-11-20 is recorded in [issue 98](https://github.com/yuxhuang/r-orch/issues/98) and is not delivered to `main` |
 | T4b | deferred by the owner on 2026-11-21; not run |
-| T10, first slice (writer and read pool) | implemented as an unwired foundation in PR 122 at `63edf0f9`, with its module tests; its Linux CI, independent reviews and the owner's merge are pending, as are the follow-ups of issue 127. The rest of T10 is pending behind T8b and T8c ("T10 split"). The deadline recheck and the bounded writer tests are in PR 154, which is open and pending its Linux CI, reviews and merge |
+| T10, first slice (writer and read pool) | implemented as an unwired foundation in PR 122 (`b67dbfa44`, merged 2026-11-22), with its module tests; the follow-ups of issue 127 are open. The rest of T10 is pending behind T8b and T8c ("T10 split"). The deadline recheck and the bounded writer tests landed in PR 154 (`8afcbe02`, 2026-11-22) |
 | Linux-only scope (the spec's record K) | recorded on 2026-11-23 by one documentation PR that is pending its review and the owner's merge: the spec, this plan, ADR 0017, the lease prototype's spec, the spec TEMPLATE, ARCHITECTURE §13 and AGENTS.md carry it. Nothing was verified on a platform: no code and no CI changed. The first independent review blocked its first head on three points: the Linux sleep/wake check of R42 (issue 110) was withdrawn with the macOS one, R16, R88 and R136 still named macOS, and the branch conflicted with `main`. The text was corrected for them and re-synchronised with `main` keeping the rows of both sides; the corrected text awaits a second review |
+| T10, internal lease adapter (issue 127 N1 to N4) | The damaged-epoch error, the lane mapping and the optional request deadline are merged (#211, #232) and their tests pass on Linux at `af0d43acd` (38 module tests). The spec's "Lease adapter contracts" records them. Unwired: only the module's tests call the adapter, and the daemon uses files. This documentation is pending its Linux CI, its review and the owner's merge. Pending behind it: T12's start and finish transactions, T13's cancel, pause and permanent-failure transactions, T15's lease expiry, T22's `orch db verify`, the R128 and R140 classification, and the SQLite registration of the shared lease suites. Issue 127 is not closed |
 | T10, internal goal adapter | Goal reads, creates, updates, deletes and explicit moves use the executor. Module tests cover transactions, snapshots, reopen and file-reference behavior for supported inputs. Public conformance still requires timestamp and counter compatibility, imported position high-water marks, and text/blob handling. |
+| T10, task format v1 | defined in the spec, this plan and ADR 0017 decision 26 by one documentation PR, with the write rules and the task-corruption rules (`TaskCorrupt`, fatal under R140). PR 226 implements only a first slice: the strict, complete `Task` byte and detail codec (`crates/orch-infra/src/sqlite/task_format`, with the R97 text chunk helper) and the guarded migration 003 (`task_details`, `task_blob_refs`). It is inactive: nothing calls it and the daemon still uses file storage. It is not the split that "T10 task mapping" names under (a) and (b): the codec already covers the reference tags and the root reference, and every SQL operation waits for the next slice. The codec validates the typed task (priority, status, attempts, canonical timestamps) before it reads any slot object, so a damaged inline value is `Invalid` even when a slot's object is unreadable (review finding I4); a detail that is itself behind root references is reconstructed first, because its typed fields cannot be read before that. Verified on Linux by the author's focused runs, whose regression test `typed_damage_is_checked_before_any_slot_object_access` failed before that fix (0 passed, 1 failed) and passes after it: the `task_format` module tests (19 passed, 0 failed, 0 ignored), `sqlite_migrations` (15 passed), `sqlite_schema` (7 passed), `cargo clippy` on `orch-infra` with warnings denied, `cargo fmt --check` and `git diff --check`. Earlier results stay on record: the first head's `fast` run was interrupted (exit 130) after 1,587 passes and 36 failures had been observed, from the umask 0002 fixture of issue 137, and counts as failed and incomplete; a migration test run failed 14 passed and 1 failed, two compile errors (a `usize` type error and a `HookError` error) and a clippy non-octal literal were fixed on the way; the hosted run on the first head was cancelled by the corrective push; the head `eec91899b` passed hosted Linux check and test and was CLEAN, which does not cover any later head. Pending for the final head of PR 226: the terminal delta code and security reviews, hosted Linux check and test SUCCESS and CLEAN on that exact head, the lead's renewed recommendation and the owner's merge; the inactive codec is not a Storage acceptance. Of the tests that R141 names, the two migration tests and the two codec tests on `proof` and `workspace_mode` exist; the codec ones are module tests of the library, not yet in `tests/sqlite_task_format.rs`. Not implemented, built or tested: create, update, delete and move; the `tasks` row, membership and `blobs` projections and their checks on read; hydration in the selecting snapshot or unit of work; `SqliteError::TaskCorrupt`, its classification and the writer latch (issue 127); the Storage port; the shared entity suites on SQLite; the importer and backup obligations. T11 owes one row-only registration change in `blob/references.rs` whose carrier is open, so that each object is published once before its `blobs` row is registered. 1.0's recorded proof is imported into the detail and `legacy_proof` stays NULL, which the lead ruled on 2026-11-23 to stand as documentation groundwork; the T21 implementation and live-copy access stay held. Backend equality is claimed only for texts of at most 67,108,864 bytes; the split of a larger text is checked on SQLite alone (R141). Whether decode shall refuse non-canonical bytes whose length and hash match is open in issue 227; two minor review conditions, the transaction-hook coverage of migration 003 and typed preflight errors under issue 127 and R140, are tracked in issue 229. |
+| T10, entity format v1 (Agent, Team, Run, Context, Config, Template, Goal) | defined in the spec, this plan and ADR 0017 decisions 27 and 28 by the documentation commits that draft PR 251 carries (`67f64741b` and `3a7434527`, between the codec's commit `5c3ff60eb` and the code correction `cae0ca499`). Only the byte and detail codec of the Agent, Team and Run families is implemented, inactive, on a branch stacked on PR 226 ("First slice: the byte codec" above): on Linux, the author's `fast` run on its first head `5c3ff60eb` passed (5,470 passed, 0 failed, 7 ignored, including the 15 module tests), and the writer of this text and the code reviewer each ran the 15 module tests on that head (15 passed, 0 failed). On the corrected head `cae0ca499` the module has 22 tests, and the fact-checker's focused Linux runs passed 22 (`agent_team_run`), 19 (`task_format`) and 22 (`import_index_reference`), 0 failed. Earlier results stay on record: 23 compile errors before the module existed, a borrow error in a test, and three collapsible-`if` clippy errors, all fixed. On `5c3ff60eb` the independent code review and the covered security review each passed with conditions (no product defect; minor conditions tracked in issue 252). Two of the code review's conditions, I1 (test sensitivity) and I2 (the shared duplicate-key reader), were addressed on the corrected head `cae0ca499`: seven added tests and the Task codec's reader reused. The delta code and security reviews, the author's `fast` run and the hosted Linux check and test on the final head, and the lead's recommendation are pending. No table or migration of this format (`entity_details`, `entity_blob_refs` and the rebuilds), no SQL operation in this format, no Storage method and no wiring exists for any family, and nothing of this format exists for Context, Config, Template or Goal; the first migration's tables and the internal goal adapter (the row "T10, internal goal adapter" above) exist and are unchanged by it. Their R142 and R143 tests, and the importer and backup obligations, are pending. The documentation's own checks were the DDL of the new tables and of the claim check on SQLite 3.45 and a throwaway probe of the domain's serde, on Linux. |
 | T2 to T27, except T4 and T4b | pending, as this table stood before 2026-11-21; this revision brings no other row up to date |
 
 ## Test plan
@@ -674,6 +1046,13 @@ These consumer obligations are pending, not delivered by the goal boundary slice
   commit as not yet synced); a start that is killed and run again writes each gap once. The ranges are taken after the writer's
   last transaction, and a start writes no gap row over a committed event (a record with such a range
   is planted).
+- Task corruption and the writer (spec R140, R141): each check of the format's read is planted in turn, and a get, a page,
+  a snapshot, a unit of work and a live backup or verification each return `TaskCorrupt` with no partial page and fail the
+  writer. An absent task, a stale revision, a refused value and an admission timeout do not. A callback that catches a fatal
+  cause still fails the writer and aborts the transaction; a failed operation rollback is classified in both causes and a
+  fatal one wins; a failed savepoint rollback forbids the commit; an ordinary failure rolled back successfully may be
+  caught and unrelated work commits. A corrupt backup, export or import file refuses its command and leaves the writer
+  usable.
 - Other connections (spec R137, R140): a result is injected at the checkpoint, read, query and backup
   connections in turn. Corruption fails the writer from each; other failures are counted and reported at
   their thresholds and do not fail it; each outcome of a checkpoint call is produced from injected counts,
@@ -931,8 +1310,9 @@ the spec's "relative to the project" asks for. The check takes no lock: whoever 
 lock for as long as it relies on an answer (R119 means something only while no 1.0 daemon can rewrite
 `state.json`), and stops it by setting its cancel flag and awaiting the result, because dropping the future
 does not stop the blocking thread. The YAML decode runs on a runtime of the check's own, so a caller's
-blocking pool of one is enough. A task id of `.` or `..` stops the check (R104); template stems are not
-judged, because the spec has no rule for them (tracked, not decided here).
+blocking pool of one is enough. A task id of `.` or `..` stops the check (R104); a template stem is stored as it is when it
+is UTF-8 and stops the check when it is not (issue 192). The check on `main` does not yet refuse one, nor a template
+body that is not UTF-8; the first importer caller of issue 192 adds both refusals, and the spec's R99 names its test.
 
 Where the check goes beyond the spec's wording, it is stricter and says so: a `running` set of `state.json`
 that 1.0 would read as empty because one entry does not decode stops the check, because that set is what
@@ -972,14 +1352,23 @@ For T10 the existing SQL names require `WHERE project_id = ?` and the exclusive
 `(due_at, task_id)` key, `ORDER BY due_at, task_id COLLATE BINARY`, fetching limit+1.
 No index migration is required by this reference change. The shared retry suite
 covers 2,500 rows and a 2,501-row restore containing a whole 65,536-byte UTF-8 error.
-The reference's larger-error refusal does not satisfy or weaken whole-text R97;
-T10/T12/T21 retain blob mapping under #109. T12 retains first-wins enqueue, T21
+The reference's larger-error refusal does not satisfy or weaken whole-text R97:
+[ADR 0020](../decisions/0020-storage-consumer-contracts.md) decides that a retry keeps its whole `error`
+text; the references of `main` at `07b5f967` refused it, and the change that carries this plan changes them to meet it
+(see "T8 consumer contracts (issue 109)").
+T10 owns the SQLite representation of the blob mapping. T12 retains first-wins enqueue, T21
 legacy invalid-deadline handling, and T14 dispatch/rotation order. The historical
 builder's due-only limitation is superseded by the reviewed module contract.
 
-T8 reference acceptance is separate from runtime acceptance: T12 owns Linux
-restart/recovery and lease-bound finish, T13 owns Linux sleep/wake fencing and
-second-host peer verification, and T23 owns durable restore including a new lineage.
+T8 reference acceptance is separate from runtime acceptance, and each runtime check has one owner:
+
+- T12 owns lease-bound finish and restart lease fencing (R36, R132; the runtime proof is issue 110).
+- T13 owns generations and recovery (R41) and the Linux sleep and wake fencing check (R42, issue 110: a real
+  suspend and resume of an isolated Linux host that the owner has authorized; pending).
+- T23 owns durable restore, including a new lineage, and the owner's open point AP14 on a backup's workspace
+  names.
+- T27 owns the second-host peer check on Linux (R89).
+
 macOS compatibility is deferred to After 2.0 and is not a release gate.
 
 ### T10 attention mapping (#183)

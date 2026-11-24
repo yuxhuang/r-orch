@@ -1,0 +1,1 @@
+Add an inactive SQLite codec for complete task records and a migration that refuses to upgrade a database already holding task, dependency, label, scope or attachment rows; the daemon continues to use file storage.
