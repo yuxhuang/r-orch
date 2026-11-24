@@ -566,10 +566,10 @@ fn current_project_lease_fences_task_mutation_in_the_same_writer_transaction() {
                     epoch: lease.epoch,
                 },
             };
-            if case == 2 {
-                if let Principal::Task { task, .. } = &mut caller.principal {
-                    *task = "other".into();
-                }
+            if case == 2
+                && let Principal::Task { task, .. } = &mut caller.principal
+            {
+                *task = "other".into();
             }
             let lineage = if case == 0 {
                 "stale".into()
