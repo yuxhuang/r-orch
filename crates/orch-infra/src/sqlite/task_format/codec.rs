@@ -123,6 +123,74 @@ pub(in crate::sqlite) fn encode(store: &DiskBlobStore, task: &Task) -> Result<De
 /// The caller must verify project-scoped `blobs` metadata in the same snapshot.
 /// This function validates exact locator coverage and immutable object contents.
 pub(in crate::sqlite) fn decode(store: &DiskBlobStore, detail: &Detail) -> Result<Task> {
+    preflight(store, detail)?.decode(store)
+}
+
+pub(in crate::sqlite) struct Prepared {
+    value: Value,
+    tags: Vec<(String, Tag)>,
+    typed: Task,
+    refs: BTreeMap<String, Vec<Chunk>>,
+}
+
+impl Prepared {
+    /// SQL projections omit tagged membership values and use NULL for tagged feedback.
+    pub(in crate::sqlite) fn projection(&self) -> Task {
+        let mut task = self.typed.clone();
+        let tagged: BTreeSet<_> = self.tags.iter().map(|(path, _)| path.as_str()).collect();
+        if tagged.contains("/feedback") {
+            task.feedback = None;
+        }
+        for (path, values) in [
+            ("depends_on", &mut task.depends_on),
+            ("labels", &mut task.labels),
+        ] {
+            let mut index = 0;
+            values.retain(|_| {
+                let keep = !tagged.contains(format!("/{path}/{index}").as_str());
+                index += 1;
+                keep
+            });
+        }
+        if let Some(scope) = &mut task.scope {
+            let mut index = 0;
+            scope.retain(|_| {
+                let keep = !tagged.contains(format!("/scope/{index}").as_str());
+                index += 1;
+                keep
+            });
+        }
+        task
+    }
+
+    pub(in crate::sqlite) fn decode(self, store: &DiskBlobStore) -> Result<Task> {
+        let Self {
+            mut value,
+            tags,
+            refs,
+            ..
+        } = self;
+        for (locator, tag) in tags {
+            let bytes = reconstruct(
+                store,
+                &tag.reference,
+                refs.get(&locator).map(Vec::as_slice).unwrap_or_default(),
+                &locator,
+            )?;
+            let slot = value
+                .pointer_mut(&locator)
+                .ok_or_else(|| invalid("text slot", &locator))?;
+            *slot = Value::String(
+                String::from_utf8(bytes).map_err(|_| invalid("text UTF-8", &locator))?,
+            );
+        }
+        let task: Task = serde_json::from_value(value).map_err(|_| invalid("typed detail", ""))?;
+        validate(&task).map_err(|_| invalid("keys or timestamps", ""))?;
+        Ok(task)
+    }
+}
+
+pub(in crate::sqlite) fn preflight(store: &DiskBlobStore, detail: &Detail) -> Result<Prepared> {
     let bytes = match &detail.inline {
         Some(text) if text.len() <= INLINE_TEXT_MAX_BYTES && text.len() as u64 == detail.bytes => {
             text.as_bytes().to_vec()
@@ -142,7 +210,7 @@ pub(in crate::sqlite) fn decode(store: &DiskBlobStore, detail: &Detail) -> Resul
     if bytes.len() as u64 != detail.bytes || BlobHash::of(&bytes).to_string() != detail.sha256 {
         return Err(invalid("detail length or hash", ""));
     }
-    let mut value = serde_json::from_slice::<UniqueValue>(&bytes)
+    let value = serde_json::from_slice::<UniqueValue>(&bytes)
         .map_err(|_| invalid("strict JSON", ""))?
         .0;
     let mut used = BTreeSet::new();
@@ -194,28 +262,12 @@ pub(in crate::sqlite) fn decode(store: &DiskBlobStore, detail: &Detail) -> Resul
     }
     let typed: Task = serde_json::from_value(typed).map_err(|_| invalid("typed detail", ""))?;
     validate(&typed).map_err(|_| invalid("keys or timestamps", ""))?;
-    // The root necessarily precedes JSON parsing. Slot metadata, reachability
-    // and inline typed values are now proven before opening any slot's object.
-    for (locator, tag) in tags {
-        let bytes = reconstruct(
-            store,
-            &tag.reference,
-            detail
-                .refs
-                .get(&locator)
-                .map(Vec::as_slice)
-                .unwrap_or_default(),
-            &locator,
-        )?;
-        let slot = value
-            .pointer_mut(&locator)
-            .ok_or_else(|| invalid("text slot", &locator))?;
-        *slot =
-            Value::String(String::from_utf8(bytes).map_err(|_| invalid("text UTF-8", &locator))?);
-    }
-    let task: Task = serde_json::from_value(value).map_err(|_| invalid("typed detail", ""))?;
-    validate(&task).map_err(|_| invalid("keys or timestamps", ""))?;
-    Ok(task)
+    Ok(Prepared {
+        value,
+        tags,
+        typed,
+        refs: detail.refs.clone(),
+    })
 }
 
 fn reconstruct(

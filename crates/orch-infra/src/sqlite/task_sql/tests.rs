@@ -3,7 +3,7 @@ use orch_core::store::{Entity, Revision};
 use orch_domain::Task;
 use rusqlite::params;
 
-fn task(id: &str) -> Task {
+pub(super) fn task(id: &str) -> Task {
     serde_json::from_value(serde_json::json!({
         "id": id, "title":"sample", "description":"", "status":"todo", "priority":-3,
         "labels":["b","a","b"], "depends_on":["z","a","z"],
@@ -13,7 +13,7 @@ fn task(id: &str) -> Task {
     .unwrap()
 }
 
-fn conn() -> rusqlite::Connection {
+pub(super) fn conn() -> rusqlite::Connection {
     let c = rusqlite::Connection::open_in_memory().unwrap();
     c.execute_batch(super::super::migrations::INITIAL_SCHEMA)
         .unwrap();
@@ -105,7 +105,7 @@ fn replace_detail(
     }
 }
 
-fn damaged(error: SqliteError, task: &str) {
+pub(super) fn damaged(error: SqliteError, task: &str) {
     match error {
         SqliteError::TaskCorrupt {
             task: actual,
@@ -155,11 +155,31 @@ fn a_task_round_trips_every_field_with_order_repeats_and_presence() {
         passed: false,
         output: "output".into(),
     }]);
-    seed(&tx, &disk, "p", &task);
+    let caller = orch_core::store::Principal::Owner {
+        identity: "owner".into(),
+    };
+    let mut writer = super::writes::TaskWrite::new(
+        TaskSql {
+            tx: &tx,
+            project: "p",
+            disk: &disk,
+        },
+        &caller,
+    );
+    writer.create(task.clone()).unwrap();
     let record = sql.get(&task.id).unwrap().unwrap();
-    assert_eq!(record.entity, Entity::Task(Box::new(task)));
+    assert_eq!(record.entity, Entity::Task(Box::new(task.clone())));
     assert_eq!(record.revision, Revision::ONE);
     assert_eq!(record.position, 1);
+    task.feedback = None;
+    task.scope = Some(Vec::new());
+    task.proof = None;
+    task.workspace_mode = None;
+    writer.update(task.clone(), record.revision).unwrap();
+    let updated = sql.get(&task.id).unwrap().unwrap();
+    assert_eq!(updated.entity, Entity::Task(Box::new(task)));
+    assert_eq!(updated.position, 1);
+    assert_eq!(updated.revision.get(), 2);
 }
 
 #[test]

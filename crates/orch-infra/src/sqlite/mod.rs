@@ -19,6 +19,8 @@ pub enum SqliteError {
     },
     #[error("task object access failed: {0:?}")]
     TaskAccess(std::io::ErrorKind),
+    #[error(transparent)]
+    TaskPublication(crate::blob::BlobError),
     #[error("SQLite counter {name} is missing for project {project} with existing rows")]
     CounterMissing { project: String, name: &'static str },
     #[error("SQLite counter {name} is negative ({value}) for project {project}")]
