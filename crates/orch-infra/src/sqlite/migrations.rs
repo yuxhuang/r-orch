@@ -12,7 +12,8 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
-pub const SCHEMA_VERSION: usize = 2;
+pub const SCHEMA_VERSION: usize = 3;
+pub const TASK_FORMAT: &str = include_str!("migrations/003_task_format.sql");
 pub const ATTENTION_FACTS: &str = include_str!("migrations/002_attention_facts.sql");
 pub const INITIAL_SCHEMA: &str = include_str!("schema.sql");
 
@@ -42,7 +43,7 @@ pub fn migrate(data: &DataDir, conn: &mut ConnectionHandle<'_>) -> Result<()> {
     apply_migrations(
         data,
         conn,
-        &[INITIAL_SCHEMA, ATTENTION_FACTS],
+        &[INITIAL_SCHEMA, ATTENTION_FACTS, TASK_FORMAT],
         DiskSpace::read(data)?,
     )
 }
@@ -79,6 +80,13 @@ pub fn apply_migrations(
     if version == steps.len() {
         return Ok(());
     }
+    // Refuse a known-lossy predecessor before any intermediate migration or
+    // checked copy. Keep the hook too: it is the migration's transactional guard.
+    if version > 0 && steps.iter().skip(version).any(|step| *step == TASK_FORMAT) {
+        refuse_lossy_tasks(conn).map_err(|error| {
+            SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
+        })?;
+    }
     let holds_project = version > 0
         && conn.query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |r| r.get(0))? > 0;
     if holds_project {
@@ -97,7 +105,26 @@ pub fn apply_migrations(
         checked_copy(data, conn, version)?;
     }
     let scripts: Vec<String> = steps.iter().enumerate().map(|(i, sql)| format!("{sql};\nINSERT INTO schema_migrations(version, applied_at) VALUES({}, CAST(unixepoch('subsec') * 1000 AS INTEGER));", i+1)).collect();
-    let migrations = Migrations::new(scripts.iter().map(|sql| M::up(sql)).collect());
+    let migrations = Migrations::new(
+        scripts
+            .iter()
+            .zip(steps)
+            .map(|(sql, step)| {
+                if *step == TASK_FORMAT {
+                    // A hook with empty SQL checks the predecessor inside the same
+                    // migration transaction, before any schema or ledger change.
+                    let sql = sql.clone();
+                    M::up_with_hook("", move |tx: &rusqlite::Transaction<'_>| {
+                        refuse_lossy_tasks(tx)?;
+                        tx.execute_batch(&sql)?;
+                        Ok(())
+                    })
+                } else {
+                    M::up(sql)
+                }
+            })
+            .collect(),
+    );
     for target in version + 1..=steps.len() {
         migrations
             .to_version(conn, target)
@@ -107,6 +134,34 @@ pub fn apply_migrations(
         // Every migration has already committed. Cleanup cannot undo it or
         // truthfully turn that success into a migration failure.
         tracing::warn!(%error, "could not prune old pre-migration copies after migration committed");
+    }
+    Ok(())
+}
+
+// No predecessor task can recover ordered duplicates, absent lists, workspace
+// or proof. Do not fabricate a backfill from the value-keyed memberships.
+fn refuse_lossy_tasks(tx: &Connection) -> rusqlite_migration::HookResult {
+    let mut counts = Vec::new();
+    for table in [
+        "tasks",
+        "task_dependencies",
+        "task_labels",
+        "task_scopes",
+        "task_attachments",
+    ] {
+        let count: i64 =
+            tx.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
+        counts.push((table, count));
+    }
+    if counts.iter().any(|(_, count)| *count != 0) {
+        let summary = counts
+            .iter()
+            .map(|(table, count)| format!("{table}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(rusqlite_migration::HookError::Hook(format!(
+            "task format v1 refuses ambiguous predecessor rows: {summary}"
+        )));
     }
     Ok(())
 }

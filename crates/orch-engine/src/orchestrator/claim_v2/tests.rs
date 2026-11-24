@@ -1,6 +1,7 @@
 use super::*;
 use orch_core::store::fake::FakeStorage;
 use orch_domain::{AgentStatus, Task};
+use orch_infra::storage::v2::FileStorage;
 
 fn caller() -> Caller {
     Caller {
@@ -87,12 +88,16 @@ async fn success(storage: &dyn Storage) {
     };
     assert_eq!(task_data.status, TaskStatus::InProgress);
     assert_eq!(task_data.attempts, 1);
+    assert_eq!(task_data.updated_at, "1970-01-01T00:00:01.234Z");
+    assert_eq!(task_data.created_at, "old");
     assert_eq!(task_data.assignee.as_deref(), Some(lease.agent.as_str()));
     assert_eq!(task.revision.get(), 2);
     let Entity::Run(run_data) = &run.entity else {
         panic!("run")
     };
     assert_eq!(run_data.status, RunStatus::Preparing);
+    assert_eq!(run_data.started_at, "1970-01-01T00:00:01.234Z");
+    assert!(run_data.finished_at.is_none());
     assert_eq!(run_data.attempt, task_data.attempts);
     assert_eq!(run_data.task_id, lease.task);
     assert_eq!(run_data.agent_id, lease.agent);
@@ -110,6 +115,73 @@ async fn success(storage: &dyn Storage) {
 #[tokio::test]
 async fn selected_task_agent_and_preparing_run_commit_together_in_memory() {
     success(&FakeStorage::default()).await;
+}
+
+#[tokio::test]
+async fn selected_task_agent_and_preparing_run_commit_together_on_files() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(root.path());
+    success(&storage).await;
+    let committed = state(&storage).await;
+    drop(storage);
+    assert_eq!(state(&FileStorage::new(root.path())).await, committed);
+}
+
+// Backend-neutral scenarios stay here so SQLite can register the same checks
+// once its reservation prerequisites are accepted (#157).
+async fn approval_refusal(storage: &dyn Storage) {
+    seed(storage).await;
+    storage
+        .transaction(caller(), Lane::Entities, |unit| {
+            let mut row = unit.get(EntityKind::Task, "task-selected")?.expect("task");
+            let Entity::Task(task) = &mut row.entity else {
+                panic!("task")
+            };
+            task.labels.push("awaiting-approval".into());
+            unit.update(row.entity, row.revision)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let before = state(storage).await;
+    let mut req = request();
+    req.task_revision = Revision::ONE.next().unwrap();
+    assert_eq!(
+        claim(storage, caller(), req.clone()).await.unwrap(),
+        ClaimResult::Refused(Refusal::TaskUnavailable)
+    );
+    assert_eq!(state(storage).await, before);
+
+    // Removing the hold must leave the first epoch available: refusal cannot
+    // silently consume an epoch even when the visible rows stay unchanged.
+    storage
+        .transaction(caller(), Lane::Entities, |unit| {
+            let mut row = unit.get(EntityKind::Task, "task-selected")?.expect("task");
+            let Entity::Task(task) = &mut row.entity else {
+                panic!("task")
+            };
+            task.labels.clear();
+            unit.update(row.entity, row.revision)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    req.task_revision = req.task_revision.next().unwrap();
+    let ClaimResult::Reserved { lease, .. } = claim(storage, caller(), req).await.unwrap() else {
+        panic!("claim after approval")
+    };
+    assert_eq!(lease.epoch, 1, "refusal must not consume an epoch");
+}
+
+#[tokio::test]
+async fn awaiting_approval_refuses_without_changes_in_memory() {
+    approval_refusal(&FakeStorage::default()).await;
+}
+
+#[tokio::test]
+async fn awaiting_approval_refuses_without_changes_on_files() {
+    let root = tempfile::tempdir().unwrap();
+    approval_refusal(&FileStorage::new(root.path())).await;
 }
 
 #[tokio::test]
@@ -210,7 +282,7 @@ async fn rollback(storage: &dyn Storage) {
             Err(StoreError::CounterExhausted)
         })
         .await;
-    assert!(result.is_err());
+    assert!(matches!(result, Err(StoreError::CounterExhausted)));
     assert_eq!(state(storage).await, before);
     let ClaimResult::Reserved { lease, .. } = claim(storage, caller(), request()).await.unwrap()
     else {
@@ -222,6 +294,12 @@ async fn rollback(storage: &dyn Storage) {
 #[tokio::test]
 async fn error_after_all_writes_rolls_back_task_run_lease_and_epoch_in_memory() {
     rollback(&FakeStorage::default()).await;
+}
+
+#[tokio::test]
+async fn error_after_all_writes_rolls_back_task_run_lease_and_epoch_on_files() {
+    let root = tempfile::tempdir().unwrap();
+    rollback(&FileStorage::new(root.path())).await;
 }
 
 #[tokio::test]

@@ -1,0 +1,1 @@
+{"type":"step_finish","part":{"type":"step-finish","reason":"tool-calls","model":"synthetic/model","tokens":{"input":400,"output":100,"reasoning":0,"cache":{"read":40,"write":0}}}}
