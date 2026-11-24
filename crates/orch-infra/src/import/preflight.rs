@@ -16,11 +16,18 @@
 //! stops a check by setting `Options::cancel` and awaiting the result: dropping the
 //! future does not stop the blocking thread.
 //!
+//! `config.yml` and the five `_index.json` files are classified on the bytes already
+//! measured, by the contract of C-V1 to C-V14 and X-V1 to X-V14. The report carries the
+//! effective `run_cap`, a bounded preview of the order, the size of the unknown keys, and
+//! whether the owner must confirm preapproval. Each is a preview: input alone never grants
+//! trust (R93, R133), and a durable caller repeats the checked reads under its own lock.
+//!
 //! Left to the slices that wire what they depend on, and listed here so that nothing
 //! reads this module as a finished importer:
-//! - `config.yml` and each `_index.json` get the file-kind, byte, I/O and budget stops
-//!   only. Their classes (C-V1 to C-V14, X-V1 to X-V14) wait for the #146 proof.
 //! - nothing is written: no database, no blob, no `.orch-project`, no resume.
+//! - nothing outside the tests calls this check: no `orch import` command, and the lock
+//!   held across it and the cancellation of a blocked read wait for the first caller
+//!   (#192).
 mod check;
 mod inflight;
 mod names;

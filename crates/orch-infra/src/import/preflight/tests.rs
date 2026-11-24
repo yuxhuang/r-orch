@@ -168,11 +168,10 @@ async fn the_generated_corpus_passes_and_the_check_changes_nothing() {
     assert_eq!(c.indexes, 5);
     assert_eq!((c.claimed, c.retry_entries, c.running), (0, 1, 0));
     // 1.0's own `.index.lock` files have no rule in R99 and are named, not read.
-    assert!(
-        notes(&report)
-            .iter()
-            .all(|(_, rule)| *rule == "not_imported")
-    );
+    assert!(notes(&report).iter().all(|(_, rule)| matches!(
+        *rule,
+        "not_imported" | "unknown_config" | "preapproval_confirmation"
+    )));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -193,7 +192,9 @@ async fn every_source_path_is_accounted_for() {
         [
             ("mystery", "not_imported"),
             ("mystery.txt", "not_imported"),
-            ("tasks/readme.txt", "not_imported")
+            ("tasks/_index.json", "index_unreadable"),
+            ("tasks/readme.txt", "not_imported"),
+            ("config.yml", "config_default")
         ]
     );
     assert_eq!(report.counts.left_in_place, 5);
@@ -321,7 +322,11 @@ async fn a_workspace_under_another_spelling_of_a_task_id_is_refused_unopened() {
     assert_eq!(report.refusals.listed[0].observed.as_deref(), Some("tsk_a"));
     assert_eq!(
         notes(&report),
-        [("workspaces/stray", "workspace_unclaimed")]
+        [
+            ("tasks/_index.json", "index_unreadable"),
+            ("config.yml", "config_default"),
+            ("workspaces/stray", "workspace_unclaimed")
+        ]
     );
     assert_eq!(report.counts.workspaces_listed, 4);
 }
@@ -443,7 +448,8 @@ async fn an_event_stream_is_counted_and_unusable_lines_are_one_gap() {
         notes(&report),
         [
             ("runs/run_a.jsonl", "run_event_gaps"),
-            ("runs/run_b.jsonl", "run_event_gaps")
+            ("runs/run_b.jsonl", "run_event_gaps"),
+            ("config.yml", "config_default")
         ]
     );
 }
