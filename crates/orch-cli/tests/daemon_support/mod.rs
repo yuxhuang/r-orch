@@ -512,10 +512,10 @@ pub struct Proc {
 }
 
 pub fn process_table() -> Vec<Proc> {
-    let out = Command::new("/bin/ps")
-        .args(["-axo", "pid=,ppid=,pgid=,command="])
-        .output()
-        .expect("ps runs");
+    let mut cmd = Command::new("/bin/ps");
+    cmd.args(["-axo", "pid=,ppid=,pgid=,command="])
+        .process_group(0);
+    let out = output_with_deadline(cmd, CALL);
     assert!(out.status.success());
     text(&out.stdout)
         .lines()
