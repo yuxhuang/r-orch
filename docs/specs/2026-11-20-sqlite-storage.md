@@ -1983,8 +1983,8 @@ and the meaning and the report below are the rule.
   refused the same way. A restart is the only way out. No attention item is added (R81).
 - *The latch is checked first.* A request whose transaction was ended under it would be answered `TransactionAborted`;
   when the latch is set, it is answered `storage_unavailable`.
-- *No recovery.* The writer runs no further statement on that connection for any request. It does not reopen the
-  connection and does not retry the rollback. The owner was also offered the reopening and a mapping of a panic of the
+- *No recovery.* The writer runs no further statement on that connection for any later request. It does not reopen
+  the connection. The owner was also offered the reopening and a mapping of a panic of the
   writer's thread to `storage_unavailable`, and chose neither (record L). A panic is neither mapped to this cause nor to
   any other by this text.
 
