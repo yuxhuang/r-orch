@@ -103,6 +103,12 @@ fn filter() -> Filter {
 
 #[test]
 fn caught_task_get_and_unit_of_work_corruption_abort_every_enclosing_write() {
+    for operation in 0..4 {
+        caught_task_corruption_aborts_enclosing_write(operation);
+    }
+}
+
+fn caught_task_corruption_aborts_enclosing_write(operation: u8) {
     scenario(|data, handle, state, disk| {
         seed(handle, disk, state, true);
         let disk = disk.clone();
@@ -112,10 +118,21 @@ fn caught_task_get_and_unit_of_work_corruption_abort_every_enclosing_write() {
             let mut write =
                 TaskWrite::new(sql(tx, &disk, &observed, FailureSource::Writer), &caller);
             write.create(task("before"))?;
-            assert!(matches!(
-                sql(tx, &disk, &observed, FailureSource::Writer).get("b"),
-                Err(SqliteError::TaskCorrupt { .. })
-            ));
+            if operation != 0 {
+                tx.execute(
+                    "UPDATE tasks SET revision=0 WHERE project_id='p' AND id='b'",
+                    [],
+                )?;
+            }
+            let result = match operation {
+                0 => sql(tx, &disk, &observed, FailureSource::Writer)
+                    .get("b")
+                    .map(|_| ()),
+                1 => write.update(task("b"), Revision::ONE).map(|_| ()),
+                2 => write.move_to_end("b", Revision::ONE).map(|_| ()),
+                _ => write.delete("b", Revision::ONE),
+            };
+            assert!(matches!(result, Err(SqliteError::TaskCorrupt { .. })));
             assert!(matches!(
                 write.create(task("after")),
                 Err(SqliteError::StorageUnavailable(_))
