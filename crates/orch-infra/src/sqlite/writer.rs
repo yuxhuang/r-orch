@@ -6,6 +6,11 @@
 //! earliest deadline, a bounded queue, a request deadline checked before BEGIN and
 //! again once BEGIN IMMEDIATE holds the reservation, rollback of a failed or
 //! panicking body, and admission closure on `close` or on dropping the last handle.
+//! It also keeps a request atomic whatever its callback does (see `Gate`): a commit
+//! that is not the executor's own is refused by SQLite, and a request whose
+//! transaction ended before the callback returned (SQLite's own rollback, a
+//! callback's COMMIT or ROLLBACK) answers `TransactionAborted` and commits nothing,
+//! even when the callback swallowed the error and went on.
 //!
 //! It also owns the shared fatal state (`FailureState`, issue 127, R128, R140):
 //! the result of BEGIN, the body, commit and rollback is classified before it
@@ -14,21 +19,32 @@
 //! mutation (every lane, claims included) and a body that returned success after
 //! a fatal cause, or after a failed savepoint rollback, is rolled back, never
 //! committed. The read pool and the checkpoint job report to the same state.
+//! An explicit rollback of the top-level transaction that fails and leaves the
+//! connection inside a transaction latches `FatalCause::RollbackLeftTransactionOpen`
+//! before the request is answered (ruling of issue 127, R128): no further statement
+//! runs on that connection, every queued and later request answers
+//! `StorageUnavailable`, and the worker then ends by a panic, which releases the
+//! write lock the open transaction holds. The latch is checked before
+//! `TransactionAborted` is chosen, so a latched request answers `StorageUnavailable`.
 //!
 //! What it does not enforce, and the adapter integration must (issue 127, R128,
-//! R130): a callback is trusted not to issue COMMIT, BEGIN, SAVEPOINT
-//! control or external side effects, and nothing here detects that it did, or
-//! that a failed rollback left the connection outside autocommit; a callback that
-//! catches an error must report it with `FailureState::observe` before it goes
-//! on; the retry of R128's retryable class and its 60 s and second-`IOERR` fatal
-//! rules are not built; and the producer invariants of R26 (bounded claim
-//! production, event coalescing) are the producer's. Blocking `WriteReceipt::wait`
-//! must not be called on an async runtime thread.
+//! R130): a callback is trusted not to perform external side effects; a callback
+//! that catches an error must report it with `FailureState::observe` before it
+//! goes on; the retry of R128's retryable class and its 60 s and second-`IOERR`
+//! fatal rules are not built; a connection that is still inside a transaction
+//! after a request for a cause other than a failed explicit rollback (a failed
+//! commit, or a request expired after BEGIN, whose rollback leaves it open
+//! latches like any failed rollback) is only a backstop: the worker ends by a
+//! panic, without a latch, and what is queued is answered `WriterClosed`; and the
+//! producer invariants of R26 (bounded claim production, event coalescing) are
+//! the producer's. Blocking `WriteReceipt::wait` must not be called on an async
+//! runtime thread.
 pub(super) mod failure;
 use super::{ConnectionHandle, ConnectionRole, Result, SqliteError, Synchronous, open_connection};
 use crate::data_dir::DataDir;
-use failure::{FailureSource, FailureState};
-use rusqlite::Transaction;
+use failure::{FailureSource, FailureState, FatalCause};
+use rusqlite::{DropBehavior, Transaction};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
@@ -105,6 +121,40 @@ impl<T> Schedule<T> {
     }
 }
 
+/// What the hooks on the writer's connection share with the executor, so that
+/// only the executor's own COMMIT can make a request durable. The callback gets
+/// the transaction itself, and SQLite can end that transaction (a full disk, an
+/// I/O error, `RAISE(ROLLBACK)`) while the callback goes on: its later
+/// statements, and the release of a savepoint it opened, would then run
+/// outside a transaction and commit one by one, whatever the request answers.
+/// Hooks run on the worker's thread inside SQLite's own calls.
+struct Gate {
+    /// Armed only around the executor's COMMIT. The commit hook turns every
+    /// other commit into a rollback and the statement into an error.
+    committing: AtomicBool,
+    /// A transaction ended by rollback since the request began. A rollback
+    /// hook does not run for `ROLLBACK TO`, so a savepoint's rollback is not one.
+    rolled_back: AtomicBool,
+}
+
+impl Gate {
+    fn install(connection: &mut ConnectionHandle<'_>) -> Result<Arc<Self>> {
+        let gate = Arc::new(Self {
+            committing: AtomicBool::new(false),
+            rolled_back: AtomicBool::new(false),
+        });
+        let connection = connection.for_migration();
+        let commit = Arc::clone(&gate);
+        // Returning true turns the commit into a rollback.
+        connection.commit_hook(Some(move || !commit.committing.load(Ordering::SeqCst)))?;
+        let rollback = Arc::clone(&gate);
+        connection.rollback_hook(Some(move || {
+            rollback.rolled_back.store(true, Ordering::SeqCst);
+        }))?;
+        Ok(gate)
+    }
+}
+
 /// Run one admitted request. The deadline is read twice: before BEGIN, to skip
 /// a request that expired in the queue, and again once BEGIN IMMEDIATE holds the
 /// write reservation, because that statement can itself wait up to the busy
@@ -113,8 +163,13 @@ impl<T> Schedule<T> {
 /// commit later (R128). The deadline still does not interrupt a body or commit
 /// that has started. `now` is a seam so tests can place the deadline between
 /// the two reads without timing luck.
+///
+/// The body's work commits only if the transaction it began with is still the
+/// open one when it returns: otherwise whatever is open now is not the
+/// request's, and the answer is `TransactionAborted`.
 fn execute<T>(
     connection: &mut ConnectionHandle<'_>,
+    gate: &Gate,
     state: &FailureState,
     deadline: Option<Instant>,
     now: impl Fn() -> Instant,
@@ -126,31 +181,54 @@ fn execute<T>(
     if expired() {
         return Err(SqliteError::Overloaded);
     }
+    gate.rolled_back.store(false, Ordering::SeqCst);
     state.begin_transaction();
     // T9 configures this connection for BEGIN IMMEDIATE.
-    let transaction = match connection.transaction() {
+    let mut transaction = match connection.transaction() {
         Ok(transaction) => transaction,
         Err(error) => return Err(observed(state, error.into())),
     };
     if expired() {
-        // Dropping the transaction rolls back and releases the reservation.
-        return Err(SqliteError::Overloaded);
+        return Err(abandon(state, transaction, SqliteError::Overloaded).settle(connection, state));
     }
     let value = match work(&transaction) {
         Ok(value) => value,
         Err(error) => {
             state.observe(FailureSource::Writer, &error);
-            return Err(abandon(state, transaction, error));
+            return Err(abandon(state, transaction, error).settle(connection, state));
         }
     };
     // The body may have caught a fatal cause or a failed savepoint rollback and
-    // returned success; so may another connection, since BEGIN.
-    if let Some(error) = state.transaction_must_abort() {
-        return Err(abandon(state, transaction, error));
+    // returned success; so may another connection, since BEGIN. A latched state
+    // is answered as such, before the transaction's own end is: the first check
+    // yields `StorageUnavailable`, the second `TransactionAborted`.
+    let must_abort = state.transaction_must_abort().or_else(|| {
+        // The executor's commit is the only one the hook lets through, so a
+        // transaction that ended since BEGIN was not ended by it.
+        gate.rolled_back
+            .load(Ordering::SeqCst)
+            .then_some(SqliteError::TransactionAborted)
+    });
+    if let Some(error) = must_abort {
+        return Err(abandon(state, transaction, error).settle(connection, state));
     }
-    match transaction.commit() {
+    gate.committing.store(true, Ordering::SeqCst);
+    transaction.set_drop_behavior(DropBehavior::Ignore);
+    let committed = transaction.commit();
+    gate.committing.store(false, Ordering::SeqCst);
+    match committed {
         Ok(()) => Ok(value),
-        Err(error) => Err(observed(state, error.into())),
+        Err(error) => {
+            let error = observed(state, error.into());
+            if connection.is_autocommit() {
+                return Err(error);
+            }
+            // `commit` consumed the transaction, with its drop behavior ignoring:
+            // SQLite left this one open (a busy or refused COMMIT), and the only
+            // rollback is the one made here, once, before the connection is judged.
+            let rolled_back = connection.execute_batch("ROLLBACK");
+            Err(Abandoned::after_rollback(state, error, rolled_back).settle(connection, state))
+        }
     }
 }
 
@@ -159,27 +237,75 @@ fn observed(state: &FailureState, error: SqliteError) -> SqliteError {
     error
 }
 
-/// Roll back, classifying the rollback's own result independently of `error`.
-/// A failed rollback keeps both causes in one `OperationRollback`.
-fn abandon(state: &FailureState, transaction: Transaction<'_>, error: SqliteError) -> SqliteError {
-    // SQLite can end the transaction itself (RAISE(ROLLBACK), a failed statement
-    // under some conflict clauses): there is then nothing left to roll back.
-    if transaction.is_autocommit() {
-        return error;
-    }
-    match transaction.rollback() {
-        Ok(()) => error,
-        Err(rollback) => observed(
-            state,
-            SqliteError::OperationRollback {
-                operation: Box::new(error),
-                rollback,
+/// The end of an abandoned request: its error, and whether its explicit rollback failed.
+struct Abandoned {
+    error: SqliteError,
+    rollback_failed: bool,
+}
+
+impl Abandoned {
+    /// The request's `error` and the result of the rollback made for it. A failed
+    /// rollback keeps both causes in one `OperationRollback`.
+    fn after_rollback(
+        state: &FailureState,
+        error: SqliteError,
+        rollback: rusqlite::Result<()>,
+    ) -> Self {
+        match rollback {
+            Ok(()) => Self {
+                error,
+                rollback_failed: false,
             },
-        ),
+            Err(rollback) => Self {
+                error: observed(
+                    state,
+                    SqliteError::OperationRollback {
+                        operation: Box::new(error),
+                        rollback,
+                    },
+                ),
+                rollback_failed: true,
+            },
+        }
+    }
+
+    /// A failed rollback that leaves the connection inside a transaction fails
+    /// the writer in the shared state before the request is answered (R128). A
+    /// rollback error that leaves the connection outside a transaction does not
+    /// latch. `Transaction` borrows the connection, so this check follows its
+    /// consumption in `abandon`.
+    fn settle(self, connection: &ConnectionHandle<'_>, state: &FailureState) -> SqliteError {
+        if self.rollback_failed && !connection.is_autocommit() {
+            state.latch(
+                FailureSource::Writer,
+                FatalCause::RollbackLeftTransactionOpen,
+            );
+        }
+        self.error
     }
 }
 
-type Job = Box<dyn FnOnce(&mut ConnectionHandle<'_>) + Send>;
+/// Roll back, classifying the rollback's own result independently of `error`.
+fn abandon(
+    state: &FailureState,
+    mut transaction: Transaction<'_>,
+    error: SqliteError,
+) -> Abandoned {
+    // SQLite can end the transaction itself (RAISE(ROLLBACK), a failed statement
+    // under some conflict clauses): there is then nothing left to roll back.
+    if transaction.is_autocommit() {
+        return Abandoned {
+            error,
+            rollback_failed: false,
+        };
+    }
+    // `Drop` would retry a failed rollback once and ignore its result: R128 allows
+    // no further statement on a connection whose rollback failed, so it must not.
+    transaction.set_drop_behavior(DropBehavior::Ignore);
+    Abandoned::after_rollback(state, error, transaction.rollback())
+}
+
+type Job = Box<dyn FnOnce(&mut ConnectionHandle<'_>, &Gate) + Send>;
 
 struct State {
     accepting: bool,
@@ -197,7 +323,9 @@ struct Shared {
 /// executor per adapter after migrations, never one per request.
 pub struct Writer<'a> {
     connection: ConnectionHandle<'a>,
+    gate: Arc<Gate>,
     shared: Arc<Shared>,
+    state: FailureState,
 }
 
 #[derive(Clone)]
@@ -238,13 +366,22 @@ impl Drop for Admission {
 /// interrupt a body or commit that has already started.
 pub struct WriteReceipt<T> {
     response: mpsc::Receiver<Result<T>>,
+    state: FailureState,
 }
 
 impl<T> WriteReceipt<T> {
     pub fn wait(self) -> Result<T> {
-        self.response
-            .recv()
-            .unwrap_or(Err(SqliteError::WriterClosed))
+        self.response.recv().unwrap_or_else(|_| Err(self.dropped()))
+    }
+
+    /// The answer of a request whose job was dropped unanswered, because the worker
+    /// is gone. A worker that failed latched the state first, so the latched failure
+    /// wins over the ordinary-shutdown answer.
+    fn dropped(&self) -> SqliteError {
+        self.state
+            .ensure_available()
+            .err()
+            .unwrap_or(SqliteError::WriterClosed)
     }
 }
 
@@ -268,7 +405,8 @@ impl<'a> Writer<'a> {
         if capacity == 0 {
             return Err(SqliteError::InvalidCapacity);
         }
-        let connection = open_connection(data, ConnectionRole::Writer, sync)?;
+        let mut connection = open_connection(data, ConnectionRole::Writer, sync)?;
+        let gate = Gate::install(&mut connection)?;
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 accepting: true,
@@ -280,15 +418,27 @@ impl<'a> Writer<'a> {
             admission: Arc::new(Admission {
                 shared: Arc::clone(&shared),
             }),
-            state,
+            state: state.clone(),
         };
-        Ok((Self { connection, shared }, handle))
+        Ok((
+            Self {
+                connection,
+                gate,
+                shared,
+                state,
+            },
+            handle,
+        ))
     }
 
     /// Drain accepted work, then return once admission is closed, either by
     /// `WriterHandle::close` or by dropping the final client handle. A callback panic rolls
     /// back its transaction and drops this worker, closing every queued receipt.
-    /// SQL/body errors go to that receipt; this foundation does not replay work.
+    /// So does a request that leaves the connection inside a transaction (a failed
+    /// rollback, latched as `FatalCause::RollbackLeftTransactionOpen` before the
+    /// answer): the worker refuses what is queued with `StorageUnavailable`, then
+    /// panics, and the connection is dropped, never served again. SQL/body errors go
+    /// to that receipt; this foundation does not replay work.
     pub fn run(mut self) {
         loop {
             let job = {
@@ -312,15 +462,53 @@ impl<'a> Writer<'a> {
                 }
             };
             match job {
-                Some(job) => job(&mut self.connection),
+                Some(job) => {
+                    job(&mut self.connection, &self.gate);
+                    if !self.connection.is_autocommit() {
+                        self.fail();
+                    }
+                }
                 None => break,
             }
         }
+    }
+
+    /// The request has its answer, and a rollback that failed left this connection
+    /// inside the transaction: every later request would fail to begin and nothing
+    /// could commit. When that failure latched the state, what is queued is
+    /// refused first, as a latched writer refuses everything: the gate in `execute`
+    /// answers `storage_unavailable` before any statement runs. Then the worker
+    /// fails, and dropping it closes the connection and releases the write lock.
+    fn fail(&mut self) -> ! {
+        if self.state.failure().is_some() {
+            loop {
+                let job = self
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .queue
+                    .pop();
+                match job {
+                    Some(job) => job(&mut self.connection, &self.gate),
+                    None => break,
+                }
+            }
+        }
+        panic!("SQLite writer connection is still inside a transaction after a request");
     }
 }
 
 impl Drop for Writer<'_> {
     fn drop(&mut self) {
+        // rusqlite 0.41.1 frees a hook's closure when the connection is closed,
+        // before SQLite rolls back a transaction that is still open, and that
+        // rollback then calls the freed closure (a segfault, reproduced with
+        // an in-memory database). A writer dropped inside a transaction is the
+        // failed-rollback case, so the hooks go first.
+        let connection = self.connection.for_migration();
+        let _ = connection.rollback_hook(None::<fn()>);
+        let _ = connection.commit_hook(None::<fn() -> bool>);
         let abandoned = {
             // Drop runs during the unwind of a panicking callback; see Admission::close.
             let mut state = self
@@ -358,12 +546,37 @@ impl WriterHandle {
         T: Send + 'static,
         F: FnOnce(&Transaction<'_>) -> Result<T> + Send + 'static,
     {
+        self.submit_after(lane, deadline, work, || {})
+    }
+
+    /// `submit`, running `after_first_check` between the unlocked latch check and
+    /// the admission lock: a seam so tests can place a failure and a closed door
+    /// in that window without timing luck.
+    fn submit_after<T, F>(
+        &self,
+        lane: Lane,
+        deadline: Option<Instant>,
+        work: F,
+        after_first_check: impl FnOnce(),
+    ) -> Result<WriteReceipt<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Transaction<'_>) -> Result<T> + Send + 'static,
+    {
         // Refuse at the door once latched: nothing is queued behind a failed writer.
         self.state.ensure_available()?;
+        after_first_check();
         let (response, receiver) = mpsc::sync_channel(1);
         let state = self.state.clone();
-        let job: Job = Box::new(move |connection| {
-            let _ = response.send(execute(connection, &state, deadline, Instant::now, work));
+        let job: Job = Box::new(move |connection, gate| {
+            let _ = response.send(execute(
+                connection,
+                gate,
+                &state,
+                deadline,
+                Instant::now,
+                work,
+            ));
         });
         let mut state = self
             .admission
@@ -371,6 +584,14 @@ impl WriterHandle {
             .state
             .lock()
             .expect("writer queue lock poisoned");
+        // The worker latches a failure before it closes admission, so a closed
+        // door that raced the check above is read again: a latched writer is
+        // never reported as an ordinary shutdown. Captures drop outside the lock.
+        if let Err(error) = self.state.ensure_available() {
+            drop(state);
+            drop(job);
+            return Err(error);
+        }
         if !state.accepting {
             // Drop user captures outside the queue lock, including on refusal.
             drop(state);
@@ -386,7 +607,10 @@ impl WriterHandle {
         }
         state.queue.push(lane, Instant::now(), job)?;
         self.admission.shared.available.notify_one();
-        Ok(WriteReceipt { response: receiver })
+        Ok(WriteReceipt {
+            response: receiver,
+            state: self.state.clone(),
+        })
     }
 
     /// Close admission and drain previously accepted transactions. Idempotent.

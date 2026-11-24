@@ -58,6 +58,10 @@ pub enum FatalCause {
     SqliteNotADatabase,
     /// Proven logical corruption of live data (R141), though SQLite reports no error.
     LogicalCorruption,
+    /// An explicit rollback of the writer's top-level transaction failed and the
+    /// connection is still inside a transaction (R128). A rollback error alone, with
+    /// the connection outside a transaction, is not this cause.
+    RollbackLeftTransactionOpen,
 }
 
 impl fmt::Display for FatalCause {
@@ -66,6 +70,9 @@ impl fmt::Display for FatalCause {
             Self::SqliteCorrupt => "SQLITE_CORRUPT",
             Self::SqliteNotADatabase => "SQLITE_NOTADB",
             Self::LogicalCorruption => "proven logical corruption of live data",
+            Self::RollbackLeftTransactionOpen => {
+                "rollback left the writer connection inside a transaction"
+            }
         })
     }
 }

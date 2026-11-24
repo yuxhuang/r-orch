@@ -449,6 +449,70 @@ fn a_fatal_cause_on_either_side_of_a_caught_rollback_failure_fails_the_writer() 
 }
 
 #[test]
+fn no_statement_of_a_request_is_durable_after_a_fatal_cause_when_sqlite_ended_its_transaction() {
+    // The writer-recovery review's F2 (issue 127), composed with the shared latch:
+    // SQLite ends the transaction under the callback (RAISE(ROLLBACK) stands for a
+    // full disk or an I/O error), the callback latches a fatal cause as it must,
+    // then writes once more. Each statement now runs alone and would commit by
+    // itself; the executor's commit hook turns it back, and the request answers
+    // with the latch, not with `TransactionAborted`.
+    scenario(|env| {
+        env.write(|tx| {
+            tx.execute_batch(
+                "CREATE TABLE scratch(x INTEGER) STRICT;
+                 CREATE TRIGGER scratch_rollback BEFORE INSERT ON scratch
+                 BEGIN SELECT RAISE(ROLLBACK, 'synthetic SQLite rollback'); END;",
+            )?;
+            Ok(())
+        })
+        .expect("create the trigger");
+        let state = env.state.clone();
+        let outcome = env.write(move |tx| {
+            tx.execute("INSERT INTO sample VALUES(1)", [])?;
+            assert!(tx.execute("INSERT INTO scratch VALUES(1)", []).is_err());
+            assert!(tx.is_autocommit(), "SQLite ended the transaction itself");
+            state.latch(FailureSource::Writer, FatalCause::LogicalCorruption);
+            // The refusal is swallowed: the callback carries on to success.
+            let _ = tx.execute("INSERT INTO sample VALUES(2)", []);
+            Ok(())
+        });
+        assert_unavailable(&outcome);
+        assert!(env.rows().is_empty(), "nothing after the latch is durable");
+        assert_unavailable(&env.insert(3));
+        assert!(env.rows().is_empty());
+        assert_eq!(
+            env.state.failure().unwrap().causes,
+            [(Role::Operation, FatalCause::LogicalCorruption)]
+        );
+    });
+}
+
+#[test]
+fn a_latched_writer_answers_storage_unavailable_before_transaction_aborted() {
+    // Both are true of this request: SQLite ended its transaction (the executor's
+    // rollback hook fired), and a fatal cause was latched. The refusal is the latch.
+    scenario(|env| {
+        env.write(|tx| {
+            tx.execute_batch(
+                "CREATE TABLE scratch(x INTEGER) STRICT;
+                 CREATE TRIGGER scratch_rollback BEFORE INSERT ON scratch
+                 BEGIN SELECT RAISE(ROLLBACK, 'synthetic SQLite rollback'); END;",
+            )?;
+            Ok(())
+        })
+        .expect("create the trigger");
+        let state = env.state.clone();
+        let outcome = env.write(move |tx| {
+            state.latch(FailureSource::Writer, FatalCause::LogicalCorruption);
+            assert!(tx.execute("INSERT INTO scratch VALUES(1)", []).is_err());
+            assert!(tx.is_autocommit(), "SQLite ended the transaction itself");
+            Ok(())
+        });
+        assert_unavailable(&outcome);
+    });
+}
+
+#[test]
 fn a_logical_corruption_latched_by_name_aborts_the_enclosing_transaction() {
     // What a Task read that proves its data corrupt will do through the typed hook
     // once the Task integration classifies `TaskCorrupt`: the cause has no SQLite code.
