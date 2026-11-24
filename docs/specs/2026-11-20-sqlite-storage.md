@@ -533,6 +533,7 @@ The contract of deliverable F. Rust signatures are fixed by the port PR and reco
 | `position` | Explicit order (R11). `move_to_end(kind, id, expected)`, which also raises the revision, is its only other writer. |
 | `claim_lease(new, now_ms)` | Inserts a lease only if the task has none and the agent has no active one, and gives it the task's next epoch. Returns `Granted(lease)` or `Held(lease)`. `now_ms` is UTC milliseconds from `Clock::now_ms()`; `expires_at` is checked `now_ms + LEASE_MS` (`LEASE_MS: i64 = 120_000`). |
 | `renew_lease`, `release_lease` | Renew takes `(task, lineage, epoch, now_ms)` and sets the same checked millisecond deadline as claim; release takes `(task, lineage, epoch)` without a clock input. Both refuse with `StaleEpoch` unless lineage and epoch are the lease's (R132). |
+| `claim_lease` on a damaged counter (SQLite adapter) | A stored `task_epochs.next_epoch` below 1 is damage, not exhaustion: the claim is refused before any write with a corruption error, and `CounterExhausted` is returned only when `next_epoch + 1` would overflow `i64` (or when `now_ms + LEASE_MS` would). "Lease adapter contracts" below states it with its tests. |
 | `append_events(run, lineage, epoch, batch)` | Refused with `StaleEpoch` unless lineage and epoch are the lease's. Inserts with "ignore if `(run, seq)` exists". Returns `{ stored, skipped }`. `record_event_gap(run, after_seq, dropped)` records a loss keyed by `(project_id, run_id, after_seq)`. Replaying an identical count is a no-op; a conflicting count returns `InvalidEvents` and writes nothing, even if the caller catches the error and commits. |
 | `read_events(run, after_seq, limit)`, `read_events_tail(run, count)`, `prune_events(run, max_rows)` | Range read, tail read, and a bounded delete that reports whether the run is finished. |
 | `put_retry`, `get_retry` / `read_retry`, `delete_retry` | One project-local row per task: `task`, `attempt` (at least 1), `due_at` (nonnegative UTC milliseconds), `error` (opaque text, whole: ADR 0020 stores more than 65,536 UTF-8 bytes through the blob store, and more than 64 MiB as ordered chunks). Put replaces the whole row; get is a point read. |
@@ -552,6 +553,37 @@ pins gap identity. The file reference registers these same suites
 them when wired. Two-backend acceptance of the operational port is therefore
 unproven until SQLite is registered, and a real suspend and resume on Linux is unproven.
 R42's real-suspend check (pending, issue 110) and runtime renewal ordering remain integration checks.
+
+**Lease adapter contracts (2026-11-23; issue 127 N1 to N4).** The SQLite lease helpers in
+`crates/orch-infra/src/sqlite/leases/` reached `main` through #156, #211 and #232 (the successor of
+#213). They are an internal, unwired adapter: `LeaseAdapter`, `LEASE_LANE`, `COMPOSED_RELEASE_LANE`
+and `writer_lane` are `pub(super)` and nothing outside that module's tests calls them, and the daemon
+still uses files. The rows say what the code and its named tests fix at `af0d43acd`. They are storage
+primitives toward R35 and R40 and the fencing part of R132. The engine's start and finish transactions
+(R35, R36; T12), its cancel, pause and permanent-failure transactions (R37 to R39; T13) and the removal
+of the file backend (T25) do not follow from these rows. Test names
+are in `contract_tests` of that module unless a path is given.
+
+| Contract | What the adapter does | Pinned by | Built or wired |
+|---|---|---|---|
+| Damaged counter and exhausted counter are two errors | `claim_lease` reads `task_epochs.next_epoch` (1 when the task has no row). A value below 1 is damage: the claim is refused before any write with helper error `LeaseError::Corrupt`, which reaches the receipt as `SqliteError::LeaseCorrupt(detail)` with the task and the value in `detail`. No lease is granted, no counter changes and the damaged value stays for `orch db verify`. `StoreError::CounterExhausted` is returned only when `next_epoch + 1` would overflow `i64` (stored `i64::MAX`), or, checked first, when `now_ms + LEASE_MS` would overflow, which `renew_lease` also returns. A stored 1 grants epoch 1 and stores 2. The check is on the claim only: a lease row whose own `epoch` is negative is not covered by this row | `a_nonpositive_stored_next_epoch_is_corruption_and_not_exhaustion` (0, -1 and `i64::MIN`; nothing written, value unchanged), `the_smallest_valid_next_epoch_grants_and_the_largest_is_exhaustion`, `a_damaged_epoch_counter_reaches_the_receipt_as_lease_corruption_and_the_writer_continues`; `tests::clock_and_sqlite_counter_overflow_change_nothing` | The check is built. The writer does not treat it as fatal: the job's transaction rolls back and the writer keeps running. R128 and R140 fail the writer on SQLite results and this check has none, so whether damage is fatal is open |
+| `orch db verify` | Every `task_epochs.next_epoch` is at least 1, beside "every epoch is below its task's `next_epoch`". The table has no `CHECK` on the column, so the claim and this check are the only places the damage shows | none: no `orch db` command exists at this commit | Pending, T22 (R73). Not built |
+| Two lane types | `orch_core::store::Lane` is what a storage caller names in `Storage::write`; `orch_infra::sqlite::Lane` is what the writer schedules. Both are `Claims`, `Entities`, `Events` and `Maintenance`. The order of R26 and the waits of "Writer lanes" are properties of the infrastructure lane. `writer_lane` matches every port lane with no default arm, so a new port lane fails to compile until it is mapped; a new writer lane is not forced into the mapping | `port_lanes_map_one_to_one_onto_writer_lanes` | Mapping built. No caller outside the tests |
+| Standalone and composed lease work | A claim, renew or release submitted on its own through `LeaseAdapter` runs on lane 1 (`LEASE_LANE`, `Lane::Claims`). A release that is a step of a finish, a cancel, a pause or a permanent failure (R36 to R39) is `release_lease` called on that job's own transaction, which is submitted on lane 2 (`COMPOSED_RELEASE_LANE`, `Lane::Entities`) and is not a second submission, so that lane 1 stays bounded by the number of tasks and agents. The start of a run (R35) composes `claim_lease` and is a lane 1 job, as the table of "Transactions and intents" says. A queued claim runs before an older queued finish. The composed helpers return `LeaseError`, which a job propagates with `?` into `SqliteError`: `Corrupt` becomes `LeaseCorrupt` and a SQL failure keeps its SQLite code, so the executor rolls the whole job back | `a_standalone_lease_change_is_a_claims_lane_job_and_a_composed_release_an_entities_job`, `claim_runs_on_the_claims_lane`, `renew_runs_on_the_claims_lane`, `release_runs_on_the_claims_lane`, `a_composed_finish_releases_its_lease_from_an_entities_lane_job` (its finish is a hand-written lane 2 job); `executor_tests::composed_lease_job_keeps_nothing_when_a_later_lease_step_fails`, `::statement_level_failure_in_a_composed_lease_job_is_rolled_back_by_the_executor` | Lease helpers and lane constants built. No SQLite start-of-run or finish transaction exists (T12), and no SQLite cancel, pause or permanent-failure transaction exists (T13). No lease expiry job exists: `leases.expire` of "Maintenance jobs" is lane 1 by this spec and belongs to T15 |
+| Optional request deadline | Claim, renew and release take `deadline: Option<Instant>`, the R128 request deadline. `Some(d)`: a job still queued at `d`, or still waiting for `BEGIN IMMEDIATE` at `d`, is answered `SqliteError::Overloaded`, does not run and cannot commit afterwards. A transaction that has started is not interrupted. `None` is the daemon's own work (finishes, lease changes, events): it is never withdrawn and stays queued until it runs. Admission is bounded by the writer's queue whatever the deadline (`WriterHandle::submit` checks capacity without reading it; the named test uses `Some`): a full queue refuses at submission with `Overloaded` and the job never runs. The clock is read when the job is submitted, so a request that waited gets an earlier expiry than one run at once. A composed job has one deadline, that of its own submission | `a_lease_request_that_expires_in_the_queue_is_answered_overloaded_and_never_commits` (claim, renew and release), `a_lease_request_without_a_deadline_stays_queued_and_commits`, `a_lease_request_refused_at_admission_never_runs_later`, `a_lease_request_whose_begin_waits_past_its_deadline_is_answered_overloaded_and_never_commits` | Built in the adapter. Which daemon calls pass `Some` and which pass `None` is not decided: no daemon caller exists, and T12 decides it |
+
+**Wired runtime and future composition.** Nothing in this block runs in a daemon; the only callers
+of the adapter are the module's tests, which drive it through a real writer and read pool. One other
+internal reader exists, also unwired: the typed-intents helper (`sqlite/intents.rs`, #220) calls the
+module's `get_lease` and `check` on its own transaction when it stores a process intent, to find the
+run's lease and fence it. It submits no lease job and uses none of `LeaseAdapter`, `LEASE_LANE`,
+`COMPOSED_RELEASE_LANE` or `writer_lane`. What a later PR composes
+from it does not exist yet, and each row above that depends on one says so: the engine's start and finish
+transactions on the SQLite adapter (T12) and its cancel, pause and permanent-failure transactions (T13);
+lease expiry (`leases.expire`) and the saved dispatch state (T15); `orch db verify` (T22); the structured
+fatal classification of R128 and R140 (T10, issue 127); and the registration of the shared lease suites on
+SQLite (T10; `memory_leases_v2` and `file_leases_v2` are the only registrations at this commit). Issue
+127 stays open until the owner lands these rows and the pieces it still names.
 
 T8c intents amendment (2026-11-22): the port `orch_core::store::intents` adds
 `IntentRead` to `ReadSnapshot` and `IntentWrite` to `UnitOfWork`, with the same
@@ -1032,7 +1064,7 @@ the resync that protocol 2 already defines. Done intents are deleted after 7 day
 
 | Lane | Work | Budget for the wait |
 |---|---|---|
-| 1 `Claims` | Claims, renewals, releases, lease expiry | 50 ms |
+| 1 `Claims` | Standalone claims, renewals and releases; the claim inside the start of a run (R35); lease expiry. A release inside a finish, cancel, pause or permanent failure (R36 to R39) is not lane 1: it runs inside that job on lane 2 ("Lease adapter contracts") | 50 ms |
 | 2 `Entities` | Every entity change and the multi-entity operations above | 200 ms |
 | 3 `Events` | Event batches and gap rows | 1 s |
 | 4 `Maintenance` | Pruning, expiry, sweeps | 5 s |
@@ -2666,7 +2698,7 @@ Unverified, and marked so where it is used:
 | Command | Daemon | Notes |
 |---|---|---|
 | `orch db status [--json]` | running | R72. Shows the log's backlog and the file's length apart (R126), and the age of the oldest read (R127). |
-| `orch db verify [--quick] [--blobs]` | running | `integrity_check` (or `quick_check`), `foreign_key_check`, and: every lease names a run of its task with the same epoch; every epoch is below its task's `next_epoch`; no two rows of a table share a `position`; every `done` task has a landing state; every named blob has a `blobs` row; no two tasks of a project have one fold key, and the index that keeps it so is present (R117). |
+| `orch db verify [--quick] [--blobs]` | running | `integrity_check` (or `quick_check`), `foreign_key_check`, and: every lease names a run of its task with the same epoch; every epoch is below its task's `next_epoch`, and every `task_epochs.next_epoch` is at least 1 (a claim refuses a smaller one as damage: "Lease adapter contracts"); no two rows of a table share a `position`; every `done` task has a landing state; every named blob has a `blobs` row; no two tasks of a project have one fold key, and the index that keeps it so is present (R117). |
 | `orch db query '<statement>' [--limit n] [--json]` | running | One statement over the diagnostic views below (R74, R130); 1,000 rows by default, 100,000 at most; 16 MiB; 5 s. |
 | `orch db backup` | running | Writes `backups/<UTC time>-g<generation>/`, created by the command, and takes no other destination (R75). The blob sweep waits while it runs. |
 | `orch db prune [--older-than <days>] [--dry-run]` | running | R79. |
