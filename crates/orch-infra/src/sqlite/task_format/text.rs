@@ -55,6 +55,7 @@ pub(in crate::sqlite) fn publish(
     }
     let mut rows = Vec::new();
     for (ordinal, part) in bytes.chunks(MAX_BLOB_BYTES as usize).enumerate() {
+        let size = i64::try_from(part.len()).map_err(|_| TextError::Corrupt("published size"))?;
         let expected = BlobHash::of(part);
         let actual = store.put(part)?;
         if actual != expected {
@@ -63,7 +64,7 @@ pub(in crate::sqlite) fn publish(
         rows.push(Chunk {
             ordinal: ordinal as u64,
             sha256: actual.to_string(),
-            size: part.len() as u64,
+            size: size as u64,
         });
     }
     Ok((

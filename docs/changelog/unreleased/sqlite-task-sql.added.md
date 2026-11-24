@@ -1,0 +1,1 @@
+Add an inactive SQLite adapter that creates, updates, moves, deletes and reads tasks in one transaction, checks each stored task against its detail on every read, and fails the SQLite writer when it proves a task corrupt; it has no Storage method yet, and the daemon continues to use file storage.

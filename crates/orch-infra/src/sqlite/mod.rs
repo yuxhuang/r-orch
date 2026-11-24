@@ -11,6 +11,16 @@ pub use connection::{ConnectionHandle, ConnectionRole, Synchronous, open_connect
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteError {
+    #[error("stored task {task} failed {check} at {locator}")]
+    TaskCorrupt {
+        task: String,
+        check: &'static str,
+        locator: &'static str,
+    },
+    #[error("task object access failed: {0:?}")]
+    TaskAccess(std::io::ErrorKind),
+    #[error(transparent)]
+    TaskPublication(crate::blob::BlobError),
     #[error("SQLite counter {name} is missing for project {project} with existing rows")]
     CounterMissing { project: String, name: &'static str },
     #[error("SQLite counter {name} is negative ({value}) for project {project}")]
@@ -155,3 +165,6 @@ mod task_format;
     reason = "inactive Agent/Team/Run detail format awaiting SQL mapping"
 )]
 mod agent_team_run;
+
+#[allow(dead_code, reason = "private Task SQL awaits Storage composition")]
+mod task_sql;

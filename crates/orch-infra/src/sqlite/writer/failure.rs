@@ -11,9 +11,8 @@
 //! What is fatal is decided here, by the structure of the error, and nowhere
 //! else. `classify` matches every `SqliteError` variant with no wildcard, so a
 //! new variant (the structured `TaskCorrupt` of R141, for one) cannot be added
-//! without a decision about its class. This module does not define that
-//! variant; the Task integration adds it and its arm. Until then the
-//! logical-corruption cause can only be latched by name (`latch`).
+//! without a decision about its class. Task corruption is fatal; object access
+//! and publication failures alone prove nothing about the live database.
 //!
 //! Corruption found in an external import, backup or export artifact is not
 //! the live database: it is classified, reported to the caller, and never
@@ -161,12 +160,12 @@ fn walk(error: &SqliteError, out: &mut Observation) {
         }
         Sql(error) => classify_sql(error),
         // Reading or opening a file can fail for reasons that prove nothing.
-        Io(_) | Confined(_) => Class::Transient,
+        Io(_) | Confined(_) | TaskAccess(_) | TaskPublication(_) => Class::Transient,
+        TaskCorrupt { .. } => Class::Fatal(FatalCause::LogicalCorruption),
         // The error that a latched state answers with: already latched.
         StorageUnavailable(_) => Class::Ordinary,
         // R140 names SQLITE_CORRUPT, SQLITE_NOTADB and `TaskCorrupt` as fatal.
-        // The three stored-data errors below are not among them. The Task
-        // integration adds the `TaskCorrupt` arm here.
+        // The three stored-data errors below are not among them.
         EventCorrupt(_) | IntentCorrupt(_) | LeaseCorrupt(_) => Class::Ordinary,
         CounterMissing { .. }
         | CounterNegative { .. }
