@@ -136,3 +136,9 @@ mod request_keys;
     reason = "internal typed intents await the combined T10 Storage adapter"
 )]
 mod intents;
+
+#[allow(
+    dead_code,
+    reason = "task format building blocks await lossless task CRUD integration"
+)]
+mod task_format;

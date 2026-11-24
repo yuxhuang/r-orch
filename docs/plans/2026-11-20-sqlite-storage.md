@@ -724,7 +724,9 @@ The public SQLite port awaits accepted T8b and T8c. T12 depends on completion of
 
 **What remains of T10 after the foundation.** The adapter of the Storage v2 port and its conformance run on SQLite;
 bulk identities and the 1,000-row or 20 ms cut (R27); event aggregation into one transaction (R26); intents
-(R28); retry that replays safely and one shared fatal policy by failure class (R128, R140); the checkpoint
+(R28); retry that replays safely and one shared fatal policy by failure class (R128, R140), which includes the latch of a
+fatal cause that a callback catches, the classification of both causes of a failed rollback, and proven `Task` corruption
+(R140, R141); the checkpoint
 connection, its backlog, outcomes and the expiry of long reads (R126, R127, R137); the authorizer and query
 connection (R130); and shutdown integration (R139). The review conditions of the foundation that belong to the
 adapter are tracked in [issue 127](https://github.com/yuxhuang/r-orch/issues/127): detecting transaction control
@@ -767,6 +769,72 @@ Remaining consumer obligations, before activation:
 
 These consumer obligations are pending, not delivered by the goal boundary slice.
 
+### T10 task mapping (format v1)
+
+The inactive SQLite adapter holds goals, leases, run events, request keys and task paging. A task needs the format of the
+spec's "Task format v1 (SQLite)" before its mapping is built: the first migration has no place for a whole `Task`, and
+its R97 text rule has no discriminator for a referenced task text. The lead chose a numbered migration that adds
+`task_details` and `task_blob_refs` over a versioned envelope in a reserved column (ADR 0017 decision 26). This
+section is the plan for that slice and for what other tasks owe it. It changes no row of the task table above.
+
+**Order.** This documentation lands, reviewed, before product code: the spec, this plan and ADR 0017 are the only files
+of its PR. The mapping slice then branches from `main` with the documentation in its history and builds the
+code and tests named in R141. It stays one bounded PR; if it would pass about 3,000 changed lines the split is
+(a) the codec, the migration and inline text, then (b) the references and the physical R97 tests, each leaving `main`
+working. The public cursor wiring and the other entity families keep their own slices, and the mapping hands the
+hydration seam to the slice that wires the public task page, whose tests check the real boundary.
+
+**Obligations, by task.**
+
+| Task | Owes | Check |
+|---|---|---|
+| T10, task mapping | Create, update, delete and move for `Task`; the migration (next free number); hydration in the selecting snapshot or unit of work; the physical R97 mapping; the creator, `landing_state` and attachment-row rules of the spec; the structured `SqliteError::TaskCorrupt`, fatal under R140, classified before any public conversion; the shared entity suites registered on SQLite for tasks | R141's named tests (the corruption ones among them); `cargo test -p orch-infra --test sqlite_task_format --test sqlite_migrations`; the shared suites on the three references and SQLite, none holding a text over 67,108,864 bytes (the file reference refuses one; the split of K >= 2 is checked only by `sqlite_task_format`) |
+| T10, retry mapping | Its own mapping of `retry_queue.error` with the same thresholds and split, and none of this format's tables | The issue 109 tests; independent of R141 |
+| T11 | One change in T11's own file, `crates/orch-infra/src/blob/references.rs`: row-only registration of an object that is already published, callable from `crate::sqlite` (a `pub(crate)` method of `BlobReferences`, or `register` split so that its upsert is `pub(crate)` and the `put` stays out of it). The `blobs` row is the one `register` writes for a prompt (`storage_location = 'disk'`, the object's own size, `unreferenced_since` cleared, refused when an existing row disagrees on size or location), and the method never calls `DiskBlobStore::put`. `register` itself, `store_prompt`, `store_attachment` and the two loaders keep their behaviour. At `07bc81124` `register` is a private method (visible only inside the `references` module) that calls `put` before its upsert, so the mapping cannot call it and could only reach it by publishing every object a second time after the spec's step 2 (a second hash and sync of each object, interleaved with row writes). The blob adapter (`DiskBlobStore::put`, `get`) is otherwise used as it is. The owner is T11; which PR carries the change is open (below) | the existing `blob_store` tests unchanged, plus one new test, not yet written, that row-only registration writes the same row as a prompt's, publishes nothing, and refuses a size or location that disagrees |
+| T12 | Nothing new: a consumer reads a `Task` through the port and never through these tables | the T12 tests |
+| T15 | `blobs.sweep` counts `task_blob_refs.sha256` as a naming row | `maintenance::a_referenced_blob_is_never_deleted`, extended for a task text and a split text |
+| T21 | One codec for every task row; list order, repeats and `Option` presence as the 1.0 document says; the decision and the record for a non-canonical timestamp; `import` and NULL as the creator of a legacy task; 1.0's recorded proof as the task's `proof` in the detail, with `legacy_proof` left NULL; text over 64 KiB as references; no path or hash made from an attachment name | an importer test per case (one asserts that an imported proof reads back through the port and that `legacy_proof` is NULL), and the R97 importer test the spec still lists as pending |
+| T22 | `orch db verify` runs the format's read checks for every task and finds orphan references and details; a live task proved corrupt is `TaskCorrupt` and fails the writer, a corrupt backup or export file refuses the command alone; the views `diag_task_details` (without `detail`) and `diag_task_blob_refs` | the schema's view-listing test; `db_commands` |
+| T23 | A backup and a restore carry every object a reference row names, in one point; an export carries both tables and the objects; an import reconstructs every text and checks its hash; a backup or an export of a live source that proves a task corrupt fails the writer, a corrupt artifact refuses the command and leaves the writer usable | `db_backup_restore`, `db_export_import`; a restore that finds a missing, short or reordered chunk refuses |
+| T27 | Records the named checks as run, with counts, on Linux, and rejects an empty or ignored selection | the verification table |
+
+**Holds that stay.** The file runtime stays until the switch (T24). Nothing here releases a writer-dependent slice, wires
+the daemon or the public cursor, or consumes an unmerged slice: the #109 retry mapping, the attention migration and the
+public cursor slices are used only after they have merged. The independent code review and, for the
+covered surfaces, the security review, the exact-head hosted Linux check and test with a clean merge state, the
+lead's recommendation and the owner's merge apply to the mapping PR as to every PR.
+
+**Settled before code.** The lead decided three write rules on 2026-11-23, and the owner of the attachment path (T11)
+concurred in the third; the spec's section states them and the mapping slice implements them with the tests R141
+names. (1) `create` derives `created_by_kind` and `created_by_run_id` once from the caller's `Principal`: `Owner` is
+`owner`, `Worker` is `daemon`, `Task` is `agent` with the authenticated, fenced run; the importer (T21) records `import`
+separately. (2) A write that leaves `done` preserves `landing_state` byte for byte; completion sets `skipped` only
+over NULL. (3) A revision-checked `delete` removes the task's `task_attachments` rows for the exact project and task in
+its own savepoint, and keeps the `blobs` registrations and object bytes for the sweep (R60). The same text corrects the
+presence rule: `proof` and `workspace_mode` are optional, and `files_changed` is required only inside a present `proof`.
+The mapping slice consumes this correction before it writes any of these columns. What remains open is the owner's
+approval of the two tables (O2), given by the merge, the structured classification of the other entities, which issue 127 holds,
+the rule for 1.0's recorded proof, which the spec's "Import rules" now sends to the detail and no longer to `legacy_proof` (the lead ruled on 2026-11-23 that this amendment of the approved rule stands as documentation groundwork, and the owner's merge of this text approves it; the T21 implementation and live-copy access stay held), and the carrier of the T11 change in the table above: the mapping's scope is the SQLite source and tests, and
+`crates/orch-infra/src/blob/references.rs` is outside it. Either a small T11 PR with the row-only registration lands first, or the lead
+widens the mapping's scope by that one file and its `blob_store` test. The mapping's references slice (b) cannot write its
+`blobs` rows until one of the two exists.
+
+**Task corruption, settled before code.** The lead decided on 2026-11-23 what "the typed stored-data error of R140" is. The mapping
+adds `SqliteError::TaskCorrupt { task, check, locator }`: the id the caller asked for, a bounded check code and a bounded
+structural locator, never a value, a raw stored key, a path or a backend message. It is classified before any public
+conversion or diagnostic, and proven logical corruption of live `Task` data is fatal under R140: a present row whose detail is
+missing, an unsupported stored version, an invalid encoding or identity, projection or membership drift, or a proven
+missing or invalid referenced object, found by a live `get`, a page or list, a snapshot or unit-of-work read, or a live
+verification, query, backup or export that validates tasks, returns the failure, discards partial results and trips the
+shared writer failure state until a restart. An absent task, a caller's validation or revision refusal and an admission
+timeout stay ordinary, a transient read or object-access failure alone does not prove corruption (the connection rules of
+R140 apply), and corruption found only in an external import, backup or export artifact refuses that operation and leaves
+the writer usable. On the writer, a fatal cause is latched even if the callback catches it and returns success, and the
+enclosing transaction aborts; an `OperationRollback` is classified in both of its causes, a fatal one on either side wins,
+any failed savepoint rollback forbids the enclosing commit, and an ordinary failure rolled back to its savepoint may be
+caught while unrelated work commits. The writer on `main` does not yet classify or latch (issue 127), so the mapping's
+error integration waits for the shared failure state of the T10 integration and this text releases no code.
+
 ## Status
 
 | Item | State (implemented / verified on <platform> / pending) |
@@ -778,6 +846,7 @@ These consumer obligations are pending, not delivered by the goal boundary slice
 | Linux-only scope (the spec's record K) | recorded on 2026-11-23 by one documentation PR that is pending its review and the owner's merge: the spec, this plan, ADR 0017, the lease prototype's spec, the spec TEMPLATE, ARCHITECTURE §13 and AGENTS.md carry it. Nothing was verified on a platform: no code and no CI changed. The first independent review blocked its first head on three points: the Linux sleep/wake check of R42 (issue 110) was withdrawn with the macOS one, R16, R88 and R136 still named macOS, and the branch conflicted with `main`. The text was corrected for them and re-synchronised with `main` keeping the rows of both sides; the corrected text awaits a second review |
 | T10, internal lease adapter (issue 127 N1 to N4) | The damaged-epoch error, the lane mapping and the optional request deadline are merged (#211, #232) and their tests pass on Linux at `af0d43acd` (38 module tests). The spec's "Lease adapter contracts" records them. Unwired: only the module's tests call the adapter, and the daemon uses files. This documentation is pending its Linux CI, its review and the owner's merge. Pending behind it: T12's start and finish transactions, T13's cancel, pause and permanent-failure transactions, T15's lease expiry, T22's `orch db verify`, the R128 and R140 classification, and the SQLite registration of the shared lease suites. Issue 127 is not closed |
 | T10, internal goal adapter | Goal reads, creates, updates, deletes and explicit moves use the executor. Module tests cover transactions, snapshots, reopen and file-reference behavior for supported inputs. Public conformance still requires timestamp and counter compatibility, imported position high-water marks, and text/blob handling. |
+| T10, task format v1 | defined in the spec, this plan and ADR 0017 decision 26 by one documentation PR, with the write rules and the task-corruption rules (`TaskCorrupt`, fatal under R140). Draft PR 226 implements only a first slice: the strict, complete `Task` byte and detail codec (`crates/orch-infra/src/sqlite/task_format`, with the R97 text chunk helper) and the guarded migration 003 (`task_details`, `task_blob_refs`). It is inactive: nothing calls it and the daemon still uses file storage. It is not the split that "T10 task mapping" names under (a) and (b): the codec already covers the reference tags and the root reference, and every SQL operation waits for the next slice. The codec validates the typed task (priority, status, attempts, canonical timestamps) before it reads any text object, so a damaged inline value is `Invalid` even when a text object is unreadable (review finding I4). Verified on Linux by the author's focused runs, whose regression test `typed_damage_is_checked_before_any_slot_object_access` failed before that fix (0 passed, 1 failed) and passes after it: the `task_format` module tests (19 passed, 0 failed, 0 ignored), `sqlite_migrations` (15 passed), `sqlite_schema` (7 passed), `cargo clippy` on `orch-infra` with warnings denied, `cargo fmt --check` and `git diff --check`. Earlier results stay on record: the first head's `fast` run was interrupted (exit 130) after 1,587 passes and 36 failures had been observed, from the umask 0002 fixture of issue 137, and counts as failed and incomplete; a migration test run failed 14 passed and 1 failed, two compile errors (a `usize` type error and a `HookError` error) and a clippy non-octal literal were fixed on the way; the hosted run on the first head was cancelled by the corrective push; the head `eec91899b` passed hosted Linux check and test and was CLEAN, which does not cover any later head. Pending for the final head of PR 226: the terminal delta code and security reviews, hosted Linux check and test SUCCESS and CLEAN on that exact head, the lead's renewed recommendation and the owner's merge; the inactive codec is not a Storage acceptance. Of the tests that R141 names, the two migration tests and the two codec tests on `proof` and `workspace_mode` exist; the codec ones are module tests of the library, not yet in `tests/sqlite_task_format.rs`. Not implemented, built or tested: create, update, delete and move; the `tasks` row, membership and `blobs` projections and their checks on read; hydration in the selecting snapshot or unit of work; `SqliteError::TaskCorrupt`, its classification and the writer latch (issue 127); the Storage port; the shared entity suites on SQLite; the importer and backup obligations. T11 owes one row-only registration change in `blob/references.rs` whose carrier is open, so that each object is published once before its `blobs` row is registered. 1.0's recorded proof is imported into the detail and `legacy_proof` stays NULL, which the lead ruled on 2026-11-23 to stand as documentation groundwork; the T21 implementation and live-copy access stay held. Backend equality is claimed only for texts of at most 67,108,864 bytes; the split of a larger text is checked on SQLite alone (R141). Whether decode shall refuse non-canonical bytes whose length and hash match is open in issue 227; two minor review conditions, the transaction-hook coverage of migration 003 and typed preflight errors under issue 127 and R140, are tracked in issue 229. |
 | T2 to T27, except T4 and T4b | pending, as this table stood before 2026-11-21; this revision brings no other row up to date |
 
 ## Test plan
@@ -827,6 +896,13 @@ These consumer obligations are pending, not delivered by the goal boundary slice
   commit as not yet synced); a start that is killed and run again writes each gap once. The ranges are taken after the writer's
   last transaction, and a start writes no gap row over a committed event (a record with such a range
   is planted).
+- Task corruption and the writer (spec R140, R141): each check of the format's read is planted in turn, and a get, a page,
+  a snapshot, a unit of work and a live backup or verification each return `TaskCorrupt` with no partial page and fail the
+  writer. An absent task, a stale revision, a refused value and an admission timeout do not. A callback that catches a fatal
+  cause still fails the writer and aborts the transaction; a failed operation rollback is classified in both causes and a
+  fatal one wins; a failed savepoint rollback forbids the commit; an ordinary failure rolled back successfully may be
+  caught and unrelated work commits. A corrupt backup, export or import file refuses its command and leaves the writer
+  usable.
 - Other connections (spec R137, R140): a result is injected at the checkpoint, read, query and backup
   connections in turn. Corruption fails the writer from each; other failures are counted and reported at
   their thresholds and do not fail it; each outcome of a checkpoint call is produced from injected counts,

@@ -16,7 +16,7 @@
   check of decision 16 stays for Linux (an isolated, authorized Linux host; spec R42, issue 110) and is
   pending.
 - Decisions 1 to 6 and 14 restate decisions the owner already took in the goal and are binding. Decisions 7 to 13
-  and 15 to 25 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
+  and 15 to 26 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
   the owner's to rule (the spec's AP13); no record shows that the owner set them.
 - The owner's answers (2026-11-20 and 2026-11-21): every point of the spec is answered as recommended,
   except AP13, which is answered in its direction; the spec's "Owner's answers" has a row for every id and
@@ -436,7 +436,8 @@ across a crash, lists that do not load everything, and a retried request that ru
     and merged with one that is already there, and it is removed only when its gap rows can no longer be
     lost with the power. And the classes cover every connection: corruption
     seen by a read, a checkpoint, a query or a backup fails the writer, other failures there are counted
-    and do not, and checkpoints that keep failing or a backlog that stays are reported (R140).
+    and do not, and checkpoints that keep failing or a backlog that stays are reported (R140). Proven logical
+    corruption of a live task (decision 26) is in the same fatal class.
 
 24. **`orch db query` reads fixed views under an authorizer; a backup stays in the data directory.** The
     command has its own read-only connection, an authorizer that denies by default, and run-time limits; it
@@ -451,6 +452,51 @@ across a crash, lists that do not load everything, and a retried request that ru
     owner confirms, and none works in agent context, where `orch init` leaves it off (R133, following the owner's answer to AP5). An attention item's words
     are fixed for its kind (R131). A request key never applies to a credential operation, and authorization
     comes before a stored result is looked up (R134).
+
+26. **A task is one typed detail record with derived projections, and its large text is behind explicit
+    references.** Added 2026-11-23, after the owner's answers, by the lead's decision on the task mapping (option
+    A of two); the owner's merge of this text ratifies it. The first migration's `tasks` row and its membership
+    tables cannot hold the domain's `Task`: `workspace`, `proof`, the review lists and the optional `scope` and
+    `attachments` have no column, the membership tables are keyed by value and so lose order, repeats and the
+    difference between an absent and an empty list, and a text over 64 KiB needs references that a NOT NULL
+    text column cannot discriminate. One numbered forward-only migration adds `task_details` (the complete typed
+    task as strict JSON, the only authority) and `task_blob_refs` (project-scoped reachability and chunk
+    rows). The `tasks` columns, the distinct membership sets and the `blobs` rows are derived from the same
+    value in the same operation and are checked against the detail on every read. A text up to 65,536 UTF-8 bytes
+    stays inline; a longer one becomes one blob object, or objects of 67,108,864 bytes when it is longer
+    still, named by a tagged JSON object that no text can equal and by ordered rows; a detail that is itself over
+    65,536 bytes is stored the same way. A write publishes its objects first and installs every row in one
+    savepoint, so a failure, caught or not, leaves the old row and its references readable. The `blobs` rows are
+    written by row-only registration of the objects already published, which needs one crate-visible change in
+    T11's reference helper (the spec's "Blob helper change"); the helper's `register` publishes by itself and is private. A read in the
+    selecting snapshot answers `SqliteError::TaskCorrupt { task, check, locator }`, a variant that this decision
+    adds, for an unknown format, a missing or malformed detail, a projection that disagrees or a broken
+    reference, and never rebuilds a task from unordered sets. The error holds the task id, a bounded check code
+    and a bounded locator, and no value, key, path or backend message, and it is classified before any public
+    conversion. R140 had no stored-data error; the lead's decision of the same day extends its failure policy to
+    this one: proven corruption of live task data is fatal, because reopening a healthy connection reads the
+    same damaged task and cannot repair it. A live read, a page, a snapshot, a unit of work or a verification,
+    query, backup or export that validates tasks returns the failure, discards partial results and trips the
+    shared writer failure state until a restart; an absent task, a caller's or revision refusal, an admission
+    timeout and a transient read or object-access failure stay ordinary, and corruption found only in an external
+    import, backup or export file refuses that operation and leaves the writer usable. On the writer a fatal
+    cause is latched even when the callback catches it, and aborts the transaction; a failed rollback is
+    classified in both causes, a fatal one on either side wins, any failed savepoint rollback forbids the enclosing
+    commit, and an ordinary failure rolled back to its savepoint may be caught. Timestamps stay the canonical millisecond strings that the goal adapter accepts. The file reference and SQLite return equal tasks for every input that the reference accepts, a text of at most 67,108,864 bytes; the split of a larger text is SQLite-only, because the reference's blob store refuses more than that, and only SQLite tests it. The migration
+    backfills nothing. A populated predecessor is refused before any copy or intermediate migration, and again in the
+    migration's own transaction, so a refused start changes nothing and repeats without growing the copies (the spec's
+    "Task format v1 (SQLite)"). The
+    optional `Task` fields, `proof` and `workspace_mode` among them, are absent for `None`; a present `proof` always
+    carries `files_changed`. A write follows three rules of the lead's decision of the same day: `create` derives the
+    creator columns once from the caller's `Principal` (`Owner` is `owner`, `Worker` is `daemon`, `Task` is `agent` with
+    its fenced run; the importer records `import`), a write that leaves `done` preserves `landing_state`, and a
+    revision-checked `delete` removes the task's `task_attachments` rows in its savepoint while its blob registrations and
+    bytes stay for the sweep (R60). The owner of the attachment path concurred in the last. The format
+    writes only the columns it projects from the detail: `review`, `legacy_proof` and `outputs` are never written
+    from a `Task`. 1.0's recorded proof, which the spec's "Import rules" had sent to `legacy_proof`, is imported as
+    the task's `proof` in the detail and `legacy_proof` stays NULL. The lead ruled on 2026-11-23 that this amendment
+    of the approved rule stands as documentation groundwork; the owner's merge of this text is the approval. The
+    importer implementation (T21) and live-copy access stay held.
 
 ## Alternatives considered
 
@@ -626,6 +672,24 @@ across a crash, lists that do not load everything, and a retried request that ru
 - **Skip or set aside a source file the import cannot read.** The import always finishes, and a task can be
   missing from 1.1 unnoticed. The spec's AP17 puts it to the owner.
 
+- **A versioned envelope inside an existing column** (`outputs` or `legacy_proof`, or the opaque `review`).
+  It avoids a migration and costs the meaning of a column that later phases own, a second reader for each
+  phase, and a harder move later; it also leaves the reachability of objects to a scan of JSON. Rejected: the
+  `outputs` and `legacy_proof` columns are kept for later phases (R19), `review` is named in no list, and a new
+  table is cheaper than a competing meaning.
+- **Only the missing fields in a side record, native rows authoritative for the rest.** Two authorities for
+  one task: a row and its side record could each be right and still disagree, and order and repeats of a list
+  would still need a place. Rejected for the single authority of decision 26.
+- **Normalizing on write** (sorted or deduplicated lists, an absent list read as empty, a truncated or
+  second-precision timestamp widened). It would make the reference and the adapter differ on the same typed
+  value and would change what a task says. Rejected: the conformance suite compares equal values.
+- **A prefix or a marker string in the native text columns for a referenced text.** A marker aliases user text,
+  and a prefix keeps bytes that R97 moved out. Rejected for an explicit tag in the detail.
+- **Return `TaskCorrupt` to the caller as an ordinary error and reopen the connection.** It is the class of a failed
+  pooled read. Rejected: reopening a healthy connection reproduces the same damaged task and cannot repair it, so the
+  writer would go on mutating, granting claims and checkpointing beside data that it knows is damaged. A transient
+  failure, which a reopen can cure, is kept ordinary.
+
 ## Consequences
 
 - A multi-entity operation is atomic across a crash, which 1.0 never was. The crash-point tests become possible
@@ -684,3 +748,13 @@ across a crash, lists that do not load everything, and a retried request that ru
 - The data directory lives outside the project, so moving a project directory no longer moves its state. The
   pointer file and the record under the data home are what let the daemon find it again instead of offering a
   second import. `<project>/.orchestry/` must stay in place: it is still the handshake's project identity.
+- A task costs two more tables and a stricter reader than the domain's serde, and a second write of the same
+  text is deduplicated by hash. A write that publishes a large text holds the one writer for the time the files
+  take. Everything that names an object (the sweep, `orch db verify`, a backup, an export and an import) reads
+  `task_blob_refs` as well as `task_attachments` and `runs`, and owes the reconstruction of a split text
+  (the plan's "T10 task mapping (format v1)").
+- One damaged task stops the project's writes. A read that proves it corrupt fails the writer, and a restart that
+  reads the same task fails it again until the task's data is repaired or the database is restored from a backup. The
+  failure is reported from memory by `orch status` and `orch doctor` with the task, the check and the locator, and it is
+  not an attention item. The shared failure state that does this is part of what remains of T10 and is held with
+  issue 127; the writer on `main` does not have it.
