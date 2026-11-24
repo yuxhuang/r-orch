@@ -16,7 +16,7 @@
   check of decision 16 stays for Linux (an isolated, authorized Linux host; spec R42, issue 110) and is
   pending.
 - Decisions 1 to 6 and 14 restate decisions the owner already took in the goal and are binding. Decisions 7 to 13
-  and 15 to 26 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
+  and 15 to 28 are the design and stay proposed until the owner's approval gate. The numbers in decision 9 are
   the owner's to rule (the spec's AP13); no record shows that the owner set them.
 - The owner's answers (2026-11-20 and 2026-11-21): every point of the spec is answered as recommended,
   except AP13, which is answered in its direction; the spec's "Owner's answers" has a row for every id and
@@ -498,6 +498,54 @@ across a crash, lists that do not load everything, and a retried request that ru
     of the approved rule stands as documentation groundwork; the owner's merge of this text is the approval. The
     importer implementation (T21) and live-copy access stay held.
 
+27. **The other seven entity families extend the task format: one typed detail per entity, with the same references,
+    and Agent, Team and Run first.** Added 2026-11-23 by the lead's decision on the Agent, Team and Run mapping
+    (option A of two); the owner's merge of this text ratifies it, except the derived items that its last sentence
+    names. The first migration cannot hold these families:
+    an agent's `status`, `current_task`, `capabilities` and `remote` have no column and `autonomous` cannot tell an
+    absent value from `false`; a team's members and task pool are keyed by value, so order, repeats and per-occurrence
+    `role` and `joined_at` are lost; a run's payload `attempt`, supplied token `total` and prompt text have no
+    column, and its `NOT NULL` claim columns and unique `attempt_no` cannot store a run that no claim made or two
+    payloads with one attempt; teams and runs have no position; names are `UNIQUE` though the entity port accepts
+    equal names. A migration adds `entity_details` and `entity_blob_refs`, keyed by project, family and identity, and
+    uses the task format's tag, chunk rows, validation and read checks unchanged. The detail is the authority and
+    every native row, member row and reference row is a projection checked on read. An unsigned 64-bit value is
+    exact in the detail and projects to a signed column only through `i64::MAX`; a time stays the caller's string
+    and projects to milliseconds only when exact; a name index replaces the unique constraint; a team's members
+    become ordinal-keyed rows; a run's `attempt` is its own column, ordered numerically for one task's runs, and its
+    claim tuple is either absent together or complete and is allocated only by the claim path; a rendered prompt is
+    always a blob named by `runs.prompt_sha256`. An identity over 65,536 bytes is found by its digest and compared on
+    its original bytes. The migrations refuse a populated predecessor, atomically and without row content, because
+    no predecessor row proves its payload, its positions or its allocator history. One owner holds the registry.
+    Seven of the ten items in the spec's "Derived, to be confirmed" are restated above and are not ratified by the
+    owner's merge: they are the writer's derivations, and they stand only when the migration owner confirms or amends
+    them in the first PR that builds them. They are (1) the one shared `entity_details` and `entity_blob_refs` pair
+    keyed by family, (2) the digest as the way an identity over 65,536 bytes is found, and its form, (3) the `env`
+    encoding, (4) a rendered prompt always a blob named by `runs.prompt_sha256`, (5) a time projecting to
+    milliseconds only when exact, (7) the ordinal-keyed team member rows, and (10) the refusal of any populated
+    predecessor row. The other three, (6), (8) and (9), are not restated here and stay in the spec's list. The names
+    of the new columns are open in the spec's "Open in this section", item 1. Item (3), and the detail-bytes half of (4),
+    were confirmed on 2026-11-23 by the author of the inactive byte codec, which builds them: `env` is an array of
+    `[name, value]` pairs, and the `prompt` slot is always a tag. The schema half of (4) and every other item still
+    wait for the migration owner.
+
+28. **Context, Config, Template and Goal use the same format, with provenance and original-byte order.** Added
+    2026-11-23 by the lead's decision on those four families (option A of two); the owner's merge ratifies it, except
+    that it relies on the spec's derived item (1), the one shared `entity_details` and `entity_blob_refs` pair, which
+    the migration owner has not confirmed: "the same format" and a migration that "creates none" hold only while that
+    pair stays shared (the alternative "A separate detail and reference pair for each family", below). A context
+    entry keeps its original `created_at` and `updated_at` and an optional `ttl_ms` and `expires_at` independently, with
+    no inference of one from the other and no implicit expiry filter in the port; its provenance (the principal's kind and
+    exact identity, and, apart from them, an optional agent and run) is bound on `create` from the authenticated caller,
+    lives outside the detail, and is kept by an update or a move whoever makes it. Config and template identifiers are
+    opaque text. A goal keeps its integration and publication columns across typed updates, and its original time
+    strings replace the staged adapter's canonical-only limit. The identifier order, the goal's `created_at` order and
+    its default order (status rank, a present `updated_at` before an absent one, the original `updated_at` text
+    descending, position, id) compare original UTF-8 bytes, also for an indirect key, and a cursor continues the same
+    total order before it limits a page.
+    Positions are allocated per project and family, kept by an update, moved by `move_to_end` and never rewound by a
+    delete. A second migration rebuilds the four tables and creates none.
+
 ## Alternatives considered
 
 - **Keep files and add indexes, a journal and file locks.** Each 2.0 need (atomic claim, fencing, paging,
@@ -690,6 +738,19 @@ across a crash, lists that do not load everything, and a retried request that ru
   writer would go on mutating, granting claims and checkpointing beside data that it knows is damaged. A transient
   failure, which a reopen can cure, is kept ordinary.
 
+- **A versioned envelope in the existing columns of these families** (`agents.config`, `runs.local`, the `value` and
+  `body` columns of context, config and templates). It saves a few native columns, but it repurposes columns that
+  have a meaning, still needs a migration and metadata for positions, and makes every reader and the export read a
+  second envelope. Rejected for the typed detail of decisions 26 to 28.
+- **A separate detail and reference pair for each family.** Seven near-identical pairs of tables, seven sweeps and
+  seven sets of diagnostic views. Rejected here for one pair keyed by family; this is the writer's alternative, and the
+  migration owner may still choose it (the spec's "Derived, to be confirmed", item 1).
+- **Refusing an identity over 65,536 bytes as unrepresentable, as the task format does.** Simpler, and consistent with
+  the task's key columns. Rejected here because the decision requires an identifier order and a lookup that compare
+  original bytes "including for indirect keys", and the decision for tasks has no such requirement.
+- **A digest as the order of an indirect text, or a truncated prefix.** A digest has no lexical order and a prefix
+  cannot order two texts that share it. Rejected: the reference compares bytes.
+
 ## Consequences
 
 - A multi-entity operation is atomic across a crash, which 1.0 never was. The crash-point tests become possible
@@ -758,3 +819,7 @@ across a crash, lists that do not load everything, and a retried request that ru
   failure is reported from memory by `orch status` and `orch doctor` with the task, the check and the locator, and it is
   not an attention item. The shared failure state that does this is part of what remains of T10 and is held with
   issue 127; the writer on `main` does not have it.
+- Seven more families cost two more tables, eight rebuilt tables and two migrations, in sequence after the task
+  format's, and the same strict reader. A rendered prompt is always an object on disk, so a run costs one object read
+  to show its prompt and equal prompts cost one object. Everything that names an object (the sweep, `orch db verify`, a
+  backup, an export and an import) reads `entity_blob_refs` as well as `task_blob_refs`, `task_attachments` and `runs`.

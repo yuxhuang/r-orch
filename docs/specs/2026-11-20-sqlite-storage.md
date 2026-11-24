@@ -464,7 +464,7 @@ holds them.
 | R94 | — | X | won't | Evidence, quarantine, uploads, text search, HTTP, TLS, tokens, enrolment, certificates, workers, the hub, landing, proposals, many projects per daemon, removing orch-peer, Postgres, an indexed scheduler, object storage, token budgets, outbound notification and Windows are out of scope (X). |
 | R95 | — | DL | won't | No tag and no version bump: cutting 1.1.0 is the owner's separate decision. |
 | R96 | An agent process shall not run its agent unless the run's pid and start time were committed first: the daemon shall create the process held, commit, then release it, and a held process whose daemon is gone shall exit without running the agent. | review finding (a stop between starting a process and recording it left an untracked agent on a workspace that recovery would hand to a second run) | must | `crates/orch-engine/tests/transactions.rs::a_stop_between_spawn_and_commit_runs_no_agent`, `crates/orch-infra` process test `held_process_exits_when_its_parent_is_gone`; both |
-| R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. | B7; review finding | must | `text_over_64_kib_round_trips_through_the_blob_store` in `storage_conformance` checks whole values on entity references; `storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store` in the `orch-infra` library pins file row hashes and disk bytes, with `inline_threshold_counts_utf8_bytes_and_preserves_empty_values`. Retry rows were not covered on `main` at `07b5f967`, which refused text over 65,536 bytes; this change covers them by the tests that "T8 consumer-contract amendment (issue 109)" names (65,536 and 65,537 bytes in `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, registered as `memory_retries_v2`, `blob_memory_retries_v2` and `file_retries_v2`; and 67,108,864 and 67,108,865 bytes, a character split across a chunk boundary, a failed publication, a failure on a later chunk, a missing and a corrupt blob and chunk, a reordered chunk, repeated chunks, a rollback that leaves published bytes unreferenced and a one-object row of the documented form in `storage::v2::tests::retry_*` of the `orch-infra` library, each run with `-- <name> --exact` and required to execute one test; a retry with no run is in the first, a restore of 67,108,865 bytes with no run is in `retry_chunked_text_survives_restore_without_a_run`, and a reordered chunk of the disk-backed fake is in the private unit test `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read`). SQLite backing assertions for tasks: R141's `sqlite_task_format` tests (T10; the other text-bearing rows, retry rows included, keep their own mappings and are not covered by them); importer backing assertions: T21 (pending, no executable import filter yet); Linux |
+| R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. | B7; review finding | must | `text_over_64_kib_round_trips_through_the_blob_store` in `storage_conformance` checks whole values on entity references; `storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store` in the `orch-infra` library pins file row hashes and disk bytes, with `inline_threshold_counts_utf8_bytes_and_preserves_empty_values`. Retry rows were not covered on `main` at `07b5f967`, which refused text over 65,536 bytes; this change covers them by the tests that "T8 consumer-contract amendment (issue 109)" names (65,536 and 65,537 bytes in `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, registered as `memory_retries_v2`, `blob_memory_retries_v2` and `file_retries_v2`; and 67,108,864 and 67,108,865 bytes, a character split across a chunk boundary, a failed publication, a failure on a later chunk, a missing and a corrupt blob and chunk, a reordered chunk, repeated chunks, a rollback that leaves published bytes unreferenced and a one-object row of the documented form in `storage::v2::tests::retry_*` of the `orch-infra` library, each run with `-- <name> --exact` and required to execute one test; a retry with no run is in the first, a restore of 67,108,865 bytes with no run is in `retry_chunked_text_survives_restore_without_a_run`, and a reordered chunk of the disk-backed fake is in the private unit test `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read`). SQLite backing assertions for tasks: R141's `sqlite_task_format` tests; for the other seven families (Agent, Team, Run, Context, Config, Template, Goal): the R97 tests of R142 and R143 (T10; Message and the retry diagnostic keep their own mappings and are not covered by them); importer backing assertions: T21 (pending, no executable import filter yet); Linux |
 | R98 | Reads shall be served by a pool of `storage.read_connections` connections (default 4); a read that finds none free shall wait up to the admission deadline and then fail with `overloaded`, never open another connection. | B6; review finding | should | `sqlite_writer::reads_wait_for_a_free_connection_then_fail_overloaded`; both |
 | R99 | `orch import` shall account for every entry of the source `.orchestry/` and of each directory that "Import rules" has it list: each is imported, or left in place as "Import rules" lists, or named by the dry run and by the import's report as not imported; a directory it does not enter is one entry. Project prompt template files shall become `templates` rows, byte for byte. | N, S2, B2 | must | `import::every_source_path_is_accounted_for` (a corpus with an unknown file and an unknown directory), `::templates_are_imported_byte_for_byte`, `::a_template_that_is_not_utf8_text_is_refused_before_any_write` (prospective: the issue 192 importer caller writes it, and no such test is on `main`); both |
 | R100 | `orch db restore` shall refuse, changing nothing, while a process that the replaced state or the backup records as a run's is alive (pid and start time), naming each run and pid and which of the two records it. With `--stop-runs` it shall first stop the process groups that the replaced state records, which this daemon wrote in this data directory. It shall never signal a process because a backup records it: such a process keeps the restore refused until it has ended or the owner names its run with `--assume-stopped <run id>`. No waiting period shall stand in for either: a run's process in 1.1 keeps no deadline of its own (R42), so the passing of time never shows that an earlier holder has stopped. After a restore no lease of the backup shall be active: each is ended and its run closed as R41 closes a run whose process is gone, and the spool of the replaced state (R129) is set aside with it. | G9; the lease prototype and its review (a restore that frees every task at once lets a holder from the replaced state and a new one work on one task); the security re-review's condition S2-C2 (a pid and a start time do not show who wrote a backup); the review of the prototype's corrections, N1 (its waiting-period alternative holds only where a holder stops itself, which arrives in 1.5); AP14 | must | `crates/orch-cli/tests/restore_fencing.rs::restore_refuses_while_a_recorded_process_is_alive`, `::stop_runs_stops_only_what_the_replaced_state_records`, `::a_process_only_the_backup_records_is_never_signalled` (a fake process table records every call), `::assume_stopped_lets_the_restore_proceed_for_the_named_run`, `::restored_leases_are_ended`; both |
@@ -509,6 +509,8 @@ holds them.
 | R139 | `orch daemon stop`, and a signal that asks the daemon to stop, shall end the daemon within a bound and in this order: (1) admission closes: a new request is answered `shutting_down`, no claim is granted, and the maintenance timer starts no job; (2) the transaction in progress commits or rolls back, and a job in progress queues nothing more (R26); (3) the collectors hand over what they hold, and the writer takes what is queued in the order of its lanes until the drain's deadline; (4) at the deadline a transaction that is still being retried (R128) is rolled back and given up: a request is answered and never committed afterwards, a finish stays in its spool (R129), and then, once the writer has ended its last transaction and takes no other and no event is given a number any more, for every run with events handed over and not committed the first and the last of their numbers (R61 gives a number at handover) are recorded in `spool/events-at-stop`, from which the next start writes that run's row of `run_event_gaps` (R61) before the run's events are numbered further and before admission opens; (5) reads still open are interrupted, a checkpoint call in progress is left to return and no other is started; (6) the lock is released last, by the process ending. The file holds the lineage; one of another lineage, or one that fails its check, is removed and counted, as R129 says of a finish file. Every version of the file shall be published whole: written to a temporary file created exclusively, 0600, in `spool/`, synced, renamed onto `spool/events-at-stop`, and `spool/` synced. A stop that finds a record of this lineage already there shall publish the ranges of that record together with its own and shall never overwrite or drop a range that an earlier stop recorded. A start shall write the gap rows of every recorded range in one transaction, shall write no second row for a range that a gap row already covers and no row over a number that a committed event of that run holds, cutting a recorded range to the numbers that neither holds, and shall remove the file only once that transaction is durable against a loss of power under the settings in force (R126): it was committed with `synchronous = FULL`, or a checkpoint that started after it has succeeded with no frame of the log left (R137, `copied_all`). A commit at `synchronous = NORMAL` alone is not that. A start that ends before that point shall leave the file as it was. Events that are neither committed nor recorded there, because that write failed as well, shall be named by run in the stop's report, as R129 names a finish. The stop shall end at its bound whatever is still in progress, and that shall lose nothing that is committed, spooled or recorded. What is said here of a stop that is killed is said of a stop of the process: after a loss of power the record can be absent or fail its check, and its ranges are then lost, with a count at most ("What a sync promises"). Proposed and not measured: 10 s for the drain, counted from the request; 5 s more for the reads and the checkpoint call; 20 s for the whole stop. This requirement covers a stop that was asked for and changes nothing in what a stop does to a run's process. | The resilience review F2 (the answers to O5 and D4 name a bounded shutdown, and no requirement stated its order, its bound or what becomes of queued events); the resilience review of `a914e78`, N4 and N5 (a record removed before its gap row was synced lost the gap, and a second stop overwrote the first record); the resilience review of `3c50293`, N11 and N12 (nothing said that the ranges are taken after the writer's last commit, so a gap row could cover an event that exists; and the record is synced by this program and not by SQLite); O5, D4 | must | `crates/orch-daemon/tests/daemon_storage_failure.rs::stop_is_bounded_while_the_writer_retries` (a second connection holds the write lock; fake clock), `::stop_follows_its_order` (each step is recorded), `crates/orch-engine/tests/run_events.rs::events_queued_at_stop_are_committed_or_left_as_a_gap`, `::a_gap_recorded_at_stop_is_written_at_the_next_start_before_new_numbers`, `::events_neither_committed_nor_recorded_are_named_by_the_stop`, `::a_second_stop_keeps_the_ranges_of_the_first` (the first record is not yet consumed), `::the_stop_record_is_removed_only_after_its_gap_rows_are_durable` (the removal is refused to a fake that reports the commit as not yet synced), `::a_start_repeated_after_a_kill_writes_each_gap_once`, `::a_start_that_fails_leaves_the_stop_record_unchanged`, `::a_stop_record_is_whole_after_a_kill_at_each_step_of_its_publication`, `::the_ranges_of_a_stop_are_taken_after_the_writers_last_transaction` (a commit is made to land as late as the order allows; no recorded range holds a committed number), `::no_gap_row_covers_a_committed_event` (a record is planted whose range holds committed numbers; the rows written cover the other numbers only); both |
 | R140 | The failure policy shall cover every connection that the daemon holds on the live database, by the table of "Writer lanes" ("When another connection fails"). `SQLITE_CORRUPT` or `SQLITE_NOTADB` on any of them (a pooled read, the checkpoint connection, the query connection of R130, the connection a backup or an export reads through) shall fail the writer at once, as R128's fatal class does, with the connection and the result named, and no checkpoint shall be called afterwards. Proven logical corruption of a live `Task` (R141) is the same fatal class on a healthy connection, as "When a Task read proves its data corrupt" states; a corrupt backup, export or import file, an external artifact and not the live database, is that command's own refusal and is not this. Any other failed result on those connections shall be returned or recorded where it occurred and counted by kind of connection, the connection shall be opened afresh, and the writer shall not fail for it. `daemon.status`, `orch status` and `orch doctor` (exit 1) shall report, from memory: three checkpoint calls in a row that ended `busy` or `failed` (R137); a backlog that has stayed over R127's 256 MiB for more than 5 minutes, with the backlog, the time, the age of the oldest read and the last call's outcome; three failed reads in a row on the pool; and the last failed backup, export or query with its result. A report shall end when its condition does. The counts and the times are proposals that no measurement backs. | The resilience review F3 (R128 classed the writer's transactions alone: corruption first seen by a checkpoint was a recorded figure while the writer went on committing, and a checkpoint that failed every time showed only when the disk floor tripped); D4 | must | `sqlite_writer::a_corrupt_result_on_the_checkpoint_connection_fails_the_writer`, `::a_corrupt_result_on_a_read_connection_fails_the_writer`, `::a_corrupt_result_on_the_query_or_backup_connection_fails_the_writer` (the result is injected at the connection named), `::other_failures_off_the_writer_are_counted_and_do_not_fail_it`, `::a_fatal_cause_that_the_callback_catches_still_fails_the_writer_and_aborts_the_transaction`, `::a_failed_operation_rollback_is_classified_for_both_causes_and_a_fatal_one_wins`, `::a_failed_savepoint_rollback_forbids_the_commit_even_when_neither_cause_fails_the_writer`, `::an_ordinary_failure_rolled_back_to_its_savepoint_may_be_caught_and_unrelated_work_commits`, `crates/orch-daemon/tests/daemon_storage_failure.rs::three_failed_checkpoints_in_a_row_are_reported`, `::a_backlog_over_its_ceiling_for_five_minutes_is_reported` (fake clock), `::a_report_ends_with_its_condition`, `crates/orch-cli/tests/db_backup_restore.rs::a_corrupt_backup_file_fails_the_command_and_not_the_writer`, `::a_backup_that_proves_a_live_task_corrupt_fails_the_writer`; both |
 | R141 | A `Task` shall be stored, read, updated, moved and deleted in the SQLite format of "Task format v1 (SQLite)": the detail is the authority and every projection (the `tasks` row, the memberships, the reference rows, the `blobs` rows and the revision) is derived from it in the same operation; every text over 65,536 UTF-8 bytes is behind blob objects, split at 67,108,864 bytes, named by an explicit tag and by project-scoped reference rows; every read hydrates in the selecting snapshot or unit of work and checks the format, the identity, the decoded types, each projection, the membership sets and every referenced size and hash, and answers `SqliteError::TaskCorrupt` on a mismatch, which is fatal under R140 (the task id, a bounded check code and a bounded locator, no value, key, path or backend message; the writer fails at once and no partial result is returned); a failed operation, a failure that the caller catches included, leaves the old row and its references readable; `create` records its creator from the caller's `Principal`; a write that leaves `done` preserves `landing_state`; and `delete` removes the task's attachment-name rows with the task and keeps every blob registration and object. | The lead's decisions on the task mapping and on task corruption (2026-11-23); R97; R140; issue 127 | must | `crates/orch-infra/tests/sqlite_task_format.rs`: `a_task_round_trips_every_field_with_order_repeats_and_presence`, `signed_priority_and_unsigned_counters_keep_their_extremes`, `timestamps_must_be_canonical_utc_milliseconds`, `the_threshold_counts_utf8_bytes_for_every_text_slot` (title, description, feedback, workspace, label, scope pattern, attachment name, each proof field, a `files_changed` element, a review output; 65,536 inline and 65,537 behind one object, by direct SQL and on disk, with the vectors of the spec), `text_at_64_mib_is_one_object_and_one_byte_more_is_two`, `a_character_split_by_a_chunk_boundary_round_trips`, `repeated_chunks_keep_every_ordinal`, `many_small_values_move_the_detail_behind_root_references`, `oversized_keys_are_unrepresentable_and_change_nothing`, `a_missing_corrupt_reordered_or_short_chunk_is_a_stored_data_error` (like the three tests that follow it with "stored data error" in their names, it asserts `TaskCorrupt` and a failed writer, and that the error holds no text, key, path or backend message), `a_tag_without_rows_and_rows_without_a_tag_are_stored_data_errors`, `projection_drift_in_each_native_column_and_membership_is_a_stored_data_error`, `an_unknown_format_or_a_missing_detail_is_a_stored_data_error`, `a_failed_chunk_or_sql_step_leaves_the_old_row_and_references_readable_even_when_caught`, `update_preserves_every_column_the_task_format_does_not_own`, `revisions_and_positions_use_checked_counters`, `move_changes_only_position_and_revision`, `an_absent_proof_and_workspace_mode_stay_absent_and_an_empty_proof_and_a_mode_word_are_kept` (an absent `proof` and `workspace_mode`, a present `proof` whose `files_changed` is empty, an explicit mode word; by the round trip, by the stored detail bytes and by `tasks.workspace_mode`), `explicit_null_and_a_proof_without_files_changed_are_refused` (`null` for each optional key, and a missing required key), `create_derives_the_creator_from_the_principal_and_edits_and_moves_preserve_it` (`Owner`, `Worker` and `Task` each; an id, payload or lane that tries to supply the value; a refused or unfenced `Task` principal writes nothing), `landing_state_follows_completion_and_survives_reopening` (create as `done`, reopen, complete again, and an existing `landed` row with its metadata), `delete_removes_the_row_detail_references_memberships_and_attachment_rows`, `delete_removes_only_the_exact_task_attachment_rows_and_keeps_every_blob_registration_and_object` (a hash shared by two tasks and by the other naming kinds, the same task id in another project), `a_stale_or_failed_delete_leaves_every_row_even_when_the_error_is_caught` (a stale revision, and an error injected after the attachment delete, then the caller's commit), `unrelated_writes_preserve_attachment_rows`, `task_corruption_on_get_page_snapshot_unit_of_work_and_live_verification_fails_the_writer_and_returns_no_partial_page`, `an_absent_task_a_stale_revision_a_refused_value_and_an_admission_timeout_do_not_fail_the_writer`, `a_transient_read_or_object_access_failure_alone_is_not_task_corruption`, `snapshot_and_unit_of_work_hydrate_one_state`, `page_order_and_binary_id_ties_match_the_reference_on_the_native_path`; `crates/orch-infra/tests/sqlite_migrations.rs`: `the_task_format_migration_keeps_earlier_versions_and_applies_to_a_populated_predecessor_without_rows`, `a_predecessor_with_any_task_or_membership_row_is_refused_and_left_unchanged`; the shared entity suites registered on SQLite. Importer and backup tests (T21, T23) are listed in "Task format v1 (SQLite)" and are not yet written; Linux |
+| R142 | An `Agent`, a `Team` and a `Run` shall be stored, read, updated, moved and deleted in the SQLite format of "Entity format v1 (SQLite)": the detail is the authority and every projection is derived from it in the same operation; an agent keeps its `config` members, its capabilities in order with repeats, and `autonomous` as absent, `false` or `true`; a team keeps each member occurrence (role and joined time included) and its task pool in order with repeats; a run keeps its prompt, workspace, pid, error, times and every token field, an absent `tokens` apart from an all-zero one and the supplied `total` apart from the sum; equal agent or team names on distinct ids coexist; revision and position are native port metadata, with a new position for a team and a run; a run's payload `attempt` is its own column and a run list whose filter names a task, with or without an agent, is ordered by it numerically, descending, then by the binary id (any other run list by the original text of `started_at` descending, then the binary id), while the claim tuple is NULL together or complete and only the claim path allocates it; every text over 65,536 UTF-8 bytes (nested ones, names of `env` and the aggregate detail included) is behind blob objects named by an explicit tag, and a rendered prompt is always one; a read hydrates in the selecting snapshot or unit of work, checks the format, key, types, projections, members, references, sizes and hashes, and answers the typed stored-data error of R140; and a failed operation, a caught one included, leaves the old state readable. | The lead's decision on the Agent, Team and Run mapping (2026-11-23); R59; R97; R140; issue 127 | must | `crates/orch-infra/tests/sqlite_agent_team_run_format.rs`: `an_agent_round_trips_every_field_and_the_three_autonomous_states`, `a_team_keeps_member_occurrences_and_task_pool_order_and_repeats`, `a_run_keeps_every_field_optional_tokens_and_an_independent_total`, `equal_agent_and_team_names_on_distinct_ids_coexist`, `u64_max_and_the_signed_neighbors_round_trip_and_project_null_above_i64_max`, `opaque_offset_and_equivalent_instant_times_are_kept_and_project_only_when_exact`, `runs_of_one_task_with_attempts_2_10_10_list_numerically_descending_with_binary_id_ties`, `filters_pages_and_cursors_agree_with_the_reference_for_all_three_families`, `a_claimed_and_an_unclaimed_run_obey_the_two_case_check_and_crud_never_allocates_or_reassigns`, `the_prompt_is_always_a_tag_and_equal_prompts_share_one_object`, `the_threshold_counts_utf8_bytes_for_every_text_slot_of_each_family` (both sides of both R97 boundaries, nested and aggregate values, a split character and repeated chunks, by direct SQL and on disk), `a_missing_corrupt_reordered_or_short_chunk_is_a_stored_data_error`, `projection_drift_in_each_column_and_member_row_is_a_stored_data_error`, `a_failed_step_leaves_the_old_row_and_references_readable_even_when_caught`, `snapshot_and_unit_of_work_hydrate_one_state`, `revision_races_and_position_moves_use_checked_counters`; `crates/orch-infra/tests/sqlite_migrations.rs`: `the_agent_team_run_migration_keeps_earlier_versions_and_applies_to_a_predecessor_without_rows_in_these_tables_and_keeps_unrelated_rows`, `a_predecessor_with_any_agent_team_member_or_run_row_is_refused_and_left_readable`; the shared entity suites, `message_and_run_filters_stay_within_their_family` among them, registered on SQLite and on both references. The byte codec's own module tests (listed in the plan's "T10 entity format") run in the library's unit tests and are not these tests: `sqlite_agent_team_run_format.rs` does not exist yet; Linux |
+| R143 | A `ContextEntry`, a `ConfigEntry`, a `TemplateEntry` and a `Goal` shall be stored, read, updated, moved and deleted in the SQLite format of "Entity format v1 (SQLite)", by the same rules as R142 and the same codec: a context entry keeps its original `created_at` and `updated_at`, and its optional `ttl_ms` and `expires_at` independently, with `ttl_ms` exact through `u64::MAX`; context provenance is bound on `create` from the authenticated caller, kept apart from the entity, preserved by an update or a move by another principal, and gives an agent or run association only from an authoritative binding; config keys and values and template names and bodies are exact text; a goal keeps every field and its integration and publication columns; the identifier order of context, config and templates and both goal orders compare original UTF-8 bytes, including for a text over 65,536 bytes, the default one putting a present `updated_at`, an empty one included, before an absent one, and cursors continue the same total order before the limit; positions are monotonic per project and family and deletes never lower them. | The lead's decision on Context, Config, Template and Goal (2026-11-23); R97; R140; issue 127 | must | `crates/orch-infra/tests/sqlite_context_config_template_goal_format.rs`: `each_family_round_trips_every_field_and_state`, `ttl_and_expiry_are_independent_and_ttl_is_exact_through_u64_max`, `provenance_is_bound_on_create_and_kept_by_an_update_or_move_from_another_principal`, `an_owner_or_worker_identity_alone_sets_no_agent_or_run`, `opaque_and_equivalent_instant_times_are_kept_and_project_only_when_exact`, `identifier_and_goal_orders_tie_and_page_on_original_bytes_across_indirect_keys`, `goal_default_order_puts_a_present_updated_at_before_an_absent_one`, `positions_are_monotonic_and_a_delete_never_rewinds_them`, `integration_and_publication_columns_survive_a_typed_update_and_move`, the R97, corruption, drift, snapshot, revision-race and caught-failure tests of R142 for these four families; `crates/orch-infra/tests/sqlite_migrations.rs`: `the_context_config_template_goal_migration_keeps_earlier_versions_and_applies_to_a_predecessor_without_rows_in_these_tables_and_keeps_unrelated_rows`, `a_predecessor_with_any_context_config_template_or_goal_row_is_refused_and_left_readable`; the shared entity suites, `declared_secondary_sorts_use_values_then_tie_breakers` among them, registered on SQLite and on both references; Linux |
 
 For the implemented R8–R15 and R97 reference checks, the acceptance cells above
 name Cargo substring filters, not Rust module paths prefixed by the test binary's
@@ -963,7 +965,7 @@ nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or
 ## Schema for 1.1
 
 The starting point is the 2.0 sketch attached to the goal: 50 tables and one FTS5 index. Times are UTC
-milliseconds; the API keeps ISO-8601 strings. Recommendation for O2: 1.1 creates 33 tables in its first migration; the task-format migration adds two more (difference 9).
+milliseconds; the API keeps ISO-8601 strings. Recommendation for O2: 1.1 creates 33 tables in its first migration; the task-format migration adds two more (difference 9) and the entity-format migrations add two more and rebuild eight (differences 10 and 11).
 
 | Group | Created in 1.1 |
 |---|---|
@@ -1000,7 +1002,7 @@ empty outside tests.
 - `project_id` in every primary key outside the daemon-wide group.
 - `leases`: `worker_id`, `epoch`, `lineage`, `state`, `offered_at`, `branch`, `base_sha`, `fetch_ref`.
 
-**Differences from the sketch**, 1 to 8 approved with O2, which the owner answered as recommended, and 9 added after it by the lead's decision on the task mapping:
+**Differences from the sketch**, 1 to 8 approved with O2, which the owner answered as recommended, and 9 to 11 added after it by the lead's decisions on the task mapping and on the other seven families:
 
 | # | Difference | Reason |
 |---|---|---|
@@ -1013,6 +1015,8 @@ empty outside tests.
 | 7 | `tasks` gains a unique index over `(project_id, id COLLATE NOCASE)`. | Two task ids that differ only in the case of ASCII letters are one workspace and one branch on a filesystem that folds case (R117, F14). `NOCASE` folds the 26 ASCII letters and nothing else. The primary key stays the exact id, so every lookup is exact to the byte and no id is changed. An export holds only the automatic indexes ("Import bounds"), so it is the destination's index that judges an imported row. |
 | 8 | `leases` gains `lineage TEXT NOT NULL`, and `daemon_config` holds the current lineage. | The owner's answer to AP11: a lease is fenced by the pair of lineage and epoch (R77, R132). The sketch has the epoch alone. Adding the column later would be a migration of a table every claim writes. |
 | 9 | A numbered migration adds `task_details` and `task_blob_refs` ("Task format v1 (SQLite)"). | The lead's decision on the task mapping (2026-11-23): `Task` has fields, shapes and text sizes that no column of the first migration holds, and R97 needs reachability rows for the objects behind a text. The two tables widen the answer to O2, whose condition named the exact schema of this spec; the owner's merge of this text approves them. |
+| 10 | A numbered migration adds `entity_details` and `entity_blob_refs` and rebuilds `agents`, `teams`, `team_members` and `runs` ("Entity format v1 (SQLite)"). | The lead's decision on the Agent, Team and Run mapping (2026-11-23): these three families have fields, shapes, order, repeats, text sizes and attempts that no column of the first migration holds, and a run that no claim made cannot carry the claim columns' `NOT NULL`. The tables widen O2's answer as difference 9 does; the owner's merge of this text approves them. |
+| 11 | A second numbered migration rebuilds `context_entries`, `project_config`, `templates` and `goals`, creating no table. | The lead's decision on Context, Config, Template and Goal (2026-11-23): the original times, the independent TTL and expiry, the positions, the provenance and the R97 references have no place in the first migration's rows. It reuses the pair of difference 10. |
 
 Rows the daemon keeps without a table of their own: the generation, the restore lineage and the saved
 dispatch state in `daemon_config`; each maintenance job's times under `maintenance/<job>` in `daemon_config`; 1.0's totals in
@@ -1025,7 +1029,10 @@ accept only canonical UTC millisecond strings from `0000-01-01T00:00:00.000Z` th
 `9999-12-30T22:00:00.999Z`, inclusive. The lower bound follows the core formatter's canonical year
 spelling; the upper bound is Jiff's parser ceiling. Alternate spellings, expanded or negative years,
 and out-of-range stored milliseconds yield `Unrepresentable`. This restriction does not widen the
-public storage port contract or establish completed SQLite conformance.
+public storage port contract or establish completed SQLite conformance. It bounds the staged adapter alone: the typed
+goal of "Entity format v1 (SQLite)" keeps both timestamps as the original strings and projects them to milliseconds
+only when exact, so the canonical-only rule ends for the typed path when that format is built. The position rules of
+this section stay.
 
 Goal create and move allocate only from the durable project-local `position:goal` counter. They refuse
 missing counters when rows survive (`CounterMissing`), negative counters (`CounterNegative`), and
@@ -1038,9 +1045,11 @@ maxima validate metadata and never reconstruct the allocation history.
 ### Task format v1 (SQLite)
 
 Status: decided by the lead as option A of the task-mapping decision (2026-11-23, Mid, stance 0.5): approved for a
-bounded implementation, not yet built. The owner's merge of the PR that carries this text ratifies it, as for the
-rest of this spec. The SQLite adapter is internal and inactive; the daemon uses file storage until T24. This
-section is the only definition of how a `Task` is stored. The SQLite task mapping (a part of T10), the importer
+bounded implementation. Of it only the inactive byte codec and the guarded migration 003 (`task_details`,
+`task_blob_refs`) exist, in PR 226 (the plan's status row "T10, task format v1"), and no mapping. The
+owner's merge of the PR that carries this text ratifies it, as for the rest of this spec. The SQLite adapter is
+internal and inactive; the daemon uses file storage until T24. This section is the only definition of how a
+`Task` is stored. The SQLite task mapping (a part of T10), the importer
 (T21) and backup, restore and export (T23) follow it, and none may invent a second layout.
 
 **Why the schema alone cannot hold a `Task`.** `Task` (`crates/orch-domain/src/task.rs`) has fields and shapes
@@ -1413,6 +1422,427 @@ held. The other way, an importer-owned `legacy_proof` copy preserved by format v
 encoding, a rule for a proof over 64 KiB (R97 covers imported text, and the column has no reference rows), and a
 decision on whether an export of a task created through the API carries the same copy; it adds a second copy that
 nothing reads in 1.1.
+
+### Entity format v1 (SQLite): Agent, Team, Run, Context, Config, Template and Goal
+
+Status: decided by the lead on 2026-11-23 (Mid, stance 0.5), as option A of two decisions: one for the Agent, Team and
+Run families and one for the Context, Config, Template and Goal families. Both extend "Task format v1 (SQLite)"
+and neither changes it. They are approved for a bounded implementation. One slice of it exists: the byte codec of
+the Agent, Team and Run details (the plan's "T10 entity format" says what it was and was not checked against). It is
+inactive and nothing calls it. No table or migration of this format (`entity_details`, `entity_blob_refs` and the
+rebuilds of differences 10 and 11), no SQL operation in this format and no port method exists for any of the seven
+families, and nothing of this format exists for Context, Config, Template or Goal. The tables of the first migration
+(which hold these families' current columns) and the internal goal adapter (the plan's row "T10, internal goal
+adapter", which reads, creates, updates, deletes and moves goals) exist and are unchanged by it. The owner's merge of
+the PR that carries this text ratifies the decisions, as for the rest of this spec. The SQLite adapter is internal and
+inactive; the daemon uses file storage until T24. This section is the only definition of how these seven families are
+stored.
+The SQLite mappings of T10, the importer (T21) and backup, restore and export (T23) follow it, and none may invent a
+second layout. "Task format v1" stays the only definition for `Task`; its rules are cited here as *the Task rules*.
+
+Three kinds of statement are mixed below, and the last two paragraphs of the section separate them. What the lead decided
+is stated plainly. Where a decision names a requirement and the schema or the domain forces a concrete form, this
+text gives the form and lists it under "Derived, to be confirmed". What nothing settles is listed under "Open in
+this section".
+
+**Why the first migration cannot hold them.** Checked against `crates/orch-domain`, `crates/orch-core/src/storage.rs`
+and `crates/orch-infra/src/sqlite/schema.sql` at the base of this text:
+
+- *Agent.* `status`, `current_task`, `capabilities` and `remote` have no column. `autonomous` is `INTEGER NOT NULL DEFAULT 0`,
+  so an absent value and `false` are one value, though the domain has three states. `agents.config` is a column for the
+  agent's `AgentConfig`, not an envelope for the whole agent. The domain has no `created_at` or `updated_at`, and both columns
+  are `NOT NULL`. `UNIQUE (project_id, name)` refuses two agents with one name, which the entity port accepts
+  (payload validation stays in the dispatcher).
+- *Team.* `team_members` and `team_tasks` are keyed by value, so they keep neither order nor repeats, and a member's
+  `role` and `joined_at` belong to an occurrence. `teams` has no `position`, though a position is monotonic for every
+  family (R11). Its two times are `INTEGER NOT NULL`; the domain's are opaque strings. The name is `UNIQUE`.
+- *Run.* `attempt` (a `u32` of the payload), the supplied `TokenUsage.total` and `workspace_path` have no column; the
+  prompt text has only `prompt_sha256`. `runs` has no `position`. Its times are `INTEGER NOT NULL`. `run_no`, `counted`
+  and `epoch` are `NOT NULL` and `runs_attempt` makes `attempt_no` unique per task, so a run that no claim
+  made, and two payloads with one attempt, cannot be stored. `local` is the pid and the workspace path (difference 3).
+- *Context.* `context_entries` has no `created_at`, no `ttl_ms` and no `position`; `updated_at` and `expires_at` are
+  signed milliseconds, and provenance columns (`set_by_*`) exist that the entity does not hold. A TTL cannot be
+  recomputed from a time difference, and it is independent of the expiry.
+- *Config and Template.* `project_config` and `templates` have no `position`.
+- *Goal.* The columns exist, but the staged adapter ("Staged SQLite goal timestamp and position limits") accepts only
+  canonical millisecond strings, and `title`, `description` and the identity have no way to say that a text is
+  behind a reference.
+- *All seven.* A text over 64 KiB needs a place that no column of the first migration has (R97), a blob object holds
+  at most 64 MiB, and the reference compares text by bytes, which a signed instant or a digest cannot reproduce.
+
+**Authority.** As the Task rules say, one record, the *detail*, holds the complete typed value and is the only
+authority for it. The family's native row, its membership and member rows, the reference rows and the `blobs` rows
+are *projections*, each derived in the same operation from the same typed value and checked against the detail on
+every read. A projection never supplies a value the detail lacks, and a read never rebuilds a detail from
+projections. Revision, position and the family's allocator high-water mark are the exceptions that the port owns:
+they are native metadata, never in the detail.
+
+**Tables.** The migration that first needs them (Agent, Team and Run) creates two tables. Their number is the next
+one unused on the integration base, as for the Task tables; this text chooses none. The migration of the other four
+families creates no table and rebuilds neither of these, because the family check below already names all seven.
+
+```sql
+CREATE TABLE entity_details (
+  project_id TEXT NOT NULL,
+  family TEXT NOT NULL CHECK (family IN ('agent', 'team', 'run', 'context', 'config', 'template', 'goal')),
+  key_form INTEGER NOT NULL CHECK (key_form IN (0, 1)),
+  entity_key TEXT NOT NULL,
+  format INTEGER NOT NULL CHECK (format >= 1),
+  detail TEXT,
+  detail_bytes INTEGER NOT NULL CHECK (detail_bytes >= 0),
+  detail_sha256 TEXT NOT NULL,
+  PRIMARY KEY (project_id, family, key_form, entity_key),
+  CHECK ((detail IS NULL AND detail_bytes > 65536)
+      OR (detail IS NOT NULL AND detail_bytes <= 65536 AND length(CAST(detail AS BLOB)) = detail_bytes)),
+  CHECK ((key_form = 0 AND length(CAST(entity_key AS BLOB)) <= 65536)
+      OR (key_form = 1 AND length(entity_key) = 64 AND entity_key NOT GLOB '*[^0-9a-f]*'))
+) STRICT;
+
+CREATE TABLE entity_blob_refs (
+  project_id TEXT NOT NULL,
+  family TEXT NOT NULL CHECK (family IN ('agent', 'team', 'run', 'context', 'config', 'template', 'goal')),
+  key_form INTEGER NOT NULL CHECK (key_form IN (0, 1)),
+  entity_key TEXT NOT NULL,
+  locator TEXT NOT NULL,
+  ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+  sha256 TEXT NOT NULL,
+  size INTEGER NOT NULL CHECK (size >= 0 AND size <= 67108864
+      AND (size >= 1 OR (family = 'run' AND locator = '/prompt'))),
+  PRIMARY KEY (project_id, family, key_form, entity_key, locator, ordinal)
+) STRICT, WITHOUT ROWID;
+CREATE INDEX entity_blob_refs_by_hash ON entity_blob_refs (project_id, sha256);
+```
+
+`format` is 1, with the Task rules' reading of any other number. `detail_bytes` and `detail_sha256` describe the
+serialized detail whether it is in `detail` or behind root references (locator `''`). `entity_blob_refs` is the
+project-scoped reachability index of these families, as `task_blob_refs` is for tasks: every object that a detail
+names has one row, and `(project_id, sha256)` finds every entity that names an object. `family` and `key_form` carry
+the checks of `entity_details`, so a reference row cannot name a family or a key form that no detail can have. The
+`size` check refuses a negative size and a size over 67,108,864, and allows size 0 only at locator `/prompt` of a run; a
+zero-byte object has a row for no other slot and no other family (below). `task_details` and `task_blob_refs` are
+untouched.
+
+**The key.** The identity of an entity is its project-qualified id inside its family: `id` for Agent, Team, Run and
+Goal, `key` for Context and Config, `name` for Template. It is compared by its exact bytes, case and whitespace
+included. A config key and a template name are opaque identifiers: they are only compared, never parsed and never used
+as a path. An identity of 65,536 UTF-8 bytes or fewer has `key_form` 0 and is `entity_key` itself. A longer one has
+`key_form` 1 and `entity_key` is the lower-case hexadecimal SHA-256 of its bytes; the identity itself sits in the
+detail behind a tag. The form is a column of its own and never a marker inside the text, so no user text, a 64-digit hexadecimal
+string included, can be mistaken for a digest. A lookup by a longer identity finds its candidate by the
+digest and then compares the identity's original bytes with the candidate's, in the same snapshot, before it answers
+that the entity exists. A digest decides nothing but which row to look at.
+
+**The detail.** One JSON object per entity with the domain's own field names, compact, in the domain's field order.
+Everything the Task rules say about the detail holds for these seven families: presence is meaning (an `Option` key is
+absent for `None` and present for `Some`, so an empty text, an empty list, `0` and `false` are kept apart from an
+absence); lists keep order and repeats; the decoder refuses an unknown key, a `null`, a duplicate key, a missing
+required key, a wrong type, an integer outside its type and a number with a fraction or an exponent (the domain's
+serde accepts an unknown key and reads `null` as `None`, and refuses a duplicate key and an attempt of 4294967296;
+all four checked in the domain crate); an enumeration is its domain spelling, and an unknown word is stored-data
+corruption, never a default. Unsigned 64-bit values are written as exact integers and decoded as integers through
+`18446744073709551615`, never through a floating-point value. The field order is:
+
+| Family | Fields, in order |
+|---|---|
+| Agent | `id`, `name`, `adapter`, `role`, `config`, `status`, `current_task`, `autonomous`, `stats`, `last_error`, `capabilities`, `remote` |
+| Team | `id`, `name`, `description`, `status`, `members`, `task_pool`, `lead_agent_id`, `created_at`, `updated_at`, `config` |
+| Run | `id`, `task_id`, `agent_id`, `attempt`, `status`, `started_at`, `finished_at`, `workspace_path`, `prompt`, `pid`, `error`, `error_kind`, `tokens` |
+| Context | `key`, `value`, `created_at`, `updated_at`, `ttl_ms`, `expires_at` |
+| Config | `key`, `value` |
+| Template | `name`, `body` |
+| Goal | `id`, `title`, `description`, `status`, `assignee`, `created_at`, `updated_at` |
+
+- `config` of an Agent has its thirteen members in the domain's order (`command`, `model`, `effort`, `approval_policy`,
+  `max_turns`, `timeout_ms`, `stall_timeout_ms`, `env`, `system_prompt`, `workspace_mode`, `skills`, `prompt_mode`,
+  `role_summary`), each absent for `None`. `stats` always holds the four counters and `tokens_used` only when present;
+  `last_error` holds `message`, `kind` and `timestamp`; `remote` holds `alias` and `online`.
+  `members` and `task_pool` are always present, empty or not. `capabilities` is absent when the list is empty, as in
+  the domain's serde, and present otherwise. A team `config` holds `max_concurrent_tasks` and `message_ttl_ms` when
+  present and always `auto_claim`.
+- `env` is an ordered map, and a JSON object cannot carry a tag as a member name, so a detail writes `env` as an array
+  of `[name, value]` pairs in the map's order, each of the two a string slot. This is the one field whose shape
+  differs from the domain's serde (derived, see the end of the section). The domain's map form is not a valid detail.
+  A name that occurs twice is refused, also when one of the two names was behind a tag, so the check follows the
+  reconstruction of every name; a pair of other than two members, a name or a value that is not a string, and a `null`
+  are refused.
+- `tokens` of a run is absent, or holds all six counters (`input`, `output`, `reasoning`, `total`, `cache_read`,
+  `cache_write`). Absent and an all-zero record are different values. `total` is stored as supplied, even when it is
+  not `input + output + reasoning`; the format neither recomputes nor checks it. `attempt` is a `u32` and `pid` a `u32`.
+- Real output of the domain's serde, which the detail reproduces apart from `env` and from the tags below. An
+  agent with a repeated capability, an empty `role`, `autonomous: false`, a maximal `u64`, and `env` as its map:
+
+```
+{"id":"agt_1","name":"Dup Name ","adapter":"codex","role":"","config":{"model":"m","max_turns":0,"timeout_ms":18446744073709551615,"env":{"Z_LAST":"1","A_FIRST":""},"skills":[]},"status":"idle","autonomous":false,"stats":{"tasks_completed":0,"tasks_failed":0,"total_runs":0,"total_runtime_ms":18446744073709551615,"tokens_used":18446744073709551615},"last_error":{"message":"m","kind":"k","timestamp":"opaque"},"capabilities":["b","a","b"],"remote":{"alias":"r","online":false}}
+```
+
+  A team with one agent twice under different roles and joined times, a repeated task, and opaque and offset times:
+
+```
+{"id":"team_1","name":"T","description":"","status":"active","members":[{"agent_id":"agt_1","role":"lead","joined_at":"2026-11-20T10:00:00+02:00"},{"agent_id":"agt_1","role":"member","joined_at":"x"}],"task_pool":["t2","t1","t2"],"lead_agent_id":"agt_1","created_at":"2026-11-20T10:00:00.1239Z","updated_at":"opaque","config":{"max_concurrent_tasks":0,"auto_claim":false,"message_ttl_ms":18446744073709551615}}
+```
+
+  A run whose supplied `total` (99) is not the sum of its parts (6), with the largest `attempt` and a maximal counter
+  (its `prompt` is the tag below in a detail; the domain's serde prints the text):
+
+```
+{"id":"run_1","task_id":"tsk_1","agent_id":"agt_1","attempt":4294967295,"status":"timed_out","started_at":"2026-11-20T10:00:00Z","workspace_path":"/w","prompt":"p","pid":0,"error":"","error_kind":"rate_limit","tokens":{"input":1,"output":2,"reasoning":3,"total":99,"cache_read":0,"cache_write":18446744073709551615}}
+```
+
+  A context entry with a TTL and no expiry, and one with an expiry and no TTL; a goal with no `updated_at`:
+
+```
+{"key":"K","value":"","created_at":"c","updated_at":"u","ttl_ms":0}
+{"key":"K","value":"","created_at":"c","updated_at":"u","expires_at":"2026-11-20T10:00:00.000Z"}
+{"id":"g","title":"t","description":"","status":"active","assignee":"","created_at":"2026-11-20T10:00:00.000Z"}
+```
+
+**Text values (R97).** The Task rules apply unchanged to every string of every detail, nested strings, list elements,
+map names (the `env` names) and identities included, and to every text that a native column or index copies. The size
+of a text is its length in UTF-8 bytes on the original value; 65,536 bytes stay inline; 65,537 to 67,108,864 bytes are
+one blob object; a longer text is split at 67,108,864-byte offsets into K objects (K = ceil(size / 67,108,864)), every
+object but the last holding exactly that many bytes, the split allowed inside a multi-byte character; the slot is the
+Task rules' tag `{"$blob":{"sha256":…,"bytes":…,"chunks":…}}` with the hash and length of the whole original value; a
+repeated chunk repeats its row; only the assembled bytes are decoded as UTF-8 after the whole length and hash have
+been checked. Their vectors, with real hashes, are the vectors of the Task section and need no second copy. The rows
+are `entity_blob_refs` rows whose `locator` is the RFC 6901 pointer of the slot (for example `/members/1/joined_at`,
+`/config/system_prompt`, `/config/env/3/0`, `/prompt`, or `''` for a detail that is itself over 65,536 bytes).
+Every object has its `blobs` row, registered by the blob store's reference helper, which checks an equal size.
+
+Two rules are added. First, the **aggregate**: the detail is serialized after every over-threshold text became a tag,
+and if the result is over 65,536 bytes the whole detail is stored behind root references, as the Task rules say for
+many small values. Second, **native copies**: a native column or index never holds a text of more than 65,536 bytes,
+and no marker string stands in for one. A required native text column that can hold an indirect text (`value`, `body`,
+`title`, `description`, an identity or a name, `role`, `workspace_path` where it is projected) is rebuilt with an
+explicit *form* column and a `CHECK` that ties the pair: in the inline form the column holds the text itself, at most
+65,536 bytes; in the indirect form it holds the empty string, beside the SHA-256 and the byte length of the whole text in
+sibling columns. A nullable text column is NULL for an absent text and is tied to its form the same way. The form
+column, not the content, says that a column is indirect, so an empty string and a text that looks like a digest mean
+what they say; the detail's tag stays the authority, and a read checks that the column's form, hash and length agree
+with it. Identity, lookup, order and filter keys need more than this, and are the subject of "Order, filters and
+cursors".
+
+**The prompt of a run.** The existing prompt contract holds: a rendered prompt is stored once per content hash and
+named by `runs.prompt_sha256` (R59), and *every* prompt, a short or an empty one included, is a blob, as the blob
+store's prompt helper (`BlobReferences::store_prompt`) stores it. So the `prompt` slot of a run's detail is always a tag,
+whatever the length, and `runs.prompt_sha256` is that tag's `sha256`, the hash of the whole prompt. Equal prompts, in
+one run or in two, name one object. A prompt of 0 bytes has a tag with `bytes` 0 and `chunks` 1, one row at locator
+`/prompt` of size 0, and its `blobs` row; this is the only zero-byte row, and the `size` check of `entity_blob_refs` admits no other. A prompt over 67,108,864 bytes has several
+chunk rows and no object named by its whole hash; `runs.prompt_sha256` still holds the whole hash.
+
+The helper at the base does not do the last case. It stores one object: `DiskBlobStore::put` refuses more than 64 MiB
+(`BlobError::TooLarge`, `MAX_BLOB_BYTES`), so `store_prompt` cannot store a prompt over 67,108,864 bytes, and
+`load_prompt` reads only the object that `runs.prompt_sha256` names through its `blobs` row, so it cannot read one. T10
+owns the change: in its run family the prompt is stored and loaded through the tag and the chunk rows of the detail
+(the rule of "Text values (R97)" above), and an object is stored by the unchanged `put`. T11's blob adapter is not
+changed. Whether a prompt of that size can occur at all is Open (3); if the owner rules that it cannot, the
+alternative is that a prompt over 67,108,864 bytes is refused with the helper's `TooLarge`, and the multi-chunk rule
+and its test are dropped. The sweep counts `runs.prompt_sha256` and the rows of `entity_blob_refs` alike (R60).
+
+**Names, equal values and optional values.** Two agents, or two teams, may have equal names, in one project too:
+`UNIQUE (project_id, name)` is replaced by a plain, nonunique index for lookup, and the dispatcher keeps whatever
+validation it has at its current boundary (the entity port says payload validation stays there). Exact text is kept
+with its case and its whitespace. Whatever the typed domain distinguishes stays distinguished: an absent value, an
+empty text, `0` and `false`; an absent `autonomous`, `false` and `true`; an absent `tokens` and an all-zero one; an
+absent `ttl_ms` and `0`.
+
+**Time and unsigned integers.** Every time is stored in the detail as the exact string the caller supplied, so an
+opaque string, a numeric offset, a fractional precision and two spellings of one instant are all kept and are all
+different values. A native time column serves time queries only and is never the order of a text: it holds UTC
+milliseconds (the unit of this schema) when the string parses as an RFC 3339 instant that is a whole number of
+milliseconds within `0000-01-01T00:00:00.000Z` to `9999-12-30T22:00:00.999Z`, by checked arithmetic, and NULL
+otherwise: an opaque string, a value out of range, a fraction finer than a millisecond (no rounding), or an absent
+time. These columns are nullable for that reason. An unsigned 64-bit value is stored in the detail as an exact
+integer. A native signed counter column holds the value when it is at most `9223372036854775807` and NULL above it
+(or when the value is absent); the detail tells an overflow from an absence, and any calculation that needs the whole
+range reads the exact value from the detail. Nothing is truncated, saturated, clamped or converted through a
+floating-point value, and no clock supplies a default. The port's own counters (revision, position, the claim
+counters) keep the independently checked bounds of the entity port and of "Task format v1" (checked signed range,
+refusal with no change before anything is written).
+
+**Revision and position.** Both are native port metadata and are in no detail. `create` stores revision 1, and `update`,
+`delete` and `move_to_end` check the caller's expected revision, as for tasks. A position is monotonic per project and
+family and is allocated from a project-local counter named by the family (`position:agent`, `position:team`,
+`position:run`, `position:context`, `position:config`, `position:template`; `position:goal` exists and is the goal
+adapter's). `create` allocates a fresh position, an ordinary `update` keeps the position, `move_to_end` allocates a
+new one, a delete never lowers the counter, and the counter is never rebuilt from `MAX(position)`, which cannot know an
+issued number that a delete removed. `teams`, `runs`, `context_entries`, `project_config` and `templates` gain a `position` column for this (the first
+migration has none there). The checked signed SQLite range and the refusal of an
+exhausted counter before any change are those of "Staged SQLite goal timestamp and position limits", for every family.
+
+**Projections.** Each operation writes every projection from the typed value, and a read checks all of them against
+the same derivation. A column named below that the format does not list as *owned* is never written from the entity
+and is preserved byte for byte by `update` and `move_to_end`. New columns are marked *(new)*; every rebuilt table keeps
+its other columns, indexes, foreign keys and later-phase columns.
+
+| Family and table | Owned projections |
+|---|---|
+| Agent: `agents` | `id`; `name` (plain index `agents_by_name`, not unique); `adapter`; `role` (NULL for absent); `status` *(new)*; `current_task` *(new, NULL for absent)*; `autonomous` (nullable: NULL, 0 or 1); `tasks_completed`, `tasks_failed`, `total_runs`, `total_runtime_ms` (nullable now; the signed rule above); `tokens_used` (NULL for absent or above `i64::MAX`); `last_error` (the message of `last_error` when it is inline, else NULL); `config`, written as the constant `'{}'` (the detail is the authority; the column's old meaning is not used); `position`; `revision`; `created_at` and `updated_at` (nullable, see below) |
+| Team: `teams` | `id`; `name` (plain index); `description` (NULL for absent); `status`; `lead_agent_id`; `config` (the compact JSON of the team's config, in the domain's field order); `created_at`, `updated_at` (milliseconds, nullable); the text of `created_at` for the default order; `position` *(new)*; `revision` |
+| Team: `team_members` | One row per occurrence: `(project_id, team_id, ordinal)` as the key, then `agent_id`, `role`, `joined_at` (milliseconds, nullable). Rows `0..n-1` without a gap; a plain index `(project_id, agent_id, team_id)` answers "is this agent a member" and may repeat. An occurrence whose `agent_id` is over 65,536 bytes has its row with a NULL `agent_id` and no index entry |
+| Team: `team_tasks` | The distinct values of `task_pool` of 65,536 bytes or fewer. No order, repeat or presence: the detail has them |
+| Run: `runs` | `id`; `task_id`; `agent_id`; `status`; `attempt` *(new, `INTEGER NOT NULL`, 0 to 4294967295)*; `started_at`, `finished_at` (milliseconds, nullable) and the text of `started_at` for the default order; `error` (NULL for absent or indirect); `error_kind` (the word); `prompt_sha256` (the prompt rule above); `tokens_input`, `tokens_output`, `tokens_reasoning`, `tokens_cache_read`, `tokens_cache_write` and `tokens_total` *(new)* (all NULL when `tokens` is absent; each NULL above `i64::MAX`); `local` (below); `position` *(new)*; `revision` |
+| Context: `context_entries` | `key`; `value`; `created_at` *(new)*, `updated_at` and `expires_at` (milliseconds, nullable); `ttl_ms` *(new)* (NULL for absent or above `i64::MAX`); `position` *(new)*; `revision` |
+| Config: `project_config` | `key`; `value`; `position` *(new)*; `revision` |
+| Template: `templates` | `name`; `body`; `position` *(new)*; `revision` |
+| Goal: `goals` | `id`; `title`; `description`; `status`; `assignee_agent_id` (NULL for absent); `created_at`, `updated_at` (milliseconds, nullable now); the texts of `created_at` and `updated_at`; `position`; `revision` |
+
+- *Agent times.* The domain's `Agent` has no `created_at` or `updated_at`, and the format never makes one: an
+  entity-only record has NULL in both. A time that an independent source put there (an import with evidence, or a
+  later migration) is retained by every update.
+- *Run local.* `runs.local` retains its documented meaning, a JSON object holding the pid and the workspace path of
+  this daemon's process (difference 3). It is written from `pid` and `workspace_path`, a member absent when its
+  source is absent or indirect, and holds no other field. It is what `process.stop` reads; the names of its members
+  are fixed by the first change that writes it (see "Open").
+- *Run claim tuple.* `run_no`, `counted`, `epoch` and `attempt_no` are the *claim tuple*, and `attempt` is not part of
+  it. The four are nullable together:
+
+```sql
+CHECK ((run_no IS NULL AND counted IS NULL AND epoch IS NULL AND attempt_no IS NULL)
+    OR (run_no IS NOT NULL AND epoch IS NOT NULL AND counted IS NOT NULL
+        AND ((counted = 1 AND attempt_no IS NOT NULL) OR (counted = 0 AND attempt_no IS NULL))))
+```
+
+  A run that no claim made (ordinary CRUD, an entity-only run) has the absent tuple. The unique indexes `runs_epoch`,
+  `runs_seq` and `runs_attempt` stay as they are: a unique index admits any number of NULLs, and a real claim keeps
+  its uniqueness per project and task. Only the claim path allocates a tuple, from the task's counters and its epoch,
+  as R35 says. Ordinary CRUD allocates no counter, advances no fence and invents no claim; it preserves a linked
+  claim and its identity on update; and it cannot move a claim to another task (an update that changes `task_id` of a
+  run that holds a claim is refused, checked with the other conflicts in the same transaction, as the port's ownership
+  contract requires). Two runs of one task, or of two tasks, may carry the same `attempt`: the payload's attempt and
+  the claim's `attempt_no` are different things and are stored apart.
+- *Agent and team times as text.* The reference orders a team by the text of `created_at` and a run by the text of
+  `started_at` (below), so the format keeps a native copy of that text when it is inline; the millisecond column is
+  for time queries.
+
+**Order, filters and cursors.** The default order of each list, and its other sorts, are the reference's, served by
+the native columns. Every order ends with the identity compared by bytes (SQLite's `BINARY` collation on UTF-8 text
+compares bytes). The cursor continues the same total order before it limits a page, and the filter is applied before
+paging.
+
+| List | Default order | Other sorts |
+|---|---|---|
+| agents | `position`, `id` | `name`: `name`, `position`, `id` |
+| teams | text of `created_at`, `id` | `name`: `name`, `id` |
+| runs | text of `started_at` descending, `id`; when the filter names a `task` (alone or with an `agent`): `attempt` descending (numeric), then `id` | none |
+| context, config, templates | the original identifier ascending (`key` or `name`) | none |
+| goals | status rank (active, paused, achieved, abandoned), presence of `updated_at` (present first), the original text of `updated_at` descending, `position`, `id` | `created_at`: text of `created_at`, `position`, `id` |
+
+Every list also offers the sort `id` (R49): the identity ascending, by bytes. For context, config and templates it is the
+default order itself.
+
+- *Attempts in numeric order.* The run and goal keys are those of "Run and goal default order" (under the list table
+  above) and are not restated here. In SQLite, `attempt` is its own nonunique `INTEGER` column with an index on
+  `(project_id, task_id, attempt DESC, id)`, so one task's runs with attempts 2, 10 and 10 list as 10, 10, 2, the two
+  tens in the byte order of their ids; it is never taken from `attempt_no`, from `position` or from `run_no`. A list
+  with no `task` in its filter keeps the text of `started_at` descending, then `id`, and a page's cursor continues the
+  key of the order that produced it.
+- *Text order and the instant.* A time that a list orders by is ordered as the reference orders it, by the original
+  string's bytes, and never by the millisecond column: two strings of one instant are two keys, an opaque string is a
+  key, and an offset string does not sort by its instant.
+- *Indirect keys.* An identity, a name or an ordered time that is over 65,536 bytes has no native copy, so SQLite
+  cannot order it from a column. It is ordered on the original bytes: a lookup uses the digest only to find candidates
+  and compares bytes before it answers; a comparison that a digest, a truncated prefix or a normalized instant cannot
+  decide reads the original bytes through the blob adapter in the same snapshot; a cursor naming such a row resumes
+  at the same place. A page over rows of both kinds returns the same rows and cursors as the reference. The columns
+  that hold the digest, and the way a page merges inline and indirect rows, are the migration's (see "Open").
+  Speed for indirect keys is not a goal: R97's premise is that they are rare.
+- *Goal order, and what the references owe.* The goal key (status rank, presence of `updated_at` with a present empty
+  text counting as present, the original `updated_at` text descending, `position`, `id`), the shared scenarios that bind
+  the memory reference, the file reference and SQLite, and the difference between the contract and a reference meeting it
+  are in "Run and goal default order" above, and `crates/orch-engine/tests/storage_contract/v2_paging.rs` holds the
+  scenarios. SQLite meets the contract only when the registration of those scenarios on SQLite passes, which is T10's.
+
+**Context provenance.** `context_entries` holds, beside the entity, who set it: the principal's kind (`set_by_kind`),
+its exact identity (a column *(new)*), and, separately, the agent and the run when the caller is bound to them
+(`set_by_agent_id`, `set_by_run_id`). `create` takes all of them from the authenticated caller of the unit of work, never
+from the entity or a request field: a Task principal supplies its run and task binding; an agent association is made
+only from an authoritative binding; an Owner or a Worker identity alone establishes no agent and no run, and the
+columns stay NULL. Provenance is not in the detail. An ordinary `update` and a `move_to_end` preserve it byte for byte,
+including when a different principal makes the call; provenance that a migration or an import had evidence for is
+retained. Neither TTL nor expiry is inferred from the other, and no read applies an implicit expiry filter: an
+expired entry is a row that the port's `get` and `list` return as stored. The `context.expire` job deletes expired
+entries (T15), and whatever the engine's context service does with an expired entry on a read happens above the port.
+
+**Goal.** The goal adapter's columns for integration and publication (`integration_branch`, `integration_head`,
+`published_at`, `published_commit`, `published_by`) are not owned by the entity: a typed update and a move preserve
+them as they are. Existing goal helpers (PR 194) are adapted once, not replayed: the signed-millisecond-only limits
+of "Staged SQLite goal timestamp and position limits" no longer bound the typed entity, whose times are the original
+strings, and the position rules of that section stay.
+
+**Writing, reading, rollback.** As the Task rules, with the family and the key form in place of the task id, and with
+this order for one operation: refuse before any write what needs none (a stale revision, a conflict, an
+unrepresentable or over-range value, an exhausted counter); publish every object through the blob adapter and check
+each returned hash; then, in one savepoint inside the caller's unit of work, write the native row, the detail, the
+reference rows, the member and membership rows, the `blobs` rows, the revision and the position counter. On any error
+the savepoint rolls back whole and the old state stays readable, even when the caller catches the error and commits
+unrelated work in the same unit (R7); published objects stay unreferenced and follow R60. A read of any family, a
+`get` and every element of a page, hydrates in the snapshot that selected it or in the unit of work that asked, and
+checks in order: the native row, the detail row with `format` 1 and the same project, family and key; the detail's
+bytes against `detail_bytes` and `detail_sha256`; a strict typed decode; the entity's own identity against the key
+(the bytes of a key of form 1 against the digest); every native projection of the table above, the member rows and the
+membership sets; the reference rows (exact locators, ordinals `0..K-1` without a gap or a duplicate, `chunks`, each
+`blobs` row, the sizes of the split, no row at a locator without a tag); and each object through the blob adapter, with
+the whole length and hash and one UTF-8 decode. A failure is the typed stored-data error of R140 and issue 127,
+classified before any backend message is read, naming the family, the identity's key form, the check and the locator, and
+never a text or a path (R101); a page that meets one returns no partial page. Nothing is ever normalized to make a
+read succeed.
+
+**Migrations and compatibility.** Two forward-only migrations, in this order on the integration base, each in one
+transaction with the pre-migration copy of R124. The first adds the two tables and rebuilds `agents`, `teams`,
+`team_members` and `runs` (nullable columns, the new columns, the plain name indexes, ordinal-keyed members and the
+two-case claim check). The second rebuilds `context_entries`, `project_config`, `templates` and `goals`. Both
+keep every earlier migration byte for byte, preserve the unrelated indexes, foreign keys, later-phase columns and
+existing claim tuples, and the registry of the migration owner stays one contiguous list (the adapter refuses a gap). A
+table rebuild is the new table, a copy, a drop and a rename inside the transaction, and a copy that a later proof
+allows (below) runs in bounded batches inside that one transaction.
+
+- *Backfill.* A predecessor row is backfilled only from evidence that proves the exact payload, the metadata, the
+  position and the allocator's history. No family has it: the first migration's rows have no home for most agent,
+  team and run fields, no order, no original time spelling and no positions, a signed instant cannot recover an original
+  string, and the live `MAX(position)` cannot prove an allocator high-water mark. So a migration refuses a predecessor
+  that holds a row of any family it rebuilds, before its first change, with a diagnostic that names the table and a
+  count and never a row's content, leaves the database as it was (apart from the copy R124 makes), and reports
+  `SqliteError::Migration`; it needs authoritative recovery input to proceed, and invents no position, time, TTL or
+  caller. No such row exists outside tests: 1.0 has no SQLite storage and the adapter is unwired on `main`. A later
+  migration may carry a proof for one family and amend this paragraph.
+- *References.* The file reference and the memory reference keep their own encodings; both backends return equal typed
+  values for the same input. Their physical layouts are not compared.
+- *Retry diagnostics* keep their own mapping and share none of these tables.
+
+**What each later task owes.**
+
+| Task | Obligation |
+|---|---|
+| T10 | Agent, Team and Run, then Context, Config, Template and Goal, each with its R142 or R143 tests; one codec for the Task, Agent, Team and Run families, reused by the second slice, not copied (the Agent, Team and Run byte codec uses the Task codec's strict duplicate-key reader, `UniqueValue`, made visible to the `sqlite` module and nothing else changed; each family keeps its own driver, and a generic driver would need a new decision); the prompt helper changed to store and load a prompt through the tag and chunk rows of the detail (above); the migrations in the order above, each owned by the one owner of the registry; the shared entity suites registered on SQLite for the families, the two scenarios of "Run and goal default order" included; the internal adapter only. Allocate migration numbers on the verified integration base in sequence. Each PR near or below 3,000 changed lines, stacked only for a real code dependency, and the whole stack qualified |
+| T12 | The claim path alone allocates a run's claim tuple; a consumer reads and writes a run through the port |
+| T15 | `blobs.sweep` counts `entity_blob_refs.sha256` with `task_blob_refs.sha256` and `runs.prompt_sha256`; the expiry of Context entries is its own job |
+| T21 | Build each entity through the same codec, never by inserting rows; keep list order, repeats and presence as the 1.0 document says; a run's claim tuple is the importer's own path (its `run_no`, `epoch` and `attempt_no` rules in "Import rules" stay), while `attempt` is the payload's value whatever that tuple holds; initialize each family's position high-water mark and preserve a larger one; record what a non-canonical time does (nothing: it is kept as it is) |
+| T22 | `orch db verify` runs the read checks for every entity, and reports an object, a reference row, a member row or a detail with no entity; diagnostic views of `entity_details` (without `detail`) and `entity_blob_refs` |
+| T23 | A backup copies every object that an `entity_blob_refs` or `blobs` row names, in one point; an export carries both tables as rows, with the counters and the positions of emptied families; an import reconstructs every text, checks its hash and reproduces every row. A restore refuses a missing, short or reordered chunk |
+| T27 | Records the named checks of R142 and R143 as run, rejecting an empty or ignored selection |
+
+**Derived, to be confirmed.** These choices are the writer's reading of the two decisions against the domain and the
+schema, are not in the lead's wording, and are confirmed or amended by the owner of the migrations in the first PR that
+builds them, through the writer of this text: (1) one shared detail and reference pair for the seven families, with the
+family and `key_form` in the key; (2) the digest form for an identity over 65,536 bytes; (3) `env` as an array of
+pairs; (4) the `prompt` slot always a tag, and the zero-byte row at `/prompt`; (5) a time is projected to milliseconds
+only when it is exact, and its original text is a separate order column; (6) `agents.config` written as `'{}'`, the
+team's `config` as compact JSON, and `last_error` as the message; (7) `team_members` ordinal-keyed and `team_tasks`
+distinct; (8) a `tokens_total` column; (9) the position counters named `position:<family>`; (10) the two migrations
+refuse any populated predecessor row. Of these, (3) and, for the bytes of the detail, (4) are confirmed by the author of
+the byte codec (2026-11-23) and built there: `env` is an array of `[name, value]` pairs, each of the two a string slot;
+the `prompt` slot is always a tag, and an empty prompt has one zero-byte row at `/prompt`, the only one. What (4) adds to
+the schema (`runs.prompt_sha256` equal to that tag's hash, and the size check of `entity_blob_refs`) and every other item
+still wait for the migration owner.
+
+**Open in this section.** (1) The names of the new columns, of the form columns and of the hash and length columns that carry an indirect
+text, and the way a page merges inline and indirect rows: all are fixed in the first PR that needs them and amended
+into this text before it merges. (2) The member names of `runs.local`. (3) Whether a prompt of more than
+67,108,864 bytes can occur; if not, the multi-chunk prompt rule is untested weight and a prompt over that size is refused instead (see "The prompt of a run"). (4) Whether T21 keeps `local`'s record of
+a repeated 1.0 attempt now that the payload keeps its attempt. (5) The mapping of an authenticated Task principal to an
+agent association for Context provenance is the dispatcher's, not defined here. None blocks the documentation; (1)
+and (2) must be settled in the code PR that writes them. The run and goal orders, once open here, are settled by the
+lead's decision of 2026-11-23 and written in "Run and goal default order" above.
 
 ## Transactions and intents
 
@@ -2627,7 +3057,7 @@ The new operations are in no MCP allowlist.
   and 1.0's own index reader writes to the directory it reads (F19), so the import runs neither.
 - Runs: `run_no` and `epoch` count from 1 per task in start order; `task_epochs.next_epoch` is one more than
   the largest. `attempt_no` is 1.0's attempt number where it is unique within the task; a run that would
-  repeat one is stored uncounted with the 1.0 number in `local`, and the dry run counts such runs. The rendered prompt becomes a blob.
+  repeat one is stored uncounted with the 1.0 number in `local`, and the dry run counts such runs. The rendered prompt becomes a blob. This is the claim tuple of the run; its payload `attempt` is stored in the detail and in `runs.attempt` whatever the tuple holds ("Entity format v1 (SQLite)").
   A task's recorded branch is stored as the `branch` of that task's last run; it is text until R106 has
   checked it. Events get `seq` from their line number; a line that does
   not parse becomes a gap. Model and adapter version are empty. Every event is imported; the pruning job
