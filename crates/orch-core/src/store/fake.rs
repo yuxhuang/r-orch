@@ -659,13 +659,21 @@ impl retries::RetryRead for View {
 async fn retry_read<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    tokio::task::spawn_blocking(work).await.map_err(|error| {
-        StoreError::Backend(crate::Error::Io {
+    finish_retry_read(tokio::task::spawn_blocking(work).await)
+}
+
+fn finish_retry_read<T>(
+    joined: std::result::Result<Result<T>, tokio::task::JoinError>,
+) -> Result<T> {
+    match joined {
+        Ok(result) => result,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        Err(error) => Err(StoreError::Backend(crate::Error::Io {
             context: "cannot join memory reference retry read".into(),
             path: None,
             source: std::io::Error::other(error),
-        })
-    })?
+        })),
+    }
 }
 
 impl retries::RetryWrite for View {
@@ -751,3 +759,6 @@ impl AttentionWrite for View {
         Ok(count)
     }
 }
+
+#[cfg(test)]
+mod tests;
