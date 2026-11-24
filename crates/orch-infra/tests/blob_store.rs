@@ -621,3 +621,53 @@ fn error_variants_and_location() {
     ));
     f.canary_unchanged();
 }
+
+#[test]
+fn metadata_refusal_preserves_existing_prompt_and_attachment_links() {
+    use orch_infra::blob::{BlobReferences, ReferenceError};
+    for (size, location) in [(99, "disk"), (9, "object")] {
+        let f = fixture();
+        let mut c = database(&f);
+        let refs = BlobReferences::new(&f.store, "p");
+        let mut tx = c.transaction().unwrap();
+        let original = refs.store_prompt(&mut tx, "run", "original", 1).unwrap();
+        assert_eq!(
+            refs.store_attachment(&mut tx, "task", "a", b"original", 1)
+                .unwrap(),
+            original
+        );
+        let candidate = f.store.put(b"candidate").unwrap();
+        tx.execute(
+            "INSERT INTO blobs VALUES ('p',?1,?2,?3,2,3)",
+            rusqlite::params![candidate.to_string(), size, location],
+        )
+        .unwrap();
+        assert!(matches!(
+            refs.store_prompt(&mut tx, "run", "candidate", 4),
+            Err(ReferenceError::Metadata)
+        ));
+        assert!(matches!(
+            refs.store_attachment(&mut tx, "task", "a", b"candidate", 4),
+            Err(ReferenceError::Metadata)
+        ));
+        tx.commit().unwrap();
+        assert_eq!(count(&c, "blobs"), 2);
+        assert_eq!(count(&c, "task_attachments"), 1);
+        let metadata: (i64, String, i64, Option<i64>) = c
+            .query_row(
+                "SELECT size,storage_location,created_at,unreferenced_since FROM blobs WHERE project_id='p' AND sha256=?1",
+                [candidate.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(metadata, (size, location.into(), 2, Some(3)));
+        assert_eq!(
+            refs.load_prompt(&c, "run").unwrap(),
+            Some("original".into())
+        );
+        assert_eq!(
+            refs.load_attachment(&c, "task", "a").unwrap(),
+            Some(b"original".to_vec())
+        );
+    }
+}
