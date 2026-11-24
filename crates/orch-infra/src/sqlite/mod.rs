@@ -11,9 +11,23 @@ pub use connection::{ConnectionHandle, ConnectionRole, Synchronous, open_connect
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteError {
+    #[error("SQLite counter {name} is missing for project {project} with existing rows")]
+    CounterMissing { project: String, name: &'static str },
+    #[error("SQLite counter {name} is negative ({value}) for project {project}")]
+    CounterNegative {
+        project: String,
+        name: &'static str,
+        value: i64,
+    },
+    #[error("SQLite counter {name} ({value}) is behind existing rows for project {project}")]
+    CounterBehind {
+        project: String,
+        name: &'static str,
+        value: i64,
+    },
     #[error("value cannot be represented losslessly in the SQLite schema: {0}")]
     Unrepresentable(String),
-    #[error("goal operation failed: {operation}; savepoint rollback failed: {rollback}")]
+    #[error("operation failed: {operation}; rollback failed: {rollback}")]
     OperationRollback {
         operation: Box<SqliteError>,
         rollback: rusqlite::Error,
@@ -22,10 +36,16 @@ pub enum SqliteError {
     TransactionAborted,
     #[error("storage admission deadline or queue bound reached")]
     Overloaded,
+    /// The shared failure state is latched (R128, R140): the writer refuses every
+    /// mutation, no claim is granted and no checkpoint is called until a restart.
+    #[error("storage_unavailable: {0}")]
+    StorageUnavailable(Failure),
     #[error(transparent)]
     Store(#[from] orch_core::store::StoreError),
     #[error("stored run event is damaged: {0}")]
     EventCorrupt(String),
+    #[error("stored lease data is damaged: {0}")]
+    LeaseCorrupt(String),
     #[error("SQLite writer is closed")]
     WriterClosed,
     #[error("SQLite connection and queue capacities must be greater than zero")]
@@ -63,6 +83,9 @@ pub(crate) mod events;
 mod read_pool;
 mod writer;
 pub use read_pool::ReadPool;
+pub use writer::failure::{
+    Class, Failure, FailureSource, FailureState, FatalCause, Observation, Role, classify,
+};
 pub use writer::{Lane, WriteReceipt, Writer, WriterHandle};
 
 #[cfg(test)]
@@ -100,3 +123,15 @@ mod leases;
     reason = "Internal task paging awaits T10 hydration and public cursor integration"
 )]
 mod task_page;
+
+#[allow(
+    dead_code,
+    reason = "internal attention mapping awaits T10 Storage composition"
+)]
+mod attention;
+
+#[allow(
+    dead_code,
+    reason = "internal request-key persistence awaits the combined T10 Storage adapter"
+)]
+mod request_keys;

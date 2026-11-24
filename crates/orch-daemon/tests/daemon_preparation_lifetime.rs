@@ -9,6 +9,7 @@ use orch_core::{ProcessManager, Result, Signal};
 use orch_daemon::testing::DaemonHarness;
 use orch_domain::RunStatus;
 use std::collections::BTreeMap;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -131,7 +132,10 @@ async fn configure_lifetime_peer(harness: &DaemonHarness) {
 async fn delayed_preparation(fail: bool, disconnect: bool, stop: Stop, owned: bool) {
     let project = tempfile::tempdir().unwrap();
     let root = project.path().canonicalize().unwrap();
-    std::fs::create_dir(root.join(".orchestry")).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.join(".orchestry"))
+        .unwrap();
     let processes = Arc::new(DelayedProbe {
         fail,
         ..Default::default()

@@ -1,5 +1,6 @@
 use super::*;
 use crate::sqlite::{ConnectionRole, SqliteError, Synchronous, open_connection, test_data};
+use failure::Role;
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -478,7 +479,8 @@ fn a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body() {
     };
     let ran = std::cell::Cell::new(false);
     let gate = Gate::install(&mut connection).unwrap();
-    let outcome = execute(&mut connection, &gate, Some(limit), clock, |tx| {
+    let state = FailureState::new();
+    let outcome = execute(&mut connection, &gate, &state, Some(limit), clock, |tx| {
         ran.set(true);
         tx.execute("INSERT INTO sample VALUES(1)", [])?;
         Ok(())
@@ -492,7 +494,7 @@ fn a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body() {
     assert!(tx_state_is_autocommit(&connection), "reservation released");
     assert_eq!(count(&connection), 0);
     // Without a deadline the same path commits, so the refusal came from the recheck.
-    execute(&mut connection, &gate, None, Instant::now, |tx| {
+    execute(&mut connection, &gate, &state, None, Instant::now, |tx| {
         tx.execute("INSERT INTO sample VALUES(2)", [])?;
         Ok(())
     })
@@ -790,17 +792,28 @@ fn a_failed_rollback_fails_the_writer_instead_of_wedging_it() {
             })
             .unwrap()
             .wait_bounded();
-        // The request keeps its own failure ...
-        assert!(matches!(first, Err(SqliteError::Migration(_))), "{first:?}");
-        // ... and the writer is gone, for everyone, rather than answering
-        // "cannot start a transaction within a transaction" for ever.
+        // The request keeps both of its failures (PR 249 classifies each side) ...
+        assert!(
+            matches!(
+                &first,
+                Err(SqliteError::OperationRollback { operation, .. })
+                    if matches!(**operation, SqliteError::Migration(_))
+            ),
+            "{first:?}"
+        );
+        // ... and the writer is refused for everyone, from the shared state (R128),
+        // rather than answering "cannot start a transaction within a transaction"
+        // for ever, or as a clean close.
         let next = handle
             .submit(Lane::Entities, None, |tx| {
                 tx.execute("INSERT INTO sample VALUES(2)", [])?;
                 Ok(())
             })
             .and_then(|receipt| receipt.wait_bounded());
-        assert!(matches!(next, Err(SqliteError::WriterClosed)), "{next:?}");
+        assert!(
+            matches!(next, Err(SqliteError::StorageUnavailable(_))),
+            "{next:?}"
+        );
         assert!(
             worker.join().is_err(),
             "the writer fails loudly, not as a clean close"
@@ -808,6 +821,187 @@ fn a_failed_rollback_fails_the_writer_instead_of_wedging_it() {
     });
     let reader = open_connection(&data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
     assert_eq!(count(&reader), 0);
+}
+
+/// A writer whose ROLLBACK statement is refused `refusals` times, standing in for a
+/// rollback that SQLite cannot complete.
+fn refuse_rollbacks(writer: &mut Writer<'_>, refusals: usize) {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    use std::sync::atomic::AtomicUsize;
+    let left = Arc::new(AtomicUsize::new(refusals));
+    writer
+        .connection
+        .for_migration()
+        .authorizer(Some(move |context: AuthContext<'_>| match context.action {
+            AuthAction::Transaction {
+                operation: TransactionOperation::Rollback,
+            } if left
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok() =>
+            {
+                Authorization::Deny
+            }
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+}
+
+fn failing_body(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    tx.execute("INSERT INTO sample VALUES(1)", [])?;
+    Err(SqliteError::Migration("synthetic body error".into()))
+}
+
+#[test]
+fn a_failed_top_level_rollback_that_leaves_the_transaction_open_fails_the_writer() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::a_failed_top_level_rollback_that_leaves_the_transaction_open_fails_the_writer",
+    ) {
+        return;
+    }
+    let (_temp, data) = data_with("CREATE TABLE sample(id INTEGER) STRICT");
+    let (mut writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    refuse_rollbacks(&mut writer, usize::MAX);
+    let (release, released) = mpsc::channel::<()>();
+    let (started, running) = mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || writer.run());
+        let _close = CloseOnDrop(&handle);
+        // The first request holds the worker while three more queue behind it.
+        let first = handle
+            .submit(Lane::Entities, None, move |tx| {
+                started.send(()).unwrap();
+                released.recv_timeout(BOUND).expect("released");
+                failing_body(tx)
+            })
+            .unwrap();
+        // Claims outrank everything: queue them only once the first request runs.
+        running.recv_timeout(BOUND).expect("running");
+        let queued: Vec<_> = [Lane::Claims, Lane::Events, Lane::Maintenance]
+            .into_iter()
+            .map(|lane| {
+                handle
+                    .submit(lane, None, |tx| {
+                        tx.execute("INSERT INTO sample VALUES(9)", [])?;
+                        Ok(())
+                    })
+                    .unwrap()
+            })
+            .collect();
+        release.send(()).unwrap();
+        assert!(
+            matches!(
+                first.wait_bounded(),
+                Err(SqliteError::OperationRollback { .. })
+            ),
+            "the request keeps its own answer"
+        );
+        // The shared state is latched with the new cause, and reports it from memory.
+        let latched = handle.failure_state().failure().expect("latched");
+        assert_eq!(latched.source, FailureSource::Writer);
+        assert_eq!(
+            latched.causes,
+            [(Role::Operation, FatalCause::RollbackLeftTransactionOpen)]
+        );
+        // What was queued is refused as a latched writer refuses, never as a clean
+        // close, and no statement of it ran.
+        for receipt in queued {
+            let outcome = receipt.wait_bounded();
+            assert!(
+                matches!(&outcome, Err(SqliteError::StorageUnavailable(f)) if *f == latched),
+                "{outcome:?}"
+            );
+        }
+        // So is every later request, at the door.
+        for lane in [
+            Lane::Claims,
+            Lane::Entities,
+            Lane::Events,
+            Lane::Maintenance,
+        ] {
+            let outcome = handle.submit(lane, None, |_| Ok(())).err();
+            assert!(
+                matches!(&outcome, Some(SqliteError::StorageUnavailable(f)) if *f == latched),
+                "{outcome:?}"
+            );
+        }
+        assert!(
+            worker.join().is_err(),
+            "the writer fails loudly, not as a clean close"
+        );
+    });
+    let reader = open_connection(&data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
+    assert_eq!(count(&reader), 0, "nothing of any request is durable");
+}
+
+#[test]
+fn a_failed_rollback_is_not_retried_before_the_connection_is_judged() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::a_failed_rollback_is_not_retried_before_the_connection_is_judged",
+    ) {
+        return;
+    }
+    // Only the first ROLLBACK is refused. A retry (rusqlite's `Drop` makes one)
+    // would succeed and hide the failure; R128 allows no further statement.
+    let (_temp, data) = data_with("CREATE TABLE sample(id INTEGER) STRICT");
+    let (mut writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    refuse_rollbacks(&mut writer, 1);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || writer.run());
+        let _close = CloseOnDrop(&handle);
+        let first = handle
+            .submit(Lane::Entities, None, failing_body)
+            .unwrap()
+            .wait_bounded();
+        assert!(
+            matches!(first, Err(SqliteError::OperationRollback { .. })),
+            "{first:?}"
+        );
+        assert_eq!(
+            handle.failure_state().failure().map(|f| f.causes),
+            Some(vec![(
+                Role::Operation,
+                FatalCause::RollbackLeftTransactionOpen
+            )])
+        );
+        assert!(worker.join().is_err());
+    });
+}
+
+#[test]
+fn a_rollback_error_that_leaves_the_connection_outside_a_transaction_is_not_that_cause() {
+    // SQLite cannot be made to fail a ROLLBACK and end the transaction anyway, so
+    // the condition is proved where it is decided: a failed rollback answered with
+    // the connection in each state, and a successful one inside a transaction.
+    let (_temp, data) = test_data();
+    let connection = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let abandoned = |rollback_failed| Abandoned {
+        error: SqliteError::Migration("synthetic".into()),
+        rollback_failed,
+    };
+    let state = FailureState::new();
+    let error = abandoned(true).settle(&connection, &state);
+    assert!(matches!(error, SqliteError::Migration(_)), "{error:?}");
+    assert_eq!(
+        state.failure(),
+        None,
+        "a rollback error alone is not the cause"
+    );
+    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    abandoned(false).settle(&connection, &state);
+    assert_eq!(
+        state.failure(),
+        None,
+        "a successful rollback is not the cause"
+    );
+    abandoned(true).settle(&connection, &state);
+    assert_eq!(
+        state.failure().map(|f| f.causes),
+        Some(vec![(
+            Role::Operation,
+            FatalCause::RollbackLeftTransactionOpen
+        )])
+    );
+    connection.execute_batch("ROLLBACK").unwrap();
 }
 
 // The lease helpers are what a composed transaction calls. They run here on the

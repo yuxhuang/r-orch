@@ -3,12 +3,48 @@
 //! open connections nor read a clock. The v1 daemon still uses files.
 
 use orch_core::store::leases::{ClaimOutcome, LEASE_MS, Lease, NewLease};
-use orch_core::store::{Caller, Principal, Result, StoreError};
+use orch_core::store::{Caller, Principal, StoreError};
 use rusqlite::{OptionalExtension, Row, Transaction, params};
 
-fn backend(error: rusqlite::Error) -> StoreError {
-    StoreError::Backend(orch_core::Error::other(format!("SQLite lease: {error}")))
+/// A lease failure that keeps the SQLite error structured. Typed refusals are
+/// ordinary outcomes a caller may handle; `Sql` is an engine failure that must
+/// reach the writer's classification and end the transaction, so it is never
+/// flattened into a backend string inside a callback that then returns `Ok`.
+/// `Corrupt` is a stored value outside its column's contract (no SQLite result
+/// code): like `Sql` it ends the job rather than being offered as a refusal,
+/// and unlike `StoreError::CounterExhausted` it says the data is damaged.
+#[derive(Debug)]
+pub(crate) enum LeaseError {
+    Store(StoreError),
+    Sql(rusqlite::Error),
+    Corrupt(String),
 }
+
+impl From<StoreError> for LeaseError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<rusqlite::Error> for LeaseError {
+    fn from(error: rusqlite::Error) -> Self {
+        Self::Sql(error)
+    }
+}
+
+/// Lets a composed writer job propagate a lease failure with `?` and keep the
+/// SQLite code: the executor then rolls the whole job back and can classify it.
+impl From<LeaseError> for crate::sqlite::SqliteError {
+    fn from(error: LeaseError) -> Self {
+        match error {
+            LeaseError::Store(error) => Self::Store(error),
+            LeaseError::Sql(error) => Self::Sql(error),
+            LeaseError::Corrupt(detail) => Self::LeaseCorrupt(detail),
+        }
+    }
+}
+
+type Result<T> = std::result::Result<T, LeaseError>;
 
 fn row(row: &Row<'_>) -> rusqlite::Result<Lease> {
     Ok(Lease {
@@ -40,7 +76,7 @@ pub(crate) fn get_lease(
         row,
     )
     .optional()
-    .map_err(backend)
+    .map_err(Into::into)
 }
 
 pub(crate) fn get_agent_lease(
@@ -51,20 +87,16 @@ pub(crate) fn get_agent_lease(
     tx.query_row(
         &format!("SELECT {COLUMNS} FROM leases WHERE project_id=?1 AND agent_id=?2 ORDER BY task_id LIMIT 1"),
         params![caller.project, agent], row,
-    ).optional().map_err(backend)
+    ).optional().map_err(Into::into)
 }
 
 pub(crate) fn list_leases(tx: &Transaction<'_>, caller: &Caller) -> Result<Vec<Lease>> {
-    let mut query = tx
-        .prepare(&format!(
-            "SELECT {COLUMNS} FROM leases WHERE project_id=?1 ORDER BY task_id"
-        ))
-        .map_err(backend)?;
-    query
-        .query_map([&caller.project], row)
-        .map_err(backend)?
-        .collect::<rusqlite::Result<_>>()
-        .map_err(backend)
+    let mut query = tx.prepare(&format!(
+        "SELECT {COLUMNS} FROM leases WHERE project_id=?1 ORDER BY task_id"
+    ))?;
+    Ok(query
+        .query_map([&caller.project], row)?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 fn lineage(tx: &Transaction<'_>) -> Result<String> {
@@ -73,13 +105,13 @@ fn lineage(tx: &Transaction<'_>) -> Result<String> {
         [],
         |r| r.get(0),
     )
-    .map_err(backend)
+    .map_err(Into::into)
 }
 
 fn expiry(now_ms: i64) -> Result<i64> {
     now_ms
         .checked_add(LEASE_MS)
-        .ok_or(StoreError::CounterExhausted)
+        .ok_or(StoreError::CounterExhausted.into())
 }
 
 /// Fences both an explicit token and a task principal. The same check can be
@@ -92,7 +124,7 @@ pub(crate) fn check(
     epoch: u64,
 ) -> Result<()> {
     if token_lineage != lineage(tx)? || lease.lineage != token_lineage || lease.epoch != epoch {
-        return Err(StoreError::StaleEpoch);
+        return Err(StoreError::StaleEpoch.into());
     }
     if let Principal::Task {
         task,
@@ -106,7 +138,7 @@ pub(crate) fn check(
             || lineage != &lease.lineage
             || *epoch != lease.epoch)
     {
-        return Err(StoreError::StaleEpoch);
+        return Err(StoreError::StaleEpoch.into());
     }
     Ok(())
 }
@@ -128,7 +160,7 @@ pub(crate) fn claim_lease(
     let held = tx.query_row(
         &format!("SELECT {COLUMNS} FROM leases WHERE project_id=?1 AND run_id=?2 ORDER BY task_id LIMIT 1"),
         params![caller.project, new.run], row,
-    ).optional().map_err(backend)?;
+    ).optional()?;
     if let Some(held) = held {
         return Ok(ClaimOutcome::Held(held));
     }
@@ -140,23 +172,29 @@ pub(crate) fn claim_lease(
             params![caller.project, new.task],
             |r| r.get(0),
         )
-        .optional()
-        .map_err(backend)?
+        .optional()?
         .unwrap_or(1);
-    let next = epoch
-        .checked_add(1)
-        .filter(|_| epoch > 0)
-        .ok_or(StoreError::CounterExhausted)?;
+    // `task_epochs.next_epoch` is the epoch the next claim issues: 1 for a task
+    // with no run, else one more than the largest epoch issued (spec "Import":
+    // `next_epoch` is one more than the largest; `orch db verify`: every epoch
+    // is below its task's `next_epoch`). Zero or a negative value is damage, not
+    // exhaustion: granting it would issue epoch 0 or, through `as u64`, a huge
+    // one. Nothing has been written yet, so the refusal changes no row.
+    if epoch < 1 {
+        return Err(LeaseError::Corrupt(format!(
+            "task_epochs.next_epoch is {epoch} for task {}; it must be at least 1",
+            new.task
+        )));
+    }
+    let next = epoch.checked_add(1).ok_or(StoreError::CounterExhausted)?;
     // rusqlite's Savepoint requires &mut Connection, while the executor lends
     // &Transaction. A fixed, internal name is safe: this synchronous operation
     // never calls another lease operation inside its savepoint.
-    tx.execute_batch("SAVEPOINT orch_lease_claim")
-        .map_err(backend)?;
-    let result = (|| {
-        tx.execute("INSERT INTO task_epochs(project_id,task_id,next_epoch) VALUES(?1,?2,?3) ON CONFLICT(project_id,task_id) DO UPDATE SET next_epoch=excluded.next_epoch", params![caller.project, new.task, next]).map_err(backend)?;
-        tx.execute("INSERT INTO leases(project_id,task_id,run_id,agent_id,worker_id,epoch,lineage,state,granted_at,renewed_at,expires_at) VALUES(?1,?2,?3,?4,'local_worker',?5,?6,'active',?7,?7,?8)", params![caller.project, new.task, new.run, new.agent, epoch, lineage, now_ms, expires_at]).map_err(backend)?;
+    tx.execute_batch("SAVEPOINT orch_lease_claim")?;
+    let result = (|| -> rusqlite::Result<()> {
+        tx.execute("INSERT INTO task_epochs(project_id,task_id,next_epoch) VALUES(?1,?2,?3) ON CONFLICT(project_id,task_id) DO UPDATE SET next_epoch=excluded.next_epoch", params![caller.project, new.task, next])?;
+        tx.execute("INSERT INTO leases(project_id,task_id,run_id,agent_id,worker_id,epoch,lineage,state,granted_at,renewed_at,expires_at) VALUES(?1,?2,?3,?4,'local_worker',?5,?6,'active',?7,?7,?8)", params![caller.project, new.task, new.run, new.agent, epoch, lineage, now_ms, expires_at])?;
         tx.execute_batch("RELEASE orch_lease_claim")
-            .map_err(backend)
     })();
     if let Err(operation) = result {
         if let Err(cleanup) =
@@ -168,7 +206,7 @@ pub(crate) fn claim_lease(
             // In particular, never silently ignore failed cleanup and commit.
             panic!("{operation}; SQLite lease cleanup failed: {cleanup}");
         }
-        return Err(operation);
+        return Err(operation.into());
     }
     Ok(ClaimOutcome::Granted(Lease {
         task: new.task.clone(),
@@ -194,8 +232,7 @@ pub(crate) fn renew_lease(
     tx.execute(
         "UPDATE leases SET renewed_at=?3, expires_at=?4 WHERE project_id=?1 AND task_id=?2",
         params![caller.project, task, now_ms, expires_at],
-    )
-    .map_err(backend)?;
+    )?;
     lease.expires_at = expires_at;
     Ok(lease)
 }
@@ -212,8 +249,7 @@ pub(crate) fn release_lease(
     tx.execute(
         "DELETE FROM leases WHERE project_id=?1 AND task_id=?2",
         params![caller.project, task],
-    )
-    .map_err(backend)?;
+    )?;
     Ok(lease)
 }
 
@@ -221,5 +257,7 @@ pub(crate) fn release_lease(
 mod tests;
 
 mod adapter;
+#[cfg(test)]
+mod contract_tests;
 #[cfg(test)]
 mod executor_tests;

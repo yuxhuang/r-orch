@@ -31,9 +31,18 @@
 //!   first row stayed. [`RetryWrite::put_retry`] replaces. A consumer that
 //!   needs 1.0's rule calls [`RetryWrite::get_retry`] first.
 //!
-//! The port has no complete read of the rows; only a point read and the due
-//! read. A caller that needs every row, such as `state.get`, recovery or
-//! export, needs a read that is added later.
+//! Every row, future ones included, is read by [`RetryRead::read_retries`]:
+//! the same order as the due read (deadline, then task id, task ids compared
+//! as bytes) over all rows rather than the due ones, in pages of at most
+//! [`MAX_DUE_RETRIES`] after a [`RetryCursor`]. That is the read for
+//! `state.get`, recovery and export. Pages of one [`ReadSnapshot`] come from
+//! one committed state, so a walk of them sees each row once and no row
+//! committed since the snapshot was taken, however many pages it takes. A
+//! cursor is only the key of the last row returned, so it also stays usable
+//! when a later snapshot no longer holds that row; such a walk is not
+//! atomic, because rows written meanwhile appear or vanish with their keys.
+//!
+//! [`ReadSnapshot`]: super::ReadSnapshot
 
 use async_trait::async_trait;
 
@@ -42,7 +51,8 @@ use super::Result;
 #[cfg(feature = "test-support")]
 pub mod fake;
 
-/// The most rows one [`RetryRead::read_due_retries`] call returns.
+/// The most rows one [`RetryRead::read_due_retries`] or
+/// [`RetryRead::read_retries`] call returns.
 pub const MAX_DUE_RETRIES: usize = 1_000;
 /// The longest `error` a row may hold, in bytes (text up to 64 KiB, decision 7).
 /// R97 also requires larger text, written through the API or imported, to be
@@ -83,6 +93,44 @@ impl Retry {
     }
 }
 
+/// Where a page of the complete read stops: the sort key of the last row it
+/// returned, which the next page starts after. The key is the whole position,
+/// so a cursor needs no row to still exist and holds no offset or snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryCursor {
+    /// UTC milliseconds, as [`Retry::due_at`]; not before the epoch.
+    pub due_at: i64,
+    pub task: String,
+}
+
+impl RetryCursor {
+    /// The cursor that continues after `retry`.
+    pub fn after(retry: &Retry) -> Self {
+        Self {
+            due_at: retry.due_at,
+            task: retry.task.clone(),
+        }
+    }
+
+    /// The checks every backend applies before it reads anything. A key no
+    /// row can have is a bad cursor, not an empty rest of the table.
+    pub fn validate(&self) -> Result<()> {
+        if self.task.is_empty() || self.due_at < 0 {
+            return Err(super::StoreError::InvalidCursor);
+        }
+        Ok(())
+    }
+}
+
+/// One page of [`RetryRead::read_retries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryPage {
+    pub rows: Vec<Retry>,
+    /// `Some` exactly when at least one row follows `rows`: a walk that ends on
+    /// `None` never ends with an empty page, even at an exact multiple of the limit.
+    pub next: Option<RetryCursor>,
+}
+
 /// `limit` must be in `1..=MAX_DUE_RETRIES`.
 pub fn check_limit(limit: usize) -> Result<()> {
     if (1..=MAX_DUE_RETRIES).contains(&limit) {
@@ -100,6 +148,11 @@ pub trait RetryRead: Send + Sync {
     async fn read_retry(&self, task: &str) -> Result<Option<Retry>>;
     /// Rows with `due_at <= now_ms`, earliest first, ties by task id.
     async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>>;
+    /// Every row, due or not, earliest deadline first, ties by task id. Starts
+    /// after `after` (exclusive) or at the first row, and returns at most
+    /// `limit` rows, which must be in `1..=MAX_DUE_RETRIES`. The cursor must
+    /// pass [`RetryCursor::validate`]. Another project's rows are not in it.
+    async fn read_retries(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage>;
 }
 
 /// Operations share the enclosing unit of work, so a retry row commits or
@@ -114,4 +167,8 @@ pub trait RetryWrite: Send {
     fn get_retry(&self, task: &str) -> Result<Option<Retry>>;
     /// As [`RetryRead::read_due_retries`], within this transaction's own writes.
     fn due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>>;
+    /// As [`RetryRead::read_retries`], within this transaction's own writes.
+    /// A walk that writes between its pages sees those writes, unlike a walk
+    /// of one read snapshot.
+    fn list_retries(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage>;
 }

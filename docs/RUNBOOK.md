@@ -430,6 +430,23 @@ the operation releases the permit and grows with the number of events the operat
 [How clients follow changes](manual/18-daemon.md#how-clients-follow-changes). An overflow design for in-process
 listeners remains deferred.
 
+## Staged SQLite goal counter damage
+
+The SQLite goal adapter is internal and inactive; the running daemon still uses file storage.
+Its `CounterMissing`, `CounterNegative` and `CounterBehind` errors indicate inconsistent staged
+storage. A nonpositive surviving goal position is also damaged metadata. Create and move refuse
+these states without consuming a position. Delete retains the durable high-water mark.
+
+Never reset a counter from the maximum surviving row position: deleted rows may have used higher
+positions, so that reset loses allocation history. If every row has been deleted, a missing counter
+cannot be distinguished from a new family. Import/export must preserve those durable marks.
+
+After SQLite activation, supported verification and restore tooling must guide recovery before
+mutation resumes; those commands and that recovery workflow are not supplied by this internal slice.
+T22 owns verification of positive positions, nonnegative counters, presence for nonempty families
+and positions no greater than the matching counter. T21/T23 own import/export and restore obligations.
+Do not treat this note as an available repair command or manually rewrite counters.
+
 ## Corrupt lock file
 
 **Symptom.** `orch daemon start` (or `orch serve`, `orch run --watch`) exits 4 with
@@ -1717,9 +1734,12 @@ Verifier zero can describe a failed or interrupted suite: preserve the original
 producer command/job failure. Only this verified redacted export is uploaded.
 Missing final receipt/inventory fails retention acceptance; bounded static phase
 progress after timeout/cancel/runner loss cannot replace it. No arbitrary loss
-can guarantee log delivery. The existing 30-minute job ceiling is provisional,
-with unmeasured headroom; the <=20-minute PR target remains. Record real durations
-in TV51/53 before proposing changes. Do not rerun failures away.
+can guarantee log delivery. The test and ambient jobs have a 40-minute ceiling.
+A six-run Linux main sample peaked at 29m42s for test and 28m46s for ambient,
+leaving only 18s and 74s under the previous 30-minute ceiling. This bounded
+sample motivates the added headroom; it does not establish the <=20-minute PR
+performance target. Continue recording real durations in TV51/53.
+Do not rerun failures away.
 
 PR code executes static plus one suite; docs-only executes build/static without
 tests. Main forces all and retains a separate unwrapped ordinary ambient suite.
