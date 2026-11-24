@@ -12,7 +12,8 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
-pub const SCHEMA_VERSION: usize = 3;
+pub const SCHEMA_VERSION: usize = 4;
+pub const AGENT_TEAM_RUN: &str = include_str!("migrations/004_agent_team_run.sql");
 pub const TASK_FORMAT: &str = include_str!("migrations/003_task_format.sql");
 pub const ATTENTION_FACTS: &str = include_str!("migrations/002_attention_facts.sql");
 pub const INITIAL_SCHEMA: &str = include_str!("schema.sql");
@@ -43,7 +44,7 @@ pub fn migrate(data: &DataDir, conn: &mut ConnectionHandle<'_>) -> Result<()> {
     apply_migrations(
         data,
         conn,
-        &[INITIAL_SCHEMA, ATTENTION_FACTS, TASK_FORMAT],
+        &[INITIAL_SCHEMA, ATTENTION_FACTS, TASK_FORMAT, AGENT_TEAM_RUN],
         DiskSpace::read(data)?,
     )
 }
@@ -87,6 +88,16 @@ pub fn apply_migrations(
             SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
         })?;
     }
+    if version > 0
+        && steps
+            .iter()
+            .skip(version)
+            .any(|step| *step == AGENT_TEAM_RUN)
+    {
+        refuse_lossy_entities(conn).map_err(|error| {
+            SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
+        })?;
+    }
     let holds_project = version > 0
         && conn.query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |r| r.get(0))? > 0;
     if holds_project {
@@ -116,6 +127,13 @@ pub fn apply_migrations(
                     let sql = sql.clone();
                     M::up_with_hook("", move |tx: &rusqlite::Transaction<'_>| {
                         refuse_lossy_tasks(tx)?;
+                        tx.execute_batch(&sql)?;
+                        Ok(())
+                    })
+                } else if *step == AGENT_TEAM_RUN {
+                    let sql = sql.clone();
+                    M::up_with_hook("", move |tx: &rusqlite::Transaction<'_>| {
+                        refuse_lossy_entities(tx)?;
                         tx.execute_batch(&sql)?;
                         Ok(())
                     })
@@ -161,6 +179,28 @@ fn refuse_lossy_tasks(tx: &Connection) -> rusqlite_migration::HookResult {
             .join(", ");
         return Err(rusqlite_migration::HookError::Hook(format!(
             "task format v1 refuses ambiguous predecessor rows: {summary}"
+        )));
+    }
+    Ok(())
+}
+
+// None of these predecessor projections is a lossless entity authority.
+// Refuse orphan memberships too; silently dropping them would make loss durable.
+fn refuse_lossy_entities(conn: &Connection) -> rusqlite_migration::HookResult {
+    let mut counts = Vec::new();
+    for table in ["agents", "teams", "team_members", "team_tasks", "runs"] {
+        let count: i64 =
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
+        counts.push((table, count));
+    }
+    if counts.iter().any(|(_, count)| *count != 0) {
+        let summary = counts
+            .iter()
+            .map(|(table, count)| format!("{table}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(rusqlite_migration::HookError::Hook(format!(
+            "entity format v1 refuses ambiguous predecessor rows: {summary}"
         )));
     }
     Ok(())

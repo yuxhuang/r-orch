@@ -9,6 +9,8 @@ const TABLES: &[&str] = &[
     "context_entries",
     "counters",
     "daemon_config",
+    "entity_blob_refs",
+    "entity_details",
     "goals",
     "identities",
     "identity_tokens",
@@ -356,5 +358,256 @@ fn attention_uniqueness_ends_when_an_item_is_resolved() {
             "blobs_sweepable",
             "intents_pending"
         ]
+    );
+}
+
+#[test]
+fn entity_key_forms_and_reference_bounds_are_disjoint_for_all_seven_families() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    let hash = "a".repeat(64);
+    for family in [
+        "agent", "team", "run", "context", "config", "template", "goal",
+    ] {
+        for form in [0, 1] {
+            conn.execute(
+                "INSERT INTO entity_details VALUES('p',?1,?2,?3,1,'{}',2,?3)",
+                rusqlite::params![family, form, hash],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entity_blob_refs VALUES('p',?1,?2,?3,'/value',0,?3,65537)",
+                rusqlite::params![family, form, hash],
+            )
+            .unwrap();
+        }
+        let zero = conn.execute(
+            "INSERT INTO entity_blob_refs VALUES('p',?1,0,'zero','/prompt',0,?2,0)",
+            rusqlite::params![family, hash],
+        );
+        assert_eq!(zero.is_ok(), family == "run");
+    }
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM entity_details", [], |r| r.get(0))
+            .unwrap(),
+        14
+    );
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM entity_blob_refs", [], |r| r.get(0))
+            .unwrap(),
+        15
+    );
+    for (form, key) in [
+        (2, "a"),
+        (1, "wrong"),
+        (1, &"A".repeat(64)),
+        (0, &"a".repeat(65537)),
+    ] {
+        assert!(
+            conn.execute(
+                "INSERT INTO entity_details VALUES('p','agent',?1,?2,1,'{}',2,?3)",
+                rusqlite::params![form, key, hash]
+            )
+            .is_err()
+        );
+    }
+    for size in [-1, 67108865] {
+        assert!(
+            conn.execute(
+                "INSERT INTO entity_blob_refs VALUES('p','run',0,'r','/prompt',0,?1,?2)",
+                rusqlite::params![hash, size]
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        conn.execute(
+            "INSERT INTO entity_details VALUES('p','unknown',0,'r',1,'{}',2,?1)",
+            [&hash]
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO entity_details VALUES('p','run',0,'r',1,NULL,65536,?1)",
+            [&hash]
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO entity_details VALUES('p','run',0,'r',1,'é',1,?1)",
+            [&hash]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn native_entity_forms_duplicate_names_and_member_occurrences() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    for id in ["a", "b"] {
+        conn.execute("INSERT INTO agents(project_id,id,name,adapter,config,position,revision) VALUES('p',?1,'same','codex','{}',1,1)", [id]).unwrap();
+        conn.execute("INSERT INTO teams(project_id,id,name,lead_agent_id,created_at_text,status,config,position,revision) VALUES('p',?1,'same','a','opaque','active','{}',1,1)", [id]).unwrap();
+    }
+    for ordinal in [0, 1] {
+        conn.execute("INSERT INTO team_members(project_id,team_id,ordinal,agent_id,role,joined_at_text) VALUES('p','a',?1,'a','member','opaque')", [ordinal]).unwrap();
+    }
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM team_members", [], |r| r.get(0))
+            .unwrap(),
+        2
+    );
+    assert!(conn.execute("INSERT INTO team_members(project_id,team_id,ordinal,agent_id,role,joined_at_text) VALUES('p','a',1,'b','member','opaque')", []).is_err());
+    conn.execute(
+        "INSERT INTO team_tasks(project_id,team_id,task_id) VALUES('p','a','t')",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO team_tasks(project_id,team_id,task_id) VALUES('p','a','t')",
+            []
+        )
+        .is_err()
+    );
+    let oversized = "é".repeat(32769);
+    assert!(
+        conn.execute("UPDATE agents SET name=?1 WHERE id='a'", [&oversized])
+            .is_err()
+    );
+    let hash = "b".repeat(64);
+    conn.execute(
+        "UPDATE agents SET name='',name_form=1,name_sha256=?1,name_bytes=65538 WHERE id='a'",
+        [&hash],
+    )
+    .unwrap();
+    assert!(
+        conn.execute("UPDATE agents SET name_bytes=65536 WHERE id='a'", [])
+            .is_err()
+    );
+    assert!(
+        conn.execute("UPDATE agents SET name_sha256=NULL WHERE id='a'", [])
+            .is_err()
+    );
+    assert!(
+        conn.execute("UPDATE agents SET autonomous=2 WHERE id='a'", [])
+            .is_err()
+    );
+    assert_eq!(
+        conn.query_row::<(Option<i64>, Option<i64>, Option<i64>), _, _>(
+            "SELECT autonomous,created_at,updated_at FROM agents WHERE id='a'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        )
+        .unwrap(),
+        (None, None, None)
+    );
+}
+
+#[test]
+fn run_claim_tuple_payload_attempt_and_identity_constraints_are_independent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    for (id, attempt) in [("r2", 2), ("r10b", 10), ("r10a", 10)] {
+        conn.execute("INSERT INTO runs(project_id,id,task_id,agent_id,status,attempt,revision) VALUES('p',?1,'t','a','running',?2,1)", rusqlite::params![id,attempt]).unwrap();
+    }
+    let order: Vec<String> = conn
+        .prepare("SELECT id FROM runs WHERE task_id='t' ORDER BY attempt DESC,id COLLATE BINARY")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(order, ["r10a", "r10b", "r2"]);
+    for invalid in [
+        "run_no=1",
+        "epoch=1",
+        "counted=0",
+        "attempt_no=1",
+        "run_no=1,epoch=1,counted=2",
+        "run_no=1,epoch=1,counted=1",
+        "run_no=1,epoch=1,counted=0,attempt_no=1",
+    ] {
+        assert!(
+            conn.execute(&format!("UPDATE runs SET {invalid} WHERE id='r2'"), [])
+                .is_err(),
+            "{invalid}"
+        );
+    }
+    conn.execute(
+        "UPDATE runs SET run_no=1,epoch=1,counted=1,attempt_no=1 WHERE id='r2'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE runs SET run_no=1,epoch=2,counted=0 WHERE id='r10a'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE runs SET run_no=2,epoch=1,counted=0 WHERE id='r10a'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE runs SET run_no=2,epoch=2,counted=1,attempt_no=1 WHERE id='r10a'",
+            []
+        )
+        .is_err()
+    );
+    conn.execute(
+        "UPDATE runs SET run_no=2,epoch=2,counted=0 WHERE id='r10a'",
+        [],
+    )
+    .unwrap();
+    for attempt in [-1i64, 4294967296] {
+        assert!(
+            conn.execute("UPDATE runs SET attempt=?1 WHERE id='r2'", [attempt])
+                .is_err()
+        );
+    }
+    conn.execute("UPDATE runs SET attempt=4294967295 WHERE id='r2'", [])
+        .unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM counters", [], |r| r.get(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn native_identity_and_claim_keys_cannot_alias_literal_digest_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    let hash = "b".repeat(64);
+    conn.execute("INSERT INTO agents(project_id,id,name,adapter,config,position,revision) VALUES('p',?1,'literal','codex','{}',1,1)", [&hash]).unwrap();
+    conn.execute("INSERT INTO agents(project_id,id,id_form,id_sha256,id_bytes,name,adapter,config,position,revision) VALUES('p',?1,1,?1,65537,'indirect','codex','{}',2,1)", [&hash]).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM agents WHERE id=?1", [&hash], |r| r
+            .get(0))
+            .unwrap(),
+        2
+    );
+    conn.execute("INSERT INTO runs(project_id,id,task_id,agent_id,status,run_no,epoch,counted,attempt_no,revision) VALUES('p','literal',?1,'a','running',1,1,1,1,1)", [&hash]).unwrap();
+    conn.execute("INSERT INTO runs(project_id,id,task_id,task_id_form,task_id_sha256,task_id_bytes,agent_id,status,run_no,epoch,counted,attempt_no,revision) VALUES('p','indirect',?1,1,?1,65537,'a','running',1,1,1,1,1)", [&hash]).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM runs", [], |r| r.get(0))
+            .unwrap(),
+        2
     );
 }
