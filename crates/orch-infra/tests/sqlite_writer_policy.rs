@@ -193,6 +193,7 @@ fn only_corrupt_and_notadb_are_fatal_and_a_constraint_or_a_busy_connection_is_no
         sql(ffi::SQLITE_BUSY),
         sql(ffi::SQLITE_FULL),
         ordinary(),
+        SqliteError::IntentCorrupt("intent payload"),
         SqliteError::Overloaded,
         SqliteError::TransactionAborted,
     ] {
