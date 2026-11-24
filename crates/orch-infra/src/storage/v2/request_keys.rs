@@ -58,7 +58,10 @@ impl RequestKeys {
             check_key(&row.key).map_err(|e| format!("request key {n}: {e}"))?;
             check_request(&row.op, &row.req_sha256, row.created_at)
                 .map_err(|e| format!("request key {n}: {e}"))?;
-            if row.identity.is_empty() || (row.run.is_empty() != (row.epoch == 0)) {
+            if row.identity.is_empty()
+                || (row.run.is_empty() != (row.epoch == 0))
+                || i64::try_from(row.epoch).is_err()
+            {
                 return Err(format!("request key {n} has an impossible scope"));
             }
             if row

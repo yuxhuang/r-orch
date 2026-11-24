@@ -69,6 +69,9 @@ pub(crate) fn query(
         Sort::Priority => vec![("priority", false), ("position", false), ("id", false)],
         Sort::CreatedAt => vec![("created_at", false), ("position", false), ("id", false)],
         Sort::UpdatedAt => vec![("updated_at", true), ("position", false), ("id", false)],
+        Sort::Attempt => {
+            return Err(StoreError::InvalidPage("Attempt is not offered for Task".into()).into());
+        }
         Sort::Name => {
             return Err(StoreError::InvalidPage("Name is not offered for Task".into()).into());
         }
