@@ -753,3 +753,20 @@ fn failed_savepoint_rollback_poison_refuses_with_outer_transaction_still_active(
     tx.rollback().unwrap();
     assert_eq!(conn.query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
 }
+
+#[test]
+fn native_approval_column_is_independent_of_shared_projection_calculation() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = conn();
+    let tx = conn.transaction().unwrap();
+    let caller = owner();
+    let mut writer = TaskWrite::new(sql(&tx, &disk, "p"), &caller);
+    let mut input = task("t");
+    input.labels = vec!["first".into(), "awaiting-approval".into()];
+    writer.create(input.clone()).unwrap();
+    assert_eq!(tx.query_row("SELECT awaiting_approval FROM tasks WHERE project_id='p' AND id='t'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    // Damage only the native column: do not reuse the write/read projection helper.
+    tx.execute("UPDATE tasks SET awaiting_approval=0 WHERE project_id='p' AND id='t'", []).unwrap();
+    assert!(matches!(sql(&tx, &disk, "p").get("t"), Err(SqliteError::TaskCorrupt { locator: "awaiting_approval", .. })));
+}
