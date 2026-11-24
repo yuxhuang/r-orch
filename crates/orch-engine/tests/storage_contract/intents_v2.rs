@@ -168,6 +168,36 @@ pub async fn an_intent_rolls_back_with_its_entity_and_lease(fixture: Fixture) {
     assert_eq!(add_ok(s.as_ref(), P, blob(HASH), 12).await.id, 1);
 }
 
+pub async fn transaction_reads_see_own_intent_completion_and_roll_back(fixture: Fixture) {
+    let s = fixture.storage.clone();
+    let failed = s
+        .transaction(owner(P), Lane::Entities, |u| {
+            // Creation times deliberately oppose id order.
+            let first = u.add_intent(&blob(HASH), 30)?;
+            let mut middle = u.add_intent(&remove("t1"), 20)?;
+            let last = u.add_intent(&remove("t2"), 10)?;
+            assert_eq!(u.finish_intent(middle.id, 40)?, FinishOutcome::Finished);
+            middle.done_at = Some(40);
+            assert_eq!(u.get_intent(middle.id)?, Some(middle));
+            assert_eq!(u.list_pending_intents(0, 1)?, vec![first.clone()]);
+            assert_eq!(
+                u.list_pending_intents(0, 3)?,
+                vec![first.clone(), last.clone()]
+            );
+            assert_eq!(u.list_pending_intents(first.id, 1)?, vec![last.clone()]);
+            assert!(u.list_pending_intents(last.id, 1)?.is_empty());
+            // Exercise the reads above without ever committing their rows.
+            Err::<(), _>(StoreError::CounterExhausted)
+        })
+        .await;
+    assert!(matches!(failed, Err(StoreError::CounterExhausted)));
+    let snap = s.read(owner(P)).await.unwrap();
+    for id in 1..=3 {
+        assert_eq!(snap.read_intent(id).await.unwrap(), None);
+    }
+    assert!(snap.read_pending_intents(0, 3).await.unwrap().is_empty());
+}
+
 pub async fn finish_and_deletion_roll_back_with_their_unit_of_work(fixture: Fixture) {
     let s = fixture.storage.clone();
     add_ok(s.as_ref(), P, blob(HASH), 0).await;
@@ -706,6 +736,7 @@ macro_rules! intent_suite {
             }
             case!(an_intent_is_written_with_its_change);
             case!(an_intent_rolls_back_with_its_entity_and_lease);
+            case!(transaction_reads_see_own_intent_completion_and_roll_back);
             case!(finish_and_deletion_roll_back_with_their_unit_of_work);
             case!(an_error_caught_inside_the_callback_changes_nothing);
             case!(ids_are_monotonic_and_never_reused);
