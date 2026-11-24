@@ -31,10 +31,11 @@
 //! R130): a callback is trusted not to perform external side effects; a callback
 //! that catches an error must report it with `FailureState::observe` before it
 //! goes on; the retry of R128's retryable class and its 60 s and second-`IOERR`
-//! fatal rules are not built; a connection left inside a transaction by any
-//! other cause than a failed explicit rollback (a failed commit whose own
-//! rollback fails too) ends the worker by a panic, without a latch and without
-//! answering what is queued; and the
+//! fatal rules are not built; a connection that is still inside a transaction
+//! after a request for a cause other than a failed explicit rollback (a failed
+//! commit, or a request expired after BEGIN, whose rollback leaves it open
+//! latches like any failed rollback) is only a backstop: the worker ends by a
+//! panic, without a latch, and what is queued is answered `WriterClosed`; and the
 //! producer invariants of R26 (bounded claim production, event coalescing) are
 //! the producer's. Blocking `WriteReceipt::wait` must not be called on an async
 //! runtime thread.
