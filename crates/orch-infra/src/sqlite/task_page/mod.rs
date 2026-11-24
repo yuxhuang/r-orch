@@ -113,6 +113,11 @@ fn sort_keys(sort: Sort) -> Result<&'static [(&'static str, bool)], StoreError> 
         Sort::Priority => &[("priority", false), ("position", false), ("id", false)],
         Sort::CreatedAt => &[("created_at", false), ("position", false), ("id", false)],
         Sort::UpdatedAt => &[("updated_at", true), ("position", false), ("id", false)],
+        Sort::Attempt => {
+            return Err(StoreError::InvalidPage(
+                "Attempt is not offered for Task".into(),
+            ));
+        }
         Sort::Name => {
             return Err(StoreError::InvalidPage(
                 "Name is not offered for Task".into(),

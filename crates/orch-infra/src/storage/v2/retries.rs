@@ -4,6 +4,8 @@
 
 use std::collections::BTreeMap;
 
+use super::text::{RetryText, StoredText};
+
 use orch_core::store::StoreError;
 use orch_core::store::retries::{Retry, RetryCursor, RetryPage, check_limit};
 use serde::{Deserialize, Serialize};
@@ -14,7 +16,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 struct Row {
     attempt: u32,
     due_at: i64,
-    error: String,
+    error: StoredText,
 }
 
 /// The retry table of one project, by task id.
@@ -23,24 +25,29 @@ pub(super) struct Retries {
     rows: BTreeMap<String, Row>,
 }
 
-fn retry(task: &str, row: &Row) -> Retry {
-    Retry {
+fn retry(text: &RetryText, task: &str, row: &Row) -> Result<Retry> {
+    Ok(Retry {
         task: task.to_owned(),
         attempt: row.attempt,
         due_at: row.due_at,
-        error: row.error.clone(),
-    }
+        error: text.resolve(&row.error).map_err(|error| {
+            StoreError::Backend(orch_core::Error::other(format!(
+                "retry task {task}: {error}"
+            )))
+        })?,
+    })
 }
 
 impl Retries {
-    pub(super) fn put(&mut self, new: &Retry) -> Result<()> {
+    pub(super) fn put(&mut self, text: &RetryText, new: &Retry) -> Result<()> {
         new.validate()?;
+        let error = text.encode(&new.error)?;
         self.rows.insert(
             new.task.clone(),
             Row {
                 attempt: new.attempt,
                 due_at: new.due_at,
-                error: new.error.clone(),
+                error,
             },
         );
         Ok(())
@@ -50,12 +57,15 @@ impl Retries {
         self.rows.remove(task).is_some()
     }
 
-    pub(super) fn get(&self, task: &str) -> Option<Retry> {
-        self.rows.get_key_value(task).map(|(t, r)| retry(t, r))
+    pub(super) fn get(&self, text: &RetryText, task: &str) -> Result<Option<Retry>> {
+        self.rows
+            .get_key_value(task)
+            .map(|(t, r)| retry(text, t, r))
+            .transpose()
     }
 
     /// Earliest deadline first, ties by task id.
-    pub(super) fn due(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>> {
+    pub(super) fn due(&self, text: &RetryText, now_ms: i64, limit: usize) -> Result<Vec<Retry>> {
         check_limit(limit)?;
         let mut due: Vec<_> = self
             .rows
@@ -63,15 +73,19 @@ impl Retries {
             .filter(|(_, r)| r.due_at <= now_ms)
             .collect();
         due.sort_by(|(ta, a), (tb, b)| (a.due_at, ta).cmp(&(b.due_at, tb)));
-        Ok(due
-            .into_iter()
+        due.into_iter()
             .take(limit)
-            .map(|(t, r)| retry(t, r))
-            .collect())
+            .map(|(t, r)| retry(text, t, r))
+            .collect()
     }
 
     /// Every row from just after `after`, in the order of [`Self::due`].
-    pub(super) fn page(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage> {
+    pub(super) fn page(
+        &self,
+        text: &RetryText,
+        after: Option<&RetryCursor>,
+        limit: usize,
+    ) -> Result<RetryPage> {
         check_limit(limit)?;
         if let Some(cursor) = after {
             cursor.validate()?;
@@ -88,8 +102,8 @@ impl Retries {
         let rows: Vec<Retry> = rest
             .into_iter()
             .take(limit)
-            .map(|(t, r)| retry(t, r))
-            .collect();
+            .map(|(t, r)| retry(text, t, r))
+            .collect::<Result<_>>()?;
         let next = rows.last().filter(|_| more).map(RetryCursor::after);
         Ok(RetryPage { rows, next })
     }

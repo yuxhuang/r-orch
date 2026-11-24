@@ -207,7 +207,12 @@ fn invalid_requests_and_misbound_continuations_are_refused() {
             Err(task_page::Error::Page(StoreError::InvalidPage(_)))
         ));
     }
-    assert!(query(&tx, "p", &filter(), &request(Sort::Name, 1), None).is_err());
+    for sort in [Sort::Name, Sort::Attempt] {
+        assert!(matches!(
+            query(&tx, "p", &filter(), &request(sort, 1), None),
+            Err(task_page::Error::Page(StoreError::InvalidPage(_)))
+        ));
+    }
     assert!(query(&tx, "p", &Filter::Agents, &request(Sort::Id, 1), None).is_err());
     let req = request(Sort::Id, 1);
     let first = query(&tx, "p", &filter(), &req, None).unwrap();
@@ -373,6 +378,7 @@ fn decoded_continuations_refuse_mismatched_bindings_and_unsupported_sorts() {
             ("p", Filter::Agents, sort),
             ("p", filter(), other_sort),
             ("p", filter(), Sort::Name),
+            ("p", filter(), Sort::Attempt),
         ] {
             assert!(matches!(
                 Continuation::from_decoded(
@@ -388,7 +394,13 @@ fn decoded_continuations_refuse_mismatched_bindings_and_unsupported_sorts() {
             ));
         }
     }
-    for (f, sort) in [(Filter::Agents, Sort::Id), (filter(), Sort::Name)] {
+    // Attempt is a Runs-only sort: even a self-consistent decoded Attempt
+    // continuation is refused as a cursor, as Name is.
+    for (f, sort) in [
+        (Filter::Agents, Sort::Id),
+        (filter(), Sort::Name),
+        (filter(), Sort::Attempt),
+    ] {
         assert!(matches!(
             Continuation::from_decoded(
                 "p".into(),
