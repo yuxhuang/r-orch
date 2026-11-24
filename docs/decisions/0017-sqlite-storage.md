@@ -643,9 +643,13 @@ across a crash, lists that do not load everything, and a retried request that ru
   then ships one event path, with the first run's miss of the first budget on macOS on record (issue 98) and
   with `metrics.get` as the only watch on the waits.
 - The numeric attempt order of a task-filtered run list, and a present empty goal `updated_at` ordering before an absent
-  one, are the contract of the memory and file references too. A separate change aligns both and strengthens the shared
-  scenarios; it lands in the same train as this text, and the SQLite registration of the shared suites follows it.
-  Whether a reference meets the contract is shown by that change's own checks, not by this text.
+  one, are the contract of the memory and file references too. PR #225 (squash `af0d43acd`, 2026-11-23) carried both
+  references' code, the strengthened shared scenarios and the first text of decision 15 together; the goal rule changed
+  code in the file reference only, because the memory fake already told the two apart. Whether a reference meets the
+  contract is shown by those scenarios on its registration (`memory_v2`, `queued_memory_v2`, `file_v2`), not by this
+  text, and the SQLite registration of the same scenarios is still T10's. Neither default is a 1.0 order, and
+  [ADR 0020](0020-storage-consumer-contracts.md) decision 2 adds the explicit sort `Sort::Attempt` beside the
+  task-filtered default.
 - `docs/TRAITS-FROZEN.md` §2, ARCHITECTURE §1, §2.1, §5.1 to §5.3 and §6.1, and the RUNBOOK's storage
   procedures change. The stable-sort rule stays: the scheduler still sorts in memory.
 - Backups become a product duty: database, blobs and repositories as one restorable point. A restore
