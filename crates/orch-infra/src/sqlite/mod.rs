@@ -142,3 +142,9 @@ mod intents;
     reason = "task format building blocks await lossless task CRUD integration"
 )]
 mod task_format;
+
+#[allow(
+    dead_code,
+    reason = "inactive Agent/Team/Run detail format awaiting SQL mapping"
+)]
+mod agent_team_run;

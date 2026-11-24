@@ -812,12 +812,14 @@ separately. (2) A write that leaves `done` preserves `landing_state` byte for by
 over NULL. (3) A revision-checked `delete` removes the task's `task_attachments` rows for the exact project and task in
 its own savepoint, and keeps the `blobs` registrations and object bytes for the sweep (R60). The same text corrects the
 presence rule: `proof` and `workspace_mode` are optional, and `files_changed` is required only inside a present `proof`.
-The mapping slice consumes this correction before it writes any of these columns. What remains open is the owner's
-approval of the two tables (O2), given by the merge, the structured classification of the other entities, which issue 127 holds,
-the rule for 1.0's recorded proof, which the spec's "Import rules" now sends to the detail and no longer to `legacy_proof` (the lead ruled on 2026-11-23 that this amendment of the approved rule stands as documentation groundwork, and the owner's merge of this text approves it; the T21 implementation and live-copy access stay held), and the carrier of the T11 change in the table above: the mapping's scope is the SQLite source and tests, and
+The mapping slice consumes this correction before it writes any of these columns. Three points remain open: the owner's
+approval of the two tables (O2), given by the merge; the structured classification of the other entities, which issue 127 holds;
+and the carrier of the T11 change in the table above: the mapping's scope is the SQLite source and tests, and
 `crates/orch-infra/src/blob/references.rs` is outside it. Either a small T11 PR with the row-only registration lands first, or the lead
 widens the mapping's scope by that one file and its `blob_store` test. The mapping's references slice (b) cannot write its
-`blobs` rows until one of the two exists.
+`blobs` rows until one of the two exists. The rule for 1.0's recorded proof is settled as documentation groundwork: the spec's
+"Import rules" sends it to the detail and no longer to `legacy_proof`, the lead ruled on 2026-11-23 that this amendment of the
+approved rule stands, and the owner's merge of this text approves it; the T21 implementation and live-copy access stay held.
 
 **Task corruption, settled before code.** The lead decided on 2026-11-23 what "the typed stored-data error of R140" is. The mapping
 adds `SqliteError::TaskCorrupt { task, check, locator }`: the id the caller asked for, a bounded check code and a bounded
@@ -835,6 +837,153 @@ any failed savepoint rollback forbids the enclosing commit, and an ordinary fail
 caught while unrelated work commits. The writer on `main` does not yet classify or latch (issue 127), so the mapping's
 error integration waits for the shared failure state of the T10 integration and this text releases no code.
 
+### T10 entity format (Agent, Team, Run, Context, Config, Template, Goal)
+
+The task mapping above settles how a `Task` is stored. The other seven families that the entity port holds have the
+same kind of gap (the spec's "Entity format v1 (SQLite)" lists it family by family), and the lead decided on
+2026-11-23 to extend the task format to them as option A of two, in two decisions: Agent, Team and Run, then Context,
+Config, Template and Goal (ADR 0017 decisions 27 and 28). The rejected option wrote a versioned envelope into columns
+that already have a meaning (`agents.config`, `runs.local`, the `value` and `body` columns) and still needed
+metadata, a migration and a second reader. This section is the plan for those two slices. It changes no row of the
+task table above and no line of "T10 task mapping (format v1)".
+
+**Order.** The sequence is fixed and each step waits for the one before it:
+
+1. The task format's documentation, then the task mapping with the shared codec and its migration (the plan's "T10 task
+   mapping (format v1)").
+2. This documentation (the spec, this plan and ADR 0017), written before any code of steps 3 and 4. The first slice's
+   pull request carries it in one commit after the codec's, because the documentation was integrated onto the frozen code.
+3. Agent, Team and Run: one slice, with the first migration of the format (the two tables and the rebuild of `agents`,
+   `teams`, `team_members` and `runs`). It reuses the verified codec of step 1 and does not copy it. Its first delivered
+   slice is an inactive byte codec for the three families, with the R97 tags, the chunked texts and the root reference,
+   and with no table, migration or SQL ("First slice: the byte codec" below); the migration, the SQL operations and the
+   hydration are the next slice. It is not the split named below, because the codec already covers the references.
+4. Context, Config, Template and Goal: one slice, with the second migration (the rebuild of four tables, no new table),
+   reusing the codec and the tables of step 3, and the goal adapter's existing helpers once, without replaying them.
+
+One owner holds the migration registry across steps 1, 3 and 4. A number is allocated on the verified integration base in
+sequence and never reserved by a document; earlier migrations stay byte for byte. Each slice is one bounded PR of about
+3,000 changed lines or fewer; if it would be more, the split is the codec and migration with inline text first, then
+the references and the physical R97 tests, each leaving `main` working. A stack is made only for a real code dependency
+and the whole stack is qualified. The public cursor wiring is not part of either slice: it belongs to its own slice, after PRs 186 and 208 have
+landed. The retry mapping (issue 109) and the attention slice (issue 183) are consumed only after a positive
+owner-landing receipt for each exists.
+
+**Obligations, by task.**
+
+| Task | Owes | Check |
+|---|---|---|
+| T10, Agent, Team and Run | Create, update, delete and move for the three families; the migration; ordinal-keyed members; a numeric `attempt` order for one task's runs; the claim tuple left to the claim path; the prompt slot as a tag, and the prompt helper changed to store and load a prompt through the tag and chunk rows (the helper at the base stores one object of at most 64 MiB); hydration in the selecting snapshot or unit of work; the physical R97 mapping; the shared entity suites registered on SQLite | R142's named tests; `cargo test -p orch-infra --test sqlite_agent_team_run_format --test sqlite_migrations`; the shared suites on SQLite and both references |
+| T10, Context, Config, Template and Goal | The same for the four families; context provenance bound from the caller; the lexical orders on original bytes across indirect keys; positions for context, config and templates; the goal's integration and publication columns kept | R143's named tests; the same commands with `sqlite_context_config_template_goal_format` |
+| T11 | Nothing new: the blob adapter (one object of at most 64 MiB) is used as it is; its prompt helper is changed by T10, not here | `blob_store` unchanged |
+| T12 | The claim path is the only writer of a run's claim tuple, and consumes a run through the port | the T12 tests |
+| T15 | `blobs.sweep` counts `entity_blob_refs.sha256`; `context.expire` is a separate job | `maintenance::a_referenced_blob_is_never_deleted`, extended for each family |
+| T21 | One codec for every entity, never rows inserted by hand; list order, repeats and presence as 1.0 says; the claim tuple of an imported run stays the importer's own rule; position high-water marks initialized and a larger one kept; a time kept as it is | an importer test per case, and the R97 importer test the spec still lists as pending |
+| T22 | `orch db verify` runs the read checks for every entity and finds orphan references, member rows and details; views of the two tables | the schema's view-listing test; `db_commands` |
+| T23 | A backup and a restore carry every object a reference row names, in one point; an export carries both tables, the counters and the positions of emptied families; an import reconstructs every text and checks its hash | `db_backup_restore`, `db_export_import`; a restore that finds a missing, short or reordered chunk refuses |
+| T27 | Records the named checks as run, with counts, on Linux, and rejects an empty or ignored selection | the verification table |
+
+**Holds that stay.** The file runtime stays until the switch (T24). Nothing here wires the daemon or the public cursor,
+releases a slice that depends on the writer, or consumes an unmerged slice. Every hold of the task mapping carries over:
+the typed stored-data error of R140 and issue 127, issues 149, 152, 166, 167, 203 and 209, the signed, time, revision and cursor
+bounds, the writer policy, checkpoint and backlog rules, the contracts of `Send`, the shared conformance suites on SQLite
+and on both references, and the combined crash proof. The first complete frozen storage head goes to the combined crash proof of
+issue 149 and to the check of transaction-local intent reads and retention of issue 167 before any writer-dependent
+work is released. Independent code review
+and, for the covered surfaces, security review, the exact-head hosted Linux check and test with a clean merge state, the
+lead's recommendation and the owner's merge apply to each PR. No release.
+
+**Evidence before code.** The verified documentation commit and its base; the actual codec and the migration head that the
+step builds on, by fetching and checking them, not by a task's status; positive owner-landing receipts for any slice it
+consumes.
+
+**Open before code.** The list "Derived, to be confirmed" and the open points of the spec's "Entity format v1
+(SQLite)": the new column names and the digest columns for an indirect key; the member names of `runs.local`; the size
+of a prompt (whether one over 64 MiB can occur; if not, it is refused instead of chunked); and what T21 keeps of
+`local`'s record of a repeated 1.0 attempt. None changes the format; the first two are settled in the PR that needs them
+and written into the spec before it merges. The run and goal orders are settled; see "Reference order" above.
+
+**First slice: the byte codec (Agent, Team and Run).** The first slice of step 3 is implemented, inactive, in
+`crates/orch-infra/src/sqlite/agent_team_run` (on the corrected head `cae0ca499`: a 502-line module, a 730-line test module
+with 22 tests and a six-line registration in `sqlite/mod.rs`; on the first head `5c3ff60eb`: 561 lines, 568 lines with 15
+tests and the same six lines), in draft PR 251, stacked on the Task codec of PR 226. Nothing calls it, and the daemon still uses file storage. What it is:
+
+- `encode_agent`, `encode_team` and `encode_run` turn the typed domain value into the Task codec's `Detail` record (the
+  JSON inline when it is at most 65,536 bytes, otherwise the same JSON behind root references at locator `''`), and
+  `decode_agent`, `decode_team` and `decode_run` read one back. It reuses `Detail` and the Task codec's text helpers
+  (`publish`, `validate_chunks`, `reconstruct`) and adds no dependency. The strict duplicate-key JSON reader is not
+  written twice: the lead approved on 2026-11-23 (option A) that this module use the Task codec's `UniqueValue`, whose
+  declaration is widened to `pub(in crate::sqlite)` and nothing else of the Task codec changes. The reader keeps
+  integer and floating-point numbers apart, represents `null` explicitly and refuses a repeated key at every depth. What
+  stays in each family is its own driver: the Agent, Team and Run decoder still refuses `null`, a fraction and an
+  exponent spelling (an integer-valued float included) at every place that takes a number, and checks the typed values
+  before it reads a slot object. The approval covers the shared reader only while the family drivers stay separate;
+  a generic driver would be a new decision. The corrected head `cae0ca499` carries this; the module shrank by 59 lines because the local reader was removed.
+- Every string of the three families is an R97 slot: identities, names, times, nested strings, list elements and the
+  names and values of `env`. Numbers and booleans are not. `env` is an array of `[name, value]` pairs. A run's `prompt` is
+  always a tag, an empty one included, naming one zero-byte object. Encoding publishes the objects it needs to the blob
+  store and returns the chunk rows in the `Detail`; it installs no reference row and no `blobs` row, so those objects stay
+  unreferenced, and follow R60, until a caller's transaction registers them.
+- The decoder refuses an unknown or missing key, a `null`, a duplicate key, a wrong type, an integer outside its type, a
+  fraction or an exponent, an inline text over 65,536 bytes, an inline prompt, a reference with inconsistent metadata,
+  rows at a locator that has no tag, and an `env` name that repeats, also when one of the two was behind a tag. It checks
+  the typed inline values and every reference's metadata before it reads any slot object, after it has reconstructed a
+  detail that is itself behind root references, so a damaged inline value or damaged metadata is `Invalid` even when an
+  object is missing or unreadable. An object that cannot be read for an I/O reason (permission denied, for one) is
+  `Access`, not corruption. Neither error holds a value or a path; both name a locator, and an `Invalid` one a check. The classification of either
+  as the typed stored-data error of R140 belongs to the mapping and to issue 127; the module's `FormatError` is internal.
+- The SQL caller owns what the codec does not: the format number, the native projections, the project-scoped reference and
+  `blobs` rows, revision and position, and every check that needs a transaction or a snapshot.
+
+**What was run.** Linux, by the author, from their logs, in this order. The tests first failed to compile (23 errors)
+before the module existed. A first run of the module tests then passed 3 tests; a focused build failed on a borrow error
+in a test, and its fix gave 11 passed. The author's focused run, `cargo test -p orch-infra --lib sqlite::agent_team_run
+--offline -- --test-threads=1`, then passed 15 tests, 0 failed, 0 ignored. After it, a first `cargo clippy` run failed on
+three collapsible `if` statements, they were fixed in the module, and a second `cargo clippy` run on `orch-infra` with
+warnings denied finished without errors. The fix was committed as `5c3ff60eb`. The author's focused run is not logged
+after the lint fix, so the 15 passed of that run cover the tree before it, not `5c3ff60eb`; the head's own results follow. `cargo fmt --check` and `git diff --check`
+are reported by the author to pass, and their logs are not among the records read for this text. The author's `fast` run on the exact head
+`5c3ff60eb` (tree `d3e10509`, clean, unmoved) then passed: 5,470 passed, 0 failed, 7 ignored, all eight steps passing,
+among them the 15 module tests of this slice and the 19 `task_format` tests. Its process exit was 3 by design, because the
+evidence a local `fast` run exports is never qualifying (`qualifying: no`); that is not a failed test and not a gate
+result. The 15 module tests also passed (0 failed, 0 ignored) on `5c3ff60eb` in two focused runs by others: the writer
+of this text ran them with a private home and a build output inside the checkout, and the code reviewer ran them on the
+same head. The writer also ran `import_index_reference` (22 passed, 0 failed) and the changelog check (exit 0) on the
+documentation's tree. The 15 tests are those of `5c3ff60eb`. They are module tests of the library, which R142 does not name:
+`complete_values_preserve_absence_empty_false_order_and_unsigned_limits`,
+`empty_capabilities_are_omitted_and_empty_prompt_is_one_zero_byte_object`,
+`strict_agent_decoder_rejects_unknown_duplicate_null_missing_and_nonintegers`,
+`every_nested_string_uses_original_byte_limits_and_oversized_ids_roundtrip`,
+`aggregate_detail_is_indirect_even_when_every_string_is_small`, `team_and_run_nested_slots_preserve_exact_values`,
+`malformed_detail_and_references_are_refused_with_bounded_diagnostics`,
+`inline_enum_and_counter_damage_is_proven_before_missing_slot_access`,
+`environment_pairs_refuse_duplicates_wrong_shapes_null_and_unknown_nested_fields`,
+`team_and_run_reject_unknown_missing_null_and_wrong_nested_types`,
+`prompt_sizes_short_inline_limit_and_one_more_always_name_verified_objects`,
+`split_utf8_prompt_and_exact_object_limit_reconstruct_from_the_manifest`,
+`repeated_slot_hashes_keep_distinct_locators_and_env_names_are_checked_after_reconstruction`,
+`permission_errors_stay_ordinary_until_metadata_or_inline_types_prove_corruption` and
+`all_statuses_empty_and_present_zero_tokens_remain_distinct`. The split at 67,108,864 bytes is exercised on the prompt only.
+
+The corrected head `cae0ca499` (tree `d54e3c69`, parent `3a7434527`) keeps these 15 unchanged and adds seven, 22 in all, in
+answer to the code review's I1 (test sensitivity): `short_prompt_manifest_damage_is_refused`,
+`oversize_inline_text_inside_indirect_root_is_refused`, `aggregate_exact_boundary`, `inline_prompt_without_refs_is_refused`,
+`oversized_inline_root_is_refused_even_when_all_slots_fit`, `tokens_unknown_fields_are_refused` and
+`shared_reader_keeps_null_fraction_exponent_and_nested_duplicate_refusals`. On Linux, by the fact-checker of this
+documentation, focused runs on that head passed: `agent_team_run` 22 passed, 0 failed, 0 ignored; `task_format` 19 passed, 0
+failed, 0 ignored; and `import_index_reference` 22 passed, 0 failed, 0 ignored. The code's author reports the same 22 and 19, a
+wider `sqlite::` filter at 150 passed and 0 failed, clippy with warnings denied, `cargo fmt --check` and `git diff --check`
+clean, and a `fast` run still in progress when the head was frozen; the author's runs are the author's own. No `fast` or hosted
+result of `cae0ca499` is recorded in this text yet; they are pending.
+
+**What is not done, and still held.** No `sqlite_agent_team_run_format.rs`, no migration test, no migration and no table;
+no native projection, revision, position, claim tuple, hydration in the selecting snapshot or unit of work, create, update,
+delete or move; no prompt-helper change; no Storage method; no shared entity suite registered on SQLite; no importer,
+backup or export work; nothing for Context, Config, Template or Goal. Pending for the slice's final head: independent
+code and security reviews, hosted Linux check and test SUCCESS and CLEAN on that exact head, the lead's recommendation
+and the owner's merge. The slice releases none of the holds listed above; it is not a Storage acceptance and gives no
+credit for R142, R140, issue 127 or any gate line.
+
 ## Status
 
 | Item | State (implemented / verified on <platform> / pending) |
@@ -846,7 +995,8 @@ error integration waits for the shared failure state of the T10 integration and 
 | Linux-only scope (the spec's record K) | recorded on 2026-11-23 by one documentation PR that is pending its review and the owner's merge: the spec, this plan, ADR 0017, the lease prototype's spec, the spec TEMPLATE, ARCHITECTURE §13 and AGENTS.md carry it. Nothing was verified on a platform: no code and no CI changed. The first independent review blocked its first head on three points: the Linux sleep/wake check of R42 (issue 110) was withdrawn with the macOS one, R16, R88 and R136 still named macOS, and the branch conflicted with `main`. The text was corrected for them and re-synchronised with `main` keeping the rows of both sides; the corrected text awaits a second review |
 | T10, internal lease adapter (issue 127 N1 to N4) | The damaged-epoch error, the lane mapping and the optional request deadline are merged (#211, #232) and their tests pass on Linux at `af0d43acd` (38 module tests). The spec's "Lease adapter contracts" records them. Unwired: only the module's tests call the adapter, and the daemon uses files. This documentation is pending its Linux CI, its review and the owner's merge. Pending behind it: T12's start and finish transactions, T13's cancel, pause and permanent-failure transactions, T15's lease expiry, T22's `orch db verify`, the R128 and R140 classification, and the SQLite registration of the shared lease suites. Issue 127 is not closed |
 | T10, internal goal adapter | Goal reads, creates, updates, deletes and explicit moves use the executor. Module tests cover transactions, snapshots, reopen and file-reference behavior for supported inputs. Public conformance still requires timestamp and counter compatibility, imported position high-water marks, and text/blob handling. |
-| T10, task format v1 | defined in the spec, this plan and ADR 0017 decision 26 by one documentation PR, with the write rules and the task-corruption rules (`TaskCorrupt`, fatal under R140). Draft PR 226 implements only a first slice: the strict, complete `Task` byte and detail codec (`crates/orch-infra/src/sqlite/task_format`, with the R97 text chunk helper) and the guarded migration 003 (`task_details`, `task_blob_refs`). It is inactive: nothing calls it and the daemon still uses file storage. It is not the split that "T10 task mapping" names under (a) and (b): the codec already covers the reference tags and the root reference, and every SQL operation waits for the next slice. The codec validates the typed task (priority, status, attempts, canonical timestamps) before it reads any text object, so a damaged inline value is `Invalid` even when a text object is unreadable (review finding I4). Verified on Linux by the author's focused runs, whose regression test `typed_damage_is_checked_before_any_slot_object_access` failed before that fix (0 passed, 1 failed) and passes after it: the `task_format` module tests (19 passed, 0 failed, 0 ignored), `sqlite_migrations` (15 passed), `sqlite_schema` (7 passed), `cargo clippy` on `orch-infra` with warnings denied, `cargo fmt --check` and `git diff --check`. Earlier results stay on record: the first head's `fast` run was interrupted (exit 130) after 1,587 passes and 36 failures had been observed, from the umask 0002 fixture of issue 137, and counts as failed and incomplete; a migration test run failed 14 passed and 1 failed, two compile errors (a `usize` type error and a `HookError` error) and a clippy non-octal literal were fixed on the way; the hosted run on the first head was cancelled by the corrective push; the head `eec91899b` passed hosted Linux check and test and was CLEAN, which does not cover any later head. Pending for the final head of PR 226: the terminal delta code and security reviews, hosted Linux check and test SUCCESS and CLEAN on that exact head, the lead's renewed recommendation and the owner's merge; the inactive codec is not a Storage acceptance. Of the tests that R141 names, the two migration tests and the two codec tests on `proof` and `workspace_mode` exist; the codec ones are module tests of the library, not yet in `tests/sqlite_task_format.rs`. Not implemented, built or tested: create, update, delete and move; the `tasks` row, membership and `blobs` projections and their checks on read; hydration in the selecting snapshot or unit of work; `SqliteError::TaskCorrupt`, its classification and the writer latch (issue 127); the Storage port; the shared entity suites on SQLite; the importer and backup obligations. T11 owes one row-only registration change in `blob/references.rs` whose carrier is open, so that each object is published once before its `blobs` row is registered. 1.0's recorded proof is imported into the detail and `legacy_proof` stays NULL, which the lead ruled on 2026-11-23 to stand as documentation groundwork; the T21 implementation and live-copy access stay held. Backend equality is claimed only for texts of at most 67,108,864 bytes; the split of a larger text is checked on SQLite alone (R141). Whether decode shall refuse non-canonical bytes whose length and hash match is open in issue 227; two minor review conditions, the transaction-hook coverage of migration 003 and typed preflight errors under issue 127 and R140, are tracked in issue 229. |
+| T10, task format v1 | defined in the spec, this plan and ADR 0017 decision 26 by one documentation PR, with the write rules and the task-corruption rules (`TaskCorrupt`, fatal under R140). PR 226 implements only a first slice: the strict, complete `Task` byte and detail codec (`crates/orch-infra/src/sqlite/task_format`, with the R97 text chunk helper) and the guarded migration 003 (`task_details`, `task_blob_refs`). It is inactive: nothing calls it and the daemon still uses file storage. It is not the split that "T10 task mapping" names under (a) and (b): the codec already covers the reference tags and the root reference, and every SQL operation waits for the next slice. The codec validates the typed task (priority, status, attempts, canonical timestamps) before it reads any slot object, so a damaged inline value is `Invalid` even when a slot's object is unreadable (review finding I4); a detail that is itself behind root references is reconstructed first, because its typed fields cannot be read before that. Verified on Linux by the author's focused runs, whose regression test `typed_damage_is_checked_before_any_slot_object_access` failed before that fix (0 passed, 1 failed) and passes after it: the `task_format` module tests (19 passed, 0 failed, 0 ignored), `sqlite_migrations` (15 passed), `sqlite_schema` (7 passed), `cargo clippy` on `orch-infra` with warnings denied, `cargo fmt --check` and `git diff --check`. Earlier results stay on record: the first head's `fast` run was interrupted (exit 130) after 1,587 passes and 36 failures had been observed, from the umask 0002 fixture of issue 137, and counts as failed and incomplete; a migration test run failed 14 passed and 1 failed, two compile errors (a `usize` type error and a `HookError` error) and a clippy non-octal literal were fixed on the way; the hosted run on the first head was cancelled by the corrective push; the head `eec91899b` passed hosted Linux check and test and was CLEAN, which does not cover any later head. Pending for the final head of PR 226: the terminal delta code and security reviews, hosted Linux check and test SUCCESS and CLEAN on that exact head, the lead's renewed recommendation and the owner's merge; the inactive codec is not a Storage acceptance. Of the tests that R141 names, the two migration tests and the two codec tests on `proof` and `workspace_mode` exist; the codec ones are module tests of the library, not yet in `tests/sqlite_task_format.rs`. Not implemented, built or tested: create, update, delete and move; the `tasks` row, membership and `blobs` projections and their checks on read; hydration in the selecting snapshot or unit of work; `SqliteError::TaskCorrupt`, its classification and the writer latch (issue 127); the Storage port; the shared entity suites on SQLite; the importer and backup obligations. T11 owes one row-only registration change in `blob/references.rs` whose carrier is open, so that each object is published once before its `blobs` row is registered. 1.0's recorded proof is imported into the detail and `legacy_proof` stays NULL, which the lead ruled on 2026-11-23 to stand as documentation groundwork; the T21 implementation and live-copy access stay held. Backend equality is claimed only for texts of at most 67,108,864 bytes; the split of a larger text is checked on SQLite alone (R141). Whether decode shall refuse non-canonical bytes whose length and hash match is open in issue 227; two minor review conditions, the transaction-hook coverage of migration 003 and typed preflight errors under issue 127 and R140, are tracked in issue 229. |
+| T10, entity format v1 (Agent, Team, Run, Context, Config, Template, Goal) | defined in the spec, this plan and ADR 0017 decisions 27 and 28 by the documentation commits that draft PR 251 carries (`67f64741b` and `3a7434527`, between the codec's commit `5c3ff60eb` and the code correction `cae0ca499`). Only the byte and detail codec of the Agent, Team and Run families is implemented, inactive, on a branch stacked on PR 226 ("First slice: the byte codec" above): on Linux, the author's `fast` run on its first head `5c3ff60eb` passed (5,470 passed, 0 failed, 7 ignored, including the 15 module tests), and the writer of this text and the code reviewer each ran the 15 module tests on that head (15 passed, 0 failed). On the corrected head `cae0ca499` the module has 22 tests, and the fact-checker's focused Linux runs passed 22 (`agent_team_run`), 19 (`task_format`) and 22 (`import_index_reference`), 0 failed. Earlier results stay on record: 23 compile errors before the module existed, a borrow error in a test, and three collapsible-`if` clippy errors, all fixed. On `5c3ff60eb` the independent code review and the covered security review each passed with conditions (no product defect; minor conditions tracked in issue 252). Two of the code review's conditions, I1 (test sensitivity) and I2 (the shared duplicate-key reader), were addressed on the corrected head `cae0ca499`: seven added tests and the Task codec's reader reused. The delta code and security reviews, the author's `fast` run and the hosted Linux check and test on the final head, and the lead's recommendation are pending. No table or migration of this format (`entity_details`, `entity_blob_refs` and the rebuilds), no SQL operation in this format, no Storage method and no wiring exists for any family, and nothing of this format exists for Context, Config, Template or Goal; the first migration's tables and the internal goal adapter (the row "T10, internal goal adapter" above) exist and are unchanged by it. Their R142 and R143 tests, and the importer and backup obligations, are pending. The documentation's own checks were the DDL of the new tables and of the claim check on SQLite 3.45 and a throwaway probe of the domain's serde, on Linux. |
 | T2 to T27, except T4 and T4b | pending, as this table stood before 2026-11-21; this revision brings no other row up to date |
 
 ## Test plan
