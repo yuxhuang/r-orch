@@ -129,6 +129,8 @@ fn a_task_round_trips_every_field_with_order_repeats_and_presence() {
     let mut conn = conn();
     let tx = conn.transaction().unwrap();
     let sql = TaskSql {
+        state: FailureState::new(),
+        source: FailureSource::Writer,
         tx: &tx,
         project: "p",
         disk: &disk,
@@ -160,6 +162,8 @@ fn a_task_round_trips_every_field_with_order_repeats_and_presence() {
     };
     let mut writer = super::writes::TaskWrite::new(
         TaskSql {
+            state: FailureState::new(),
+            source: FailureSource::Writer,
             tx: &tx,
             project: "p",
             disk: &disk,
@@ -189,6 +193,8 @@ fn projection_drift_in_each_native_column_and_membership_is_typed() {
     let mut conn = conn();
     let tx = conn.transaction().unwrap();
     let sql = TaskSql {
+        state: FailureState::new(),
+        source: FailureSource::Writer,
         tx: &tx,
         project: "p",
         disk: &disk,
@@ -230,6 +236,8 @@ fn unknown_format_missing_detail_wrong_identity_and_bad_root_are_typed() {
     let mut conn = conn();
     let tx = conn.transaction().unwrap();
     let sql = TaskSql {
+        state: FailureState::new(),
+        source: FailureSource::Writer,
         tx: &tx,
         project: "p",
         disk: &disk,
@@ -275,6 +283,8 @@ fn native_extremes_and_unowned_columns_do_not_rewrite_the_detail() {
     .unwrap();
     let before = tx.total_changes();
     let record = TaskSql {
+        state: FailureState::new(),
+        source: FailureSource::Writer,
         tx: &tx,
         project: "p",
         disk: &disk,
@@ -306,6 +316,8 @@ fn indirect_fields_memberships_and_aggregate_root_use_project_scoped_metadata() 
     ]);
     seed(&tx, &disk, "p", &task);
     let sql = TaskSql {
+        state: FailureState::new(),
+        source: FailureSource::Writer,
         tx: &tx,
         project: "p",
         disk: &disk,
@@ -349,6 +361,8 @@ fn hydrate_retains_input_order_project_binding_and_discards_partial_results() {
     other.title = "other project".into();
     seed(&tx, &disk, "q", &other);
     let sql = TaskSql {
+        state: FailureState::new(),
+        source: FailureSource::Writer,
         tx: &tx,
         project: "p",
         disk: &disk,
@@ -360,6 +374,8 @@ fn hydrate_retains_input_order_project_binding_and_discards_partial_results() {
     }
     assert_eq!(
         TaskSql {
+            state: FailureState::new(),
+            source: FailureSource::Writer,
             tx: &tx,
             project: "q",
             disk: &disk
@@ -424,6 +440,8 @@ fn snapshot_hydrates_selected_ids_before_and_after_another_connection_commits() 
         .unwrap();
     write.commit().unwrap();
     let rows = TaskSql {
+        state: FailureState::new(),
+        source: FailureSource::Writer,
         tx: &tx,
         project: "p",
         disk: &disk,
@@ -435,6 +453,8 @@ fn snapshot_hydrates_selected_ids_before_and_after_another_connection_commits() 
     let tx = reader.transaction().unwrap();
     damaged(
         TaskSql {
+            state: FailureState::new(),
+            source: FailureSource::Writer,
             tx: &tx,
             project: "p",
             disk: &disk,
@@ -469,6 +489,8 @@ fn transient_access_remains_distinct_and_corrupt_objects_are_private() {
         .join(&hash[2..4])
         .join(&hash);
     let sql = TaskSql {
+        state: FailureState::new(),
+        source: FailureSource::Writer,
         tx: &tx,
         project: "p",
         disk: &disk,
@@ -507,6 +529,8 @@ fn reference_rows_cannot_smuggle_keys_and_registrations_are_checked_before_acces
     task.feedback = Some("f".repeat(65537));
     seed(&tx, &disk, "p", &task);
     let sql = TaskSql {
+        state: FailureState::new(),
+        source: FailureSource::Writer,
         tx: &tx,
         project: "p",
         disk: &disk,
@@ -554,6 +578,8 @@ fn a_surplus_reference_without_a_tag_is_damage_and_sql_failures_stay_typed() {
     )
     .unwrap();
     let sql = TaskSql {
+        state: FailureState::new(),
+        source: FailureSource::Writer,
         tx: &tx,
         project: "p",
         disk: &disk,
@@ -574,6 +600,8 @@ fn transaction_local_reads_observe_one_uncommitted_state_and_rollback() {
         let tx = conn.transaction().unwrap();
         seed(&tx, &disk, "p", &task("t"));
         let sql = TaskSql {
+            state: FailureState::new(),
+            source: FailureSource::Writer,
             tx: &tx,
             project: "p",
             disk: &disk,
@@ -584,6 +612,8 @@ fn transaction_local_reads_observe_one_uncommitted_state_and_rollback() {
     let tx = conn.transaction().unwrap();
     assert!(
         TaskSql {
+            state: FailureState::new(),
+            source: FailureSource::Writer,
             tx: &tx,
             project: "p",
             disk: &disk

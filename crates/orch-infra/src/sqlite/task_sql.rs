@@ -1,13 +1,12 @@
-//! Private Task SQL and snapshot hydration. The caller supplies the authorized project and
-//! the SAME transaction that selected page IDs. This leaf never opens a second
-//! connection or returns a partial page. Storage composition must classify its
-//! structured errors and immediately latch live corruption under R140; neither
-//! public error conversion nor the shared failure state is implemented here.
+//! Private Task persistence on the authorized caller's selecting transaction.
+//! Live errors are observed before conversion, even when the caller catches
+//! them. The shared state must be the writer/read pool's state. Artifact callers
+//! use `FailureSource::Artifact`, which never latches the live database.
 use super::task_format::{
     codec::{self, CodecError, Detail},
     text::Chunk,
 };
-use super::{Result, SqliteError};
+use super::{FailureSource, FailureState, Result, SqliteError};
 use crate::blob::{BlobHash, DiskBlobStore, INLINE_TEXT_MAX_BYTES, MAX_BLOB_BYTES};
 use orch_core::store::{Entity, Record, Revision};
 use orch_domain::Task;
@@ -17,6 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(super) struct TaskSql<'a, 'conn> {
     pub tx: &'a Transaction<'conn>,
     pub project: &'a str,
+    pub state: FailureState,
+    pub source: FailureSource,
     pub disk: &'a DiskBlobStore,
 }
 
@@ -49,7 +50,18 @@ const PROJECTIONS: [&str; 16] = [
 ];
 
 impl TaskSql<'_, '_> {
+    fn observed<T>(&self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            self.state.observe(self.source, error);
+        }
+        result
+    }
+
     pub(super) fn get(&self, id: &str) -> Result<Option<Record>> {
+        self.observed(self.get_inner(id))
+    }
+
+    fn get_inner(&self, id: &str) -> Result<Option<Record>> {
         let native = stored(
             id,
             "tasks",
@@ -97,12 +109,14 @@ impl TaskSql<'_, '_> {
     /// Missing selected IDs are damage. `collect` discards preceding records if
     /// any hydration fails. The caller must use this object's selecting tx.
     pub(super) fn hydrate(&self, ids: &[String]) -> Result<Vec<Record>> {
-        ids.iter()
-            .map(|id| {
-                self.get(id)?
-                    .ok_or_else(|| corrupt(id, "selected row missing", "id"))
-            })
-            .collect()
+        self.observed(
+            ids.iter()
+                .map(|id| {
+                    self.get(id)?
+                        .ok_or_else(|| corrupt(id, "selected row missing", "id"))
+                })
+                .collect(),
+        )
     }
 
     fn check_projections(&self, id: &str, native: &[Value], task: &Task) -> Result<()> {
@@ -312,3 +326,6 @@ pub(super) mod writes;
 
 #[cfg(test)]
 mod write_tests;
+
+#[cfg(test)]
+mod integrated_tests;

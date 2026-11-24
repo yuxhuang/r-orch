@@ -166,8 +166,5 @@ mod task_format;
 )]
 mod agent_team_run;
 
-#[allow(
-    dead_code,
-    reason = "private Task SQL awaits Storage composition"
-)]
+#[allow(dead_code, reason = "private Task SQL awaits Storage composition")]
 mod task_sql;

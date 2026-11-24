@@ -14,7 +14,13 @@ fn sql<'a, 'conn>(
     disk: &'a DiskBlobStore,
     project: &'a str,
 ) -> TaskSql<'a, 'conn> {
-    TaskSql { tx, disk, project }
+    TaskSql {
+        tx,
+        disk,
+        project,
+        state: FailureState::new(),
+        source: FailureSource::Writer,
+    }
 }
 
 // Capture all persisted operation state, including independent columns and
@@ -727,8 +733,15 @@ fn outer_rollback_alone_refuses_next_task_write() {
     writer.create(task("before")).unwrap();
     tx.execute_batch("ROLLBACK").unwrap();
     assert!(tx.is_autocommit());
-    assert!(matches!(writer.create(task("after")), Err(SqliteError::TransactionAborted)));
-    assert_eq!(tx.query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert!(matches!(
+        writer.create(task("after")),
+        Err(SqliteError::TransactionAborted)
+    ));
+    assert_eq!(
+        tx.query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -738,20 +751,37 @@ fn failed_savepoint_rollback_poison_refuses_with_outer_transaction_still_active(
     let disk = DiskBlobStore::open(data.root()).unwrap();
     let mut conn = conn();
     conn.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
-        AuthAction::Savepoint { operation: TransactionOperation::Rollback, .. } => Authorization::Deny,
+        AuthAction::Savepoint {
+            operation: TransactionOperation::Rollback,
+            ..
+        } => Authorization::Deny,
         _ => Authorization::Allow,
-    })).unwrap();
+    }))
+    .unwrap();
     let tx = conn.transaction().unwrap();
     let caller = owner();
     let mut writer = TaskWrite::new(sql(&tx, &disk, "p"), &caller);
     writer.create(task("t")).unwrap();
     tx.execute_batch("CREATE TEMP TRIGGER fail_delete BEFORE DELETE ON task_details BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
-    assert!(matches!(writer.delete("t", Revision::ONE), Err(SqliteError::OperationRollback { .. })));
+    assert!(matches!(
+        writer.delete("t", Revision::ONE),
+        Err(SqliteError::OperationRollback { .. })
+    ));
     assert!(!tx.is_autocommit());
-    assert!(matches!(writer.ensure_committable(), Err(SqliteError::TransactionAborted)));
-    assert!(matches!(writer.create(task("later")), Err(SqliteError::TransactionAborted)));
+    assert!(matches!(
+        writer.ensure_committable(),
+        Err(SqliteError::TransactionAborted)
+    ));
+    assert!(matches!(
+        writer.create(task("later")),
+        Err(SqliteError::TransactionAborted)
+    ));
     tx.rollback().unwrap();
-    assert_eq!(conn.query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -765,8 +795,47 @@ fn native_approval_column_is_independent_of_shared_projection_calculation() {
     let mut input = task("t");
     input.labels = vec!["first".into(), "awaiting-approval".into()];
     writer.create(input.clone()).unwrap();
-    assert_eq!(tx.query_row("SELECT awaiting_approval FROM tasks WHERE project_id='p' AND id='t'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    assert_eq!(
+        tx.query_row(
+            "SELECT awaiting_approval FROM tasks WHERE project_id='p' AND id='t'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        1
+    );
     // Damage only the native column: do not reuse the write/read projection helper.
-    tx.execute("UPDATE tasks SET awaiting_approval=0 WHERE project_id='p' AND id='t'", []).unwrap();
-    assert!(matches!(sql(&tx, &disk, "p").get("t"), Err(SqliteError::TaskCorrupt { locator: "awaiting_approval", .. })));
+    tx.execute(
+        "UPDATE tasks SET awaiting_approval=0 WHERE project_id='p' AND id='t'",
+        [],
+    )
+    .unwrap();
+    assert!(matches!(
+        sql(&tx, &disk, "p").get("t"),
+        Err(SqliteError::TaskCorrupt {
+            locator: "awaiting_approval",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn damaged_position_names_requested_task_and_preserves_bounded_codec_check() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = conn();
+    let tx = conn.transaction().unwrap();
+    let caller = owner();
+    let mut writer = TaskWrite::new(sql(&tx, &disk, "p"), &caller);
+    writer.create(task("t")).unwrap();
+    tx.execute("UPDATE tasks SET position=0", []).unwrap();
+    assert!(
+        matches!(writer.create(task("requested")), Err(SqliteError::TaskCorrupt { task, check: "counter", locator: "position" }) if task == "requested")
+    );
+    tx.execute("UPDATE tasks SET position=1", []).unwrap();
+    tx.execute("UPDATE task_details SET detail_sha256=?1", ["0".repeat(64)])
+        .unwrap();
+    assert!(
+        matches!(sql(&tx, &disk, "p").get("t"), Err(SqliteError::TaskCorrupt { task, check: "detail length or hash", locator: "detail" }) if task == "t")
+    );
 }

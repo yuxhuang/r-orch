@@ -739,18 +739,48 @@ fn a_pooled_connection_that_finds_the_file_damaged_when_it_reopens_fails_the_wri
     });
 }
 
-// ---- outstanding combined proofs ---------------------------------------------------
-
-/// Not provable in this slice, and named so that no later one is claimed to have
-/// proved them. `TaskCorrupt` is not a `SqliteError` variant on this base; the
-/// Task integration (tsk_Sw1wdBo) adds it, adds its arm to `classify` (the match has
-/// no wildcard, so it cannot compile without one) and proves, through real Task paths
-/// on SQLite: `get`, page hydration, snapshot, unit-of-work and live-source
-/// verification each fail the writer and return no partial page; an absent task, a
-/// stale revision, an admission timeout and a transient object-access failure do
-/// not; a caught `TaskCorrupt` in a unit of work never commits. The R128 retry
-/// rules (the retryable class, a second `IOERR`, 60 s without a commit) and the
-/// checkpoint job itself are other slices.
+// Real Task get/page/snapshot/unit-of-work/live-source proofs are committed in
+// sqlite/task_sql/integrated_tests.rs, where the private leaf can be exercised.
 #[test]
-#[ignore = "outstanding: combined proofs through real Task paths (Task integration)"]
-fn outstanding_task_corrupt_through_real_task_paths() {}
+fn typed_task_corruption_and_nested_rollback_are_classified_before_conversion() {
+    let damage = || SqliteError::TaskCorrupt {
+        task: "synthetic".into(),
+        check: "detail missing",
+        locator: "detail",
+    };
+    let error = rollback_failure(rollback_failure(damage(), constraint()), corrupt());
+    let observation = classify(&error);
+    assert!(observation.savepoint_rollback_failed());
+    assert_eq!(
+        observation.fatal_causes(),
+        vec![
+            (Role::Operation, FatalCause::LogicalCorruption),
+            (Role::Rollback, FatalCause::SqliteCorrupt),
+        ]
+    );
+    let state = FailureState::new();
+    state.observe(FailureSource::Writer, &error);
+    assert!(state.failure().is_some());
+    let transient = SqliteError::TaskAccess(std::io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        classify(&transient).leaves(),
+        &[(Role::Operation, Class::Transient)]
+    );
+    assert_eq!(
+        classify(&constraint()).leaves(),
+        &[(Role::Operation, Class::Ordinary)]
+    );
+}
+
+#[test]
+fn task_publication_failure_alone_does_not_fail_live_storage() {
+    let state = FailureState::new();
+    let error = SqliteError::TaskPublication(orch_infra::blob::BlobError::Io(
+        std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+    ));
+    assert_eq!(
+        state.observe(FailureSource::Writer, &error).leaves(),
+        &[(Role::Operation, Class::Transient)]
+    );
+    state.ensure_available().unwrap();
+}

@@ -24,6 +24,7 @@ impl<'a, 'conn> TaskWrite<'a, 'conn> {
     }
 
     pub(in crate::sqlite) fn ensure_committable(&self) -> Result<()> {
+        self.sql.state.ensure_available()?;
         if self.poisoned || self.sql.tx.is_autocommit() {
             Err(SqliteError::TransactionAborted)
         } else {
@@ -95,6 +96,11 @@ impl<'a, 'conn> TaskWrite<'a, 'conn> {
     }
 
     pub(in crate::sqlite) fn create(&mut self, task: Task) -> Result<Record> {
+        let result = self.create_inner(task);
+        self.sql.observed(result)
+    }
+
+    fn create_inner(&mut self, task: Task) -> Result<Record> {
         self.ensure_committable()?;
         let existing = stored(
             &task.id,
@@ -123,7 +129,7 @@ impl<'a, 'conn> TaskWrite<'a, 'conn> {
             .into());
         }
         codec::validate(&task).map_err(write_error)?;
-        let position = self.next_position()?;
+        let position = self.next_position(&task.id)?;
         let (kind, run) = match self.principal {
             Principal::Owner { .. } => ("owner", None),
             Principal::Worker { .. } => ("daemon", None),
@@ -146,6 +152,11 @@ impl<'a, 'conn> TaskWrite<'a, 'conn> {
     }
 
     pub(in crate::sqlite) fn update(&mut self, task: Task, expected: Revision) -> Result<Record> {
+        let result = self.update_inner(task, expected);
+        self.sql.observed(result)
+    }
+
+    fn update_inner(&mut self, task: Task, expected: Revision) -> Result<Record> {
         let (_, position) = self.current(&task.id, expected)?;
         let revision = next_revision(expected)?;
         codec::validate(&task).map_err(write_error)?;
@@ -171,9 +182,14 @@ impl<'a, 'conn> TaskWrite<'a, 'conn> {
         id: &str,
         expected: Revision,
     ) -> Result<(Revision, u64)> {
+        let result = self.move_inner(id, expected);
+        self.sql.observed(result)
+    }
+
+    fn move_inner(&mut self, id: &str, expected: Revision) -> Result<(Revision, u64)> {
         self.current(id, expected)?;
         let revision = next_revision(expected)?;
-        let position = self.next_position()?;
+        let position = self.next_position(id)?;
         self.atomic(|this| {
             this.sql.tx.execute(
                 "UPDATE tasks SET revision=?3,position=?4 WHERE project_id=?1 AND id=?2",
@@ -190,6 +206,11 @@ impl<'a, 'conn> TaskWrite<'a, 'conn> {
     }
 
     pub(in crate::sqlite) fn delete(&mut self, id: &str, expected: Revision) -> Result<()> {
+        let result = self.delete_inner(id, expected);
+        self.sql.observed(result)
+    }
+
+    fn delete_inner(&mut self, id: &str, expected: Revision) -> Result<()> {
         self.current(id, expected)?;
         self.atomic(|this| {
             for query in [
@@ -281,7 +302,7 @@ impl<'a, 'conn> TaskWrite<'a, 'conn> {
         Ok(())
     }
 
-    fn next_position(&self) -> Result<u64> {
+    fn next_position(&self, id: &str) -> Result<u64> {
         let counter: Option<i64> = self
             .sql
             .tx
@@ -305,7 +326,7 @@ impl<'a, 'conn> TaskWrite<'a, 'conn> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         if minimum.is_some_and(|value| value <= 0) {
-            return Err(corrupt("", "counter", "position"));
+            return Err(corrupt(id, "counter", "position"));
         }
         if maximum.is_some_and(|value| value > last) {
             return Err(if counter.is_none() {
