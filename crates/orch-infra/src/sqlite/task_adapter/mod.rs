@@ -104,7 +104,7 @@ fn page_between(
     let after = request
         .cursor
         .as_ref()
-        .map(|token| cursors.resume(token, sql.project, filter, request.sort, now_ms))
+        .map(|token| cursors.resume(sql.tx, token, sql.project, filter, request.sort, now_ms))
         .transpose()?;
     // The token is resolved; the leaf refuses a request that still carries one.
     let walk = PageRequest {
