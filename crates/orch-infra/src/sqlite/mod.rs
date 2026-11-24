@@ -168,3 +168,9 @@ mod agent_team_run;
 
 #[allow(dead_code, reason = "private Task SQL awaits Storage composition")]
 mod task_sql;
+
+#[allow(
+    dead_code,
+    reason = "private Task list awaits Storage composition and the public cursor wiring"
+)]
+mod task_adapter;
