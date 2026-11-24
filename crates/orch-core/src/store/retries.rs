@@ -54,10 +54,8 @@ pub mod fake;
 /// The most rows one [`RetryRead::read_due_retries`] or
 /// [`RetryRead::read_retries`] call returns.
 pub const MAX_DUE_RETRIES: usize = 1_000;
-/// The longest `error` a row may hold, in bytes (text up to 64 KiB, decision 7).
-/// R97 also requires larger text, written through the API or imported, to be
-/// returned whole from the blob store. This slice stores no blob and refuses
-/// longer text; how T12 and T21 meet R97 is open and tracked in #109.
+/// The largest inline `error`, in UTF-8 bytes. Larger diagnostics are stored
+/// through the blob port and returned whole; this is not a diagnostic limit.
 pub const MAX_RETRY_ERROR_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +65,9 @@ pub struct Retry {
     pub attempt: u32,
     /// UTC milliseconds, matching `Clock::now_ms()`; not before the epoch.
     pub due_at: i64,
-    /// What failed; may be empty. At most [`MAX_RETRY_ERROR_BYTES`].
+    /// Complete diagnostic, including when no run survives; may be empty.
+    /// Above [`MAX_RETRY_ERROR_BYTES`], publish the complete UTF-8 bytes before
+    /// storing their hash. Unresolvable references fail reads, never truncate.
     pub error: String,
 }
 
@@ -83,11 +83,6 @@ impl Retry {
         }
         if self.due_at < 0 {
             return Err(InvalidRetry("the deadline is before the epoch".into()));
-        }
-        if self.error.len() > MAX_RETRY_ERROR_BYTES {
-            return Err(InvalidRetry(format!(
-                "the error is over {MAX_RETRY_ERROR_BYTES} bytes"
-            )));
         }
         Ok(())
     }

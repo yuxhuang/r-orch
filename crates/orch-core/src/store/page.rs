@@ -35,6 +35,8 @@ pub enum Sort {
     Priority,
     CreatedAt,
     UpdatedAt,
+    /// Numeric attempt descending, then id; requires a task-scoped Runs filter.
+    Attempt,
 }
 
 /// Typed filters cannot accidentally apply a task status to another family.
@@ -57,6 +59,11 @@ pub enum Filter {
     Messages {
         recipient: Option<String>,
     },
+    /// Pending for one exact recipient, at a caller-captured lexical time.
+    PendingMessages {
+        recipient: String,
+        now: String,
+    },
     Context,
     Config,
     Templates,
@@ -70,7 +77,7 @@ impl Filter {
             Self::Agents => EntityKind::Agent,
             Self::Teams => EntityKind::Team,
             Self::Runs { .. } => EntityKind::Run,
-            Self::Messages { .. } => EntityKind::Message,
+            Self::Messages { .. } | Self::PendingMessages { .. } => EntityKind::Message,
             Self::Context => EntityKind::Context,
             Self::Config => EntityKind::Config,
             Self::Templates => EntityKind::Template,

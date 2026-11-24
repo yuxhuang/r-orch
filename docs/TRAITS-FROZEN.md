@@ -110,10 +110,11 @@ plain objects, so unknown keys in `config.yml` survive a `config set`. Use
 
 The existing v1 signatures remain active until T25. The additive `orch_core::store`
 port is governed by the storage spec's "Storage port v2" and ADR 0017; it returns
-`store::Result<T>`. Its `ReadSnapshot` extends `EventRead + LeaseRead`, and
-`UnitOfWork` extends `EventWrite + LeaseWrite`. All operations use the enclosing
-caller's project; authorization belongs to the dispatcher. These operations are
-not yet wired into the running daemon.
+`store::Result<T>`. Its `ReadSnapshot` and `UnitOfWork` supertraits are listed in
+"Additive v2 port: entities, paging and operational families" below, which also
+records the other families; this section holds the event and lease signatures.
+All operations use the enclosing caller's project; authorization belongs to the
+dispatcher. These operations are not yet wired into the running daemon.
 
 ```rust
 // events::EventRead (async, &self)
@@ -153,6 +154,302 @@ or run is checked in that order and burns no epoch. Renew, release and append
 refuse `StaleEpoch` for a missing lease, stale lineage/epoch or mismatching task
 principal. Invalid event arguments return `InvalidEvents(String)`. Operation errors
 leave the operation unchanged; a callback error rolls back the entire unit of work.
+
+### Additive v2 port: entities, paging and operational families (ADR 0017 decision 3; ADR 0020)
+
+Recorded from `crates/orch-core/src/store*` as of `main` at `07b5f967` plus the three additions of issue 109
+(ADR 0020, "Added for issue 109" below): every public trait, trait method, type,
+constant and free function, and every public inherent method (the shared validators an adapter calls for parity
+are in the listings below, as one-line comments or as `fn` lines). The `test-support` fakes (`store::*::fake`) are
+not listed; they are the memory reference, not the contract. This is the contract of the
+spec's "Storage port v2", the amendments in it and ADR 0020. The v1 traits of the table above stay active, with
+their three rules, until T25 removes the product file adapter; nothing in this section is wired into the running
+daemon. Every operation below uses the enclosing caller's project (a key cannot select another), and none of them
+authorizes: the dispatcher does.
+
+Traits with `async fn` use `#[async_trait]`; the listings drop `pub` on traits and the `async_trait` attribute.
+
+```rust
+// store (store.rs)
+pub struct Caller { pub principal: Principal, pub project: String }
+pub enum Principal {                          // serde: tag "kind", snake_case
+    Owner  { identity: String },
+    Worker { identity: String },
+    Task   { identity: String, task: String, run: String, lineage: String, epoch: u64 },
+}
+pub enum Lane { Claims, Entities, Events, Maintenance }      // choosing a lane grants nothing
+pub type Result<T> = std::result::Result<T, StoreError>;
+pub type WriteWork = Box<dyn FnOnce(&mut dyn UnitOfWork) -> Result<()> + Send + 'static>;
+
+// The only entry points (async_trait). Backends serialize writers.
+trait Storage: Send + Sync {
+    async fn read(&self, caller: Caller) -> Result<Box<dyn ReadSnapshot>>;
+    async fn write(&self, caller: Caller, lane: Lane, work: WriteWork) -> Result<()>;
+}
+// Blanket-implemented for every Storage: the typed result is returned only after commit.
+trait StorageExt: Storage {
+    async fn transaction<T, F>(&self, caller: Caller, lane: Lane, work: F) -> Result<T>
+        where T: Send + 'static, F: FnOnce(&mut dyn UnitOfWork) -> Result<T> + Send + 'static;
+}
+
+// One committed state for every read through it, repeated page reads included.
+trait ReadSnapshot: AttentionRead + EventRead + IntentRead + LeaseRead + RetryRead + Send + Sync {
+    fn caller(&self) -> &Caller;
+    async fn get(&self, kind: EntityKind, id: &str) -> Result<Option<Record>>;
+    async fn list(&self, filter: &Filter, page: &PageRequest) -> Result<Page<Record>>;
+}
+// Synchronous, inside one transaction. An error from the callback discards every operation.
+trait UnitOfWork: AttentionWrite + EventWrite + IntentWrite + LeaseWrite + RequestKeyWrite + RetryWrite + Send {
+    fn caller(&self) -> &Caller;
+    fn get(&self, kind: EntityKind, id: &str) -> Result<Option<Record>>;
+    fn list(&self, filter: &Filter, page: &PageRequest) -> Result<Page<Record>>;
+    fn create(&mut self, entity: Entity) -> Result<Record>;
+    fn update(&mut self, entity: Entity, expected: Revision) -> Result<Record>;
+    fn delete(&mut self, kind: EntityKind, id: &str, expected: Revision) -> Result<()>;
+    fn move_to_end(&mut self, kind: EntityKind, id: &str, expected: Revision) -> Result<Record>;
+}
+```
+
+`ReadSnapshot` has no request-key read: a stored result is read only by the writer, in the transaction of its change
+(R74). `update`, `delete` and `move_to_end` take the `expected` revision the caller read; any other stored value,
+or no row, is `StaleRevision { kind, id, expected, actual }` (`actual` is `None` for a missing row) and changes
+nothing. `create` stores revision 1 and the next `position` of its project and family, `update` adds one to the
+revision and keeps the position, `move_to_end` adds one to the revision and gives the next position, and `delete`
+never lets a position be reused. A second `create` of an id is `AlreadyExists`, and a task id with the same ASCII
+fold key as another is `IdAlias` (R117); every lookup is exact to the byte.
+
+```rust
+// store::entity
+pub struct Revision(NonZeroU64);              // serde refuses 0; Revision::ONE; get() -> u64; next() -> Result<Revision>
+pub enum EntityKind { Task, Goal, Agent, Team, Run, Message, Context, Config, Template }   // snake_case
+pub struct ConfigEntry { pub key: String, pub value: String }        // project_config; the key is the id
+pub struct TemplateEntry { pub name: String, pub body: String }      // templates; the name is the id
+pub enum Entity {                             // serde: tag "kind", content "value", snake_case
+    Task(Box<Task>), Goal(Box<Goal>), Agent(Box<Agent>), Team(Box<Team>), Run(Box<Run>),
+    Message(Box<Message>), Context(ContextEntry), Config(ConfigEntry), Template(TemplateEntry),
+}                                             // Entity::kind() -> EntityKind, Entity::id() -> &str
+pub struct Record { pub entity: Entity, pub revision: Revision, pub position: u64 }
+
+// store::page
+pub struct Cursor(String);                    // Cursor::new refuses empty or over 512 bytes; as_str()
+pub enum Sort { Default, Id, Position, Name, Priority, CreatedAt, UpdatedAt, Attempt }   // snake_case; Default is the default
+pub enum Filter {                             // serde: tag "kind", snake_case
+    Tasks { status: Option<TaskStatus>, goal: Option<String> },
+    Goals { status: Option<GoalStatus> },
+    Agents,
+    Teams,
+    Runs { task: Option<String>, agent: Option<String> },
+    Messages { recipient: Option<String> },
+    PendingMessages { recipient: String, now: String },    // serde kind "pending_messages"; kind() = Message
+    Context,
+    Config,
+    Templates,
+}                                             // Filter::kind() -> EntityKind
+pub struct PageRequest { pub limit: usize, pub cursor: Option<Cursor>, pub sort: Sort, pub with_count: bool }
+                                              // default: 100, no cursor, Sort::Default, no count; validate(): limit in 1..=1000
+pub struct Page<T> { pub items: Vec<T>, pub next_cursor: Option<Cursor>, pub total: Option<u64> }
+                                              // total counts rows matching the filter, before the cursor
+
+// store::blob (independent of the entity transaction; publish bytes first, then register the hash in a unit of work)
+trait BlobStore: Send + Sync {
+    type Hash: Clone + Eq + Display + FromStr + Send + Sync;
+    type Error: std::error::Error + Send + Sync + 'static;
+    fn put(&self, bytes: &[u8]) -> Result<Self::Hash, Self::Error>;       // durable on return; equal bytes deduplicate
+    fn get(&self, hash: &Self::Hash) -> Result<Vec<u8>, Self::Error>;     // verifies the hash; missing or corrupt is an error
+    fn remove(&self, hash: &Self::Hash) -> Result<bool, Self::Error>;     // idempotent; the caller proves no reference remains
+}
+```
+
+The sorts each family offers are the spec's table: tasks `Position`, `Priority`, `CreatedAt`, `UpdatedAt`; goals
+`CreatedAt`; agents and teams `Name`; every family `Default` and `Id`; `Attempt` only for runs of one task (below);
+a backend refuses any other combination as `InvalidPage`. A cursor is opaque, holds no snapshot, and is bound to its project, filter and sort.
+
+```rust
+// store::retries (RetryRead on ReadSnapshot, RetryWrite on UnitOfWork)
+pub const MAX_DUE_RETRIES: usize = 1_000;
+pub const MAX_RETRY_ERROR_BYTES: usize = 64 * 1024;       // 65,536: the inline threshold, not a limit on the text
+pub struct Retry { pub task: String, pub attempt: u32 /* >= 1 */, pub due_at: i64 /* UTC ms, >= 0 */, pub error: String }
+                                              // Retry::validate(&self) -> Result<()>: task not empty, attempt >= 1, due_at >= 0
+pub struct RetryCursor { pub due_at: i64, pub task: String }   // RetryCursor::after(&Retry); validate()
+pub struct RetryPage { pub rows: Vec<Retry>, pub next: Option<RetryCursor> }
+pub fn check_limit(limit: usize) -> Result<()>;           // 1..=MAX_DUE_RETRIES
+trait RetryRead: Send + Sync {
+    async fn read_retry(&self, task: &str) -> Result<Option<Retry>>;
+    async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>>;
+    async fn read_retries(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage>;
+}
+trait RetryWrite: Send {
+    fn put_retry(&mut self, retry: &Retry) -> Result<()>;                 // inserts or replaces the whole row
+    fn delete_retry(&mut self, task: &str) -> Result<bool>;               // a missing row is not an error
+    fn get_retry(&self, task: &str) -> Result<Option<Retry>>;
+    fn due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>>;
+    fn list_retries(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage>;
+}
+```
+
+Retries: one row per task and project, no cap and no drop. A due row has `due_at <= now_ms`. Due and complete reads
+return earliest deadline first, ties by task id compared as UTF-8 bytes; that is a read order and never dispatch
+order. A read that would return a row whose long `error` cannot be resolved fails (below); a row it does not select is not
+resolved, and the three async `RetryRead` methods of the file reference and the disk-backed fake read blobs on the
+blocking boundary, not on the executor (behaviour, not a signature). The complete read follows `next` (exclusive keyset cursor; `Some` exactly when a row follows, so a walk never
+ends on an empty page); pages of one snapshot see one committed state, and a unit of work sees its own writes. Put
+replaces, where 1.0's enqueue kept the first row: a consumer that needs first-wins calls `get_retry` first, in the
+same unit of work. An unparsable 1.0 deadline is mapped to due by the importer, not by the port.
+
+```rust
+// store::intents (IntentRead, IntentWrite)
+pub const DONE_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;   pub const MAX_ID_BYTES: usize = 128;   pub const MAX_ROWS: usize = 1_000;
+pub enum IntentKind { ProcessStart, ProcessStop, WorkspaceRemove, BlobDelete }   // as_str(): "process.start" "process.stop" "workspace.remove" "blob.delete"; repeats_after_restart(): false for ProcessStart only
+pub enum IntentPayload {                      // serde tag "kind", deny_unknown_fields
+    ProcessStart { run: String }, ProcessStop { run: String }, WorkspaceRemove { task: String }, BlobDelete { hash: String },
+}                                             // kind(), run(), validate()
+pub fn check_bound(value: usize) -> Result<()>;           // 1..=MAX_ROWS; the bound both backends apply to reads and deletions
+pub struct Intent { pub id: u64, pub payload: IntentPayload, pub created_at: i64, pub done_at: Option<i64> }
+pub enum FinishOutcome { Finished, AlreadyDone }
+trait IntentRead: Send + Sync {
+    async fn read_intent(&self, id: u64) -> Result<Option<Intent>>;
+    async fn read_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<Intent>>;
+}
+trait IntentWrite: Send {
+    fn add_intent(&mut self, payload: &IntentPayload, now_ms: i64) -> Result<Intent>;
+    fn finish_intent(&mut self, id: u64, now_ms: i64) -> Result<FinishOutcome>;
+    fn delete_finished_intents(&mut self, now_ms: i64, max_rows: usize) -> Result<usize>;
+    fn get_intent(&self, id: u64) -> Result<Option<Intent>>;
+    fn list_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<Intent>>;
+}
+
+// store::request_keys (RequestKeyWrite only)
+pub const KEY_TTL_MS: i64 = 3_600_000;   pub const MAX_RESULT_BYTES: usize = 64 * 1024;   pub const MAX_ROWS: usize = 1_000;
+pub const MIN_KEY_BYTES: usize = 16;   pub const MAX_KEY_BYTES: usize = 128;   pub const MAX_OP_BYTES: usize = 128;
+pub struct RequestScope { /* identity, project, run, epoch, key */ }       // RequestScope::of(&Caller, key) -> Result<Self>
+                                              // identity() -> &str, project() -> &str, run() -> &str ("" for owner or worker),
+                                              // epoch() -> u64 (0 for owner or worker, otherwise 1..=i64::MAX), key() -> &str,
+                                              // check_caller(&Caller) -> Result<()>: refuses a scope built for another caller
+// The shape checks both backends make before they read or change anything:
+pub fn check_key(key: &str) -> Result<()>;                // MIN_KEY_BYTES..=MAX_KEY_BYTES of A-Z a-z 0-9 _ -
+pub fn check_request(op: &str, req_sha256: &str, now_ms: i64) -> Result<()>;   // op 1..=MAX_OP_BYTES of A-Z a-z 0-9 . _ -; 64 lowercase hex; check_now
+pub fn check_now(now_ms: i64) -> Result<()>;              // UTC milliseconds, not before the epoch
+pub fn expires_at(now_ms: i64) -> Result<i64>;            // checked now_ms + KEY_TTL_MS
+pub fn check_bound(value: usize) -> Result<()>;           // 1..=MAX_ROWS, the bound on one expiry call
+pub enum KeyCheck { New, Replay(String), ReplayWithoutResult, Mismatch }
+trait RequestKeyWrite: Send {
+    fn check_request_key(&self, scope: &RequestScope, op: &str, req_sha256: &str, now_ms: i64) -> Result<KeyCheck>;
+    fn store_request_key(&mut self, scope: &RequestScope, op: &str, req_sha256: &str, result: &str, now_ms: i64) -> Result<()>;
+    fn delete_expired_request_keys(&mut self, now_ms: i64, max_rows: usize) -> Result<usize>;
+}
+
+// store::attention (AttentionRead, AttentionWrite)
+pub const MAX_ATTENTION_PAGE: usize = 1_000;   pub const MAX_ATTENTION_DELETE: usize = 1_000;
+pub enum AttentionKind { DiskFloor, DispatchOffWithWork }   pub enum Severity { Blocking, Warning }
+pub enum DiskSubject { DataDirectory, ProjectWorkspaces { project: String } }
+pub enum AttentionFacts {
+    DiskFloor { subject: DiskSubject, free_bytes: u64, floor_bytes: u64 },
+    DispatchOffWithWork { waiting_tasks: u64, oldest_waiting_at: i64 },
+}                                             // kind() -> AttentionKind, validate(&self, project: &str, at: i64) -> Result<()>
+                                              // (scope and facts, checked before even a duplicate-open lookup),
+                                              // subject_id() -> String (the uniqueness key within kind and scope),
+                                              // severity() -> Severity, title() -> &'static str,
+                                              // detail() -> Result<String>, remedy() -> Result<&'static str> (both recheck ids)
+pub struct Acknowledgement { pub identity: String, pub at: i64 }
+pub enum ResolutionReason { DiskSpaceRecovered, DispatchEnabled, NoDispatchableWork }
+                                              // validate(self, kind: AttentionKind) -> Result<()>: refuses a reason of another kind
+pub struct Resolution { pub reason: ResolutionReason, pub at: i64 }
+pub struct Attention { pub id: u64, pub facts: AttentionFacts, pub opened_at: i64,
+                       pub acknowledgement: Option<Acknowledgement>, pub resolution: Option<Resolution>, pub revision: Revision }
+                                              // check_transition_time(&self, at: i64) -> Result<()>: refuses a time before the last of opened, acknowledged, resolved
+pub enum AttentionFilter { All, Open, Resolved }   // matches(self, &Attention) -> bool
+pub struct AttentionCursor { /* project, filter, last id */ }   // after(project: &str, filter, id: u64) -> Self; check(&self, project, filter) -> Result<u64>
+pub fn check_id(id: &str) -> Result<()>;                  // 1..=128 of A-Z a-z 0-9 _ -
+pub fn check_time(at: i64) -> Result<()>;                 // UTC milliseconds, not before the epoch
+pub fn check_limit(limit: usize) -> Result<()>;           // 1..=MAX_ATTENTION_PAGE (store::attention's; retries has its own)
+pub struct AttentionPage { pub items: Vec<Attention>, pub next: Option<AttentionCursor> }
+trait AttentionRead: Send + Sync {
+    async fn read_attention(&self, id: u64) -> Result<Option<Attention>>;
+    async fn read_attention_page(&self, filter: AttentionFilter, after: Option<&AttentionCursor>, limit: usize) -> Result<AttentionPage>;
+}
+trait AttentionWrite: Send {
+    fn get_attention(&self, id: u64) -> Result<Option<Attention>>;
+    fn attention_page(&self, filter: AttentionFilter, after: Option<&AttentionCursor>, limit: usize) -> Result<AttentionPage>;
+    fn open_attention(&mut self, facts: &AttentionFacts, at: i64) -> Result<Attention>;
+    fn ack_attention(&mut self, id: u64, expected: Revision, at: i64) -> Result<Attention>;
+    fn resolve_attention(&mut self, id: u64, expected: Revision, reason: ResolutionReason, at: i64) -> Result<Attention>;
+    fn expire_attention(&mut self, cutoff: i64, limit: usize) -> Result<usize>;
+}
+
+// Errors (thiserror)
+pub enum StoreError {
+    StaleRevision { kind: EntityKind, id: String, expected: Revision, actual: Option<Revision> },
+    AlreadyExists { kind: EntityKind, id: String },   IdAlias { existing: String, requested: String },
+    InvalidPage(String),  InvalidCursor,  StaleEpoch,  InvalidEvents(String),  InvalidIntent(String),
+    InvalidRetry(String), InvalidRequestKey(String),  InvalidAttention(String),
+    StaleAttentionRevision { id: u64, expected: Revision, actual: Option<Revision> },
+    CounterExhausted,  Backend(orch_core::Error),
+}
+```
+
+The families' rules (time is always the caller's UTC milliseconds, the one exception being the ISO string that
+`PendingMessages` carries below; bounds 1..=1,000; the first stored bytes win; a refusal caught and committed leaves
+nothing) are in the spec's amendments for leases,
+intents, attention and request keys. `orch_core::store::fake::FakeStorage` (feature `test-support`) is the memory
+reference, and `orch_infra::storage::v2` the file reference; both run the same shared conformance suites, and neither
+is wired into the daemon. The only `BlobStore` adapter in 1.1 is `orch_infra::blob::DiskBlobStore`.
+
+The file reference also fixes what a persisted request-key document may hold (the spec's T8c request-keys amendment).
+It adds no signature. A stored row's epoch is at most `i64::MAX`, the ceiling `RequestScope::of` applies, and its
+`expires_at` is exactly `created_at + KEY_TTL_MS`, so a change to `KEY_TTL_MS` must migrate or reconcile the stored
+rows in the same change. A row denies an unknown field and the collection that holds the rows ignores one. A negative
+`now_ms` is refused on `check_request_key` as on `store_request_key`. The tie order of rows with an equal expiry in
+`delete_expired_request_keys` is not observable through the port; T10 proves it on SQLite under issue 127.
+
+#### Added for issue 109 (ADR 0020)
+
+These three changes are implemented by the change that carries this record, on the memory and file references. Each is
+an addition: no earlier signature changes, and nothing is removed. On `main` at `07b5f967` neither variant existed and
+a retry `error` over 65,536 bytes was refused. The `test-support` fakes are not part of the contract and are not
+listed.
+
+```rust
+// store::page
+pub enum Filter { /* ..., */
+    PendingMessages { recipient: String, now: String },    // serde kind "pending_messages"; Filter::kind() = Message
+}
+pub enum Sort { /* ..., */ Attempt }                       // serde "attempt"
+```
+
+- `Filter::PendingMessages { recipient, now }` selects messages with status `pending`, `to_agent_id == Some(recipient)`
+  byte for byte, and `expires_at` absent or `expires_at >= now`, compared as strings. 1.0's `is_expired` is
+  `expires_at < now`, so equality is pending, a broadcast (no recipient) is never pending, and an `expires_at` that is
+  not a date is compared as text and never parsed. `now` is the caller's captured `Clock::now_iso()`; the port reads
+  no clock and adds no validation. The filter runs before the count, the cursor and the page bound, so a page fills
+  with matches and `total` counts matches. A cursor binds the recipient, `now`, the sort and the project. Order is the
+  messages' default (`created_at`, `position`, id); the other sorts are those of `Filter::Messages` (`Default` and `Id`).
+- `Sort::Attempt` is offered only for `Filter::Runs { task: Some(_), .. }`. It orders by `Run.attempt` numerically,
+  descending, then run id bytes ascending. For `Runs` with no task, for any other family and for any other
+  filter it is `InvalidPage`, before any paging work. The `Sort::Default` of a run list whose filter names a
+  task (alone or beside an `agent`) is the same key (PR #225; the spec's "Run and goal default order"), so the default and
+  `Attempt` list the same rows in the same order and are two sorts for a cursor. For a run list with no task,
+  `Sort::Default` is `started_at` text descending, then id. The spec's earlier `run_no` is this sort: `Run` has no such
+  field.
+- `Retry.error` is the whole logical text. `MAX_RETRY_ERROR_BYTES` (65,536 UTF-8 bytes) is the inline
+  threshold and `Retry::validate` no longer refuses longer text; the other checks stay. Longer text is published to the
+  blob store before the row that carries its hash is committed, and a read returns the original text byte for byte. A
+  failed publication, or a missing or corrupt blob when writing, fails the write and keeps the previous row. A
+  reference that does not resolve on read is an error from `read_retry`, `read_due_retries`, `read_retries`,
+  `get_retry`, `due_retries` and `list_retries` whenever the call would return that row, and never a shortened row.
+  Rows, bounds, orders and first-wins handling are unchanged.
+- Above one blob object the text is chunked. `DiskBlobStore` holds at most 67,108,864 bytes (64 MiB) per object, and
+  that bound stays. Text of 65,537 to 67,108,864 bytes inclusive is one object named by the row's hash. Longer text keeps the SHA-256 of the whole value in the row, which no single object holds,
+  plus an ordered mapping to chunk objects of at most 67,108,864 bytes each, with one entry per position (identical
+  chunks repeat). A chunk may split a UTF-8 character: the joined bytes are verified against the whole-value hash
+  and only then decoded. A read verifies every object and the whole value; a missing, corrupt or reordered chunk is
+  an error. A write publishes every object before it commits the row and mapping together, and a failure on a later
+  chunk keeps the previous row readable even if the caller catches the error and commits other work. Objects an
+  interrupted write leaves follow the blob store's lifecycle. The mapping's physical encoding is the adapters'
+  (`Retry`, `RetryRead` and `RetryWrite` keep the shape listed above). The reference adapters record it as
+  `{sha256, chunks}`: the file reference's retry row holds an inline string, `{"sha256": H}` for one object, or
+  `{"sha256": H, "chunks": [...]}` above 67,108,864 bytes (hashes are 64 lower-case hex digits, and chunks are cut at
+  67,108,864 bytes); a stored mapping with any other field is refused when the document loads. No public type carries it, so this record has no new type to list; the types that hold it are
+  private to each adapter, and T10 may choose another encoding that holds the same facts.
 
 ## 3. `orch_core::adapter`
 
