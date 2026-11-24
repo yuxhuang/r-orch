@@ -1397,16 +1397,23 @@ its tests calls it, and there is still no `orch import` command.
 - `_index.json`: the array is examined whole, so a bad entry anywhere is `index_entry` before any
   `index_duplicate`, which holds for bare identities and for whole entities alike. A missing, unparsable,
   object or `null` index is a note `index_unreadable` and the files go in id order; the budget, file-kind and
-  I/O stops stay terminal and are never `index_unreadable`. `index_unlisted`, `index_missing_file` (never opened
-  as a path) and `index_differs` are notes, and the file's content wins. The report's `order` previews at most
+  I/O stops stay terminal and are never `index_unreadable`. `index_unlisted`, `index_missing_file` (an entry with
+  no file, never opened as a path; a present file that is refused gets its own refusal and is not also reported
+  as missing) and `index_differs` are notes, and the file's content wins. The report's `order` previews at most
   1,000 positions for all stores together and counts the rest in `more`; it is not a load manifest.
-- Tests: `crates/orch-infra/tests/import_preflight_compat.rs`, named in the compatibility record.
+- Tests: `crates/orch-infra/tests/import_preflight_compat.rs`, named in the compatibility record. The same
+  test that pins C-V11 runs 1.0's task, agent, goal and team readers on a separately created zero-byte file
+  for each, and X-V5 and X-V7 run 1.0's `IndexManager` on a second, disposable source for each of the five
+  directories. X-V13 is the unit test `an_index_read_error_stops_and_an_interrupted_read_is_retried`, which
+  injects the read fault into the method the whole-source check reads every index through. The tests also
+  pin that a JSON message or context document with a repeated field the entity type knows is refused as before, and that a YAML
+  entity keeps an ignored YAML-only key.
 
 Held, and not claimed by this slice: the writer, the importer and its command, integrated dry run, resume and
-zero-write acceptance (issue 146), the lock held across the check and the cancellation of a blocked read
-(issue 192), the injected read-error vector X-V13, and 1.0's readers run beside the check for the entity files of C-V11 (1.0's index reader is run beside it for X-V5). The reader-level
-`import::index::reconcile` is unwired and still names a repeated identity `index_entry`; it is not the
-preflight's classifier. No changelog fragment is added: nothing a user can run or notice changes, and
+zero-write acceptance (issue 146), and the lock held across the check and the cancellation of a blocked read
+(issue 192). The reader-level `import::index::reconcile` is unwired, is kept as historical evidence and still
+names a repeated identity `index_entry`; it is not the preflight's classifier, and it takes every entity
+document of a directory at once, which the check does not gather. No changelog fragment is added: nothing a user can run or notice changes, and
 the check has no caller outside its tests (AGENTS.md, "Changelog fragments").
 
 ### T8c complete retry enumeration follow-up

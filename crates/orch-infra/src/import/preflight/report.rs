@@ -106,7 +106,7 @@ pub struct Report {
     pub counts: Counts,
     /// A preview only. The durable caller must repeat the checked reads under its lock.
     pub order: Capped<OrderedEntity>,
-    /// Effective 1.0 run cap; absent if config checking did not finish.
+    /// Effective 1.0 run cap; null if config checking did not finish.
     pub run_cap: Option<u64>,
     /// Size of the compact JSON legacy object, not its potentially sensitive values.
     pub legacy_config_bytes: u64,

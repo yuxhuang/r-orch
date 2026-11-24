@@ -287,11 +287,15 @@ fn each_yaml_budget_passes_at_its_limit_and_refuses_one_over() {
     assert_eq!(over[0]["limit"], 64);
     // nodes as expanded
     // These fixtures pass the parser budget, then stop on config shape.
-    refused_everywhere(
+    let at = refused_everywhere(
         "200,000 nodes",
         flat_sequence(199_999).as_bytes(),
         &[CONFIG],
         "unreadable",
+    );
+    assert!(
+        at.iter()
+            .all(|f| f["detail"].as_str().unwrap().contains("expected a mapping"))
     );
     refused_everywhere(
         "200,001 nodes",
@@ -300,11 +304,15 @@ fn each_yaml_budget_passes_at_its_limit_and_refuses_one_over() {
         "expanded_nodes",
     );
     // bytes as expanded
-    refused_everywhere(
+    let at = refused_everywhere(
         "4,194,304 bytes expanded",
         repeated_scalar(63, false).as_bytes(),
         &[CONFIG],
         "unreadable",
+    );
+    assert!(
+        at.iter()
+            .all(|f| f["detail"].as_str().unwrap().contains("expected a mapping"))
     );
     refused_everywhere(
         "4,194,305 bytes expanded",

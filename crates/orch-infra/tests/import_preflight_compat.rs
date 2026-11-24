@@ -242,6 +242,10 @@ async fn index_order_and_named_problems_use_files_and_never_open_index_identitie
             (Some("null".to_owned()), vec!["a", "b", "c"]),
             (Some("[]".to_owned()), vec!["a", "b", "c"]),
             (
+                Some(json!([{key:"A"},{key:"a"}]).to_string()),
+                vec!["a", "b", "c"],
+            ),
+            (
                 Some(json!([{key:"b"},{key:"../x"},{key:"A"},{key:"a"}]).to_string()),
                 vec!["b", "a", "c"],
             ),
@@ -273,6 +277,41 @@ async fn index_order_and_named_problems_use_files_and_never_open_index_identitie
                     .count(),
                 usize::from(unreadable)
             );
+            if input.as_deref() == Some("[]") {
+                let listed: Vec<_> = report
+                    .notes
+                    .listed
+                    .iter()
+                    .filter(|f| f.rule == "index_unlisted")
+                    .map(|f| f.observed.as_deref().unwrap())
+                    .collect();
+                assert_eq!(listed, ["a", "b", "c"]);
+            }
+            if input.as_deref().is_some_and(|s| s.contains("\"A\"")) {
+                assert!(
+                    report
+                        .notes
+                        .listed
+                        .iter()
+                        .any(|f| f.rule == "index_missing_file"
+                            && f.observed.as_deref() == Some("A"))
+                );
+                let listed: Vec<_> = report
+                    .notes
+                    .listed
+                    .iter()
+                    .filter(|f| f.rule == "index_unlisted")
+                    .map(|f| f.observed.as_deref().unwrap())
+                    .collect();
+                assert_eq!(
+                    listed,
+                    if input.as_deref().unwrap().contains("../x") {
+                        vec!["c"]
+                    } else {
+                        vec!["b", "c"]
+                    }
+                );
+            }
             if input.as_deref().is_some_and(|s| s.contains("../x")) {
                 assert!(report.notes.listed.iter().any(
                     |f| f.rule == "index_missing_file" && f.observed.as_deref() == Some("../x")
@@ -418,7 +457,7 @@ async fn budgets_and_file_kind_stops_never_become_index_unreadable() {
 }
 
 #[tokio::test]
-async fn empty_entity_streams_keep_their_document_refusal_without_config_wording() {
+async fn an_entity_file_with_no_document_is_refused_as_1_0_refuses_it() {
     use orch_core::storage::{AgentStore, GoalStore, TaskStore, TeamStore};
     use orch_infra::storage::{FileAgentStore, FileGoalStore, FileTaskStore, FileTeamStore, Paths};
     for store in ["tasks", "agents", "goals", "teams"] {
@@ -479,6 +518,8 @@ async fn order_and_notes_are_capped_without_changing_counts() {
     let value = serde_json::to_value(&report).unwrap();
     assert_eq!(value["order"]["listed"].as_array().unwrap().len(), 1000);
     assert_eq!(value["order"]["more"], json!(3));
+    assert_eq!(value["order"]["listed"][0]["id"], json!("k0000"));
+    assert_eq!(value["order"]["listed"][999]["id"], json!("k0999"));
     assert_eq!(report.notes.listed.len(), 1000);
     assert_eq!(report.notes.more, 4); // 3 unlisted overflow + default note
 }
@@ -524,16 +565,190 @@ async fn typed_yaml_entities_keep_ignored_yaml_only_fields() {
 
 #[tokio::test]
 async fn an_unreadable_entity_is_not_reported_as_a_missing_file() {
+    for id in ["a", "a b", ".", ".."] {
+        let src = source();
+        put(src.path(), &format!("tasks/{id}.yml"), "null\n");
+        put(
+            src.path(),
+            "tasks/_index.json",
+            json!([{"id":id}]).to_string(),
+        );
+        let report = run(src.path()).await;
+        assert!(report.refused());
+        assert!(
+            !report
+                .notes
+                .listed
+                .iter()
+                .any(|f| f.rule == "index_missing_file"),
+            "{id}: {report:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn numeric_and_boolean_yaml_keys_follow_the_effective_legacy_reader() {
+    use orch_infra::storage::{FileConfigStore, Paths};
+    let input = "extras: {200: x, true: y}\n200: top\n";
+    let copy = source();
+    put(copy.path(), "config.yml", input);
+    let legacy = FileConfigStore::new(Paths::new(copy.path()))
+        .read_merged()
+        .await
+        .unwrap();
+    assert_eq!(legacy["extras"]["200"], json!("x"));
+    assert_eq!(legacy["extras"]["true"], json!("y"));
+    assert_eq!(legacy["200"], json!("top"));
     let src = source();
-    put(src.path(), "tasks/a.yml", "null\n");
-    put(src.path(), "tasks/_index.json", r#"[{"id":"a"}]"#);
+    put(src.path(), "config.yml", input);
     let report = run(src.path()).await;
-    assert!(report.refused());
+    assert!(!report.refused(), "{report:?}");
+    let mut keys: Vec<_> = report
+        .notes
+        .listed
+        .iter()
+        .filter(|f| f.rule == "unknown_config")
+        .map(|f| f.observed.as_deref().unwrap())
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["200", "extras.200", "extras.true"]);
+    let bad = "extras: {~: x}\n";
+    put(copy.path(), "config.yml", bad);
     assert!(
-        !report
-            .notes
-            .listed
-            .iter()
-            .any(|f| f.rule == "index_missing_file")
+        FileConfigStore::new(Paths::new(copy.path()))
+            .read_merged()
+            .await
+            .is_err()
     );
+    put(src.path(), "config.yml", bad);
+    assert_eq!(run(src.path()).await.refusals.listed[0].rule, "unreadable");
+}
+
+#[tokio::test]
+async fn prefix_id_order_is_independent_of_the_document_extension_in_every_store() {
+    for store in STORES {
+        let key = if store == "context" { "key" } else { "id" };
+        for index in [
+            None,
+            Some("[]".to_owned()),
+            Some(json!([{key:"a_b"}]).to_string()),
+        ] {
+            let src = source();
+            let ext = if matches!(store, "context" | "messages") {
+                "json"
+            } else {
+                "yml"
+            };
+            for id in ["a", "a-b", "a.b", "a_b"] {
+                put(
+                    src.path(),
+                    &format!("{store}/{id}.{ext}"),
+                    entity(store, id).to_string(),
+                );
+            }
+            if let Some(input) = &index {
+                put(src.path(), &format!("{store}/_index.json"), input);
+            }
+            let report = run(src.path()).await;
+            assert!(!report.refused(), "{report:?}");
+            let value = serde_json::to_value(&report).unwrap();
+            let ids: Vec<_> = value["order"]["listed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["id"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                ids,
+                if index.as_deref().is_some_and(|s| s.contains("a_b")) {
+                    vec!["a_b", "a", "a-b", "a.b"]
+                } else {
+                    vec!["a", "a-b", "a.b", "a_b"]
+                },
+                "{store}: {report:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn opaque_ignored_json_numbers_preserve_acceptance_order_and_structural_comparison() {
+    let src = source();
+    let a = entity("context", "a").to_string();
+    let b = entity("context", "b").to_string();
+    let file_b = format!(
+        "{{\"x\":{{\"n\":1e999,\"seq\":[0,{{\"n\":2e999}}],\"s\":\"a\"}},{}",
+        &b[1..]
+    );
+    assert!(serde_json::from_str::<orch_core::storage::ContextEntry>(&file_b).is_ok());
+    put(src.path(), "context/a.json", &a);
+    put(src.path(), "context/b.json", &file_b);
+    for (number, sequence, differs) in [
+        ("1e999", "[0,{\"n\":2e999}]", false),
+        ("2e999", "[0,{\"n\":2e999}]", true),
+        ("1e999", "[{\"n\":2e999},0]", true),
+    ] {
+        let index_b = format!(
+            "{}, \"x\": {{\"s\": \"\\u0061\", \"seq\": {sequence}, \"n\": {number} }} }}",
+            &b[..b.len() - 1]
+        );
+        put(
+            src.path(),
+            "context/_index.json",
+            format!("[{index_b},{a}]"),
+        );
+        let report = run(src.path()).await;
+        assert!(!report.refused(), "{report:?}");
+        assert_eq!(report.counts.context, 2);
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["order"]["listed"][0]["id"], json!("b"));
+        assert_eq!(value["order"]["listed"][1]["id"], json!("a"));
+        assert_eq!(
+            report
+                .notes
+                .listed
+                .iter()
+                .filter(|f| f.rule == "index_differs")
+                .count(),
+            usize::from(differs),
+            "{report:?}"
+        );
+    }
+    let invalid = format!("{{\"value\":1e999,{}", &a[1..]);
+    assert!(serde_json::from_str::<orch_core::storage::ContextEntry>(&invalid).is_err());
+    put(src.path(), "context/a.json", invalid);
+    assert!(run(src.path()).await.refused());
+}
+
+#[tokio::test]
+async fn opaque_index_members_do_not_change_whole_array_precedence_in_any_store() {
+    for store in STORES {
+        let key = if store == "context" { "key" } else { "id" };
+        let src = source();
+        populate(src.path(), store);
+        for input in [
+            format!("[{{\"{key}\":\"b\",\"x\":1e999}},{{\"{key}\":\"b\"}},0]"),
+            format!("[0,{{\"{key}\":\"b\",\"x\":1e999}},{{\"{key}\":\"b\"}}]"),
+        ] {
+            put(src.path(), &format!("{store}/_index.json"), input);
+            let report = run(src.path()).await;
+            assert_eq!(report.refusals.total(), 1, "{report:?}");
+            assert_eq!(report.refusals.listed[0].rule, "index_entry");
+        }
+        put(
+            src.path(),
+            &format!("{store}/_index.json"),
+            format!("[{{\"{key}\":\"b\",\"x\":1e999}},{{\"{key}\":\"a\"}}]"),
+        );
+        let report = run(src.path()).await;
+        assert!(!report.refused(), "{report:?}");
+        let value = serde_json::to_value(&report).unwrap();
+        let ids: Vec<_> = value["order"]["listed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["b", "a", "c"]);
+    }
 }

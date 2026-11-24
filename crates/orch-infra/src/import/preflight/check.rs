@@ -5,13 +5,19 @@ use super::report::{Counts, Finding, OrderedEntity, Report};
 use super::source::{kind, list_bounded};
 use super::{Options, PreflightError};
 use crate::data_dir::confined::{ConfinedDir, ConfinedError, FileAccess};
-use crate::import::document::{Limits, Refusal, decode_json, decode_yaml, read_bounded};
+use crate::import::document::{
+    Limits, Refusal, check_json, decode_json, decode_yaml, read_bounded,
+};
 use crate::import::event::{EventItem, EventStream};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 #[path = "compatibility.rs"]
 mod compatibility;
 use compatibility::{legacy_defaults, unknown_config};
+#[path = "comparison.rs"]
+mod comparison;
+use comparison::DocumentContent;
+use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -131,6 +137,13 @@ fn classify(store: Store, name: &OsStr) -> Name<'_> {
                 Name::Other
             }
         }
+    }
+}
+
+fn order_key(store: Store, name: &OsStr) -> &[u8] {
+    match classify(store, name) {
+        Name::Document(stem) => stem,
+        _ => name.as_bytes(),
     }
 }
 
@@ -595,7 +608,13 @@ impl Check<'_> {
         } else {
             None
         };
-        for name in &level.names {
+        let mut names: Vec<_> = level.names.iter().collect();
+        if store.has_index() {
+            // Removing the extension changes prefix order: a-b.json precedes
+            // a.json as a file name, but the entity id a precedes a-b.
+            names.sort_by(|a, b| order_key(store, a).cmp(order_key(store, b)));
+        }
+        for name in names {
             self.cancelled()?;
             let path = relative(&[OsStr::new(store.dir()), name]);
             match classify(store, name) {
@@ -624,6 +643,9 @@ impl Check<'_> {
                 Name::Document(stem) => {
                     if !is_id(stem) {
                         self.bad_stem(&path);
+                        if let Some(index) = &mut index {
+                            self.index_invalid_file(index, stem);
+                        }
                         continue;
                     }
                     if store == Store::Tasks {
@@ -637,6 +659,9 @@ impl Check<'_> {
                                 None,
                                 "a task id may not be `.` or `..`",
                             );
+                            if let Some(index) = &mut index {
+                                self.index_invalid_file(index, stem);
+                            }
                             continue;
                         }
                         self.register_task(stem, &path);
@@ -695,7 +720,7 @@ impl Check<'_> {
         name: &OsStr,
         stem: &[u8],
         path: &str,
-    ) -> Result<Option<Value>, PreflightError> {
+    ) -> Result<Option<DocumentContent>, PreflightError> {
         let Some(file) = self.acquire(dir, name, path) else {
             return Ok(None);
         };
@@ -720,7 +745,9 @@ impl Check<'_> {
             };
             // A YAML-only key cannot equal a JSON index entry. It is still legal
             // in an ignored entity field, as it was to 1.0's typed YAML reader.
-            let comparison = serde_json::to_value(&value).unwrap_or(Value::Null);
+            let comparison = serde_json::to_value(&value)
+                .ok()
+                .and_then(|v| serde_json::value::to_raw_value(&v).ok());
             let own = match store {
                 Store::Tasks => serde_yaml_ng::from_value::<orch_domain::Task>(value).map(|d| d.id),
                 Store::Agents => serde_yaml_ng::from_value::<orch_domain::Agent>(value).map(|d| {
@@ -734,9 +761,10 @@ impl Check<'_> {
             .map_err(|e| e.to_string());
             (own, comparison)
         } else {
-            let Some(value) = self.json::<Value>(&bytes, path) else {
+            if let Err(refusal) = check_json(&bytes, Limits::JSON) {
+                self.refusal(path, refusal);
                 return Ok(None);
-            };
+            }
             let own = match store {
                 Store::Messages => {
                     serde_json::from_slice::<orch_domain::Message>(&bytes).map(|d| d.id)
@@ -749,7 +777,9 @@ impl Check<'_> {
                 _ => unreachable!("JSON store"),
             }
             .map_err(|e| e.to_string());
-            (own, value)
+            let comparison = serde_json::from_slice::<Box<RawValue>>(&bytes)
+                .expect("JSON budget pass checked the syntax");
+            (own, Some(comparison))
         };
         let own = match own {
             Ok(own) => own,
@@ -777,7 +807,7 @@ impl Check<'_> {
             Store::Runs => counts.runs += 1,
             Store::Templates => {}
         }
-        Ok(Some(value))
+        Ok(Some(DocumentContent(value)))
     }
 
     fn config(&mut self, orch: &ConfinedDir, present: bool) -> Result<(), PreflightError> {
@@ -791,7 +821,7 @@ impl Check<'_> {
             };
             let value = match self
                 .runtime
-                .block_on(decode_yaml::<Value>(&bytes, Limits::YAML))
+                .block_on(decode_yaml::<serde_yaml_ng::Value>(&bytes, Limits::YAML))
             {
                 Ok(value) => value,
                 Err(mut refusal) => {
@@ -799,6 +829,13 @@ impl Check<'_> {
                         refusal.detail.push_str("; 1.0 read this file as its defaults; after taking a copy, write {} to keep those defaults");
                     }
                     self.refusal(path, refusal);
+                    return Ok(());
+                }
+            };
+            let value = match serde_json::to_value(&value) {
+                Ok(value) => value,
+                Err(e) => {
+                    self.refusal(path, Refusal::invalid("type", e));
                     return Ok(());
                 }
             };

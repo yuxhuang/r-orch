@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 /// The source is bounded by one index's JSON budget. Entity files are checked one at
 /// a time; their contents are not accumulated across a directory.
 pub(super) struct IndexPlan {
-    entries: BTreeMap<String, (u64, Value)>,
+    entries: BTreeMap<String, (u64, Box<RawValue>)>,
     order: BTreeMap<u64, String>,
     next: u64,
     usable: bool,
@@ -14,7 +14,7 @@ pub(super) struct IndexPlan {
 }
 
 enum IndexRead {
-    Value(Value),
+    Value(Vec<Box<RawValue>>),
     Unreadable,
     Stopped,
 }
@@ -51,7 +51,7 @@ impl Check<'_> {
         } else {
             None
         };
-        let Some(Value::Array(entries)) = value else {
+        let Some(entries) = value else {
             self.note(
                 &path,
                 "index_unreadable",
@@ -61,20 +61,29 @@ impl Check<'_> {
             return Ok(plan);
         };
         let key = if store == Store::Context { "key" } else { "id" };
-        // Whole-array precedence is part of R122: no earlier duplicate can hide
-        // a malformed identity later in the array.
-        if entries
+        // Extract identities without judging other fields. RawValue preserves
+        // valid ignored numbers that a generic Value cannot represent.
+        let identities: Vec<_> = entries
             .iter()
-            .any(|e| e.get(key).and_then(Value::as_str).is_none())
-        {
+            .map(|entry| {
+                serde_json::from_str::<BTreeMap<String, &RawValue>>(entry.get())
+                    .ok()
+                    .and_then(|map| {
+                        map.get(key)
+                            .and_then(|id| serde_json::from_str::<String>(id.get()).ok())
+                    })
+            })
+            .collect();
+        // Whole-array precedence is part of R122, independent of entry order.
+        if identities.iter().any(Option::is_none) {
             self.refuse(&path, "index_entry", None, None, "index entry has no string identity; 1.0 rebuilt such an index; after taking a copy, remove the index to accept id order");
             plan.stopped = true;
             return Ok(plan);
         }
         let mut seen = BTreeSet::new();
-        for entry in &entries {
+        for id in &identities {
             self.cancelled()?;
-            let id = entry[key].as_str().expect("checked whole array");
+            let id = id.as_ref().expect("checked whole array");
             if !seen.insert(id) {
                 self.refuse(&path, "index_duplicate", None, Some(bounded(id)), "repeated identity; 1.0 used such an index only if every entry was a complete entity of this directory's type, and otherwise rebuilt it; after taking a copy, remove the extra entry or remove the index to accept id order");
                 plan.stopped = true;
@@ -83,9 +92,11 @@ impl Check<'_> {
         }
         plan.usable = true;
         plan.next = entries.len() as u64 + 1;
-        for (position, entry) in entries.into_iter().enumerate() {
-            let id = entry[key].as_str().expect("checked whole array").to_owned();
-            plan.entries.insert(id, (position as u64 + 1, entry));
+        for (position, (id, entry)) in identities.into_iter().zip(entries).enumerate() {
+            plan.entries.insert(
+                id.expect("checked whole array"),
+                (position as u64 + 1, entry),
+            );
         }
         Ok(plan)
     }
@@ -94,10 +105,15 @@ impl Check<'_> {
         let Some(bytes) = self.read(reader, Limits::JSON.bytes, path)? else {
             return Ok(IndexRead::Stopped);
         };
-        match decode_json::<Value>(&bytes, Limits::JSON) {
-            Ok(value) => {
+        match check_json(&bytes, Limits::JSON) {
+            Ok(()) => {
                 self.counts().indexes += 1;
-                Ok(IndexRead::Value(value))
+                if bytes.iter().copied().find(|b| !b.is_ascii_whitespace()) != Some(b'[') {
+                    return Ok(IndexRead::Unreadable);
+                }
+                let entries = serde_json::from_slice::<Vec<Box<RawValue>>>(&bytes)
+                    .expect("JSON budget pass checked an array's syntax");
+                Ok(IndexRead::Value(entries))
             }
             Err(r) if r.rule == "parse" => {
                 self.counts().indexes += 1;
@@ -113,8 +129,9 @@ impl Check<'_> {
     pub(super) fn index_invalid_file(&mut self, plan: &mut IndexPlan, stem: &[u8]) {
         // The file has already produced its refusal. It exists, so do not also
         // tell the owner that its index names a file that is missing.
-        plan.entries
-            .remove(std::str::from_utf8(stem).expect("validated ASCII stem"));
+        if let Ok(stem) = std::str::from_utf8(stem) {
+            plan.entries.remove(stem);
+        }
     }
 
     pub(super) fn index_file(
@@ -122,7 +139,7 @@ impl Check<'_> {
         store: &'static str,
         plan: &mut IndexPlan,
         stem: &[u8],
-        value: &Value,
+        value: &DocumentContent,
     ) {
         if plan.stopped {
             return;
@@ -131,7 +148,7 @@ impl Check<'_> {
         let path = format!("{store}/_index.json");
         let position = match plan.entries.remove(id) {
             Some((position, entry)) => {
-                if &entry != value {
+                if !value.matches(&entry) {
                     self.note(
                         &path,
                         "index_differs",

@@ -55,13 +55,15 @@ configuration type; a mapping that does not refuses as `unreadable`.
 **`run_cap`.** The report's `run_cap` is the merged `scheduling.max_concurrent_agents`,
 6 unless the file sets it. When the file does not set the key, including a missing or `{}`
 config, a note `config_default` (observed `6`) says that 6 is 1.0's default and not a
-value the source set. It is a note and stops nothing. `run_cap` is absent from the report
-if the config check did not finish.
+value the source set. It is a note and stops nothing. `run_cap` is `null` in the report's
+JSON if the config check did not finish; the member is not omitted.
 
 **Unknown keys.** A key that is not in the frozen defaults is unknown, at any depth: an unknown key inside
 a known section is unknown too, and `prompt` has the known children `template`,
 `system_template` and `user_template`. Each unknown path is listed as a note
-`unknown_config` with a dotted path, each component cut to 256 characters and escaped.
+`unknown_config` with a dotted path. Each component is first limited to 256 characters,
+the joined path is then cut to 256 characters overall, and only then is it escaped, so a
+long path does not keep 256 characters of every component.
 Values are never reported. `legacy_config_bytes` in the report is the size of the compact
 JSON of the unknown keys. Above 65,536 bytes the check refuses under `legacy_config_bytes`
 (limit 65,536), which is the `legacy.config` bound of R70.
@@ -86,7 +88,7 @@ An entity file's content is taken from its file, never from its index.
 | `[]` | A usable index that lists nothing: not `index_unreadable`; each file is noted `index_unlisted` and ordered by id |
 | An array with any entry that is not an object or has no string identity (`id`, and `key` under `context/`) | Refuses `index_entry`, saying that 1.0 rebuilt such an index |
 | An array of string identities with one identity more than once, whether the entries are bare identities or whole entities, and whether or not a file exists | Refuses `index_duplicate`, naming the identity (escaped, cut), saying that 1.0 used such an index as it stood only if every entry was a complete entity of the directory's type and otherwise rebuilt it |
-| An entry whose file is missing or was not accepted | Note `index_missing_file`; its identity is never opened as a path |
+| An entry whose file is missing | Note `index_missing_file`; its identity is never opened as a path. A file that is present but refused (for example a `null` document) gets its own refusal and is not also reported as missing (`an_unreadable_entity_is_not_reported_as_a_missing_file`) |
 | A file the index does not list | Note `index_unlisted`; ordered after the listed entities, in id order |
 | An entry that differs from its file | Note `index_differs` |
 | Over 16,777,216 bytes, nested more than 64 deep, over 1,000,000 nodes; a symbolic link, a FIFO or a file with two hard links; an input or output error | Terminal stop (`bytes`, `depth`, `nodes`, `file_kind`, `io`); never `index_unreadable` |
@@ -115,20 +117,29 @@ synthetic sources in disposable directories:
 | C-V2 to C-V6, C-V9, C-V12 and the C-V13 wording | `config_empty_null_and_non_mapping_diagnostics_match_the_contract` |
 | C-V1, C-V7, C-V8, C-V14 | `omitted_config_run_cap_uses_frozen_legacy_default_and_a_note` |
 | C-V10, X-V12, X-V14 | `budgets_and_file_kind_stops_never_become_index_unreadable` |
-| C-V11 | `empty_entity_streams_keep_their_document_refusal_without_config_wording` |
+| C-V11 | `an_entity_file_with_no_document_is_refused_as_1_0_refuses_it`, which also runs 1.0's `FileTaskStore`, `FileAgentStore`, `FileGoalStore` and `FileTeamStore` `get` on a separately created zero-byte file for each and requires each to error, as the preflight does |
 | X-V4, X-V6 | `whole_array_bad_entry_precedes_duplicates_in_all_five_directories` |
-| X-V5, X-V7 | `both_duplicate_shapes_and_missing_files_stop_in_all_five_directories`, which also runs 1.0's `IndexManager::read_index` on an independent copy of each case: it keeps a complete-entity duplicate and rebuilds an array of identities |
+| X-V5, X-V7 | `both_duplicate_shapes_and_missing_files_stop_in_all_five_directories`, which also runs 1.0's `IndexManager::read_index` on a second, disposable source for each case in each of the five directories: it keeps a complete-entity duplicate and rebuilds an array of identities |
 | X-V1 to X-V3, X-V8 to X-V11 | `index_order_and_named_problems_use_files_and_never_open_index_identities` |
 | Unknown keys, the 64 KiB bound | `unknown_config_is_inert_bounded_and_values_are_not_reported` |
 | Preapproval | `auto_agents_require_owner_confirmation_without_granting_policy` |
 | Escaping and cutting | `hostile_duplicate_identity_is_escaped_and_cut_without_changing_class` |
 | Entity documents decode as before | `typed_json_documents_still_refuse_duplicate_identity_members`, `typed_yaml_entities_keep_ignored_yaml_only_fields` |
 | Report caps | `order_and_notes_are_capped_without_changing_counts` |
+| A present file that is refused is not also a missing file | `an_unreadable_entity_is_not_reported_as_a_missing_file` |
 
-X-V13 (an injected read error and an interrupted read at the preflight) and the run of
-1.0's own readers beside the import for C-V11 stay with the reader-level tests below and
-the integrated acceptance. C-V6's bare `---` is now pinned by the test of C-V2 to C-V6:
-the preflight's pass counts it as one null document.
+X-V13 is a unit test of the module, where a reader can be injected:
+`an_index_read_error_stops_and_an_interrupted_read_is_retried`, in
+`crates/orch-infra/src/import/preflight/compatibility.rs`. It calls `Check::index_read`,
+the method `index_plan` reads every index through, with a reader that fails in the middle
+of the stream. A `PermissionDenied` stops with an `io` refusal on the index's path and is
+never noted as `index_unreadable`; one `Interrupted` is retried and gives the result of
+an undisturbed read.
+
+C-V6's bare `---` is pinned by the test of C-V2 to C-V6: the preflight's pass counts it
+as one null document. The tests also pin two points on the entity documents: a JSON
+message or context document that repeats a field the entity type knows is still refused as `unreadable`, and
+a YAML entity keeps an extra YAML-only key that the typed reader ignores.
 
 ## Compatibility conditions
 
@@ -138,10 +149,7 @@ These reader-level checks pre-date the wiring and still stand.
 |---|---|
 | I1 | The config table above pins the discrepancy; the contract on `main` disposes of it. The named-path report is the preflight's. Integrated dry-run output, including the `.orchestry/` prefix on a printed path, is the command's. |
 | N1 | `physical_blank_lines_form_gaps_while_legacy_skips_unicode_whitespace` compares real `FileRunStore` reads. Empty, ASCII, U+2003 and U+00A0 lines with CRLF join adjacent malformed lines into physical gap 2–4; valid events retain lines 1 and 5. The final newline creates no extra line. The legacy reader returns two events. R111 is unchanged. |
-| N2 | `index_damage_distinguishes_unreadable_streams_from_bad_array_entries` runs the bounded reader on missing, malformed JSON, object and null indexes, and on non-object entries, absent or non-string identities and duplicates, and real `IndexManager::read_index` rebuilds the first seven cases on disposable copies. That test decodes entries into a type of one field, so its "decoded duplicates survive" result does not hold for a real directory: an array of identities alone does not decode as the entity type, and 1.0 rebuilds it (spec F19). That reader-level `reconcile` stops at the first problem it meets and names a repeated
-identity `index_entry`, so its class depends on the order of the entries; the preflight does
-not call it and follows R122 and R123 instead (`index_entry` first, then `index_duplicate`),
-as the preflight tests above show. Existing corpus tests retain stale-file content and distinct legacy/import order checks. |
+| N2 | `index_damage_distinguishes_unreadable_streams_from_bad_array_entries` runs the bounded reader on missing, malformed JSON, object and null indexes, and on non-object entries, absent or non-string identities and duplicates, and real `IndexManager::read_index` rebuilds the first seven cases on disposable copies. That test decodes entries into a type of one field, so its "decoded duplicates survive" result does not hold for a real directory: an array of identities alone does not decode as the entity type, and 1.0 rebuilds it (spec F19). That reader-level `reconcile` stops at the first problem it meets and names a repeated identity `index_entry`, so its class depends on the order of the entries; the preflight does not call it and follows R122 and R123 instead (`index_entry` first, then `index_duplicate`), as the preflight tests above show. Existing corpus tests retain stale-file content and distinct legacy/import order checks. |
 | N3 | Named `JSON_DEPTH_CLAMP = 64`, pinned at 64/65 even when the requested limit is 100. No limit was raised. |
 | N4 | `interrupted_buffered_reads_retry_and_terminal_errors_end_the_stream` injects one Interrupted after a partial buffered line and verifies both events survive. A PermissionDenied at the same position yields an I/O refusal and terminates, rather than a gap. Document `read_to_end` retries Interrupted and propagates terminal failure too. |
 | N5 | Existing `depth_bombs_are_refused_on_a_small_stack` pins the YAML parser's depth classification. Its scanner's "recursion limit exceeded" wording is still a dependency; parser updates must preserve that test or deliberately review the classification. |
@@ -154,11 +162,11 @@ as the preflight tests above show. Existing corpus tests retain stale-file conte
   dry-run/import parity and zero writes on refusal are acceptance of issue 146, not of
   this check.
 - The lock held across the check and cancellation of a blocked read (issue 192).
-- The 1.0 readers run beside the preflight for the entity files of C-V11, and the
-  injected read errors (X-V13).
 - The reader-level `import::index::reconcile` and its test are an older, unwired
-  classifier that disagrees with the contract on a repeated identity. Until it is removed
-  or routed through the preflight's rules, two classifiers exist.
+  classifier, kept as historical evidence. It disagrees with the contract on a repeated
+  identity, and its signature takes every entity document of a directory at once. The
+  preflight reads one index and one entity document at a time and must not gather all
+  the payloads, so it does not call it. Until it is removed, two classifiers exist.
 
 Rollback is reverting the wiring. There is no database migration, backfill, source
 transformation or format cutover, and no new command.
