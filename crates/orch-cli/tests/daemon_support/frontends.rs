@@ -33,6 +33,8 @@ pub enum Cond {
 struct HarnessKeep {
     runtime: tokio::runtime::Runtime,
     daemon: Option<orch_daemon::testing::DaemonHarness>,
+    #[cfg(target_os = "linux")]
+    _watchdog: super::orphans::Watchdog,
 }
 
 enum Keep {
@@ -84,6 +86,8 @@ impl Scene {
                 let root = daemon.project_root().to_path_buf();
                 let socket = daemon.socket().unwrap().to_path_buf();
                 let test_root = socket.parent().unwrap().to_path_buf();
+                #[cfg(target_os = "linux")]
+                let watchdog = super::orphans::Watchdog::new(&root, &test_root);
                 Scene {
                     root,
                     socket,
@@ -92,6 +96,8 @@ impl Scene {
                     keep: Keep::Harness(Box::new(HarnessKeep {
                         runtime,
                         daemon: Some(daemon),
+                        #[cfg(target_os = "linux")]
+                        _watchdog: watchdog,
                     })),
                 }
             }
@@ -807,6 +813,7 @@ impl TuiPane {
     pub(crate) fn cmd(&self) -> Command {
         let mut cmd = tmux_command().expect("tmux was available when this private pane launched");
         cmd.env("TMUX_TMPDIR", &self.dir)
+            .env("ORCH_TEST_SOCKET_ROOT", &self.dir)
             .env("HOME", &self.home)
             .env("SHELL", "/bin/sh")
             .args(["-u", "-L", &self.name, "-f", "/dev/null"])

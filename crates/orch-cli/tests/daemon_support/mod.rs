@@ -14,6 +14,8 @@
 #![allow(dead_code, reason = "each daemon_lifecycle* test crate uses a subset")]
 
 pub mod frontends;
+#[cfg(target_os = "linux")]
+mod orphans;
 
 use serde_json::Value;
 use std::fs;
@@ -37,6 +39,8 @@ const EXIT_POLL: Duration = Duration::from_millis(50);
 pub struct Sandbox {
     project: tempfile::TempDir,
     short: tempfile::TempDir,
+    #[cfg(target_os = "linux")]
+    _watchdog: orphans::Watchdog,
 }
 
 impl Sandbox {
@@ -48,7 +52,14 @@ impl Sandbox {
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir_in("/tmp")
             .unwrap();
-        Sandbox { project, short }
+        #[cfg(target_os = "linux")]
+        let watchdog = orphans::Watchdog::new(project.path(), short.path());
+        Sandbox {
+            project,
+            short,
+            #[cfg(target_os = "linux")]
+            _watchdog: watchdog,
+        }
     }
 
     /// Keep the default in-project socket short regardless of the ambient TMPDIR.
