@@ -78,8 +78,9 @@ fn validate_continuation(
         return Err(StoreError::InvalidCursor);
     }
     let keys = sort_keys(sort).map_err(|_| StoreError::InvalidCursor)?;
-    // Every supported sort ends in a text ID; all preceding columns are
-    // STRICT-table integers. Check arity before inspecting or indexing values.
+    // Every supported sort ends in a text ID; preceding keys are integer
+    // columns or the computed integer status rank. Check arity before
+    // inspecting or indexing values.
     if values.len() != keys.len()
         || !matches!(values.last(), Some(Value::Text(_)))
         || !values[..values.len() - 1]
