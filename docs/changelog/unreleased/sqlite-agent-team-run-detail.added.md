@@ -1,1 +1,1 @@
-Add an inactive SQLite byte codec that encodes and decodes complete agent, team and run details, with every large text behind blob objects; it has no table, migration, SQL operation or storage method yet, and the daemon continues to use file storage.
+Add an inactive SQLite byte codec that encodes and decodes complete agent, team and run details, with every large text behind blob objects; no SQL operation or storage method uses it yet, and the daemon continues to use file storage.
