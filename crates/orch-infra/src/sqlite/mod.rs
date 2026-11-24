@@ -40,6 +40,8 @@ pub enum SqliteError {
     Store(#[from] orch_core::store::StoreError),
     #[error("stored run event is damaged: {0}")]
     EventCorrupt(String),
+    #[error("stored intent is damaged: {0}")]
+    IntentCorrupt(&'static str),
     #[error("stored lease data is damaged: {0}")]
     LeaseCorrupt(String),
     #[error("SQLite writer is closed")]
@@ -128,3 +130,9 @@ mod attention;
     reason = "internal request-key persistence awaits the combined T10 Storage adapter"
 )]
 mod request_keys;
+
+#[allow(
+    dead_code,
+    reason = "internal typed intents await the combined T10 Storage adapter"
+)]
+mod intents;
