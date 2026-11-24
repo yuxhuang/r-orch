@@ -23,8 +23,8 @@
 //!    and the socket directory are identical afterwards (a direct-store
 //!    fallback or an auto-start would show here).
 //!
-//! The cells run one at a time (a process-wide lock) so a before/after
-//! process-table comparison is not confused by a sibling case's clients.
+//! The lock serializes cells within this test process only. Process observations
+//! also use scene identity so independent test binaries can run concurrently.
 
 mod daemon_support;
 
@@ -53,7 +53,7 @@ fn check_cli(cond: Cond, args: &[&str], env: &[(&str, &str)], agent: bool) {
     assert_eq!(run.code, Some(7), "{who}: {}", run.stderr);
     assert!(run.stdout.is_empty(), "{who} wrote stdout: {}", run.stdout);
     scene.assert_uniform(&who, &run.stderr, agent);
-    watch.assert_only_clients(&who, &[]);
+    watch.assert_only_scene_clients(&who, &scene, &[]);
     assert!(
         process_group_empty(run.pid),
         "{who} left a process in its group"
@@ -77,7 +77,7 @@ fn check_web(cond: Cond) {
         "web announced a URL before the preflight: {}",
         run.stdout
     );
-    watch.assert_only_clients("web", &[]);
+    watch.assert_only_scene_clients("web", &scene, &[]);
     assert!(process_group_empty(run.pid));
     watch.assert_nothing_left("web", &scene);
     scene.assert_untouched("web", &before);
@@ -105,7 +105,7 @@ fn check_mcp_initialize(cond: Cond, env: &[(&str, &str)], agent: bool) {
         "the bridge died instead of surfacing the error: {}",
         mcp.stderr()
     );
-    watch.assert_only_clients("mcp initialize", &[pid]);
+    watch.assert_only_scene_clients("mcp initialize", &scene, &[pid]);
     assert_eq!(mcp.finish(), Some(0), "stderr: {}", mcp.stderr());
     assert!(process_group_empty(pid));
     watch.assert_nothing_left("mcp initialize", &scene);
@@ -137,7 +137,7 @@ fn check_mcp_tool_call(cond: Cond, env: &[(&str, &str)], agent: bool) {
     let response = mcp.call_tool("task_add", json!({"title": "must not exist"}));
     let failure = mcp_failure("mcp write tool", &response);
     scene.assert_uniform("mcp write tool", &failure, agent);
-    watch.assert_only_clients("mcp tool call", &[pid]);
+    watch.assert_only_scene_clients("mcp tool call", &scene, &[pid]);
     assert_eq!(mcp.finish(), Some(0), "stderr: {}", mcp.stderr());
     assert!(process_group_empty(pid));
     watch.assert_nothing_left("mcp tool call", &scene);
@@ -158,7 +158,7 @@ fn check_tui(cond: Cond) {
     // While it shows the message the only orch process is the TUI itself.
     let clients = pane.client_pids();
     assert_eq!(clients.len(), 1, "expected exactly the TUI: {clients:?}");
-    watch.assert_only_clients("tui", &clients);
+    watch.assert_only_scene_clients("tui", &scene, &clients);
     assert!(
         !pane.has_exited(),
         "the TUI exited instead of offering retry"
@@ -172,7 +172,7 @@ fn check_tui(cond: Cond) {
     });
     scene.assert_uniform("tui after retry", &screen, false);
     assert!(!pane.has_exited(), "retry made the TUI exit");
-    watch.assert_only_clients("tui after retry", &clients);
+    watch.assert_only_scene_clients("tui after retry", &scene, &clients);
 
     // `q` quits with the dedicated exit code.
     pane.keys(&["q"]);
@@ -289,10 +289,15 @@ fn cli_checklist_rejects_a_client_that_answers_without_a_daemon() {
 fn tui_retry_reaches_the_daemon_after_the_owner_starts_it() {
     let _serial = serial();
     let scene = Scene::new(Cond::NoSocket);
+    let watch = Watch::begin();
     let pane = TuiPane::launch(&scene, "tui", &[]);
     pane.wait_screen("the no-daemon screen", |s| {
         s.contains("No orch daemon is running for")
     });
+
+    let clients = pane.client_pids();
+    assert_eq!(clients.len(), 1);
+    watch.assert_only_scene_clients("before owner start", &scene, &clients);
 
     // The owner starts the daemon (an explicit act, by the test).
     let daemon = start_ready(scene.sandbox(), &[], "owner");
@@ -304,11 +309,16 @@ fn tui_retry_reaches_the_daemon_after_the_owner_starts_it() {
     assert!(!pane.has_exited(), "screen:\n{screen}");
     // Only the owner's daemon and the TUI exist: the TUI started nothing.
     let exe = env!("CARGO_BIN_EXE_orch");
-    let daemons: Vec<_> = process_table()
+    let daemons: Vec<_> = watch
+        .new_orch_in_scene(&scene, &pane.client_pids())
         .into_iter()
         .filter(|p| p.command.starts_with(&format!("{exe} daemon start")))
         .filter(|p| p.command.contains("daemon start") && is_alive(p.pid))
         .collect();
+    assert!(
+        daemons.iter().any(|p| p.pid == daemon.pid),
+        "the owner's daemon was not observed: {daemons:?}"
+    );
     assert!(
         daemons.iter().all(|p| p.pid == daemon.pid),
         "a daemon other than the owner's exists: {daemons:?}"
@@ -327,12 +337,14 @@ fn tui_retry_discards_queued_view_and_move_keys() {
     let (agent, _) = scene
         .sandbox()
         .seed_agent_task("drain-stub", "exit 0", "Drain older");
+    let watch = Watch::begin();
     let pane = TuiPane::launch(&scene, "tui", &[]);
     pane.wait_screen("the no-daemon screen", |s| {
         s.contains("No orch daemon is running for")
     });
     let clients = pane.client_pids();
     assert_eq!(clients.len(), 1);
+    watch.assert_only_scene_clients("queued keys", &scene, &clients);
     let client = clients[0];
     let _daemon = start_ready(scene.sandbox(), &[], "owner");
     let added = scene
@@ -448,7 +460,11 @@ fn web_answers_503_when_the_daemon_dies_while_serving_and_starts_nothing() {
         "the 503 leaked the socket path: {body}"
     );
     // The page's server did not restart anything.
-    assert!(watch.new_orch().is_empty(), "{:?}", watch.new_orch());
+    assert!(
+        watch.new_orch_in_scene(&scene, &[]).is_empty(),
+        "{:?}",
+        watch.new_orch_in_scene(&scene, &[])
+    );
     assert_eq!(scene.sandbox().daemon_json().unwrap()["pid"], daemon.pid);
     assert!(!is_alive(daemon.pid));
 }
@@ -461,10 +477,147 @@ fn process_watch_flags_a_daemon_started_during_the_window() {
     let scene = Scene::new(Cond::NoSocket);
     let watch = Watch::begin();
     let daemon = start_ready(scene.sandbox(), &[], "control");
-    let new = watch.new_orch();
+    let new = watch.new_orch_in_scene(&scene, &[]);
     assert!(new.iter().any(|p| p.pid == daemon.pid), "{new:?}");
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        watch.assert_only_clients("control", &[]);
+        watch.assert_only_scene_clients("control", &scene, &[]);
     }));
     assert!(caught.is_err(), "the watch missed a running daemon");
+}
+
+/// Synthetic process with orch argv, no product behavior. A release file gives
+/// even the reparented fixture bounded, signal-free teardown.
+struct SyntheticOrch {
+    pid: u32,
+    dir: tempfile::TempDir,
+}
+
+impl SyntheticOrch {
+    fn start(scene: Option<&Scene>, detached: bool) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let release = dir.path().join("release");
+        let mut cmd = std::process::Command::new("/usr/bin/python3");
+        cmd.env_clear().current_dir("/");
+        if let Some(scene) = scene {
+            cmd.env("ORCH_SOCKET", &scene.socket)
+                .env("ORCH_PROJECT_ROOT", &scene.root);
+        }
+        cmd.args([
+            "-c",
+            r#"import os,sys
+if sys.argv[4] == 'detach':
+    if os.fork(): sys.exit(0)
+    os.setsid()
+    if os.fork(): os._exit(0)
+code = '''import os,sys,time
+from pathlib import Path
+Path(sys.argv[1]).write_text(str(os.getpid()))
+deadline=time.monotonic()+30
+while not Path(sys.argv[2]).exists() and time.monotonic()<deadline:
+    time.sleep(0.05)
+'''
+os.execve('/usr/bin/python3', [sys.argv[1], '-c', code, sys.argv[2], sys.argv[3]], dict(os.environ))
+"#,
+            &format!("{} daemon start", env!("CARGO_BIN_EXE_orch")),
+            pid_file.to_str().unwrap(),
+            release.to_str().unwrap(),
+            if detached { "detach" } else { "attached" },
+        ]);
+        // Attached fixtures are also released by file. Keep the child handle
+        // until it exits rather than ever signalling a process-table match.
+        let child = cmd.spawn().unwrap();
+        let pid = wait_for(READY, "the synthetic process to exec", || {
+            let pid: u32 = std::fs::read_to_string(&pid_file).ok()?.parse().ok()?;
+            orch_processes(&process_table())
+                .iter()
+                .any(|p| p.pid == pid)
+                .then_some(pid)
+        });
+        std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
+        Self { pid, dir }
+    }
+}
+
+impl Drop for SyntheticOrch {
+    fn drop(&mut self) {
+        std::fs::write(self.dir.path().join("release"), "exit").unwrap();
+        wait_for(READY, "the synthetic process to exit", || {
+            (!orch_processes(&process_table())
+                .iter()
+                .any(|p| p.pid == self.pid))
+            .then_some(())
+        });
+    }
+}
+
+#[test]
+fn process_watch_ignores_foreign_same_path_before_and_during_the_cell() {
+    let _serial = serial();
+    let before = SyntheticOrch::start(None, false);
+    let scene = Scene::new(Cond::NoSocket);
+    let watch = Watch::begin();
+    let pane = TuiPane::launch(&scene, "tui", &[]);
+    pane.wait_screen("the no-daemon screen", |s| {
+        s.contains("No orch daemon is running for")
+    });
+    let during = SyntheticOrch::start(None, false);
+    let clients = pane.client_pids();
+    assert_eq!(
+        clients.len(),
+        1,
+        "expected exactly this pane's client: {clients:?}"
+    );
+    assert!(!clients.contains(&before.pid) && !clients.contains(&during.pid));
+    // Verify that the negative fixture really entered the raw observation window.
+    assert!(watch.new_orch().iter().any(|p| p.pid == during.pid));
+    assert!(!watch.new_orch().iter().any(|p| p.pid == before.pid));
+    watch.assert_only_scene_clients("foreign control", &scene, &clients);
+    pane.keys(&["q"]);
+    assert_eq!(pane.exit_code(), 7);
+    watch.assert_nothing_left("foreign control", &scene);
+}
+
+#[test]
+fn process_watch_flags_a_scene_daemon_after_loss_of_ancestry() {
+    let _serial = serial();
+    let scene = Scene::new(Cond::NoSocket);
+    let watch = Watch::begin();
+    let daemon = SyntheticOrch::start(Some(&scene), true);
+    wait_for(
+        READY,
+        "the synthetic daemon to lose its launcher ancestry",
+        || {
+            let table = process_table();
+            let process = table.iter().find(|p| p.pid == daemon.pid)?;
+            // Linux hosts with a subreaper need not reparent to pid 1. In either
+            // case no ancestor can be our test process after both forks exit.
+            let mut parent = process.ppid;
+            for _ in 0..table.len() {
+                if parent == std::process::id() {
+                    return None;
+                }
+                let Some(p) = table.iter().find(|p| p.pid == parent) else {
+                    break;
+                };
+                if parent == p.ppid {
+                    break;
+                }
+                parent = p.ppid;
+            }
+            Some(())
+        },
+    );
+    let observed = watch.new_orch_in_scene(&scene, &[]);
+    assert!(observed.iter().any(|p| p.pid == daemon.pid), "{observed:?}");
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        watch.assert_only_scene_clients("reparented daemon control", &scene, &[]);
+    }));
+    assert!(
+        caught.is_err(),
+        "the watch missed a reparented scene daemon"
+    );
 }

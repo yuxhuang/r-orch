@@ -15,6 +15,22 @@
       }
     },
     {
+      "type": "output",
+      "data": {
+        "text": "",
+        "type": "step_finish",
+        "part": {
+          "type": "step-finish",
+          "reason": "tool-calls",
+          "tokens": {
+            "total": 500,
+            "input": 400,
+            "output": 100
+          }
+        }
+      }
+    },
+    {
       "type": "done",
       "data": {
         "type": "step-finish",

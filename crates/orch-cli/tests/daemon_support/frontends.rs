@@ -33,6 +33,8 @@ pub enum Cond {
 struct HarnessKeep {
     runtime: tokio::runtime::Runtime,
     daemon: Option<orch_daemon::testing::DaemonHarness>,
+    #[cfg(target_os = "linux")]
+    _watchdog: super::orphans::Watchdog,
 }
 
 enum Keep {
@@ -84,6 +86,8 @@ impl Scene {
                 let root = daemon.project_root().to_path_buf();
                 let socket = daemon.socket().unwrap().to_path_buf();
                 let test_root = socket.parent().unwrap().to_path_buf();
+                #[cfg(target_os = "linux")]
+                let watchdog = super::orphans::Watchdog::new(&root, &test_root);
                 Scene {
                     root,
                     socket,
@@ -92,6 +96,8 @@ impl Scene {
                     keep: Keep::Harness(Box::new(HarnessKeep {
                         runtime,
                         daemon: Some(daemon),
+                        #[cfg(target_os = "linux")]
+                        _watchdog: watchdog,
                     })),
                 }
             }
@@ -252,11 +258,67 @@ pub fn endpoint_identity(socket: &Path) -> Option<(u64, u32, u64, i64)> {
 /// for the caller's own processes); `None` once it has exited.
 fn process_env_line(pid: u32) -> Option<String> {
     let flag = if cfg!(target_os = "macos") { "-E" } else { "e" };
-    let out = std::process::Command::new("/bin/ps")
-        .args([flag, "-ww", "-o", "command=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new("/bin/ps");
+    cmd.args([flag, "-ww", "-o", "command=", "-p", &pid.to_string()])
+        .process_group(0);
+    let out = output_with_deadline(cmd, CALL);
     out.status.success().then(|| text(&out.stdout))
+}
+
+/// Ancestry is resolved from one snapshot, with a bound even for a malformed cycle.
+fn descends_from(process: &Proc, ancestors: &[u32], table: &[Proc]) -> bool {
+    let mut parent = process.ppid;
+    for _ in 0..table.len() {
+        if ancestors.contains(&parent) {
+            return true;
+        }
+        let Some(found) = table.iter().find(|p| p.pid == parent) else {
+            break;
+        };
+        parent = found.ppid;
+    }
+    false
+}
+
+fn scene_process(process: &Proc, scene: &Scene, clients: &[u32], table: &[Proc]) -> bool {
+    if clients.contains(&process.pid)
+        || descends_from(process, clients, table)
+        || process
+            .command
+            .contains(scene.root.to_string_lossy().as_ref())
+        || process
+            .command
+            .contains(scene.test_root.to_string_lossy().as_ref())
+    {
+        return true;
+    }
+    // Markers survive reparenting, including a daemon's double fork.
+    let markers = [
+        format!("ORCH_SOCKET={}", scene.socket.display()),
+        format!("ORCH_PROJECT_ROOT={}", scene.root.display()),
+    ];
+    if process_env_line(process.pid).is_some_and(|env| {
+        env.split_whitespace()
+            .any(|word| markers.iter().any(|m| word == m))
+    }) {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_link(format!("/proc/{}/cwd", process.pid))
+            .is_ok_and(|cwd| cwd.starts_with(&scene.root))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut cmd = Command::new("/usr/sbin/lsof");
+        cmd.args(["-a", "-p", &process.pid.to_string(), "-d", "cwd", "-Fn"])
+            .process_group(0);
+        let out = output_with_deadline(cmd, CALL);
+        text(&out.stdout)
+            .lines()
+            .filter_map(|s| s.strip_prefix('n'))
+            .any(|cwd| Path::new(cwd).starts_with(&scene.root))
+    }
 }
 
 /// A process-table baseline taken before a client runs.
@@ -290,6 +352,28 @@ impl Watch {
             .collect()
     }
 
+    /// New processes of this scene, including reparented marked daemons.
+    pub fn new_orch_in_scene(&self, scene: &Scene, clients: &[u32]) -> Vec<Proc> {
+        let table = process_table();
+        orch_processes(&table)
+            .into_iter()
+            .filter(|p| !self.known.contains(&p.pid))
+            .filter(|p| scene_process(p, scene, clients, &table))
+            .collect()
+    }
+
+    pub fn assert_only_scene_clients(&self, who: &str, scene: &Scene, clients: &[u32]) {
+        let offenders: Vec<_> = self
+            .new_orch_in_scene(scene, clients)
+            .into_iter()
+            .filter(|p| !clients.contains(&p.pid))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "{who} spawned an orch process: {offenders:?}"
+        );
+    }
+
     /// While a client is alive, the only new `orch` process is the client
     /// itself: `<exe> <subcommand>` with the given pid(s).
     pub fn assert_only_clients(&self, who: &str, clients: &[u32]) {
@@ -318,8 +402,8 @@ impl Watch {
             .iter()
             .filter(|p| !self.known.contains(&p.pid))
             .filter(|p| {
-                p.command == exe
-                    || p.command.starts_with(&format!("{exe} "))
+                ((p.command == exe || p.command.starts_with(&format!("{exe} ")))
+                    && scene_process(p, scene, &[], &table))
                     || (markers.iter().any(|m| p.command.contains(m.as_str()))
                         && !p.command.starts_with("tmux")
                         && !p.command.contains("/tmux ")
@@ -729,6 +813,7 @@ impl TuiPane {
     pub(crate) fn cmd(&self) -> Command {
         let mut cmd = tmux_command().expect("tmux was available when this private pane launched");
         cmd.env("TMUX_TMPDIR", &self.dir)
+            .env("ORCH_TEST_SOCKET_ROOT", &self.dir)
             .env("HOME", &self.home)
             .env("SHELL", "/bin/sh")
             .args(["-u", "-L", &self.name, "-f", "/dev/null"])
@@ -780,9 +865,16 @@ impl TuiPane {
     /// The pid of the client in the pane (the child of the wrapper shell).
     pub fn client_pids(&self) -> Vec<u32> {
         let exe = env!("CARGO_BIN_EXE_orch");
-        orch_processes(&process_table())
+        let table = process_table();
+        let owned = self
+            .owned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pane = owned.as_ref().and_then(|ids| ids.get(1)).copied();
+        orch_processes(&table)
             .into_iter()
             .filter(|p| p.command.starts_with(exe))
+            .filter(|p| pane.is_some_and(|pid| descends_from(p, &[pid], &table)))
             .map(|p| p.pid)
             .collect()
     }

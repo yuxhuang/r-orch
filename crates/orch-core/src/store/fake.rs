@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
-use orch_domain::{GoalStatus, TaskStatus};
+use orch_domain::{GoalStatus, MessageStatus, TaskStatus};
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::attention::*;
@@ -57,6 +57,7 @@ pub struct FakeStorage {
     bookmarks: Arc<Mutex<Bookmarks>>,
     /// Daemon-wide, so it lives beside the projects. Lock `projects` first.
     lineage: Mutex<String>,
+    retry_state: retries::fake::RetryState,
 }
 
 impl Default for FakeStorage {
@@ -65,6 +66,7 @@ impl Default for FakeStorage {
             projects: AsyncMutex::default(),
             bookmarks: Arc::default(),
             lineage: Mutex::new("fake-lineage-1".into()),
+            retry_state: retries::fake::RetryState::default(),
         }
     }
 }
@@ -85,7 +87,10 @@ impl Storage for FakeStorage {
             .await
             .get(&caller.project)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|| Project {
+                retries: self.retry_state.clone(),
+                ..Project::default()
+            });
         let lineage = self.lineage();
         Ok(Box::new(View {
             caller,
@@ -97,7 +102,13 @@ impl Storage for FakeStorage {
 
     async fn write(&self, caller: Caller, _lane: Lane, work: WriteWork) -> Result<()> {
         let mut projects = self.projects.lock().await;
-        let project = projects.get(&caller.project).cloned().unwrap_or_default();
+        let project = projects
+            .get(&caller.project)
+            .cloned()
+            .unwrap_or_else(|| Project {
+                retries: self.retry_state.clone(),
+                ..Project::default()
+            });
         let mut view = View {
             caller,
             lineage: self.lineage(),
@@ -111,6 +122,18 @@ impl Storage for FakeStorage {
 }
 
 impl FakeStorage {
+    /// Use a blob port for retry backing and publication/damage fault proofs.
+    pub fn with_retry_blob_store<B: blob::BlobStore + 'static>(
+        blobs: B,
+        hash: fn(&[u8]) -> B::Hash,
+        chunk_bytes: usize,
+    ) -> Self {
+        Self {
+            retry_state: retries::fake::RetryState::with_blob_store(blobs, hash, chunk_bytes),
+            ..Self::default()
+        }
+    }
+
     fn lineage(&self) -> String {
         self.lineage
             .lock()
@@ -171,7 +194,7 @@ impl View {
 
     fn page(&self, filter: &Filter, request: &PageRequest) -> Result<Page<Record>> {
         request.validate()?;
-        validate_sort(filter.kind(), request.sort)?;
+        validate_sort(filter, request.sort)?;
         let after = if let Some(cursor) = &request.cursor {
             let bookmarks = self
                 .bookmarks
@@ -338,11 +361,26 @@ fn matches_filter(entity: &Entity, filter: &Filter) -> bool {
         (Entity::Message(v), Filter::Messages { recipient }) => recipient
             .as_ref()
             .is_none_or(|r| v.to_agent_id.as_ref() == Some(r)),
+        (Entity::Message(v), Filter::PendingMessages { recipient, now }) => {
+            v.status == MessageStatus::Pending
+                && v.to_agent_id.as_ref() == Some(recipient)
+                && v.expires_at.as_ref().is_none_or(|expiry| expiry >= now)
+        }
         _ => false,
     }
 }
 
-fn validate_sort(kind: EntityKind, sort: Sort) -> Result<()> {
+fn validate_sort(filter: &Filter, sort: Sort) -> Result<()> {
+    let kind = filter.kind();
+    if sort == Sort::Attempt {
+        return if matches!(filter, Filter::Runs { task: Some(_), .. }) {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidPage(
+                "Attempt requires a task-scoped Runs filter".into(),
+            ))
+        };
+    }
     let valid = matches!(sort, Sort::Default | Sort::Id)
         || match kind {
             EntityKind::Task => matches!(
@@ -409,6 +447,7 @@ fn sort_key(row: &Record, sort: Sort, filter: &Filter) -> Key {
         ],
         (_, Entity::Agent(_)) => vec![Position(row.position)],
         (_, Entity::Team(v)) => vec![Text(v.created_at.clone())],
+        (Sort::Attempt, Entity::Run(v)) => vec![Number(-i64::from(v.attempt))],
         (_, Entity::Run(v)) if matches!(filter, Filter::Runs { task: Some(_), .. }) => {
             vec![Number(-i64::from(v.attempt))]
         }
@@ -596,18 +635,37 @@ impl request_keys::RequestKeyWrite for View {
 #[async_trait]
 impl retries::RetryRead for View {
     async fn read_retry(&self, task: &str) -> Result<Option<retries::Retry>> {
-        Ok(self.project.retries.get(task))
+        let rows = self.project.retries.clone();
+        let task = task.to_owned();
+        retry_read(move || rows.get(&task)).await
     }
     async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<retries::Retry>> {
-        self.project.retries.due(now_ms, limit)
+        let rows = self.project.retries.clone();
+        retry_read(move || rows.due(now_ms, limit)).await
     }
     async fn read_retries(
         &self,
         after: Option<&retries::RetryCursor>,
         limit: usize,
     ) -> Result<retries::RetryPage> {
-        self.project.retries.page(after, limit)
+        let rows = self.project.retries.clone();
+        let after = after.cloned();
+        retry_read(move || rows.page(after.as_ref(), limit)).await
     }
+}
+
+// A disk-backed fake resolves retry blobs synchronously; keep that work off
+// the executor while retaining the snapshot's cloned state.
+async fn retry_read<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    tokio::task::spawn_blocking(work).await.map_err(|error| {
+        StoreError::Backend(crate::Error::Io {
+            context: "cannot join memory reference retry read".into(),
+            path: None,
+            source: std::io::Error::other(error),
+        })
+    })?
 }
 
 impl retries::RetryWrite for View {
@@ -618,7 +676,7 @@ impl retries::RetryWrite for View {
         Ok(self.project.retries.delete(task))
     }
     fn get_retry(&self, task: &str) -> Result<Option<retries::Retry>> {
-        Ok(self.project.retries.get(task))
+        self.project.retries.get(task)
     }
     fn due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<retries::Retry>> {
         self.project.retries.due(now_ms, limit)

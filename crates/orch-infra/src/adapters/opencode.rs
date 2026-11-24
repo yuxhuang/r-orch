@@ -293,9 +293,25 @@ fn parse_event(line: &str, clock: &dyn Clock) -> Option<AgentEvent> {
                     event.tokens = tokens;
                     Some(event)
                 }
-                // Intermediate lifecycle — the tool_use events carry the
-                // actual content.
-                Some("tool-calls") => None,
+                Some("tool-calls") => {
+                    // Preserve nullable usage for the observer even when the
+                    // process dies before a terminal message. This is neither
+                    // completion nor a legacy token total. Keep lifecycle data
+                    // out of the assistant text/result fields.
+                    if !part.get("tokens").is_some_and(Value::is_object) {
+                        return None;
+                    }
+                    let mut data = Map::new();
+                    data.insert("text".to_owned(), Value::String(String::new()));
+                    data.insert("type".to_owned(), Value::String("step_finish".to_owned()));
+                    data.insert("part".to_owned(), part);
+                    copy_present(&mut data, "model", &parsed, "model");
+                    Some(AgentEvent::new(
+                        AgentEventKind::Output,
+                        timestamp,
+                        Value::Object(data),
+                    ))
+                }
                 // `stop`, `max_tokens`, anything else, or absent → done.
                 _ => {
                     let mut event = AgentEvent::new(AgentEventKind::Done, timestamp, part);

@@ -203,7 +203,31 @@ async fn ensure_git_commit(project_root: &Path) {
 }
 
 async fn git(cwd: &Path, args: &[&str]) -> bool {
-    tokio::process::Command::new("git")
+    let mut command = tokio::process::Command::new("git");
+    // Repository-local overrides belong to the caller's Git invocation, not
+    // the project being initialized. Keep normal config/identity discovery
+    // and let Git resolve existing repositories and linked worktrees from cwd.
+    for variable in [
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_GRAFT_FILE",
+        "GIT_INDEX_FILE",
+        "GIT_NO_REPLACE_OBJECTS",
+        "GIT_REPLACE_REF_BASE",
+        "GIT_PREFIX",
+        "GIT_SHALLOW_FILE",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+    ] {
+        command.env_remove(variable);
+    }
+    command
         .args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())

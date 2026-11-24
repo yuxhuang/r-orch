@@ -502,6 +502,12 @@ macro_rules! entity_suite {
             case!(duplicate_create_and_missing_mutations_are_unchanged);
             case!(declared_secondary_sorts_use_values_then_tie_breakers);
             case!(message_and_run_filters_stay_within_their_family);
+            case!(pending_messages_filter_status_recipient_and_lexical_expiry);
+            case!(pending_messages_page_matches_before_count_cursor_and_bound);
+            case!(run_attempt_order_is_numeric_task_scoped_and_keeps_default);
+            case!(run_attempt_pages_keep_snapshot_and_bind_every_query_field);
+            case!(run_attempt_sort_refuses_every_unscoped_or_other_family_filter);
+
             case!(settings_and_templates_are_keyed_rows_listed_by_their_exact_key);
             case!(settings_and_templates_belong_to_their_project);
             case!(a_failed_unit_of_work_keeps_no_setting_or_template_row_or_position);
@@ -534,4 +540,14 @@ pub use settings::{
     text_over_64_kib_round_trips_through_the_blob_store,
     text_over_the_limit_stays_whole_when_rows_projects_and_aborted_work_share_it,
     two_task_ids_that_differ_only_in_case_are_refused,
+};
+
+#[path = "v2_consumers.rs"]
+mod consumers;
+pub use consumers::{
+    pending_messages_filter_status_recipient_and_lexical_expiry,
+    pending_messages_page_matches_before_count_cursor_and_bound,
+    run_attempt_order_is_numeric_task_scoped_and_keeps_default,
+    run_attempt_pages_keep_snapshot_and_bind_every_query_field,
+    run_attempt_sort_refuses_every_unscoped_or_other_family_filter,
 };
