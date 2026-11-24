@@ -1,6 +1,6 @@
 use super::*;
 use crate::sqlite::{ConnectionRole, SqliteError, Synchronous, open_connection, test_data};
-use failure::Role;
+use failure::{Failure, Role};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
@@ -98,7 +98,7 @@ impl<T> WaitBounded<T> for WriteReceipt<T> {
     fn wait_bounded(self) -> Result<T> {
         match self.response.recv_timeout(BOUND) {
             Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(SqliteError::WriterClosed),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(self.dropped()),
             Err(mpsc::RecvTimeoutError::Timeout) => panic!("receipt not answered within bound"),
         }
     }
@@ -492,6 +492,7 @@ fn a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body() {
         "the body must not run after the recheck refuses it"
     );
     assert!(tx_state_is_autocommit(&connection), "reservation released");
+    assert_eq!(state.failure(), None, "a clean rollback is no failure");
     assert_eq!(count(&connection), 0);
     // Without a deadline the same path commits, so the refusal came from the recheck.
     execute(&mut connection, &gate, &state, None, Instant::now, |tx| {
@@ -1004,6 +1005,380 @@ fn a_rollback_error_that_leaves_the_connection_outside_a_transaction_is_not_that
     connection.execute_batch("ROLLBACK").unwrap();
 }
 
+/// A connection whose COMMIT is refused `commits` times and whose ROLLBACK is refused
+/// `rollbacks` times, standing in for a commit and a rollback SQLite cannot complete.
+fn refuse_commits_and_rollbacks(writer: &mut Writer<'_>, commits: usize, rollbacks: usize) {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    use std::sync::atomic::AtomicUsize;
+    let commits = Arc::new(AtomicUsize::new(commits));
+    let rollbacks = Arc::new(AtomicUsize::new(rollbacks));
+    let take = |left: &AtomicUsize| {
+        left.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+    };
+    writer
+        .connection
+        .for_migration()
+        .authorizer(Some(move |context: AuthContext<'_>| match context.action {
+            // rusqlite reports COMMIT as the unknown operation.
+            AuthAction::Transaction {
+                operation: TransactionOperation::Unknown,
+            } if take(&commits) => Authorization::Deny,
+            AuthAction::Transaction {
+                operation: TransactionOperation::Rollback,
+            } if take(&rollbacks) => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+}
+
+#[test]
+fn a_failed_commit_whose_rollback_also_fails_fails_the_writer() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::a_failed_commit_whose_rollback_also_fails_fails_the_writer",
+    ) {
+        return;
+    }
+    // The commit is refused, so SQLite leaves the transaction open; rusqlite's
+    // implicit rollback (`Drop`) would fail without a trace and the worker would
+    // panic with nothing latched. The executor rolls back once, explicitly.
+    let (_temp, data) = data_with("CREATE TABLE sample(id INTEGER) STRICT");
+    let (mut writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    refuse_commits_and_rollbacks(&mut writer, usize::MAX, usize::MAX);
+    let (release, released) = mpsc::channel::<()>();
+    let (started, running) = mpsc::channel::<()>();
+    let ran = Arc::new(AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || writer.run());
+        let _close = CloseOnDrop(&handle);
+        let first = handle
+            .submit(Lane::Entities, None, move |tx| {
+                started.send(()).unwrap();
+                released.recv_timeout(BOUND).expect("released");
+                tx.execute("INSERT INTO sample VALUES(1)", [])?;
+                Ok(())
+            })
+            .unwrap();
+        running.recv_timeout(BOUND).expect("running");
+        let queued: Vec<_> = [Lane::Claims, Lane::Events]
+            .into_iter()
+            .map(|lane| {
+                let ran = Arc::clone(&ran);
+                handle
+                    .submit(lane, None, move |tx| {
+                        ran.store(true, Ordering::SeqCst);
+                        tx.execute("INSERT INTO sample VALUES(9)", [])?;
+                        Ok(())
+                    })
+                    .unwrap()
+            })
+            .collect();
+        release.send(()).unwrap();
+        // The request keeps both failures: its failed commit and its failed rollback.
+        let first = first.wait_bounded();
+        assert!(
+            matches!(&first, Err(SqliteError::OperationRollback { .. })),
+            "{first:?}"
+        );
+        let latched = handle.failure_state().failure().expect("latched");
+        assert_eq!(latched.source, FailureSource::Writer);
+        assert_eq!(
+            latched.causes,
+            [(Role::Operation, FatalCause::RollbackLeftTransactionOpen)]
+        );
+        for receipt in queued {
+            let outcome = receipt.wait_bounded();
+            assert!(
+                matches!(&outcome, Err(SqliteError::StorageUnavailable(f)) if *f == latched),
+                "{outcome:?}"
+            );
+        }
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "no queued request runs after the latch"
+        );
+        let later = handle.submit(Lane::Entities, None, |_| Ok(())).err();
+        assert!(
+            matches!(&later, Some(SqliteError::StorageUnavailable(f)) if *f == latched),
+            "{later:?}"
+        );
+        assert!(
+            worker.join().is_err(),
+            "the writer fails loudly, not as a clean close"
+        );
+    });
+    let reader = open_connection(&data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
+    assert_eq!(count(&reader), 0, "nothing of any request is durable");
+}
+
+#[test]
+fn a_failed_commit_is_not_rolled_back_implicitly_before_the_connection_is_judged() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::a_failed_commit_is_not_rolled_back_implicitly_before_the_connection_is_judged",
+    ) {
+        return;
+    }
+    // Only the first ROLLBACK is refused. If rusqlite's `Drop` rolled back after the
+    // failed commit it would take that refusal and the explicit rollback would then
+    // succeed, hiding the failure from the latch (R128: one rollback, then judge).
+    let (_temp, data) = data_with("CREATE TABLE sample(id INTEGER) STRICT");
+    let (mut writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    refuse_commits_and_rollbacks(&mut writer, usize::MAX, 1);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || writer.run());
+        let _close = CloseOnDrop(&handle);
+        let first = handle
+            .submit(Lane::Entities, None, |tx| {
+                tx.execute("INSERT INTO sample VALUES(1)", [])?;
+                Ok(())
+            })
+            .unwrap()
+            .wait_bounded();
+        assert!(
+            matches!(first, Err(SqliteError::OperationRollback { .. })),
+            "{first:?}"
+        );
+        assert_eq!(
+            handle.failure_state().failure().map(|f| f.causes),
+            Some(vec![(
+                Role::Operation,
+                FatalCause::RollbackLeftTransactionOpen
+            )])
+        );
+        assert!(worker.join().is_err());
+    });
+}
+
+#[test]
+fn a_failed_commit_whose_rollback_succeeds_is_an_ordinary_failure() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::a_failed_commit_whose_rollback_succeeds_is_an_ordinary_failure",
+    ) {
+        return;
+    }
+    // The control: the same refused COMMIT, with a rollback that works. Nothing
+    // latches and the writer serves the next request, so only a rollback that
+    // leaves the transaction open is the fatal cause.
+    let (_temp, data) = data_with("CREATE TABLE sample(id INTEGER) STRICT");
+    let (mut writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    refuse_commits_and_rollbacks(&mut writer, 1, 0);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || writer.run());
+        let _close = CloseOnDrop(&handle);
+        let first = handle
+            .submit(Lane::Entities, None, |tx| {
+                tx.execute("INSERT INTO sample VALUES(1)", [])?;
+                Ok(())
+            })
+            .unwrap()
+            .wait_bounded();
+        assert!(
+            first.is_err() && !matches!(first, Err(SqliteError::OperationRollback { .. })),
+            "{first:?}"
+        );
+        assert_eq!(handle.failure_state().failure(), None);
+        handle
+            .submit(Lane::Entities, None, |tx| {
+                tx.execute("INSERT INTO sample VALUES(2)", [])?;
+                Ok(())
+            })
+            .unwrap()
+            .wait_bounded()
+            .unwrap();
+        handle.close();
+        worker.join().unwrap();
+    });
+    let reader = open_connection(&data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
+    assert_eq!(count(&reader), 1, "only the second request is durable");
+}
+
+#[test]
+fn a_failed_commit_that_sqlite_ended_the_transaction_for_is_answered_as_it_is() {
+    let (_temp, data) = data_with("CREATE TABLE sample(id INTEGER) STRICT");
+    let mut connection =
+        open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let gate = Gate::install(&mut connection).unwrap();
+    // A commit hook that vetoes turns the COMMIT into a rollback: SQLite itself
+    // ends the transaction, so there is nothing for the executor to roll back.
+    connection
+        .for_migration()
+        .commit_hook(Some(|| true))
+        .unwrap();
+    let state = FailureState::new();
+    let outcome = execute(&mut connection, &gate, &state, None, Instant::now, |tx| {
+        tx.execute("INSERT INTO sample VALUES(1)", [])?;
+        Ok(())
+    });
+    assert!(
+        outcome.is_err() && !matches!(outcome, Err(SqliteError::OperationRollback { .. })),
+        "{outcome:?}"
+    );
+    assert!(connection.is_autocommit());
+    assert_eq!(state.failure(), None);
+    assert_eq!(count(&connection), 0);
+}
+
+#[test]
+fn a_deadline_that_passes_after_begin_whose_rollback_is_denied_fails_the_writer() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    if !in_scenario_child(
+        "sqlite::writer::tests::a_deadline_that_passes_after_begin_whose_rollback_is_denied_fails_the_writer",
+    ) {
+        return;
+    }
+    let (_temp, data) = data_with("CREATE TABLE sample(id INTEGER) STRICT");
+    let mut connection =
+        open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let gate = Gate::install(&mut connection).unwrap();
+    connection
+        .for_migration()
+        .authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Transaction {
+                operation: TransactionOperation::Rollback,
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    let start = Instant::now();
+    let limit = start + Duration::from_secs(60);
+    // In time before BEGIN; expired once it holds the reservation.
+    let reads = std::cell::Cell::new(0);
+    let clock = || {
+        reads.set(reads.get() + 1);
+        if reads.get() == 1 { start } else { limit }
+    };
+    let state = FailureState::new();
+    let outcome = execute(
+        &mut connection,
+        &gate,
+        &state,
+        Some(limit),
+        clock,
+        |_| -> Result<()> { panic!("an expired request never runs") },
+    );
+    // Both failures are kept, and the unrolled-back transaction is the cause.
+    assert!(
+        matches!(
+            &outcome,
+            Err(SqliteError::OperationRollback { operation, .. })
+                if matches!(**operation, SqliteError::Overloaded)
+        ),
+        "{outcome:?}"
+    );
+    assert!(
+        !connection.is_autocommit(),
+        "the denied rollback left the transaction open"
+    );
+    assert_eq!(
+        state.failure().map(|f| f.causes),
+        Some(vec![(
+            Role::Operation,
+            FatalCause::RollbackLeftTransactionOpen
+        )])
+    );
+    // Whatever follows is refused as a latched writer refuses it, unrun.
+    let next = execute(
+        &mut connection,
+        &gate,
+        &state,
+        None,
+        Instant::now,
+        |_| -> Result<()> { panic!("a latched writer runs nothing") },
+    );
+    assert!(
+        matches!(next, Err(SqliteError::StorageUnavailable(_))),
+        "{next:?}"
+    );
+    // Leave the connection as the worker's failure would: hooks off, rolled back.
+    connection
+        .for_migration()
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>)
+        .unwrap();
+    connection.execute_batch("ROLLBACK").unwrap();
+    connection
+        .for_migration()
+        .rollback_hook(None::<fn()>)
+        .unwrap();
+    connection
+        .for_migration()
+        .commit_hook(None::<fn() -> bool>)
+        .unwrap();
+}
+
+fn latch_for_test(state: &FailureState) -> Failure {
+    state.latch(
+        FailureSource::Writer,
+        FatalCause::RollbackLeftTransactionOpen,
+    );
+    state.failure().expect("latched")
+}
+
+#[test]
+fn a_submit_racing_the_latch_answers_the_latched_failure_not_a_clean_close() {
+    let (_temp, data) = data_with("CREATE TABLE sample(id INTEGER) STRICT");
+    let (_writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let state = handle.failure_state();
+    // The submit has passed its first check; the worker then latches a failure and
+    // closes admission, the order a failed worker takes. The closed door must not
+    // hide the latch behind an ordinary shutdown.
+    let mut latched = None;
+    let outcome = handle
+        .submit_after(
+            Lane::Entities,
+            None,
+            |_| Ok(()),
+            || {
+                latched = Some(latch_for_test(&state));
+                handle.close();
+            },
+        )
+        .err();
+    assert!(
+        matches!(&outcome, Some(SqliteError::StorageUnavailable(f)) if Some(f) == latched.as_ref()),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_submit_racing_an_ordinary_shutdown_still_answers_writer_closed() {
+    // The control for the race above: with nothing latched the same window is an
+    // ordinary shutdown, which keeps its own answer.
+    let (_temp, data) = data_with("CREATE TABLE sample(id INTEGER) STRICT");
+    let (_writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let outcome = handle
+        .submit_after(Lane::Entities, None, |_| Ok(()), || handle.close())
+        .err();
+    assert!(
+        matches!(outcome, Some(SqliteError::WriterClosed)),
+        "{outcome:?}"
+    );
+}
+
+#[test]
+fn a_request_dropped_unanswered_by_a_failed_worker_answers_the_latched_failure() {
+    // A request accepted in the instant the worker fails is dropped with the
+    // queue, and its receipt disconnects. The latch precedes that, so it is the answer.
+    let (_temp, data) = data_with("CREATE TABLE sample(id INTEGER) STRICT");
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let receipt = handle.submit(Lane::Entities, None, |_| Ok(())).unwrap();
+    let latched = latch_for_test(&handle.failure_state());
+    drop(writer);
+    let outcome = receipt.wait();
+    assert!(
+        matches!(&outcome, Err(SqliteError::StorageUnavailable(f)) if *f == latched),
+        "{outcome:?}"
+    );
+    // Control: dropped by an ordinary close, the same receipt answers WriterClosed.
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let receipt = handle.submit(Lane::Entities, None, |_| Ok(())).unwrap();
+    drop(writer);
+    let outcome = receipt.wait();
+    assert!(
+        matches!(outcome, Err(SqliteError::WriterClosed)),
+        "{outcome:?}"
+    );
+}
+
 // The lease helpers are what a composed transaction calls. They run here on the
 // real executor, after a SQLite rollback the caller swallowed, with real tables.
 
@@ -1101,9 +1476,9 @@ fn lease_renew_release_and_claim_after_a_sqlite_rollback_are_not_durable() {
         }
         // A claim after the loss opens its own implicit transaction, and the
         // executor refuses the release that would commit it. No lease and no
-        // consumed epoch may be left behind; the claim's own cleanup cannot
-        // find its savepoint and fails the writer, as it does for any failed
-        // cleanup.
+        // consumed epoch may be left behind. The claim's own cleanup cannot find
+        // its savepoint, but SQLite ended the transaction, so the executor answers
+        // `TransactionAborted` and nothing is latched: the writer serves on.
         let claim = handle
             .submit(Lane::Claims, None, |tx| {
                 lose_the_transaction(tx);
@@ -1112,10 +1487,14 @@ fn lease_renew_release_and_claim_after_a_sqlite_rollback_are_not_durable() {
             })
             .unwrap()
             .wait_bounded();
-        assert!(claim.is_err(), "{claim:?}");
+        assert!(
+            matches!(claim, Err(SqliteError::TransactionAborted)),
+            "{claim:?}"
+        );
+        assert_eq!(handle.failure_state().failure(), None);
         assert_eq!(lease_state(&data), (1, Some(granted.expires_at), 1));
         handle.close();
-        let _ = worker.join();
+        worker.join().expect("the writer exits cleanly");
         granted
     });
     assert_eq!(granted.epoch, 1);

@@ -183,13 +183,12 @@ fn execute<T>(
     gate.rolled_back.store(false, Ordering::SeqCst);
     state.begin_transaction();
     // T9 configures this connection for BEGIN IMMEDIATE.
-    let transaction = match connection.transaction() {
+    let mut transaction = match connection.transaction() {
         Ok(transaction) => transaction,
         Err(error) => return Err(observed(state, error.into())),
     };
     if expired() {
-        // Dropping the transaction rolls back and releases the reservation.
-        return Err(SqliteError::Overloaded);
+        return Err(abandon(state, transaction, SqliteError::Overloaded).settle(connection, state));
     }
     let value = match work(&transaction) {
         Ok(value) => value,
@@ -213,11 +212,22 @@ fn execute<T>(
         return Err(abandon(state, transaction, error).settle(connection, state));
     }
     gate.committing.store(true, Ordering::SeqCst);
+    transaction.set_drop_behavior(DropBehavior::Ignore);
     let committed = transaction.commit();
     gate.committing.store(false, Ordering::SeqCst);
     match committed {
         Ok(()) => Ok(value),
-        Err(error) => Err(observed(state, error.into())),
+        Err(error) => {
+            let error = observed(state, error.into());
+            if connection.is_autocommit() {
+                return Err(error);
+            }
+            // `commit` consumed the transaction, with its drop behavior ignoring:
+            // SQLite left this one open (a busy or refused COMMIT), and the only
+            // rollback is the one made here, once, before the connection is judged.
+            let rolled_back = connection.execute_batch("ROLLBACK");
+            Err(Abandoned::after_rollback(state, error, rolled_back).settle(connection, state))
+        }
     }
 }
 
@@ -233,6 +243,31 @@ struct Abandoned {
 }
 
 impl Abandoned {
+    /// The request's `error` and the result of the rollback made for it. A failed
+    /// rollback keeps both causes in one `OperationRollback`.
+    fn after_rollback(
+        state: &FailureState,
+        error: SqliteError,
+        rollback: rusqlite::Result<()>,
+    ) -> Self {
+        match rollback {
+            Ok(()) => Self {
+                error,
+                rollback_failed: false,
+            },
+            Err(rollback) => Self {
+                error: observed(
+                    state,
+                    SqliteError::OperationRollback {
+                        operation: Box::new(error),
+                        rollback,
+                    },
+                ),
+                rollback_failed: true,
+            },
+        }
+    }
+
     /// A failed rollback that leaves the connection inside a transaction fails
     /// the writer in the shared state before the request is answered (R128). A
     /// rollback error that leaves the connection outside a transaction does not
@@ -250,7 +285,6 @@ impl Abandoned {
 }
 
 /// Roll back, classifying the rollback's own result independently of `error`.
-/// A failed rollback keeps both causes in one `OperationRollback`.
 fn abandon(
     state: &FailureState,
     mut transaction: Transaction<'_>,
@@ -267,22 +301,7 @@ fn abandon(
     // `Drop` would retry a failed rollback once and ignore its result: R128 allows
     // no further statement on a connection whose rollback failed, so it must not.
     transaction.set_drop_behavior(DropBehavior::Ignore);
-    match transaction.rollback() {
-        Ok(()) => Abandoned {
-            error,
-            rollback_failed: false,
-        },
-        Err(rollback) => Abandoned {
-            error: observed(
-                state,
-                SqliteError::OperationRollback {
-                    operation: Box::new(error),
-                    rollback,
-                },
-            ),
-            rollback_failed: true,
-        },
-    }
+    Abandoned::after_rollback(state, error, transaction.rollback())
 }
 
 type Job = Box<dyn FnOnce(&mut ConnectionHandle<'_>, &Gate) + Send>;
@@ -346,13 +365,22 @@ impl Drop for Admission {
 /// interrupt a body or commit that has already started.
 pub struct WriteReceipt<T> {
     response: mpsc::Receiver<Result<T>>,
+    state: FailureState,
 }
 
 impl<T> WriteReceipt<T> {
     pub fn wait(self) -> Result<T> {
-        self.response
-            .recv()
-            .unwrap_or(Err(SqliteError::WriterClosed))
+        self.response.recv().unwrap_or_else(|_| Err(self.dropped()))
+    }
+
+    /// The answer of a request whose job was dropped unanswered, because the worker
+    /// is gone. A worker that failed latched the state first, so the latched failure
+    /// wins over the ordinary-shutdown answer.
+    fn dropped(&self) -> SqliteError {
+        self.state
+            .ensure_available()
+            .err()
+            .unwrap_or(SqliteError::WriterClosed)
     }
 }
 
@@ -517,8 +545,26 @@ impl WriterHandle {
         T: Send + 'static,
         F: FnOnce(&Transaction<'_>) -> Result<T> + Send + 'static,
     {
+        self.submit_after(lane, deadline, work, || {})
+    }
+
+    /// `submit`, running `after_first_check` between the unlocked latch check and
+    /// the admission lock: a seam so tests can place a failure and a closed door
+    /// in that window without timing luck.
+    fn submit_after<T, F>(
+        &self,
+        lane: Lane,
+        deadline: Option<Instant>,
+        work: F,
+        after_first_check: impl FnOnce(),
+    ) -> Result<WriteReceipt<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Transaction<'_>) -> Result<T> + Send + 'static,
+    {
         // Refuse at the door once latched: nothing is queued behind a failed writer.
         self.state.ensure_available()?;
+        after_first_check();
         let (response, receiver) = mpsc::sync_channel(1);
         let state = self.state.clone();
         let job: Job = Box::new(move |connection, gate| {
@@ -537,6 +583,14 @@ impl WriterHandle {
             .state
             .lock()
             .expect("writer queue lock poisoned");
+        // The worker latches a failure before it closes admission, so a closed
+        // door that raced the check above is read again: a latched writer is
+        // never reported as an ordinary shutdown. Captures drop outside the lock.
+        if let Err(error) = self.state.ensure_available() {
+            drop(state);
+            drop(job);
+            return Err(error);
+        }
         if !state.accepting {
             // Drop user captures outside the queue lock, including on refusal.
             drop(state);
@@ -552,7 +606,10 @@ impl WriterHandle {
         }
         state.queue.push(lane, Instant::now(), job)?;
         self.admission.shared.available.notify_one();
-        Ok(WriteReceipt { response: receiver })
+        Ok(WriteReceipt {
+            response: receiver,
+            state: self.state.clone(),
+        })
     }
 
     /// Close admission and drain previously accepted transactions. Idempotent.
