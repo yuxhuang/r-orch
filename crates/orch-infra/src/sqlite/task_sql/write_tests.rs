@@ -715,3 +715,41 @@ fn missing_behind_and_negative_position_high_water_marks_are_refused_without_mut
         assert_eq!(state(&tx), before);
     }
 }
+
+#[test]
+fn outer_rollback_alone_refuses_next_task_write() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = conn();
+    let tx = conn.transaction().unwrap();
+    let caller = owner();
+    let mut writer = TaskWrite::new(sql(&tx, &disk, "p"), &caller);
+    writer.create(task("before")).unwrap();
+    tx.execute_batch("ROLLBACK").unwrap();
+    assert!(tx.is_autocommit());
+    assert!(matches!(writer.create(task("after")), Err(SqliteError::TransactionAborted)));
+    assert_eq!(tx.query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[test]
+fn failed_savepoint_rollback_poison_refuses_with_outer_transaction_still_active() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    let (_temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = conn();
+    conn.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+        AuthAction::Savepoint { operation: TransactionOperation::Rollback, .. } => Authorization::Deny,
+        _ => Authorization::Allow,
+    })).unwrap();
+    let tx = conn.transaction().unwrap();
+    let caller = owner();
+    let mut writer = TaskWrite::new(sql(&tx, &disk, "p"), &caller);
+    writer.create(task("t")).unwrap();
+    tx.execute_batch("CREATE TEMP TRIGGER fail_delete BEFORE DELETE ON task_details BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    assert!(matches!(writer.delete("t", Revision::ONE), Err(SqliteError::OperationRollback { .. })));
+    assert!(!tx.is_autocommit());
+    assert!(matches!(writer.ensure_committable(), Err(SqliteError::TransactionAborted)));
+    assert!(matches!(writer.create(task("later")), Err(SqliteError::TransactionAborted)));
+    tx.rollback().unwrap();
+    assert_eq!(conn.query_row("SELECT count(*) FROM tasks", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+}
