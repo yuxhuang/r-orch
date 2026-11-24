@@ -343,7 +343,7 @@ fn slots(value: &Value) -> Result<Vec<String>> {
 
 /// serde_json::Value alone overwrites duplicate keys. Preserve the JSON parser's
 /// numeric types and recursion limit while refusing duplicates at every depth.
-struct UniqueValue(Value);
+pub(in crate::sqlite) struct UniqueValue(pub(in crate::sqlite) Value);
 impl<'de> Deserialize<'de> for UniqueValue {
     fn deserialize<D: de::Deserializer<'de>>(
         deserializer: D,
