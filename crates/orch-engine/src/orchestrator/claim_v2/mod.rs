@@ -4,6 +4,8 @@
 //! removal, start intents, admission (disk floor/run cap/unspooled finishes),
 //! dependency/goal/scope checks and dispatcher authorization before wiring it.
 //! Retrying tasks are deliberately refused until their queue can participate.
+//! An automatic retry keeps its attempt count, so it never resets the budget;
+//! only [`claim_explicit_rerun`] does, and only for a failed or cancelled task.
 //! Prompt blobs (#134), workspace preparation and peer submission stay outside
 //! this helper. A preparing run stores empty prompt/workspace placeholders;
 //! nothing here emits a started event or launches a process.
@@ -50,6 +52,25 @@ pub enum ClaimResult {
     Refused(Refusal),
 }
 
+/// Which task states a reservation accepts, and what it does to the budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// A `todo` task keeps the attempts it has, as before.
+    Dispatch,
+    /// A `failed` or `cancelled` task starts again with a fresh budget, which
+    /// is what 1.0's `retry` followed by the next dispatch did in two saves.
+    ExplicitRerun,
+}
+
+impl Mode {
+    fn accepts(self, status: TaskStatus) -> bool {
+        match self {
+            Self::Dispatch => status == TaskStatus::Todo,
+            Self::ExplicitRerun => matches!(status, TaskStatus::Failed | TaskStatus::Cancelled),
+        }
+    }
+}
+
 /// Returns a reservation only after commit. Any storage error aborts the entire
 /// transaction, including a newly issued lease and its epoch. A repeated claim
 /// is refused; it is not a replay key or permission to launch again.
@@ -59,7 +80,31 @@ pub async fn claim(
     request: ClaimRequest,
 ) -> Result<ClaimResult> {
     storage
-        .transaction(caller, Lane::Claims, move |unit| reserve(unit, request))
+        .transaction(caller, Lane::Claims, move |unit| {
+            reserve(unit, request, Mode::Dispatch)
+        })
+        .await
+}
+
+/// The reservation of an explicit rerun of a `failed` or `cancelled` task (1.0's
+/// `orch task retry` and the dispatch that follows it). The attempt count is
+/// reset to zero and then spent by this reservation, so the run is attempt 1 of
+/// a fresh budget, in the same transaction as the lease, the run row and the
+/// task update: a refusal (approval hold, unavailable agent, held lease) or a
+/// storage error after the reset leaves the task failed or cancelled with the
+/// attempts it had. Every other status is refused, `retrying` included: an
+/// automatic retry never resets the budget, and `todo` goes through [`claim`].
+/// Like [`claim`] it checks no admission, dependency or goal rule and starts
+/// nothing.
+pub async fn claim_explicit_rerun(
+    storage: &(impl Storage + ?Sized),
+    caller: Caller,
+    request: ClaimRequest,
+) -> Result<ClaimResult> {
+    storage
+        .transaction(caller, Lane::Claims, move |unit| {
+            reserve(unit, request, Mode::ExplicitRerun)
+        })
         .await
 }
 
@@ -80,7 +125,7 @@ fn selected(
     }
 }
 
-fn reserve(unit: &mut dyn UnitOfWork, request: ClaimRequest) -> Result<ClaimResult> {
+fn reserve(unit: &mut dyn UnitOfWork, request: ClaimRequest, mode: Mode) -> Result<ClaimResult> {
     let task = selected(
         unit,
         EntityKind::Task,
@@ -99,16 +144,19 @@ fn reserve(unit: &mut dyn UnitOfWork, request: ClaimRequest) -> Result<ClaimResu
     let Entity::Agent(agent_data) = agent.entity else {
         return Ok(ClaimResult::Refused(Refusal::AgentUnavailable));
     };
-    if task_data.status != TaskStatus::Todo || task_data.awaits_approval() {
+    if !mode.accepts(task_data.status) || task_data.awaits_approval() {
         return Ok(ClaimResult::Refused(Refusal::TaskUnavailable));
     }
     if crate::agent_service::AgentService::find_best_in(&task_data, vec![*agent_data]).is_none() {
         return Ok(ClaimResult::Refused(Refusal::AgentUnavailable));
     }
-    let attempt = task_data
-        .attempts
-        .checked_add(1)
-        .ok_or(StoreError::CounterExhausted)?;
+    // The reset is only a local value until the task update below, so every
+    // refusal and error before it leaves the stored budget as it was.
+    let spent = match mode {
+        Mode::Dispatch => task_data.attempts,
+        Mode::ExplicitRerun => 0,
+    };
+    let attempt = spent.checked_add(1).ok_or(StoreError::CounterExhausted)?;
     let lease = match unit.claim_lease(
         &NewLease {
             task: request.task_id.clone(),

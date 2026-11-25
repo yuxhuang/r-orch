@@ -276,7 +276,7 @@ async fn rollback(storage: &dyn Storage) {
     let result: Result<()> = storage
         .transaction(caller(), Lane::Claims, |unit| {
             assert!(matches!(
-                reserve(unit, request())?,
+                reserve(unit, request(), Mode::Dispatch)?,
                 ClaimResult::Reserved { .. }
             ));
             Err(StoreError::CounterExhausted)
@@ -455,4 +455,406 @@ async fn a_lease_on_the_selected_task_refuses_without_changes() {
         ClaimResult::Refused(Refusal::Held(_))
     ));
     assert_eq!(state(&storage).await, before);
+}
+
+// ── explicit rerun of a failed or cancelled task ────────────────────────────
+//
+// 1.0 reset the budget in `TaskService::retry` (failed/cancelled → todo, attempts
+// 0) and dispatched the todo task in a later save. Its `dispatch_claimed`
+// re-run branch cannot be reached (`is_dispatchable` refuses a terminal task
+// first), so `retry` plus the next dispatch is the behaviour to keep, and an
+// automatic retry (`retrying`, attempts kept) is a different path. The retry
+// service's own cases are `task_service::tests::retry_resets_a_failed_task_to_todo_with_no_attempts`,
+// `::retry_also_resets_a_cancelled_task` and `::retry_refuses_anything_but_failed_or_cancelled`.
+// The scenarios below are backend-neutral, like the ones above, so SQLite can
+// register them with the rest of #157.
+
+fn old_run() -> Run {
+    Run {
+        id: "run-old".into(),
+        task_id: "task-selected".into(),
+        agent_id: "agent-selected".into(),
+        attempt: 3,
+        status: RunStatus::Failed,
+        started_at: "old".into(),
+        finished_at: Some("old".into()),
+        workspace_path: String::new(),
+        prompt: String::new(),
+        pid: None,
+        error: Some("synthetic".into()),
+        error_kind: None,
+        tokens: None,
+    }
+}
+
+/// Seeds the usual rows, then makes the selected task `status` with `attempts`
+/// spent and one finished run of it; returns the selected task's revision.
+async fn seed_terminal(storage: &dyn Storage, status: TaskStatus, attempts: u32) -> Revision {
+    seed(storage).await;
+    storage
+        .transaction(caller(), Lane::Entities, move |unit| {
+            let mut row = unit.get(EntityKind::Task, "task-selected")?.expect("task");
+            let Entity::Task(task) = &mut row.entity else {
+                panic!("task")
+            };
+            task.status = status;
+            task.attempts = attempts;
+            task.max_attempts = 3;
+            task.feedback = Some("synthetic feedback".into());
+            let updated = unit.update(row.entity, row.revision)?;
+            unit.create(Entity::Run(Box::new(old_run())))?;
+            Ok(updated.revision)
+        })
+        .await
+        .expect("seed terminal")
+}
+
+async fn rerun_state(storage: &dyn Storage) -> (Vec<Record>, Vec<Lease>) {
+    let (mut rows, leases) = state(storage).await;
+    let view = storage.read(caller()).await.expect("snapshot");
+    rows.extend(view.get(EntityKind::Run, "run-old").await.expect("old run"));
+    (rows, leases)
+}
+
+fn rerun_request(revision: Revision) -> ClaimRequest {
+    ClaimRequest {
+        task_revision: revision,
+        ..request()
+    }
+}
+
+async fn rerun_success(storage: &dyn Storage, status: TaskStatus, attempts: u32) {
+    let revision = seed_terminal(storage, status, attempts).await;
+    let before = rerun_state(storage).await;
+    let ClaimResult::Reserved { task, run, lease } =
+        claim_explicit_rerun(storage, caller(), rerun_request(revision))
+            .await
+            .expect("rerun")
+    else {
+        panic!("rerun refused");
+    };
+    let Entity::Task(task_data) = &task.entity else {
+        panic!("task")
+    };
+    assert_eq!(task_data.status, TaskStatus::InProgress);
+    assert_eq!(
+        task_data.attempts, 1,
+        "the budget restarts and one is spent"
+    );
+    assert_eq!(task_data.max_attempts, 3);
+    assert_eq!(task_data.updated_at, "1970-01-01T00:00:01.234Z");
+    assert_eq!(task_data.created_at, "old");
+    assert_eq!(task_data.feedback.as_deref(), Some("synthetic feedback"));
+    assert_eq!(task_data.assignee.as_deref(), Some("agent-selected"));
+    assert_eq!(task.revision, revision.next().unwrap());
+    let Entity::Run(run_data) = &run.entity else {
+        panic!("run")
+    };
+    assert_eq!(run_data.status, RunStatus::Preparing);
+    assert_eq!(run_data.attempt, 1);
+    assert_eq!(run_data.started_at, "1970-01-01T00:00:01.234Z");
+    assert_eq!(lease.task, "task-selected");
+    assert_eq!(lease.agent, "agent-selected");
+    assert_eq!(lease.run, "run-selected");
+    assert_eq!(lease.epoch, 1);
+    assert_eq!(lease.expires_at, 1234 + orch_core::store::leases::LEASE_MS);
+    let after = rerun_state(storage).await;
+    for row in before.0.iter().filter(|r| r.entity.id() != "task-selected") {
+        assert!(
+            after.0.contains(row),
+            "an unselected or earlier row changed"
+        );
+    }
+    assert!(after.0.contains(task.as_ref()));
+    assert!(after.0.contains(run.as_ref()));
+    assert_eq!(after.1, vec![lease]);
+    // The same budget cannot be reset twice: the task is now in progress.
+    assert_eq!(
+        claim_explicit_rerun(storage, caller(), rerun_request(task.revision))
+            .await
+            .unwrap(),
+        ClaimResult::Refused(Refusal::TaskUnavailable)
+    );
+    assert_eq!(rerun_state(storage).await, after);
+}
+
+#[tokio::test]
+async fn a_failed_or_cancelled_task_restarts_its_budget_in_one_transaction_in_memory() {
+    rerun_success(&FakeStorage::default(), TaskStatus::Failed, 3).await;
+    rerun_success(&FakeStorage::default(), TaskStatus::Cancelled, 1).await;
+}
+
+#[tokio::test]
+async fn a_failed_or_cancelled_task_restarts_its_budget_in_one_transaction_on_files() {
+    for (status, attempts) in [(TaskStatus::Failed, 3), (TaskStatus::Cancelled, 1)] {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(root.path());
+        rerun_success(&storage, status, attempts).await;
+        let committed = rerun_state(&storage).await;
+        drop(storage);
+        assert_eq!(rerun_state(&FileStorage::new(root.path())).await, committed);
+    }
+}
+
+#[tokio::test]
+async fn an_exhausted_counter_does_not_stop_an_explicit_rerun() {
+    // The ordinary claim at `u32::MAX` is `attempt_overflow_aborts_without_issuing_a_lease`;
+    // a rerun starts from zero, as 1.0's `retry` did.
+    let storage = FakeStorage::default();
+    let revision = seed_terminal(&storage, TaskStatus::Failed, u32::MAX).await;
+    let ClaimResult::Reserved { task, .. } =
+        claim_explicit_rerun(&storage, caller(), rerun_request(revision))
+            .await
+            .unwrap()
+    else {
+        panic!("rerun refused")
+    };
+    let Entity::Task(task) = task.entity else {
+        panic!("task")
+    };
+    assert_eq!(task.attempts, 1);
+}
+
+async fn rerun_refused_without_change(storage: &dyn Storage, revision: Revision) {
+    let before = rerun_state(storage).await;
+    assert_eq!(
+        claim_explicit_rerun(storage, caller(), rerun_request(revision))
+            .await
+            .unwrap(),
+        ClaimResult::Refused(Refusal::TaskUnavailable)
+    );
+    assert_eq!(rerun_state(storage).await, before);
+}
+
+#[tokio::test]
+async fn only_failed_and_cancelled_tasks_can_be_rerun_and_the_ordinary_claim_refuses_them() {
+    // `retry_refuses_anything_but_failed_or_cancelled`, at the reservation.
+    // `retrying` has a queue and keeps its attempts: it is not an explicit rerun.
+    for status in [
+        TaskStatus::Todo,
+        TaskStatus::InProgress,
+        TaskStatus::Retrying,
+        TaskStatus::Review,
+        TaskStatus::Done,
+    ] {
+        let storage = FakeStorage::default();
+        let revision = seed_terminal(&storage, status, 2).await;
+        rerun_refused_without_change(&storage, revision).await;
+    }
+    for status in [TaskStatus::Failed, TaskStatus::Cancelled] {
+        let storage = FakeStorage::default();
+        let revision = seed_terminal(&storage, status, 2).await;
+        let before = rerun_state(&storage).await;
+        assert_eq!(
+            claim(&storage, caller(), rerun_request(revision))
+                .await
+                .unwrap(),
+            ClaimResult::Refused(Refusal::TaskUnavailable),
+            "the ordinary claim keeps refusing {status}"
+        );
+        assert_eq!(rerun_state(&storage).await, before);
+    }
+}
+
+async fn rerun_approval_refusal(storage: &dyn Storage) {
+    seed_terminal(storage, TaskStatus::Failed, 3).await;
+    let hold = |add: bool| {
+        move |unit: &mut dyn UnitOfWork| {
+            let mut row = unit.get(EntityKind::Task, "task-selected")?.expect("task");
+            let Entity::Task(task) = &mut row.entity else {
+                panic!("task")
+            };
+            if add {
+                task.labels.push("awaiting-approval".into());
+            } else {
+                task.labels.clear();
+            }
+            Ok(unit.update(row.entity, row.revision)?.revision)
+        }
+    };
+    let revision = storage
+        .transaction(caller(), Lane::Entities, hold(true))
+        .await
+        .unwrap();
+    // The refusal must not keep a budget reset: 1.0 reset in `retry` and
+    // refused later, but the reservation is one unit.
+    rerun_refused_without_change(storage, revision).await;
+    let revision = storage
+        .transaction(caller(), Lane::Entities, hold(false))
+        .await
+        .unwrap();
+    let ClaimResult::Reserved { lease, task, .. } =
+        claim_explicit_rerun(storage, caller(), rerun_request(revision))
+            .await
+            .unwrap()
+    else {
+        panic!("rerun after approval")
+    };
+    assert_eq!(lease.epoch, 1, "refusal must not consume an epoch");
+    let Entity::Task(task) = task.entity else {
+        panic!("task")
+    };
+    assert_eq!(task.attempts, 1);
+}
+
+#[tokio::test]
+async fn awaiting_approval_refuses_an_explicit_rerun_without_a_budget_reset_in_memory() {
+    rerun_approval_refusal(&FakeStorage::default()).await;
+}
+
+#[tokio::test]
+async fn awaiting_approval_refuses_an_explicit_rerun_without_a_budget_reset_on_files() {
+    let root = tempfile::tempdir().unwrap();
+    rerun_approval_refusal(&FileStorage::new(root.path())).await;
+}
+
+async fn rerun_rollback(storage: &dyn Storage) {
+    let revision = seed_terminal(storage, TaskStatus::Failed, 3).await;
+    let before = rerun_state(storage).await;
+    let result: Result<()> = storage
+        .transaction(caller(), Lane::Claims, move |unit| {
+            assert!(matches!(
+                reserve(unit, rerun_request(revision), Mode::ExplicitRerun)?,
+                ClaimResult::Reserved { .. }
+            ));
+            Err(StoreError::CounterExhausted)
+        })
+        .await;
+    assert!(matches!(result, Err(StoreError::CounterExhausted)));
+    assert_eq!(
+        rerun_state(storage).await,
+        before,
+        "the reset, the run, the lease and the task update roll back together"
+    );
+    let ClaimResult::Reserved { lease, task, .. } =
+        claim_explicit_rerun(storage, caller(), rerun_request(revision))
+            .await
+            .unwrap()
+    else {
+        panic!("rerun")
+    };
+    assert_eq!(lease.epoch, 1, "rollback must restore the epoch too");
+    assert_eq!(task.revision, revision.next().unwrap());
+}
+
+#[tokio::test]
+async fn error_after_an_explicit_rerun_rolls_back_the_reset_run_lease_and_epoch_in_memory() {
+    rerun_rollback(&FakeStorage::default()).await;
+}
+
+#[tokio::test]
+async fn error_after_an_explicit_rerun_rolls_back_the_reset_run_lease_and_epoch_on_files() {
+    let root = tempfile::tempdir().unwrap();
+    rerun_rollback(&FileStorage::new(root.path())).await;
+}
+
+#[tokio::test]
+async fn a_held_lease_stale_revision_or_unavailable_agent_keeps_the_spent_budget() {
+    // Held: another run owns the task's lease.
+    let storage = FakeStorage::default();
+    let revision = seed_terminal(&storage, TaskStatus::Failed, 3).await;
+    storage
+        .transaction(caller(), Lane::Claims, |unit| {
+            unit.claim_lease(
+                &NewLease {
+                    task: "task-selected".into(),
+                    agent: "agent-other".into(),
+                    run: "run-other".into(),
+                },
+                0,
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let before = rerun_state(&storage).await;
+    assert!(matches!(
+        claim_explicit_rerun(&storage, caller(), rerun_request(revision))
+            .await
+            .unwrap(),
+        ClaimResult::Refused(Refusal::Held(_))
+    ));
+    assert_eq!(rerun_state(&storage).await, before);
+
+    // Stale: the selected revision is not the stored one.
+    let storage = FakeStorage::default();
+    let revision = seed_terminal(&storage, TaskStatus::Cancelled, 2).await;
+    let before = rerun_state(&storage).await;
+    assert!(matches!(
+        claim_explicit_rerun(&storage, caller(), rerun_request(revision.next().unwrap())).await,
+        Err(StoreError::StaleRevision {
+            kind: EntityKind::Task,
+            ..
+        })
+    ));
+    assert_eq!(rerun_state(&storage).await, before);
+
+    // Unavailable: the selected agent is disabled, and a task assigned to
+    // another agent refuses this one, as the ordinary claim does.
+    for disable in [true, false] {
+        let storage = FakeStorage::default();
+        let seeded = seed_terminal(&storage, TaskStatus::Failed, 3).await;
+        let mut req = rerun_request(seeded);
+        let changed = storage
+            .transaction(caller(), Lane::Entities, move |unit| {
+                let (kind, id) = if disable {
+                    (EntityKind::Agent, "agent-selected")
+                } else {
+                    (EntityKind::Task, "task-selected")
+                };
+                let mut row = unit.get(kind, id)?.expect("row");
+                match &mut row.entity {
+                    Entity::Agent(agent) => agent.status = AgentStatus::Disabled,
+                    Entity::Task(task) => task.assignee = Some("agent-other".into()),
+                    _ => unreachable!(),
+                }
+                Ok(unit.update(row.entity, row.revision)?.revision)
+            })
+            .await
+            .unwrap();
+        if disable {
+            req.agent_revision = changed;
+        } else {
+            req.task_revision = changed;
+        }
+        let before = rerun_state(&storage).await;
+        assert_eq!(
+            claim_explicit_rerun(&storage, caller(), req).await.unwrap(),
+            ClaimResult::Refused(Refusal::AgentUnavailable)
+        );
+        assert_eq!(rerun_state(&storage).await, before);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_explicit_reruns_have_one_winner_and_spend_one_attempt() {
+    let storage = FakeStorage::default();
+    let revision = seed_terminal(&storage, TaskStatus::Failed, 3).await;
+    let (a, b) = tokio::join!(
+        claim_explicit_rerun(&storage, caller(), rerun_request(revision)),
+        claim_explicit_rerun(&storage, caller(), rerun_request(revision))
+    );
+    assert_eq!(
+        [&a, &b]
+            .iter()
+            .filter(|r| matches!(r, Ok(ClaimResult::Reserved { .. })))
+            .count(),
+        1
+    );
+    let after = rerun_state(&storage).await;
+    let task = after
+        .0
+        .iter()
+        .find_map(|row| match &row.entity {
+            Entity::Task(task) if task.id == "task-selected" => Some(task),
+            _ => None,
+        })
+        .expect("task");
+    assert_eq!((task.status, task.attempts), (TaskStatus::InProgress, 1));
+    assert_eq!(after.1.len(), 1);
+    assert!(matches!(
+        claim_explicit_rerun(&storage, caller(), rerun_request(revision)).await,
+        Err(StoreError::StaleRevision { .. })
+    ));
+    assert_eq!(rerun_state(&storage).await, after);
 }
