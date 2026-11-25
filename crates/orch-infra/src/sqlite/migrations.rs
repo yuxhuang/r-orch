@@ -84,9 +84,7 @@ pub fn apply_migrations(
     // Refuse a known-lossy predecessor before any intermediate migration or
     // checked copy. Keep the hook too: it is the migration's transactional guard.
     if version > 0 && steps.iter().skip(version).any(|step| *step == TASK_FORMAT) {
-        refuse_lossy_tasks(conn).map_err(|error| {
-            SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
-        })?;
+        refuse_lossy_tasks(conn).map_err(preflight_error)?;
     }
     if version > 0
         && steps
@@ -94,9 +92,7 @@ pub fn apply_migrations(
             .skip(version)
             .any(|step| *step == AGENT_TEAM_RUN)
     {
-        refuse_lossy_entities(conn).map_err(|error| {
-            SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
-        })?;
+        refuse_lossy_entities(conn).map_err(preflight_error)?;
     }
     let holds_project = version > 0
         && conn.query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |r| r.get(0))? > 0;
@@ -154,6 +150,16 @@ pub fn apply_migrations(
         tracing::warn!(%error, "could not prune old pre-migration copies after migration committed");
     }
     Ok(())
+}
+
+/// A preflight statement failure keeps its typed SQLite error, so `classify` sees
+/// SQLITE_CORRUPT, SQLITE_NOTADB or SQLITE_BUSY. Only the intentional row refusal
+/// is a `Migration` message: stringifying a statement failure would erase its code.
+fn preflight_error(error: rusqlite_migration::HookError) -> SqliteError {
+    match error {
+        rusqlite_migration::HookError::RusqliteError(error) => SqliteError::Sql(error),
+        refusal => SqliteError::Migration(rusqlite_migration::Error::from(refusal).to_string()),
+    }
 }
 
 // No predecessor task can recover ordered duplicates, absent lists, workspace
@@ -380,7 +386,7 @@ fn retain_two(data: &DataDir) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlite::{Class, Role, classify, open_connection, test_data};
+    use crate::sqlite::{Class, FatalCause, Role, classify, open_connection, test_data};
 
     fn plenty() -> DiskSpace {
         DiskSpace {
@@ -428,5 +434,97 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn task_format_preflight_statement_error_keeps_its_sqlite_category() {
+        let (_tmp, data) = test_data();
+        let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        apply_migrations(&data, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
+        // A malformed synthetic predecessor makes the actual preflight SELECT
+        // fail. This must differ structurally from the intentional row refusal.
+        conn.execute_batch("DROP TABLE task_labels").unwrap();
+        let error = apply_migrations(
+            &data,
+            &mut conn,
+            &[INITIAL_SCHEMA, ATTENTION_FACTS, TASK_FORMAT],
+            plenty(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, SqliteError::Sql(rusqlite::Error::SqliteFailure(ref code, _)) if code.extended_code == rusqlite::ffi::SQLITE_ERROR),
+            "preflight lost its SQLite category: {error:?}"
+        );
+    }
+
+    #[test]
+    fn entity_format_preflight_statement_error_keeps_its_sqlite_category() {
+        let (_tmp, data) = test_data();
+        let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        apply_migrations(&data, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
+        conn.execute_batch("DROP TABLE team_tasks").unwrap();
+        let error = apply_migrations(
+            &data,
+            &mut conn,
+            &[INITIAL_SCHEMA, ATTENTION_FACTS, AGENT_TEAM_RUN],
+            plenty(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, SqliteError::Sql(rusqlite::Error::SqliteFailure(ref code, _)) if code.extended_code == rusqlite::ffi::SQLITE_ERROR),
+            "preflight lost its SQLite category: {error:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_refusal_stays_an_ordinary_migration_message() {
+        let error = preflight_error(rusqlite_migration::HookError::Hook(
+            "task format v1 refuses ambiguous predecessor rows: tasks=1".into(),
+        ));
+        assert!(
+            matches!(&error, SqliteError::Migration(message) if message.contains("tasks=1")),
+            "{error:?}"
+        );
+        assert_eq!(
+            classify(&error).leaves(),
+            &[(Role::Operation, Class::Ordinary)]
+        );
+    }
+
+    // The mapping seam takes the hook's own error type, so each SQLite category is
+    // injected without an unsafe SQLite callback. These prove the classifier
+    // sees the category; the real SQLITE_ERROR tests above prove an actual
+    // statement failure reaches the seam.
+    fn injected(code: i32) -> rusqlite_migration::HookError {
+        rusqlite_migration::HookError::RusqliteError(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(code),
+            Some("synthetic".into()),
+        ))
+    }
+
+    #[test]
+    fn preflight_statement_categories_classify_fatal_and_transient() {
+        for (code, expected) in [
+            (
+                rusqlite::ffi::SQLITE_CORRUPT,
+                Class::Fatal(FatalCause::SqliteCorrupt),
+            ),
+            (
+                rusqlite::ffi::SQLITE_NOTADB,
+                Class::Fatal(FatalCause::SqliteNotADatabase),
+            ),
+            (rusqlite::ffi::SQLITE_BUSY, Class::Transient),
+        ] {
+            let error = preflight_error(injected(code));
+            assert!(
+                matches!(&error, SqliteError::Sql(rusqlite::Error::SqliteFailure(failure, _)) if failure.extended_code == code),
+                "{error:?}"
+            );
+            assert_eq!(
+                classify(&error).leaves(),
+                &[(Role::Operation, expected)],
+                "{error:?}"
+            );
+        }
     }
 }
