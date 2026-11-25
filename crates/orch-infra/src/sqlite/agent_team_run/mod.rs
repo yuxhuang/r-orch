@@ -1,5 +1,5 @@
-//! Agent, Team and Run detail bytes. SQL projections and reachability belong
-//! to the selecting transaction; this module never installs a reference row.
+//! Agent, Team and Run detail bytes and private native persistence. Every SQL
+//! operation borrows the selecting snapshot or authorized caller transaction.
 use super::task_format::{
     codec::{Detail, UniqueValue},
     text::{self, Chunk, Reference, Tag, TextError},
@@ -28,7 +28,7 @@ pub(super) enum FormatError {
 type Result<T> = std::result::Result<T, FormatError>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Family {
+pub(super) enum Family {
     Agent,
     Team,
     Run,
@@ -499,4 +499,1673 @@ fn slots(family: Family, value: &Value) -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    // Keep the qualified prerequisite corpus byte-for-byte while native tests
+    // grow separately in this bounded leaf.
+    include!("tests.rs");
+
+    fn native_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::sqlite::migrations::INITIAL_SCHEMA)
+            .unwrap();
+        conn.execute_batch(crate::sqlite::migrations::ATTENTION_FACTS)
+            .unwrap();
+        conn.execute_batch(crate::sqlite::migrations::TASK_FORMAT)
+            .unwrap();
+        conn.execute_batch(crate::sqlite::migrations::AGENT_TEAM_RUN)
+            .unwrap();
+        conn
+    }
+
+    #[test]
+    fn native_create_explicitly_projects_status_attempt_time_and_advancing_run_positions() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let mut a = agent();
+        a.status = orch_domain::AgentStatus::Running;
+        let saved = sql.create(Entity::Agent(Box::new(a))).unwrap();
+        assert_eq!(saved.position, 1);
+        assert_eq!(
+            tx.query_row("SELECT status FROM agents", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "running"
+        );
+        for (id, attempt, position) in [("r", 10, 1), ("s", 2, 2)] {
+            let mut r = run();
+            r.id = id.into();
+            r.attempt = attempt;
+            let saved = sql.create(Entity::Run(Box::new(r))).unwrap();
+            assert_eq!(saved.position, position);
+            let actual: (String, u32, i64) = tx
+                .query_row(
+                    "SELECT started_at_text,attempt,position FROM runs WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(actual, ("opaque".into(), attempt, position as i64));
+        }
+        assert_eq!(
+            tx.query_row(
+                "SELECT value FROM counters WHERE name='position:run'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    fn native_state(tx: &Transaction<'_>) -> Vec<Vec<Vec<SqlValue>>> {
+        [
+            "agents",
+            "teams",
+            "runs",
+            "team_members",
+            "team_tasks",
+            "entity_details",
+            "entity_blob_refs",
+            "blobs",
+            "counters",
+        ]
+        .iter()
+        .map(|table| {
+            let mut stmt = tx
+                .prepare(&format!("SELECT * FROM {table} ORDER BY 1,2,3"))
+                .unwrap();
+            let n = stmt.column_count();
+            stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+        .collect()
+    }
+
+    #[test]
+    fn native_crud_round_trips_all_families_project_isolation_and_checked_moves() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        for entity in [
+            Entity::Agent(Box::new(agent())),
+            Entity::Team(Box::new(team())),
+            Entity::Run(Box::new(run())),
+        ] {
+            let family = Family::of(&entity).unwrap();
+            let id = entity.id().to_owned();
+            let first = sql.create(entity.clone()).unwrap();
+            assert_eq!(first.revision, Revision::ONE);
+            assert_eq!(first.position, 1);
+            assert_eq!(sql.get(family, &id).unwrap(), Some(first.clone()));
+            assert_eq!(
+                sql.hydrate(family, std::slice::from_ref(&id)).unwrap(),
+                vec![first.clone()]
+            );
+            assert!(
+                NativeSql::new(&tx, &disk, "other", 123)
+                    .get(family, &id)
+                    .unwrap()
+                    .is_none()
+            );
+            let before = native_state(&tx);
+            assert!(matches!(
+                sql.create(entity.clone()),
+                Err(NativeError::Store(StoreError::AlreadyExists { .. }))
+            ));
+            assert_eq!(native_state(&tx), before);
+            let updated = sql.update(entity.clone(), first.revision).unwrap();
+            assert_eq!(updated.entity, entity);
+            assert_eq!(updated.position, 1);
+            assert_eq!(updated.revision.get(), 2);
+            let before = native_state(&tx);
+            assert!(matches!(
+                sql.update(entity.clone(), Revision::ONE),
+                Err(NativeError::Store(StoreError::StaleRevision { .. }))
+            ));
+            assert!(matches!(
+                sql.delete(family, &id, Revision::ONE),
+                Err(NativeError::Store(StoreError::StaleRevision { .. }))
+            ));
+            assert_eq!(native_state(&tx), before);
+            let moved = sql.move_to_end(family, &id, updated.revision).unwrap();
+            assert_eq!(moved.position, 2);
+            assert_eq!(moved.revision.get(), 3);
+            assert_eq!(sql.get(family, &id).unwrap(), Some(moved.clone()));
+            sql.delete(family, &id, moved.revision).unwrap();
+            assert!(sql.get(family, &id).unwrap().is_none());
+            let next = sql.create(entity).unwrap();
+            assert_eq!(next.position, 3);
+        }
+        assert!(
+            sql.hydrate(Family::Agent, &["a".into(), "missing".into()])
+                .is_err()
+        );
+        sql.ensure_committable().unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn native_team_oversized_identity_names_lead_members_and_pool_preserve_occurrences() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let long = "é".repeat(32769);
+        let mut t = team();
+        t.id = long.clone();
+        t.name = long.clone();
+        t.lead_agent_id = long.clone();
+        t.description = Some(String::new());
+        t.config.max_concurrent_tasks = Some(u32::MAX);
+        t.config.message_ttl_ms = Some(u64::MAX);
+        t.members = serde_json::from_value(json!([
+        {"agent_id":long,"role":"lead","joined_at":"2026-11-20T10:00:00.123+02:00"},
+        {"agent_id":"a","role":"member","joined_at":"opaque"},
+        {"agent_id":"a","role":"lead","joined_at":""}]))
+        .unwrap();
+        t.task_pool = vec![long, "b".into(), "a".into(), "b".into()];
+        let saved = sql.create(Entity::Team(Box::new(t.clone()))).unwrap();
+        assert_eq!(sql.get(Family::Team, &t.id).unwrap(), Some(saved));
+        let rows: Vec<(i64, Option<String>, String, Option<i64>)> = tx
+        .prepare(
+            "SELECT ordinal,agent_id,joined_at_text,joined_at FROM team_members ORDER BY ordinal",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].0, 0);
+        assert!(rows[0].1.is_none());
+        assert!(rows[0].3.is_some());
+        assert_eq!(rows[1], (1, Some("a".into()), "opaque".into(), None));
+        let count: i64 = tx
+            .query_row("SELECT COUNT(*) FROM team_tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        let literal = BlobHash::of(t.id.as_bytes()).to_string();
+        t.id = literal.clone();
+        sql.create(Entity::Team(Box::new(t.clone()))).unwrap();
+        assert_eq!(
+            sql.get(Family::Team, &literal).unwrap().unwrap().entity,
+            Entity::Team(Box::new(t))
+        );
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM teams", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn native_agent_optional_states_config_maxima_and_unsigned_stats_are_lossless() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        for (i, autonomous) in [None, Some(false), Some(true)].into_iter().enumerate() {
+            let mut a = agent();
+            a.id = format!("a{i}");
+            a.autonomous = autonomous;
+            a.role = Some(String::new());
+            a.current_task = Some("x".repeat(65537));
+            a.config.max_turns = Some(u32::MAX);
+            a.config.timeout_ms = Some(u64::MAX);
+            a.config.stall_timeout_ms = Some(u64::MAX);
+            a.stats.tasks_completed = i64::MAX as u64;
+            a.stats.tasks_failed = i64::MAX as u64 + 1;
+            a.stats.total_runs = u64::MAX;
+            a.stats.total_runtime_ms = u64::MAX;
+            a.stats.tokens_used = Some(u64::MAX);
+            a.capabilities = vec!["b".into(), "a".into(), "b".into()];
+            let saved = sql.create(Entity::Agent(Box::new(a.clone()))).unwrap();
+            assert_eq!(sql.get(Family::Agent, &a.id).unwrap(), Some(saved));
+            let values: [Option<i64>; 6] = tx.query_row(
+            "SELECT autonomous,tasks_completed,tasks_failed,total_runs,total_runtime_ms,tokens_used FROM agents WHERE id=?1",
+            [&a.id], |r| Ok([r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?])
+        ).unwrap();
+            assert_eq!(
+                values,
+                [
+                    autonomous.map(i64::from),
+                    Some(i64::MAX),
+                    None,
+                    None,
+                    None,
+                    None
+                ]
+            );
+        }
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM agents WHERE name='same'", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn native_run_local_uses_serialized_json_byte_cap_keeps_pid_and_tokens() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        for (i, path) in ["small".into(), "\"".repeat(65536), "é".repeat(32769)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut r = run();
+            r.id = format!("r{i}");
+            r.workspace_path = path;
+            r.pid = Some(u32::MAX);
+            r.attempt = u32::MAX;
+            r.tokens=serde_json::from_value(json!({"input":i64::MAX,"output":i64::MAX as u64+1,"reasoning":u64::MAX,"cache_read":0,"cache_write":u64::MAX,"total":99})).ok();
+            let saved = sql.create(Entity::Run(Box::new(r.clone()))).unwrap();
+            assert_eq!(sql.get(Family::Run, &r.id).unwrap(), Some(saved));
+            let actual:(String,i64,Option<i64>,Option<i64>,i64,Option<i64>,i64)=tx.query_row("SELECT local,tokens_input,tokens_output,tokens_reasoning,tokens_cache_read,tokens_cache_write,tokens_total FROM runs WHERE id=?1",[&r.id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).unwrap();
+            assert!(actual.0.len() <= 65536);
+            let local: Value = serde_json::from_str(&actual.0).unwrap();
+            assert_eq!(local["pid"], u32::MAX);
+            assert_eq!(local.get("workspace_path").is_some(), i == 0);
+            assert_eq!(
+                (actual.1, actual.2, actual.3, actual.4, actual.5, actual.6),
+                (i64::MAX, None, None, 0, None, 99)
+            );
+        }
+    }
+
+    #[test]
+    fn native_claim_identity_is_preserved_and_form_aware_run_collisions_stay_separate() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let mut indirect = run();
+        indirect.id = "r".repeat(65537);
+        indirect.task_id = "t".repeat(65537);
+        indirect.agent_id = "a".repeat(65537);
+        let mut literal = indirect.clone();
+        literal.id = BlobHash::of(indirect.id.as_bytes()).to_string();
+        literal.task_id = BlobHash::of(indirect.task_id.as_bytes()).to_string();
+        literal.agent_id = BlobHash::of(indirect.agent_id.as_bytes()).to_string();
+        literal.prompt = "literal".into();
+        let a = sql.create(Entity::Run(Box::new(indirect.clone()))).unwrap();
+        let b = sql.create(Entity::Run(Box::new(literal.clone()))).unwrap();
+        // Two claim identities with the same stored task bytes, separated by form.
+        tx.execute(
+            "UPDATE runs SET run_no=1,counted=1,epoch=1,attempt_no=1",
+            [],
+        )
+        .unwrap();
+        let before = native_state(&tx);
+        let mut wrong = indirect.clone();
+        wrong.task_id = literal.task_id.clone();
+        assert!(matches!(
+            sql.update(Entity::Run(Box::new(wrong)), a.revision),
+            Err(NativeError::ClaimedIdentity)
+        ));
+        let mut wrong = indirect.clone();
+        wrong.agent_id = literal.agent_id.clone();
+        assert!(matches!(
+            sql.update(Entity::Run(Box::new(wrong)), a.revision),
+            Err(NativeError::ClaimedIdentity)
+        ));
+        assert_eq!(native_state(&tx), before);
+        indirect.prompt = "changed".into();
+        indirect.attempt = 2;
+        let a = sql
+            .update(Entity::Run(Box::new(indirect.clone())), a.revision)
+            .unwrap();
+        assert_eq!(sql.get(Family::Run, &indirect.id).unwrap(), Some(a));
+        assert_eq!(sql.get(Family::Run, &literal.id).unwrap(), Some(b));
+        let claims: Vec<(i64, i64, i64, i64)> = tx
+            .prepare("SELECT run_no,counted,epoch,attempt_no FROM runs ORDER BY id_form")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(claims, vec![(1, 1, 1, 1), (1, 1, 1, 1)]);
+        assert_eq!(
+            tx.query_row(
+                "SELECT COUNT(*) FROM counters WHERE name NOT LIKE 'position:%'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn native_failed_install_update_delete_and_move_are_caught_without_partial_rows() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let saved = sql.create(Entity::Run(Box::new(run()))).unwrap();
+        tx.execute_batch("CREATE TEMP TRIGGER fail_ref BEFORE INSERT ON entity_blob_refs WHEN NEW.locator='/prompt' BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+        let before = native_state(&tx);
+        let mut changed = run();
+        changed.prompt = "changed".into();
+        assert!(
+            sql.update(Entity::Run(Box::new(changed.clone())), saved.revision)
+                .is_err()
+        );
+        assert_eq!(native_state(&tx), before);
+        assert_eq!(sql.get(Family::Run, "r").unwrap(), Some(saved.clone()));
+        changed.id = "other".into();
+        assert!(sql.create(Entity::Run(Box::new(changed))).is_err());
+        assert_eq!(native_state(&tx), before);
+        tx.execute_batch("DROP TRIGGER fail_ref; CREATE TEMP TRIGGER fail_delete BEFORE DELETE ON runs BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+        assert!(sql.delete(Family::Run, "r", saved.revision).is_err());
+        assert_eq!(native_state(&tx), before);
+        tx.execute_batch("DROP TRIGGER fail_delete; CREATE TEMP TRIGGER fail_counter BEFORE UPDATE ON counters BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+        assert!(sql.move_to_end(Family::Run, "r", saved.revision).is_err());
+        assert_eq!(native_state(&tx), before);
+        tx.execute_batch("DROP TRIGGER fail_counter").unwrap();
+        sql.create(Entity::Agent(Box::new(agent()))).unwrap();
+        sql.ensure_committable().unwrap();
+        tx.commit().unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM runs", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn native_projection_membership_reference_drift_and_empty_prompt_ordinal_are_refused() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        sql.create(Entity::Agent(Box::new(agent()))).unwrap();
+        let mut t = team();
+        t.members =
+            serde_json::from_value(json!([{"agent_id":"a","role":"lead","joined_at":"opaque"}]))
+                .unwrap();
+        t.task_pool = vec!["x".into()];
+        sql.create(Entity::Team(Box::new(t))).unwrap();
+        sql.create(Entity::Run(Box::new(run()))).unwrap();
+        for (family, id, mutation) in [
+            (Family::Agent, "a", "UPDATE agents SET status='running'"),
+            (Family::Agent, "a", "UPDATE agents SET autonomous=0"),
+            (Family::Agent, "a", "UPDATE agents SET tasks_completed=1"),
+            (Family::Agent, "a", "UPDATE agents SET current_task=''"),
+            (Family::Team, "t", "UPDATE teams SET name='different'"),
+            (Family::Team, "t", "UPDATE team_members SET ordinal=5"),
+            (
+                Family::Team,
+                "t",
+                "UPDATE team_members SET joined_at_text='different'",
+            ),
+            (
+                Family::Team,
+                "t",
+                "UPDATE team_tasks SET task_id='different'",
+            ),
+            (Family::Run, "r", "UPDATE runs SET attempt=2"),
+            (Family::Run, "r", "UPDATE runs SET started_at_text=''"),
+            (Family::Run, "r", "UPDATE runs SET prompt_sha256=NULL"),
+            (Family::Run, "r", "UPDATE runs SET local='{}'"),
+            (
+                Family::Run,
+                "r",
+                "UPDATE entity_blob_refs SET ordinal=1 WHERE family='run'",
+            ),
+            (Family::Run, "r", "DELETE FROM blobs"),
+            (
+                Family::Run,
+                "r",
+                "UPDATE entity_details SET format=2 WHERE family='run'",
+            ),
+            (
+                Family::Run,
+                "r",
+                "DELETE FROM entity_details WHERE family='run'",
+            ),
+        ] {
+            tx.execute_batch("SAVEPOINT damage").unwrap();
+            tx.execute_batch(mutation).unwrap();
+            assert!(
+                matches!(sql.get(family, id), Err(NativeError::Corrupt { .. })),
+                "{mutation}"
+            );
+            tx.execute_batch("ROLLBACK TO damage; RELEASE damage")
+                .unwrap();
+            assert!(sql.get(family, id).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn native_counter_missing_behind_negative_exhausted_and_revision_overflow_do_not_write() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        sql.create(Entity::Run(Box::new(run()))).unwrap();
+        for mutation in [
+            "DELETE FROM counters",
+            "UPDATE counters SET value=0",
+            "UPDATE counters SET value=-1",
+            "UPDATE counters SET value=9223372036854775807",
+        ] {
+            tx.execute_batch("SAVEPOINT damage").unwrap();
+            tx.execute_batch(mutation).unwrap();
+            let before = native_state(&tx);
+            let mut r = run();
+            r.id = "new".into();
+            assert!(sql.create(Entity::Run(Box::new(r))).is_err());
+            assert_eq!(native_state(&tx), before);
+            tx.execute_batch("ROLLBACK TO damage; RELEASE damage")
+                .unwrap();
+        }
+        tx.execute("UPDATE runs SET revision=?1", [i64::MAX])
+            .unwrap();
+        let max: Revision = serde_json::from_value(json!(i64::MAX)).unwrap();
+        let before = native_state(&tx);
+        assert!(matches!(
+            sql.update(Entity::Run(Box::new(run())), max),
+            Err(NativeError::Store(StoreError::CounterExhausted))
+        ));
+        assert!(matches!(
+            sql.move_to_end(Family::Run, "r", max),
+            Err(NativeError::Store(StoreError::CounterExhausted))
+        ));
+        assert_eq!(native_state(&tx), before);
+    }
+
+    #[test]
+    fn native_updates_and_moves_preserve_independent_columns() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let a = sql.create(Entity::Agent(Box::new(agent()))).unwrap();
+        let r = sql.create(Entity::Run(Box::new(run()))).unwrap();
+        tx.execute_batch("UPDATE agents SET created_at=17,updated_at=19,last_run_finished_at=23; UPDATE runs SET branch='retained',worker_id='retained',events_pruned_count=7").unwrap();
+        for saved in [a, r] {
+            let family = Family::of(&saved.entity).unwrap();
+            let updated = sql.update(saved.entity, saved.revision).unwrap();
+            sql.move_to_end(family, updated.entity.id(), updated.revision)
+                .unwrap();
+        }
+        assert_eq!(
+            tx.query_row(
+                "SELECT created_at,updated_at,last_run_finished_at FROM agents",
+                [],
+                |r| Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?
+                ))
+            )
+            .unwrap(),
+            (17, 19, 23)
+        );
+        assert_eq!(
+            tx.query_row(
+                "SELECT branch,worker_id,events_pruned_count FROM runs",
+                [],
+                |r| Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?
+                ))
+            )
+            .unwrap(),
+            ("retained".into(), "retained".into(), 7)
+        );
+    }
+
+    #[test]
+    fn native_rollback_failure_retains_both_errors_and_poison_blocks_later_writes() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        sql.create(Entity::Agent(Box::new(agent()))).unwrap();
+        tx.execute_batch("CREATE TEMP TRIGGER abort_transaction BEFORE INSERT ON entity_blob_refs BEGIN SELECT RAISE(ROLLBACK,'injected'); END").unwrap();
+        let error = sql.create(Entity::Run(Box::new(run()))).unwrap_err();
+        assert!(
+            matches!(error,NativeError::Rollback {operation,rollback:rusqlite::Error::SqliteFailure(..)} if matches!(*operation,NativeError::Sql(rusqlite::Error::SqliteFailure(..))))
+        );
+        assert!(matches!(
+            sql.ensure_committable(),
+            Err(NativeError::Aborted)
+        ));
+        assert!(matches!(
+            sql.create(Entity::Team(Box::new(team()))),
+            Err(NativeError::Aborted)
+        ));
+        assert!(tx.is_autocommit());
+    }
+
+    #[test]
+    fn native_value_equivalent_detail_is_readable_without_reencoding_hash_equality() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let saved = sql.create(Entity::Agent(Box::new(agent()))).unwrap();
+        let encoded: String = tx
+            .query_row(
+                "SELECT detail FROM entity_details WHERE family='agent'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let value: Value = serde_json::from_str(&encoded).unwrap();
+        let mut reordered = Map::new();
+        for (key, value) in value.as_object().unwrap().iter().rev() {
+            reordered.insert(key.clone(), value.clone());
+        }
+        reordered.insert("capabilities".into(), json!([]));
+        let text = serde_json::to_string_pretty(&reordered).unwrap();
+        assert_ne!(text, encoded);
+        tx.execute(
+        "UPDATE entity_details SET detail=?1,detail_bytes=?2,detail_sha256=?3 WHERE family='agent'",
+        params![
+            text,
+            text.len() as i64,
+            BlobHash::of(text.as_bytes()).to_string()
+        ],
+    )
+    .unwrap();
+        assert_eq!(sql.get(Family::Agent, "a").unwrap(), Some(saved));
+    }
+
+    #[test]
+    fn native_read_snapshot_and_caller_transaction_each_hydrate_one_state() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let db = _temp.path().join("snapshot.sqlite");
+        let mut writer = rusqlite::Connection::open(&db).unwrap();
+        writer.execute_batch("PRAGMA journal_mode=WAL").unwrap();
+        for schema in [
+            crate::sqlite::migrations::INITIAL_SCHEMA,
+            crate::sqlite::migrations::ATTENTION_FACTS,
+            crate::sqlite::migrations::TASK_FORMAT,
+            crate::sqlite::migrations::AGENT_TEAM_RUN,
+        ] {
+            writer.execute_batch(schema).unwrap();
+        }
+        let first = {
+            let tx = writer.transaction().unwrap();
+            let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+            let first = sql.create(Entity::Agent(Box::new(agent()))).unwrap();
+            tx.commit().unwrap();
+            first
+        };
+        let mut reader = rusqlite::Connection::open(&db).unwrap();
+        let snapshot = reader.transaction().unwrap();
+        assert_eq!(
+            NativeSql::new(&snapshot, &disk, "p", 123)
+                .get(Family::Agent, "a")
+                .unwrap(),
+            Some(first.clone())
+        );
+        let changed = {
+            let tx = writer.transaction().unwrap();
+            let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+            let mut a = agent();
+            a.name = "new".into();
+            let saved = sql
+                .update(Entity::Agent(Box::new(a)), first.revision)
+                .unwrap();
+            assert_eq!(sql.get(Family::Agent, "a").unwrap(), Some(saved.clone()));
+            tx.commit().unwrap();
+            saved
+        };
+        assert_eq!(
+            NativeSql::new(&snapshot, &disk, "p", 123)
+                .hydrate(Family::Agent, &["a".into()])
+                .unwrap(),
+            vec![first]
+        );
+        snapshot.commit().unwrap();
+        let fresh = reader.transaction().unwrap();
+        assert_eq!(
+            NativeSql::new(&fresh, &disk, "p", 123)
+                .get(Family::Agent, "a")
+                .unwrap(),
+            Some(changed)
+        );
+    }
+
+    #[test]
+    fn native_exact_time_projection_keeps_opaque_offsets_submillisecond_and_original_text() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        for (i, text, expected) in [
+            ("0", "opaque", None),
+            ("1", "2026-11-20T10:00:00.1239+02:00", None),
+            (
+                "2",
+                "2026-11-20T10:00:00.123+02:00",
+                Some(1795161600123_i64),
+            ),
+            ("3", "2026-11-20T08:00:00.123Z", Some(1795161600123_i64)),
+        ] {
+            let mut r = run();
+            r.id = i.into();
+            r.started_at = text.into();
+            r.finished_at = Some(text.into());
+            let saved = sql.create(Entity::Run(Box::new(r))).unwrap();
+            assert_eq!(sql.get(Family::Run, i).unwrap(), Some(saved));
+            let values: (String, Option<i64>, Option<i64>) = tx
+                .query_row(
+                    "SELECT started_at_text,started_at,finished_at FROM runs WHERE id=?1",
+                    [i],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(values, (text.into(), expected, expected));
+        }
+    }
+
+    #[test]
+    fn native_every_scalar_projection_and_invalid_utf8_are_checked_on_read() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        sql.create(Entity::Agent(Box::new(agent()))).unwrap();
+        sql.create(Entity::Team(Box::new(team()))).unwrap();
+        sql.create(Entity::Run(Box::new(run()))).unwrap();
+        for (family, id, table, columns) in [
+            (
+                Family::Agent,
+                "a",
+                "agents",
+                "status autonomous tasks_completed tasks_failed total_runs total_runtime_ms tokens_used",
+            ),
+            (
+                Family::Team,
+                "t",
+                "teams",
+                "status config created_at updated_at",
+            ),
+            (
+                Family::Run,
+                "r",
+                "runs",
+                "status attempt started_at finished_at error_kind prompt_sha256 tokens_input tokens_output tokens_reasoning tokens_cache_read tokens_cache_write tokens_total local",
+            ),
+        ] {
+            for column in columns.split_whitespace() {
+                tx.execute_batch("SAVEPOINT damage").unwrap();
+                tx.execute_batch(&format!("UPDATE {table} SET {column}=CASE typeof({column}) WHEN 'integer' THEN {column}+1 WHEN 'text' THEN 'drift' ELSE 0 END")).unwrap();
+                assert!(
+                    matches!(sql.get(family, id), Err(NativeError::Corrupt { .. })),
+                    "{table}.{column}"
+                );
+                tx.execute_batch("ROLLBACK TO damage; RELEASE damage")
+                    .unwrap();
+            }
+        }
+        tx.execute_batch("UPDATE agents SET name=CAST(x'80' AS TEXT)")
+            .unwrap();
+        assert!(matches!(
+            sql.get(Family::Agent, "a"),
+            Err(NativeError::Corrupt {
+                check: "text encoding",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn native_prompt_tag_registration_time_and_absent_vs_zero_tokens_stay_distinct() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        for (id, tokens) in [
+            ("absent", None),
+            ("zero", Some(orch_domain::TokenUsage::default())),
+        ] {
+            let mut r = run();
+            r.id = id.into();
+            r.tokens = tokens;
+            let saved = sql.create(Entity::Run(Box::new(r))).unwrap();
+            assert_eq!(sql.get(Family::Run, id).unwrap(), Some(saved));
+            let detail: String = tx
+                .query_row(
+                    "SELECT detail FROM entity_details WHERE family='run' AND entity_key=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let value: Value = serde_json::from_str(&detail).unwrap();
+            assert!(value["prompt"]["$blob"].is_object());
+        }
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*),MIN(created_at) FROM blobs", [], |r| Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?
+            )))
+            .unwrap(),
+            (1, 123)
+        );
+        assert_eq!(
+            tx.query_row("SELECT tokens_total FROM runs WHERE id='absent'", [], |r| r
+                .get::<_, Option<i64>>(0))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            tx.query_row("SELECT tokens_total FROM runs WHERE id='zero'", [], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .unwrap(),
+            Some(0)
+        );
+    }
+}
+
+// Private native leaf: authorization, fencing and R140 observation belong to
+// the combined adapter. This type neither opens nor commits a transaction.
+use crate::blob::{BlobReferences, ReferenceError};
+use orch_core::store::{Entity, EntityKind, Record, Revision, StoreError};
+use rusqlite::{OptionalExtension, Transaction, params, types::Value as SqlValue};
+
+type NativeResult<T> = std::result::Result<T, NativeError>;
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum NativeError {
+    #[error("stored {family} form {form} failed {check} at {locator}")]
+    Corrupt {
+        family: &'static str,
+        form: i64,
+        check: &'static str,
+        locator: String,
+    },
+    #[error(transparent)]
+    Sql(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Counter(Box<super::SqliteError>),
+    #[error("entity object access failed: {0:?}")]
+    Access(std::io::ErrorKind),
+    #[error(transparent)]
+    Publication(crate::blob::BlobError),
+    #[error("entity encoding is not representable")]
+    Encoding,
+    #[error("ordinary CRUD cannot reassign a claimed run")]
+    ClaimedIdentity,
+    #[error("native transaction cannot commit after failed rollback")]
+    Aborted,
+    #[error("operation failed: {operation}; rollback failed: {rollback}")]
+    Rollback {
+        operation: Box<NativeError>,
+        rollback: rusqlite::Error,
+    },
+}
+
+impl Family {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Team => "team",
+            Self::Run => "run",
+        }
+    }
+    fn table(self) -> &'static str {
+        match self {
+            Self::Agent => "agents",
+            Self::Team => "teams",
+            Self::Run => "runs",
+        }
+    }
+    fn counter(self) -> &'static str {
+        match self {
+            Self::Agent => "position:agent",
+            Self::Team => "position:team",
+            Self::Run => "position:run",
+        }
+    }
+    fn kind(self) -> EntityKind {
+        match self {
+            Self::Agent => EntityKind::Agent,
+            Self::Team => EntityKind::Team,
+            Self::Run => EntityKind::Run,
+        }
+    }
+    fn of(entity: &Entity) -> NativeResult<Self> {
+        match entity {
+            Entity::Agent(_) => Ok(Self::Agent),
+            Entity::Team(_) => Ok(Self::Team),
+            Entity::Run(_) => Ok(Self::Run),
+            _ => Err(NativeError::Encoding),
+        }
+    }
+    fn texts(self) -> &'static [&'static str] {
+        match self {
+            Self::Agent => &[
+                "id",
+                "name",
+                "adapter",
+                "role",
+                "current_task",
+                "last_error",
+            ],
+            Self::Team => &[
+                "id",
+                "name",
+                "description",
+                "lead_agent_id",
+                "created_at_text",
+            ],
+            Self::Run => &["id", "task_id", "agent_id", "started_at_text", "error"],
+        }
+    }
+    fn scalars(self) -> &'static [&'static str] {
+        match self {
+            Self::Agent => &[
+                "config",
+                "status",
+                "autonomous",
+                "tasks_completed",
+                "tasks_failed",
+                "total_runs",
+                "total_runtime_ms",
+                "tokens_used",
+            ],
+            Self::Team => &["status", "config", "created_at", "updated_at"],
+            Self::Run => &[
+                "status",
+                "attempt",
+                "started_at",
+                "finished_at",
+                "error_kind",
+                "prompt_sha256",
+                "tokens_input",
+                "tokens_output",
+                "tokens_reasoning",
+                "tokens_cache_read",
+                "tokens_cache_write",
+                "tokens_total",
+                "local",
+            ],
+        }
+    }
+    fn columns(self) -> Vec<String> {
+        let mut columns = Vec::new();
+        for field in self.texts() {
+            columns.extend([
+                field.to_string(),
+                format!("{field}_form"),
+                format!("{field}_sha256"),
+                format!("{field}_bytes"),
+            ]);
+        }
+        columns.extend(self.scalars().iter().map(|s| s.to_string()));
+        columns
+    }
+}
+fn native_corrupt(family: Family, id: &str, check: &'static str, locator: &str) -> NativeError {
+    NativeError::Corrupt {
+        family: family.name(),
+        form: key(id).0,
+        check,
+        locator: locator.into(),
+    }
+}
+fn key(id: &str) -> (i64, String) {
+    if id.len() <= INLINE_TEXT_MAX_BYTES {
+        (0, id.into())
+    } else {
+        (1, BlobHash::of(id.as_bytes()).to_string())
+    }
+}
+fn integer(value: u64) -> NativeResult<i64> {
+    i64::try_from(value).map_err(|_| StoreError::CounterExhausted.into())
+}
+fn unsigned(value: u64) -> SqlValue {
+    i64::try_from(value)
+        .map(SqlValue::Integer)
+        .unwrap_or(SqlValue::Null)
+}
+fn nullable_text(value: Option<&str>) -> SqlValue {
+    value
+        .map(|v| SqlValue::Text(v.into()))
+        .unwrap_or(SqlValue::Null)
+}
+fn time(value: &str) -> SqlValue {
+    value
+        .parse::<jiff::Timestamp>()
+        .ok()
+        .filter(|t| t.as_nanosecond() % 1_000_000 == 0)
+        .map(|t| SqlValue::Integer(t.as_millisecond()))
+        .unwrap_or(SqlValue::Null)
+}
+fn quartet(value: Option<&str>, identity: bool) -> Vec<SqlValue> {
+    match value {
+        Some(text) if text.len() > INLINE_TEXT_MAX_BYTES => {
+            let hash = BlobHash::of(text.as_bytes()).to_string();
+            vec![
+                SqlValue::Text(if identity {
+                    hash.clone()
+                } else {
+                    String::new()
+                }),
+                SqlValue::Integer(1),
+                SqlValue::Text(hash),
+                SqlValue::Integer(text.len() as i64),
+            ]
+        }
+        other => vec![
+            nullable_text(other),
+            SqlValue::Integer(0),
+            SqlValue::Null,
+            SqlValue::Null,
+        ],
+    }
+}
+fn local(run: &Run) -> NativeResult<String> {
+    let mut map = Map::new();
+    if let Some(pid) = run.pid {
+        map.insert("pid".into(), pid.into());
+    }
+    if run.workspace_path.len() <= INLINE_TEXT_MAX_BYTES {
+        map.insert("workspace_path".into(), run.workspace_path.clone().into());
+    }
+    let mut json = serde_json::to_string(&map).map_err(|_| NativeError::Encoding)?;
+    if json.len() > INLINE_TEXT_MAX_BYTES {
+        map.remove("workspace_path");
+        json = serde_json::to_string(&map).map_err(|_| NativeError::Encoding)?;
+    }
+    Ok(json)
+}
+fn projections(entity: &Entity) -> NativeResult<Vec<SqlValue>> {
+    let mut values = Vec::new();
+    match entity {
+        Entity::Agent(a) => {
+            for (text, identity) in [
+                (Some(a.id.as_str()), true),
+                (Some(a.name.as_str()), false),
+                (Some(a.adapter.as_str()), false),
+                (a.role.as_deref(), false),
+                (a.current_task.as_deref(), false),
+                (a.last_error.as_ref().map(|e| e.message.as_str()), false),
+            ] {
+                values.extend(quartet(text, identity));
+            }
+            values.extend([
+                SqlValue::Text("{}".into()),
+                SqlValue::Text(a.status.to_string()),
+                a.autonomous
+                    .map(|v| SqlValue::Integer(v.into()))
+                    .unwrap_or(SqlValue::Null),
+                unsigned(a.stats.tasks_completed),
+                unsigned(a.stats.tasks_failed),
+                unsigned(a.stats.total_runs),
+                unsigned(a.stats.total_runtime_ms),
+                a.stats.tokens_used.map(unsigned).unwrap_or(SqlValue::Null),
+            ]);
+        }
+        Entity::Team(t) => {
+            for text in [
+                Some(t.id.as_str()),
+                Some(t.name.as_str()),
+                t.description.as_deref(),
+                Some(t.lead_agent_id.as_str()),
+                Some(t.created_at.as_str()),
+            ] {
+                values.extend(quartet(text, values.is_empty()));
+            }
+            values.extend([
+                SqlValue::Text(t.status.to_string()),
+                SqlValue::Text(
+                    serde_json::to_string(&t.config).map_err(|_| NativeError::Encoding)?,
+                ),
+                time(&t.created_at),
+                time(&t.updated_at),
+            ]);
+        }
+        Entity::Run(r) => {
+            for (text, identity) in [
+                (Some(r.id.as_str()), true),
+                (Some(r.task_id.as_str()), true),
+                (Some(r.agent_id.as_str()), true),
+                (Some(r.started_at.as_str()), false),
+                (r.error.as_deref(), false),
+            ] {
+                values.extend(quartet(text, identity));
+            }
+            let error_kind = r
+                .error_kind
+                .map(|v| serde_json::to_value(v).map_err(|_| NativeError::Encoding))
+                .transpose()?;
+            values.extend([
+                SqlValue::Text(r.status.to_string()),
+                SqlValue::Integer(r.attempt.into()),
+                time(&r.started_at),
+                r.finished_at.as_deref().map(time).unwrap_or(SqlValue::Null),
+                nullable_text(error_kind.as_ref().and_then(Value::as_str)),
+                SqlValue::Text(BlobHash::of(r.prompt.as_bytes()).to_string()),
+            ]);
+            for value in [
+                r.tokens.as_ref().map(|v| v.input),
+                r.tokens.as_ref().map(|v| v.output),
+                r.tokens.as_ref().map(|v| v.reasoning),
+                r.tokens.as_ref().map(|v| v.cache_read),
+                r.tokens.as_ref().map(|v| v.cache_write),
+                r.tokens.as_ref().map(|v| v.total),
+            ] {
+                values.push(value.map(unsigned).unwrap_or(SqlValue::Null));
+            }
+            values.push(SqlValue::Text(local(r)?));
+        }
+        _ => return Err(NativeError::Encoding),
+    }
+    Ok(values)
+}
+fn format_error(family: Family, id: &str, error: FormatError, writing: bool) -> NativeError {
+    match error {
+        FormatError::Access { kind, .. } | FormatError::Publish(TextError::Access(kind)) => {
+            NativeError::Access(kind)
+        }
+        FormatError::Publish(TextError::Publish(error)) if writing => {
+            NativeError::Publication(error)
+        }
+        _ if writing => NativeError::Encoding,
+        FormatError::Invalid { check, locator } => native_corrupt(family, id, check, &locator),
+        _ => native_corrupt(family, id, "detail encoding", ""),
+    }
+}
+
+pub(super) struct NativeSql<'a, 'conn> {
+    tx: &'a Transaction<'conn>,
+    disk: &'a DiskBlobStore,
+    project: &'a str,
+    poisoned: bool,
+    now: i64,
+}
+impl<'a, 'conn> NativeSql<'a, 'conn> {
+    pub(super) fn new(
+        tx: &'a Transaction<'conn>,
+        disk: &'a DiskBlobStore,
+        project: &'a str,
+        now: i64,
+    ) -> Self {
+        Self {
+            tx,
+            disk,
+            project,
+            poisoned: false,
+            now,
+        }
+    }
+    pub(super) fn ensure_committable(&self) -> NativeResult<()> {
+        if self.poisoned || self.tx.is_autocommit() {
+            Err(NativeError::Aborted)
+        } else {
+            Ok(())
+        }
+    }
+    fn atomic<T>(&mut self, work: impl FnOnce(&Self) -> NativeResult<T>) -> NativeResult<T> {
+        self.ensure_committable()?;
+        self.tx.execute_batch("SAVEPOINT native_entity")?;
+        let result = work(self).and_then(|v| {
+            self.tx.execute_batch("RELEASE native_entity")?;
+            Ok(v)
+        });
+        match result {
+            Ok(value) => Ok(value),
+            Err(operation) => match self
+                .tx
+                .execute_batch("ROLLBACK TO native_entity; RELEASE native_entity")
+            {
+                Ok(()) => Err(operation),
+                Err(rollback) => {
+                    self.poisoned = true;
+                    Err(NativeError::Rollback {
+                        operation: Box::new(operation),
+                        rollback,
+                    })
+                }
+            },
+        }
+    }
+    // Compiled identifiers only. Keys, locators and payloads are always bound.
+    fn rows(&self, query: &str, values: &[SqlValue]) -> NativeResult<Vec<Vec<SqlValue>>> {
+        let mut stmt = self.tx.prepare(query)?;
+        let count = stmt.column_count();
+        Ok(stmt
+            .query_map(rusqlite::params_from_iter(values), |r| {
+                (0..count).map(|i| r.get(i)).collect()
+            })?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+    fn identity(&self, id: &str) -> Vec<SqlValue> {
+        let (form, key) = key(id);
+        vec![
+            SqlValue::Text(self.project.into()),
+            SqlValue::Integer(form),
+            SqlValue::Text(key),
+        ]
+    }
+    pub(super) fn get(&self, family: Family, id: &str) -> NativeResult<Option<Record>> {
+        self.get_inner(family, id).map_err(|error| match error {
+            NativeError::Sql(rusqlite::Error::Utf8Error(..)) => {
+                native_corrupt(family, id, "text encoding", "native/detail/ref")
+            }
+            other => other,
+        })
+    }
+
+    fn get_inner(&self, family: Family, id: &str) -> NativeResult<Option<Record>> {
+        let columns = family.columns();
+        let rows = self.rows(
+            &format!(
+                "SELECT {},revision,position FROM {} WHERE project_id=?1 AND id_form=?2 AND id=?3",
+                columns.join(","),
+                family.table()
+            ),
+            &self.identity(id),
+        )?;
+        let Some(native) = rows.first() else {
+            return Ok(None);
+        };
+        if native[..4] != quartet(Some(id), true) {
+            return Err(native_corrupt(family, id, "identity projection", "id"));
+        }
+        let n = columns.len();
+        let (SqlValue::Integer(revision), SqlValue::Integer(position)) =
+            (&native[n], &native[n + 1])
+        else {
+            return Err(native_corrupt(
+                family,
+                id,
+                "counter type",
+                "revision/position",
+            ));
+        };
+        if *revision <= 0 || *position <= 0 {
+            return Err(native_corrupt(family, id, "counter", "revision/position"));
+        }
+        let detail = self.detail(family, id)?;
+        let entity = match family {
+            Family::Agent => decode_agent(self.disk, &detail).map(|v| Entity::Agent(Box::new(v))),
+            Family::Team => decode_team(self.disk, &detail).map(|v| Entity::Team(Box::new(v))),
+            Family::Run => decode_run(self.disk, &detail).map(|v| Entity::Run(Box::new(v))),
+        }
+        .map_err(|e| format_error(family, id, e, false))?;
+        if entity.id() != id {
+            return Err(native_corrupt(family, id, "identity", "/id"));
+        }
+        let expected = projections(&entity)
+            .map_err(|_| native_corrupt(family, id, "projection encoding", ""))?;
+        for (i, column) in columns.iter().enumerate() {
+            if native[i] != expected[i] {
+                return Err(native_corrupt(family, id, "projection", column));
+            }
+        }
+        if let Entity::Team(t) = &entity {
+            self.check_members(t)?;
+        }
+        if family == Family::Run {
+            self.claim(id)?;
+        }
+        let revision = serde_json::from_value((*revision).into())
+            .map_err(|_| native_corrupt(family, id, "revision", "revision"))?;
+        Ok(Some(Record {
+            entity,
+            revision,
+            position: *position as u64,
+        }))
+    }
+    pub(super) fn hydrate(&self, family: Family, ids: &[String]) -> NativeResult<Vec<Record>> {
+        ids.iter()
+            .map(|id| {
+                self.get(family, id)?
+                    .ok_or_else(|| native_corrupt(family, id, "selected row missing", "id"))
+            })
+            .collect()
+    }
+    fn detail(&self, family: Family, id: &str) -> NativeResult<Detail> {
+        let mut identity = self.identity(id);
+        identity.push(SqlValue::Text(family.name().into()));
+        let rows = self.rows("SELECT format,detail,detail_bytes,detail_sha256 FROM entity_details WHERE project_id=?1 AND key_form=?2 AND entity_key=?3 AND family=?4",&identity)?;
+        let Some(row) = rows.first() else {
+            return Err(native_corrupt(family, id, "detail missing", ""));
+        };
+        let [
+            SqlValue::Integer(1),
+            inline,
+            SqlValue::Integer(bytes),
+            SqlValue::Text(hash),
+        ] = row.as_slice()
+        else {
+            return Err(native_corrupt(family, id, "detail metadata", ""));
+        };
+        if *bytes < 0 || hash.parse::<BlobHash>().is_err() {
+            return Err(native_corrupt(family, id, "detail metadata", ""));
+        }
+        let inline = match inline {
+            SqlValue::Null if *bytes > INLINE_TEXT_MAX_BYTES as i64 => None,
+            SqlValue::Text(s) if s.len() <= INLINE_TEXT_MAX_BYTES && s.len() as i64 == *bytes => {
+                Some(s.clone())
+            }
+            _ => return Err(native_corrupt(family, id, "detail size", "")),
+        };
+        let rows = self.rows("SELECT locator,ordinal,sha256,size FROM entity_blob_refs WHERE project_id=?1 AND key_form=?2 AND entity_key=?3 AND family=?4 ORDER BY locator COLLATE BINARY,ordinal",&identity)?;
+        let mut refs: BTreeMap<String, Vec<Chunk>> = BTreeMap::new();
+        for row in rows {
+            let [
+                SqlValue::Text(locator),
+                SqlValue::Integer(ordinal),
+                SqlValue::Text(hash),
+                SqlValue::Integer(size),
+            ] = row.as_slice()
+            else {
+                return Err(native_corrupt(family, id, "reference metadata", ""));
+            };
+            if *ordinal < 0
+                || *size < 0
+                || *size as u64 > MAX_BLOB_BYTES
+                || (*size == 0 && !(family == Family::Run && locator == "/prompt"))
+                || hash.parse::<BlobHash>().is_err()
+            {
+                return Err(native_corrupt(family, id, "reference metadata", "blob_ref"));
+            }
+            let registration = self.rows(
+                "SELECT size,storage_location FROM blobs WHERE project_id=?1 AND sha256=?2",
+                &[
+                    SqlValue::Text(self.project.into()),
+                    SqlValue::Text(hash.clone()),
+                ],
+            )?;
+            if registration
+                != vec![vec![
+                    SqlValue::Integer(*size),
+                    SqlValue::Text("disk".into()),
+                ]]
+            {
+                return Err(native_corrupt(family, id, "blob registration", "blob_ref"));
+            }
+            refs.entry(locator.clone()).or_default().push(Chunk {
+                ordinal: *ordinal as u64,
+                sha256: hash.clone(),
+                size: *size as u64,
+            });
+        }
+        Ok(Detail {
+            inline,
+            bytes: *bytes as u64,
+            sha256: hash.clone(),
+            refs,
+        })
+    }
+    fn member_values(team: &Team) -> NativeResult<Vec<Vec<SqlValue>>> {
+        team.members
+            .iter()
+            .enumerate()
+            .map(|(ordinal, m)| {
+                let mut row = quartet(Some(&team.id), true);
+                row.push(SqlValue::Integer(integer(ordinal as u64)?));
+                row.push(nullable_text(
+                    Some(&m.agent_id)
+                        .filter(|s| s.len() <= INLINE_TEXT_MAX_BYTES)
+                        .map(String::as_str),
+                ));
+                row.extend(quartet(Some(m.role.as_str()), false));
+                row.push(time(&m.joined_at));
+                row.extend(quartet(Some(&m.joined_at), false));
+                Ok(row)
+            })
+            .collect()
+    }
+    fn check_members(&self, team: &Team) -> NativeResult<()> {
+        let actual = self.rows("SELECT team_id,team_id_form,team_id_sha256,team_id_bytes,ordinal,agent_id,role,role_form,role_sha256,role_bytes,joined_at,joined_at_text,joined_at_text_form,joined_at_text_sha256,joined_at_text_bytes FROM team_members WHERE project_id=?1 AND team_id_form=?2 AND team_id=?3 ORDER BY ordinal",&self.identity(&team.id))?;
+        if actual != Self::member_values(team)? {
+            return Err(native_corrupt(
+                Family::Team,
+                &team.id,
+                "membership",
+                "members",
+            ));
+        }
+        let actual = self.rows("SELECT team_id,team_id_form,team_id_sha256,team_id_bytes,task_id FROM team_tasks WHERE project_id=?1 AND team_id_form=?2 AND team_id=?3 ORDER BY task_id COLLATE BINARY",&self.identity(&team.id))?;
+        if actual != Self::task_values(team) {
+            return Err(native_corrupt(
+                Family::Team,
+                &team.id,
+                "membership",
+                "task_pool",
+            ));
+        }
+        Ok(())
+    }
+    fn task_values(team: &Team) -> Vec<Vec<SqlValue>> {
+        team.task_pool
+            .iter()
+            .filter(|s| s.len() <= INLINE_TEXT_MAX_BYTES)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|s| {
+                let mut row = quartet(Some(&team.id), true);
+                row.push(SqlValue::Text(s.clone()));
+                row
+            })
+            .collect()
+    }
+    fn claim(&self, id: &str) -> NativeResult<bool> {
+        let rows=self.rows("SELECT run_no,counted,epoch,attempt_no FROM runs WHERE project_id=?1 AND id_form=?2 AND id=?3",&self.identity(id))?;
+        match rows.first().map(Vec::as_slice) {
+            Some(
+                [
+                    SqlValue::Null,
+                    SqlValue::Null,
+                    SqlValue::Null,
+                    SqlValue::Null,
+                ],
+            ) => Ok(false),
+            Some(
+                [
+                    SqlValue::Integer(run),
+                    SqlValue::Integer(counted),
+                    SqlValue::Integer(epoch),
+                    attempt,
+                ],
+            ) if *run >= 0
+                && *epoch >= 0
+                && ((*counted == 0 && *attempt == SqlValue::Null)
+                    || (*counted == 1 && matches!(attempt,SqlValue::Integer(n) if *n>=0))) =>
+            {
+                Ok(true)
+            }
+            _ => Err(native_corrupt(Family::Run, id, "claim tuple", "claim")),
+        }
+    }
+    fn current(&self, family: Family, id: &str, expected: Revision) -> NativeResult<Record> {
+        match self.get(family, id)? {
+            Some(record) if record.revision == expected => Ok(record),
+            other => Err(StoreError::StaleRevision {
+                kind: family.kind(),
+                id: id.into(),
+                expected,
+                actual: other.map(|r| r.revision),
+            }
+            .into()),
+        }
+    }
+    fn next_position(&self, family: Family, id: &str) -> NativeResult<u64> {
+        let counter: Option<i64> = self
+            .tx
+            .query_row(
+                "SELECT value FROM counters WHERE project_id=?1 AND name=?2",
+                params![self.project, family.counter()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let last = counter.unwrap_or(0);
+        if last < 0 {
+            return Err(NativeError::Counter(Box::new(
+                super::SqliteError::CounterNegative {
+                    project: self.project.into(),
+                    name: family.counter(),
+                    value: last,
+                },
+            )));
+        }
+        let (min, max): (Option<i64>, Option<i64>) = self.tx.query_row(
+            &format!(
+                "SELECT MIN(position),MAX(position) FROM {} WHERE project_id=?1",
+                family.table()
+            ),
+            [self.project],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        if min.is_some_and(|v| v <= 0) {
+            return Err(native_corrupt(family, id, "counter", "position"));
+        }
+        if max.is_some_and(|v| v > last) {
+            return Err(NativeError::Counter(Box::new(if counter.is_none() {
+                super::SqliteError::CounterMissing {
+                    project: self.project.into(),
+                    name: family.counter(),
+                }
+            } else {
+                super::SqliteError::CounterBehind {
+                    project: self.project.into(),
+                    name: family.counter(),
+                    value: last,
+                }
+            })));
+        }
+        Ok(last.checked_add(1).ok_or(StoreError::CounterExhausted)? as u64)
+    }
+    fn store_position(&self, family: Family, position: u64) -> NativeResult<()> {
+        self.tx.execute("INSERT INTO counters(project_id,name,value) VALUES(?1,?2,?3) ON CONFLICT(project_id,name) DO UPDATE SET value=excluded.value",params![self.project,family.counter(),integer(position)?])?;
+        Ok(())
+    }
+    fn encode(&self, entity: &Entity) -> NativeResult<Detail> {
+        let family = Family::of(entity)?;
+        match entity {
+            Entity::Agent(v) => encode_agent(self.disk, v),
+            Entity::Team(v) => encode_team(self.disk, v),
+            Entity::Run(v) => encode_run(self.disk, v),
+            _ => return Err(NativeError::Encoding),
+        }
+        .map_err(|e| format_error(family, entity.id(), e, true))
+    }
+    pub(super) fn create(&mut self, entity: Entity) -> NativeResult<Record> {
+        self.ensure_committable()?;
+        let family = Family::of(&entity)?;
+        let id = entity.id();
+        if self.get(family, id)?.is_some() {
+            return Err(StoreError::AlreadyExists {
+                kind: family.kind(),
+                id: id.into(),
+            }
+            .into());
+        }
+        let mut identity = self.identity(id);
+        identity.push(SqlValue::Text(family.name().into()));
+        for table in ["entity_details", "entity_blob_refs"] {
+            if !self.rows(&format!("SELECT 1 FROM {table} WHERE project_id=?1 AND key_form=?2 AND entity_key=?3 AND family=?4 LIMIT 1"),&identity)?.is_empty() {return Err(native_corrupt(family,id,"orphan row",table));}
+        }
+        if family == Family::Team {
+            for table in ["team_members", "team_tasks"] {
+                if !self.rows(&format!("SELECT 1 FROM {table} WHERE project_id=?1 AND team_id_form=?2 AND team_id=?3 LIMIT 1"),&self.identity(id))?.is_empty() {return Err(native_corrupt(family,id,"orphan membership",table));}
+            }
+        }
+        let position = self.next_position(family, id)?;
+        let projected = projections(&entity)?;
+        let detail = self.encode(&entity)?;
+        self.atomic(|this| {
+            let mut columns = family.columns();
+            columns.extend(["project_id".into(), "revision".into(), "position".into()]);
+            let mut values = projected;
+            values.extend([
+                SqlValue::Text(this.project.into()),
+                SqlValue::Integer(1),
+                SqlValue::Integer(integer(position)?),
+            ]);
+            let slots = (1..=values.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            this.tx.execute(
+                &format!(
+                    "INSERT INTO {}({}) VALUES({slots})",
+                    family.table(),
+                    columns.join(",")
+                ),
+                rusqlite::params_from_iter(values),
+            )?;
+            this.install(&entity, &detail)?;
+            this.store_position(family, position)?;
+            Ok(Record {
+                entity,
+                revision: Revision::ONE,
+                position,
+            })
+        })
+    }
+    pub(super) fn update(&mut self, entity: Entity, expected: Revision) -> NativeResult<Record> {
+        self.ensure_committable()?;
+        let family = Family::of(&entity)?;
+        let old = self.current(family, entity.id(), expected)?;
+        if let (Entity::Run(old), Entity::Run(new)) = (&old.entity, &entity)
+            && self.claim(&old.id)?
+            && (old.task_id != new.task_id || old.agent_id != new.agent_id)
+        {
+            return Err(NativeError::ClaimedIdentity);
+        }
+        let revision = expected.next()?;
+        integer(revision.get())?;
+        let projected = projections(&entity)?;
+        let detail = self.encode(&entity)?;
+        self.atomic(|this| {
+            let mut values = this.identity(entity.id());
+            values.extend(projected);
+            values.push(SqlValue::Integer(integer(revision.get())?));
+            let mut assignments = family
+                .columns()
+                .iter()
+                .enumerate()
+                .map(|(i, c)| format!("{c}=?{}", i + 4))
+                .collect::<Vec<_>>();
+            assignments.push(format!("revision=?{}", values.len()));
+            this.tx.execute(
+                &format!(
+                    "UPDATE {} SET {} WHERE project_id=?1 AND id_form=?2 AND id=?3",
+                    family.table(),
+                    assignments.join(",")
+                ),
+                rusqlite::params_from_iter(values),
+            )?;
+            this.install(&entity, &detail)?;
+            Ok(Record {
+                entity,
+                revision,
+                position: old.position,
+            })
+        })
+    }
+    pub(super) fn move_to_end(
+        &mut self,
+        family: Family,
+        id: &str,
+        expected: Revision,
+    ) -> NativeResult<Record> {
+        self.ensure_committable()?;
+        let old = self.current(family, id, expected)?;
+        let revision = expected.next()?;
+        integer(revision.get())?;
+        let position = self.next_position(family, id)?;
+        self.atomic(|this| {
+            let mut values=this.identity(id);values.extend([SqlValue::Integer(integer(revision.get())?),SqlValue::Integer(integer(position)?)]);
+            this.tx.execute(&format!("UPDATE {} SET revision=?4,position=?5 WHERE project_id=?1 AND id_form=?2 AND id=?3",family.table()),rusqlite::params_from_iter(values))?;
+            this.store_position(family,position)?;Ok(Record {entity:old.entity,revision,position})
+        })
+    }
+    pub(super) fn delete(
+        &mut self,
+        family: Family,
+        id: &str,
+        expected: Revision,
+    ) -> NativeResult<()> {
+        self.ensure_committable()?;
+        self.current(family, id, expected)?;
+        self.atomic(|this| {
+            this.clear(family, id)?;
+            this.tx.execute(
+                &format!(
+                    "DELETE FROM {} WHERE project_id=?1 AND id_form=?2 AND id=?3",
+                    family.table()
+                ),
+                rusqlite::params_from_iter(this.identity(id)),
+            )?;
+            Ok(())
+        })
+    }
+    fn clear(&self, family: Family, id: &str) -> NativeResult<()> {
+        let mut values = self.identity(id);
+        values.push(SqlValue::Text(family.name().into()));
+        for table in ["entity_details", "entity_blob_refs"] {
+            self.tx.execute(&format!("DELETE FROM {table} WHERE project_id=?1 AND key_form=?2 AND entity_key=?3 AND family=?4"),rusqlite::params_from_iter(&values))?;
+        }
+        if family == Family::Team {
+            for table in ["team_members", "team_tasks"] {
+                self.tx.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE project_id=?1 AND team_id_form=?2 AND team_id=?3"
+                    ),
+                    rusqlite::params_from_iter(self.identity(id)),
+                )?;
+            }
+        }
+        Ok(())
+    }
+    fn install(&self, entity: &Entity, detail: &Detail) -> NativeResult<()> {
+        let family = Family::of(entity)?;
+        let id = entity.id();
+        let (form, key) = key(id);
+        self.clear(family, id)?;
+        self.tx.execute("INSERT INTO entity_details(project_id,family,key_form,entity_key,format,detail,detail_bytes,detail_sha256) VALUES(?1,?2,?3,?4,1,?5,?6,?7)",params![self.project,family.name(),form,key,detail.inline,integer(detail.bytes)?,detail.sha256])?;
+        for (locator, chunks) in &detail.refs {
+            for chunk in chunks {
+                let hash = chunk
+                    .sha256
+                    .parse::<BlobHash>()
+                    .map_err(|_| NativeError::Encoding)?;
+                BlobReferences::register_published(
+                    self.tx,
+                    self.project,
+                    &hash,
+                    integer(chunk.size)?,
+                    self.now,
+                )
+                .map_err(|e| match e {
+                    ReferenceError::Sql(e) => NativeError::Sql(e),
+                    _ => native_corrupt(family, id, "blob registration", "blob_ref"),
+                })?;
+                self.tx.execute("INSERT INTO entity_blob_refs(project_id,family,key_form,entity_key,locator,ordinal,sha256,size) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![self.project,family.name(),form,key,locator,integer(chunk.ordinal)?,chunk.sha256,integer(chunk.size)?])?;
+            }
+        }
+        if let Entity::Team(team) = entity {
+            for row in Self::member_values(team)? {
+                let mut values = vec![SqlValue::Text(self.project.into())];
+                values.extend(row);
+                self.tx.execute("INSERT INTO team_members(project_id,team_id,team_id_form,team_id_sha256,team_id_bytes,ordinal,agent_id,role,role_form,role_sha256,role_bytes,joined_at,joined_at_text,joined_at_text_form,joined_at_text_sha256,joined_at_text_bytes) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",rusqlite::params_from_iter(values))?;
+            }
+            for row in Self::task_values(team) {
+                let mut values = vec![SqlValue::Text(self.project.into())];
+                values.extend(row);
+                self.tx.execute("INSERT INTO team_tasks(project_id,team_id,team_id_form,team_id_sha256,team_id_bytes,task_id) VALUES(?1,?2,?3,?4,?5,?6)",rusqlite::params_from_iter(values))?;
+            }
+        }
+        Ok(())
+    }
+}
