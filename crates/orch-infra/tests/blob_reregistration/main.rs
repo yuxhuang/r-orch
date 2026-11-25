@@ -69,7 +69,17 @@ impl Fixture {
             open_connection(&self.data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
         let mut tx = conn.transaction().unwrap();
         let hash = BlobReferences::new(&self.disk, project)
-            .store_attachment(&mut tx, "task", "payload", &self.bytes, ELIGIBLE + 1)
+            .store_attachment(
+                &mut tx,
+                "task",
+                "payload",
+                &self.bytes,
+                if project == OLD {
+                    CREATED
+                } else {
+                    ELIGIBLE + 1
+                },
+            )
             .unwrap();
         assert_eq!(hash, self.hash);
         if commit {
