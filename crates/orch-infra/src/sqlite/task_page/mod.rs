@@ -151,6 +151,58 @@ fn sort_keys(sort: Sort) -> Result<&'static [(&'static str, bool)], StoreError> 
     })
 }
 
+/// The first ID of `project`'s tasks, in ID order, that begins with `prefix`,
+/// is exactly `byte_len` bytes long and that `accept` takes, from the
+/// transaction's snapshot. The page cursor names an ID too long to carry by its
+/// length, a digest and a prefix; `accept` checks the digest. Candidates are
+/// read one at a time and none is kept, so memory is one ID however many rows
+/// share the prefix. The primary key bounds the scan to the rows that do.
+pub(crate) fn find_id_with_prefix(
+    tx: &Transaction<'_>,
+    project: &str,
+    prefix: &str,
+    byte_len: usize,
+    mut accept: impl FnMut(&str) -> bool,
+) -> rusqlite::Result<Option<String>> {
+    let mut sql = "SELECT id FROM tasks WHERE project_id = ?1 AND id >= ?2".to_owned();
+    let mut args = vec![
+        Value::Text(project.to_owned()),
+        Value::Text(prefix.to_owned()),
+    ];
+    if let Some(end) = prefix_end(prefix) {
+        args.push(Value::Text(end));
+        sql.push_str(&format!(" AND id < ?{}", args.len()));
+    }
+    args.push(Value::Integer(byte_len as i64));
+    sql.push_str(&format!(" AND length(CAST(id AS BLOB)) = ?{}", args.len()));
+    let mut statement = tx.prepare(&sql)?;
+    let mut rows = statement.query(params_from_iter(&args))?;
+    while let Some(row) = rows.next()? {
+        let id = row.get_ref(0)?.as_str()?;
+        if accept(id) {
+            return Ok(Some(id.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+/// The least string that sorts after every string beginning with `prefix`
+/// (byte order is code point order in UTF-8), or `None` when none is bounded.
+fn prefix_end(prefix: &str) -> Option<String> {
+    let chars = prefix.char_indices().collect::<Vec<_>>();
+    for (at, c) in chars.into_iter().rev() {
+        let next = match c {
+            char::MAX => continue,
+            '\u{D7FF}' => '\u{E000}',
+            c => char::from_u32(u32::from(c) + 1)?,
+        };
+        let mut end = prefix[..at].to_owned();
+        end.push(next);
+        return Some(end);
+    }
+    None
+}
+
 /// Borrow an already-open transaction: count and IDs share its snapshot.
 /// Call on the read executor thread, or inside a writer callback. A supplied
 /// public cursor must first be resolved by the integrator to `after`; this

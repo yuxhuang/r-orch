@@ -9,6 +9,7 @@ use crate::storage::v2::FileStorage;
 use orch_core::store::{Caller, Cursor, Entity, Principal, Revision, Sort, Storage, StoreError};
 use orch_core::test_support::{FixedClock, make_task};
 use orch_domain::{Task, TaskStatus};
+use sha2::{Digest, Sha256};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -176,6 +177,8 @@ impl Fixture<'_> {
             if request.cursor.is_none() {
                 return pages;
             }
+            // A walk that does not end is a failure, not a hung test.
+            assert!(pages.len() < 10_000, "the walk does not terminate");
         }
     }
 
@@ -677,42 +680,346 @@ fn one_damaged_record_fails_the_whole_page_and_the_shared_state() {
     });
 }
 
-#[test]
-fn a_last_id_that_does_not_fit_in_a_512_byte_token_is_refused_not_truncated() {
-    scenario(1, |fx| {
-        // Sort::Id carries only the ID: 26 header bytes and two hex digits per
-        // byte leave 230 bytes of ID in 512 bytes of token.
-        let id = |n: usize, c: &str| c.repeat(n);
-        fx.seed(vec![
-            task(&id(230, "a"), TaskStatus::Todo, 1, 1, None),
-            task(&id(231, "b"), TaskStatus::Todo, 1, 1, None),
-            task(&id(231, "c"), TaskStatus::Todo, 1, 1, None),
-        ]);
-        let fits = fx.list(&filter(), &request(Sort::Id, 1)).unwrap();
-        let token = fits.next_cursor.unwrap();
-        assert_eq!(token.as_str().len(), 512);
-        // The next page would end on a 231-byte ID: refused whole, loudly.
-        let error = fx
-            .list(
-                &filter(),
-                &PageRequest {
-                    cursor: Some(token.clone()),
-                    ..request(Sort::Id, 1)
-                },
-            )
-            .unwrap_err();
-        assert!(
-            matches!(error, SqliteError::Unrepresentable(_)),
-            "{error:?}"
-        );
-        // A page that ends before the long IDs, or on the last row, needs no token.
-        let rest = PageRequest {
-            cursor: Some(token),
-            ..request(Sort::Id, 2)
+/// How many bytes of ID a token carries whole: the 256 raw bytes, less the
+/// 26-byte header and eight per integer key.
+fn inline_capacity(sort: Sort) -> usize {
+    256 - 26
+        - 8 * match sort {
+            Sort::Id => 0,
+            Sort::Position => 1,
+            Sort::Priority | Sort::CreatedAt | Sort::UpdatedAt => 2,
+            _ => 3,
+        }
+}
+
+/// An ID of exactly `len` bytes that no other `(len, tag)` shares.
+fn id_of(len: usize, tag: &str) -> String {
+    format!("{tag}{}", "k".repeat(len - tag.len()))
+}
+
+/// Valid stored IDs from one byte to the 65,536-byte limit. Every length at
+/// and beside each sort's inline capacity; the longest; runs that share all but
+/// their last bytes, at several lengths, so that only the digest tells them
+/// apart; and multi-byte characters straddling each sort's prefix cut.
+fn long_id_dataset() -> Vec<String> {
+    let mut ids = vec!["a".to_owned(), "t-short".to_owned()];
+    for sort in SORTS {
+        let cap = inline_capacity(sort);
+        for len in [cap - 1, cap, cap + 1] {
+            ids.push(id_of(len, &format!("b{sort:?}")));
+        }
+        // A 4-byte character that starts 3, 2, 1 and 0 bytes inside the prefix's
+        // room, so that it is cut off whole or fits.
+        let room = cap - 20;
+        for cut in 0..4 {
+            ids.push(format!(
+                "c{sort:?}{}\u{1D11E}{}",
+                "m".repeat(room - 3 - 1 - format!("{sort:?}").len() + cut),
+                "z".repeat(40)
+            ));
+        }
+    }
+    let shared = "s".repeat(400);
+    for tail in ["1", "2", "3", "22"] {
+        ids.push(format!("{shared}{tail}"));
+    }
+    let wide = "\u{20AC}".repeat(300);
+    for tail in ["x", "y"] {
+        ids.push(format!("{wide}{tail}"));
+    }
+    ids.push("q".repeat(65_535));
+    ids.push(format!("{}a", "q".repeat(65_535)));
+    ids.push(format!("{}b", "q".repeat(65_535)));
+    ids.push(format!("{}c", "q".repeat(65_534)));
+    ids
+}
+
+fn rank(status: &str) -> usize {
+    [
+        "in_progress",
+        "retrying",
+        "review",
+        "todo",
+        "done",
+        "failed",
+        "cancelled",
+    ]
+    .iter()
+    .position(|s| *s == status)
+    .unwrap_or(7)
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Key {
+    Int(i64),
+    Text(String),
+    Newest(std::cmp::Reverse<String>),
+}
+
+/// The order of `records` under `sort`, by the rules of the spec written out
+/// here, never by SQL: the keys, then the ID's bytes.
+fn expected_order(records: &[Record], sort: Sort) -> Vec<String> {
+    let keys = |r: &Record| {
+        let Entity::Task(t) = &r.entity else {
+            unreachable!()
         };
-        let last = fx.list(&filter(), &rest).unwrap();
-        assert_eq!(last.items.len(), 2);
-        assert!(last.next_cursor.is_none());
+        let position = Key::Int(r.position as i64);
+        let id = Key::Text(t.id.clone());
+        // Times compare as their canonical strings; `updated_at` is newest first.
+        let updated = Key::Newest(std::cmp::Reverse(t.updated_at.clone()));
+        match sort {
+            Sort::Default => vec![
+                Key::Int(rank(t.status.as_str()) as i64),
+                updated,
+                position,
+                id,
+            ],
+            Sort::Id => vec![id],
+            Sort::Position => vec![position, id],
+            Sort::Priority => vec![Key::Int(t.priority), position, id],
+            Sort::CreatedAt => vec![Key::Text(t.created_at.clone()), position, id],
+            Sort::UpdatedAt => vec![updated, position, id],
+            _ => unreachable!(),
+        }
+    };
+    let mut keyed = records.iter().map(|r| (keys(r), r)).collect::<Vec<_>>();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    keyed
+        .iter()
+        .map(|(_, r)| r.entity.id().to_owned())
+        .collect()
+}
+
+/// The statuses, priorities and times of the dataset: varied, or all equal, so
+/// that the ID alone orders the rows.
+fn long_id_tasks(ids: &[String], tied: bool) -> Vec<Task> {
+    use TaskStatus::*;
+    let statuses = [Todo, InProgress, Done, Review];
+    ids.iter()
+        .enumerate()
+        .map(|(i, id)| {
+            if tied {
+                task(id, Todo, 1, 1, None)
+            } else {
+                task(id, statuses[i % 4], (i % 3) as i64, (i % 5) as i64, None)
+            }
+        })
+        .collect()
+}
+
+fn token_version(token: &Cursor) -> u8 {
+    raw(token)[0]
+}
+
+#[test]
+fn every_stored_id_pages_at_every_sort_with_a_token_of_at_most_512_bytes() {
+    let ids = long_id_dataset();
+    assert!(ids.iter().any(|id| id.len() == 65_536));
+    {
+        let mut all = ids.clone();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), ids.len(), "the dataset's IDs are distinct");
+    }
+    for tied in [false, true] {
+        scenario(2, |fx| {
+            fx.seed(long_id_tasks(&ids, tied));
+            if tied {
+                // Equal on every key, the position included.
+                submit(fx.handle, |tx| {
+                    tx.execute("UPDATE tasks SET position = 7", [])?;
+                    Ok(())
+                })
+                .unwrap();
+            }
+            for sort in SORTS {
+                let all = fx.list(&filter(), &request(sort, 1000)).unwrap();
+                assert!(all.next_cursor.is_none());
+                assert_eq!(all.items.len(), ids.len());
+                let want = expected_order(&all.items, sort);
+                assert_eq!(Fixture::ids(&all), want, "{sort:?} tied={tied}");
+                let mut references = 0;
+                for limit in [1, 2, 3, 7] {
+                    let pages = fx.walk(&filter(), request(sort, limit));
+                    // Ordered, exactly once, whatever the page size.
+                    let got: Vec<_> = pages.iter().flat_map(Fixture::ids).collect();
+                    assert_eq!(got, want, "{sort:?} limit {limit} tied={tied}");
+                    assert_eq!(pages.len(), ids.len().div_ceil(limit));
+                    for (n, page) in pages.iter().enumerate() {
+                        let last = n + 1 == pages.len();
+                        assert_eq!(page.next_cursor.is_none(), last);
+                        assert!(!page.items.is_empty());
+                        assert!(last || page.items.len() == limit);
+                        let Some(token) = &page.next_cursor else {
+                            continue;
+                        };
+                        assert!(token.as_str().len() <= 512, "{sort:?} {limit}");
+                        // Whole while it fits, by reference once it does not.
+                        let id = Fixture::ids(page).pop().unwrap();
+                        let want_version = if id.len() <= inline_capacity(sort) {
+                            1
+                        } else {
+                            2
+                        };
+                        assert_eq!(token_version(token), want_version, "{sort:?} {}", id.len());
+                        references += usize::from(want_version == 2);
+                    }
+                }
+                assert!(references > 0);
+            }
+            fx.state.ensure_available().unwrap();
+        });
+    }
+}
+
+#[test]
+fn a_walk_with_a_page_size_of_one_crosses_consecutive_ids_of_the_longest_length() {
+    scenario(1, |fx| {
+        let shared = "q".repeat(65_535);
+        let ids = [
+            format!("{shared}a"),
+            format!("{shared}b"),
+            format!("{shared}c"),
+        ];
+        fx.seed(
+            ids.iter()
+                .map(|id| task(id, TaskStatus::Todo, 1, 1, None))
+                .collect(),
+        );
+        for sort in SORTS {
+            let pages = fx.walk(&filter(), request(sort, 1));
+            let got: Vec<_> = pages.iter().flat_map(Fixture::ids).collect();
+            assert_eq!(got, ids, "{sort:?}");
+            // The two nonterminal tokens are each a different position.
+            let tokens: Vec<_> = pages.iter().filter_map(|p| p.next_cursor.clone()).collect();
+            assert_eq!(tokens.len(), 2);
+            assert_ne!(tokens[0], tokens[1]);
+            assert!(tokens.iter().all(|t| t.as_str().len() <= 512));
+        }
+        fx.state.ensure_available().unwrap();
+    });
+}
+
+/// A token for a page that ends on a row of 65,536 bytes, and the offset in
+/// its raw bytes where the reference begins.
+fn reference_token(fx: &Fixture<'_>) -> (Vec<u8>, usize) {
+    let shared = "q".repeat(65_535);
+    fx.seed(vec![
+        task(&format!("{shared}a"), TaskStatus::Todo, 1, 1, None),
+        task(&format!("{shared}b"), TaskStatus::Todo, 1, 1, None),
+        task(&format!("{shared}c"), TaskStatus::Todo, 1, 1, None),
+    ]);
+    let token = fx
+        .list(&filter(), &request(Sort::Id, 1))
+        .unwrap()
+        .next_cursor
+        .unwrap();
+    let good = raw(&token);
+    assert_eq!(good[0], 2);
+    // Sort::Id has no integer key: the header, then length, digest, prefix.
+    (good, 26)
+}
+
+#[test]
+fn a_reference_that_issue_could_not_have_written_is_refused() {
+    scenario(1, |fx| {
+        let (good, at) = reference_token(fx);
+        let sort = Sort::Id;
+        let try_raw = |bytes: &[u8]| fx.list(&filter(), &resumed(&cursor(hex(bytes)), sort));
+        let page = try_raw(&good).unwrap();
+        // Resumed after the first row, not at it.
+        assert_eq!(page.items.len(), 2);
+        let shared = "q".repeat(65_535);
+        assert_eq!(Fixture::ids(&page)[0], format!("{shared}b"));
+        // The length: one more, one fewer, one that would have fit whole, and
+        // one past the 65,536-byte limit.
+        for length in [65_537u32, 65_535, 230, 0] {
+            let mut bad = good.clone();
+            bad[at..at + 4].copy_from_slice(&length.to_be_bytes());
+            invalid_cursor(try_raw(&bad));
+        }
+        // A reference to a row whose ID fits whole: found and digest-true, yet
+        // not a token `issue` writes, so not one position with two tokens.
+        let fitting = id_of(inline_capacity(sort), "n");
+        fx.seed(vec![task(&fitting, TaskStatus::Todo, 1, 1, None)]);
+        let mut forged = good[..at].to_vec();
+        forged.extend((fitting.len() as u32).to_be_bytes());
+        forged.extend(&Sha256::digest(fitting.as_bytes())[..16]);
+        forged.extend(&fitting.as_bytes()[..good.len() - at - 20]);
+        invalid_cursor(try_raw(&forged));
+        // The same forgery in the form `issue` does write resumes.
+        let mut whole = good[..at].to_vec();
+        whole[0] = 1;
+        whole.extend(fitting.as_bytes());
+        try_raw(&whole).unwrap();
+        // Any digest byte, and any prefix byte that makes it another prefix.
+        for index in [at + 4, at + 19, at + 20, good.len() - 1] {
+            let mut bad = good.clone();
+            bad[index] ^= 1;
+            invalid_cursor(try_raw(&bad));
+        }
+        // A prefix that is too short (it would widen the lookup), however little
+        // too short (one position has one token), one that is not UTF-8, and a
+        // reference cut short.
+        for short in 1..=4 {
+            invalid_cursor(try_raw(&good[..good.len() - short]));
+        }
+        let mut not_utf8 = good.clone();
+        *not_utf8.last_mut().unwrap() = 0xff;
+        invalid_cursor(try_raw(&not_utf8));
+        invalid_cursor(try_raw(&good[..at + 19]));
+        // Neither the failures nor the lookups latch the pool.
+        try_raw(&good).unwrap();
+        fx.state.ensure_available().unwrap();
+    });
+}
+
+#[test]
+fn a_reference_to_a_deleted_row_is_refused_and_one_to_an_updated_row_resumes() {
+    scenario(1, |fx| {
+        let tall = |tag: &str| format!("{}{tag}", "w".repeat(400));
+        fx.seed(vec![
+            task(&tall("1"), TaskStatus::Todo, 1, 1, None),
+            task(&tall("2"), TaskStatus::Todo, 1, 2, None),
+            task(&tall("3"), TaskStatus::Todo, 2, 3, None),
+        ]);
+        let head =
+            |fx: &Fixture<'_>| fx.list(&filter(), &request(Sort::Id, 1)).unwrap().items[0].clone();
+        for sort in [Sort::Id, Sort::Priority] {
+            let first = fx.list(&filter(), &request(sort, 1)).unwrap();
+            assert_eq!(Fixture::ids(&first), [tall("1")]);
+            let token = first.next_cursor.unwrap();
+            assert_eq!(token_version(&token), 2);
+            // The row it ends on changes its sort key before the next page: the
+            // walk goes on after its old position, as for a token that holds the ID.
+            let Record {
+                entity: Entity::Task(old),
+                revision,
+                ..
+            } = head(fx)
+            else {
+                unreachable!()
+            };
+            let mut moved = (*old).clone();
+            moved.priority = 9;
+            fx.write(move |w| w.update(moved, revision).map(drop))
+                .unwrap();
+            let rest = fx.list(&filter(), &resumed(&token, sort)).unwrap();
+            assert_eq!(Fixture::ids(&rest), [tall("2"), tall("3")], "{sort:?}");
+            // Put it back for the next sort.
+            let Record { revision, .. } = head(fx);
+            fx.write(move |w| w.update(*old, revision).map(drop))
+                .unwrap();
+        }
+        let token = (fx.list(&filter(), &request(Sort::Id, 1)).unwrap())
+            .next_cursor
+            .unwrap();
+        let Record { revision, .. } = head(fx);
+        fx.write(move |w| w.delete(&tall("1"), revision)).unwrap();
+        invalid_cursor(fx.list(&filter(), &resumed(&token, Sort::Id)));
+        // It is a refusal of that token only.
+        let again = fx.list(&filter(), &request(Sort::Id, 5)).unwrap();
+        assert_eq!(Fixture::ids(&again), [tall("2"), tall("3")]);
         fx.state.ensure_available().unwrap();
     });
 }
@@ -832,4 +1139,16 @@ fn record_page_costs() {
             "SELECT MIN(position),MAX(position) FROM tasks WHERE project_id = 'p'"
         )
     );
+}
+
+#[test]
+fn a_reference_token_for_another_sort_is_refused() {
+    scenario(1, |fx| {
+        let (good, _) = reference_token(fx);
+        // Sort::Id's token under every other sort.
+        for sort in SORTS.into_iter().filter(|s| *s != Sort::Id) {
+            invalid_cursor(fx.list(&filter(), &resumed(&cursor(hex(&good)), sort)));
+        }
+        fx.state.ensure_available().unwrap();
+    });
 }

@@ -842,3 +842,100 @@ fn read_pool_preserves_query_errors_and_returns_its_slot() {
     assert_eq!(recovered.ids, ["a"]);
     assert_eq!(recovered.total, Some(1));
 }
+
+#[test]
+fn prefix_end_is_the_least_string_after_every_string_with_the_prefix() {
+    use super::prefix_end;
+    assert_eq!(prefix_end("ab").as_deref(), Some("ac"));
+    assert_eq!(prefix_end("a\u{10FFFF}").as_deref(), Some("b"));
+    assert_eq!(prefix_end("\u{D7FF}").as_deref(), Some("\u{E000}"));
+    assert_eq!(prefix_end("a\u{7F}").as_deref(), Some("a\u{80}"));
+    assert_eq!(prefix_end("\u{10FFFF}\u{10FFFF}"), None);
+    assert_eq!(prefix_end(""), None);
+}
+
+#[test]
+fn ids_with_prefix_are_the_projects_rows_of_that_prefix_and_byte_length() {
+    let root = tempfile::tempdir().unwrap();
+    let data = data(&root);
+    let mut db = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&data, &mut db).unwrap();
+    // The same ID in another project, a longer and a shorter ID of the prefix,
+    // neighbours either side of the prefix range, and two IDs of equal
+    // character count but different byte length.
+    let ids = [
+        "ab",
+        "abc1",
+        "abc2",
+        "abcd",
+        "abd",
+        "ac",
+        "abc\u{e9}",
+        "abcde",
+        "abc\u{10FFFF}z",
+    ];
+    for (i, id) in ids.iter().enumerate() {
+        let t = task(id, TaskStatus::Todo, 1, 1, None);
+        insert(&db, "p", &t, i as u64 + 1);
+    }
+    insert(&db, "other", &task("abc9", TaskStatus::Todo, 1, 1, None), 1);
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    let find = |project: &str, prefix: &str, len: usize| {
+        let mut got = Vec::new();
+        let found = pool
+            .read(deadline(), |tx| {
+                Ok(super::find_id_with_prefix(tx, project, prefix, len, |id| {
+                    got.push(id.to_owned());
+                    false
+                }))
+            })
+            .unwrap()
+            .unwrap();
+        // Refusing every candidate reads each one and finds none.
+        assert_eq!(found, None);
+        got.sort();
+        got
+    };
+    assert_eq!(find("p", "abc", 4), ["abc1", "abc2", "abcd"]);
+    // Five bytes: four characters and five.
+    assert_eq!(find("p", "abc", 5), ["abcde", "abc\u{e9}"]);
+    assert_eq!(find("p", "abc", 7), Vec::<String>::new());
+    assert_eq!(find("p", "abc", 8), ["abc\u{10FFFF}z"]);
+    assert_eq!(find("p", "abc", 3), Vec::<String>::new());
+    assert_eq!(find("p", "ab", 2), ["ab"]);
+    // The prefix is not a substring match, and the project is the caller's.
+    assert_eq!(find("p", "bc", 4), Vec::<String>::new());
+    assert_eq!(find("other", "abc", 4), ["abc9"]);
+    assert_eq!(find("missing", "abc", 4), Vec::<String>::new());
+    // A prefix of only the greatest character has no bound above it.
+    assert_eq!(find("p", "\u{10FFFF}", 4), Vec::<String>::new());
+}
+
+#[test]
+fn the_prefix_lookup_stops_at_the_first_id_taken() {
+    let root = tempfile::tempdir().unwrap();
+    let data = data(&root);
+    let mut db = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&data, &mut db).unwrap();
+    for (i, id) in ["ab1", "ab2", "ab3"].iter().enumerate() {
+        insert(
+            &db,
+            "p",
+            &task(id, TaskStatus::Todo, 1, 1, None),
+            i as u64 + 1,
+        );
+    }
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    let mut seen = Vec::new();
+    let found = pool
+        .read(deadline(), |tx| {
+            Ok(super::find_id_with_prefix(tx, "p", "ab", 3, |id| {
+                seen.push(id.to_owned());
+                id == "ab2"
+            }))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.as_deref(), Some("ab2"));
+    assert_eq!(seen, ["ab1", "ab2"]);
+}
