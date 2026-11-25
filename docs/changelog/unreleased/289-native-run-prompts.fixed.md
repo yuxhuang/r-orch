@@ -1,0 +1,1 @@
+Run prompts now use the native run create/update and read path exclusively, keeping the detail, prompt chunks, whole-content hash and revision consistent. Removed the separate blob-reference prompt writer and single-object reader before their first product caller.
