@@ -1,0 +1,1 @@
+Add an inactive read-only scheduler decision that maps tasks to agents from a plain view of tasks, agents and leases, keeping the 1.0 dispatch order, eligibility checks and rotation of tied agents; nothing calls it yet, so dispatch and the daemon are unchanged.
