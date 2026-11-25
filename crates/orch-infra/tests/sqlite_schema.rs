@@ -881,3 +881,124 @@ fn native_auxiliary_bounds_config_and_run_order_index_are_pinned() {
         ]
     );
 }
+
+// Migration 005's four rebuilt tables: each key and text is an explicit
+// inline or digest form, and the port-owned counters are bounded.
+#[test]
+fn settings_tables_enforce_key_forms_text_forms_provenance_and_bounds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    let hash = "a".repeat(64);
+    let over = "x".repeat(65537);
+    // (table, identity column, text column, columns and values of the other required members)
+    let tables = [
+        (
+            "context_entries",
+            "key",
+            "value",
+            "set_by_kind,position,revision",
+            "'owner',1,1",
+        ),
+        ("project_config", "key", "value", "position,revision", "1,1"),
+        ("templates", "name", "body", "position,revision", "1,1"),
+        (
+            "goals",
+            "id",
+            "title",
+            "description,created_at_text,status,position,revision",
+            "'',''  ,'active',1,1",
+        ),
+    ];
+    for (table, id, text, other, values) in tables {
+        let insert = |id_value: &str,
+                      form: i64,
+                      sha: Option<&str>,
+                      bytes: Option<i64>,
+                      v: &str,
+                      vform: i64| {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table}(project_id,{id},{id}_form,{id}_sha256,{id}_bytes,{text},{text}_form,{text}_sha256,{text}_bytes,{other}) VALUES('p',?1,?2,?3,?4,?5,?6,?7,?8,{values})"
+                ),
+                rusqlite::params![id_value, form, sha, bytes, v, vform, (vform == 1).then_some(&hash), (vform == 1).then_some(65537)],
+            )
+        };
+        // A literal that looks like a digest and an indirect identity with that digest are two rows.
+        insert(&hash, 0, None, None, "v", 0).unwrap();
+        insert(&hash, 1, Some(&hash), Some(65537), "v", 0).unwrap();
+        assert!(
+            insert(&hash, 0, None, None, "w", 0).is_err(),
+            "{table}: duplicate literal"
+        );
+        assert!(
+            insert(&hash, 1, Some(&hash), Some(65537), "w", 0).is_err(),
+            "{table}: duplicate indirect"
+        );
+        // An indirect identity holds its digest and a length over the inline bound.
+        for (name, form, sha, bytes) in [
+            ("a", 1, Some(hash.as_str()), Some(65537)),
+            (hash.as_str(), 1, Some(hash.as_str()), Some(65536)),
+            (hash.as_str(), 1, Some(hash.as_str()), None),
+            (hash.as_str(), 1, None, Some(65537)),
+            (hash.as_str(), 2, None, None),
+            (over.as_str(), 0, None, None),
+            ("b", 0, Some(hash.as_str()), None),
+        ] {
+            assert!(
+                insert(name, form, sha, bytes, "v", 0).is_err(),
+                "{table}: {name:.8} {form} {sha:?} {bytes:?}"
+            );
+        }
+        // A text is inline up to 65,536 bytes; above it the column is empty beside a digest.
+        insert("inline", 0, None, None, &"x".repeat(65536), 0).unwrap();
+        assert!(
+            insert("big-inline", 0, None, None, &over, 0).is_err(),
+            "{table}: oversize inline text"
+        );
+        insert("indirect-text", 0, None, None, "", 1).unwrap();
+        assert!(
+            insert("held", 0, None, None, "kept", 1).is_err(),
+            "{table}: form 1 holds ''"
+        );
+        assert!(insert("no-digest", 0, None, None, "", 3).is_err());
+        // The counters of the port are never optional or out of range.
+        for set in [
+            "position=-1",
+            "revision=0",
+            "position=NULL",
+            "revision=NULL",
+        ] {
+            assert!(
+                conn.execute(&format!("UPDATE {table} SET {set} WHERE {id}='inline'"), [])
+                    .is_err(),
+                "{table}: {set}"
+            );
+        }
+    }
+    let goal = |set: &str| conn.execute(&format!("UPDATE goals SET {set} WHERE id='inline'"), []);
+    assert!(goal("status='done'").is_err());
+    for status in ["active", "paused", "achieved", "abandoned"] {
+        goal(&format!("status='{status}'")).unwrap();
+    }
+    // A goal's optional texts are NULL only inline, and its times are never required.
+    goal("assignee_agent_id=NULL,created_at=NULL,updated_at=NULL,updated_at_text=NULL").unwrap();
+    assert!(goal("assignee_agent_id_form=1").is_err());
+    assert!(goal(&format!("assignee_agent_id='{over}'")).is_err());
+    let context = |set: &str| {
+        conn.execute(
+            &format!("UPDATE context_entries SET {set} WHERE key='inline'"),
+            [],
+        )
+    };
+    context("ttl_ms=NULL,created_at=NULL,updated_at=NULL,expires_at=NULL").unwrap();
+    context("ttl_ms=0").unwrap();
+    context(&format!("ttl_ms={}", i64::MAX)).unwrap();
+    assert!(context("ttl_ms=-1").is_err());
+    for column in ["set_by_identity", "set_by_agent_id", "set_by_run_id"] {
+        context(&format!("{column}='ok'")).unwrap();
+        assert!(context(&format!("{column}='{over}'")).is_err(), "{column}");
+    }
+    assert!(context("set_by_kind=NULL").is_err());
+}

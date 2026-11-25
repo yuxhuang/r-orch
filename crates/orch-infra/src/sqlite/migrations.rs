@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
-pub const SCHEMA_VERSION: usize = 4;
+pub const SCHEMA_VERSION: usize = 5;
+pub const CONTEXT_CONFIG_TEMPLATE_GOAL: &str =
+    include_str!("migrations/005_context_config_template_goal.sql");
 pub const AGENT_TEAM_RUN: &str = include_str!("migrations/004_agent_team_run.sql");
 pub const TASK_FORMAT: &str = include_str!("migrations/003_task_format.sql");
 pub const ATTENTION_FACTS: &str = include_str!("migrations/002_attention_facts.sql");
@@ -44,7 +46,13 @@ pub fn migrate(data: &DataDir, conn: &mut ConnectionHandle<'_>) -> Result<()> {
     apply_migrations(
         data,
         conn,
-        &[INITIAL_SCHEMA, ATTENTION_FACTS, TASK_FORMAT, AGENT_TEAM_RUN],
+        &[
+            INITIAL_SCHEMA,
+            ATTENTION_FACTS,
+            TASK_FORMAT,
+            AGENT_TEAM_RUN,
+            CONTEXT_CONFIG_TEMPLATE_GOAL,
+        ],
         DiskSpace::read(data)?,
     )
 }
@@ -98,6 +106,16 @@ pub fn apply_migrations(
             SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
         })?;
     }
+    if version > 0
+        && steps
+            .iter()
+            .skip(version)
+            .any(|step| *step == CONTEXT_CONFIG_TEMPLATE_GOAL)
+    {
+        refuse_lossy_settings(conn).map_err(|error| {
+            SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
+        })?;
+    }
     let holds_project = version > 0
         && conn.query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |r| r.get(0))? > 0;
     if holds_project {
@@ -134,6 +152,13 @@ pub fn apply_migrations(
                     let sql = sql.clone();
                     M::up_with_hook("", move |tx: &rusqlite::Transaction<'_>| {
                         refuse_lossy_entities(tx)?;
+                        tx.execute_batch(&sql)?;
+                        Ok(())
+                    })
+                } else if *step == CONTEXT_CONFIG_TEMPLATE_GOAL {
+                    let sql = sql.clone();
+                    M::up_with_hook("", move |tx: &rusqlite::Transaction<'_>| {
+                        refuse_lossy_settings(tx)?;
                         tx.execute_batch(&sql)?;
                         Ok(())
                     })
@@ -201,6 +226,29 @@ fn refuse_lossy_entities(conn: &Connection) -> rusqlite_migration::HookResult {
             .join(", ");
         return Err(rusqlite_migration::HookError::Hook(format!(
             "entity format v1 refuses ambiguous predecessor rows: {summary}"
+        )));
+    }
+    Ok(())
+}
+
+// The predecessor rows hold neither the original time spellings, the independent
+// TTL, positions nor an allocator high-water mark. Never invent them: refuse,
+// with counts only, and leave the previous schema and its contents readable.
+fn refuse_lossy_settings(conn: &Connection) -> rusqlite_migration::HookResult {
+    let mut counts = Vec::new();
+    for table in ["context_entries", "project_config", "templates", "goals"] {
+        let count: i64 =
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
+        counts.push((table, count));
+    }
+    if counts.iter().any(|(_, count)| *count != 0) {
+        let summary = counts
+            .iter()
+            .map(|(table, count)| format!("{table}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(rusqlite_migration::HookError::Hook(format!(
+            "settings entity format v1 refuses ambiguous predecessor rows: {summary}"
         )));
     }
     Ok(())
