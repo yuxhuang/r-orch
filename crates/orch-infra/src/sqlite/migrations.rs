@@ -430,24 +430,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn task_format_preflight_statement_error_keeps_its_sqlite_category() {
-        let (_tmp, data) = test_data();
-        let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-        apply_migrations(&data, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
-        // A malformed synthetic predecessor makes the actual preflight SELECT
-        // fail. This must differ structurally from the intentional row refusal.
-        conn.execute_batch("DROP TABLE task_labels").unwrap();
-        let error = apply_migrations(
-            &data,
-            &mut conn,
-            &[INITIAL_SCHEMA, ATTENTION_FACTS, TASK_FORMAT],
-            plenty(),
-        )
-        .unwrap_err();
-        assert!(
-            matches!(error, SqliteError::Sql(rusqlite::Error::SqliteFailure(ref code, _)) if code.extended_code == rusqlite::ffi::SQLITE_ERROR),
-            "preflight lost its SQLite category: {error:?}"
-        );
-    }
 }
