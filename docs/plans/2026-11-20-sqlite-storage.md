@@ -211,6 +211,19 @@ execute exactly one test. Do not prefix a filter with `storage_conformance::`.
 | R15 | `caller_selects_the_project_and_keeps_the_principal`, `settings_and_templates_belong_to_their_project` | Same 3 entity references |
 | R97 whole text | `text_over_64_kib_round_trips_through_the_blob_store` | Same 3 entity references; this alone cannot observe blob backing |
 
+The Task cursor exception of R10 (issue 277, option A) is proved by two `orch-infra`
+unit tests, not by the conformance filters above, so they have no registrations in
+`storage_conformance`. Each selection must execute one passing test:
+
+| Requirement | Exact selection (append `--exact`) | Proves |
+|---|---|---|
+| R10 refusal | `cargo test -p orch-infra --lib -- sqlite::task_adapter::tests::a_deleted_row_is_resumed_at_the_shortest_fallback_and_without_one_it_is_refused` | A deleted anchor resumes at its shortest fallback (past the keys, from a prefix of the next row, or from the next row itself); with the anchor and its successor both deleted, a long-ID cursor whose IDs part beyond the carried prefix is refused as `InvalidCursor`, never resumed at a guessed position, and the surviving rows stay listed |
+| R10 continuation | `cargo test -p orch-infra --lib -- sqlite::task_adapter::tests::a_walk_returns_every_row_once_when_the_row_each_page_ends_on_is_deleted` | For every Task sort, with tied and untied integer keys, a walk that deletes the row each page ends on (or the whole page) before the next page returns every remaining row exactly once, in order |
+
+These two names cover only the Task cursor on SQLite. Every other obligation of
+R10, including the filter and sort binding and the walk for the other entity
+families, stays with the bare filters in the R10 row above.
+
 PR142's file-specific R97 proof is
 `cargo test -p orch-infra --lib -- storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store --exact`
 and the same command with the full filter
