@@ -808,3 +808,44 @@ fn value_equivalent_detail_whitespace_key_order_and_empty_capabilities_are_reada
     assert_ne!(equivalent, encoded.inline.unwrap());
     assert_eq!(decode_agent(&store, &detail(&equivalent)).unwrap(), agent());
 }
+
+#[test]
+fn empty_prompt_requires_exactly_one_chunk_at_ordinal_zero() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let store = DiskBlobStore::open(data.root()).unwrap();
+    let r = run();
+    let valid = encode_run(&store, &r).unwrap();
+    assert_eq!(decode_run(&store, &valid).unwrap(), r);
+    for mutation in 0..4 {
+        let mut broken = valid.clone();
+        match mutation {
+            0 => broken.refs.get_mut("/prompt").unwrap()[0].ordinal = 1,
+            1 => {
+                broken.refs.get_mut("/prompt").unwrap().clear();
+            }
+            2 => {
+                let chunk = broken.refs["/prompt"][0].clone();
+                broken.refs.get_mut("/prompt").unwrap().push(chunk);
+            }
+            _ => {
+                let mut value: Value =
+                    serde_json::from_str(broken.inline.as_ref().unwrap()).unwrap();
+                value["prompt"]["$blob"]["chunks"] = 0.into();
+                let bytes = serde_json::to_string(&value).unwrap();
+                broken.bytes = bytes.len() as u64;
+                broken.sha256 = BlobHash::of(bytes.as_bytes()).to_string();
+                broken.inline = Some(bytes);
+            }
+        }
+        assert!(
+            matches!(
+                decode_run(&store, &broken),
+                Err(FormatError::Invalid {
+                    check: "prompt metadata",
+                    ..
+                })
+            ),
+            "mutation {mutation}"
+        );
+    }
+}
