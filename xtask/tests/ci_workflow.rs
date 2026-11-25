@@ -11,6 +11,25 @@ const CI: &str = include_str!("../../.github/workflows/ci.yml");
 const TEST_IF: &str = "github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all')";
 const AMBIENT_IF: &str = "github.event_name == 'push' && github.ref == 'refs/heads/main'";
 const AMBIENT_TARGET: &str = "${{ github.workspace }}/target/ci-ambient";
+/// The suite runner, pinned. A job that runs tests installs exactly this.
+const INSTALL: &str = "      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir \"$RUNNER_TEMP/nextest-install\"";
+/// One step per pass, in `nextest::PROFILES` order. The pass split itself is
+/// defined only in `.config/nextest.toml`; this pins that the ambient job runs
+/// both halves of it, and `xtask/tests/nextest_isolation.rs` pins that the
+/// three readers of the split agree.
+///
+/// Every step after the first carries `if: ${{ !cancelled() }}`, which is this
+/// job's `--no-fail-fast` across steps: a failing pass must not hide the other
+/// pass's result or the doc-tests'. That is why these are the `run:` halves of
+/// a two-line step, and why [`GUARD`] is pinned beside them.
+const AMBIENT_PASSES: [&str; 2] = [
+    "      - run: cargo nextest run --profile default --workspace --no-fail-fast --no-tests fail",
+    "        run: cargo nextest run --profile alone --workspace --no-fail-fast --no-tests fail",
+];
+const AMBIENT_SUITE: &str = AMBIENT_PASSES[0];
+const AMBIENT_DOC: &str = "        run: cargo test --workspace --doc --no-fail-fast";
+/// The step guard that keeps a failed pass from skipping what follows it.
+const GUARD: &str = "      - if: ${{ !cancelled() }}";
 
 // This extracts only this file's fixed indentation, not arbitrary YAML. Shape
 // changes require deliberate updates; do not silently accept an unknown form.
@@ -67,6 +86,18 @@ fn contract(ci: &str) {
     );
     assert!(!check.contains("cargo test"));
     assert!(!changes.contains("cargo test"));
+    // Every job that runs tests installs the pinned runner, and no job that
+    // does not run tests pays for it.
+    for (name, job) in [("test", test), ("ambient", ambient)] {
+        assert!(
+            job.lines().any(|line| line == INSTALL),
+            "{name} must install the pinned runner"
+        );
+    }
+    assert!(!check.contains("cargo install"));
+    assert!(!changes.contains("cargo install"));
+    assert_eq!(ci.matches("cargo install cargo-nextest").count(), 2);
+    assert_eq!(ci.matches("--version 0.9.152").count(), 2);
     assert_ambient_target_contract(ci);
     assert!(!ambient.contains("./xtask/gate.sh"));
     let suite = step(test, "Folded suite");
@@ -287,6 +318,17 @@ fn workflow_mutants_are_discriminated() {
         ("cache-targets: false", "cache-targets: true"),
         ("cache-bin: false", "cache-bin: true"),
         ("if-no-files-found: error", "if-no-files-found: warn"),
+        ("--version 0.9.152", "--version 0.9.153"),
+        (
+            "cargo nextest run --profile default --workspace",
+            "cargo test --workspace",
+        ),
+        (
+            "cargo nextest run --profile alone --workspace",
+            "cargo nextest run --workspace",
+        ),
+        ("--no-tests fail", "--no-tests warn"),
+        ("cargo test --workspace --doc", "cargo test --workspace"),
         (
             "steps.receipt.outcome == 'success'",
             "steps.suite.outcome == 'success'",
@@ -392,16 +434,28 @@ fn assert_ambient_target_contract(ci: &str) {
     assert_eq!(ambient_target_value(ci), AMBIENT_TARGET);
     assert_eq!(ambient.matches("CARGO_TARGET_DIR:").count(), 1);
     assert!(!ambient.contains("working-directory:"));
-    // The single ordinary suite provisions the CLI through orch-cli's test
-    // targets. No separate build or step-level target/cwd override is needed.
+    // The two suite passes provision the CLI through orch-cli's test targets.
+    // No separate build or step-level target/cwd override is needed.
     let cargo_steps: Vec<_> = ambient
         .lines()
-        .filter(|line| line.contains("cargo "))
+        .filter(|line| line.contains("cargo ") && !line.trim_start().starts_with('#'))
         .collect();
+    // The runner install, then one step per pass in order, then the doc-tests
+    // nextest does not run. Nothing else, and no step-level target or cwd
+    // override.
     assert_eq!(
         cargo_steps,
-        ["      - run: cargo test --workspace --no-fail-fast"]
+        [INSTALL, AMBIENT_PASSES[0], AMBIENT_PASSES[1], AMBIENT_DOC]
     );
+    // The second pass and the doc-tests each run even when the step before
+    // them failed, and nothing else in the job is guarded that way.
+    for step in [AMBIENT_PASSES[1], AMBIENT_DOC] {
+        assert!(
+            ambient.contains(&format!("{GUARD}\n{step}\n")),
+            "{step} must be guarded by {GUARD}, or a failed pass hides it"
+        );
+    }
+    assert_eq!(ambient.matches(GUARD).count(), 2);
     assert!(!ambient.contains("Build ambient CLI"));
 }
 
@@ -451,6 +505,86 @@ fn ambient_workspace_target_resolves_from_package_cwd() {
     assert_ambient_target_contract(CI);
 }
 
+/// The ambient job must run both passes, in order, each reached even when the
+/// step before it failed, and nothing else.
+#[test]
+fn an_ambient_job_that_drops_reorders_or_merges_a_pass_is_rejected() {
+    // The three lines the split occupies: the first pass, then the guard and
+    // the second pass as one step.
+    let split = format!("{}\n{}\n{}\n", AMBIENT_PASSES[0], GUARD, AMBIENT_PASSES[1]);
+    assert!(CI.contains(&split));
+    for (why, mutant) in [
+        (
+            "the second pass dropped",
+            CI.replacen(&format!("{GUARD}\n{}\n", AMBIENT_PASSES[1]), "", 1),
+        ),
+        (
+            "the first pass dropped",
+            CI.replacen(&format!("{}\n", AMBIENT_PASSES[0]), "", 1),
+        ),
+        (
+            "the passes reordered",
+            CI.replace(
+                "--profile default --workspace",
+                "--profile reordered --workspace",
+            )
+            .replace(
+                "--profile alone --workspace",
+                "--profile default --workspace",
+            )
+            .replace(
+                "--profile reordered --workspace",
+                "--profile alone --workspace",
+            ),
+        ),
+        (
+            // One unsplit run is what the split replaced.
+            "the two passes merged into one unsplit run",
+            CI.replacen(
+                &split,
+                "      - run: cargo nextest run --workspace --no-fail-fast --no-tests fail\n",
+                1,
+            ),
+        ),
+        (
+            "a pass that drops the empty-run failure",
+            CI.replacen(
+                AMBIENT_PASSES[1],
+                &AMBIENT_PASSES[1].replace(" --no-tests fail", ""),
+                1,
+            ),
+        ),
+        (
+            "the doc-tests dropped",
+            CI.replacen(&format!("{GUARD}\n{AMBIENT_DOC}\n"), "", 1),
+        ),
+        (
+            // Without the guard a failing first pass skips the rest, and the
+            // job reports one pass's failure instead of every result.
+            "the second pass's guard dropped, so a failed first pass skips it",
+            CI.replacen(
+                &format!("{GUARD}\n{}", AMBIENT_PASSES[1]),
+                &AMBIENT_PASSES[1].replacen("        run:", "      - run:", 1),
+                1,
+            ),
+        ),
+        (
+            "the doc-tests' guard dropped",
+            CI.replacen(
+                &format!("{GUARD}\n{AMBIENT_DOC}"),
+                &AMBIENT_DOC.replacen("        run:", "      - run:", 1),
+                1,
+            ),
+        ),
+    ] {
+        assert_ne!(mutant, CI, "{why}");
+        assert!(
+            std::panic::catch_unwind(|| assert_ambient_target_contract(&mutant)).is_err(),
+            "{why} must be rejected: {mutant}"
+        );
+    }
+}
+
 #[test]
 fn ambient_relative_target_and_override_controls_are_discriminated() {
     let relative = CI.replacen(AMBIENT_TARGET, "target/ci-ambient", 1);
@@ -459,7 +593,7 @@ fn ambient_relative_target_and_override_controls_are_discriminated() {
         !ambient_target_resolves_from_package(&relative),
         "the original relative target must fail despite the workspace artifact"
     );
-    let suite = "      - run: cargo test --workspace --no-fail-fast";
+    let suite = AMBIENT_SUITE;
     for mutant in [
         relative,
         CI.replacen(AMBIENT_TARGET, "${{ github.workspace }}/target/wrong", 1),

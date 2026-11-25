@@ -159,7 +159,7 @@ in the sections after the table, each marked with its status (see "Status of eac
 | Tier | Command | What it runs | Target and lease | Use |
 |---|---|---|---|---|
 | `fast` | `./xtask/gate.sh fast --base origin/main` | `fmt`, workspace `clippy -D warnings`, `crate-graph`; then, for a code change, `build`, `test`, `home-hygiene`, `no-real-cli` and `real-home` on the selected packages (plus `environment-witness` when the selection is a package list without `xtask`); for a documentation-only change, a workspace `build` and no tests | `target/gate-warm`; shared lease | Local iteration, every commit and fix round. Never merge or release evidence: its result always says `qualifying: no: local iteration; never merge evidence`. |
-| `pr` | `./xtask/gate.sh pr` | All nine steps in one run: `build`, `test`, `clippy`, `fmt`, `advisories`, `crate-graph`, `home-hygiene`, `no-real-cli`, `real-home`. The `test` step is one whole-workspace suite run under a sentinel `HOME` and recording agent shims, judged for failures, zero tests and nonzero named inventory | `target/gate-warm`, reused only after a content check; exclusive lease | The merge-condition tier. CI runs its suite steps as `pr --part suite`; its separate `check` job runs the equivalent static commands (`cargo fmt`, `clippy`, `cargo xtask crate-graph`, cargo-deny) directly, not `pr --part static`. |
+| `pr` | `./xtask/gate.sh pr` | All nine steps in one run: `build`, `test`, `clippy`, `fmt`, `advisories`, `crate-graph`, `home-hygiene`, `no-real-cli`, `real-home`. The `test` step is one whole-workspace suite run under a sentinel `HOME` and recording agent shims, judged for failures, zero tests and nonzero named inventory. It is two `cargo nextest run` passes (everything, then the one binary that needs the host to itself) plus one `cargo test --doc`, judged together as one inventory over the union | `target/gate-warm`, reused only after a content check; exclusive lease | The merge-condition tier. CI runs its suite steps as `pr --part suite`; its separate `check` job runs the equivalent static commands (`cargo fmt`, `clippy`, `cargo xtask crate-graph`, cargo-deny) directly, not `pr --part static`. |
 | `full` (the default) | `./xtask/gate.sh` | The same nine steps as `pr` | Cold `target/gate`, removed afterwards unless `--keep`; needs 12 GiB free; exclusive lease | The goal and release gate, once per goal or release, not per PR. |
 
 `--plan` runs no step: it prints the tier, target, lease and steps. Through `./xtask/gate.sh` it is not free of side
@@ -190,13 +190,55 @@ the lease.
 Time **targets** (spec R12), not measurements: `fast` at most 5 minutes for a single-crate change and under 1 minute
 for documentation only; `pr` at most 20 minutes; `full` at most 25 minutes. None has been measured at this commit.
 
-**Parallel test binaries: PR 4 is deferred and `cargo-nextest` is not adopted.** On 2026-11-17 the owner deferred the
-goal's PR 4 after the dependency audit of the tool (version 0.9.152) found 23 advisories and 10 licence items outside
-the repository's allow-list (the owner's record of the audit). Every tier still runs the suite's test binaries one after
-another, and nextest is not available in any command or workflow here. The 20 consecutive green runs on each platform
-and the at-least-2x nextest speedup that the goal's plan asked for were **not delivered**, and no licence allowance,
-advisory ignore or tool change is authorized. Do not describe nextest as available, add it or work toward it without a
-new owner decision. The time targets above rest on sequential binaries, and a green tier is not a speed result.
+**Parallel test binaries: `cargo-nextest` is the default runner.** On 2026-11-24 the owner reversed the deferral of
+2026-11-17 and adopted the tool, and amended the bar to **5** consecutive green runs on this Linux host (decision 24 of
+[ADR 0013](docs/decisions/0013-tiered-verification-gates.md) asked for 20 per platform). The decision and its design are
+[ADR 0022](docs/decisions/0022-adopt-cargo-nextest.md).
+
+- **Install it:** `cargo install cargo-nextest --locked --version 0.9.152`. The version is pinned. A missing or
+  different version **fails the gate closed** with that line and the rollback; there is no silent fallback.
+- **There is one runner.** The suite step has no runner option: asking for one is a usage error. The rollback is to
+  revert the change that adopted nextest, which is why it lands as one reviewable branch. Two commands still use
+  libtest on purpose and are not a fallback for the suite: `fast`'s `environment-witness` step
+  (`cargo test -p xtask --test gate_witness`, one independently inventoried test) and `cargo xtask linux` inside its
+  container.
+- **Isolation lives in `.config/nextest.toml` only**, in three forms, cheapest first. nextest runs every test in its
+  own process, so an in-process mutex no longer serialises anything. A test whose in-process lock guarded a
+  per-binary resource gets a `max-threads = 1` test group; a binary whose tests race *each other* for a host-wide
+  resource but not the workspace gets **a pass of its own** (below); a test that observes a host-wide resource gets
+  `threads-required = "num-test-threads"`, at test level where only one test needs it. Never split, rename, reorder
+  or skip a test under `crates/**` to suit the
+  runner, and never add a retry: a flaky test is fixed or named. `xtask/tests/nextest_isolation.rs` enforces this: it scans
+  `crates/**` for process-global locks and host process-table reads and fails unless each one is either named in
+  `.config/nextest.toml` or carried in its ledger with the reason it needs no entry. A new test that needs isolation
+  needs a line in that file, with the file and line of its evidence, like the entries already there.
+- **The suite runs in two passes**, because orch-cli's `remote_peers` releases an ephemeral port and rebinds it
+  across a restart: it needs the host to itself, but its own 42 tests must still run in parallel, which is the
+  condition it was green under when cargo ran one test binary at a time. So one `cargo nextest run` takes everything
+  except that binary and a second takes only it. The split is defined **once**, as the two profiles' complementary
+  `default-filter`s in `.config/nextest.toml`; the gate, the `ambient` CI job and the guard all read that one
+  definition, and the guard fails if any of them disagrees. It cannot hide a test: the expected set comes from one
+  **unfiltered** `cargo nextest list --ignore-default-filter`, and the gate judges the **union** of both passes
+  against it, so a test no pass ran has no result and a test two passes ran is a duplicate. Both refuse. Each
+  pass's exit status is judged against its own stream, so one pass's failure cannot be answered by the other's
+  exit. The second profile may be nothing but `inherits = "default"` and its half of the split: with two
+  profiles, a setting in the wrong one escapes a whole-file check, so the guard names every table and key the
+  file may have.
+- **The speedup that counts is on the development host**, and the only timing taken is from before this
+  configuration existed: `cargo test --workspace --no-fail-fast` at 1014.7 s against a two-pass nextest prototype at
+  about 400 s (roughly 2.5x), the prototype having made *more* binaries exclusive than the shipped configuration
+  does. So that figure is an upper bound on the exclusive work, **no timing is claimed for the configuration as it
+  ships**, and no improvement on a GitHub runner is claimed either (CI also pays to build the tool). Composing those
+  samples **estimates** about 335 s for the two passes plus the doc-tests (~175 s of parallel work, ~135 s of
+  exclusive tests inside the first pass, ~20 s for the alone pass, 4.2 s of doc-tests), roughly 3x; it is arithmetic
+  over two different samples, not a run, and [ADR 0022](docs/decisions/0022-adopt-cargo-nextest.md) carries the
+  per-component sources. The owner's bar is 5 consecutive green runs on this Linux host, which is a flakiness bar,
+  not a timing one.
+- **Not resolved by the adoption:** the tool's dependency audit, whose 23 advisories and 10 licence items sit in
+  nextest's own tree rather than `Cargo.lock`, so `cargo deny` never saw them and the `advisories` step is
+  unaffected. The owner accepts nextest as an out-of-tree development tool; no licence allowance or advisory
+  `ignore` is authorized, and that security review is separate.
+- The time targets above are still targets: a green tier is not a speed result.
 
 #### Status of each rule
 
@@ -284,9 +326,13 @@ A reviewer states what was checked and what was not, as in Roles.
   so the workflow has no path filters. A natural documentation-only PR under the
   live rules has not yet been observed (acceptance is owed); report what you see.
 - **After the merge.** A push to `main` forces `all` and also runs the `ambient` job: the ordinary
-  `cargo test --workspace --no-fail-fast` with the repository's `.cargo/config.toml` `[env]`. No tier run before the
-  merge runs that configuration, and `ambient` does not run on PRs: it reports after the merge. A weekly schedule runs
-  `check` alone.
+  two-pass `cargo nextest run --profile default|alone --workspace --no-fail-fast` plus
+  `cargo test --workspace --doc --no-fail-fast`, from the
+  repository root with the repository's `.cargo/config.toml` `[env]`. Every step after the first carries
+  `if: ${{ !cancelled() }}`, so a failing pass does not hide the other pass's result or the doc-tests': the
+  job exists to be diagnosed, not to stop early. `xtask/tests/ambient_env.rs` is what proves that
+  `[env]` reaches the test processes a runner starts itself. No tier run before the merge runs that configuration, and
+  `ambient` does not run on PRs: it reports after the merge. A weekly schedule runs `check` alone.
 
 #### The full gate (status: implemented; once per goal and release is approved policy)
 
@@ -296,7 +342,10 @@ Run it from a clean, committed tree. It proves:
 - **No stale artifact:** a cold `target/gate` is built for the run; `pr` and `fast` reuse `target/gate-warm` only after
   a content check against the source.
 - **Real tests ran:** the suite's exit status is judged, and a run with no executed test fails. The inventory names the
-  tests.
+  tests: the names come from `cargo nextest list`, and a test the listing reports as filtered for any reason but
+  `ignored`, or a binary the listing could not query, refuses the run. Cargo's own `--no-run --message-format=json`
+  artifact map stays the independent expected set: the two must name the same test binaries, so the runner does not
+  supply both sides.
 - **`home-hygiene`:** the suite ran from outside the workspace under an empty sentinel `HOME`, and nothing but
   `.cargo` and `.rustup` appeared in it.
 - **`no-real-cli`:** no test reached a recording shim standing in for an agent CLI.
@@ -345,7 +394,9 @@ Run the CI set locally; it is the mandated check before a PR (status: standing r
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo nextest run --profile default --workspace   # the suite runner; nextest 0.9.152
+cargo nextest run --profile alone --workspace     # the binary that needs the host to itself
+cargo test --workspace --doc                      # nextest does not run doc-tests
 cargo xtask crate-graph
 cargo deny check          # only if cargo-deny is installed; CI always runs it
 cargo xtask changelog check   # when the PR adds or edits a changelog fragment; CI does not run it yet
@@ -650,7 +701,10 @@ docs/                 # ARCHITECTURE, RUNBOOK, TRAITS-FROZEN, specs/, plans/, de
   write into a temp dir. Fake agent scripts are in `fixtures/fake-agents/`.
 - **No real AI CLIs in tests.** Never exec `claude`, `codex`, `cursor-agent`, etc., and never read their config
   dirs. The gate's `no-real-cli` step puts shims on `PATH` and fails if any test reaches one.
-- **Run one crate:** `cargo test -p orch-peer`; one test: `cargo test -p orch-cli --test remote_peers <name>`.
+- **Run one crate:** `cargo test -p orch-peer`; one test: `cargo test -p orch-cli --test remote_peers <name>`. Under
+  nextest: `cargo nextest run -p orch-peer`, and `cargo nextest run -E 'test(<name>)'` for one test. A test that needs
+  isolation is listed in `.config/nextest.toml`, never serialised by a lock in the test file (see "Parallel test
+  binaries").
 - **Portable by default.** Write tests, fixtures and scripts to run on macOS and Linux, or mark them Linux-only
   (and then CI runs them). No GNU-only flags (`sed -i` without a suffix argument, `df -BG`, `date -Is`); no
   `/proc` outside `#[cfg(target_os = "linux")]`. Through 2.0 only Linux is run and gated (rule 10): a test that

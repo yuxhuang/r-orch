@@ -7,7 +7,7 @@ mod witness;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::symlink;
-use witness::fixture::{Capture, STEPS, Sandbox};
+use witness::fixture::{Capture, STEPS, Sandbox, nextest_log};
 
 struct Evidence {
     sandbox: Sandbox,
@@ -132,7 +132,6 @@ impl Evidence {
             ("host-os", "linux"),
             ("host-arch", "x86_64"),
             ("host-label", "synthetic-lab"),
-            ("runner", "cargo"),
             ("exit", "0"),
             ("total-wall-ms", "9000"),
         ]);
@@ -152,14 +151,26 @@ impl Evidence {
             result.push_str(&format!(
                 "{step}\tpass\t0\t1000\tsteps/{step}.log\tsynthetic fixture\n"
             ));
-            sandbox.write(format!("bundle/steps/{step}.log"), if step == "test" {
-                "     Running unittests src/lib.rs (<REPO>/target/gate-warm/debug/deps/fixture-012345)\n\nrunning 1 test\ntest sample ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n   Doc-tests fixture\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n".to_owned()
-            } else { format!("synthetic fixture: {step} passed\n") });
+            sandbox.write(
+                format!("bundle/steps/{step}.log"),
+                if step == "test" {
+                    nextest_log("ok")
+                } else {
+                    format!("synthetic fixture: {step} passed\n")
+                },
+            );
         }
+        // Both expected sets: Cargo's compiler artifact and nextest's listing.
         sandbox.write("bundle/steps/build.log", serde_json::json!({
             "reason": "compiler-artifact", "package_id": "path+file:///fixture#fixture@0.0.0",
             "profile": {"test": true}, "executable": "<REPO>/target/gate-warm/debug/deps/fixture-012345",
             "target": {"kind": ["lib"], "name": "fixture"}
+        }).to_string() + "\n" + &serde_json::json!({
+            "rust-suites": {"fixture": {
+                "package-name": "fixture", "binary-name": "fixture", "kind": "lib",
+                "status": "listed",
+                "testcases": {"sample": {"ignored": false, "filter-match": {"status": "matches"}}}
+            }}
         }).to_string() + "\n");
         sandbox.write("bundle/result.txt", result);
         sandbox.write(
@@ -177,7 +188,8 @@ impl Evidence {
             ("clippy", "clippy 0.1.99 (synthetic fixture)"),
             ("cargo-deny", "cargo-deny 0.18.3 (synthetic fixture)"),
             ("git", "git version 2.50.0 (synthetic fixture)"),
-            ("cargo-nextest", "not-used"),
+            ("cargo-nextest", "cargo-nextest 0.9.152 (synthetic fixture)"),
+            ("nextest-config", "0123456789abcdef0123456789abcdef01234567"),
             ("lock-blob", blobs["Cargo.lock"].as_str()),
             ("cargo-config-blob", blobs[".cargo/config.toml"].as_str()),
             ("toolchain-file-blob", blobs["rust-toolchain.toml"].as_str()),
@@ -811,15 +823,11 @@ fn failed_and_interrupted_receipts_do_not_become_passing_evidence() {
     e.key("verdict", "FAILED (part suite)");
     e.step("test", 1, "FAIL");
     e.step("test", 2, "101");
-    let p = e.sandbox.root.join("bundle/steps/test.log");
-    let log = fs::read_to_string(&p)
-        .unwrap()
-        .replace("test sample ... ok", "test sample ... FAILED")
-        .replace(
-            "test result: ok. 1 passed; 0 failed",
-            "test result: FAILED. 0 passed; 1 failed",
-        );
-    fs::write(p, log).unwrap();
+    fs::write(
+        e.sandbox.root.join("bundle/steps/test.log"),
+        nextest_log("failed"),
+    )
+    .unwrap();
     e.sandbox.write(
         "bundle/inventory.tsv",
         "lib\tfixture\tfixture\tsample\tfailed\n",

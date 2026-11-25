@@ -85,6 +85,37 @@ pub mod fixture {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     pub const PIN: &str = "1.99.1";
+    /// The suite runner the gate refuses to run without (ADR 0022).
+    pub const NEXTEST_PIN: &str = "0.9.152";
+
+    /// The framed test-step log the suite step writes: the runner's exit
+    /// status, its operator log and the whole doc-test run as three leading
+    /// JSON records, then the raw event stream. One library target, one test
+    /// named `sample`, and a doc-test section with nothing in it.
+    pub fn nextest_log(status: &str) -> String {
+        let suite = serde_json::json!({"crate":"fixture","test_binary":"fixture","kind":"lib"});
+        let (passed, failed, exit) = if status == "ok" {
+            (1, 0, 0)
+        } else {
+            (0, 1, 100)
+        };
+        let doc = "   Doc-tests fixture\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n";
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n",
+            // `lines` is the number of event lines the pass produced: the three
+            // below belong to the first pass, which is what lets its exit
+            // status be judged against its own stream.
+            serde_json::json!({"reason":"gate-nextest-pass","profile":"default","exit":exit,"lines":3,"text":"synthetic fixture: one test run\n"}),
+            // The fixture's only binary is in the first pass; the second has
+            // nothing to run and exits 4, as it does for real whenever a tier's
+            // package selection leaves its binaries out of scope.
+            serde_json::json!({"reason":"gate-nextest-pass","profile":"alone","exit":4,"lines":0,"text":""}),
+            serde_json::json!({"reason":"gate-doc-tests","exit":0,"lines":null,"text":doc}),
+            serde_json::json!({"type":"suite","event":"started","test_count":1,"nextest":suite}),
+            serde_json::json!({"type":"test","event":status,"name":"fixture::fixture$sample","exec_time":0.1}),
+            serde_json::json!({"type":"suite","event":status,"passed":passed,"failed":failed,"ignored":0,"measured":0,"filtered_out":0,"exec_time":0.1,"nextest":suite}),
+        )
+    }
     pub const HANDSHAKE_BUDGET: Duration = Duration::from_secs(30);
     pub const COMMAND_BUDGET: Duration = Duration::from_secs(30);
     pub const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -534,6 +565,41 @@ def cargo_subcommand(args):
             for name in TOOL_NAMES.into_iter().chain(["rustup"]) {
                 std::os::unix::fs::symlink(&rustup, self.temporary.join("bin").join(name)).unwrap();
             }
+            // The suite step runs on the pinned cargo-nextest and refuses any
+            // other version, so a fixture repository needs the real tool on
+            // its own PATH. Absent is a hard setup failure with the install
+            // line, never a silent skip.
+            let nextest = std::env::var_os("PATH")
+                .map(|path| {
+                    std::env::split_paths(&path)
+                        .filter(|p| p.is_absolute())
+                        .map(|p| p.join("cargo-nextest"))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .find_map(|candidate| {
+                    let path = fs::canonicalize(candidate).ok()?;
+                    let metadata = fs::metadata(&path).ok()?;
+                    (metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+                        .then_some(path)
+                })
+                .unwrap_or_else(|| {
+                    panic!(
+                        "setup: cargo-nextest missing from PATH; \
+                         cargo install cargo-nextest --locked --version {NEXTEST_PIN}"
+                    )
+                });
+            std::os::unix::fs::symlink(&nextest, self.temporary.join("bin/cargo-nextest")).unwrap();
+            let pinned = self.run(self.command("cargo-nextest").arg("--version"));
+            pinned.code(0);
+            assert!(
+                pinned
+                    .stdout
+                    .starts_with(&format!("cargo-nextest {NEXTEST_PIN} ")),
+                "setup: cargo-nextest pin: {}",
+                pinned.text()
+            );
             let cargo = self.run(self.command("cargo").arg("--version"));
             cargo.code(0);
             assert!(
@@ -593,6 +659,22 @@ def cargo_subcommand(args):
             );
             self.write("rust-toolchain.toml", "[toolchain]\nchannel = \"1.99.1\"\n");
             self.write(".cargo/config.toml", "[env]\nORCHESTRY_GLOBAL_CONFIG_PATH = { value = \"target/test-global/global.yml\", relative = true }\n");
+            // The gate passes `--config-file <repo>/.config/nextest.toml` and
+            // runs one pass per profile, so a fixture repository needs both.
+            // Minimal and as strict as the real one: no retries, and the only
+            // filter is the pass split. The alone pass here matches nothing
+            // and exits 4, exactly as it does for a tier whose selection
+            // leaves it out of scope; it is written over a test name no
+            // fixture defines because nextest refuses a `binary()` predicate
+            // that matches no binary at all.
+            self.write(
+                ".config/nextest.toml",
+                "[profile.default]\nretries = 0\nfail-fast = false\n\
+                 leak-timeout = { period = \"1s\", result = \"fail\" }\n\
+                 default-filter = 'not test(=alone_fixture_nothing)'\n\n\
+                 [profile.alone]\ninherits = \"default\"\n\
+                 default-filter = 'test(=alone_fixture_nothing)'\n",
+            );
             self.write(
                 "fixture/Cargo.toml",
                 "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n",
