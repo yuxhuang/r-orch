@@ -134,6 +134,23 @@ filter = 'package(orch-cli) & binary(daemon_nodaemon_matrix) & test(=web_answers
 threads-required = "num-test-threads"
 priority = 100
 
+# (d) The two production-holder matrices each cold-build the real xtask in a
+# private target while observing direct exit and last-close within 120 seconds.
+# Parallel workspace builds can consume that window (#222). Reserve all test
+# slots for each matrix, including against its sibling. Moving them into the
+# remote_peers pass would still allow overlap there; a one-thread group would
+# still allow overlap with the workspace. Keep every lifecycle assertion and
+# the drain deadline unchanged. Other xtask tests remain parallel.
+[[profile.default.overrides]]
+filter = 'package(xtask) & binary(xtask) & test(=gate::target::qualification::production_holder_commands_and_discriminators_on_scratch_filesystem)'
+threads-required = "num-test-threads"
+priority = 100
+
+[[profile.default.overrides]]
+filter = 'package(xtask) & binary(xtask) & test(=gate::target::qualification::production_holder_commands_and_discriminators_on_worktree_filesystem)'
+threads-required = "num-test-threads"
+priority = 100
+
 # Pass 2: remote_peers alone, with its own tests in parallel — the condition it
 # was green under when cargo ran one test binary at a time. Its tests then
 # compete only with each other for ephemeral ports.

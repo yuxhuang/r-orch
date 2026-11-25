@@ -70,16 +70,28 @@ enum Verdict {
 /// The configuration gives each of these a test-level override; anything here
 /// must be there and anything there must be here.
 ///
-/// The one entry is host-exclusive rather than moved into the alone pass on
+/// The port-reuse entry is host-exclusive rather than moved into the alone pass on
 /// purpose. Its hazard is the same released-and-rebound ephemeral port, and in
 /// the alone pass it would compete for ports with the 42 tests that pass runs
 /// in parallel — worse than what it had under `cargo test`, where its binary's
 /// own mutex meant no sibling ran beside it. Host-wide exclusivity reproduces
 /// that, and for one test it costs one test's duration.
-const EXCLUSIVE_TESTS: &[(&str, &str)] = &[(
-    "crates/orch-cli/tests/daemon_nodaemon_matrix.rs",
-    "web_answers_503_when_the_daemon_dies_while_serving_and_starts_nothing",
-)];
+const EXCLUSIVE_TESTS: &[(&str, &str)] = &[
+    (
+        "crates/orch-cli/tests/daemon_nodaemon_matrix.rs",
+        "web_answers_503_when_the_daemon_dies_while_serving_and_starts_nothing",
+    ),
+    // #222: each matrix cold-builds xtask in a private target inside its drain
+    // deadline. A group cannot keep unrelated workspace work off the host.
+    (
+        "xtask/src/gate/target/qualification.rs",
+        "gate::target::qualification::production_holder_commands_and_discriminators_on_scratch_filesystem",
+    ),
+    (
+        "xtask/src/gate/target/qualification.rs",
+        "gate::target::qualification::production_holder_commands_and_discriminators_on_worktree_filesystem",
+    ),
+];
 
 /// A helper that binds an ephemeral port, takes the address and **releases**
 /// the listener, so the address is rebound later. Its callers race every other
@@ -574,6 +586,11 @@ fn configured() -> BTreeMap<&'static str, BTreeSet<String>> {
 /// `crates/<package>/tests/<name>.rs` is the test binary `<name>`. Anything
 /// deeper is a shared module and owns no binary of its own.
 fn owning_binary(path: &str) -> Option<&str> {
+    // Unit tests in this module belong to xtask's binary, not an integration
+    // test named qualification. Keep its two matrix overrides test-scoped.
+    if path == "xtask/src/gate/target/qualification.rs" {
+        return Some("xtask");
+    }
     let rest = path.strip_prefix("crates/")?;
     let (_, rest) = rest.split_once('/')?;
     let rest = rest.strip_prefix("tests/")?;
@@ -1229,4 +1246,39 @@ fn the_detector_sees_the_idioms_that_escaped_it() {
             .any(|h| "assert!(orch_processes(&process_table()).is_empty());".contains(h)),
         "the unscoped list must cover a bare host-wide emptiness assertion"
     );
+}
+
+/// Pin the exact two expensive matrices and their reservation, so weakening
+/// `threads-required` to a group or a fixed count cannot silently pass the
+/// ledger's classification checks.
+fn assert_holder_matrices_are_exclusive(config: &str) {
+    let actual: BTreeSet<Vec<String>> = tables(config)
+        .into_iter()
+        .filter(|(header, body)| {
+            header == "[[profile.default.overrides]]"
+                && body
+                    .iter()
+                    .any(|line| line.contains("production_holder_commands_and_discriminators"))
+        })
+        .map(|(_, body)| body)
+        .collect();
+    let expected: BTreeSet<Vec<String>> = ["scratch", "worktree"]
+        .into_iter()
+        .map(|variant| {
+            vec![
+                format!("filter = 'package(xtask) & binary(xtask) & test(=gate::target::qualification::production_holder_commands_and_discriminators_on_{variant}_filesystem)'"),
+                r#"threads-required = "num-test-threads""#.to_owned(),
+                "priority = 100".to_owned(),
+            ]
+        })
+        .collect();
+    assert_eq!(
+        actual, expected,
+        "#222 matrices must each reserve the whole nextest host"
+    );
+}
+
+#[test]
+fn holder_matrices_reserve_the_host_without_serialising_other_xtask_tests() {
+    assert_holder_matrices_are_exclusive(CONFIG);
 }
