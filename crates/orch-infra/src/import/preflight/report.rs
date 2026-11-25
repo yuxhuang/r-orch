@@ -92,9 +92,26 @@ pub struct Confirmation {
     pub found: &'static str,
 }
 
+/// A bounded preview of the order the import would assign, never a load manifest.
+#[derive(Debug, Serialize)]
+pub struct OrderedEntity {
+    pub store: &'static str,
+    /// Escaped and bounded, like a finding. Never used as a path.
+    pub id: String,
+    pub position: u64,
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct Report {
     pub counts: Counts,
+    /// A preview only. The durable caller must repeat the checked reads under its lock.
+    pub order: Capped<OrderedEntity>,
+    /// Effective 1.0 run cap; null if config checking did not finish.
+    pub run_cap: Option<u64>,
+    /// Size of the compact JSON legacy object, not its potentially sensitive values.
+    pub legacy_config_bytes: u64,
+    /// Input never grants trust: the command must ask the owner before enabling it.
+    pub preapproval_requires_confirmation: bool,
     /// A finding here means the check stops: exit 2 with nothing created (R112, R123).
     pub refusals: Capped<Finding>,
     /// Listed and not a stop: no rule for a path, an unclaimed workspace, event gaps.

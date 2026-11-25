@@ -1,0 +1,1 @@
+Add an inactive SQLite mapping for the retry table that stores each whole diagnostic, however long, behind blob objects with an ordered, hash-checked manifest and reads the due and complete retry orders; it is registered in no storage method yet, and the daemon continues to use file storage.

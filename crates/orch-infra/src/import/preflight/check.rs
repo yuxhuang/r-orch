@@ -1,15 +1,23 @@
 //! The blocking body of the check. See the module header for what it promises.
 use super::names::{escape, fold, is_id, relative};
 use super::probe::ProcessProbe;
-use super::report::{Counts, Finding, Report};
+use super::report::{Counts, Finding, OrderedEntity, Report};
 use super::source::{kind, list_bounded};
 use super::{Options, PreflightError};
 use crate::data_dir::confined::{ConfinedDir, ConfinedError, FileAccess};
 use crate::import::document::{
-    Limits, Refusal, check_json, check_yaml, decode_json, decode_yaml, read_bounded,
+    Limits, Refusal, check_json, decode_json, decode_yaml, read_bounded,
 };
 use crate::import::event::{EventItem, EventStream};
 use serde::de::DeserializeOwned;
+use serde_json::Value;
+#[path = "compatibility.rs"]
+mod compatibility;
+use compatibility::{legacy_defaults, unknown_config};
+#[path = "comparison.rs"]
+mod comparison;
+use comparison::DocumentContent;
+use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -132,6 +140,13 @@ fn classify(store: Store, name: &OsStr) -> Name<'_> {
     }
 }
 
+fn order_key(store: Store, name: &OsStr) -> &[u8] {
+    match classify(store, name) {
+        Name::Document(stem) => stem,
+        _ => name.as_bytes(),
+    }
+}
+
 struct Level {
     dir: ConfinedDir,
     names: Vec<OsString>,
@@ -239,6 +254,8 @@ pub(super) fn run(
         report: Report::default(),
         listed: 0,
         tasks: BTreeMap::new(),
+        auto_agent: false,
+        inherited_agent_policy: false,
     };
     if let Some(plan) = check.plan(&orch)? {
         check.examine(&orch, plan)?;
@@ -255,6 +272,8 @@ pub(super) struct Check<'a> {
     listed: u64,
     /// One fold key for each task id of the listing (R117): fold key to the id.
     tasks: BTreeMap<Vec<u8>, Vec<u8>>,
+    auto_agent: bool,
+    inherited_agent_policy: bool,
 }
 
 impl Check<'_> {
@@ -298,7 +317,13 @@ impl Check<'_> {
         });
     }
 
-    fn note(&mut self, path: &str, rule: &'static str, observed: Option<String>, detail: &str) {
+    pub(super) fn note(
+        &mut self,
+        path: &str,
+        rule: &'static str,
+        observed: Option<String>,
+        detail: &str,
+    ) {
         self.report.notes.push(Finding {
             path: path.to_owned(),
             rule,
@@ -510,7 +535,7 @@ impl Check<'_> {
 
     pub(super) fn read(
         &mut self,
-        file: File,
+        file: impl Read,
         limit: usize,
         path: &str,
     ) -> Result<Option<Vec<u8>>, PreflightError> {
@@ -568,9 +593,7 @@ impl Check<'_> {
             self.store(*store, level)?;
         }
         self.cancelled()?;
-        if plan.has_config {
-            self.config(orch)?;
-        }
+        self.config(orch, plan.has_config)?;
         self.state(orch, plan.has_state)?;
         if let Some((dir, attachments)) = &plan.attachments {
             self.attachments(dir, attachments)?;
@@ -580,7 +603,18 @@ impl Check<'_> {
     }
 
     fn store(&mut self, store: Store, level: &Level) -> Result<(), PreflightError> {
-        for name in &level.names {
+        let mut index = if store.has_index() {
+            Some(self.index_plan(store, level)?)
+        } else {
+            None
+        };
+        let mut names: Vec<_> = level.names.iter().collect();
+        if store.has_index() {
+            // Removing the extension changes prefix order: a-b.json precedes
+            // a.json as a file name, but the entity id a precedes a-b.
+            names.sort_by(|a, b| order_key(store, a).cmp(order_key(store, b)));
+        }
+        for name in names {
             self.cancelled()?;
             let path = relative(&[OsStr::new(store.dir()), name]);
             match classify(store, name) {
@@ -590,7 +624,7 @@ impl Check<'_> {
                     None,
                     "a path with no rule: not imported",
                 ),
-                Name::Index => self.index(&level.dir, name, &path)?,
+                Name::Index => {}
                 Name::Template => {
                     let Some(file) = self.acquire(&level.dir, name, &path) else {
                         continue;
@@ -609,6 +643,9 @@ impl Check<'_> {
                 Name::Document(stem) => {
                     if !is_id(stem) {
                         self.bad_stem(&path);
+                        if let Some(index) = &mut index {
+                            self.index_invalid_file(index, stem);
+                        }
                         continue;
                     }
                     if store == Store::Tasks {
@@ -622,13 +659,25 @@ impl Check<'_> {
                                 None,
                                 "a task id may not be `.` or `..`",
                             );
+                            if let Some(index) = &mut index {
+                                self.index_invalid_file(index, stem);
+                            }
                             continue;
                         }
                         self.register_task(stem, &path);
                     }
-                    self.document(store, &level.dir, name, stem, &path)?;
+                    let value = self.document(store, &level.dir, name, stem, &path)?;
+                    if let Some(index) = &mut index {
+                        match value {
+                            Some(value) => self.index_file(store.dir(), index, stem, &value),
+                            None => self.index_invalid_file(index, stem),
+                        }
+                    }
                 }
             }
+        }
+        if let Some(index) = index {
+            self.finish_index(store.dir(), index);
         }
         Ok(())
     }
@@ -671,9 +720,9 @@ impl Check<'_> {
         name: &OsStr,
         stem: &[u8],
         path: &str,
-    ) -> Result<(), PreflightError> {
+    ) -> Result<Option<DocumentContent>, PreflightError> {
         let Some(file) = self.acquire(dir, name, path) else {
-            return Ok(());
+            return Ok(None);
         };
         let yaml = matches!(
             store,
@@ -685,71 +734,157 @@ impl Check<'_> {
             Limits::JSON.bytes
         };
         let Some(bytes) = self.read(file, limit, path)? else {
-            return Ok(());
+            return Ok(None);
         };
-        let own = match store {
-            Store::Tasks => self.yaml::<orch_domain::Task>(&bytes, path).map(|d| d.id),
-            Store::Agents => self.yaml::<orch_domain::Agent>(&bytes, path).map(|d| d.id),
-            Store::Goals => self.yaml::<orch_domain::Goal>(&bytes, path).map(|d| d.id),
-            Store::Teams => self.yaml::<orch_domain::Team>(&bytes, path).map(|d| d.id),
-            Store::Messages => self
-                .json::<orch_domain::Message>(&bytes, path)
-                .map(|d| d.id),
-            Store::Context => self
-                .json::<orch_core::storage::ContextEntry>(&bytes, path)
-                .map(|d| d.key),
-            Store::Runs => self.json::<orch_domain::Run>(&bytes, path).map(|d| d.id),
-            Store::Templates => None,
-        };
-        if let Some(own) = own
-            && self.own_id(path, &own, stem)
-        {
-            let counts = self.counts();
-            match store {
-                Store::Tasks => counts.tasks += 1,
-                Store::Agents => counts.agents += 1,
-                Store::Goals => counts.goals += 1,
-                Store::Teams => counts.teams += 1,
-                Store::Messages => counts.messages += 1,
-                Store::Context => counts.context += 1,
-                Store::Runs => counts.runs += 1,
-                Store::Templates => {}
+        // Keep the native typed decoders: building a JSON Value first would
+        // silently accept repeated known members of a JSON entity.
+        let mut agent_policy = None;
+        let (own, value) = if yaml {
+            let Some(value) = self.yaml::<serde_yaml_ng::Value>(&bytes, path) else {
+                return Ok(None);
+            };
+            // A YAML-only key cannot equal a JSON index entry. It is still legal
+            // in an ignored entity field, as it was to 1.0's typed YAML reader.
+            let comparison = serde_json::to_value(&value)
+                .ok()
+                .and_then(|v| serde_json::value::to_raw_value(&v).ok());
+            let own = match store {
+                Store::Tasks => serde_yaml_ng::from_value::<orch_domain::Task>(value).map(|d| d.id),
+                Store::Agents => serde_yaml_ng::from_value::<orch_domain::Agent>(value).map(|d| {
+                    agent_policy = Some(d.config.approval_policy);
+                    d.id
+                }),
+                Store::Goals => serde_yaml_ng::from_value::<orch_domain::Goal>(value).map(|d| d.id),
+                Store::Teams => serde_yaml_ng::from_value::<orch_domain::Team>(value).map(|d| d.id),
+                _ => unreachable!("YAML store"),
             }
+            .map_err(|e| e.to_string());
+            (own, comparison)
+        } else {
+            if let Err(refusal) = check_json(&bytes, Limits::JSON) {
+                self.refusal(path, refusal);
+                return Ok(None);
+            }
+            let own = match store {
+                Store::Messages => {
+                    serde_json::from_slice::<orch_domain::Message>(&bytes).map(|d| d.id)
+                }
+                Store::Context => {
+                    serde_json::from_slice::<orch_core::storage::ContextEntry>(&bytes)
+                        .map(|d| d.key)
+                }
+                Store::Runs => serde_json::from_slice::<orch_domain::Run>(&bytes).map(|d| d.id),
+                _ => unreachable!("JSON store"),
+            }
+            .map_err(|e| e.to_string());
+            let comparison = serde_json::from_slice::<Box<RawValue>>(&bytes)
+                .expect("JSON budget pass checked the syntax");
+            (own, Some(comparison))
+        };
+        let own = match own {
+            Ok(own) => own,
+            Err(e) => {
+                self.refusal(path, Refusal::invalid("type", e));
+                return Ok(None);
+            }
+        };
+        if !self.own_id(path, &own, stem) {
+            return Ok(None);
         }
-        Ok(())
+        match agent_policy {
+            Some(Some(orch_domain::agent::ApprovalPolicy::Auto)) => self.auto_agent = true,
+            Some(None) => self.inherited_agent_policy = true,
+            _ => {}
+        }
+        let counts = self.counts();
+        match store {
+            Store::Tasks => counts.tasks += 1,
+            Store::Agents => counts.agents += 1,
+            Store::Goals => counts.goals += 1,
+            Store::Teams => counts.teams += 1,
+            Store::Messages => counts.messages += 1,
+            Store::Context => counts.context += 1,
+            Store::Runs => counts.runs += 1,
+            Store::Templates => {}
+        }
+        Ok(Some(DocumentContent(value)))
     }
 
-    /// The file kind, the byte bound, an I/O error and the depth and node budgets are
-    /// terminal. What an index that is not JSON, not an array or has bad entries means
-    /// is the #146 wiring's, which reads these same bytes after the contract's proof.
-    fn index(&mut self, dir: &ConfinedDir, name: &OsStr, path: &str) -> Result<(), PreflightError> {
-        let Some(file) = self.acquire(dir, name, path) else {
-            return Ok(());
+    fn config(&mut self, orch: &ConfinedDir, present: bool) -> Result<(), PreflightError> {
+        let path = "config.yml";
+        let value = if present {
+            let Some(file) = self.acquire(orch, OsStr::new(path), path) else {
+                return Ok(());
+            };
+            let Some(bytes) = self.read(file, Limits::YAML.bytes, path)? else {
+                return Ok(());
+            };
+            let value = match self
+                .runtime
+                .block_on(decode_yaml::<serde_yaml_ng::Value>(&bytes, Limits::YAML))
+            {
+                Ok(value) => value,
+                Err(mut refusal) => {
+                    if refusal.rule == "documents" && refusal.observed == 0 {
+                        refusal.detail.push_str("; 1.0 read this file as its defaults; after taking a copy, write {} to keep those defaults");
+                    }
+                    self.refusal(path, refusal);
+                    return Ok(());
+                }
+            };
+            let value = match serde_json::to_value(&value) {
+                Ok(value) => value,
+                Err(e) => {
+                    self.refusal(path, Refusal::invalid("type", e));
+                    return Ok(());
+                }
+            };
+            if !value.is_object() {
+                self.refusal(path, Refusal::invalid("type", "expected a mapping; 1.0 read this file as its defaults; after taking a copy, write {} to keep those defaults"));
+                return Ok(());
+            }
+            value
+        } else {
+            serde_json::json!({})
         };
-        let Some(bytes) = self.read(file, Limits::JSON.bytes, path)? else {
+        let defaults = legacy_defaults();
+        let unknown = unknown_config(&value, &defaults);
+        let size = serde_json::to_vec(&unknown).expect("JSON value").len() as u64;
+        self.report.legacy_config_bytes = size;
+        if size > 65_536 {
+            self.refuse(
+                path,
+                "legacy_config_bytes",
+                Some(65_536),
+                Some(size.to_string()),
+                "unknown configuration keys exceed the legacy.config byte limit",
+            );
             return Ok(());
-        };
-        match check_json(&bytes, Limits::JSON) {
-            Ok(()) => self.counts().indexes += 1,
-            Err(r) if r.rule == "parse" => self.counts().indexes += 1,
-            Err(r) => self.refusal(path, r),
         }
-        Ok(())
-    }
-
-    fn config(&mut self, orch: &ConfinedDir) -> Result<(), PreflightError> {
-        let name = OsStr::new("config.yml");
-        let path = relative(&[name]);
-        let Some(file) = self.acquire(orch, name, &path) else {
-            return Ok(());
+        self.config_unknown_notes(path, &unknown, "");
+        let merged = orch_domain::deep_merge(&defaults, &value);
+        let config = match serde_json::from_value::<orch_domain::OrchestratorConfig>(merged) {
+            Ok(config) => config,
+            Err(e) => {
+                self.refusal(path, Refusal::invalid("type", e));
+                return Ok(());
+            }
         };
-        let Some(bytes) = self.read(file, Limits::YAML.bytes, &path)? else {
-            return Ok(());
-        };
-        // The budget pass and its document count only; the classes of C-V1 to C-V14
-        // that follow a clean pass are the #146 wiring's.
-        if let Err(refusal) = check_yaml(&bytes, Limits::YAML) {
-            self.refusal(&path, refusal);
+        self.report.run_cap = Some(config.scheduling.max_concurrent_agents as u64);
+        if value.pointer("/scheduling/max_concurrent_agents").is_none() {
+            self.note(
+                path,
+                "config_default",
+                Some("6".into()),
+                "run_cap 6 is 1.0's default, not a value set by the source file",
+            );
+        }
+        self.report.preapproval_requires_confirmation = self.auto_agent
+            || (self.inherited_agent_policy
+                && config.defaults.agent.approval_policy
+                    == orch_domain::agent::ApprovalPolicy::Auto);
+        if self.report.preapproval_requires_confirmation {
+            self.note(path, "preapproval_confirmation", None, "the owner must confirm preapproval: auto agents are implicitly trusted to run unattended; source input alone never grants trust");
         }
         Ok(())
     }

@@ -1316,6 +1316,11 @@ What follows for T21, and nothing here is built by this text:
    1.0's reader. That is so for the test type of one field that the test uses. In a real directory an
    array of identities alone does not decode, and 1.0 rebuilds it (the spec's F19).
 
+Status: the owner merged the contract text (PR 158), which ratifies the drafted rows and the proposal of
+T21-O1 as the plan above says. The read-side wiring slice below gives the `config.yml` path and the index
+reconciliation their first caller, the whole-source check, and the record of point 4 is brought up to date
+there.
+
 ### T21 bounded reader slice
 
 The private `orch-infra::import` module compiles the read-only YAML/JSON budget pass,
@@ -1352,10 +1357,10 @@ Where the check goes beyond the spec's wording, it is stricter and says so: a `r
 that 1.0 would read as empty because one entry does not decode stops the check, because that set is what
 R119 asks about.
 
-Not in this slice: the `config.yml` and `_index.json` classes (C-V1 to C-V14, X-V1 to X-V14), which keep
-only the file-kind, byte, I/O and budget stops until the proof of issue 146 is accepted; every write (rows,
-blobs, `.orch-project`, the manifest), `orch import` and its dry-run report, `--resume`, the second reading
-of each file at the load, and any use of a copy of a live project. The check has no caller outside its tests.
+Not in this slice: the `config.yml` and `_index.json` classes (C-V1 to C-V14, X-V1 to X-V14), which the
+read-side wiring slice below adds; every write (rows, blobs, `.orch-project`, the manifest), `orch import` and
+its dry-run report, `--resume`, the second reading of each file at the load, and any use of a copy of a live
+project. The check has no caller outside its tests.
 
 ### T21 reader compatibility evidence (issue 146)
 
@@ -1365,15 +1370,51 @@ buffered event reads and propagates terminal I/O failures. The document-count ru
 physical gap semantics and index disposition are unchanged. JSON's effective depth
 ceiling remains 64, even when a caller requests more.
 
-Before the first runtime caller, the spec owner must reconcile R109's exactly-one-document
-rule with the R110 compatibility table: the effective legacy config reader supplies
-defaults for missing, empty, space/newline-only, comment-only and explicit-null config;
-the bounded reader refuses the three zero-document streams. Explicit null passes the
-budget check but is not a typed entity. Multi-document config is refused by both readers.
-This evidence does not grant a config exception or amend AP15. See
-[the compatibility record](../internal/import-reader-compatibility.md) for the decision
-and individually tracked integration conditions. Full T21 still requires its actual
-writer, source confinement/preflight, reporting, dry run, resume and acceptance evidence.
+The effective legacy config reader supplies defaults for missing, empty, space/newline-only,
+comment-only and explicit-null config; the bounded reader refuses the three zero-document
+streams, and explicit null passes the budget check but is not a typed entity. Multi-document
+config is refused by both readers. The contract that reconciles this with R109 is the one of
+"T21 config and index contract" above, and the read-side wiring slice below applies it. See
+[the compatibility record](../internal/import-reader-compatibility.md) for the table and the
+individually tracked conditions. Full T21 still requires its actual writer, reporting, dry run,
+resume and acceptance evidence.
+
+### T21 read-side wiring slice (issue 146)
+
+The whole-source check now classifies `config.yml` and the five `_index.json` files by the contract of
+"T21 config and index contract", on the bytes it already measured, and still writes nothing. Nothing outside
+its tests calls it, and there is still no `orch import` command.
+
+- `config.yml`: a missing file is the empty mapping; a stream of no document is refused under `documents` and a
+  null, scalar or sequence document as `unreadable`, each saying that 1.0 read the file as its defaults; two
+  documents are refused under `documents` without that statement; the mapping is merged over a private copy
+  of 1.0's defaults that no later default changes. A key the defaults do not hold is noted as `unknown_config`
+  by its bounded dotted path, its value never reported, and the compact JSON of those keys above 65,536 bytes
+  is refused under `legacy_config_bytes`. The report carries the effective `run_cap` (6 when the file does not
+  set it, with a `config_default` note that says so) and `preapproval_requires_confirmation`, true when an
+  agent is `auto` or inherits an `auto` project default. That flag, with its note, is a preview: input never
+  grants trust (R93, R133), and nothing sets a policy.
+- `_index.json`: the array is examined whole, so a bad entry anywhere is `index_entry` before any
+  `index_duplicate`, which holds for bare identities and for whole entities alike. A missing, unparsable,
+  object or `null` index is a note `index_unreadable` and the files go in id order; the budget, file-kind and
+  I/O stops stay terminal and are never `index_unreadable`. `index_unlisted`, `index_missing_file` (an entry with
+  no file, never opened as a path; a present file that is refused gets its own refusal and is not also reported
+  as missing) and `index_differs` are notes, and the file's content wins. The report's `order` previews at most
+  1,000 positions for all stores together and counts the rest in `more`; it is not a load manifest.
+- Tests: `crates/orch-infra/tests/import_preflight_compat.rs`, named in the compatibility record. The same
+  test that pins C-V11 runs 1.0's task, agent, goal and team readers on a separately created zero-byte file
+  for each, and X-V5 and X-V7 run 1.0's `IndexManager` on a second, disposable source for each of the five
+  directories. X-V13 is the unit test `an_index_read_error_stops_and_an_interrupted_read_is_retried`, which
+  injects the read fault into the method the whole-source check reads every index through. The tests also
+  pin that a JSON message or context document with a repeated field the entity type knows is refused as before, and that a YAML
+  entity keeps an ignored YAML-only key.
+
+Held, and not claimed by this slice: the writer, the importer and its command, integrated dry run, resume and
+zero-write acceptance (issue 146), and the lock held across the check and the cancellation of a blocked read
+(issue 192). The reader-level `import::index::reconcile` is unwired, is kept as historical evidence and still
+names a repeated identity `index_entry`; it is not the preflight's classifier, and it takes every entity
+document of a directory at once, which the check does not gather. No changelog fragment is added: nothing a user can run or notice changes, and
+the check has no caller outside its tests (AGENTS.md, "Changelog fragments").
 
 ### T8c complete retry enumeration follow-up
 

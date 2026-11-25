@@ -58,6 +58,8 @@ pub enum SqliteError {
     IntentCorrupt(&'static str),
     #[error("stored lease data is damaged: {0}")]
     LeaseCorrupt(String),
+    #[error("stored retry data is damaged: {0}")]
+    RetryMessageCorrupt(&'static str),
     #[error("SQLite writer is closed")]
     WriterClosed,
     #[error("SQLite connection and queue capacities must be greater than zero")]
@@ -168,6 +170,12 @@ mod agent_team_run;
 
 #[allow(dead_code, reason = "private Task SQL awaits Storage composition")]
 mod task_sql;
+
+#[allow(
+    dead_code,
+    reason = "internal retry mapping awaits the combined T10 Storage adapter"
+)]
+mod retry_message;
 
 #[allow(
     dead_code,

@@ -286,7 +286,17 @@ fn each_yaml_budget_passes_at_its_limit_and_refuses_one_over() {
     );
     assert_eq!(over[0]["limit"], 64);
     // nodes as expanded
-    accepted_in("200,000 nodes", flat_sequence(199_999).as_bytes(), CONFIG);
+    // These fixtures pass the parser budget, then stop on config shape.
+    let at = refused_everywhere(
+        "200,000 nodes",
+        flat_sequence(199_999).as_bytes(),
+        &[CONFIG],
+        "unreadable",
+    );
+    assert!(
+        at.iter()
+            .all(|f| f["detail"].as_str().unwrap().contains("expected a mapping"))
+    );
     refused_everywhere(
         "200,001 nodes",
         flat_sequence(200_000).as_bytes(),
@@ -294,10 +304,15 @@ fn each_yaml_budget_passes_at_its_limit_and_refuses_one_over() {
         "expanded_nodes",
     );
     // bytes as expanded
-    accepted_in(
+    let at = refused_everywhere(
         "4,194,304 bytes expanded",
         repeated_scalar(63, false).as_bytes(),
-        CONFIG,
+        &[CONFIG],
+        "unreadable",
+    );
+    assert!(
+        at.iter()
+            .all(|f| f["detail"].as_str().unwrap().contains("expected a mapping"))
     );
     refused_everywhere(
         "4,194,305 bytes expanded",
@@ -409,14 +424,20 @@ fn spaced(total: usize) -> String {
 
 #[test]
 fn each_json_budget_passes_at_its_limit_and_refuses_one_over() {
-    accepted_in("999,999 strings", strings(999_999).as_bytes(), INDEX);
+    // A bounded scalar array still stops on index entry shape after parsing.
+    refused_everywhere(
+        "999,999 strings",
+        strings(999_999).as_bytes(),
+        &[INDEX],
+        "index_entry",
+    );
     refused_everywhere(
         "1,000,000 strings",
         strings(1_000_000).as_bytes(),
         &[INDEX],
         "nodes",
     );
-    accepted_in("64 deep", nested(64).as_bytes(), INDEX);
+    refused_everywhere("64 deep", nested(64).as_bytes(), &[INDEX], "index_entry");
     accepted_in("64 deep", nested(64).as_bytes(), STATE);
     refused_everywhere("65 deep", nested(65).as_bytes(), &JSON_SLOTS, "depth");
     accepted_in("16 MiB", spaced(16_777_216).as_bytes(), INDEX);
