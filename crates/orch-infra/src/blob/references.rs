@@ -2,7 +2,7 @@
 //! No transaction is opened or committed here. A savepoint makes each operation atomic;
 //! an outer rollback leaves only a harmless unreferenced file. Authorization belongs to
 //! the dispatcher, and the active file backend is unchanged until T24.
-use super::{BlobError, BlobHash, DiskBlobStore, INLINE_TEXT_MAX_BYTES};
+use super::{BlobError, BlobHash, DiskBlobStore};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 #[derive(Debug, thiserror::Error)]
@@ -22,6 +22,23 @@ type Result<T> = std::result::Result<T, ReferenceError>;
 
 /// A project's references to a daemon-wide content-addressed disk store.
 /// `project` must come from the caller context, never from an entity payload.
+/// Run prompts belong to the native run create/update and hydration path, which
+/// keeps the detail, `/prompt` chunks, whole-content hash and revision together.
+/// The former independent prompt writer and single-object reader are unavailable:
+///
+/// ```compile_fail,E0599
+/// use orch_infra::blob::BlobReferences;
+/// fn independent_writer(refs: &BlobReferences<'_>, tx: &mut rusqlite::Transaction<'_>) {
+///     refs.store_prompt(tx, "run", "prompt", 0).unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use orch_infra::blob::BlobReferences;
+/// fn single_object_reader(refs: &BlobReferences<'_>, conn: &rusqlite::Connection) {
+///     refs.load_prompt(conn, "run").unwrap();
+/// }
+/// ```
 pub struct BlobReferences<'a> {
     disk: &'a DiskBlobStore,
     project: &'a str,
@@ -29,34 +46,6 @@ pub struct BlobReferences<'a> {
 impl<'a> BlobReferences<'a> {
     pub fn new(disk: &'a DiskBlobStore, project: &'a str) -> Self {
         Self { disk, project }
-    }
-
-    /// All prompts, including short/empty ones, are blobs (R59).
-    /// The run must already exist in the same transaction. Revision changes belong
-    /// to the surrounding run operation, which may set other fields as well.
-    pub fn store_prompt(
-        &self,
-        tx: &mut Transaction<'_>,
-        run: &str,
-        prompt: &str,
-        now: i64,
-    ) -> Result<BlobHash> {
-        let (form, key) = run_key(run);
-        let sp = tx.savepoint()?;
-        if !sp.query_row(
-            "SELECT EXISTS(SELECT 1 FROM runs WHERE project_id=?1 AND id_form=?2 AND id=?3)",
-            params![self.project, form, key],
-            |r| r.get::<_, bool>(0),
-        )? {
-            return Err(ReferenceError::MissingOwner { kind: "run" });
-        }
-        let hash = self.register(&sp, prompt.as_bytes(), now)?;
-        sp.execute(
-            "UPDATE runs SET prompt_sha256=?4 WHERE project_id=?1 AND id_form=?2 AND id=?3",
-            params![self.project, form, key, hash.to_string()],
-        )?;
-        sp.commit()?;
-        Ok(hash)
     }
 
     /// The display name is bound as data and is never used for filesystem access.
@@ -112,22 +101,6 @@ impl<'a> BlobReferences<'a> {
         Ok(())
     }
 
-    pub fn load_prompt(&self, conn: &Connection, run: &str) -> Result<Option<String>> {
-        let (form, key) = run_key(run);
-        let hash: Option<Option<String>> = conn
-            .query_row(
-                "SELECT prompt_sha256 FROM runs WHERE project_id=?1 AND id_form=?2 AND id=?3",
-                params![self.project, form, key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        hash.flatten()
-            .map(|h| {
-                String::from_utf8(self.read(conn, &h)?).map_err(|_| ReferenceError::PromptEncoding)
-            })
-            .transpose()
-    }
-
     pub fn load_attachment(
         &self,
         conn: &Connection,
@@ -159,16 +132,6 @@ impl<'a> BlobReferences<'a> {
             return Err(ReferenceError::Metadata);
         }
         Ok(bytes)
-    }
-}
-
-// The API accepts the original domain ID, never a caller-supplied stored digest.
-// The form keeps a literal hash-looking ID distinct from an oversized ID.
-fn run_key(run: &str) -> (i64, String) {
-    if run.len() > INLINE_TEXT_MAX_BYTES {
-        (1, BlobHash::of(run.as_bytes()).to_string())
-    } else {
-        (0, run.into())
     }
 }
 

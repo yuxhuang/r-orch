@@ -1236,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn native_writer_exact_identity_threshold_is_shared_with_prompt_reader() {
+    fn native_run_prompt_identity_threshold_round_trips() {
         let (_temp, data) = crate::sqlite::test_data();
         let disk = DiskBlobStore::open(data.root()).unwrap();
         let mut conn = native_conn();
@@ -1261,12 +1261,212 @@ mod tests {
                 .unwrap();
             assert_eq!(stored, (form, expected));
             assert_eq!(
-                BlobReferences::new(&disk, "p")
-                    .load_prompt(&tx, &r.id)
-                    .unwrap(),
-                Some(r.prompt)
+                sql.get(Family::Run, &r.id).unwrap().unwrap().entity,
+                Entity::Run(Box::new(r))
             );
         }
+    }
+
+    #[test]
+    fn native_prompt_create_update_and_read_share_manifest_hash_and_revision() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let mut r = run();
+        let mut saved = sql.create(Entity::Run(Box::new(r.clone()))).unwrap();
+        assert_eq!(sql.get(Family::Run, &r.id).unwrap(), Some(saved.clone()));
+        for prompt in [
+            "short".into(),
+            "é".repeat(32768),
+            "é".repeat(32768) + "x",
+            String::new(),
+        ] {
+            r.prompt = prompt;
+            let old_revision = saved.revision;
+            saved = sql
+                .update(Entity::Run(Box::new(r.clone())), old_revision)
+                .unwrap();
+            assert_eq!(saved.revision.get(), old_revision.get() + 1);
+            assert_eq!(saved.position, 1);
+            assert_eq!(sql.get(Family::Run, &r.id).unwrap(), Some(saved.clone()));
+            assert_eq!(
+                sql.hydrate(Family::Run, std::slice::from_ref(&r.id))
+                    .unwrap(),
+                vec![saved.clone()]
+            );
+            let (hash, count, size): (String, i64, i64) = tx.query_row(
+                "SELECT prompt_sha256,(SELECT COUNT(*) FROM entity_blob_refs WHERE project_id='p' AND family='run' AND locator='/prompt'),(SELECT size FROM entity_blob_refs WHERE project_id='p' AND family='run' AND locator='/prompt') FROM runs WHERE project_id='p'",
+                [], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+            assert_eq!(
+                (hash, count, size),
+                (
+                    BlobHash::of(r.prompt.as_bytes()).to_string(),
+                    1,
+                    r.prompt.len() as i64
+                )
+            );
+            let before = native_state(&tx);
+            assert!(matches!(
+                sql.update(Entity::Run(Box::new(run())), old_revision),
+                Err(NativeError::Store(StoreError::StaleRevision { .. }))
+            ));
+            assert_eq!(native_state(&tx), before);
+        }
+        sql.ensure_committable().unwrap();
+        tx.commit().unwrap();
+        let tx = conn.transaction().unwrap();
+        assert_eq!(
+            NativeSql::new(&tx, &disk, "p", 124)
+                .get(Family::Run, &r.id)
+                .unwrap(),
+            Some(saved)
+        );
+    }
+
+    #[test]
+    fn native_prompt_multichunk_reader_returns_original_bytes_after_create_and_update() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let mut r = run();
+        // The first object's last byte is the first half of a UTF-8 character.
+        r.prompt = "x".repeat(MAX_BLOB_BYTES as usize - 1) + "é";
+        let first = sql.create(Entity::Run(Box::new(r.clone()))).unwrap();
+        assert_eq!(sql.get(Family::Run, &r.id).unwrap(), Some(first.clone()));
+        let rows: Vec<(i64, String, i64)> = tx.prepare("SELECT ordinal,sha256,size FROM entity_blob_refs WHERE family='run' AND locator='/prompt' ORDER BY ordinal").unwrap()
+            .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].0, rows[0].2, rows[1].0, rows[1].2),
+            (0, MAX_BLOB_BYTES as i64, 1, 1)
+        );
+        let whole = BlobHash::of(r.prompt.as_bytes());
+        assert!(matches!(
+            disk.get(&whole),
+            Err(crate::blob::BlobError::NotFound(_))
+        ));
+        assert_eq!(
+            tx.query_row::<String, _, _>("SELECT prompt_sha256 FROM runs", [], |row| row.get(0))
+                .unwrap(),
+            whole.to_string()
+        );
+        let filter = Filter::Runs {
+            task: None,
+            agent: None,
+        };
+        assert_eq!(
+            sql.select(selection(&filter, Sort::Default), None, 10)
+                .unwrap()
+                .items,
+            vec![first.clone()]
+        );
+        // Replacing the prompt uses the same manifest writer, even across object sizes.
+        r.prompt = "short".into();
+        let short = sql
+            .update(Entity::Run(Box::new(r.clone())), first.revision)
+            .unwrap();
+        assert_eq!(sql.get(Family::Run, &r.id).unwrap(), Some(short.clone()));
+        r.prompt = "x".repeat(MAX_BLOB_BYTES as usize - 1) + "é";
+        let large = sql
+            .update(Entity::Run(Box::new(r.clone())), short.revision)
+            .unwrap();
+        assert_eq!(
+            sql.hydrate(Family::Run, std::slice::from_ref(&r.id))
+                .unwrap(),
+            vec![large.clone()]
+        );
+        sql.ensure_committable().unwrap();
+        tx.commit().unwrap();
+        let tx = conn.transaction().unwrap();
+        let sql = NativeSql::new(&tx, &disk, "p", 124);
+        assert_eq!(sql.get(Family::Run, &r.id).unwrap(), Some(large.clone()));
+        tx.execute(
+            "UPDATE entity_blob_refs SET ordinal=2 WHERE locator='/prompt' AND ordinal=1",
+            [],
+        )
+        .unwrap();
+        assert!(matches!(
+            sql.get(Family::Run, &r.id),
+            Err(NativeError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn native_prompt_form_project_isolation_and_outer_rollback_preserve_old_bytes() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let indirect = "é".repeat(32769);
+        let literal = BlobHash::of(indirect.as_bytes()).to_string();
+        let mut original = Vec::new();
+        {
+            let tx = conn.transaction().unwrap();
+            for project in ["p", "other"] {
+                let mut sql = NativeSql::new(&tx, &disk, project, 123);
+                for id in [&literal, &indirect] {
+                    let mut r = run();
+                    r.id = id.clone();
+                    r.prompt = format!("{project}-{}", id.len());
+                    original.push((project, sql.create(Entity::Run(Box::new(r))).unwrap()));
+                }
+            }
+            tx.commit().unwrap();
+        }
+        {
+            let tx = conn.transaction().unwrap();
+            let mut sql = NativeSql::new(&tx, &disk, "p", 124);
+            for (_, saved) in &original[..2] {
+                let Entity::Run(r) = &saved.entity else {
+                    panic!("run fixture")
+                };
+                let mut changed = r.clone();
+                changed.prompt = "replacement".into();
+                let updated = sql.update(Entity::Run(changed), saved.revision).unwrap();
+                assert_eq!(sql.get(Family::Run, &r.id).unwrap(), Some(updated));
+            }
+            for (project, saved) in &original[2..] {
+                assert_eq!(
+                    NativeSql::new(&tx, &disk, project, 124)
+                        .get(Family::Run, saved.entity.id())
+                        .unwrap(),
+                    Some(saved.clone())
+                );
+            }
+            sql.ensure_committable().unwrap();
+            tx.rollback().unwrap();
+        }
+        let tx = conn.transaction().unwrap();
+        for (project, saved) in &original {
+            assert_eq!(
+                NativeSql::new(&tx, &disk, project, 125)
+                    .get(Family::Run, saved.entity.id())
+                    .unwrap(),
+                Some(saved.clone())
+            );
+        }
+        let mut sql = NativeSql::new(&tx, &disk, "p", 125);
+        sql.delete(Family::Run, &indirect, Revision::ONE).unwrap();
+        let before = native_state(&tx);
+        let mut missing = run();
+        missing.id = indirect.clone();
+        missing.prompt = "must not overwrite literal sibling".into();
+        assert!(matches!(
+            sql.update(Entity::Run(Box::new(missing)), Revision::ONE),
+            Err(NativeError::Store(StoreError::StaleRevision {
+                actual: None,
+                ..
+            }))
+        ));
+        assert_eq!(native_state(&tx), before);
+        assert!(sql.get(Family::Run, &indirect).unwrap().is_none());
+        assert_eq!(
+            sql.get(Family::Run, &literal).unwrap(),
+            Some(original[0].1.clone())
+        );
     }
 
     fn native_state(tx: &Transaction<'_>) -> Vec<Vec<Vec<SqlValue>>> {

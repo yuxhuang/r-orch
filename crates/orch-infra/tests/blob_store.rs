@@ -354,9 +354,6 @@ fn database(f: &Fixture) -> orch_infra::sqlite::ConnectionHandle<'_> {
     migrate(&f._data, &mut c).unwrap();
     for project in ["p", "other"] {
         c.execute("INSERT INTO tasks (project_id,id,title,description,status,priority,attempts,max_attempts,position,created_by_kind,created_at,updated_at,revision) VALUES (?1,'task','t','','todo',1,0,3,0,'owner',0,0,1)", [project]).unwrap();
-        for (run, number) in [("run", 1), ("run2", 2)] {
-            c.execute("INSERT INTO runs (project_id,id,task_id,agent_id,run_no,counted,attempt_no,epoch,status,started_at,revision) VALUES (?1,?2,'task','agent',?3,1,?3,?3,'running',0,1)", rusqlite::params![project, run, number]).unwrap();
-        }
     }
     c
 }
@@ -368,17 +365,17 @@ fn count(c: &rusqlite::Connection, table: &str) -> i64 {
 }
 
 #[test]
-fn prompt_rows_deduplicate_and_round_trip_with_the_real_reader() {
+fn attachment_rows_deduplicate_and_round_trip_with_the_real_reader() {
     use orch_infra::blob::BlobReferences;
     let f = fixture();
     let mut c = database(&f);
     let refs = BlobReferences::new(&f.store, "p");
     let mut tx = c.transaction().unwrap();
     let first = refs
-        .store_prompt(&mut tx, "run", "rendered prompt", 123)
+        .store_attachment(&mut tx, "task", "first", b"rendered prompt", 123)
         .unwrap();
     let second = refs
-        .store_prompt(&mut tx, "run2", "rendered prompt", 456)
+        .store_attachment(&mut tx, "task", "second", b"rendered prompt", 456)
         .unwrap();
     assert_eq!(first, second);
     assert_eq!(count(&tx, "blobs"), 1);
@@ -396,12 +393,12 @@ fn prompt_rows_deduplicate_and_round_trip_with_the_real_reader() {
     );
     tx.commit().unwrap();
     assert_eq!(
-        refs.load_prompt(&c, "run").unwrap(),
-        Some("rendered prompt".into())
+        refs.load_attachment(&c, "task", "first").unwrap(),
+        Some(b"rendered prompt".to_vec())
     );
     assert_eq!(
         BlobReferences::new(&f.store, "other")
-            .load_prompt(&c, "run")
+            .load_attachment(&c, "task", "first")
             .unwrap(),
         None
     );
@@ -442,16 +439,19 @@ fn rolled_back_references_leave_no_rows_and_are_replayable() {
     let mut c = database(&f);
     let refs = BlobReferences::new(&f.store, "p");
     let mut tx = c.transaction().unwrap();
-    let hash = refs.store_prompt(&mut tx, "run", "rollback", 0).unwrap();
+    let hash = refs
+        .store_attachment(&mut tx, "task", "first", b"rollback", 0)
+        .unwrap();
     refs.store_attachment(&mut tx, "task", "a", b"rollback", 0)
         .unwrap();
     tx.rollback().unwrap();
     assert_eq!(count(&c, "blobs"), 0);
     assert_eq!(count(&c, "task_attachments"), 0);
-    assert_eq!(refs.load_prompt(&c, "run").unwrap(), None);
+    assert_eq!(refs.load_attachment(&c, "task", "first").unwrap(), None);
     assert_eq!(f.store.get(&hash).unwrap(), b"rollback");
     let mut tx = c.transaction().unwrap();
-    refs.store_prompt(&mut tx, "run", "rollback", 1).unwrap();
+    refs.store_attachment(&mut tx, "task", "first", b"rollback", 1)
+        .unwrap();
     tx.commit().unwrap();
     assert_eq!(count(&c, "blobs"), 1);
 }
@@ -463,20 +463,19 @@ fn failed_owners_and_failed_disk_publication_leave_no_metadata() {
     let mut c = database(&f);
     let refs = BlobReferences::new(&f.store, "p");
     let mut tx = c.transaction().unwrap();
-    assert!(refs.store_prompt(&mut tx, "missing", "x", 0).is_err());
     assert!(
         refs.store_attachment(&mut tx, "missing", "a", b"x", 0)
             .is_err()
     );
     std::fs::remove_dir(f.root.join("blobs/tmp")).unwrap();
     assert!(
-        refs.store_prompt(&mut tx, "run", "disk failure", 0)
+        refs.store_attachment(&mut tx, "task", "first", b"disk failure", 0)
             .is_err()
     );
     assert_eq!(count(&tx, "blobs"), 0);
     assert_eq!(count(&tx, "task_attachments"), 0);
     tx.commit().unwrap();
-    assert_eq!(refs.load_prompt(&c, "run").unwrap(), None);
+    assert_eq!(refs.load_attachment(&c, "task", "first").unwrap(), None);
 }
 
 #[test]
@@ -486,23 +485,28 @@ fn row_hashes_and_metadata_are_checked_before_reading_bytes() {
     let mut c = database(&f);
     let refs = BlobReferences::new(&f.store, "p");
     let mut tx = c.transaction().unwrap();
-    let hash = refs.store_prompt(&mut tx, "run", "intact", 0).unwrap();
+    let hash = refs
+        .store_attachment(&mut tx, "task", "first", b"intact", 0)
+        .unwrap();
     tx.commit().unwrap();
     c.execute("UPDATE blobs SET size=99", []).unwrap();
-    assert!(refs.load_prompt(&c, "run").is_err());
+    assert!(refs.load_attachment(&c, "task", "first").is_err());
     let mut tx = c.transaction().unwrap();
-    assert!(refs.store_prompt(&mut tx, "run2", "intact", 0).is_err());
-    assert_eq!(refs.load_prompt(&tx, "run2").unwrap(), None);
+    assert!(
+        refs.store_attachment(&mut tx, "task", "second", b"intact", 0)
+            .is_err()
+    );
+    assert_eq!(refs.load_attachment(&tx, "task", "second").unwrap(), None);
     tx.rollback().unwrap();
     c.execute("UPDATE blobs SET size=6", []).unwrap();
     std::fs::write(f.blob_path(&hash), b"broken").unwrap();
-    assert!(refs.load_prompt(&c, "run").is_err());
+    assert!(refs.load_attachment(&c, "task", "first").is_err());
     c.execute(
-        "UPDATE runs SET prompt_sha256='../../outside/canary' WHERE project_id='p'",
+        "UPDATE task_attachments SET sha256='../../outside/canary' WHERE project_id='p'",
         [],
     )
     .unwrap();
-    assert!(refs.load_prompt(&c, "run").is_err());
+    assert!(refs.load_attachment(&c, "task", "first").is_err());
     f.canary_unchanged();
 }
 
@@ -513,13 +517,8 @@ fn owner_only_in_another_project_is_missing() {
     let f = fixture();
     let mut c = database(&f);
     c.execute("INSERT INTO tasks (project_id,id,title,description,status,priority,attempts,max_attempts,position,created_by_kind,created_at,updated_at,revision) VALUES ('other','only_other','t','','todo',1,0,3,0,'owner',0,0,1)", []).unwrap();
-    c.execute("INSERT INTO runs (project_id,id,task_id,agent_id,run_no,counted,attempt_no,epoch,status,started_at,revision) VALUES ('other','run_other','only_other','agent',9,1,9,9,'running',0,1)", []).unwrap();
     let refs = BlobReferences::new(&f.store, "p");
     let mut tx = c.transaction().unwrap();
-    assert!(matches!(
-        refs.store_prompt(&mut tx, "run_other", "x", 0),
-        Err(ReferenceError::MissingOwner { kind: "run" })
-    ));
     assert!(matches!(
         refs.store_attachment(&mut tx, "only_other", "a", b"x", 0),
         Err(ReferenceError::MissingOwner { kind: "task" })
@@ -535,16 +534,16 @@ fn another_projects_blob_row_does_not_authorize_a_read() {
     let mut c = database(&f);
     let mut tx = c.transaction().unwrap();
     let hash = BlobReferences::new(&f.store, "p")
-        .store_prompt(&mut tx, "run", "shared", 0)
+        .store_attachment(&mut tx, "task", "first", b"shared", 0)
         .unwrap();
     tx.commit().unwrap();
     c.execute(
-        "UPDATE runs SET prompt_sha256=?1 WHERE project_id='other' AND id='run'",
+        "INSERT INTO task_attachments(project_id,task_id,name,sha256) VALUES ('other','task','first',?1)",
         [hash.to_string()],
     )
     .unwrap();
     assert!(matches!(
-        BlobReferences::new(&f.store, "other").load_prompt(&c, "run"),
+        BlobReferences::new(&f.store, "other").load_attachment(&c, "task", "first"),
         Err(ReferenceError::Metadata)
     ));
 }
@@ -556,10 +555,12 @@ fn reregistration_clears_the_sweep_mark_and_attachment_replaces() {
     let mut c = database(&f);
     let refs = BlobReferences::new(&f.store, "p");
     let mut tx = c.transaction().unwrap();
-    refs.store_prompt(&mut tx, "run", "mark", 0).unwrap();
+    refs.store_attachment(&mut tx, "task", "first", b"mark", 0)
+        .unwrap();
     tx.execute("UPDATE blobs SET unreferenced_since=5", [])
         .unwrap();
-    refs.store_prompt(&mut tx, "run2", "mark", 1).unwrap();
+    refs.store_attachment(&mut tx, "task", "second", b"mark", 1)
+        .unwrap();
     assert_eq!(
         tx.query_row::<Option<i64>, _, _>("SELECT unreferenced_since FROM blobs", [], |r| r.get(0))
             .unwrap(),
@@ -574,7 +575,7 @@ fn reregistration_clears_the_sweep_mark_and_attachment_replaces() {
         refs.load_attachment(&c, "task", "a").unwrap(),
         Some(b"two".to_vec())
     );
-    assert_eq!(count(&c, "task_attachments"), 1);
+    assert_eq!(count(&c, "task_attachments"), 3);
 }
 
 #[test]
@@ -584,35 +585,37 @@ fn error_variants_and_location() {
     let mut c = database(&f);
     let refs = BlobReferences::new(&f.store, "p");
     let mut tx = c.transaction().unwrap();
-    let hash = refs.store_prompt(&mut tx, "run", "loc", 0).unwrap();
+    let hash = refs
+        .store_attachment(&mut tx, "task", "first", b"loc", 0)
+        .unwrap();
     tx.commit().unwrap();
     c.execute("UPDATE blobs SET storage_location='object'", [])
         .unwrap();
     assert!(matches!(
-        refs.load_prompt(&c, "run"),
+        refs.load_attachment(&c, "task", "first"),
         Err(ReferenceError::Metadata)
     ));
     c.execute("UPDATE blobs SET storage_location='disk'", [])
         .unwrap();
     std::fs::write(f.blob_path(&hash), b"bad").unwrap();
     assert!(matches!(
-        refs.load_prompt(&c, "run"),
+        refs.load_attachment(&c, "task", "first"),
         Err(ReferenceError::Blob(BlobError::Corrupt(_)))
     ));
     std::fs::remove_file(f.blob_path(&hash)).unwrap();
     assert!(matches!(
-        refs.load_prompt(&c, "run"),
+        refs.load_attachment(&c, "task", "first"),
         Err(ReferenceError::Blob(BlobError::NotFound(_)))
     ));
     c.execute(
-        "UPDATE runs SET prompt_sha256='../x' WHERE project_id='p' AND id='run'",
+        "UPDATE task_attachments SET sha256='../x' WHERE project_id='p' AND name='first'",
         [],
     )
     .unwrap();
     c.execute("INSERT INTO task_attachments (project_id,task_id,name,sha256) VALUES ('p','task','bad','../x')", []).unwrap();
     c.execute("UPDATE blobs SET sha256='../x'", []).unwrap();
     assert!(matches!(
-        refs.load_prompt(&c, "run"),
+        refs.load_attachment(&c, "task", "first"),
         Err(ReferenceError::Blob(BlobError::InvalidHash(_)))
     ));
     assert!(matches!(
@@ -623,14 +626,16 @@ fn error_variants_and_location() {
 }
 
 #[test]
-fn metadata_refusal_preserves_existing_prompt_and_attachment_links() {
+fn metadata_refusal_preserves_existing_attachment_links() {
     use orch_infra::blob::{BlobReferences, ReferenceError};
     for (size, location) in [(99, "disk"), (9, "object")] {
         let f = fixture();
         let mut c = database(&f);
         let refs = BlobReferences::new(&f.store, "p");
         let mut tx = c.transaction().unwrap();
-        let original = refs.store_prompt(&mut tx, "run", "original", 1).unwrap();
+        let original = refs
+            .store_attachment(&mut tx, "task", "first", b"original", 1)
+            .unwrap();
         assert_eq!(
             refs.store_attachment(&mut tx, "task", "a", b"original", 1)
                 .unwrap(),
@@ -643,7 +648,7 @@ fn metadata_refusal_preserves_existing_prompt_and_attachment_links() {
         )
         .unwrap();
         assert!(matches!(
-            refs.store_prompt(&mut tx, "run", "candidate", 4),
+            refs.store_attachment(&mut tx, "task", "first", b"candidate", 4),
             Err(ReferenceError::Metadata)
         ));
         assert!(matches!(
@@ -652,7 +657,7 @@ fn metadata_refusal_preserves_existing_prompt_and_attachment_links() {
         ));
         tx.commit().unwrap();
         assert_eq!(count(&c, "blobs"), 2);
-        assert_eq!(count(&c, "task_attachments"), 1);
+        assert_eq!(count(&c, "task_attachments"), 2);
         let metadata: (i64, String, i64, Option<i64>) = c
             .query_row(
                 "SELECT size,storage_location,created_at,unreferenced_since FROM blobs WHERE project_id='p' AND sha256=?1",
@@ -662,89 +667,12 @@ fn metadata_refusal_preserves_existing_prompt_and_attachment_links() {
             .unwrap();
         assert_eq!(metadata, (size, location.into(), 2, Some(3)));
         assert_eq!(
-            refs.load_prompt(&c, "run").unwrap(),
-            Some("original".into())
+            refs.load_attachment(&c, "task", "first").unwrap(),
+            Some(b"original".to_vec())
         );
         assert_eq!(
             refs.load_attachment(&c, "task", "a").unwrap(),
             Some(b"original".to_vec())
         );
     }
-}
-
-#[test]
-fn run_prompt_lookup_and_update_distinguish_literal_and_digest_ids() {
-    use orch_infra::blob::BlobReferences;
-    let f = fixture();
-    let mut c = database(&f);
-    // Both native keys contain the same bytes in one project. Only the form differs.
-    // Count UTF-8 bytes: this ID has fewer than 65,536 characters.
-    let indirect = "é".repeat(32_769);
-    let literal = BlobHash::of(indirect.as_bytes()).to_string();
-    for project in ["p", "other"] {
-        for form in [0, 1] {
-            c.execute(
-                "INSERT INTO runs(project_id,id,id_form,id_sha256,id_bytes,task_id,agent_id,status,revision)
-                 VALUES(?1,?2,?3,?4,?5,'task','agent','running',1)",
-                rusqlite::params![project,literal,form,
-                    (form == 1).then_some(&literal),
-                    (form == 1).then_some(indirect.len() as i64)],
-            ).unwrap();
-        }
-    }
-    assert_eq!(count(&c, "runs"), 8);
-    let refs = BlobReferences::new(&f.store, "p");
-    let other = BlobReferences::new(&f.store, "other");
-    let mut tx = c.transaction().unwrap();
-    refs.store_prompt(&mut tx, &literal, "literal prompt", 1)
-        .unwrap();
-    assert_eq!(
-        refs.load_prompt(&tx, &literal).unwrap().as_deref(),
-        Some("literal prompt")
-    );
-    assert_eq!(refs.load_prompt(&tx, &indirect).unwrap(), None);
-    let digest_link: Option<String> = tx
-        .query_row(
-            "SELECT prompt_sha256 FROM runs WHERE project_id='p' AND id_form=1 AND id=?1",
-            [&literal],
-            |r| r.get(0),
-        )
-        .unwrap();
-    assert_eq!(digest_link, None);
-    refs.store_prompt(&mut tx, &indirect, "indirect prompt", 2)
-        .unwrap();
-    assert_eq!(
-        refs.load_prompt(&tx, &literal).unwrap().as_deref(),
-        Some("literal prompt")
-    );
-    assert_eq!(
-        refs.load_prompt(&tx, &indirect).unwrap().as_deref(),
-        Some("indirect prompt")
-    );
-    assert_eq!(other.load_prompt(&tx, &literal).unwrap(), None);
-    assert_eq!(other.load_prompt(&tx, &indirect).unwrap(), None);
-    tx.commit().unwrap();
-    assert_eq!(count(&c, "runs"), 8);
-    assert_eq!(count(&c, "blobs"), 2);
-
-    // An absent form must not fall back to its other-form sibling. A caught
-    // refusal creates no registration and leaves the sibling link intact.
-    c.execute(
-        "DELETE FROM runs WHERE project_id='p' AND id_form=1 AND id=?1",
-        [&literal],
-    )
-    .unwrap();
-    let mut tx = c.transaction().unwrap();
-    assert!(matches!(
-        refs.store_prompt(&mut tx, &indirect, "missing form", 3),
-        Err(orch_infra::blob::ReferenceError::MissingOwner { kind: "run" })
-    ));
-    assert_eq!(refs.load_prompt(&tx, &indirect).unwrap(), None);
-    assert_eq!(
-        refs.load_prompt(&tx, &literal).unwrap().as_deref(),
-        Some("literal prompt")
-    );
-    tx.commit().unwrap();
-    assert_eq!(count(&c, "runs"), 7);
-    assert_eq!(count(&c, "blobs"), 2);
 }
