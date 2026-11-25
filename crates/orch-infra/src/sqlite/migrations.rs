@@ -376,3 +376,78 @@ fn retain_two(data: &DataDir) -> Result<()> {
     backups.sync()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sqlite::{Class, Role, classify, open_connection, test_data};
+
+    fn plenty() -> DiskSpace {
+        DiskSpace {
+            available: 100 * 1024 * 1024 * 1024,
+            total: 200 * 1024 * 1024 * 1024,
+        }
+    }
+
+    #[test]
+    fn task_format_hook_refuses_late_predecessor_and_preserves_committed_intermediate() {
+        let (_tmp, data) = test_data();
+        let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        // Starting at zero skips preflight. A trusted synthetic second step
+        // creates an orphan membership after 001 commits; only 003's hook
+        // can refuse it. No shipped migration SQL is changed.
+        let intermediate = "CREATE TABLE committed_marker(value TEXT); INSERT INTO committed_marker VALUES('kept'); INSERT INTO task_labels VALUES('p','synthetic-task','synthetic-label');";
+        let error = apply_migrations(
+            &data,
+            &mut conn,
+            &[INITIAL_SCHEMA, intermediate, TASK_FORMAT],
+            plenty(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, SqliteError::Migration(_)), "{error:?}");
+        assert!(error.to_string().contains("task_labels=1"), "{error}");
+        assert!(!error.to_string().contains("synthetic-"), "{error}");
+        assert_eq!(
+            classify(&error).leaves(),
+            &[(Role::Operation, Class::Ordinary)]
+        );
+        // The durable predecessor, its ledger and 003's absent tables form
+        // one atomic refusal contract, including after closing and reopening.
+        drop(conn);
+        let conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        let state: (i64, String, i64, i64, String) = conn.query_row(
+            "SELECT (SELECT user_version FROM pragma_user_version), (SELECT group_concat(version, ',') FROM (SELECT version FROM schema_migrations ORDER BY version)), (SELECT count(*) FROM sqlite_schema WHERE name IN ('task_details','task_blob_refs','task_blob_refs_by_hash')), (SELECT count(*) FROM task_labels WHERE project_id='p' AND task_id='synthetic-task' AND label='synthetic-label'), (SELECT value FROM committed_marker)",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).unwrap();
+        assert_eq!(state, (2, "1,2".into(), 0, 1, "kept".into()));
+        assert!(
+            data.root()
+                .open_dir("backups")
+                .unwrap()
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn task_format_preflight_statement_error_keeps_its_sqlite_category() {
+        let (_tmp, data) = test_data();
+        let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        apply_migrations(&data, &mut conn, &[INITIAL_SCHEMA], plenty()).unwrap();
+        // A malformed synthetic predecessor makes the actual preflight SELECT
+        // fail. This must differ structurally from the intentional row refusal.
+        conn.execute_batch("DROP TABLE task_labels").unwrap();
+        let error = apply_migrations(
+            &data,
+            &mut conn,
+            &[INITIAL_SCHEMA, ATTENTION_FACTS, TASK_FORMAT],
+            plenty(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, SqliteError::Sql(rusqlite::Error::SqliteFailure(ref code, _)) if code.extended_code == rusqlite::ffi::SQLITE_ERROR),
+            "preflight lost its SQLite category: {error:?}"
+        );
+    }
+}
