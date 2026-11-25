@@ -2,7 +2,7 @@
 //! No transaction is opened or committed here. A savepoint makes each operation atomic;
 //! an outer rollback leaves only a harmless unreferenced file. Authorization belongs to
 //! the dispatcher, and the active file backend is unchanged until T24.
-use super::{BlobError, BlobHash, DiskBlobStore};
+use super::{BlobError, BlobHash, DiskBlobStore, INLINE_TEXT_MAX_BYTES};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 #[derive(Debug, thiserror::Error)]
@@ -41,18 +41,19 @@ impl<'a> BlobReferences<'a> {
         prompt: &str,
         now: i64,
     ) -> Result<BlobHash> {
+        let (form, key) = run_key(run);
         let sp = tx.savepoint()?;
         if !sp.query_row(
-            "SELECT EXISTS(SELECT 1 FROM runs WHERE project_id=?1 AND id=?2)",
-            params![self.project, run],
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE project_id=?1 AND id_form=?2 AND id=?3)",
+            params![self.project, form, key],
             |r| r.get::<_, bool>(0),
         )? {
             return Err(ReferenceError::MissingOwner { kind: "run" });
         }
         let hash = self.register(&sp, prompt.as_bytes(), now)?;
         sp.execute(
-            "UPDATE runs SET prompt_sha256=?3 WHERE project_id=?1 AND id=?2",
-            params![self.project, run, hash.to_string()],
+            "UPDATE runs SET prompt_sha256=?4 WHERE project_id=?1 AND id_form=?2 AND id=?3",
+            params![self.project, form, key, hash.to_string()],
         )?;
         sp.commit()?;
         Ok(hash)
@@ -112,10 +113,11 @@ impl<'a> BlobReferences<'a> {
     }
 
     pub fn load_prompt(&self, conn: &Connection, run: &str) -> Result<Option<String>> {
+        let (form, key) = run_key(run);
         let hash: Option<Option<String>> = conn
             .query_row(
-                "SELECT prompt_sha256 FROM runs WHERE project_id=?1 AND id=?2",
-                params![self.project, run],
+                "SELECT prompt_sha256 FROM runs WHERE project_id=?1 AND id_form=?2 AND id=?3",
+                params![self.project, form, key],
                 |r| r.get(0),
             )
             .optional()?;
@@ -157,6 +159,16 @@ impl<'a> BlobReferences<'a> {
             return Err(ReferenceError::Metadata);
         }
         Ok(bytes)
+    }
+}
+
+// The API accepts the original domain ID, never a caller-supplied stored digest.
+// The form keeps a literal hash-looking ID distinct from an oversized ID.
+fn run_key(run: &str) -> (i64, String) {
+    if run.len() > INLINE_TEXT_MAX_BYTES {
+        (1, BlobHash::of(run.as_bytes()).to_string())
+    } else {
+        (0, run.into())
     }
 }
 
