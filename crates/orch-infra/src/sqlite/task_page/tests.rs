@@ -881,17 +881,23 @@ fn ids_with_prefix_are_the_projects_rows_of_that_prefix_and_byte_length() {
     insert(&db, "other", &task("abc9", TaskStatus::Todo, 1, 1, None), 1);
     let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
     let find = |project: &str, prefix: &str, len: usize| {
-        let mut got = pool
+        let mut got = Vec::new();
+        let found = pool
             .read(deadline(), |tx| {
-                Ok(super::ids_with_prefix(tx, project, prefix, len))
+                Ok(super::find_id_with_prefix(tx, project, prefix, len, |id| {
+                    got.push(id.to_owned());
+                    false
+                }))
             })
             .unwrap()
             .unwrap();
+        // Refusing every candidate reads each one and finds none.
+        assert_eq!(found, None);
         got.sort();
         got
     };
     assert_eq!(find("p", "abc", 4), ["abc1", "abc2", "abcd"]);
-    // Four bytes, three characters.
+    // Five bytes: four characters and five.
     assert_eq!(find("p", "abc", 5), ["abcde", "abc\u{e9}"]);
     assert_eq!(find("p", "abc", 7), Vec::<String>::new());
     assert_eq!(find("p", "abc", 8), ["abc\u{10FFFF}z"]);
@@ -903,4 +909,33 @@ fn ids_with_prefix_are_the_projects_rows_of_that_prefix_and_byte_length() {
     assert_eq!(find("missing", "abc", 4), Vec::<String>::new());
     // A prefix of only the greatest character has no bound above it.
     assert_eq!(find("p", "\u{10FFFF}", 4), Vec::<String>::new());
+}
+
+#[test]
+fn the_prefix_lookup_stops_at_the_first_id_taken() {
+    let root = tempfile::tempdir().unwrap();
+    let data = data(&root);
+    let mut db = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&data, &mut db).unwrap();
+    for (i, id) in ["ab1", "ab2", "ab3"].iter().enumerate() {
+        insert(
+            &db,
+            "p",
+            &task(id, TaskStatus::Todo, 1, 1, None),
+            i as u64 + 1,
+        );
+    }
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    let mut seen = Vec::new();
+    let found = pool
+        .read(deadline(), |tx| {
+            Ok(super::find_id_with_prefix(tx, "p", "ab", 3, |id| {
+                seen.push(id.to_owned());
+                id == "ab2"
+            }))
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.as_deref(), Some("ab2"));
+    assert_eq!(seen, ["ab1", "ab2"]);
 }

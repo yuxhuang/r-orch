@@ -958,9 +958,12 @@ fn a_reference_that_issue_could_not_have_written_is_refused() {
             bad[index] ^= 1;
             invalid_cursor(try_raw(&bad));
         }
-        // A prefix that is too short (it would widen the lookup), one that is
-        // not UTF-8, and a reference cut short.
-        invalid_cursor(try_raw(&good[..good.len() - 4]));
+        // A prefix that is too short (it would widen the lookup), however little
+        // too short (one position has one token), one that is not UTF-8, and a
+        // reference cut short.
+        for short in 1..=4 {
+            invalid_cursor(try_raw(&good[..good.len() - short]));
+        }
         let mut not_utf8 = good.clone();
         *not_utf8.last_mut().unwrap() = 0xff;
         invalid_cursor(try_raw(&not_utf8));
@@ -1136,4 +1139,16 @@ fn record_page_costs() {
             "SELECT MIN(position),MAX(position) FROM tasks WHERE project_id = 'p'"
         )
     );
+}
+
+#[test]
+fn a_reference_token_for_another_sort_is_refused() {
+    scenario(1, |fx| {
+        let (good, _) = reference_token(fx);
+        // Sort::Id's token under every other sort.
+        for sort in SORTS.into_iter().filter(|s| *s != Sort::Id) {
+            invalid_cursor(fx.list(&filter(), &resumed(&cursor(hex(&good)), sort)));
+        }
+        fx.state.ensure_available().unwrap();
+    });
 }

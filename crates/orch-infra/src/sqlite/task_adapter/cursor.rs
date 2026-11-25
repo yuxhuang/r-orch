@@ -162,6 +162,10 @@ impl TaskCursors {
         if raw[10..HEADER] != binding {
             return Err(invalid().into());
         }
+        // Before any lookup: another sort's token is refused without reading.
+        if decoded_sort != sort {
+            return Err(invalid().into());
+        }
         let keys = task_page::seek_width(decoded_sort)? - 1;
         let tail = raw.get(HEADER..HEADER + keys * 8).ok_or_else(invalid)?;
         let mut values = tail
@@ -195,10 +199,8 @@ impl TaskCursors {
     /// The ID that `reference` (`length, digest, prefix`) names in `project`.
     /// `fits` is how many ID bytes a token with these keys carries whole. The
     /// reference must be one `issue` could have written: a length that did not
-    /// fit, and the longest prefix that did (the token's size holds it to no
-    /// more). That also bounds the rows a forged
-    /// token can make the lookup read to those that share a prefix of at least
-    /// `fits - 20 - 3` bytes.
+    /// fit, and the longest prefix that did. The scan is bounded to the rows that
+    /// share a prefix of at least `fits - 20 - 3` bytes, and holds one ID at a time.
     fn referenced(
         &self,
         tx: &Transaction<'_>,
@@ -216,10 +218,12 @@ impl TaskCursors {
         if length <= fits || prefix.len() + BOUNDARY_SLACK < room {
             return Err(invalid().into());
         }
-        task_page::ids_with_prefix(tx, project, prefix, length)?
-            .into_iter()
-            .find(|id| Sha256::digest(id.as_bytes())[..DIGEST] == fixed[4..])
-            .ok_or_else(|| invalid().into())
+        // Exactly the prefix `issue` cuts, so that one position has one token.
+        let issued = |id: &str| id.floor_char_boundary(room) == prefix.len();
+        task_page::find_id_with_prefix(tx, project, prefix, length, |id| {
+            issued(id) && Sha256::digest(id.as_bytes())[..DIGEST] == fixed[4..]
+        })?
+        .ok_or_else(|| invalid().into())
     }
 }
 

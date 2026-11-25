@@ -151,17 +151,19 @@ fn sort_keys(sort: Sort) -> Result<&'static [(&'static str, bool)], StoreError> 
     })
 }
 
-/// The IDs of `project`'s tasks that begin with `prefix` and are exactly
-/// `byte_len` bytes long, from the transaction's snapshot. The page cursor
-/// names an ID too long to carry by its length, a digest and this prefix;
-/// the caller picks the one the digest names. The primary key bounds the scan
-/// to the rows that share the prefix.
-pub(crate) fn ids_with_prefix(
+/// The first ID of `project`'s tasks, in ID order, that begins with `prefix`,
+/// is exactly `byte_len` bytes long and that `accept` takes, from the
+/// transaction's snapshot. The page cursor names an ID too long to carry by its
+/// length, a digest and a prefix; `accept` checks the digest. Candidates are
+/// read one at a time and none is kept, so memory is one ID however many rows
+/// share the prefix. The primary key bounds the scan to the rows that do.
+pub(crate) fn find_id_with_prefix(
     tx: &Transaction<'_>,
     project: &str,
     prefix: &str,
     byte_len: usize,
-) -> rusqlite::Result<Vec<String>> {
+    mut accept: impl FnMut(&str) -> bool,
+) -> rusqlite::Result<Option<String>> {
     let mut sql = "SELECT id FROM tasks WHERE project_id = ?1 AND id >= ?2".to_owned();
     let mut args = vec![
         Value::Text(project.to_owned()),
@@ -174,9 +176,14 @@ pub(crate) fn ids_with_prefix(
     args.push(Value::Integer(byte_len as i64));
     sql.push_str(&format!(" AND length(CAST(id AS BLOB)) = ?{}", args.len()));
     let mut statement = tx.prepare(&sql)?;
-    statement
-        .query_map(params_from_iter(&args), |r| r.get(0))?
-        .collect()
+    let mut rows = statement.query(params_from_iter(&args))?;
+    while let Some(row) = rows.next()? {
+        let id = row.get_ref(0)?.as_str()?;
+        if accept(id) {
+            return Ok(Some(id.to_owned()));
+        }
+    }
+    Ok(None)
 }
 
 /// The least string that sorts after every string beginning with `prefix`
