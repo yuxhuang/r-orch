@@ -559,6 +559,716 @@ mod tests {
         );
     }
 
+    fn selection(
+        filter: &orch_core::store::Filter,
+        sort: orch_core::store::Sort,
+    ) -> NativeSelection<'_> {
+        NativeSelection {
+            filter,
+            sort,
+            name: None,
+            member: None,
+        }
+    }
+    fn page_ids(page: &NativePage) -> Vec<String> {
+        page.items
+            .iter()
+            .map(|r| r.entity.id().to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn native_selection_non_utf8_identity_is_typed_corrupt_with_stored_form() {
+        for family in [Family::Agent, Family::Team, Family::Run] {
+            for form in [0, 1] {
+                let (_temp, data) = crate::sqlite::test_data();
+                let disk = DiskBlobStore::open(data.root()).unwrap();
+                let mut conn = native_conn();
+                conn.execute_batch("PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON")
+                    .unwrap();
+                let tx = conn.transaction().unwrap();
+                let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+                let id = if form == 0 {
+                    "bad".into()
+                } else {
+                    "z".repeat(65537)
+                };
+                let filter = match family {
+                    Family::Agent => Filter::Agents,
+                    Family::Team => Filter::Teams,
+                    Family::Run => Filter::Runs {
+                        task: None,
+                        agent: None,
+                    },
+                };
+                for id in ["good".to_owned(), id.clone()] {
+                    let entity = match family {
+                        Family::Agent => {
+                            let mut a = agent();
+                            a.id = id;
+                            Entity::Agent(Box::new(a))
+                        }
+                        Family::Team => {
+                            let mut t = team();
+                            t.id = id;
+                            Entity::Team(Box::new(t))
+                        }
+                        Family::Run => {
+                            let mut r = run();
+                            r.id = id;
+                            Entity::Run(Box::new(r))
+                        }
+                    };
+                    sql.create(entity).unwrap();
+                }
+                let (_, stored) = key(&id);
+                assert_eq!(
+                    tx.execute(
+                        &format!(
+                            "UPDATE {} SET id=CAST(X'FF61' AS TEXT) WHERE id_form=?1 AND id=?2",
+                            family.table()
+                        ),
+                        params![form, stored],
+                    )
+                    .unwrap(),
+                    1
+                );
+                assert_eq!(
+                    tx.query_row(
+                        &format!("SELECT COUNT(*) FROM {}", family.table()),
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    2
+                );
+                // No valid first item may escape ahead of a corrupt later candidate.
+                let error = sql
+                    .select(selection(&filter, Sort::Default), None, 1)
+                    .err()
+                    .unwrap();
+                assert!(
+                    matches!(error, NativeError::Corrupt { family: actual, form: actual_form, check: "text encoding", ref locator }
+                    if actual == family.name() && actual_form == form && locator == "native/id"),
+                    "{error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_selection_non_utf8_detail_is_typed_corrupt_with_stored_form() {
+        for family in [Family::Agent, Family::Team, Family::Run] {
+            for form in [0, 1] {
+                let (_temp, data) = crate::sqlite::test_data();
+                let disk = DiskBlobStore::open(data.root()).unwrap();
+                let mut conn = native_conn();
+                conn.execute_batch("PRAGMA ignore_check_constraints=ON")
+                    .unwrap();
+                let tx = conn.transaction().unwrap();
+                let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+                let id = if form == 0 {
+                    "literal".into()
+                } else {
+                    "z".repeat(65537)
+                };
+                let (entity, filter) = match family {
+                    Family::Agent => {
+                        let mut a = agent();
+                        a.id = id;
+                        (Entity::Agent(Box::new(a)), Filter::Agents)
+                    }
+                    Family::Team => {
+                        let mut t = team();
+                        t.id = id;
+                        (Entity::Team(Box::new(t)), Filter::Teams)
+                    }
+                    Family::Run => {
+                        let mut r = run();
+                        r.id = id;
+                        (
+                            Entity::Run(Box::new(r)),
+                            Filter::Runs {
+                                task: None,
+                                agent: None,
+                            },
+                        )
+                    }
+                };
+                sql.create(entity).unwrap();
+                assert_eq!(
+                    tx.execute("UPDATE entity_details SET detail=CAST(X'FF61' AS TEXT)", [])
+                        .unwrap(),
+                    1
+                );
+                let error = sql
+                    .select(selection(&filter, Sort::Default), None, 1)
+                    .err()
+                    .unwrap();
+                assert!(
+                    matches!(error, NativeError::Corrupt { family: actual, form: actual_form, check: "text encoding", ref locator }
+                    if actual == family.name() && actual_form == form && locator == "native/detail/ref"),
+                    "{error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_selection_refuses_poisoned_helper() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        sql.create(Entity::Agent(Box::new(agent()))).unwrap();
+        sql.poisoned = true;
+        assert!(matches!(
+            sql.select(selection(&Filter::Agents, Sort::Default), None, 10),
+            Err(NativeError::Aborted)
+        ));
+    }
+
+    #[test]
+    fn native_selection_team_name_order_limit_1000_and_total_before_anchor() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        for (id, name) in [("a", "z"), ("b", "y"), ("c", "x")] {
+            let mut t = team();
+            t.id = id.into();
+            t.name = name.into();
+            sql.create(Entity::Team(Box::new(t))).unwrap();
+        }
+        let teams = Filter::Teams;
+        let first = sql
+            .select(selection(&teams, Sort::Name), None, 1000)
+            .unwrap();
+        assert_eq!(page_ids(&first), ["c", "b", "a"]);
+        assert_eq!(first.total, 3);
+        assert!(!first.has_more);
+        let second = sql
+            .select(selection(&teams, Sort::Name), first.items.first(), 1)
+            .unwrap();
+        assert_eq!(page_ids(&second), ["b"]);
+        assert_eq!(second.total, 3);
+        assert!(second.has_more);
+        let last = sql
+            .select(selection(&teams, Sort::Name), second.items.first(), 1)
+            .unwrap();
+        assert_eq!(page_ids(&last), ["a"]);
+        assert_eq!(last.total, 3);
+        assert!(!last.has_more);
+    }
+
+    #[test]
+    fn native_selection_anchor_must_match_name_member_and_run_filters() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let a = sql.create(Entity::Agent(Box::new(agent()))).unwrap();
+        let t = sql.create(Entity::Team(Box::new(team()))).unwrap();
+        let r = sql.create(Entity::Run(Box::new(run()))).unwrap();
+        let agents = Filter::Agents;
+        let teams = Filter::Teams;
+        for (filter, anchor) in [(&agents, &a), (&teams, &t)] {
+            let mut q = selection(filter, Sort::Default);
+            q.name = Some("other");
+            assert!(matches!(
+                sql.select(q, Some(anchor), 1),
+                Err(NativeError::Store(StoreError::InvalidCursor))
+            ));
+        }
+        let mut q = selection(&teams, Sort::Default);
+        q.member = Some("absent");
+        assert!(matches!(
+            sql.select(q, Some(&t), 1),
+            Err(NativeError::Store(StoreError::InvalidCursor))
+        ));
+        for filter in [
+            Filter::Runs {
+                task: Some("other".into()),
+                agent: None,
+            },
+            Filter::Runs {
+                task: None,
+                agent: Some("other".into()),
+            },
+        ] {
+            assert!(matches!(
+                sql.select(selection(&filter, Sort::Default), Some(&r), 1),
+                Err(NativeError::Store(StoreError::InvalidCursor))
+            ));
+        }
+    }
+
+    #[test]
+    fn native_selection_indirect_detail_cannot_alias_a_literal_identity() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let literal = agent();
+        let mut indirect = literal.clone();
+        indirect.id = "z".repeat(65537);
+        sql.create(Entity::Agent(Box::new(literal.clone())))
+            .unwrap();
+        sql.create(Entity::Agent(Box::new(indirect))).unwrap();
+        let detail = encode_agent(&disk, &literal).unwrap();
+        tx.execute(
+            "DELETE FROM entity_blob_refs WHERE family='agent' AND key_form=1",
+            [],
+        )
+        .unwrap();
+        assert_eq!(tx.execute("UPDATE entity_details SET detail=?1,detail_bytes=?2,detail_sha256=?3 WHERE family='agent' AND key_form=1", params![detail.inline, detail.bytes as i64, detail.sha256]).unwrap(), 1);
+        assert_eq!(
+            tx.query_row("SELECT COUNT(*) FROM agents", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        // Re-looking up decoded 'a' would duplicate the literal row without this precheck.
+        assert!(
+            matches!(sql.select(selection(&Filter::Agents, Sort::Id), None, 100), Err(NativeError::Corrupt { family: "agent", form: 1, check: "identity projection", ref locator }) if locator == "id")
+        );
+    }
+
+    #[test]
+    fn native_selection_team_name_filter_without_member_filter() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        for (id, name) in [("a", "yes"), ("b", "no"), ("c", "yes")] {
+            let mut t = team();
+            t.id = id.into();
+            t.name = name.into();
+            sql.create(Entity::Team(Box::new(t))).unwrap();
+        }
+        let teams = Filter::Teams;
+        let mut q = selection(&teams, Sort::Id);
+        q.name = Some("yes");
+        let page = sql.select(q, None, 100).unwrap();
+        assert_eq!(page_ids(&page), ["a", "c"]);
+        assert_eq!(page.total, 2);
+    }
+
+    #[test]
+    fn native_selection_runs_refuse_name_sort_and_name_filter() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        sql.create(Entity::Run(Box::new(run()))).unwrap();
+        for filter in [
+            Filter::Runs {
+                task: None,
+                agent: None,
+            },
+            Filter::Runs {
+                task: Some("t".into()),
+                agent: None,
+            },
+        ] {
+            assert!(matches!(
+                sql.select(selection(&filter, Sort::Name), None, 1),
+                Err(NativeError::Store(StoreError::InvalidPage(_)))
+            ));
+            let mut q = selection(&filter, Sort::Default);
+            q.name = Some("name");
+            assert!(matches!(
+                sql.select(q, None, 1),
+                Err(NativeError::Store(StoreError::InvalidPage(_)))
+            ));
+        }
+    }
+
+    #[test]
+    fn native_selection_team_member_matches_any_of_distinct_members() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        for (id, members) in [
+            ("a", vec!["other", "wanted"]),
+            ("b", vec!["other"]),
+            ("c", vec![]),
+        ] {
+            let mut t = team();
+            t.id = id.into();
+            t.members = serde_json::from_value(Value::Array(
+                members
+                    .into_iter()
+                    .map(|id| json!({"agent_id": id, "role": "member", "joined_at": ""}))
+                    .collect(),
+            ))
+            .unwrap();
+            sql.create(Entity::Team(Box::new(t))).unwrap();
+        }
+        let teams = Filter::Teams;
+        let mut q = selection(&teams, Sort::Id);
+        q.member = Some("wanted");
+        let page = sql.select(q, None, 100).unwrap();
+        assert_eq!(page_ids(&page), ["a"]);
+        assert_eq!(page.total, 1);
+    }
+
+    #[test]
+    fn native_selection_numeric_attempts_task_agent_and_deleted_anchor() {
+        use orch_core::store::{Filter, Sort};
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        for (id, attempt, started, task, agent) in [
+            ("z", 2, "zzz", "t", "a"),
+            ("b", 10, "aaa", "t", "a"),
+            ("a", 10, "bbb", "t", "a"),
+            ("x", 99, "xxx", "other", "a"),
+            ("q", 20, "qqq", "t", "other"),
+        ] {
+            let mut r = run();
+            r.id = id.into();
+            r.attempt = attempt;
+            r.started_at = started.into();
+            r.task_id = task.into();
+            r.agent_id = agent.into();
+            sql.create(Entity::Run(Box::new(r))).unwrap();
+        }
+        for agent in [None, Some("a".into())] {
+            let filter = Filter::Runs {
+                task: Some("t".into()),
+                agent: agent.clone(),
+            };
+            let expected = if agent.is_some() {
+                vec!["a", "b", "z"]
+            } else {
+                vec!["q", "a", "b", "z"]
+            };
+            for sort in [Sort::Default, Sort::Attempt] {
+                let page = sql.select(selection(&filter, sort), None, 100).unwrap();
+                assert_eq!(page_ids(&page), expected);
+                assert_eq!(page.total, expected.len() as u64);
+            }
+        }
+        let filter = Filter::Runs {
+            task: Some("t".into()),
+            agent: Some("a".into()),
+        };
+        let first = sql
+            .select(selection(&filter, Sort::Default), None, 1)
+            .unwrap();
+        assert_eq!(page_ids(&first), ["a"]);
+        assert!(first.has_more);
+        assert_eq!(first.total, 3);
+        let anchor = &first.items[0];
+        sql.delete(Family::Run, anchor.entity.id(), anchor.revision)
+            .unwrap();
+        let next = sql
+            .select(selection(&filter, Sort::Default), Some(anchor), 1)
+            .unwrap();
+        assert_eq!(page_ids(&next), ["b"]);
+        assert!(next.has_more);
+        assert_eq!(next.total, 2);
+        let last = sql
+            .select(selection(&filter, Sort::Default), next.items.first(), 1)
+            .unwrap();
+        assert_eq!(page_ids(&last), ["z"]);
+        assert!(!last.has_more);
+        let filter = Filter::Runs {
+            task: None,
+            agent: Some("a".into()),
+        };
+        assert_eq!(
+            page_ids(
+                &sql.select(selection(&filter, Sort::Default), None, 100)
+                    .unwrap()
+            ),
+            ["z", "x", "b"]
+        );
+        assert!(
+            sql.select(selection(&filter, Sort::Attempt), None, 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn native_selection_original_id_time_and_indirect_filter_collisions() {
+        use orch_core::store::{Filter, Sort};
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let long = "z".repeat(65537);
+        let digest = BlobHash::of(long.as_bytes()).to_string();
+        let indirect_time = "opaque".repeat(14000);
+        let times = [
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T01:00:00+01:00",
+            indirect_time.as_str(),
+            "é",
+        ];
+        let ids = [long.clone(), digest.clone(), "A".into(), "a".into()];
+        for (i, id) in ids.iter().enumerate() {
+            let mut r = run();
+            r.id = id.clone();
+            r.started_at = times[i].into();
+            r.task_id = if i % 2 == 0 {
+                long.clone()
+            } else {
+                digest.clone()
+            };
+            r.agent_id = r.task_id.clone();
+            sql.create(Entity::Run(Box::new(r))).unwrap();
+        }
+        let all = Filter::Runs {
+            task: None,
+            agent: None,
+        };
+        assert_eq!(
+            page_ids(
+                &sql.select(selection(&all, Sort::Default), None, 100)
+                    .unwrap()
+            ),
+            [
+                ids[3].clone(),
+                ids[2].clone(),
+                ids[1].clone(),
+                ids[0].clone()
+            ]
+        );
+        let mut sorted = ids.to_vec();
+        sorted.sort();
+        let first = sql.select(selection(&all, Sort::Id), None, 2).unwrap();
+        let second = sql
+            .select(selection(&all, Sort::Id), first.items.last(), 2)
+            .unwrap();
+        assert_eq!([page_ids(&first), page_ids(&second)].concat(), sorted);
+        for (value, expected) in [
+            (&long, vec!["A".to_owned(), long.clone()]),
+            (&digest, vec![digest.clone(), "a".into()]),
+        ] {
+            let f = Filter::Runs {
+                task: Some(value.clone()),
+                agent: Some(value.clone()),
+            };
+            assert_eq!(
+                page_ids(&sql.select(selection(&f, Sort::Default), None, 100).unwrap()),
+                expected
+            );
+        }
+        assert!(
+            NativeSql::new(&tx, &disk, "other", 123)
+                .select(selection(&all, Sort::Default), None, 100)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn native_selection_agent_names_positions_and_team_members_are_original_bytes() {
+        use orch_core::store::{Filter, Sort};
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let long = "z".repeat(65537);
+        let digest = BlobHash::of(long.as_bytes()).to_string();
+        for (id, name) in [
+            ("b", long.as_str()),
+            ("a", digest.as_str()),
+            ("c", long.as_str()),
+        ] {
+            let mut a = agent();
+            a.id = id.into();
+            a.name = name.into();
+            sql.create(Entity::Agent(Box::new(a))).unwrap();
+        }
+        let agents = Filter::Agents;
+        assert_eq!(
+            page_ids(
+                &sql.select(selection(&agents, Sort::Default), None, 100)
+                    .unwrap()
+            ),
+            ["b", "a", "c"]
+        );
+        assert_eq!(
+            page_ids(
+                &sql.select(selection(&agents, Sort::Name), None, 100)
+                    .unwrap()
+            ),
+            ["a", "b", "c"]
+        );
+        let mut q = selection(&agents, Sort::Name);
+        q.name = Some(&long);
+        assert_eq!(page_ids(&sql.select(q, None, 100).unwrap()), ["b", "c"]);
+        let b = sql.get(Family::Agent, "b").unwrap().unwrap();
+        sql.move_to_end(Family::Agent, "b", b.revision).unwrap();
+        assert_eq!(
+            page_ids(
+                &sql.select(selection(&agents, Sort::Name), None, 100)
+                    .unwrap()
+            ),
+            ["a", "c", "b"]
+        );
+        for (id, name, member, created) in [
+            ("b", long.as_str(), long.as_str(), "z"),
+            ("a", digest.as_str(), digest.as_str(), "a"),
+            ("c", long.as_str(), long.as_str(), "m"),
+        ] {
+            let mut t = team();
+            t.id = id.into();
+            t.name = name.into();
+            t.created_at = created.into();
+            t.members=serde_json::from_value(json!([{ "agent_id":member,"role":"member","joined_at":""},{ "agent_id":member,"role":"lead","joined_at":"opaque"}])).unwrap();
+            sql.create(Entity::Team(Box::new(t))).unwrap();
+        }
+        let teams = Filter::Teams;
+        assert_eq!(
+            page_ids(
+                &sql.select(selection(&teams, Sort::Default), None, 100)
+                    .unwrap()
+            ),
+            ["a", "c", "b"]
+        );
+        assert_eq!(
+            page_ids(
+                &sql.select(selection(&teams, Sort::Name), None, 100)
+                    .unwrap()
+            ),
+            ["a", "b", "c"]
+        );
+        let mut q = selection(&teams, Sort::Name);
+        q.name = Some(&long);
+        q.member = Some(&long);
+        let page = sql.select(q, None, 100).unwrap();
+        assert_eq!(page_ids(&page), ["b", "c"]);
+        assert_eq!(page.total, 2);
+        let mut q = selection(&teams, Sort::Name);
+        q.member = Some(&digest);
+        assert_eq!(page_ids(&sql.select(q, None, 100).unwrap()), ["a"]);
+    }
+
+    #[test]
+    fn native_selection_full_page_corruption_and_invalid_combinations_fail() {
+        use orch_core::store::{Filter, Sort};
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        for id in ["a", "b"] {
+            let mut a = agent();
+            a.id = id.into();
+            sql.create(Entity::Agent(Box::new(a))).unwrap();
+        }
+        let agents = Filter::Agents;
+        assert!(
+            sql.select(selection(&agents, Sort::Default), None, 0)
+                .is_err()
+        );
+        assert!(
+            sql.select(selection(&agents, Sort::Default), None, 1001)
+                .is_err()
+        );
+        assert!(
+            sql.select(selection(&agents, Sort::CreatedAt), None, 1)
+                .is_err()
+        );
+        let mut q = selection(&agents, Sort::Default);
+        q.member = Some("a");
+        assert!(sql.select(q, None, 1).is_err());
+        let anchor = sql.create(Entity::Team(Box::new(team()))).unwrap();
+        assert!(
+            sql.select(selection(&agents, Sort::Default), Some(&anchor), 1)
+                .is_err()
+        );
+        let mut long_agent = agent();
+        long_agent.id = "z".repeat(65537);
+        sql.create(Entity::Agent(Box::new(long_agent.clone())))
+            .unwrap();
+        tx.execute(
+            "UPDATE entity_details SET detail_sha256=?1 WHERE family='agent' AND key_form=1",
+            ["0".repeat(64)],
+        )
+        .unwrap();
+        assert!(matches!(
+            sql.select(selection(&agents, Sort::Default), None, 1),
+            Err(NativeError::Corrupt {
+                family: "agent",
+                form: 1,
+                ..
+            })
+        ));
+        // Remove only the injected corrupt fixture before testing projection drift.
+        tx.execute(
+            "DELETE FROM entity_details WHERE family='agent' AND key_form=1",
+            [],
+        )
+        .unwrap();
+        tx.execute(
+            "DELETE FROM entity_blob_refs WHERE family='agent' AND key_form=1",
+            [],
+        )
+        .unwrap();
+        tx.execute("DELETE FROM agents WHERE id_form=1", [])
+            .unwrap();
+        tx.execute("UPDATE agents SET name='drift' WHERE id='b'", [])
+            .unwrap();
+        assert!(matches!(
+            sql.select(selection(&agents, Sort::Default), None, 1),
+            Err(NativeError::Corrupt {
+                family: "agent",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn native_writer_exact_identity_threshold_is_shared_with_prompt_reader() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        for (size, form) in [(65536, 0), (65537, 1)] {
+            let mut r = run();
+            r.id = "é".repeat(size / 2) + if size % 2 == 1 { "a" } else { "" };
+            r.prompt = "boundary prompt".into();
+            sql.create(Entity::Run(Box::new(r.clone()))).unwrap();
+            let expected = if form == 0 {
+                r.id.clone()
+            } else {
+                BlobHash::of(r.id.as_bytes()).to_string()
+            };
+            let stored: (i64, String) = tx
+                .query_row(
+                    "SELECT id_form,id FROM runs WHERE id_form=?1",
+                    [form],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(stored, (form, expected));
+            assert_eq!(
+                BlobReferences::new(&disk, "p")
+                    .load_prompt(&tx, &r.id)
+                    .unwrap(),
+                Some(r.prompt)
+            );
+        }
+    }
+
     fn native_state(tx: &Transaction<'_>) -> Vec<Vec<Vec<SqlValue>>> {
         [
             "agents",
@@ -1134,6 +1844,10 @@ mod tests {
                 .update(Entity::Agent(Box::new(a)), first.revision)
                 .unwrap();
             assert_eq!(sql.get(Family::Agent, "a").unwrap(), Some(saved.clone()));
+            let page = sql
+                .select(selection(&Filter::Agents, Sort::Name), None, 1)
+                .unwrap();
+            assert_eq!(page.items, vec![saved.clone()]);
             tx.commit().unwrap();
             saved
         };
@@ -1143,8 +1857,16 @@ mod tests {
                 .unwrap(),
             vec![first]
         );
+        let page = NativeSql::new(&snapshot, &disk, "p", 123)
+            .select(selection(&Filter::Agents, Sort::Name), None, 1)
+            .unwrap();
+        assert_eq!(page.items[0].entity, Entity::Agent(Box::new(agent())));
         snapshot.commit().unwrap();
         let fresh = reader.transaction().unwrap();
+        let page = NativeSql::new(&fresh, &disk, "p", 123)
+            .select(selection(&Filter::Agents, Sort::Name), None, 1)
+            .unwrap();
+        assert_eq!(page.items, vec![changed.clone()]);
         assert_eq!(
             NativeSql::new(&fresh, &disk, "p", 123)
                 .get(Family::Agent, "a")
@@ -1324,8 +2046,9 @@ mod tests {
 // Private native leaf: authorization, fencing and R140 observation belong to
 // the combined adapter. This type neither opens nor commits a transaction.
 use crate::blob::{BlobReferences, ReferenceError};
-use orch_core::store::{Entity, EntityKind, Record, Revision, StoreError};
+use orch_core::store::{Entity, EntityKind, Filter, Record, Revision, Sort, StoreError};
 use rusqlite::{OptionalExtension, Transaction, params, types::Value as SqlValue};
+use std::cmp::Ordering;
 
 type NativeResult<T> = std::result::Result<T, NativeError>;
 
@@ -1634,6 +2357,85 @@ fn format_error(family: Family, id: &str, error: FormatError, writing: bool) -> 
     }
 }
 
+/// Private query composition only; public cursor identity and validation remain
+/// owned by the combined adapter. All strings are exact original UTF-8 bytes.
+pub(super) struct NativeSelection<'a> {
+    pub(super) filter: &'a Filter,
+    pub(super) sort: Sort,
+    pub(super) name: Option<&'a str>,
+    pub(super) member: Option<&'a str>,
+}
+pub(super) struct NativePage {
+    pub(super) items: Vec<Record>,
+    pub(super) total: u64,
+    pub(super) has_more: bool,
+}
+impl NativeSelection<'_> {
+    fn family(&self) -> NativeResult<Family> {
+        let family = match self.filter {
+            Filter::Agents => Family::Agent,
+            Filter::Teams => Family::Team,
+            Filter::Runs { .. } => Family::Run,
+            _ => return Err(StoreError::InvalidPage("unsupported native family".into()).into()),
+        };
+        let valid = matches!(self.sort, Sort::Default | Sort::Id)
+            || (self.sort == Sort::Name && family != Family::Run)
+            || (self.sort == Sort::Attempt
+                && matches!(self.filter, Filter::Runs { task: Some(_), .. }));
+        if !valid
+            || (self.name.is_some() && family == Family::Run)
+            || (self.member.is_some() && family != Family::Team)
+        {
+            return Err(StoreError::InvalidPage("unsupported native selection".into()).into());
+        }
+        Ok(family)
+    }
+    fn matches(&self, row: &Record) -> bool {
+        match (&row.entity, self.filter) {
+            (Entity::Agent(a), Filter::Agents) => self.name.is_none_or(|name| a.name == name),
+            (Entity::Team(t), Filter::Teams) => {
+                self.name.is_none_or(|name| t.name == name)
+                    && self
+                        .member
+                        .is_none_or(|member| t.members.iter().any(|m| m.agent_id == member))
+            }
+            (Entity::Run(r), Filter::Runs { task, agent }) => {
+                task.as_ref().is_none_or(|id| r.task_id == *id)
+                    && agent.as_ref().is_none_or(|id| r.agent_id == *id)
+            }
+            _ => false,
+        }
+    }
+    fn compare(&self, a: &Record, b: &Record) -> Ordering {
+        let primary = match (&a.entity, &b.entity, self.sort) {
+            (_, _, Sort::Id) => Ordering::Equal,
+            (Entity::Agent(ae), Entity::Agent(be), Sort::Name) => ae
+                .name
+                .as_bytes()
+                .cmp(be.name.as_bytes())
+                .then(a.position.cmp(&b.position)),
+            (Entity::Agent(_), Entity::Agent(_), _) => a.position.cmp(&b.position),
+            (Entity::Team(a), Entity::Team(b), Sort::Name) => {
+                a.name.as_bytes().cmp(b.name.as_bytes())
+            }
+            (Entity::Team(a), Entity::Team(b), _) => {
+                a.created_at.as_bytes().cmp(b.created_at.as_bytes())
+            }
+            (Entity::Run(a), Entity::Run(b), _)
+                if matches!(self.filter, Filter::Runs { task: Some(_), .. }) =>
+            {
+                b.attempt.cmp(&a.attempt)
+            }
+            (Entity::Run(a), Entity::Run(b), _) => {
+                b.started_at.as_bytes().cmp(a.started_at.as_bytes())
+            }
+            // Family and sort are validated before comparing, including anchors.
+            _ => Ordering::Equal,
+        };
+        primary.then_with(|| a.entity.id().as_bytes().cmp(b.entity.id().as_bytes()))
+    }
+}
+
 pub(super) struct NativeSql<'a, 'conn> {
     tx: &'a Transaction<'conn>,
     disk: &'a DiskBlobStore,
@@ -1775,6 +2577,127 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
             position: *position as u64,
         }))
     }
+    /// Hydrate candidates and compare originals in this selecting transaction.
+    /// Full hydration is deliberately conservative: no digest/index order can
+    /// exclude a row whose original key must participate in the total order.
+    /// No records escape if any candidate is corrupt. The composition owner
+    /// must bind the saved anchor to its project/filter/sort in the public cursor.
+    pub(super) fn select(
+        &self,
+        query: NativeSelection<'_>,
+        after: Option<&Record>,
+        limit: usize,
+    ) -> NativeResult<NativePage> {
+        self.ensure_committable()?;
+        let family = query.family()?;
+        if !(1..=1000).contains(&limit) {
+            return Err(StoreError::InvalidPage("limit must be 1..=1000".into()).into());
+        }
+        if let Some(anchor) = after
+            && (Family::of(&anchor.entity)? != family || !query.matches(anchor))
+        {
+            return Err(StoreError::InvalidCursor.into());
+        }
+        let mut stmt = self.tx.prepare(&format!(
+            "SELECT id_form,id FROM {} WHERE project_id=?1",
+            family.table()
+        ))?;
+        // Keep the stored form even when decoding the key fails. In particular,
+        // malformed TEXT is stored-data corruption before any detail is read.
+        let keys = stmt
+            .query_map([self.project], |row| {
+                Ok((row.get::<_, SqlValue>(0)?, row.get::<_, SqlValue>(1)))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut records = Vec::new();
+        for (form, stored) in keys {
+            let SqlValue::Integer(form @ (0 | 1)) = form else {
+                return Err(native_corrupt(family, "", "identity metadata", "id"));
+            };
+            let stored = stored.map_err(|error| match error {
+                rusqlite::Error::Utf8Error(..) => NativeError::Corrupt {
+                    family: family.name(),
+                    form,
+                    check: "text encoding",
+                    locator: "native/id".into(),
+                },
+                other => NativeError::Sql(other),
+            })?;
+            let SqlValue::Text(stored) = stored else {
+                return Err(native_corrupt(family, "", "identity metadata", "id"));
+            };
+            // Stored keys are locators, not original IDs: form 1's key can be
+            // equal to a form 0 ID. Never feed a digest into get as an ID.
+            let candidate = (|| {
+                let detail = self.detail_key(
+                    family,
+                    "",
+                    vec![
+                        SqlValue::Text(self.project.into()),
+                        SqlValue::Integer(form),
+                        SqlValue::Text(stored.clone()),
+                    ],
+                )?;
+                let entity = match family {
+                    Family::Agent => {
+                        decode_agent(self.disk, &detail).map(|v| Entity::Agent(Box::new(v)))
+                    }
+                    Family::Team => {
+                        decode_team(self.disk, &detail).map(|v| Entity::Team(Box::new(v)))
+                    }
+                    Family::Run => decode_run(self.disk, &detail).map(|v| Entity::Run(Box::new(v))),
+                }
+                .map_err(|e| format_error(family, "", e, false))?;
+                if key(entity.id()) != (form, stored.clone()) {
+                    return Err(native_corrupt(
+                        family,
+                        entity.id(),
+                        "identity projection",
+                        "id",
+                    ));
+                }
+                self.get(family, entity.id())?.ok_or_else(|| {
+                    native_corrupt(family, entity.id(), "selected row missing", "id")
+                })
+            })()
+            .map_err(|error| match error {
+                NativeError::Corrupt {
+                    family,
+                    check,
+                    locator,
+                    ..
+                } => NativeError::Corrupt {
+                    family,
+                    form,
+                    check,
+                    locator,
+                },
+                NativeError::Sql(rusqlite::Error::Utf8Error(..)) => NativeError::Corrupt {
+                    family: family.name(),
+                    form,
+                    check: "text encoding",
+                    locator: "native/detail/ref".into(),
+                },
+                other => other,
+            })?;
+            if query.matches(&candidate) {
+                records.push(candidate);
+            }
+        }
+        records.sort_by(|a, b| query.compare(a, b));
+        let total = records.len() as u64;
+        let mut remaining = records.into_iter().filter(|row| {
+            after.is_none_or(|anchor| query.compare(row, anchor) == Ordering::Greater)
+        });
+        let items = remaining.by_ref().take(limit).collect();
+        let has_more = remaining.next().is_some();
+        Ok(NativePage {
+            items,
+            total,
+            has_more,
+        })
+    }
+
     pub(super) fn hydrate(&self, family: Family, ids: &[String]) -> NativeResult<Vec<Record>> {
         ids.iter()
             .map(|id| {
@@ -1784,7 +2707,14 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
             .collect()
     }
     fn detail(&self, family: Family, id: &str) -> NativeResult<Detail> {
-        let mut identity = self.identity(id);
+        self.detail_key(family, id, self.identity(id))
+    }
+    fn detail_key(
+        &self,
+        family: Family,
+        id: &str,
+        mut identity: Vec<SqlValue>,
+    ) -> NativeResult<Detail> {
         identity.push(SqlValue::Text(family.name().into()));
         let rows = self.rows("SELECT format,detail,detail_bytes,detail_sha256 FROM entity_details WHERE project_id=?1 AND key_form=?2 AND entity_key=?3 AND family=?4",&identity)?;
         let Some(row) = rows.first() else {
