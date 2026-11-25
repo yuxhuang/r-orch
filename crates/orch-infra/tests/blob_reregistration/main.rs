@@ -242,3 +242,104 @@ fn rolled_back_cross_project_registration_keeps_whole_orphan_bytes_for_retry() {
     );
     f.assert_pending(true);
 }
+
+// These are registration preconditions only. Marks and imported timestamps are
+// schema-valid synthetic setup, not evidence that a sweep or importer ran.
+// At registration time ELIGIBLE + 1, each mark is over seven days old.
+impl Fixture {
+    fn mark_both_projects(&self, created: i64) {
+        self.register(NEW, true);
+        let conn =
+            open_connection(&self.data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        conn.execute("DELETE FROM task_attachments", []).unwrap();
+        conn.execute(
+            "UPDATE blobs SET created_at=?1,unreferenced_since=?2 WHERE sha256=?3",
+            params![created, CREATED, self.hash.to_string()],
+        )
+        .unwrap();
+    }
+
+    fn eligibility_metadata(&self) -> Vec<(String, i64, Option<i64>)> {
+        let conn =
+            open_connection(&self.data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
+        conn.prepare("SELECT project_id,created_at,unreferenced_since FROM blobs WHERE sha256=?1 ORDER BY project_id")
+            .unwrap().query_map([self.hash.to_string()], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+}
+
+fn committed_reuse_preserves_creation_and_clears_only_selected_mark(created: i64) {
+    let f = Fixture::new();
+    f.mark_both_projects(created);
+    assert_eq!(
+        f.eligibility_metadata(),
+        vec![
+            (NEW.into(), created, Some(CREATED)),
+            (OLD.into(), created, Some(CREATED)),
+        ]
+    );
+    // The same bytes already have matching rows in two projects. Reuse the
+    // selected project's row through the public API, not the row-only helper.
+    f.register(NEW, true);
+    assert_eq!(
+        f.eligibility_metadata(),
+        vec![
+            (NEW.into(), created, None),
+            (OLD.into(), created, Some(CREATED)),
+        ]
+    );
+    f.assert_readable(NEW);
+}
+
+#[test]
+fn matching_cross_project_reregistration_preserves_creation_and_clears_only_selected_mark() {
+    committed_reuse_preserves_creation_and_clears_only_selected_mark(CREATED);
+}
+
+#[test]
+fn matching_cross_project_reregistration_preserves_old_imported_creation_and_clears_mark() {
+    // 1900-01-01 UTC: predates the epoch and is much older than the mark.
+    committed_reuse_preserves_creation_and_clears_only_selected_mark(-2_208_988_800_000);
+}
+
+fn rolled_back_reuse_restores_eligibility(created: i64) {
+    let f = Fixture::new();
+    f.mark_both_projects(created);
+    let before = f.eligibility_metadata();
+    let mut conn = open_connection(&f.data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let mut tx = conn.transaction().unwrap();
+    BlobReferences::new(&f.disk, NEW)
+        .store_attachment(&mut tx, "task", "payload", &f.bytes, ELIGIBLE + 1)
+        .unwrap();
+    // Prove the change happened before rolling it back; otherwise an API that
+    // silently stopped clearing marks would give a vacuous rollback pass.
+    assert_eq!(
+        tx.query_row(
+            "SELECT created_at,unreferenced_since FROM blobs WHERE project_id=?1 AND sha256=?2",
+            params![NEW, f.hash.to_string()],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .unwrap(),
+        (created, None)
+    );
+    tx.rollback().unwrap();
+    drop(conn);
+    assert_eq!(f.eligibility_metadata(), before);
+    let conn = open_connection(&f.data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
+    assert_eq!(
+        BlobReferences::new(&f.disk, NEW)
+            .load_attachment(&conn, "task", "payload")
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn rolled_back_matching_cross_project_reregistration_restores_sweep_mark() {
+    rolled_back_reuse_restores_eligibility(CREATED);
+}
+
+#[test]
+fn rolled_back_matching_cross_project_reregistration_restores_old_imported_metadata() {
+    rolled_back_reuse_restores_eligibility(-2_208_988_800_000);
+}
