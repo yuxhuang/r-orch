@@ -671,3 +671,80 @@ fn metadata_refusal_preserves_existing_prompt_and_attachment_links() {
         );
     }
 }
+
+#[test]
+fn run_prompt_lookup_and_update_distinguish_literal_and_digest_ids() {
+    use orch_infra::blob::BlobReferences;
+    let f = fixture();
+    let mut c = database(&f);
+    // Both native keys contain the same bytes in one project. Only the form differs.
+    // Count UTF-8 bytes: this ID has fewer than 65,536 characters.
+    let indirect = "é".repeat(32_769);
+    let literal = BlobHash::of(indirect.as_bytes()).to_string();
+    for project in ["p", "other"] {
+        for form in [0, 1] {
+            c.execute(
+                "INSERT INTO runs(project_id,id,id_form,id_sha256,id_bytes,task_id,agent_id,status,revision)
+                 VALUES(?1,?2,?3,?4,?5,'task','agent','running',1)",
+                rusqlite::params![project,literal,form,
+                    (form == 1).then_some(&literal),
+                    (form == 1).then_some(indirect.len() as i64)],
+            ).unwrap();
+        }
+    }
+    assert_eq!(count(&c, "runs"), 8);
+    let refs = BlobReferences::new(&f.store, "p");
+    let other = BlobReferences::new(&f.store, "other");
+    let mut tx = c.transaction().unwrap();
+    refs.store_prompt(&mut tx, &literal, "literal prompt", 1)
+        .unwrap();
+    assert_eq!(
+        refs.load_prompt(&tx, &literal).unwrap().as_deref(),
+        Some("literal prompt")
+    );
+    assert_eq!(refs.load_prompt(&tx, &indirect).unwrap(), None);
+    let digest_link: Option<String> = tx
+        .query_row(
+            "SELECT prompt_sha256 FROM runs WHERE project_id='p' AND id_form=1 AND id=?1",
+            [&literal],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(digest_link, None);
+    refs.store_prompt(&mut tx, &indirect, "indirect prompt", 2)
+        .unwrap();
+    assert_eq!(
+        refs.load_prompt(&tx, &literal).unwrap().as_deref(),
+        Some("literal prompt")
+    );
+    assert_eq!(
+        refs.load_prompt(&tx, &indirect).unwrap().as_deref(),
+        Some("indirect prompt")
+    );
+    assert_eq!(other.load_prompt(&tx, &literal).unwrap(), None);
+    assert_eq!(other.load_prompt(&tx, &indirect).unwrap(), None);
+    tx.commit().unwrap();
+    assert_eq!(count(&c, "runs"), 8);
+    assert_eq!(count(&c, "blobs"), 2);
+
+    // An absent form must not fall back to its other-form sibling. A caught
+    // refusal creates no registration and leaves the sibling link intact.
+    c.execute(
+        "DELETE FROM runs WHERE project_id='p' AND id_form=1 AND id=?1",
+        [&literal],
+    )
+    .unwrap();
+    let mut tx = c.transaction().unwrap();
+    assert!(matches!(
+        refs.store_prompt(&mut tx, &indirect, "missing form", 3),
+        Err(orch_infra::blob::ReferenceError::MissingOwner { kind: "run" })
+    ));
+    assert_eq!(refs.load_prompt(&tx, &indirect).unwrap(), None);
+    assert_eq!(
+        refs.load_prompt(&tx, &literal).unwrap().as_deref(),
+        Some("literal prompt")
+    );
+    tx.commit().unwrap();
+    assert_eq!(count(&c, "runs"), 7);
+    assert_eq!(count(&c, "blobs"), 2);
+}
