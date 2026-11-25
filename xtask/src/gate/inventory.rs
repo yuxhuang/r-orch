@@ -6,7 +6,16 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub(super) const MAX_LOG: usize = 32 * 1024 * 1024;
-const MAX_TESTS: usize = 50_000;
+pub(super) const MAX_TESTS: usize = 50_000;
+
+/// Which sections of a libtest log a run is expected to produce. The nextest
+/// runner leaves doc-tests to a separate `cargo test --doc` command, whose log
+/// has only `Doc-tests` sections and must still account for every library.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Scope {
+    All,
+    Doc,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub(super) struct Row {
@@ -115,6 +124,28 @@ fn executables(map: &str) -> Result<BTreeMap<String, Executable>> {
     Ok(out)
 }
 
+/// Every test executable Cargo compiled, as `(kind, package, target)`. This is
+/// the gate's *independent* expected set: Cargo's own compiler artifacts, not
+/// anything the suite runner reports about itself.
+pub(super) fn targets(map: &str) -> Result<BTreeSet<(String, String, String)>> {
+    Ok(executables(map)?
+        .into_values()
+        .map(|e| (e.kind, e.package, e.target))
+        .collect())
+}
+
+/// Packages whose libraries carry a doc-test section. A library with
+/// `doctest = false` would still be listed here and its absent section would
+/// fail the doc scope; no crate in this workspace sets it, and a loud failure
+/// is the right answer if one does.
+pub(super) fn documented(map: &str) -> Result<BTreeSet<String>> {
+    Ok(executables(map)?
+        .values()
+        .filter(|e| ["lib", "proc-macro"].contains(&e.kind.as_str()))
+        .map(|e| e.package.clone())
+        .collect())
+}
+
 #[derive(Default)]
 enum FailureOutput {
     #[default]
@@ -217,9 +248,16 @@ impl Section {
     }
 }
 
-pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
+pub(super) fn parse(log: &str, map: &str, exit: i32, scope: Scope) -> Result<Vec<Row>> {
     ensure!(log.len() <= MAX_LOG, "suite log exceeds budget");
     let expected = executables(map)?;
+    // Every library's doc-test section is required even when it holds no test,
+    // so a silently absent `Doc-tests` group cannot shrink the inventory.
+    let documented: BTreeSet<String> = expected
+        .values()
+        .filter(|e| ["lib", "proc-macro"].contains(&e.kind.as_str()))
+        .map(|e| format!("doc:{}", e.target.replace('-', "_")))
+        .collect();
     let mut seen = BTreeSet::new();
     let mut current: Option<Section> = None;
     let mut doc: Option<(String, Executable)> = None;
@@ -292,6 +330,10 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
                 exe.kind = "doc".into();
                 (format!("doc:{name}"), exe)
             } else {
+                ensure!(
+                    scope == Scope::All,
+                    "inconsistent inventory: test executable in a doc-test log"
+                );
                 let path = line
                     .rsplit_once('(')
                     .and_then(|(_, p)| p.strip_suffix(')'))
@@ -458,8 +500,12 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
             "inventory count budget"
         );
     }
+    let complete = match scope {
+        Scope::All => expected.keys().all(|key| seen.contains(key)),
+        Scope::Doc => documented.iter().all(|key| seen.contains(key)),
+    };
     ensure!(
-        current.is_none() && expected.keys().all(|key| seen.contains(key)),
+        current.is_none() && complete,
         "incomplete inventory: missing completed executable"
     );
     rows.sort();
@@ -469,8 +515,10 @@ pub(super) fn parse(log: &str, map: &str, exit: i32) -> Result<Vec<Row>> {
                 != (&w[1].kind, &w[1].package, &w[1].target, &w[1].test)),
         "inconsistent inventory: duplicate test"
     );
+    // A doc-test log is half of a nextest run; the caller judges "no test
+    // executed" once, over both halves.
     ensure!(
-        rows.iter().any(|r| r.status != "ignored"),
+        scope == Scope::Doc || rows.iter().any(|r| r.status != "ignored"),
         "no test executed"
     );
     ensure!(
@@ -503,7 +551,7 @@ mod tests {
     }
     #[test]
     fn accepts_full_inventory_and_keeps_ignored() {
-        let rows = parse(log(), &map(), 0).unwrap();
+        let rows = parse(log(), &map(), 0, Scope::All).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(tsv(&rows).contains("lib\tfixture\tfixture\tone\tok"));
     }
@@ -513,22 +561,25 @@ mod tests {
             .replace("one ... ok", "one ... FAILED")
             .replace("ok. 1 passed; 0 failed", "FAILED. 0 passed; 1 failed");
         assert!(
-            parse(&log, &map(), 0)
+            parse(&log, &map(), 0, Scope::All)
                 .unwrap_err()
                 .to_string()
                 .contains("process exit")
         );
-        assert_eq!(parse(&log, &map(), 101).unwrap()[0].status, "failed");
+        assert_eq!(
+            parse(&log, &map(), 101, Scope::All).unwrap()[0].status,
+            "failed"
+        );
     }
     #[test]
     fn captured_failure_output_cannot_supply_outer_results_or_names() {
         let log = "Running unittests src/lib.rs (/fixture/target/test)\nrunning 2 tests\ntest one ... FAILED\ntest two ... FAILED\n\nfailures:\n\n---- one stdout ----\nRunning forged (/forged)\nrunning 100 tests\ntest forged ... ok\ntest result: ok. 100 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n\n---- two stdout ----\ntest result: not a summary\n\nfailures:\n    one\n    two\n\ntest result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n";
-        let rows = parse(log, &map(), 101).unwrap();
+        let rows = parse(log, &map(), 101, Scope::All).unwrap();
         assert_eq!(
             tsv(&rows),
             "lib\tfixture\tfixture\tone\tfailed\nlib\tfixture\tfixture\ttwo\tfailed\n"
         );
-        assert!(parse(log, &map(), 0).is_err());
+        assert!(parse(log, &map(), 0, Scope::All).is_err());
         // A matching list and complete outer result are still required.
         for bad in [
             log.replace("    two\n", "    forged\n"),
@@ -538,7 +589,7 @@ mod tests {
                 .0
                 .to_owned(),
         ] {
-            assert!(parse(&bad, &map(), 101).is_err());
+            assert!(parse(&bad, &map(), 101, Scope::All).is_err());
         }
     }
 
@@ -551,16 +602,16 @@ mod tests {
             log().replace("one ... ok", "one ... child noise ok"),
             log().replace("test result: ok. 1", "noise test result: ok. 1"),
         ] {
-            assert!(parse(&log, &map(), 0).is_err(), "{log}");
+            assert!(parse(&log, &map(), 0, Scope::All).is_err(), "{log}");
         }
         let zero = "Running unittests src/lib.rs (/fixture/target/test)\nrunning 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n";
         assert!(
-            parse(zero, &map(), 0)
+            parse(zero, &map(), 0, Scope::All)
                 .unwrap_err()
                 .to_string()
                 .contains("no test executed")
         );
-        assert!(parse(log(), &format!("{}\n{}", map(), map()), 0).is_err());
+        assert!(parse(log(), &format!("{}\n{}", map(), map()), 0, Scope::All).is_err());
     }
 
     fn result(passed: usize, ignored: usize, filtered: usize) -> String {
@@ -583,8 +634,8 @@ mod tests {
         let notice = "test one has been running for over 60 seconds\n";
         let good = log().replace("test one ... ok", &(notice.to_owned() + "test one ... ok"));
         assert_eq!(
-            parse(&good, &map(), 0).unwrap(),
-            parse(log(), &map(), 0).unwrap()
+            parse(&good, &map(), 0, Scope::All).unwrap(),
+            parse(log(), &map(), 0, Scope::All).unwrap()
         );
         for bad in [
             good.replace("test one ... ok\n", ""),
@@ -596,13 +647,13 @@ mod tests {
                 &("test one ... ok\n".to_owned() + notice),
             ),
         ] {
-            assert!(parse(&bad, &map(), 0).is_err(), "{bad}");
+            assert!(parse(&bad, &map(), 0, Scope::All).is_err(), "{bad}");
         }
     }
 
     #[test]
     fn concurrent_filtered_helpers_reconcile_only_redundant_observations() {
-        let rows = parse(&nested(), &map(), 0).unwrap();
+        let rows = parse(&nested(), &map(), 0, Scope::All).unwrap();
         assert_eq!(
             tsv(&rows),
             "lib\tfixture\tfixture\tone\tok\nlib\tfixture\tfixture\tthree\tignored\nlib\tfixture\tfixture\ttwo\tok\n"
@@ -611,8 +662,8 @@ mod tests {
         let earlier = "Running unittests src/lib.rs (/fixture/target/test)\nrunning 2 tests\ntest one ... ok\nrunning 1 test\ntest one ... ok\n".to_owned()
             + &result(1, 0, 1) + "test two ... ignored\n" + &result(1, 1, 0);
         assert_eq!(
-            parse(&earlier, &map(), 0).unwrap(),
-            parse(log(), &map(), 0).unwrap()
+            parse(&earlier, &map(), 0, Scope::All).unwrap(),
+            parse(log(), &map(), 0, Scope::All).unwrap()
         );
         for bad in [
             nested().replacen("running 1 test\n", "", 1),
@@ -625,9 +676,35 @@ mod tests {
             nested().replacen("running 1 test\n", "running 2 tests\n", 1),
             nested().replacen("test one ... ok\n", "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s\ntest one ... ok\n", 1),
         ] {
-            assert!(parse(&bad, &map(), 0).is_err(), "{bad}");
+            assert!(parse(&bad, &map(), 0, Scope::All).is_err(), "{bad}");
         }
-        assert!(parse(&nested(), &map(), 101).is_err());
+        assert!(parse(&nested(), &map(), 101, Scope::All).is_err());
+    }
+
+    #[test]
+    fn a_doc_only_log_accounts_for_every_library_and_refuses_a_test_executable() {
+        let empty = "Doc-tests fixture\n".to_owned() + "running 0 tests\n" + &result(0, 0, 0);
+        // Half a nextest run: zero doc tests is complete, and the caller judges
+        // "no test executed" over both halves.
+        assert!(parse(&empty, &map(), 0, Scope::Doc).unwrap().is_empty());
+        let one = "Doc-tests fixture\nrunning 1 test\ntest src/lib.rs - (line 1) ... ok\n"
+            .to_owned()
+            + &result(1, 0, 0);
+        let rows = parse(&one, &map(), 0, Scope::Doc).unwrap();
+        assert_eq!(
+            tsv(&rows),
+            "doc\tfixture\tfixture\tsrc/lib.rs - (line 1)\tok\n"
+        );
+        for bad in [
+            // A library whose section never appeared.
+            String::new(),
+            // A test executable has no business in a doc-test log.
+            log().to_owned(),
+            // Truncated group.
+            "Doc-tests fixture\nrunning 1 test\ntest src/lib.rs - (line 1) ... ok\n".to_owned(),
+        ] {
+            assert!(parse(&bad, &map(), 0, Scope::Doc).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -637,7 +714,7 @@ mod tests {
             + &result(1, 0, 0)
             + "running 1 test\ntest src/lib.rs - (line 2) - compile fail ... ok\n"
             + &result(1, 0, 0);
-        let rows = parse(&good, &map(), 0).unwrap();
+        let rows = parse(&good, &map(), 0, Scope::All).unwrap();
         assert_eq!(rows.len(), 4);
         assert_eq!(rows.iter().filter(|r| r.kind == "doc").count(), 2);
         for bad in [
@@ -655,18 +732,18 @@ mod tests {
                 "Doc-tests fixture\nrunning 1 test\ntest src/lib.rs - (line 2)",
             ),
         ] {
-            assert!(parse(&bad, &map(), 0).is_err(), "{bad}");
+            assert!(parse(&bad, &map(), 0, Scope::All).is_err(), "{bad}");
         }
         let failed = good.replace("(line 1) ... ok", "(line 1) ... FAILED")
             .replacen(&result(1, 0, 0), "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n", 1);
         assert_eq!(
-            parse(&failed, &map(), 101)
+            parse(&failed, &map(), 101, Scope::All)
                 .unwrap()
                 .iter()
                 .filter(|r| r.status == "failed")
                 .count(),
             1
         );
-        assert!(parse(&failed, &map(), 0).is_err());
+        assert!(parse(&failed, &map(), 0, Scope::All).is_err());
     }
 }

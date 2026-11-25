@@ -167,7 +167,8 @@ fn failed_suite_receipt_redacts_secrets_and_never_streams_workflow_commands() {
     );
     retain(&s, "failed", &out, &dest);
     out.code(1);
-    assert_eq!(field(&s.result(), "step-test-exit"), "101");
+    // nextest reports a test failure as 100, where libtest used 101.
+    assert_eq!(field(&s.result(), "step-test-exit"), "100");
     assert!(
         fs::read_to_string(dest.join("steps/test.log"))
             .unwrap()

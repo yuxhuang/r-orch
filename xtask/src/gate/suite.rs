@@ -3,13 +3,14 @@
 use super::receipt::progress as report_progress;
 use super::{
     hermetic::Hermetic,
-    inventory,
+    inventory, nextest,
     report::{self, Step, Verdict},
     steps::{LogFailure, Runner},
 };
 use anyhow::{Result, ensure};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::process::Command;
 use std::time::Instant;
 
 pub(super) struct Suite {
@@ -39,6 +40,29 @@ pub(super) fn run(repo: &Path, hermetic: &Hermetic, runner: &mut Runner<'_, '_>)
     run_scoped(repo, hermetic, runner, None)
 }
 
+/// Resolve the one suite runner before anything is executed. There is no other
+/// runner to fall back to: a missing or unpinned nextest fails the gate closed
+/// with an install hint, and the rollback is to revert the change that adopted
+/// it (ADR 0022).
+fn resolve(hermetic: &Hermetic, runner: &mut Runner<'_, '_>) -> Result<String> {
+    ensure!(
+        hermetic.available("cargo-nextest"),
+        "cargo-nextest is not on the suite PATH; {}",
+        nextest::install_hint()
+    );
+    let out = runner.capture_raw(
+        hermetic.program("cargo-nextest").arg("--version"),
+        16 * 1024,
+    )?;
+    ensure!(
+        out.exit.success(),
+        "cargo-nextest --version exited {}; {}",
+        report::code(out.exit),
+        nextest::install_hint()
+    );
+    nextest::pinned(&String::from_utf8_lossy(&out.stdout))
+}
+
 fn scope(
     command: &mut std::process::Command,
     selection: Option<&crate::gate_selection::Selection>,
@@ -55,12 +79,165 @@ fn scope(
     }
 }
 
+/// A collected suite run: the child's status, the log the inventory is rebuilt
+/// from, and whether collection itself succeeded.
+type Collected = (Option<i32>, Vec<u8>, Result<()>);
+
+fn collect_logged(
+    runner: &mut Runner<'_, '_>,
+    command: &mut Command,
+    index: usize,
+) -> (Option<i32>, Vec<u8>, Result<()>) {
+    match runner.logged(command, inventory::MAX_LOG) {
+        Ok(log) => (Some(report::code(log.exit)), log.bytes, Ok(())),
+        Err(e) => {
+            let bytes = e
+                .downcast_ref::<LogFailure>()
+                .map_or_else(Vec::new, |f| f.bytes.clone());
+            let exit = runner.statuses().get(index).map(|s| report::code(s.exit));
+            (exit, bytes, Err(e))
+        }
+    }
+}
+
+/// The suite: one `cargo nextest run` per pass in [`nextest::PROFILES`], whose
+/// isolation and split both come from `.config/nextest.toml`, then the
+/// doc-tests nextest does not run, framed into one log. A runner or doc-test
+/// failure to collect is never a pass: the frame keeps every status and an
+/// unknown one refuses on read-back, and a pass that was never attempted keeps
+/// its `null`.
+fn nextest_suite(
+    repo: &Path,
+    hermetic: &Hermetic,
+    runner: &mut Runner<'_, '_>,
+    selection: Option<&crate::gate_selection::Selection>,
+    map: &[u8],
+) -> Collected {
+    let mut passes = Vec::new();
+    let mut collected = Ok(());
+    for profile in nextest::PROFILES {
+        if collected.is_err() {
+            // A pass that was never attempted has no status; read-back refuses
+            // the frame rather than judging a partial run.
+            passes.push((None, Vec::new(), Vec::new()));
+            continue;
+        }
+        let mut run = hermetic.program("cargo-nextest");
+        run.args(["nextest", "run", "--locked", "--manifest-path"])
+            .arg(repo.join("Cargo.toml"))
+            .args([
+                "--no-fail-fast",
+                "--user-config-file",
+                "none",
+                "--config-file",
+            ])
+            .arg(repo.join(".config/nextest.toml"))
+            .args([
+                // The profile is pinned on the command line: nothing filters
+                // NEXTEST_* out of the suite environment, and an inherited
+                // NEXTEST_PROFILE would otherwise select different isolation rules
+                // from the same configuration file. Every other setting that could
+                // change a judgement is passed here too, and a flag beats the
+                // environment. It also selects the pass: each profile's
+                // `default-filter` is one half of the split.
+                "--profile",
+                profile,
+                // A passing test's output stays out of the evidence whatever the
+                // profile says; the canary tests rest on this.
+                "--success-output",
+                "never",
+                "--message-format",
+                "libtest-json-plus",
+                "--message-format-version",
+                nextest::FORMAT_VERSION,
+                "--no-pager",
+                "--no-input-handler",
+                "--show-progress",
+                "none",
+                // The retained operator log names every test, whatever the
+                // profile says; the inventory reads the stream, not this log.
+                "--status-level",
+                "all",
+                // Not left to the configuration or to a default: a retry is
+                // refused by this repository's rules, and an empty run is a
+                // failure. The inventory refuses the resulting exit anyway.
+                "--retries",
+                "0",
+                "--no-tests",
+                "fail",
+            ])
+            .env(nextest::EXPERIMENT.0, nextest::EXPERIMENT.1);
+        scope(&mut run, selection);
+        let index = runner.statuses().len();
+        // Structured results on stdout, the operator log on stderr: a test's
+        // own output can never reach the stream the inventory is read from.
+        match runner.capture_split(&mut run, inventory::MAX_LOG, inventory::MAX_LOG) {
+            Ok(out) => passes.push((Some(report::code(out.exit)), out.stdout, out.stderr)),
+            Err(e) => {
+                passes.push((
+                    runner.statuses().get(index).map(|s| report::code(s.exit)),
+                    Vec::new(),
+                    Vec::new(),
+                ));
+                collected = Err(e);
+            }
+        }
+    }
+    let documented = std::str::from_utf8(map)
+        .map_err(anyhow::Error::from)
+        .and_then(inventory::documented);
+    let (doc_exit, doc_log, doc_collected) = match (&collected, &documented) {
+        (Ok(()), Ok(packages)) if packages.is_empty() => (Some(0), Vec::new(), Ok(())),
+        (Ok(()), Ok(packages)) => {
+            let mut doc = hermetic.command(repo);
+            doc.args(["test", "--locked", "--manifest-path"])
+                .arg(repo.join("Cargo.toml"))
+                .args(["--doc", "--no-fail-fast"]);
+            for package in packages {
+                doc.arg("-p").arg(package);
+            }
+            let index = runner.statuses().len();
+            collect_logged(runner, &mut doc, index)
+        }
+        (Ok(()), Err(e)) => (None, Vec::new(), Err(anyhow::anyhow!("{e:#}"))),
+        (Err(_), _) => (None, Vec::new(), Ok(())),
+    };
+    let framed: Vec<nextest::Pass<'_>> = nextest::PROFILES
+        .iter()
+        .zip(&passes)
+        .map(|(profile, (exit, events, stderr))| nextest::Pass {
+            profile,
+            exit: *exit,
+            events,
+            stderr,
+        })
+        .collect();
+    let log = nextest::frame(&framed, doc_exit, &doc_log);
+    // The step's status is the first non-zero of the passes and the doc-tests,
+    // and unknown if any of them is unknown. A pass exit of 4 is "no test
+    // matched this pass's filter", which a tier that selects a subset of
+    // packages produces legitimately; whether anything was owed is the
+    // inventory's judgement, against the unfiltered listing, so it is not a
+    // failure here. A run where *nothing* executed still fails: the inventory
+    // refuses with "no test executed".
+    let combined = passes
+        .iter()
+        .map(|(exit, _, _)| exit.map(|code| if code == 4 { 0 } else { code }))
+        .chain(std::iter::once(doc_exit))
+        .try_fold(0, |acc, exit| match (acc, exit?) {
+            (0, code) => Some(code),
+            (code, _) => Some(code),
+        });
+    (combined, log, collected.and(doc_collected))
+}
+
 fn run_scoped(
     repo: &Path,
     hermetic: &Hermetic,
     runner: &mut Runner<'_, '_>,
     selection: Option<&crate::gate_selection::Selection>,
 ) -> Suite {
+    let resolved = resolve(hermetic, runner);
     let mut out = Suite {
         steps: vec![],
         logs: BTreeMap::new(),
@@ -79,7 +256,13 @@ fn run_scoped(
         .arg("--all-targets");
     scope(&mut workspace, selection);
     let workspace_start = runner.statuses().len();
-    let workspace_status = runner.logged(&mut workspace, inventory::MAX_LOG);
+    // Fail fast: a missing or unpinned runner is decided before anything is
+    // built, so the refusal costs the operator a version check, not a whole
+    // workspace build.
+    let workspace_status = match &resolved {
+        Ok(_) => runner.logged(&mut workspace, inventory::MAX_LOG),
+        Err(e) => Err(anyhow::anyhow!("{e:#}")),
+    };
     let mut build = hermetic.command(repo);
     build
         .args(["test", "--quiet", "--locked", "--manifest-path"])
@@ -109,10 +292,11 @@ fn run_scoped(
             .get(workspace_start)
             .map(|s| report::code(s.exit))
     };
-    let built = mapped
+    let mut built = resolved
         .as_ref()
         .map_err(|e| anyhow::anyhow!("{e:#}"))
-        .and_then(|log| {
+        .and_then(|_| {
+            let log = mapped.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?;
             ensure!(
                 log.exit.success(),
                 "test map compilation failed: child exit {}",
@@ -120,8 +304,65 @@ fn run_scoped(
             );
             Ok(log.stdout.clone())
         });
+    // nextest's own listing is the authoritative set of tests its run must
+    // account for, so it is produced here, with the suite's build, and kept in
+    // the same build log a receipt verifier rebuilds the inventory from.
+    let mut list_exit = None;
+    if built.is_ok() {
+        let mut list = hermetic.program("cargo-nextest");
+        list.args(["nextest", "list", "--locked", "--manifest-path"])
+            .arg(repo.join("Cargo.toml"))
+            .args([
+                // The listing is the complete expected set the two passes
+                // are judged against together, so neither pass's half of the
+                // split may apply to it: the profile is pinned for everything
+                // else it carries, and its `default-filter` is ignored.
+                "--profile",
+                "default",
+                nextest::UNFILTERED,
+                "--message-format",
+                "json",
+                "--user-config-file",
+                "none",
+                "--config-file",
+            ])
+            .arg(repo.join(".config/nextest.toml"));
+        scope(&mut list, selection);
+        let index = runner.statuses().len();
+        built = built.and_then(|map| {
+            let out = runner.capture_split(&mut list, inventory::MAX_LOG, inventory::MAX_LOG)?;
+            list_exit = Some(report::code(out.exit));
+            ensure!(
+                out.exit.success(),
+                "nextest listing exited {}: {}",
+                report::code(out.exit),
+                report::diagnostic(&out.stderr)
+            );
+            let listing = String::from_utf8(out.stdout)?;
+            let mut listing = listing.trim_end_matches('\n').to_owned();
+            ensure!(
+                !listing.is_empty() && !listing.contains('\n'),
+                "nextest listing is not one JSON record"
+            );
+            listing.push('\n');
+            Ok([map, listing.into_bytes()].concat())
+        });
+        if list_exit.is_none() {
+            list_exit = runner.statuses().get(index).map(|s| report::code(s.exit));
+        }
+    }
+    let build_exit = list_exit.filter(|code| *code != 0).or(build_exit);
     let (verdict, detail) = match &built {
-        Ok(_) => (Verdict::Pass, "test executable map compiled".into()),
+        Ok(_) => (
+            Verdict::Pass,
+            format!(
+                "test executable map compiled; runner: {}",
+                match &resolved {
+                    Ok(version) => version.clone(),
+                    Err(_) => "unresolved".into(),
+                }
+            ),
+        ),
         Err(e) => (Verdict::Fail, format!("{e:#}")),
     };
     let workspace_log = match &workspace_status {
@@ -135,7 +376,9 @@ fn run_scoped(
     if let Ok(mapped) = &mapped {
         build_log.extend(serde_json::json!({"reason":"gate-map-stderr","text":String::from_utf8_lossy(&mapped.stderr),"exit":report::code(mapped.exit)}).to_string().as_bytes());
         build_log.push(b'\n');
-        build_log.extend(&mapped.stdout);
+        // On success this is the cargo executable map plus nextest's listing,
+        // which is exactly what the two inventory parsers read back.
+        build_log.extend(built.as_ref().unwrap_or(&mapped.stdout));
         build_log.push(b'\n');
     }
     match &built {
@@ -159,30 +402,15 @@ fn run_scoped(
         report_progress(super::receipt::Phase::TestStarted);
     }
     let start = Instant::now();
-    let mut command = hermetic.command(repo);
-    command
-        .args(["test", "--locked", "--manifest-path"])
-        .arg(repo.join("Cargo.toml"))
-        .arg("--no-fail-fast");
-    scope(&mut command, selection);
-    let status_start = runner.statuses().len();
-    let result = if built.is_ok() {
-        runner.logged(&mut command, inventory::MAX_LOG)
+    let (exit, bytes, collection) = if built.is_err() {
+        (
+            None,
+            Vec::new(),
+            Err(anyhow::anyhow!("suite did not start: build failed")),
+        )
     } else {
-        Err(anyhow::anyhow!("suite did not start: build failed"))
-    };
-    let (exit, bytes, collection) = match result {
-        Ok(log) => (Some(report::code(log.exit)), log.bytes, Ok(())),
-        Err(e) => {
-            let bytes = e
-                .downcast_ref::<LogFailure>()
-                .map_or_else(Vec::new, |f| f.bytes.clone());
-            let exit = runner
-                .statuses()
-                .get(status_start)
-                .map(|s| report::code(s.exit));
-            (exit, bytes, Err(e))
-        }
+        let map = built.as_ref().map(Vec::clone).unwrap_or_default();
+        nextest_suite(repo, hermetic, runner, selection, &map)
     };
     if runner.receipt_progress {
         report_progress(super::receipt::Phase::TestReturned);
@@ -192,7 +420,7 @@ fn run_scoped(
         collection?;
         let log = std::str::from_utf8(&bytes)?;
         let map = std::str::from_utf8(built.as_ref().map_err(|e| anyhow::anyhow!("{e:#}"))?)?;
-        let rows = inventory::parse(log, map, exit.unwrap_or(1))?;
+        let rows = nextest::inventory(log, map)?;
         out.inventory = inventory::tsv(&rows);
         let failed: Vec<_> = rows
             .iter()
@@ -512,6 +740,7 @@ pub(super) fn run_fast(
                     std::str::from_utf8(&bytes)?,
                     std::str::from_utf8(&compiled.stdout)?,
                     report::code(log.exit),
+                    inventory::Scope::All,
                 )?;
                 out.inventory = inventory::tsv(&rows);
                 ensure!(
@@ -589,6 +818,20 @@ mod tests {
             b"version = 4\n[[package]]\nname = \"fold-fixture\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
+        // The gate passes `--config-file <repo>/.config/nextest.toml` and runs
+        // one pass per profile, so even a one-file fixture repository needs
+        // both. As strict as the real file: no retries, and the only filter is
+        // the pass split itself, so nothing here can turn a planted failure or
+        // an empty suite into a pass. No fixture has the alone pass's binary,
+        // so that pass matches nothing and exits 4 — the same shape a tier
+        // whose package selection leaves it out of scope produces, and the
+        // inventory still owes a result for every listed test.
+        std::fs::create_dir(repo.join(".config")).unwrap();
+        files::write(
+            &repo.join(".config/nextest.toml"),
+            b"[profile.default]\nretries = 0\nfail-fast = false\nleak-timeout = { period = \"1s\", result = \"fail\" }\ndefault-filter = 'not test(=alone_fixture_nothing)'\n\n[profile.alone]\ninherits = \"default\"\ndefault-filter = 'test(=alone_fixture_nothing)'\n",
+        )
+        .unwrap();
         std::fs::create_dir(repo.join("src")).unwrap();
         let action = match case {
             "home" => {
@@ -653,8 +896,24 @@ mod tests {
             .parent()
             .unwrap()
             .to_path_buf();
+        // The suite runs on the pinned cargo-nextest, so the fixture's own
+        // PATH needs it. Absent is a setup failure with the install line.
+        let nextest = std::process::Command::new("/usr/bin/which")
+            .arg("cargo-nextest")
+            .output()
+            .unwrap();
+        assert!(
+            nextest.status.success(),
+            "fixture setup: cargo-nextest missing from PATH; cargo install cargo-nextest --locked --version {}",
+            super::nextest::VERSION
+        );
+        let nextest = std::path::PathBuf::from(String::from_utf8(nextest.stdout).unwrap().trim())
+            .parent()
+            .unwrap()
+            .to_path_buf();
         let mut path = std::env::join_paths([
             proxy,
+            nextest.clone(),
             toolchain.join("bin"),
             "/usr/bin".into(),
             "/bin".into(),
@@ -663,9 +922,19 @@ mod tests {
         ])
         .unwrap();
         if case == "spawn" {
-            let empty = resources.join("empty-bin");
-            std::fs::create_dir(&empty).unwrap();
-            path = empty.into_os_string();
+            // Only the runner, never cargo: the suite runner resolves, so the
+            // build is still *attempted* and fails to spawn. That is what this
+            // case proves — the gate never reuses an earlier child's status for
+            // a build it could not start — and it would prove nothing if the
+            // runner check refused first.
+            let only_nextest = resources.join("only-nextest");
+            std::fs::create_dir(&only_nextest).unwrap();
+            std::os::unix::fs::symlink(
+                nextest.join("cargo-nextest"),
+                only_nextest.join("cargo-nextest"),
+            )
+            .unwrap();
+            path = only_nextest.into_os_string();
         }
         let env: BTreeMap<OsString, OsString> = [
             ("HOME".into(), home.into_os_string()),
@@ -915,11 +1184,16 @@ mod tests {
                 report::table(&suite.steps)
             );
             if case == "failure" {
-                assert_eq!(suite.steps[1].exit, Some(101));
+                // nextest reports a test failure as 100, where libtest used 101.
+                assert_eq!(suite.steps[1].exit, Some(100));
                 assert!(suite.inventory.contains("witness\tfailed"));
             }
             if case == "zero" {
-                assert!(suite.steps[1].detail.contains("no test executed"));
+                assert!(
+                    suite.steps[1].detail.contains("no test executed"),
+                    "{}",
+                    suite.steps[1].detail
+                );
             }
             if case == "toolchain" {
                 assert!(fail("build"));

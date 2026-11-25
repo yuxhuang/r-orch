@@ -103,7 +103,7 @@ def identity():
               'crates/orch-daemon/Cargo.toml', 'crates/orch-engine/Cargo.toml',
               'crates/orch-peer/Cargo.toml', 'crates/orch-proto/Cargo.toml',
               'crates/orch-tui/Cargo.toml', 'Cargo.toml', 'Cargo.lock',
-              'rust-toolchain.toml', '.cargo/config.toml')
+              'rust-toolchain.toml', '.cargo/config.toml', '.config/nextest.toml')
     paths=git('ls-files','-z','--cached','--others','--exclude-standard','--',*inputs).split(b'\0')
     if len(paths)>4096: raise RuntimeError('judge source count budget')
     records=[]

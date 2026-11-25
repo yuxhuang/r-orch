@@ -414,13 +414,25 @@ impl<'a, 'm> Runner<'a, 'm> {
     }
 
     pub(super) fn capture_raw(&mut self, command: &mut Command, limit: usize) -> Result<Raw> {
+        self.capture_split(command, limit, 16 * 1024)
+    }
+
+    /// Separate streams with their own budgets. The suite runner's structured
+    /// results arrive on stdout and must stay free of the operator log it
+    /// writes to stderr, which is far larger than an identity command's.
+    pub(super) fn capture_split(
+        &mut self,
+        command: &mut Command,
+        limit: usize,
+        err_limit: usize,
+    ) -> Result<Raw> {
         let result = (|| {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
             self.start(command)?;
             let child = self.child.as_mut().context("no direct command")?;
             let mut capture = Capture {
                 out: Pipe::new(child.stdout.take().context("missing stdout")?, limit)?,
-                err: Pipe::new(child.stderr.take().context("missing stderr")?, 16 * 1024)?,
+                err: Pipe::new(child.stderr.take().context("missing stderr")?, err_limit)?,
             };
             let exit = self.drive(Some(&mut capture))?;
             Ok(Raw {

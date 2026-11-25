@@ -408,8 +408,8 @@ fn sensitive_export_payload_case(
 #[test]
 fn sensitive_child_output() {{
     let secret = std::env::var("SYNTHETIC_API_KEY").unwrap();
-    assert!(std::process::Command::new("/usr/bin/printf").args(["%s\\n", &secret]).status().unwrap().success());
-    assert!(std::process::Command::new("/bin/sh").args(["-c", "printf '%s\\n' \"$SYNTHETIC_API_KEY\" >&2"]).status().unwrap().success());
+    assert!(std::process::Command::new("/usr/bin/printf").args(["test stdout: %s\\n", &secret]).status().unwrap().success());
+    assert!(std::process::Command::new("/bin/sh").args(["-c", "printf 'test stderr: %s\\n' \"$SYNTHETIC_API_KEY\" >&2"]).status().unwrap().success());
     {failure}
 }}
 "#), true);
@@ -430,6 +430,9 @@ fn sensitive_child_output() {{
     sandbox.commit();
     let inputs: std::collections::BTreeMap<_, _> = [
         ".cargo/config.toml",
+        // The runner's isolation configuration is a judge input too: it
+        // decides which tests may run beside which.
+        ".config/nextest.toml",
         "Cargo.lock",
         "Cargo.toml",
         "rust-toolchain.toml",
@@ -495,7 +498,8 @@ exec '{}' "$@"
         row(&record, "test")[1],
         if failed { "FAIL" } else { "pass" }
     );
-    assert_eq!(row(&record, "test")[2], if failed { "101" } else { "0" });
+    // nextest reports a test failure as 100, where libtest used 101.
+    assert_eq!(row(&record, "test")[2], if failed { "100" } else { "0" });
     let run = Path::new(field(&record, "run-dir"));
     let build = fs::read_to_string(run.join("steps/build.log")).unwrap();
     for reason in ["gate-build-log", "gate-map-stderr"] {
@@ -513,14 +517,33 @@ exec '{}' "$@"
             assert!(value["text"].as_str().unwrap().contains("build stderr:"));
         }
     }
-    assert!(
-        fs::read_to_string(run.join("steps/test.log"))
-            .unwrap()
-            .matches(secret)
-            .count()
-            >= 2,
-        "both test stdout and stderr must reach the real log"
-    );
+    let test_log = fs::read_to_string(run.join("steps/test.log")).unwrap();
+    if failed {
+        // The test log is JSON-framed now, so the canary is there in its
+        // escaped form. That the redactor handles the escaped form is what the
+        // export assertions below prove. Each stream is asserted by its own
+        // label: a count alone could be satisfied by stdout twice.
+        let json = serde_json::to_string(secret).unwrap();
+        let escaped = json.trim_matches('"');
+        for stream in ["test stdout: ", "test stderr: "] {
+            assert!(
+                test_log.contains(&format!("{stream}{escaped}")),
+                "{stream}canary missing from the real log: {test_log}"
+            );
+        }
+    } else {
+        // nextest captures each test's output and `success-output = "never"`
+        // does not print a passing test's, so a passing test's bytes never
+        // enter the evidence at all — strictly less exposure than before. The
+        // redaction and refusal boundaries are still exercised on everything
+        // that does enter: the build log above, which carries the canary on
+        // both of cargo's streams, the host label in the record, and the
+        // failing-suite case, which is where a test's own output appears.
+        // A one- to three-byte canary occurs incidentally in any text, so
+        // absence is not asserted; what is asserted is that the runner's own
+        // framed record is there to be redacted.
+        assert!(test_log.contains("gate-nextest-pass"), "{test_log}");
+    }
     assert!(
         record.contains(
             &secret
@@ -544,7 +567,7 @@ exec '{}' "$@"
         );
         assert_eq!(
             field(&copied, "step-test-exit"),
-            if failed { "101" } else { "0" }
+            if failed { "100" } else { "0" }
         );
         assert!(field(&copied, "qualifying").starts_with("no"));
         assert_eq!(field(&copied, "host-label"), "<REDACTED>");
