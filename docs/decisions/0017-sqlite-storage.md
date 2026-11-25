@@ -523,11 +523,18 @@ across a crash, lists that do not load everything, and a retried request that ru
     keyed by family, (2) the digest as the way an identity over 65,536 bytes is found, and its form, (3) the `env`
     encoding, (4) a rendered prompt always a blob named by `runs.prompt_sha256`, (5) a time projecting to
     milliseconds only when exact, (7) the ordinal-keyed team member rows, and (10) the refusal of any populated
-    predecessor row. The other three, (6), (8) and (9), are not restated here and stay in the spec's list. The names
-    of the new columns are open in the spec's "Open in this section", item 1. Item (3), and the detail-bytes half of (4),
-    were confirmed on 2026-11-23 by the author of the inactive byte codec, which builds them: `env` is an array of
-    `[name, value]` pairs, and the `prompt` slot is always a tag. The schema half of (4) and every other item still
-    wait for the migration owner.
+    predecessor row. The other three, (6), (8) and (9), are not restated here and stay in the spec's list. Item (3),
+    and the detail-bytes half of (4), were confirmed on 2026-11-23 by the author of the inactive byte codec, which
+    builds them: `env` is an array of `[name, value]` pairs, and the `prompt` slot is always a tag. The owner of the
+    migrations confirmed all ten items on 2026-11-24, in writing, for the bounded design of migration 004, the first
+    schema slice, and the spec's "Physical schema of migration 004" records the forms: the names of the new columns are
+    settled there (item 1 of "Open in this section"), and two amendments follow from them. Migration 004 rebuilds
+    five tables, `team_tasks` as well as `agents`, `teams`, `team_members` and `runs`, because a team key over 65,536 bytes needs a key form
+    there; and an identity over 65,536 bytes is found by its digest in a column that sits beside an explicit form
+    column, so a literal text that looks like a digest cannot alias it; every digest column is checked to hold exactly 64 bytes
+    of lowercase hexadecimal characters, which refuses a NUL suffix. The confirmation is of the design: migration 004
+    is inactive, writes no entity row and runs on no real database before T24, the native CRUD, the page merge of inline and
+    indirect keys and the second migration are not built, and its independent reviews and gates are separate.
 
 28. **Context, Config, Template and Goal use the same format, with provenance and original-byte order.** Added
     2026-11-23 by the lead's decision on those four families (option A of two); the owner's merge ratifies it, except
@@ -743,8 +750,9 @@ across a crash, lists that do not load everything, and a retried request that ru
   have a meaning, still needs a migration and metadata for positions, and makes every reader and the export read a
   second envelope. Rejected for the typed detail of decisions 26 to 28.
 - **A separate detail and reference pair for each family.** Seven near-identical pairs of tables, seven sweeps and
-  seven sets of diagnostic views. Rejected here for one pair keyed by family; this is the writer's alternative, and the
-  migration owner may still choose it (the spec's "Derived, to be confirmed", item 1).
+  seven sets of diagnostic views. Rejected here for one pair keyed by family; this was the writer's alternative, and
+  the migration owner chose the shared pair when confirming item 1 of the spec's "Derived, to be confirmed" on
+  2026-11-24 (migration 004 creates it).
 - **Refusing an identity over 65,536 bytes as unrepresentable, as the task format does.** Simpler, and consistent with
   the task's key columns. Rejected here because the decision requires an identifier order and a lookup that compare
   original bytes "including for indirect keys", and the decision for tasks has no such requirement.

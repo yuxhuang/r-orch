@@ -728,3 +728,83 @@ fn shared_reader_keeps_null_fraction_exponent_and_nested_duplicate_refusals() {
         assert!(decode_run(&store, &d).is_err(), "{to}");
     }
 }
+
+// #252: presence is meaningful even for optional scalar projections. These
+// permanent cases must precede any SQL mapping claims.
+fn rejects_optional_null(family: Family, pointer: &str) {
+    let (_temp, data) = crate::sqlite::test_data();
+    let store = DiskBlobStore::open(data.root()).unwrap();
+    let encoded = match family {
+        Family::Agent => encode_agent(&store, &agent()),
+        Family::Team => encode_team(&store, &team()),
+        Family::Run => encode_run(&store, &run()),
+    }
+    .unwrap();
+    let mut value: serde_json::Value =
+        serde_json::from_str(encoded.inline.as_ref().unwrap()).unwrap();
+    let (parent, key) = pointer.rsplit_once('/').unwrap();
+    value
+        .pointer_mut(parent)
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert(key.into(), serde_json::Value::Null);
+    let mut invalid = detail(&value.to_string());
+    invalid.refs = encoded.refs;
+    let result = match family {
+        Family::Agent => decode_agent(&store, &invalid).map(|_| ()),
+        Family::Team => decode_team(&store, &invalid).map(|_| ()),
+        Family::Run => decode_run(&store, &invalid).map(|_| ()),
+    };
+    assert!(result.is_err(), "accepted explicit null at {pointer}");
+}
+
+#[test]
+fn optional_null_agent_autonomous_is_refused() {
+    rejects_optional_null(Family::Agent, "/autonomous");
+}
+#[test]
+fn optional_null_agent_max_turns_is_refused() {
+    rejects_optional_null(Family::Agent, "/config/max_turns");
+}
+#[test]
+fn optional_null_agent_timeout_ms_is_refused() {
+    rejects_optional_null(Family::Agent, "/config/timeout_ms");
+}
+#[test]
+fn optional_null_agent_stall_timeout_ms_is_refused() {
+    rejects_optional_null(Family::Agent, "/config/stall_timeout_ms");
+}
+#[test]
+fn optional_null_agent_tokens_used_is_refused() {
+    rejects_optional_null(Family::Agent, "/stats/tokens_used");
+}
+#[test]
+fn optional_null_team_max_concurrent_tasks_is_refused() {
+    rejects_optional_null(Family::Team, "/config/max_concurrent_tasks");
+}
+#[test]
+fn optional_null_team_message_ttl_ms_is_refused() {
+    rejects_optional_null(Family::Team, "/config/message_ttl_ms");
+}
+#[test]
+fn optional_null_run_pid_is_refused() {
+    rejects_optional_null(Family::Run, "/pid");
+}
+
+#[test]
+fn value_equivalent_detail_whitespace_key_order_and_empty_capabilities_are_readable() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let store = DiskBlobStore::open(data.root()).unwrap();
+    let encoded = encode_agent(&store, &agent()).unwrap();
+    let value: serde_json::Value = serde_json::from_str(encoded.inline.as_ref().unwrap()).unwrap();
+    // Deliberately reverse insertion order rather than comparing encoder bytes.
+    let mut reordered = serde_json::Map::new();
+    for (key, value) in value.as_object().unwrap().iter().rev() {
+        reordered.insert(key.clone(), value.clone());
+    }
+    reordered.insert("capabilities".into(), json!([]));
+    let equivalent = serde_json::to_string_pretty(&reordered).unwrap();
+    assert_ne!(equivalent, encoded.inline.unwrap());
+    assert_eq!(decode_agent(&store, &detail(&equivalent)).unwrap(), agent());
+}

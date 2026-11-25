@@ -9,6 +9,8 @@ const TABLES: &[&str] = &[
     "context_entries",
     "counters",
     "daemon_config",
+    "entity_blob_refs",
+    "entity_details",
     "goals",
     "identities",
     "identity_tokens",
@@ -355,6 +357,527 @@ fn attention_uniqueness_ends_when_an_item_is_resolved() {
             "attention_open",
             "blobs_sweepable",
             "intents_pending"
+        ]
+    );
+}
+
+#[test]
+fn entity_key_forms_and_reference_bounds_are_disjoint_for_all_seven_families() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    let hash = "a".repeat(64);
+    for family in [
+        "agent", "team", "run", "context", "config", "template", "goal",
+    ] {
+        for form in [0, 1] {
+            conn.execute(
+                "INSERT INTO entity_details VALUES('p',?1,?2,?3,1,'{}',2,?3)",
+                rusqlite::params![family, form, hash],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO entity_blob_refs VALUES('p',?1,?2,?3,'/value',0,?3,65537)",
+                rusqlite::params![family, form, hash],
+            )
+            .unwrap();
+        }
+        let zero = conn.execute(
+            "INSERT INTO entity_blob_refs VALUES('p',?1,0,'zero','/prompt',0,?2,0)",
+            rusqlite::params![family, hash],
+        );
+        assert_eq!(zero.is_ok(), family == "run");
+    }
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM entity_details", [], |r| r.get(0))
+            .unwrap(),
+        14
+    );
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM entity_blob_refs", [], |r| r.get(0))
+            .unwrap(),
+        15
+    );
+    for (form, key) in [
+        (2, "a"),
+        (1, "wrong"),
+        (1, &"A".repeat(64)),
+        (0, &"a".repeat(65537)),
+    ] {
+        assert!(
+            conn.execute(
+                "INSERT INTO entity_details VALUES('p','agent',?1,?2,1,'{}',2,?3)",
+                rusqlite::params![form, key, hash]
+            )
+            .is_err()
+        );
+    }
+    for size in [-1, 67108865] {
+        assert!(
+            conn.execute(
+                "INSERT INTO entity_blob_refs VALUES('p','run',0,'r','/prompt',0,?1,?2)",
+                rusqlite::params![hash, size]
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        conn.execute(
+            "INSERT INTO entity_details VALUES('p','unknown',0,'r',1,'{}',2,?1)",
+            [&hash]
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO entity_details VALUES('p','run',0,'r',1,NULL,65536,?1)",
+            [&hash]
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "INSERT INTO entity_details VALUES('p','run',0,'r',1,'é',1,?1)",
+            [&hash]
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn native_entity_forms_duplicate_names_and_member_occurrences() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    for id in ["a", "b"] {
+        conn.execute("INSERT INTO agents(project_id,id,name,adapter,config,position,revision) VALUES('p',?1,'same','codex','{}',1,1)", [id]).unwrap();
+        conn.execute("INSERT INTO teams(project_id,id,name,lead_agent_id,created_at_text,status,config,position,revision) VALUES('p',?1,'same','a','opaque','active','{}',1,1)", [id]).unwrap();
+    }
+    for ordinal in [0, 1] {
+        conn.execute("INSERT INTO team_members(project_id,team_id,ordinal,agent_id,role,joined_at_text) VALUES('p','a',?1,'a','member','opaque')", [ordinal]).unwrap();
+    }
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM team_members", [], |r| r.get(0))
+            .unwrap(),
+        2
+    );
+    assert!(conn.execute("INSERT INTO team_members(project_id,team_id,ordinal,agent_id,role,joined_at_text) VALUES('p','a',1,'b','member','opaque')", []).is_err());
+    conn.execute(
+        "INSERT INTO team_tasks(project_id,team_id,task_id) VALUES('p','a','t')",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "INSERT INTO team_tasks(project_id,team_id,task_id) VALUES('p','a','t')",
+            []
+        )
+        .is_err()
+    );
+    let oversized = "é".repeat(32769);
+    assert!(
+        conn.execute("UPDATE agents SET name=?1 WHERE id='a'", [&oversized])
+            .is_err()
+    );
+    let hash = "b".repeat(64);
+    conn.execute(
+        "UPDATE agents SET name='',name_form=1,name_sha256=?1,name_bytes=65538 WHERE id='a'",
+        [&hash],
+    )
+    .unwrap();
+    assert!(
+        conn.execute("UPDATE agents SET name_bytes=65536 WHERE id='a'", [])
+            .is_err()
+    );
+    assert!(
+        conn.execute("UPDATE agents SET name_sha256=NULL WHERE id='a'", [])
+            .is_err()
+    );
+    assert!(
+        conn.execute("UPDATE agents SET autonomous=2 WHERE id='a'", [])
+            .is_err()
+    );
+    assert_eq!(
+        conn.query_row::<(Option<i64>, Option<i64>, Option<i64>), _, _>(
+            "SELECT autonomous,created_at,updated_at FROM agents WHERE id='a'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        )
+        .unwrap(),
+        (None, None, None)
+    );
+}
+
+#[test]
+fn run_claim_tuple_payload_attempt_and_identity_constraints_are_independent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    for (id, attempt) in [("r2", 2), ("r10b", 10), ("r10a", 10)] {
+        conn.execute("INSERT INTO runs(project_id,id,task_id,agent_id,status,attempt,revision) VALUES('p',?1,'t','a','running',?2,1)", rusqlite::params![id,attempt]).unwrap();
+    }
+    let order: Vec<String> = conn
+        .prepare("SELECT id FROM runs WHERE task_id='t' ORDER BY attempt DESC,id COLLATE BINARY")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(order, ["r10a", "r10b", "r2"]);
+    for invalid in [
+        "run_no=1",
+        "epoch=1",
+        "counted=0",
+        "attempt_no=1",
+        "run_no=1,epoch=1,counted=2",
+        "run_no=1,epoch=1,counted=1",
+        "run_no=1,epoch=1,counted=0,attempt_no=1",
+    ] {
+        assert!(
+            conn.execute(&format!("UPDATE runs SET {invalid} WHERE id='r2'"), [])
+                .is_err(),
+            "{invalid}"
+        );
+    }
+    conn.execute(
+        "UPDATE runs SET run_no=1,epoch=1,counted=1,attempt_no=1 WHERE id='r2'",
+        [],
+    )
+    .unwrap();
+    assert!(
+        conn.execute(
+            "UPDATE runs SET run_no=1,epoch=2,counted=0 WHERE id='r10a'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE runs SET run_no=2,epoch=1,counted=0 WHERE id='r10a'",
+            []
+        )
+        .is_err()
+    );
+    assert!(
+        conn.execute(
+            "UPDATE runs SET run_no=2,epoch=2,counted=1,attempt_no=1 WHERE id='r10a'",
+            []
+        )
+        .is_err()
+    );
+    conn.execute(
+        "UPDATE runs SET run_no=2,epoch=2,counted=0 WHERE id='r10a'",
+        [],
+    )
+    .unwrap();
+    for attempt in [-1i64, 4294967296] {
+        assert!(
+            conn.execute("UPDATE runs SET attempt=?1 WHERE id='r2'", [attempt])
+                .is_err()
+        );
+    }
+    conn.execute("UPDATE runs SET attempt=4294967295 WHERE id='r2'", [])
+        .unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM counters", [], |r| r.get(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn native_identity_and_claim_keys_cannot_alias_literal_digest_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    let hash = "b".repeat(64);
+    conn.execute("INSERT INTO agents(project_id,id,name,adapter,config,position,revision) VALUES('p',?1,'literal','codex','{}',1,1)", [&hash]).unwrap();
+    conn.execute("INSERT INTO agents(project_id,id,id_form,id_sha256,id_bytes,name,adapter,config,position,revision) VALUES('p',?1,1,?1,65537,'indirect','codex','{}',2,1)", [&hash]).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM agents WHERE id=?1", [&hash], |r| r
+            .get(0))
+            .unwrap(),
+        2
+    );
+    conn.execute("INSERT INTO runs(project_id,id,task_id,agent_id,status,run_no,epoch,counted,attempt_no,revision) VALUES('p','literal',?1,'a','running',1,1,1,1,1)", [&hash]).unwrap();
+    conn.execute("INSERT INTO runs(project_id,id,task_id,task_id_form,task_id_sha256,task_id_bytes,agent_id,status,run_no,epoch,counted,attempt_no,revision) VALUES('p','indirect',?1,1,?1,65537,'a','running',1,1,1,1,1)", [&hash]).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM runs", [], |r| r.get(0))
+            .unwrap(),
+        2
+    );
+}
+
+// Apply the shipped registry SQL with the product's SQLite reader. Each case
+// uses a savepoint so a successful probe cannot change the next case's inputs.
+fn native_contract_fixture() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    for sql in [
+        include_str!("../src/sqlite/schema.sql"),
+        include_str!("../src/sqlite/migrations/002_attention_facts.sql"),
+        include_str!("../src/sqlite/migrations/003_task_format.sql"),
+        include_str!("../src/sqlite/migrations/004_agent_team_run.sql"),
+    ] {
+        conn.execute_batch(sql).unwrap();
+    }
+    conn.execute_batch("
+        INSERT INTO agents(project_id,id,name,adapter,config,position,revision) VALUES('p','a','name','codex','{}',1,1);
+        INSERT INTO teams(project_id,id,name,lead_agent_id,created_at_text,status,config,position,revision) VALUES('p','t','name','a','opaque','active','{}',1,1);
+        INSERT INTO team_members(project_id,team_id,ordinal,agent_id,role,joined_at_text) VALUES('p','t',0,'a','member','opaque');
+        INSERT INTO team_tasks(project_id,team_id,task_id) VALUES('p','t','task');
+        INSERT INTO runs(project_id,id,task_id,agent_id,status,revision) VALUES('p','r','task','a','running',1);
+    ").unwrap();
+    conn
+}
+
+const NATIVE_TEXTS: &[(&str, &str, bool)] = &[
+    ("agents", "id", true),
+    ("agents", "name", false),
+    ("agents", "adapter", false),
+    ("agents", "role", false),
+    ("agents", "current_task", false),
+    ("agents", "last_error", false),
+    ("teams", "id", true),
+    ("teams", "name", false),
+    ("teams", "description", false),
+    ("teams", "lead_agent_id", false),
+    ("teams", "created_at_text", false),
+    ("team_members", "team_id", true),
+    ("team_members", "role", false),
+    ("team_members", "joined_at_text", false),
+    ("team_tasks", "team_id", true),
+    ("runs", "id", true),
+    ("runs", "task_id", true),
+    ("runs", "agent_id", true),
+    ("runs", "started_at_text", false),
+    ("runs", "error", false),
+];
+
+fn probe_update(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    values: &[&dyn rusqlite::ToSql],
+    valid: bool,
+) {
+    conn.execute_batch("SAVEPOINT probe").unwrap();
+    let result = conn.execute(sql, values);
+    assert_eq!(result.is_ok(), valid, "{sql}: {result:?}");
+    if valid {
+        assert_eq!(result.unwrap(), 1, "probe must target one fixture row");
+    } else {
+        assert_eq!(
+            result.unwrap_err().sqlite_error_code(),
+            Some(rusqlite::ErrorCode::ConstraintViolation)
+        );
+    }
+    conn.execute_batch("ROLLBACK TO probe; RELEASE probe")
+        .unwrap();
+}
+
+#[test]
+fn every_native_text_form_enforces_its_complete_projection_contract() {
+    let conn = native_contract_fixture();
+    let hash = "a".repeat(64);
+    let max = "é".repeat(32768);
+    let over = format!("{max}x");
+    for &(table, col, identity) in NATIVE_TEXTS {
+        probe_update(
+            &conn,
+            &format!("UPDATE {table} SET {col}=?1"),
+            &[&max],
+            true,
+        );
+        probe_update(
+            &conn,
+            &format!("UPDATE {table} SET {col}=?1"),
+            &[&over],
+            false,
+        );
+        for sibling in [format!("{col}_sha256=?1"), format!("{col}_bytes=65537")] {
+            let params: Vec<&dyn rusqlite::ToSql> = if sibling.contains("?1") {
+                vec![&hash]
+            } else {
+                vec![]
+            };
+            probe_update(
+                &conn,
+                &format!("UPDATE {table} SET {sibling}"),
+                &params,
+                false,
+            );
+        }
+        let native = if identity { hash.as_str() } else { "" };
+        let prefix =
+            format!("UPDATE {table} SET {col}_form=1,{col}=?1,{col}_sha256=?2,{col}_bytes=");
+        probe_update(&conn, &format!("{prefix}65537"), &[&native, &hash], true);
+        probe_update(&conn, &format!("{prefix}65536"), &[&native, &hash], false);
+        probe_update(&conn, &format!("{prefix}NULL"), &[&native, &hash], false);
+        probe_update(
+            &conn,
+            &format!("{prefix}65537"),
+            &[&"mismatch", &hash],
+            false,
+        );
+        probe_update(
+            &conn,
+            &format!("{prefix}65537"),
+            &[&native, &Option::<String>::None],
+            false,
+        );
+        probe_update(
+            &conn,
+            &format!("{prefix}65537"),
+            &[&Option::<String>::None, &hash],
+            false,
+        );
+        probe_update(
+            &conn,
+            &format!("UPDATE {table} SET {col}_form=2"),
+            &[],
+            false,
+        );
+    }
+}
+
+#[test]
+fn every_digest_check_rejects_bound_nul_and_nonhex_bytes() {
+    let conn = native_contract_fixture();
+    let hash = "a".repeat(64);
+    let bad = [
+        format!("{hash}\0"),
+        format!("{hash}\0/../../canary"),
+        format!("aa\0{}", "a".repeat(61)),
+        "a".repeat(63),
+        "a".repeat(65),
+        "A".repeat(64),
+        "é".repeat(64),
+    ];
+    for digest in std::iter::once(&hash).chain(bad.iter()) {
+        let valid = digest == &hash;
+        for &(table, col, identity) in NATIVE_TEXTS {
+            let native = if identity { digest.as_str() } else { "" };
+            probe_update(
+                &conn,
+                &format!(
+                    "UPDATE {table} SET {col}=?1,{col}_form=1,{col}_sha256=?2,{col}_bytes=65537"
+                ),
+                &[&native, digest],
+                valid,
+            );
+        }
+        // Four shared-pair digest expressions: key in each table, detail and ref hash.
+        for (sql, params) in [
+            (
+                "INSERT INTO entity_details VALUES('p','run',1,?1,1,'{}',2,?2)",
+                rusqlite::params![digest, hash],
+            ),
+            (
+                "INSERT INTO entity_details VALUES('p','run',0,'r',1,'{}',2,?1)",
+                rusqlite::params![digest],
+            ),
+            (
+                "INSERT INTO entity_blob_refs VALUES('p','run',1,?1,'/prompt',0,?2,1)",
+                rusqlite::params![digest, hash],
+            ),
+            (
+                "INSERT INTO entity_blob_refs VALUES('p','run',0,'r','/prompt',0,?1,1)",
+                rusqlite::params![digest],
+            ),
+        ] {
+            probe_update(&conn, sql, params, valid);
+        }
+    }
+}
+
+#[test]
+fn all_native_identity_forms_keep_literal_digest_text_distinct() {
+    let conn = native_contract_fixture();
+    let hash = "b".repeat(64);
+    for (table, key) in [
+        ("agents", "id"),
+        ("teams", "id"),
+        ("runs", "id"),
+        ("team_members", "team_id"),
+        ("team_tasks", "team_id"),
+    ] {
+        conn.execute(&format!("UPDATE {table} SET {key}=?1"), [&hash])
+            .unwrap();
+        let columns: Vec<String> = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let projection = columns
+            .iter()
+            .map(|c| {
+                if c == &format!("{key}_form") {
+                    "1".into()
+                } else if c == &format!("{key}_sha256") {
+                    "?1".into()
+                } else if c == &format!("{key}_bytes") {
+                    "65537".into()
+                } else {
+                    c.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql =
+            format!("INSERT INTO {table} SELECT {projection} FROM {table} WHERE {key}_form=0");
+        assert_eq!(conn.execute(&sql, [&hash]).unwrap(), 1, "{table}");
+        assert!(
+            conn.execute(&sql, [&hash]).is_err(),
+            "duplicate indirect {table}"
+        );
+        assert!(
+            conn.execute(
+                &format!("INSERT INTO {table} SELECT * FROM {table} WHERE {key}_form=0"),
+                []
+            )
+            .is_err(),
+            "duplicate literal {table}"
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                &format!("SELECT count(*) FROM {table} WHERE {key}=?1"),
+                [&hash],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            2
+        );
+    }
+}
+
+#[test]
+fn native_auxiliary_bounds_config_and_run_order_index_are_pinned() {
+    let conn = native_contract_fixture();
+    let over = "a".repeat(65537);
+    for sql in [
+        "UPDATE team_members SET agent_id=?1",
+        "UPDATE team_tasks SET task_id=?1",
+    ] {
+        probe_update(&conn, sql, &[&over], false);
+    }
+    probe_update(&conn, "UPDATE agents SET config='[]'", &[], false);
+    probe_update(&conn, "UPDATE teams SET position=-1", &[], false);
+    let index: Vec<(String, i64)> = conn.prepare("SELECT name,desc FROM pragma_index_xinfo('runs_by_task_attempt') WHERE key=1 ORDER BY seqno").unwrap()
+        .query_map([], |r| Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(
+        index,
+        [
+            ("project_id".into(), 0),
+            ("task_id_form".into(), 0),
+            ("task_id".into(), 0),
+            ("attempt".into(), 1),
+            ("id_form".into(), 0),
+            ("id".into(), 0)
         ]
     );
 }
