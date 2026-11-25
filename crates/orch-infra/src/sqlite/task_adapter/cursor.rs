@@ -347,6 +347,11 @@ impl TaskCursors {
         let (fixed, rest) = reference.split_at_checked(4 + DIGEST).ok_or_else(invalid)?;
         let length = u32::from_be_bytes(fixed[..4].try_into().map_err(|_| invalid())?) as usize;
         let (fallback, prefix) = Fallback::read(rest).ok_or_else(invalid)?;
+        // `issue` writes the rest of one character: 1 to 4 bytes. More would
+        // spend the room the prefix needs, and so widen the scan below.
+        if matches!(&fallback, Fallback::From { tail, .. } if !(1..=4).contains(&tail.len())) {
+            return Err(invalid().into());
+        }
         let payload = match fallback {
             Fallback::PastKeys => 0,
             Fallback::From { ref tail, .. } => FROM_FIXED + tail.len(),
@@ -363,6 +368,16 @@ impl TaskCursors {
         if prefix.len() > room {
             return Err(invalid().into());
         }
+        // The shape of a `From` is checked before the first lookup, not once
+        // the row is found to be gone: the first `k` bytes of the ID are the
+        // prefix's, and `issue` wrote a prefix that reaches them.
+        let from = match &fallback {
+            Fallback::From { k, tail } => {
+                let head = prefix.as_bytes().get(..*k).ok_or_else(invalid)?;
+                Some(String::from_utf8([head, tail].concat()).map_err(|_| invalid())?)
+            }
+            _ => None,
+        };
         let issued = |id: &str| id.floor_char_boundary(room) == prefix.len();
         let found = task_page::find_id_with_prefix(tx, project, prefix, length, |id| {
             issued(id) && Sha256::digest(id.as_bytes())[..DIGEST] == fixed[4..]
@@ -372,13 +387,7 @@ impl TaskCursors {
         }
         match fallback {
             Fallback::PastKeys => Ok((Bound::PastKeys, None)),
-            Fallback::From { k, tail } => {
-                // The first `k` bytes of the ID are the prefix's; `issue` wrote a
-                // prefix that reaches them.
-                let head = prefix.as_bytes().get(..k).ok_or_else(invalid)?;
-                let id = String::from_utf8([head, &tail].concat()).map_err(|_| invalid())?;
-                Ok((Bound::From, Some(id)))
-            }
+            Fallback::From { .. } => Ok((Bound::From, from)),
             Fallback::Successor { length, digest } => {
                 let length = length as usize;
                 // The next row shares the prefix, and is not the row sought.

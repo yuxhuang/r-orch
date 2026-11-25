@@ -1284,6 +1284,72 @@ fn a_deleted_row_is_resumed_at_the_shortest_fallback_and_without_one_it_is_refus
     });
 }
 
+/// A `From` that `issue` could not have written is refused before any row is
+/// looked up: not once the row is found to be gone, and not after it is found.
+/// Its tail is the rest of one character, and the prefix is what the room leaves
+/// after it, so a longer tail could only spend the prefix, and a scan with it,
+/// on nothing (a tail of 206 bytes leaves none for the sort by ID).
+#[test]
+fn a_from_fallback_that_issue_could_not_have_written_is_refused_before_any_lookup() {
+    scenario(1, |fx| {
+        let near = |tag: &str| format!("{}{tag}{}", "v".repeat(100), "x".repeat(300));
+        let ids = [near("a"), near("b")];
+        fx.seed(
+            ids.iter()
+                .map(|id| task(id, TaskStatus::Todo, 1, 1, None))
+                .collect(),
+        );
+        let sort = Sort::Id;
+        let token = fx.list(&filter(), &request(sort, 1)).unwrap().next_cursor;
+        let good = raw(&token.unwrap());
+        // After the header, the length and digest, then the fallback: the kind,
+        // `k`, the tail's length, the tail and the prefix.
+        let at = 26 + KIND;
+        assert_eq!(good[at], 1, "the IDs part at byte 100: a `From`");
+        let tail_len = usize::from(good[at + 3]);
+        assert_eq!(tail_len, 1);
+        let (tail, prefix) = good[at + 4..].split_at(tail_len);
+        let forge = |k: u16, tail: &[u8], prefix: &[u8]| {
+            let mut bytes = good[..at].to_vec();
+            bytes.push(1);
+            bytes.extend(k.to_be_bytes());
+            bytes.push(tail.len() as u8);
+            bytes.extend(tail);
+            bytes.extend(prefix);
+            bytes
+        };
+        let try_raw = |bytes: &[u8]| fx.list(&filter(), &resumed(&cursor(hex(bytes)), sort));
+        // The anchor is there, so each of these would resume after it, were the
+        // shape looked at only once the anchor is gone.
+        assert_eq!(Fixture::ids(&try_raw(&good).unwrap()), [near("b")]);
+        assert_eq!(
+            Fixture::ids(&try_raw(&forge(100, tail, prefix)).unwrap()),
+            [near("b")]
+        );
+        // No tail, and one a character cannot have.
+        invalid_cursor(try_raw(&forge(100, &[], prefix)));
+        // (The prefix is cut to the room that tail leaves, so that the length
+        // of the tail is the only fault.)
+        invalid_cursor(try_raw(&forge(100, b"xxxxx", &prefix[..prefix.len() - 4])));
+        // A tail that takes all the room: the empty prefix is every ID's, so the
+        // scan for the anchor would be over every row of the project.
+        let wide = [b'x'; 206];
+        let all = forge(0, &wide, &[]);
+        assert_eq!(all.len(), 256, "it fits the token");
+        invalid_cursor(try_raw(&all));
+        // `k` past the prefix, and bytes that are not UTF-8 once joined.
+        invalid_cursor(try_raw(&forge(prefix.len() as u16 + 1, tail, prefix)));
+        invalid_cursor(try_raw(&forge(100, &[0xff], prefix)));
+        invalid_cursor(try_raw(&forge(99, &[0xa9], prefix)));
+        // The same with the anchor gone.
+        delete_rows(fx, &[&ids[0]]);
+        assert_eq!(Fixture::ids(&try_raw(&good).unwrap()), [near("b")]);
+        invalid_cursor(try_raw(&forge(100, &[], prefix)));
+        invalid_cursor(try_raw(&all));
+        fx.state.ensure_available().unwrap();
+    });
+}
+
 /// Issue 265 evidence, not an assertion: what one page costs today, before any
 /// tuning is proposed. Run with
 /// `cargo test -p orch-infra --lib task_adapter::tests::record_page_costs -- --ignored --nocapture`.
