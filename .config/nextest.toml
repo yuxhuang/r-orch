@@ -1,0 +1,142 @@
+# cargo-nextest configuration for the verification gate and the ambient CI run.
+#
+# Standing rules this file must keep (AGENTS.md "Verification tiers", ADR 0013
+# decision 24, ADR 0022):
+#
+#   * `retries` stays 0. A flaky test is fixed or named, never retried.
+#   * No `slow-timeout.terminate-after`: a hang must stay a hang. `leak-timeout`
+#     may only make a leak *fail*, never excuse one; nextest terminates nothing
+#     for a leak, so that cannot turn a hang into a pass.
+#   * Isolation is expressed *here only*. No test is split, renamed, reordered
+#     or skipped under `crates/**` to suit the runner.
+#   * A `default-filter` only as the pass split below, and only as two exact
+#     complements, and only in these two profile tables. Anywhere else it would
+#     drop tests. The gate's listing is taken with `--ignore-default-filter`, so
+#     a filter no longer shows there as a mismatch; what fails closed is the
+#     union check, because a test no pass ran has no result against that
+#     unfiltered listing. `xtask/tests/nextest_isolation.rs` is what refuses the
+#     filter itself, along with every table and key not named below.
+#
+# Three forms of isolation, in order of what they cost:
+#
+#   * a `max-threads = 1` test group: "one of these at a time, beside anything
+#     else";
+#   * a pass of its own (the split below): "this binary alone on the host, its
+#     own tests in parallel with each other";
+#   * `threads-required = "num-test-threads"`: "nothing else runs beside this
+#     test", the most expensive and the only one that serialises a whole binary.
+#
+# Every entry below says which hazard it answers, and
+# `xtask/tests/nextest_isolation.rs` refuses an entry that nothing explains and
+# a hazard that nothing covers.
+nextest-version = { required = "0.9.152" }
+
+# ── the pass split ────────────────────────────────────────────────────────
+# This is the single definition of which tests run alone. The gate runs one
+# `cargo nextest run` per profile and the ambient CI job runs the same two;
+# `xtask/tests/nextest_isolation.rs` checks the two filters are complements,
+# that every release-and-reuse port caller is in the alone pass or
+# host-exclusive, and that `ci.yml` names both profiles.
+#
+# A `default-filter` is allowed *only* here, as that split. It cannot hide a
+# test: the gate takes its expected set from `cargo nextest list
+# --ignore-default-filter`, which is unfiltered, and then requires the union of
+# the two passes to name every listed test exactly once — so a test in neither
+# pass, or in both, refuses the run.
+[profile.default]
+retries = 0
+fail-fast = false
+default-filter = 'not binary(remote_peers)'
+# A test that leaves a process holding its output behind is a failure, not a
+# warning. This is the opposite of masking: nextest never terminates the leaked
+# process, it only stops waiting for the pipe and names the test that leaked.
+# Under `cargo test` such a process held the gate's own output open and the gate
+# kept its target; nextest captures each test's output, so the gate no longer
+# sees it and this is what reports it instead. A full workspace run has zero
+# leaks today (two measured runs), and the 1 s period is headroom over
+# nextest's 100 ms default for a loaded host.
+leak-timeout = { period = "1s", result = "fail" }
+
+# These shape the human log only. The gate reads the machine-readable stream
+# and passes `--status-level all` itself, so its retained log names every test
+# while the ambient CI log stays readable.
+status-level = "fail"
+final-status-level = "fail"
+failure-output = "final"
+success-output = "never"
+
+# (a) Host-global observation. These binaries assert that *no* new `orch`
+# process exists anywhere on the host while a client runs, so any concurrent
+# test that starts the `orch` binary fails them:
+#   crates/orch-cli/tests/daemon_admission.rs:33,            via
+#     daemon_support/frontends.rs:379 `assert_only_clients` (unscoped
+#     `new_orch()`),
+#   crates/orch-cli/tests/daemon_lifecycle_nospawn.rs:28     ("the process
+#     table before/after has no new `orch` process", file docs lines 8-10),
+#   crates/orch-cli/tests/daemon_skew_two_binaries.rs:35,187 (`watch
+#     .new_orch().is_empty()`; the file's own comment says the watch "sees
+#     every `orch` process of the binary under test, including another test's
+#     daemon").
+# Under libtest these were serialised only because cargo runs one test binary
+# at a time; nextest needs it said out loud.
+[[profile.default.overrides]]
+filter = 'package(orch-cli) & binary(/^(daemon_admission|daemon_lifecycle_nospawn|daemon_skew_two_binaries)$/)'
+threads-required = "num-test-threads"
+# Exclusive work cannot overlap with anything, so run it first: scheduled late
+# it would drain the whole run once per test. At the start nothing is running
+# yet, so the drain is free.
+priority = 100
+
+# (b) In-binary serialisation only. `crates/orch-cli/tests/
+# daemon_nodaemon_matrix.rs:36` takes a process-wide `SERIAL` mutex for every
+# cell; its process observations are scene-scoped
+# (`assert_only_scene_clients`, `assert_nothing_left`, and the two
+# `new_orch()` uses at lines 576-577 test membership of a known pid), so its
+# own comment states that "independent test binaries can run concurrently".
+# nextest runs each cell in its own process, which neutralises that mutex, so
+# the group restores exactly what it guaranteed: one cell at a time, beside
+# the rest of the workspace.
+[test-groups.orch-cli-scene-matrix]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'package(orch-cli) & binary(daemon_nodaemon_matrix)'
+test-group = 'orch-cli-scene-matrix'
+
+# (c) Host-wide resource: the ephemeral port space. `port()`
+# (crates/orch-cli/tests/remote_peers.rs:700) and `free_loopback_port()`
+# (crates/orch-cli/tests/daemon_support/frontends.rs:472) bind 127.0.0.1:0,
+# take the address and **drop the listener**, and a peer then binds that same
+# address again across a restart; remote_peers.rs:414-425 retries only a
+# confirmed collision, until a deadline. Those are the only two such helpers in
+# the workspace: the other eighteen ephemeral binds keep their listener alive,
+# so they reserve the port instead of releasing it.
+#
+# Under `cargo test` one test binary ran at a time, so an address the kernel had
+# just handed out was almost never taken in between. With a process per test,
+# ~128 of them binding ephemeral ports, another process wins that race and
+# holds the address past the deadline. Observed on 2026-11-24 in qualification
+# run 1: `s23b_sigterm_run_watch_while_offline_keeps_the_remote_run` failed with
+# "Listen on 127.0.0.1:42369: Address already in use (os error 98)".
+#
+# remote_peers is handled by the **pass split** below rather than by
+# exclusivity: 36 of its 42 tests reach `port()`, so a per-test list would be no
+# narrower and would silently miss the next test added, while making the whole
+# binary host-exclusive would serialise all 42 and block the host for the sum of
+# their times. What was green under `cargo test` is "the binary alone, its own
+# tests in parallel", and that is what the two passes reproduce.
+
+# Only one test reaches `free_loopback_port()`, so only that test is exclusive.
+# The rest of the binary keeps its scene-matrix group and runs beside everything
+# else, which is why this is a test-level filter and not a second binary.
+[[profile.default.overrides]]
+filter = 'package(orch-cli) & binary(daemon_nodaemon_matrix) & test(=web_answers_503_when_the_daemon_dies_while_serving_and_starts_nothing)'
+threads-required = "num-test-threads"
+priority = 100
+
+# Pass 2: remote_peers alone, with its own tests in parallel — the condition it
+# was green under when cargo ran one test binary at a time. Its tests then
+# compete only with each other for ephemeral ports.
+[profile.alone]
+inherits = "default"
+default-filter = 'binary(remote_peers)'

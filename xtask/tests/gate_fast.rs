@@ -242,7 +242,8 @@ fn selected_fast_retains_home_shim_and_failure_negatives() {
         assert_eq!(row(&record, failed_step)[1], "FAIL", "{case}: {record}");
         assert_eq!(row(&record, "environment-witness")[1], "pass", "{record}");
         if case == "failure" {
-            assert_eq!(row(&record, "test")[2], "101");
+            // nextest reports a test failure as 100, where libtest used 101.
+            assert_eq!(row(&record, "test")[2], "100");
         }
         assert!(
             Path::new(field(&record, "run-dir"))
