@@ -422,6 +422,7 @@ fn assert_query_wrong_length_is_refused(sort: Sort, width: usize) {
             filter: filter(),
             sort,
             values,
+            bound: task_page::Bound::After,
         };
         let rejected = pool
             .read(deadline(), |tx| {
@@ -580,6 +581,7 @@ fn malformed_decoded_continuation_keeps_read_pool_available() {
         filter: filter(),
         sort: Sort::Id,
         values: vec![Value::Null],
+        bound: task_page::Bound::After,
     };
     let refused = pool
         .read(deadline(), |tx| {
@@ -603,6 +605,117 @@ fn malformed_decoded_continuation_keeps_read_pool_available() {
         .unwrap()
         .unwrap();
     assert_eq!(next.ids, ["a"]);
+}
+
+#[test]
+fn from_keeps_its_own_row_and_past_keys_skips_every_row_of_the_keys() {
+    use rusqlite::types::Value;
+    use task_page::Bound;
+
+    let root = tempfile::tempdir().unwrap();
+    let data = data(&root);
+    let mut db = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&data, &mut db).unwrap();
+    // Priorities, times and statuses that repeat, so that runs of rows tie on
+    // every key but the ID; the position ties too in every second row.
+    for (n, id) in ["h", "b", "g", "a", "f", "c", "e", "d"]
+        .into_iter()
+        .enumerate()
+    {
+        let status = [TaskStatus::Todo, TaskStatus::Done][n % 2];
+        let t = task(id, status, (n % 2) as i64, (n % 3) as i64, None);
+        insert(&db, "p", &t, 1 + (n / 2) as u64);
+    }
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    let page = |limit: usize, sort: Sort, after: Option<Continuation>| {
+        pool.read(deadline(), |tx| {
+            Ok(query(tx, "p", &filter(), &request(sort, limit), after.as_ref()).unwrap())
+        })
+        .unwrap()
+    };
+    let at = |sort: Sort, values: Vec<Value>, bound: Bound| {
+        Continuation::from_decoded_at(
+            "p".into(),
+            filter(),
+            sort,
+            values,
+            bound,
+            "p",
+            &filter(),
+            sort,
+        )
+    };
+    let mut skipped_ties = 0;
+    for sort in SORTS {
+        let everything = page(100, sort, None);
+        let all = everything.ids;
+        assert_eq!(all.len(), 8);
+        // The seek tuple of every row: the page that ends on it holds it in `next`.
+        let tuples = (1..=all.len())
+            .map(|n| page(n, sort, None))
+            .map(|p| (p.next.map(|c| c.seek().to_vec()), p.following))
+            .collect::<Vec<_>>();
+        let width = tuples[0].0.as_ref().unwrap().len();
+        for i in 0..all.len() - 1 {
+            let (last, following) = tuples[i].clone();
+            let (last, following) = (last.unwrap(), following.unwrap());
+            assert_eq!(last, tuples[i].0.clone().unwrap());
+            // After the last row and from the next are the same rows; from the
+            // last row is one more.
+            let from = |values: &[Value]| {
+                page(
+                    100,
+                    sort,
+                    Some(at(sort, values.to_vec(), Bound::From).unwrap()),
+                )
+                .ids
+            };
+            assert_eq!(from(&following), all[i + 1..], "{sort:?} from {i}+1");
+            assert_eq!(from(&last), all[i..], "{sort:?} from {i}");
+            let after = page(
+                100,
+                sort,
+                Some(at(sort, last.clone(), Bound::After).unwrap()),
+            )
+            .ids;
+            assert_eq!(after, all[i + 1..], "{sort:?} after {i}");
+            // Past the keys of the last row: its ties, which follow it, are skipped.
+            let keys = &last[..width - 1];
+            let past = at(sort, keys.to_vec(), Bound::PastKeys);
+            if width == 1 {
+                assert!(matches!(past, Err(StoreError::InvalidCursor)));
+                continue;
+            }
+            let skipped = (i + 1..all.len())
+                .take_while(|j| {
+                    let tuple = tuples[*j - 1].1.as_ref().unwrap();
+                    tuple[..width - 1] == *keys
+                })
+                .count();
+            skipped_ties += skipped;
+            assert_eq!(
+                page(100, sort, Some(past.unwrap())).ids,
+                all[i + 1 + skipped..],
+                "{sort:?} past {i}"
+            );
+        }
+    }
+    assert!(skipped_ties > 0, "some rows tie on every integer key");
+    // A tuple whose shape does not fit its bound is refused.
+    for (values, bound) in [
+        (
+            vec![Value::Integer(0), Value::Text("a".into())],
+            Bound::PastKeys,
+        ),
+        (vec![Value::Integer(0)], Bound::From),
+        (vec![Value::Text("a".into())], Bound::PastKeys),
+        (vec![], Bound::PastKeys),
+    ] {
+        assert!(matches!(
+            at(Sort::Position, values, bound),
+            Err(StoreError::InvalidCursor)
+        ));
+    }
 }
 
 #[tokio::test]
