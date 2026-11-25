@@ -25,6 +25,7 @@ pub mod error;
 pub mod ids;
 pub mod process;
 pub mod remote;
+pub mod scheduler;
 pub mod skills;
 pub mod storage;
 pub mod store;
