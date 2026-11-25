@@ -1,5 +1,32 @@
 # Tiered verification checks — plan
 
+## PR4 nextest adoption — 2026-11-24 (divergence from this plan)
+
+The owner reversed the deferral of 2026-11-17 and adopted cargo-nextest, pinned
+to 0.9.152, as the only suite runner. The decision, the amended bar
+(5 consecutive green runs on one Linux host instead of 20 per platform) and the
+design are [ADR 0022](../decisions/0022-adopt-cargo-nextest.md). Three details of
+this plan's PR 4 sketch below are **not** what was built, and the ADR is the
+record for each:
+
+- doc-tests stay inside the `test` step rather than becoming a tenth step, so
+  the nine step names, the `qualifying` rules and the receipts are unchanged.
+  The step runs `cargo nextest run` once per pass of the split (ADR 0022
+  decision 4b: everything, then the one binary that needs the host to itself
+  with its own tests still in parallel) and `cargo test --doc`, and judges them
+  as one inventory.
+- the executed set comes from nextest's `libtest-json-plus` stream rather than
+  a JUnit report, with the expected set from `cargo nextest list` as the plan
+  says — taken once and unfiltered, with the union of both passes judged
+  against it. The stream is experimental, which is acceptable only because the
+  gate refuses any version but the pin.
+- `--retries 0` and `--no-tests fail` are passed on the command line as the plan
+  asks, and `retries = 0` is also in `.config/nextest.toml`.
+
+The plan's open question — whether nextest applies cargo's `[env]` to the test
+processes it starts — is answered yes, and `xtask/tests/ambient_env.rs` asserts
+it from inside a test process so the answer cannot regress silently.
+
 ## PR3 configured hosted lease amendment — 2026-11-17 (before code)
 
 The lead's approved node J start resolves open item 19(b) for CI: replace the

@@ -643,7 +643,8 @@ pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<()> 
             "missing step {name} log"
         );
     }
-    let rebuilt = inventory::parse(&entries["steps/test.log"], &entries["steps/build.log"], 0)?;
+    let rebuilt =
+        super::nextest::inventory(&entries["steps/test.log"], &entries["steps/build.log"])?;
     ensure!(
         inventory::tsv(&rebuilt) == entries["inventory.tsv"],
         "inventory differs from step logs"
@@ -676,6 +677,21 @@ pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<()> 
             && entries["tools.txt"]
                 .lines()
                 .any(|s| s.starts_with("cargo: cargo "))
+            // The suite ran on the pinned runner, under a named configuration.
+            && entries["tools.txt"]
+                .lines()
+                .any(|s| s.starts_with(&format!(
+                    "cargo-nextest: cargo-nextest {} ",
+                    super::nextest::VERSION
+                )))
+            // The hash is recorded for a reader; what *binds* the isolation
+            // rules to the commit is judge-source-id, checked above, because
+            // `.config/nextest.toml` is one of the judge's source inputs. This
+            // verifier runs against an arbitrary checkout, so comparing the
+            // recorded hash to the working tree would reject a valid bundle.
+            && entries["tools.txt"]
+                .lines()
+                .any(|s| s.strip_prefix("nextest-config: ").is_some_and(|h| h.len() == 40))
             && entries["tools.txt"]
                 .lines()
                 .any(|s| s.starts_with("cargo-deny: cargo-deny ")),
@@ -971,14 +987,53 @@ mod tests {
             entries.insert(format!("steps/{step}.log"), vec![]);
         }
         result.push('\n');
-        let map=serde_json::json!({"reason":"compiler-artifact","package_id":"path+file:///fixture#fixture@0.1.0","profile":{"test":true},"executable":"/fixture/target/test","target":{"kind":["lib"],"name":"fixture"}}).to_string();
-        let log = "Running unittests src/lib.rs (/fixture/target/test)\nrunning 1 test\ntest example ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n";
+        // The build log carries both expected sets: Cargo's compiler artifact
+        // and nextest's listing. The test log is the framed runner stream plus
+        // the doc-test run, exactly as the suite step writes it.
+        let artifact=serde_json::json!({"reason":"compiler-artifact","package_id":"path+file:///fixture#fixture@0.1.0","profile":{"test":true},"executable":"/fixture/target/test","target":{"kind":["lib"],"name":"fixture"}}).to_string();
+        let listing=serde_json::json!({"rust-suites":{"fixture":{"package-name":"fixture","binary-name":"fixture","kind":"lib","status":"listed","testcases":{"example":{"ignored":false,"filter-match":{"status":"matches"}}}}}}).to_string();
+        let map = format!("{artifact}\n{listing}\n");
+        let nextest = |status: &str| {
+            let suite = serde_json::json!({"crate":"fixture","test_binary":"fixture","kind":"lib"});
+            let (passed, failed) = if status == "ok" { (1, 0) } else { (0, 1) };
+            format!(
+                "{}\n{}\n{}\n",
+                serde_json::json!({"type":"suite","event":"started","test_count":1,"nextest":suite}),
+                serde_json::json!({"type":"test","event":status,"name":"fixture::fixture$example","exec_time":0.1}),
+                serde_json::json!({"type":"suite","event":status,"passed":passed,"failed":failed,"ignored":0,"measured":0,"filtered_out":0,"exec_time":0.1,"nextest":suite})
+            )
+        };
+        let doc = "Doc-tests fixture\nrunning 1 test\ntest src/lib.rs - (line 1) ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0s\n";
+        // The fixture suite belongs to the first pass; the second matches
+        // nothing in this one-binary workspace and exits 4, as it does in a
+        // real tier whose package selection leaves its binaries out of scope.
+        let framed = |exit: i32, events: &str| -> Vec<u8> {
+            super::super::nextest::frame(
+                &[
+                    super::super::nextest::Pass {
+                        profile: "default",
+                        exit: Some(exit),
+                        events: events.as_bytes(),
+                        stderr: b"",
+                    },
+                    super::super::nextest::Pass {
+                        profile: "alone",
+                        exit: Some(4),
+                        events: b"",
+                        stderr: b"",
+                    },
+                ],
+                Some(0),
+                doc.as_bytes(),
+            )
+        };
+        let log = framed(0, &nextest("ok"));
+        let good_inventory =
+            b"doc\tfixture\tfixture\tsrc/lib.rs - (line 1)\tok\nlib\tfixture\tfixture\texample\tok\n"
+                .to_vec();
         entries.insert("steps/build.log".into(), map.as_bytes().to_vec());
-        entries.insert("steps/test.log".into(), log.as_bytes().to_vec());
-        entries.insert(
-            "inventory.tsv".into(),
-            b"lib\tfixture\tfixture\texample\tok\n".to_vec(),
-        );
+        entries.insert("steps/test.log".into(), log.clone());
+        entries.insert("inventory.tsv".into(), good_inventory.clone());
         entries.insert(
             "environment.txt".into(),
             super::super::hermetic::SET
@@ -989,8 +1044,12 @@ mod tests {
         );
         entries.insert(
             "tools.txt".into(),
-            b"rustc: rustc 1.99.1\ncargo: cargo 1.99.1\ncargo-deny: cargo-deny synthetic\n"
-                .to_vec(),
+            format!(
+                "rustc: rustc 1.99.1\ncargo: cargo 1.99.1\ncargo-deny: cargo-deny synthetic\ncargo-nextest: cargo-nextest {} (synthetic)\nnextest-config: {}\n",
+                super::super::nextest::VERSION,
+                blob(repo, b"synthetic nextest configuration").unwrap()
+            )
+            .into_bytes(),
         );
         entries.insert("result.txt".into(), result.as_bytes().to_vec());
         let root = Scratch::new();
@@ -1051,15 +1110,11 @@ mod tests {
         // Parser success is not suite success: a structurally valid failed
         // inventory cannot verify even when every success alias is forged green.
         entries.insert("result.txt".into(), result.as_bytes().to_vec());
-        entries.insert(
-            "steps/test.log".into(),
-            log.replace("example ... ok", "example ... FAILED")
-                .replace("ok. 1 passed; 0 failed", "FAILED. 0 passed; 1 failed")
-                .into_bytes(),
-        );
+        entries.insert("steps/test.log".into(), framed(100, &nextest("failed")));
         entries.insert(
             "inventory.tsv".into(),
-            b"lib\tfixture\tfixture\texample\tfailed\n".to_vec(),
+            b"doc\tfixture\tfixture\tsrc/lib.rs - (line 1)\tok\nlib\tfixture\tfixture\texample\tfailed\n"
+                .to_vec(),
         );
         let failed = root.0.join("failed-suite");
         export(repo, &failed, &entries, &redactor).unwrap();
@@ -1067,13 +1122,10 @@ mod tests {
             verify(repo, &failed, &commit)
                 .unwrap_err()
                 .to_string()
-                .contains("process exit")
+                .contains("failed")
         );
-        entries.insert("steps/test.log".into(), log.as_bytes().to_vec());
-        entries.insert(
-            "inventory.tsv".into(),
-            b"lib\tfixture\tfixture\texample\tok\n".to_vec(),
-        );
+        entries.insert("steps/test.log".into(), log.clone());
+        entries.insert("inventory.tsv".into(), good_inventory);
 
         let tools = String::from_utf8(entries["tools.txt"].clone()).unwrap();
         let bounded = format!(

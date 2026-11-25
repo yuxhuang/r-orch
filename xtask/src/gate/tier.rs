@@ -230,6 +230,7 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
                 ("rustc", "rustc", vec!["-Vv"]),
                 ("cargo", "cargo", vec!["-V"]),
                 ("cargo-deny", "cargo-deny", vec!["--version"]),
+                ("cargo-nextest", "cargo-nextest", vec!["--version"]),
             ] {
                 if !h.available(program) {
                     tools.push_str(&format!("{label}: unavailable\n"));
@@ -249,6 +250,16 @@ pub(super) fn run(repo: &Path, args: &GateArgs) -> Result<i32> {
                 && tools
                     .lines()
                     .any(|s| s.starts_with(&format!("cargo: cargo {} ", h.pin)));
+            // The runner's isolation configuration decides which tests may run
+            // beside which, so the evidence names its content, not just its
+            // path. It is already part of the judge's source identity.
+            tools.push_str(&format!(
+                "nextest-config: {}\n",
+                report::blob(
+                    &repo,
+                    &files::read(&repo.join(".config/nextest.toml"), 1024 * 1024)?
+                )?
+            ));
             tools.push_str(&format!(
                 "Cargo.lock: {}\n",
                 report::blob(

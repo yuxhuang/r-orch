@@ -40,6 +40,12 @@ mod judge;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(
     dead_code,
+    reason = "Framing and listing helpers are also exercised by private fixtures"
+)]
+mod nextest;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(
+    dead_code,
     reason = "Private metadata fixture controls retain independent snapshot coverage"
 )]
 mod real_home;
@@ -221,7 +227,7 @@ pub fn run(repo: &Path, args: GateArgs) -> Result<i32> {
             let result = (|| -> Result<()> {
                 let log = files::text(&args.log, inventory::MAX_LOG)?;
                 let map = files::text(&args.executables, inventory::MAX_LOG)?;
-                let rows = inventory::parse(&log, &map, args.exit)?;
+                let rows = inventory::parse(&log, &map, args.exit, inventory::Scope::All)?;
                 let text = inventory::tsv(&rows);
                 if let Some(out) = args.out {
                     files::write(&out, text.as_bytes())?;
@@ -338,6 +344,10 @@ mod tests {
     #[test]
     fn usage_errors_stay_usage_errors() {
         for args in [
+            // There is one runner. The suite step has no runner choice, so
+            // asking for one is a usage error, never a silent fallback.
+            vec!["xtask", "gate", "pr", "--runner", "cargo"],
+            vec!["xtask", "gate", "--runner", "cargo", "pr"],
             vec!["xtask", "gate", "unknown"],
             vec!["xtask", "gate", "inventory"],
             vec!["xtask", "gate", "lease", "exec", "--purpose", "x"],

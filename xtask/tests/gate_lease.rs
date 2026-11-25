@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use witness::fixture::{
     CARGO_SUBCOMMAND_PY, COMMAND_BUDGET, HANDSHAKE_BUDGET, OwnedChild, POLL_INTERVAL, Sandbox,
-    field, wait_for,
+    field, row, wait_for,
 };
 
 const PAYLOAD: &str = r#"#!/usr/bin/python3
@@ -460,6 +460,44 @@ fn replaced_lock_inode_is_lost_and_cannot_qualify() {
     assert!(
         qualifying.starts_with("no") && qualifying.contains("lease"),
         "lost lease not attributed in qualification: {result}"
+    );
+}
+
+/// A fake cargo whose first `build` spawns the parked holder as a **child** and
+/// then exits 0, so the gate's direct child completes while a descendant still
+/// holds the gate's own output pipe. Later invocations exec the real cargo, so
+/// the rest of the suite is real.
+///
+/// This is the vehicle for `steps.rs`'s "capture EOF deadline; descendant may
+/// hold output; target kept", and it is independent of the suite runner: the
+/// gate's build command is the gate's own child whatever runs the tests.
+fn completed_build_with_holder(sandbox: &Sandbox, boundary: &Boundary) {
+    let cargo = sandbox.temporary.join("bin/cargo");
+    let real = sandbox.cargo_forwarder();
+    let once = sandbox.temporary.join("first-build-holder");
+    sandbox.script(
+        &cargo,
+        &format!(
+            r#"#!/usr/bin/python3
+import os, subprocess, sys
+from pathlib import Path
+{parser}
+if cargo_subcommand(sys.argv[1:]) == 'build':
+    try:
+        Path({once:?}).mkdir()
+    except FileExistsError:
+        pass
+    else:
+        subprocess.Popen(['/usr/bin/python3', {payload:?}, 'holder', {socket:?}])
+        sys.exit(0)
+os.execv({real:?}, [{real:?}] + sys.argv[1:])
+"#,
+            parser = CARGO_SUBCOMMAND_PY,
+            once = once.to_str().unwrap(),
+            payload = sandbox.temporary.join("payload.py").to_str().unwrap(),
+            socket = boundary.path.to_str().unwrap(),
+            real = real.to_str().unwrap(),
+        ),
     );
 }
 
@@ -1429,8 +1467,135 @@ sys.exit(out.returncode)
     assert!(field(&record, "contention-sampling").contains("every 15s"));
 }
 
+/// A gate-only TERM while **`cargo nextest run` is the direct child**, with a
+/// test child that ignores TERM.
+///
+/// Measured behaviour this pins (see ADR 0022 Consequences): nextest cancels,
+/// signals each running test's process group and exits 0.207 s after the
+/// signal, well inside the gate's 2 s grace, so the gate never reaches SIGKILL
+/// and never has to. nextest closes its own capture pipes as it goes, so the
+/// gate's output is resolved. A test child that ignores TERM therefore
+/// **survives**, reparented away from the test, and it holds nextest's capture
+/// pipe rather than the gate's — so the gate's "descendant may hold output"
+/// check cannot see it, and because the use *finishes* cleanly the gate even
+/// publishes a record for the target. `cargo test` had to be killed with its
+/// output unresolved, which kept the target; this is the one place where the
+/// adoption makes the standing accepted risk for processes the gate did not
+/// start (AGENTS.md "What no tier proves", ADR 0015 decision 41) easier to
+/// reach rather than harder. ADR 0022 Consequences records it for the owner.
+#[test]
+fn suite_cancellation_finishes_the_use_and_leaves_a_term_ignoring_test_child() {
+    use witness::fixture::rust_literal;
+    let sandbox = Sandbox::new();
+    sandbox.mini("#[test]\nfn sample() {}\n", true);
+    let ready = sandbox.temporary.join("stubborn.pid");
+    let release = sandbox.temporary.join("stubborn.release");
+    sandbox.write(
+        "fixture/src/lib.rs",
+        format!(
+            r#"
+#[test]
+fn stubborn_child_outlives_cancellation() {{
+    std::process::Command::new("/bin/sh")
+        .args(["-c", concat!("trap '' TERM; echo $$ > ", {ready}, "; while [ ! -f ", {release}, " ]; do sleep 0.05; done")])
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(120));
+}}
+"#,
+            ready = rust_literal(&ready),
+            release = rust_literal(&release),
+        ),
+    );
+    let marker = sandbox.root.join("target/.gate-state/warm.use");
+    let mut gate =
+        sandbox.spawn(&mut sandbox.gate(&["pr", "--part", "suite", "--lease-wait", "0"]));
+    wait_for(&ready, COMMAND_BUDGET);
+    let child: u64 = fs::read_to_string(&ready).unwrap().trim().parse().unwrap();
+    gate.signal("TERM");
+    let output = gate.finish(COMMAND_BUDGET);
+    output.code(143);
+    let record = sandbox.result();
+    assert_eq!(field(&record, "verdict"), "INTERRUPTED (part suite)");
+    // THE CHANGE, pinned deliberately. nextest exits cleanly on the gate's
+    // TERM with its pipes closed, so the gate's use *finishes* and a record is
+    // published — where `cargo test` had to be killed with its output
+    // unresolved, which kept the target. A later run therefore trusts a target
+    // whose suite was cancelled. ADR 0022 Consequences records this and flags
+    // it for the owner; it is not a behaviour this test endorses.
+    assert_eq!(field(&record, "target-finished"), "yes", "{record}");
+    assert_eq!(
+        field(&record, "publication"),
+        "record published",
+        "{record}"
+    );
+    // The orphan really outlived the cancellation: nextest signalled its group
+    // once and exited without escalating.
+    let stat = fs::read_to_string(format!("/proc/{child}/stat")).expect("orphan is alive");
+    let fields: Vec<&str> = stat.split_once(") ").unwrap().1.split(' ').collect();
+    assert_ne!(
+        fields[1],
+        std::process::id().to_string(),
+        "the orphan must be reparented away from this test: {stat}"
+    );
+    // And nothing records it: the finished use removed its marker, so the
+    // inherited descriptor no longer holds anything a later run would notice.
+    assert!(
+        !marker.exists(),
+        "a finished use leaves no marker, so the orphan is untracked"
+    );
+    fs::write(&release, "go").unwrap();
+    require_process_gone(&sandbox, child);
+}
+
+/// The gate's direct child completes while a descendant still holds the gate's
+/// output pipe: the target is kept and no record is published.
+///
+/// Measured, so the vehicle is the build phase rather than the suite: a suite
+/// test can no longer reach the gate's pipe at all. nextest captures each
+/// test's output and closes its own pipes on exit (TERM to nextest: process
+/// exit and pipe EOF both at 0.207 s), and `cargo test --doc` *blocks* until a
+/// doctest's leaked child closes its output (child exit and pipe EOF both at
+/// 20.2 s), so neither half of the suite step can produce "child completed,
+/// output unresolved". The gate's own build command still can, for any runner.
 #[test]
 fn completed_direct_command_with_live_output_holder_keeps_target_until_fixture_cleanup() {
+    let sandbox = Sandbox::new();
+    sandbox.mini("#[test]\nfn sample() {}\n", true);
+    let boundary = Boundary::new(&sandbox);
+    completed_build_with_holder(&sandbox, &boundary);
+    let mut gate =
+        sandbox.spawn(&mut sandbox.gate(&["pr", "--part", "suite", "--lease-wait", "0"]));
+    let mut leaf = boundary.accept(&mut gate);
+    leaf.alive();
+    let output = gate.finish(Duration::from_secs(60));
+    // Still live after the gate returned. The fixture releases its own child by
+    // protocol, observes process absence, then removes scratch.
+    leaf.alive();
+    leaf.release();
+    require_process_gone(&sandbox, leaf.ready["pid"].as_u64().unwrap());
+    output.code(1);
+    let record = sandbox.result();
+    assert!(field(&record, "target").starts_with("kept ("), "{record}");
+    assert_eq!(field(&record, "target-finished"), "no");
+    assert!(sandbox.root.join("target/.gate-state/warm.use").exists());
+    assert!(!sandbox.root.join("target/.gate-state/warm.record").exists());
+    let commands =
+        fs::read_to_string(Path::new(field(&record, "run-dir")).join("commands.txt")).unwrap();
+    assert!(
+        commands.contains("reaped-exit=0"),
+        "no actual completed cargo status: {commands}"
+    );
+}
+
+/// A suite test that leaves a process holding its output behind. nextest
+/// captures each test's output, so the leak never reaches the gate; what it
+/// does instead is fail the test that caused it
+/// (`leak-timeout = { result = "fail" }`). The kept-target path that such a
+/// test used to exercise is covered by the test above, on the gate's own build
+/// command.
+#[test]
+fn a_suite_test_that_leaks_an_output_holder_fails_the_suite_and_names_it() {
     use witness::fixture::rust_literal;
     let sandbox = Sandbox::new();
     sandbox.mini("#[test]\nfn sample() {}\n", true);
@@ -1454,23 +1619,30 @@ fn leaves_an_explicitly_controlled_output_holder() {{
         sandbox.spawn(&mut sandbox.gate(&["pr", "--part", "suite", "--lease-wait", "0"]));
     let mut leaf = boundary.accept(&mut gate);
     leaf.alive();
-    let output = gate.finish(Duration::from_secs(10));
-    // It really is still live after the gate returned. The fixture releases
-    // its own child by protocol, observes process absence, then removes scratch.
+    let output = gate.finish(Duration::from_secs(60));
+    // It really is still live after the gate returned: nextest stopped waiting
+    // for the pipe, it did not kill anything. The fixture releases its own
+    // child by protocol, observes process absence, then removes scratch.
     leaf.alive();
     leaf.release();
     require_process_gone(&sandbox, leaf.ready["pid"].as_u64().unwrap());
     output.code(1);
     let record = sandbox.result();
-    assert!(field(&record, "target").starts_with("kept ("), "{record}");
-    assert_eq!(field(&record, "target-finished"), "no");
-    assert!(sandbox.root.join("target/.gate-state/warm.use").exists());
-    assert!(!sandbox.root.join("target/.gate-state/warm.record").exists());
+    assert_eq!(row(&record, "test")[1], "FAIL", "{record}");
+    let inventory =
+        fs::read_to_string(Path::new(field(&record, "run-dir")).join("inventory.tsv")).unwrap();
+    assert!(
+        inventory.contains("leaves_an_explicitly_controlled_output_holder\tfailed"),
+        "the leaking test must be named: {inventory}"
+    );
+    // The gate's own lifecycle is clean: nothing of its output was unresolved.
+    assert_eq!(field(&record, "target-finished"), "yes");
+    assert!(!sandbox.root.join("target/.gate-state/warm.use").exists());
     let commands =
         fs::read_to_string(Path::new(field(&record, "run-dir")).join("commands.txt")).unwrap();
     assert!(
-        commands.contains("reaped-exit=0"),
-        "no actual completed cargo status: {commands}"
+        commands.contains("exit=100"),
+        "no actual completed runner status: {commands}"
     );
 }
 
@@ -1570,18 +1742,24 @@ fn interrupted_output_holder(tier: &str) {
     sandbox.mini("#[test]\nfn sample() {}\n", true);
     let boundary = Boundary::new(&sandbox);
     let waited = sandbox.temporary.join("worker.waited");
+    // A doc-test, for the reason given in the completed-holder test above:
+    // only `cargo test --doc` still hands the gate's own pipe to what the
+    // suite starts.
     sandbox.write(
         "fixture/src/lib.rs",
         format!(
             r#"
 #[test]
-fn controlled_output_holder() {{
-    let mut child = std::process::Command::new("/usr/bin/python3")
-        .args([{payload}, "holder", {socket}]).spawn().unwrap();
-    let status = child.wait().unwrap();
-    std::fs::write({waited}, format!("{{:?}}", status.code())).unwrap();
-    assert!(status.success());
-}}
+fn sample() {{}}
+
+/// ```
+/// let mut child = std::process::Command::new("/usr/bin/python3")
+///     .args([{payload}, "holder", {socket}]).spawn().unwrap();
+/// let status = child.wait().unwrap();
+/// std::fs::write({waited}, format!("{{:?}}", status.code())).unwrap();
+/// assert!(status.success());
+/// ```
+pub fn controlled_output_holder() {{}}
 "#,
             payload = rust_literal(&sandbox.temporary.join("payload.py")),
             socket = rust_literal(&boundary.path),

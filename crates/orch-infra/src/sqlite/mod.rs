@@ -176,3 +176,9 @@ mod task_sql;
     reason = "internal retry mapping awaits the combined T10 Storage adapter"
 )]
 mod retry_message;
+
+#[allow(
+    dead_code,
+    reason = "private Task list awaits Storage composition and the public cursor wiring"
+)]
+mod task_adapter;

@@ -28,6 +28,10 @@ pub(super) const INPUTS: &[&str] = &[
     "Cargo.lock",
     "rust-toolchain.toml",
     ".cargo/config.toml",
+    // Not a compile input: it decides which tests may run beside which, so an
+    // edit to it during a run must invalidate the run exactly as one to the
+    // judge's own sources does.
+    ".config/nextest.toml",
 ];
 fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let output = Command::new("git")

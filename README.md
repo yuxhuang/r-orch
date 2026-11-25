@@ -854,18 +854,29 @@ cooperative host-wide lease under `/tmp`; a busy lease exits 75 and runs nothing
 What is and is not true today:
 
 - **Implemented:** the three tiers, change-based selection, the folded suite, the lease, and the CI jobs `changes`,
-  `check`, `test` and, on `main` only, `ambient` (the ordinary `cargo test --workspace`).
+  `check`, `test` and, on `main` only, `ambient` (the ordinary workspace run: both `cargo nextest run` passes plus
+  the doc-tests).
 - **Approved policy, not enforced by code:** one green Linux CI execution at the PR's final head is the merge evidence,
   and `full` runs once per goal or release rather than per PR. The pre-PR check in
   [AGENTS.md](AGENTS.md#pre-pr-check) still applies.
 - **Not yet in force:** the owner's change to the GitHub ruleset. Both `check` and `test` remain required on `main` and
   `release/**` until the owner applies and verifies it. A documentation-only PR skips its `test` job by condition,
   which satisfies the requirement.
-- **Deferred:** PR 4 and `cargo-nextest`. The owner deferred them on 2026-11-17 after the tool's dependency audit found
-  23 advisories and 10 licence items outside the repository's allow-list. Test binaries run sequentially in every tier;
-  the 20-run qualification on each platform and the at-least-2x nextest speedup were not delivered, and no exception is
-  authorized.
-- **Not claimed:** no tier's wall time has been measured against its target.
+- **The test runner is `cargo-nextest`, pinned to 0.9.152.** The owner adopted it on 2026-11-24, reversing the
+  deferral of 2026-11-17 ([ADR 0022](docs/decisions/0022-adopt-cargo-nextest.md)). Install it with
+  `cargo install cargo-nextest --locked --version 0.9.152`; a missing or different version fails the gate closed with
+  that line. It is the only suite runner, and the rollback is to revert that change. Tests that need isolation are
+  named in `.config/nextest.toml` and a guard test keeps that list honest; no test was split, renamed or skipped for
+  the runner, and retries stay off. The suite runs as **two passes** — everything, then the one binary that needs the
+  host to itself with its own tests still in parallel — split by that same file, with the inventory judged over the
+  union of both against one unfiltered listing, so neither pass can lose or double a test.
+- **Not claimed:** no tier's wall time has been measured against its target, and no timing has been measured for the
+  runner configuration as it ships — the figures in [ADR 0022](docs/decisions/0022-adopt-cargo-nextest.md) come from
+  a prototype that made more binaries exclusive than this does, and that record's ~335 s figure for the two passes is
+  an **estimate** composed from those samples, not a run. The owner's bar is 5 consecutive green runs on the
+  Linux development host, which replaces decision 24's 20 runs per platform, and no speedup on a GitHub-hosted
+  runner is claimed; and the tool's dependency audit (23 advisories, 10 licence items in nextest's own
+  tree, outside `Cargo.lock` and so outside `cargo deny`) is not resolved by the adoption.
 
 CI's suite step uploads a verified, redacted **diagnostic receipt**. It records what a suite run did; it is not a full
 qualifying gate bundle.
