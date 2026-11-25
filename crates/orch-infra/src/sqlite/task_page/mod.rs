@@ -21,6 +21,18 @@ pub(crate) enum Error {
     Sql(#[from] rusqlite::Error),
 }
 
+/// Where a continuation's tuple stands in the order of the rows it seeks past.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bound {
+    /// The rows after the tuple: the last row of a page.
+    After,
+    /// The tuple and the rows after it: a row known to follow the last one.
+    From,
+    /// The rows whose integer keys come after the tuple's, which holds no ID: a
+    /// walk that ended on the last row of its keys and goes on at the next.
+    PastKeys,
+}
+
 /// Trusted internal continuation, never a public token. Contains only the
 /// seek tuple and its query binding, no snapshot or row offset.
 #[derive(Debug, Clone)]
@@ -29,6 +41,7 @@ pub(crate) struct Continuation {
     filter: Filter,
     sort: Sort,
     values: Vec<Value>,
+    bound: Bound,
 }
 
 impl Continuation {
@@ -44,11 +57,40 @@ impl Continuation {
         filter: &Filter,
         sort: Sort,
     ) -> Result<Self, StoreError> {
+        Self::from_decoded_at(
+            decoded_project,
+            decoded_filter,
+            decoded_sort,
+            values,
+            Bound::After,
+            project,
+            filter,
+            sort,
+        )
+    }
+
+    /// [`from_decoded`](Self::from_decoded) for a tuple that stands at `bound`.
+    /// `PastKeys` holds the integer keys alone.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the decoded query and the requested one, side by side, as `from_decoded` has them"
+    )]
+    pub(crate) fn from_decoded_at(
+        decoded_project: String,
+        decoded_filter: Filter,
+        decoded_sort: Sort,
+        values: Vec<Value>,
+        bound: Bound,
+        project: &str,
+        filter: &Filter,
+        sort: Sort,
+    ) -> Result<Self, StoreError> {
         validate_continuation(
             &decoded_project,
             &decoded_filter,
             decoded_sort,
             &values,
+            bound,
             project,
             filter,
             sort,
@@ -58,15 +100,21 @@ impl Continuation {
             filter: decoded_filter,
             sort: decoded_sort,
             values,
+            bound,
         })
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the decoded query and the requested one, side by side, as `from_decoded` has them"
+)]
 fn validate_continuation(
     decoded_project: &str,
     decoded_filter: &Filter,
     decoded_sort: Sort,
     values: &[Value],
+    bound: Bound,
     project: &str,
     filter: &Filter,
     sort: Sort,
@@ -81,12 +129,16 @@ fn validate_continuation(
     let keys = sort_keys(sort).map_err(|_| StoreError::InvalidCursor)?;
     // Every supported sort ends in a text ID; preceding keys are integer
     // columns or the computed integer status rank. Check arity before
-    // inspecting or indexing values.
-    if values.len() != keys.len()
-        || !matches!(values.last(), Some(Value::Text(_)))
-        || !values[..values.len() - 1]
-            .iter()
-            .all(|value| matches!(value, Value::Integer(_)))
+    // inspecting or indexing values. Past its integer keys alone a sort with
+    // none has nothing left to seek.
+    let (ints, id) = match bound {
+        Bound::After | Bound::From => (values.split_last().map_or(&[][..], |(_, k)| k), true),
+        Bound::PastKeys if keys.len() > 1 => (values, false),
+        Bound::PastKeys => return Err(StoreError::InvalidCursor),
+    };
+    if values.len() != keys.len() - usize::from(!id)
+        || (id && !matches!(values.last(), Some(Value::Text(_))))
+        || !ints.iter().all(|value| matches!(value, Value::Integer(_)))
     {
         return Err(StoreError::InvalidCursor);
     }
@@ -120,6 +172,9 @@ pub(crate) fn validate_request(filter: &Filter, request: &PageRequest) -> Result
 pub(crate) struct TaskIdPage {
     pub(crate) ids: Vec<String>,
     pub(crate) next: Option<Continuation>,
+    /// The seek tuple of the row that the next page begins with: the tuple of
+    /// the first row `next` leaves out. Present with `next`.
+    pub(crate) following: Option<Vec<Value>>,
     pub(crate) total: Option<u64>,
 }
 
@@ -228,6 +283,7 @@ pub(crate) fn query(
             &after.filter,
             after.sort,
             &after.values,
+            after.bound,
             project,
             filter,
             request.sort,
@@ -256,16 +312,24 @@ pub(crate) fn query(
         // Lexicographic seek with per-component direction. Repeating bounded
         // parameters avoids numeric negation (which would overflow i64::MIN).
         let mut terms = Vec::new();
-        for (i, (column, descending)) in keys.iter().enumerate() {
+        // Past the keys alone, the ID is not compared.
+        let width = keys.len() - usize::from(after.bound == Bound::PastKeys);
+        for (i, (column, descending)) in keys.iter().enumerate().take(width) {
             let mut parts = Vec::new();
             for (j, (equal_column, _)) in keys.iter().enumerate().take(i) {
                 parts.push(format!("{equal_column} = ?"));
                 args.push(after.values[j].clone());
             }
-            parts.push(format!(
-                "{column} {} ?",
-                if *descending { "<" } else { ">" }
-            ));
+            // The ID is the last key and ascends: `From` keeps its own row.
+            let operator = match (
+                *descending,
+                after.bound == Bound::From && i + 1 == keys.len(),
+            ) {
+                (true, _) => "<",
+                (false, true) => ">=",
+                (false, false) => ">",
+            };
+            parts.push(format!("{column} {operator} ?"));
             args.push(after.values[i].clone());
             terms.push(format!("({})", parts.join(" AND ")));
         }
@@ -289,6 +353,10 @@ pub(crate) fn query(
     })?;
     let mut rows = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     let more = rows.len() > request.limit;
+    let following = rows
+        .get(request.limit)
+        .filter(|_| more)
+        .map(|(_, values)| values.clone());
     rows.truncate(request.limit);
     let next = if more {
         rows.last().map(|(_, values)| Continuation {
@@ -296,6 +364,7 @@ pub(crate) fn query(
             filter: filter.clone(),
             sort: request.sort,
             values: values.clone(),
+            bound: Bound::After,
         })
     } else {
         None
@@ -303,6 +372,7 @@ pub(crate) fn query(
     Ok(TaskIdPage {
         ids: rows.into_iter().map(|(id, _)| id).collect(),
         next,
+        following,
         total,
     })
 }

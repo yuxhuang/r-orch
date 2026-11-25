@@ -431,13 +431,14 @@ fn tokens_are_bound_to_filter_sort_project_generation_and_lifetime() {
 
         // One that outlives any token the generation could have issued.
         let cursors = TaskCursors::new("generation-1");
-        let next = task_page_continuation(fx, &bound, Sort::Priority);
+        let (next, following) = task_page_continuation(fx, &bound, Sort::Priority);
         let future = cursors
             .issue(
                 "p",
                 &bound,
                 Sort::Priority,
                 &next,
+                &following,
                 fx.clock.now_ms() + 2 * TTL_MS,
             )
             .unwrap();
@@ -453,13 +454,11 @@ fn task_page_continuation(
     fx: &Fixture<'_>,
     filter: &Filter,
     sort: Sort,
-) -> task_page::Continuation {
+) -> (task_page::Continuation, Vec<rusqlite::types::Value>) {
     fx.pool
         .read(Instant::now() + Duration::from_secs(15), |tx| {
-            Ok(task_page::query(tx, "p", filter, &request(sort, 2), None)
-                .unwrap()
-                .next
-                .unwrap())
+            let page = task_page::query(tx, "p", filter, &request(sort, 2), None).unwrap();
+            Ok((page.next.unwrap(), page.following.unwrap()))
         })
         .unwrap()
 }
@@ -900,8 +899,8 @@ fn a_walk_with_a_page_size_of_one_crosses_consecutive_ids_of_the_longest_length(
     });
 }
 
-/// A token for a page that ends on a row of 65,536 bytes, and the offset in
-/// its raw bytes where the reference begins.
+/// The raw bytes of a reference token for a page that ends on a row of 65,536
+/// bytes, and the offset in them where the reference begins.
 fn reference_token(fx: &Fixture<'_>) -> (Vec<u8>, usize) {
     let shared = "q".repeat(65_535);
     fx.seed(vec![
@@ -916,9 +915,15 @@ fn reference_token(fx: &Fixture<'_>) -> (Vec<u8>, usize) {
         .unwrap();
     let good = raw(&token);
     assert_eq!(good[0], 2);
-    // Sort::Id has no integer key: the header, then length, digest, prefix.
+    // Sort::Id has no integer key: the header, then the reference.
     (good, 26)
 }
+
+/// The fallback of a reference token starts 20 bytes in, after its length and
+/// digest; of a `Successor` the next 20 bytes are the next row's; the prefix
+/// follows.
+const KIND: usize = 20;
+const SUCCESSOR_PREFIX: usize = KIND + 1 + 20;
 
 #[test]
 fn a_reference_that_issue_could_not_have_written_is_refused() {
@@ -926,14 +931,19 @@ fn a_reference_that_issue_could_not_have_written_is_refused() {
         let (good, at) = reference_token(fx);
         let sort = Sort::Id;
         let try_raw = |bytes: &[u8]| fx.list(&filter(), &resumed(&cursor(hex(bytes)), sort));
+        let shared = "q".repeat(65_535);
+        let rest = [format!("{shared}b"), format!("{shared}c")];
         let page = try_raw(&good).unwrap();
         // Resumed after the first row, not at it.
-        assert_eq!(page.items.len(), 2);
-        let shared = "q".repeat(65_535);
-        assert_eq!(Fixture::ids(&page)[0], format!("{shared}b"));
-        // The length: one more, one fewer, one that would have fit whole, and
-        // one past the 65,536-byte limit.
-        for length in [65_537u32, 65_535, 230, 0] {
+        assert_eq!(Fixture::ids(&page), rest);
+        assert_eq!(
+            good[at + KIND],
+            2,
+            "the keys tie and the IDs share 65,535 bytes"
+        );
+        // The length: one that would have fit whole, and none at all, are not
+        // references that `issue` writes.
+        for length in [230u32, 0] {
             let mut bad = good.clone();
             bad[at..at + 4].copy_from_slice(&length.to_be_bytes());
             invalid_cursor(try_raw(&bad));
@@ -945,29 +955,55 @@ fn a_reference_that_issue_could_not_have_written_is_refused() {
         let mut forged = good[..at].to_vec();
         forged.extend((fitting.len() as u32).to_be_bytes());
         forged.extend(&Sha256::digest(fitting.as_bytes())[..16]);
-        forged.extend(&fitting.as_bytes()[..good.len() - at - 20]);
+        forged.extend(&good[at + KIND..at + SUCCESSOR_PREFIX]);
+        forged.extend(&fitting.as_bytes()[..good.len() - at - SUCCESSOR_PREFIX]);
         invalid_cursor(try_raw(&forged));
         // The same forgery in the form `issue` does write resumes.
         let mut whole = good[..at].to_vec();
         whole[0] = 1;
         whole.extend(fitting.as_bytes());
         try_raw(&whole).unwrap();
-        // Any digest byte, and any prefix byte that makes it another prefix.
-        for index in [at + 4, at + 19, at + 20, good.len() - 1] {
+        // A length or digest that names no row is a row that is gone: the walk
+        // goes on at its fallback, the next row, which is where it was.
+        for index in [at + 2, at + 3, at + 4, at + 19] {
+            let mut bad = good.clone();
+            bad[index] ^= 1;
+            assert_eq!(Fixture::ids(&try_raw(&bad).unwrap()), rest, "{index}");
+        }
+        // What the fallback names matters only once the row is gone.
+        for index in [at + KIND + 4, at + KIND + 20] {
+            let mut bad = good.clone();
+            bad[index] ^= 1;
+            assert_eq!(Fixture::ids(&try_raw(&bad).unwrap()), rest, "{index}");
+            let mut gone = bad.clone();
+            gone[at + 4] ^= 1;
+            invalid_cursor(try_raw(&gone));
+        }
+        // A prefix byte that makes it another prefix finds neither row; one that
+        // ends before the next 20 bytes of the fallback, or is cut off, or is
+        // not UTF-8, or a kind that is none of the three, is no reference.
+        for index in [at + SUCCESSOR_PREFIX, good.len() - 1] {
             let mut bad = good.clone();
             bad[index] ^= 1;
             invalid_cursor(try_raw(&bad));
         }
-        // A prefix that is too short (it would widen the lookup), however little
-        // too short (one position has one token), one that is not UTF-8, and a
-        // reference cut short.
-        for short in 1..=4 {
-            invalid_cursor(try_raw(&good[..good.len() - short]));
+        let mut kind = good.clone();
+        kind[at + KIND] = 3;
+        invalid_cursor(try_raw(&kind));
+        // A prefix a few bytes short still names the rows: one more byte of it
+        // than `issue` could leave out, and it is not a prefix that fits.
+        for short in 1..=3 {
+            assert_eq!(
+                Fixture::ids(&try_raw(&good[..good.len() - short]).unwrap()),
+                rest
+            );
         }
+        invalid_cursor(try_raw(&good[..good.len() - 4]));
         let mut not_utf8 = good.clone();
         *not_utf8.last_mut().unwrap() = 0xff;
         invalid_cursor(try_raw(&not_utf8));
         invalid_cursor(try_raw(&good[..at + 19]));
+        invalid_cursor(try_raw(&good[..at + KIND + 10]));
         // Neither the failures nor the lookups latch the pool.
         try_raw(&good).unwrap();
         fx.state.ensure_available().unwrap();
@@ -975,7 +1011,7 @@ fn a_reference_that_issue_could_not_have_written_is_refused() {
 }
 
 #[test]
-fn a_reference_to_a_deleted_row_is_refused_and_one_to_an_updated_row_resumes() {
+fn a_reference_to_a_deleted_or_updated_row_resumes() {
     scenario(1, |fx| {
         let tall = |tag: &str| format!("{}{tag}", "w".repeat(400));
         fx.seed(vec![
@@ -1016,10 +1052,300 @@ fn a_reference_to_a_deleted_row_is_refused_and_one_to_an_updated_row_resumes() {
             .unwrap();
         let Record { revision, .. } = head(fx);
         fx.write(move |w| w.delete(&tall("1"), revision)).unwrap();
-        invalid_cursor(fx.list(&filter(), &resumed(&token, Sort::Id)));
-        // It is a refusal of that token only.
+        // Deleted, the row it ends on is not found: the walk goes on at the next row
+        // (issue 277), exactly once.
+        let rest = fx.list(&filter(), &resumed(&token, Sort::Id)).unwrap();
+        assert_eq!(Fixture::ids(&rest), [tall("2"), tall("3")]);
+        assert!(rest.next_cursor.is_none());
         let again = fx.list(&filter(), &request(Sort::Id, 5)).unwrap();
         assert_eq!(Fixture::ids(&again), [tall("2"), tall("3")]);
+        fx.state.ensure_available().unwrap();
+    });
+}
+
+/// IDs for walks that delete the row each page ends on. Every one is long, or
+/// is the short neighbour of a long one, and the long ones first differ at
+/// every distance from the start, below and above where any sort cuts its
+/// prefix: before it (a separator fits), after it (only the next row's reference
+/// can tell them apart), in the middle of a multi-byte character, and where one
+/// ID is a prefix of the next. Three of them are the longest stored ID and its
+/// neighbours.
+fn anchor_dataset() -> Vec<String> {
+    let mut ids = vec!["a".to_owned(), "t-short".to_owned(), "r".repeat(150)];
+    for (n, k) in [5, 100, 150, 160, 170, 178, 184, 190, 250, 399]
+        .into_iter()
+        .enumerate()
+    {
+        let letter = char::from(b'd' + n as u8);
+        let stem = letter.to_string().repeat(k);
+        for tail in ["a", "b", "c"] {
+            ids.push(format!("{stem}{tail}{}", "x".repeat(400 - k)));
+        }
+    }
+    let shared = "s".repeat(400);
+    for tail in ["1", "2", "3"] {
+        ids.push(format!("{shared}{tail}"));
+    }
+    // One ID is a prefix of the next two.
+    let stem = "u".repeat(210);
+    ids.push(stem.clone());
+    ids.push(format!("{stem}{}", "x".repeat(190)));
+    ids.push(format!("{stem}{}", "y".repeat(190)));
+    // Neighbours that share the first bytes of a character and not its last.
+    for (a, b) in [('\u{20AC}', '\u{20AD}'), ('\u{1D11E}', '\u{1D11F}')] {
+        let stem = "\u{20AA}".repeat(100);
+        ids.push(format!("{stem}{a}{}", "z".repeat(50)));
+        ids.push(format!("{stem}{b}{}", "z".repeat(50)));
+    }
+    let longest = "q".repeat(65_535);
+    for tail in ["a", "b", "c"] {
+        ids.push(format!("{longest}{tail}"));
+    }
+    ids
+}
+
+/// Walk to the end with `limit`, deleting after each page the row it ends on,
+/// or with `whole` every row of it, before the next page is read.
+fn walk_deleting(fx: &Fixture<'_>, sort: Sort, limit: usize, whole: bool) -> Vec<String> {
+    let mut request = request(sort, limit);
+    let mut got = Vec::new();
+    loop {
+        let page = fx.list(&filter(), &request).unwrap();
+        got.extend(Fixture::ids(&page));
+        let doomed = if whole {
+            page.items.clone()
+        } else {
+            page.items.last().cloned().into_iter().collect()
+        };
+        for record in doomed {
+            let (id, revision) = (record.entity.id().to_owned(), record.revision);
+            fx.write(move |w| w.delete(&id, revision)).unwrap();
+        }
+        request.cursor = page.next_cursor;
+        if request.cursor.is_none() {
+            return got;
+        }
+        assert!(got.len() < 10_000, "the walk does not terminate");
+    }
+}
+
+#[test]
+fn a_walk_returns_every_row_once_when_the_row_each_page_ends_on_is_deleted() {
+    let ids = anchor_dataset();
+    {
+        let mut all = ids.clone();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), ids.len(), "the dataset's IDs are distinct");
+    }
+    for sort in SORTS {
+        for tied in [false, true] {
+            for (limit, whole) in [(1, false), (2, false), (3, true)] {
+                scenario(1, |fx| {
+                    fx.seed(long_id_tasks(&ids, tied));
+                    if tied {
+                        // Equal on every key, the position included.
+                        submit(fx.handle, |tx| {
+                            tx.execute("UPDATE tasks SET position = 7", [])?;
+                            Ok(())
+                        })
+                        .unwrap();
+                    }
+                    let all = fx.list(&filter(), &request(sort, 1000)).unwrap();
+                    let want = expected_order(&all.items, sort);
+                    let got = walk_deleting(fx, sort, limit, whole);
+                    assert_eq!(
+                        got, want,
+                        "{sort:?} tied={tied} limit {limit} whole={whole}"
+                    );
+                    fx.state.ensure_available().unwrap();
+                });
+            }
+        }
+    }
+}
+
+/// Which fallback a reference token names: after the header, the integer keys
+/// of `sort`, and the length and digest of the ID.
+fn fallback_kind(token: &Cursor, sort: Sort) -> u8 {
+    let keys = match sort {
+        Sort::Id => 0,
+        Sort::Position => 1,
+        Sort::Priority | Sort::CreatedAt | Sort::UpdatedAt => 2,
+        _ => 3,
+    };
+    raw(token)[26 + keys * 8 + 20]
+}
+
+fn delete_rows(fx: &Fixture<'_>, ids: &[&str]) {
+    let all = fx.list(&filter(), &request(Sort::Id, 1000)).unwrap();
+    for id in ids {
+        let revision = all
+            .items
+            .iter()
+            .find(|r| r.entity.id() == *id)
+            .map(|r| r.revision)
+            .expect("the row to delete exists");
+        let id = (*id).to_owned();
+        fx.write(move |w| w.delete(&id, revision)).unwrap();
+    }
+}
+
+#[test]
+fn a_deleted_row_is_resumed_at_the_shortest_fallback_and_without_one_it_is_refused() {
+    scenario(1, |fx| {
+        let near = |tag: &str| format!("{}{tag}{}", "v".repeat(100), "x".repeat(300));
+        let far = |tag: &str| format!("{}{tag}", "w".repeat(400));
+        let ids = [
+            near("a"),
+            near("b"),
+            near("c"),
+            far("1"),
+            far("2"),
+            far("3"),
+        ];
+        fx.seed(
+            ids.iter()
+                .enumerate()
+                .map(|(i, id)| task(id, TaskStatus::Todo, i as i64, 1, None))
+                .collect(),
+        );
+        let token_after = |sort: Sort, id: &str| {
+            let mut request = request(sort, 1);
+            loop {
+                let page = fx.list(&filter(), &request).unwrap();
+                if Fixture::ids(&page) == [id] {
+                    return page.next_cursor.unwrap();
+                }
+                request.cursor = Some(page.next_cursor.expect("the walk reaches the row"));
+            }
+        };
+        let resumed_ids = |token: &Cursor, sort: Sort| {
+            let rest = PageRequest {
+                cursor: Some(token.clone()),
+                ..request(sort, 100)
+            };
+            Fixture::ids(&fx.list(&filter(), &rest).unwrap())
+        };
+        let from = |ids: &[String]| ids.to_vec();
+
+        // The keys tie and the IDs part at byte 100, within what the token
+        // carries of the first: the next row's own bytes up to there are the
+        // fallback, and the row after it is found without the next row.
+        let token = token_after(Sort::Id, &near("a"));
+        assert_eq!(fallback_kind(&token, Sort::Id), 1);
+        delete_rows(fx, &[&near("a"), &near("b")]);
+        assert_eq!(resumed_ids(&token, Sort::Id), from(&ids[2..]));
+        // Parting at byte 0 is the same fallback.
+        let token = token_after(Sort::Id, &near("c"));
+        assert_eq!(fallback_kind(&token, Sort::Id), 1);
+        delete_rows(fx, &[&near("c")]);
+        assert_eq!(resumed_ids(&token, Sort::Id), from(&ids[3..]));
+
+        // The keys tie and the IDs part at byte 400: past the prefix. The next
+        // row is the fallback.
+        let token = token_after(Sort::Id, &far("1"));
+        assert_eq!(fallback_kind(&token, Sort::Id), 2);
+        delete_rows(fx, &[&far("1")]);
+        assert_eq!(resumed_ids(&token, Sort::Id), from(&ids[4..]));
+        // Both gone, no surviving row says where the first was among the rows that
+        // share its prefix. The token is refused, not resumed at a guess, and
+        // nothing else is the worse for it.
+        delete_rows(fx, &[&far("2")]);
+        invalid_cursor(fx.list(&filter(), &resumed(&token, Sort::Id)));
+        assert_eq!(
+            Fixture::ids(&fx.list(&filter(), &request(Sort::Id, 9)).unwrap()),
+            from(&ids[5..])
+        );
+        fx.state.ensure_available().unwrap();
+    });
+    // Another key is the next row's, whatever the IDs: nothing of the ID is
+    // needed, and the next row may go too.
+    scenario(1, |fx| {
+        let far = |tag: &str| format!("{}{tag}", "w".repeat(400));
+        fx.seed(vec![
+            task(&far("1"), TaskStatus::Todo, 1, 1, None),
+            task(&far("2"), TaskStatus::Todo, 2, 1, None),
+            task(&far("3"), TaskStatus::Todo, 3, 1, None),
+        ]);
+        let first = fx.list(&filter(), &request(Sort::Priority, 1)).unwrap();
+        let token = first.next_cursor.unwrap();
+        assert_eq!(fallback_kind(&token, Sort::Priority), 0);
+        delete_rows(fx, &[&far("1"), &far("2")]);
+        let rest = fx
+            .list(&filter(), &resumed(&token, Sort::Priority))
+            .unwrap();
+        assert_eq!(Fixture::ids(&rest), [far("3")]);
+        assert!(rest.next_cursor.is_none());
+        // Past the keys of the row that is gone, not past the row: the same token
+        // for the other sorts is refused as for any other sort.
+        invalid_cursor(fx.list(&filter(), &resumed(&token, Sort::Id)));
+        fx.state.ensure_available().unwrap();
+    });
+}
+
+/// A `From` that `issue` could not have written is refused before any row is
+/// looked up: not once the row is found to be gone, and not after it is found.
+/// Its tail is the rest of one character, and the prefix is what the room leaves
+/// after it, so a longer tail could only spend the prefix, and a scan with it,
+/// on nothing (a tail of 206 bytes leaves none for the sort by ID).
+#[test]
+fn a_from_fallback_that_issue_could_not_have_written_is_refused_before_any_lookup() {
+    scenario(1, |fx| {
+        let near = |tag: &str| format!("{}{tag}{}", "v".repeat(100), "x".repeat(300));
+        let ids = [near("a"), near("b")];
+        fx.seed(
+            ids.iter()
+                .map(|id| task(id, TaskStatus::Todo, 1, 1, None))
+                .collect(),
+        );
+        let sort = Sort::Id;
+        let token = fx.list(&filter(), &request(sort, 1)).unwrap().next_cursor;
+        let good = raw(&token.unwrap());
+        // After the header, the length and digest, then the fallback: the kind,
+        // `k`, the tail's length, the tail and the prefix.
+        let at = 26 + KIND;
+        assert_eq!(good[at], 1, "the IDs part at byte 100: a `From`");
+        let tail_len = usize::from(good[at + 3]);
+        assert_eq!(tail_len, 1);
+        let (tail, prefix) = good[at + 4..].split_at(tail_len);
+        let forge = |k: u16, tail: &[u8], prefix: &[u8]| {
+            let mut bytes = good[..at].to_vec();
+            bytes.push(1);
+            bytes.extend(k.to_be_bytes());
+            bytes.push(tail.len() as u8);
+            bytes.extend(tail);
+            bytes.extend(prefix);
+            bytes
+        };
+        let try_raw = |bytes: &[u8]| fx.list(&filter(), &resumed(&cursor(hex(bytes)), sort));
+        // The anchor is there, so each of these would resume after it, were the
+        // shape looked at only once the anchor is gone.
+        assert_eq!(Fixture::ids(&try_raw(&good).unwrap()), [near("b")]);
+        assert_eq!(
+            Fixture::ids(&try_raw(&forge(100, tail, prefix)).unwrap()),
+            [near("b")]
+        );
+        // No tail, and one a character cannot have.
+        invalid_cursor(try_raw(&forge(100, &[], prefix)));
+        // (The prefix is cut to the room that tail leaves, so that the length
+        // of the tail is the only fault.)
+        invalid_cursor(try_raw(&forge(100, b"xxxxx", &prefix[..prefix.len() - 4])));
+        // A tail that takes all the room: the empty prefix is every ID's, so the
+        // scan for the anchor would be over every row of the project.
+        let wide = [b'x'; 206];
+        let all = forge(0, &wide, &[]);
+        assert_eq!(all.len(), 256, "it fits the token");
+        invalid_cursor(try_raw(&all));
+        // `k` past the prefix, and bytes that are not UTF-8 once joined.
+        invalid_cursor(try_raw(&forge(prefix.len() as u16 + 1, tail, prefix)));
+        invalid_cursor(try_raw(&forge(100, &[0xff], prefix)));
+        invalid_cursor(try_raw(&forge(99, &[0xa9], prefix)));
+        // The same with the anchor gone.
+        delete_rows(fx, &[&ids[0]]);
+        assert_eq!(Fixture::ids(&try_raw(&good).unwrap()), [near("b")]);
+        invalid_cursor(try_raw(&forge(100, &[], prefix)));
+        invalid_cursor(try_raw(&all));
         fx.state.ensure_available().unwrap();
     });
 }

@@ -111,12 +111,19 @@ fn page_between(
         cursor: None,
         ..request.clone()
     };
-    let TaskIdPage { ids, next, total } =
-        task_page::query(sql.tx, sql.project, filter, &walk, after.as_ref()).map_err(selected)?;
+    let TaskIdPage {
+        ids,
+        next,
+        following,
+        total,
+    } = task_page::query(sql.tx, sql.project, filter, &walk, after.as_ref()).map_err(selected)?;
     between();
     let items = sql.hydrate(&ids)?;
     let next_cursor = next
-        .map(|next| cursors.issue(sql.project, filter, request.sort, &next, now_ms))
+        .zip(following)
+        .map(|(next, following)| {
+            cursors.issue(sql.project, filter, request.sort, &next, &following, now_ms)
+        })
         .transpose()?;
     Ok(Page {
         items,
