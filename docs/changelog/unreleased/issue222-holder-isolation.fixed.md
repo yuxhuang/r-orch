@@ -1,0 +1,1 @@
+The scratch and worktree production-holder qualification tests each reserve all nextest test slots while their private cold crate-graph build runs. This reduces contention without changing the drain deadline or the live-holder, last-close and recovery assertions; other xtask tests remain parallel.
