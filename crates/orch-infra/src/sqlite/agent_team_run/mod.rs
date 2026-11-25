@@ -1287,6 +1287,38 @@ mod tests {
             Some(0)
         );
     }
+
+    #[test]
+    fn native_run_update_explicitly_writes_preserved_position() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let saved = sql.create(Entity::Run(Box::new(run()))).unwrap();
+        tx.execute_batch("CREATE TEMP TABLE observed_position(value INTEGER); CREATE TEMP TRIGGER observe_position AFTER UPDATE OF position ON runs BEGIN INSERT INTO observed_position VALUES(NEW.position); END").unwrap();
+        let updated = sql
+            .update(Entity::Run(Box::new(run())), saved.revision)
+            .unwrap();
+        let positions: Vec<i64> = tx
+            .prepare("SELECT value FROM observed_position")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(positions, vec![saved.position as i64]);
+        assert_eq!(updated.position, saved.position);
+        assert_eq!(
+            tx.query_row(
+                "SELECT value FROM counters WHERE name='position:run'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
 }
 
 // Private native leaf: authorization, fencing and R140 observation belong to
@@ -2057,6 +2089,8 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
                 .map(|(i, c)| format!("{c}=?{}", i + 4))
                 .collect::<Vec<_>>();
             assignments.push(format!("revision=?{}", values.len()));
+            values.push(SqlValue::Integer(integer(old.position)?));
+            assignments.push(format!("position=?{}", values.len()));
             this.tx.execute(
                 &format!(
                     "UPDATE {} SET {} WHERE project_id=?1 AND id_form=?2 AND id=?3",
