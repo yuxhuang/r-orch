@@ -1,5 +1,5 @@
 //! Partial diagnostic integrity is separate from execution and qualification.
-use super::{inventory, judge, report};
+use super::{inventory, judge, nextest, report};
 use anyhow::{Context, Result, ensure};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -210,15 +210,9 @@ pub(super) fn verify(repo: &Path, directory: &Path, commit: &str) -> Result<Summ
     if inventory.is_empty() {
         complete = false;
     } else {
-        let exit = f
-            .get("step-test-exit")
-            .context("test exit missing")?
-            .parse::<i32>()?;
-        let rebuilt = inventory::parse(
-            &entries["steps/test.log"],
-            &entries["steps/build.log"],
-            exit,
-        )?;
+        // The framed log carries the runner's and the doc-test run's own
+        // statuses, so no result field is needed to read it back.
+        let rebuilt = nextest::inventory(&entries["steps/test.log"], &entries["steps/build.log"])?;
         ensure!(
             inventory::tsv(&rebuilt) == *inventory,
             "inventory differs from step logs"

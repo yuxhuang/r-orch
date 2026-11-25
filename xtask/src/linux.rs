@@ -801,14 +801,47 @@ mod tests {
         assert_ci_mirror(&ci);
     }
 
+    /// CI runs the suite on the pinned `cargo-nextest`; the container runs the
+    /// same tests with plain `cargo test`, because the platform-quirk skips are
+    /// libtest's `--skip` and would have to be re-expressed as nextest
+    /// filtersets, and the image would have to build the pinned tool as well.
+    /// One `cargo test --workspace --no-fail-fast` covers the doc-tests too, so
+    /// no test is lost — and one libtest run also needs no pass split: the
+    /// split exists because nextest runs a process per test, which is the
+    /// condition `cargo test` never creates. This command is optional, it is
+    /// never a gate (its
+    /// home-hygiene step cannot pass under the emulator), and macOS is not a
+    /// qualified platform before 2.0 (AGENTS.md rule 10). These are exact
+    /// lines: a new CI-only command is still caught.
+    const MIRROR_RUNNER_LINES: &[&str] = &[
+        "cargo install cargo-nextest --locked --version 0.9.152 --target-dir \"$RUNNER_TEMP/nextest-install\"",
+        "cargo nextest run --profile default --workspace --no-fail-fast --no-tests fail",
+        "cargo nextest run --profile alone --workspace --no-fail-fast --no-tests fail",
+        "cargo test --workspace --doc --no-fail-fast",
+    ];
+    /// The `check` job's documentation-only build, which replaces the tests for
+    /// a documentation change. It is a routing step of the workflow, not a check
+    /// the container owes: `cargo xtask linux` always runs the whole suite.
+    const DOCS_ONLY_BUILD: &str = "cargo build --workspace";
+
     fn assert_ci_mirror(ci: &str) {
         let script = container_script(&LinuxCommand::Ci).0;
         let mut checked = 0;
         for line in ci.lines().map(str::trim) {
-            let Some(run) = line.strip_prefix("- run: ") else {
+            // Both shapes of a `run:` step: on its own, and as the second line
+            // of a step that carries an `if:` guard. Reading only the first
+            // would let a guarded CI-only command escape the mirror.
+            let Some(run) = line
+                .strip_prefix("- run: ")
+                .or_else(|| line.strip_prefix("run: "))
+            else {
                 continue;
             };
-            if run.starts_with("rustup ") || run.contains("apt-get") {
+            if run.starts_with("rustup ")
+                || run.contains("apt-get")
+                || run == DOCS_ONLY_BUILD
+                || MIRROR_RUNNER_LINES.contains(&run)
+            {
                 continue;
             }
             assert!(
@@ -817,10 +850,23 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked >= 4, "found only {checked} cargo steps in ci.yml");
+        // fmt, clippy and crate-graph; the suite lines are runner-specific.
+        assert!(checked >= 3, "found only {checked} cargo steps in ci.yml");
         for command in &CI_STEPS[1..] {
+            // The suite command is the one that differs by runner.
+            if command.starts_with("cargo test ") {
+                assert!(script.contains(command), "Docker lost {command}");
+                continue;
+            }
             assert!(ci.contains(&format!("run: {command}")), "CI lost {command}");
             assert!(script.contains(command), "Docker lost {command}");
+        }
+        for line in MIRROR_RUNNER_LINES {
+            assert!(ci.contains(line), "CI lost the pinned runner line {line}");
+            assert!(
+                !script.contains(line),
+                "the container must stay on plain cargo test, not {line}"
+            );
         }
         for line in [
             "test -s Cargo.lock",

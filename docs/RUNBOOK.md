@@ -1577,11 +1577,41 @@ What each tier is for, who runs it and what it does not prove is in
 reading results, evidence, refusals and recovery. `./xtask/gate.sh full` is the
 goal/release gate. `pr` is the merge-condition tier by approved policy, but the
 live GitHub rules still require both `check` and `test` until the owner applies the
-reviewed change. `fast` is local iteration. PR 4 is deferred and cargo-nextest is
-not adopted (owner decision of 2026-11-17 after its dependency audit: 23 advisories,
-10 licence items outside the allow-list): test binaries run sequentially, and its
-qualification and speedup were not delivered. No tier's wall time is measured
-against its target.
+reviewed change. `fast` is local iteration. The suite step runs on
+cargo-nextest, pinned to 0.9.152 (owner decision of 2026-11-24, reversing the
+deferral of 2026-11-17; [ADR 0022](decisions/0022-adopt-cargo-nextest.md)): install
+it with `cargo install cargo-nextest --locked --version 0.9.152`. A missing or
+different version fails the `build` step with that line and does not fall back;
+there is no second runner, and the rollback is to revert the adoption. The suite is two
+`nextest` passes — everything, then orch-cli's `remote_peers` alone on the host
+with its own tests in parallel — and the step's `test.log` carries one record per
+pass, each with that pass's exit status and the number of event lines it produced;
+a log missing, renaming or reordering a pass, or claiming a count the stream does
+not have, refuses on read-back. The counts are what let each pass's status be
+judged against its own events: a pass exits 100 only when its own stream reports a
+failure and 4 only when it reported no suite at all. Doc-tests
+are still libtest's own `cargo test --doc`, run beside them and judged as one
+inventory over the union of both passes against one unfiltered
+`cargo nextest list --ignore-default-filter`. Tests that need isolation, and the
+pass split itself, are named with their evidence in
+`.config/nextest.toml`; that file is part of the judge's source set, so editing it
+during a run invalidates the run, and its content hash is recorded in the
+evidence's `tools.txt` beside the runner's version. No tier's wall time is
+measured against its target, and the tool's dependency audit is not resolved by
+the adoption (see ADR 0022).
+Two tests are named as load-sensitive, neither fixed here because neither is
+this change's to fix (one is under `crates/**`, which it does not touch):
+`orch-daemon::daemon_prelaunch_failure::a_read_queued_during_a_failure_batch_is_served_before_the_batch_ends`
+failed once in the `pr` run of 2026-11-25 with "connection closed before reply"
+inside the child it re-execs, while that run's own sampling recorded a load peak
+of 124.79 and 5 foreign builds from a bare `cargo test` outside the lease. Its
+child is fully sandboxed, so it is a scheduling failure and not an isolation
+gap. And:
+`xtask::gate::target::tests::f3_publication_boundary_observes_cancellation_after_command_owner_lifetime`
+failed once at a load average of 141, with another agent's run overlapping this
+host, and passed 13 of 13 other times. A failure there is this known timing
+sensitivity, to be diagnosed on a quiet host — never retried, and not evidence
+about the runner or the pass split.
 Use `qualifying: yes` in verified exact-head evidence; an exit0 or a consistent
 inventory alone is insufficient. A direct unstamped executable cannot qualify.
 The wrapper privately publishes a single-link executable after Cargo success and
@@ -1608,8 +1638,9 @@ partial bundle. Unknown secrets are outside known-value redaction.
 Option3 direct-writer/legacy-use overlap is accepted, not repaired. FS1 indirect
 writers and interim D45 checked-path/by-name races remain separate. RC18 was
 replaced as a precondition; finite propagation and last-close observations do not
-prove universal writer cessation. No timing target or nextest qualification is
-implied by scoped implementation checks.
+prove universal writer cessation. No timing target is implied by scoped
+implementation checks. The owner's nextest bar is 5 consecutive green runs on one
+Linux host; decision 24's remaining 15 runs per platform are not claimed.
 
 ### Local fast checks
 
