@@ -1,4 +1,5 @@
-//! Internal task-ID paging leaf; hydration and public cursor issuance belong to T10.
+//! Internal task-ID paging leaf. `task_adapter` hydrates its IDs and owns the
+//! public cursor token; this leaf only selects.
 //!
 //! Times are schema UTC milliseconds. Numeric ordering matches the file
 //! reference's bytewise ordering for canonical `YYYY-MM-DDTHH:MM:SS.sssZ`
@@ -90,6 +91,29 @@ fn validate_continuation(
         return Err(StoreError::InvalidCursor);
     }
     Ok(())
+}
+
+impl Continuation {
+    /// The seek tuple: integer sort keys, then the last row's text ID.
+    pub(crate) fn seek(&self) -> &[Value] {
+        &self.values
+    }
+}
+
+/// Number of components in a sort's seek tuple, the ID included. Refuses
+/// the sorts that Task does not offer.
+pub(crate) fn seek_width(sort: Sort) -> Result<usize, StoreError> {
+    sort_keys(sort).map(<[_]>::len)
+}
+
+/// Request-side checks that precede any cursor decoding, so that a bad
+/// request keeps its own error whatever token it carries.
+pub(crate) fn validate_request(filter: &Filter, request: &PageRequest) -> Result<(), StoreError> {
+    request.validate()?;
+    if !matches!(filter, Filter::Tasks { .. }) {
+        return Err(StoreError::InvalidPage("task filter required".into()));
+    }
+    sort_keys(request.sort).map(drop)
 }
 
 #[derive(Debug)]

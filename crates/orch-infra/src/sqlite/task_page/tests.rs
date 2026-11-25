@@ -254,6 +254,35 @@ fn invalid_requests_and_misbound_continuations_are_refused() {
 }
 
 #[test]
+fn unsupported_sort_keeps_its_request_error_beside_a_supplied_continuation() {
+    let root = tempfile::tempdir().unwrap();
+    let data = data(&root);
+    let mut db = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&data, &mut db).unwrap();
+    for id in ["a", "b"] {
+        insert(&db, "p", &task(id, TaskStatus::Todo, 0, 0, None), 1);
+    }
+    let tx = db.transaction().unwrap();
+    let next = query(&tx, "p", &filter(), &request(Sort::Id, 1), None)
+        .unwrap()
+        .next
+        .unwrap();
+    // The continuation is bound to Id, so validating it first would answer
+    // InvalidCursor; the request's own error comes first.
+    for sort in [Sort::Attempt, Sort::Name] {
+        assert!(matches!(
+            query(&tx, "p", &filter(), &request(sort, 1), Some(&next)),
+            Err(task_page::Error::Page(StoreError::InvalidPage(_)))
+        ));
+        assert!(matches!(
+            task_page::validate_request(&filter(), &request(sort, 1)),
+            Err(StoreError::InvalidPage(_))
+        ));
+    }
+    assert!(task_page::validate_request(&filter(), &request(Sort::Id, 1)).is_ok());
+}
+
+#[test]
 fn decoded_continuations_validate_every_tuple_component_before_querying() {
     use rusqlite::types::Value;
 
