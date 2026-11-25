@@ -164,6 +164,18 @@ jobs:
       # The TUI end-to-end tests drive the real binary in tmux and fail when
       # it is missing (AGENTS.md, "TUI end-to-end tests").
       - run: sudo apt-get update && sudo apt-get install -y tmux
+      # The suite runner is pinned: the gate refuses any other version and
+      # prints this command. Built from crates.io with the tool's own lockfile
+      # rather than fetched as a prebuilt binary or through a third-party
+      # install action. Be clear about what that costs: this builds nextest's
+      # own dependency tree -- a second, unvetted lockfile with its own build
+      # scripts and proc-macros -- inside this job, and cargo-deny covers only
+      # r-orch's Cargo.lock, not that one. Deliberately accepted per ADR 0022,
+      # bounded by what the job can reach: a read-only token, a checkout that
+      # persists no credentials, and no secrets. The build cost on a
+      # GitHub-hosted runner is not measured yet; if it eats the suite's
+      # saving, a commit-pinned install action is the follow-up.
+      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir "$RUNNER_TEMP/nextest-install"
       # Replace the step shell so runner cancellation signals reach the gate.
       # Export time under real cancellation remains unverified; no receipt guarantee.
       - name: Folded suite
@@ -214,4 +226,35 @@ jobs:
       # The TUI end-to-end tests drive the real binary in tmux and fail when
       # it is missing (AGENTS.md, "TUI end-to-end tests").
       - run: sudo apt-get update && sudo apt-get install -y tmux
-      - run: cargo test --workspace --no-fail-fast
+      # The suite runner is pinned: the gate refuses any other version and
+      # prints this command. Built from crates.io with the tool's own lockfile
+      # rather than fetched as a prebuilt binary or through a third-party
+      # install action. Be clear about what that costs: this builds nextest's
+      # own dependency tree -- a second, unvetted lockfile with its own build
+      # scripts and proc-macros -- inside this job, and cargo-deny covers only
+      # r-orch's Cargo.lock, not that one. Deliberately accepted per ADR 0022,
+      # bounded by what the job can reach: a read-only token, a checkout that
+      # persists no credentials, and no secrets. The build cost on a
+      # GitHub-hosted runner is not measured yet; if it eats the suite's
+      # saving, a commit-pinned install action is the follow-up.
+      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir "$RUNNER_TEMP/nextest-install"
+      # nextest runs the test binaries itself, so Cargo's `[env]` table has to
+      # reach the test processes; xtask/tests/ambient_env.rs fails this job if
+      # it does not. Doc-tests are libtest's own and stay a cargo run.
+      #
+      # Two passes, the same split the gate runs: the profiles' complementary
+      # `default-filter`s in .config/nextest.toml are the only definition of
+      # which tests run alone, and xtask/tests/nextest_isolation.rs fails if
+      # these two steps and that file disagree. The second pass runs with
+      # nothing beside it, which is the condition its binary needs.
+      #
+      # `if: ${{ !cancelled() }}` on every step after the first is this job's
+      # `--no-fail-fast` across steps: one pass failing must not hide the other
+      # pass's result or the doc-tests', which is the whole point of a job whose
+      # failures are kept and diagnosed. A cancellation still stops the job, and
+      # the job still fails if any step did.
+      - run: cargo nextest run --profile default --workspace --no-fail-fast --no-tests fail
+      - if: ${{ !cancelled() }}
+        run: cargo nextest run --profile alone --workspace --no-fail-fast --no-tests fail
+      - if: ${{ !cancelled() }}
+        run: cargo test --workspace --doc --no-fail-fast
