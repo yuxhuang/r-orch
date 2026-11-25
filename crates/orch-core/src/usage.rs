@@ -79,7 +79,14 @@ impl RunUsage {
                     })
                 })
                 .unwrap_or(&Value::Null),
-            ("pi", Some("message_end" | "turn_end" | "response")) => output,
+            // Native Pi repeats the assistant snapshot on message_end and
+            // turn_end. Read the same source as agent_end; replacement below
+            // keeps repeated reports idempotent without adding their counters.
+            ("pi", Some("message_end" | "turn_end")) => output
+                .get("message")
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+                .unwrap_or(output),
+            ("pi", Some("response")) => output,
             _ => return,
         };
         self.observe_source(adapter, source);
@@ -507,6 +514,137 @@ mod tests {
         let mut direct = output;
         direct["usage"] = Value::Null;
         assert_eq!(observed("claude", direct).tokens_input, None);
+    }
+
+    #[test]
+    fn pi_native_lifecycle_extracts_assistant_counters_and_model() {
+        for kind in ["message_end", "turn_end"] {
+            let usage = observed(
+                "pi",
+                json!({"type":kind, "model":"wrapper", "usage":{"input":99},
+                    "message":{"role":"assistant", "model":"native", "stopReason":"aborted",
+                        "usage":{"input":17, "output":0, "reasoning":2, "cacheRead":4, "cacheWrite":0}}
+                }),
+            );
+            assert_eq!(
+                counters(&usage),
+                [Some(17), Some(0), Some(2), Some(4), Some(0)]
+            );
+            assert_eq!(usage.model.as_deref(), Some("native"));
+        }
+    }
+
+    #[test]
+    fn pi_native_lifecycle_keeps_unknown_separate_from_zero_and_validates_counts() {
+        for kind in ["message_end", "turn_end"] {
+            for value in [
+                json!(null),
+                json!(-1),
+                json!(1.5),
+                json!(1.0),
+                json!("3"),
+                json!(true),
+                json!(u64::MAX),
+            ] {
+                let usage = observed(
+                    "pi",
+                    json!({"type":kind, "message":{"role":"assistant",
+                    "usage":{"input":value, "output":value, "reasoning":value,
+                        "cacheRead":value, "cacheWrite":value}}}),
+                );
+                assert_eq!(counters(&usage), [None; 5], "{kind}: {value}");
+            }
+            for (fields, expected) in [
+                (json!({}), [None; 5]),
+                (
+                    json!({"input":0, "output":0, "reasoning":0, "cacheRead":0, "cacheWrite":0}),
+                    [Some(0); 5],
+                ),
+                (
+                    json!({"input":i64::MAX}),
+                    [Some(i64::MAX), None, None, None, None],
+                ),
+                (
+                    json!({"input":null, "input_tokens":7, "output_tokens":0,
+                    "cache_read_input_tokens":4, "cache_creation_input_tokens":0}),
+                    [Some(7), Some(0), None, Some(4), Some(0)],
+                ),
+            ] {
+                let usage = observed(
+                    "pi",
+                    json!({"type":kind, "message":{"role":"assistant", "usage":fields}}),
+                );
+                assert_eq!(counters(&usage), expected, "{kind}: {fields}");
+            }
+        }
+    }
+
+    #[test]
+    fn pi_native_assistant_snapshots_are_idempotent_across_lifecycle_carriers() {
+        let message = json!({"role":"assistant", "timestamp":123, "model":"native",
+            "usage":{"input":17, "output":0, "cacheRead":4}});
+        let mut usage = RunUsage::default();
+        for kind in ["message_end", "turn_end", "message_end"] {
+            let output = json!({"type":kind, "message":message});
+            usage.observe_output("pi", &output);
+            // A raw tap and the event path may both observe the same report.
+            usage.observe_event(
+                "pi",
+                &AgentEvent::new(
+                    AgentEventKind::Output,
+                    "synthetic",
+                    json!({"text":"", "raw":output}),
+                ),
+            );
+            assert_eq!(counters(&usage), [Some(17), Some(0), None, Some(4), None]);
+        }
+        usage.observe_output("pi", &json!({"type":"agent_end", "messages":[message]}));
+        assert_eq!(counters(&usage), [Some(17), Some(0), None, Some(4), None]);
+        // Keep the established latest-snapshot rule. Cross-message totals are
+        // a separate policy; an earlier assistant must not be added again.
+        usage.observe_output(
+            "pi",
+            &json!({"type":"turn_end", "message":{"role":"assistant",
+            "usage":{"input":0}}}),
+        );
+        assert_eq!(counters(&usage), [Some(0), Some(0), None, Some(4), None]);
+    }
+
+    #[test]
+    fn pi_native_lifecycle_ignores_non_assistant_and_nested_tool_metadata() {
+        for kind in ["message_end", "turn_end"] {
+            for role in [json!("user"), json!("toolResult"), json!(null)] {
+                assert_eq!(
+                    observed(
+                        "pi",
+                        json!({"type":kind, "message":{"role":role,
+                    "model":"spoof", "usage":{"input":999}}})
+                    ),
+                    RunUsage::default()
+                );
+            }
+            assert_eq!(
+                observed(
+                    "pi",
+                    json!({"type":kind, "message":{"role":"assistant",
+                "content":[{"model":"spoof", "usage":{"input":999}}]}})
+                ),
+                RunUsage::default()
+            );
+        }
+    }
+
+    #[test]
+    fn pi_native_lifecycle_uses_outer_model_only_when_native_model_is_unknown() {
+        for model in [json!(null), json!("  "), json!("x".repeat(64 * 1024 + 1))] {
+            let usage = observed(
+                "pi",
+                json!({"type":"message_end", "model":"outer",
+                "message":{"role":"assistant", "model":model, "usage":{"output":0}}}),
+            );
+            assert_eq!(usage.model.as_deref(), Some("outer"));
+            assert_eq!(counters(&usage), [None, Some(0), None, None, None]);
+        }
     }
 
     #[test]
