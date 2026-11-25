@@ -39,9 +39,11 @@ bounded reader on the same synthetic bytes.
 | Explicit `null`, `~`, a bare `---` | Defaults | Refuses as `unreadable` (a document that is not a mapping), with the same 1.0 statement |
 | `42`, `[1]`, `"x"` | Defaults | As the row above |
 | `{}` | Defaults | Baseline. No problem; one `config_default` note for `run_cap` |
-| A tab at the start of a line | Rejects it as scanner syntax | Refuses as `unreadable`; says nothing about 1.0. A file that does not scan is never counted as a stream of no document |
+| A tab at the start of a line (C-V5) | Rejects it as scanner syntax | Refuses as `unreadable`; says nothing about 1.0. A file that does not scan is never counted as a stream of no document. The bounded reader reaches this from `parse` (limit 0, observed 0), not from `documents` (PR 239) |
 | Two mappings separated by `---` | Refuses | Refuses under `documents`; says nothing about 1.0 |
 | A mapping | The mapping over the defaults | The mapping over the frozen 1.0 defaults, below |
+| A mapping with a numeric or boolean key, at the top or inside another mapping (`200: x`, `true: y`) | Reads the key as the string `"200"` or `"true"` | The same strings. `extras: {200: x, true: y}` with a top-level `200: top` gives the unknown keys `200`, `extras.200` and `extras.true`, and no refusal |
+| A mapping with a null key (`extras: {~: x}`) | Refuses | Refuses as `unreadable` |
 | More than 1,048,576 bytes | Not compared | Refuses under `bytes`, before documents are counted |
 
 The file kind (R103), the byte bound, an input or output error, and the depth and node
@@ -98,6 +100,29 @@ The array is examined whole before a class is chosen (R122): a bad entry anywher
 only in case are two (`A` and `a`). The preflight judges an entry by its identity alone and
 decodes no entry as an entity type.
 
+**Id order.** Files with no index entry, and every file when the index is missing, `[]` or unreadable, are
+ordered by their id: the file name with its extension removed (`.yml` for tasks, agents and goals, `.json` for
+messages and context), compared as bytes. The extension must not take part: as file names `a-b.json` sorts before
+`a.json`, but as ids `a` precedes `a-b`. In every one of the five directories the files `a`, `a-b`, `a.b` and
+`a_b` are listed in that order with no index and with `[]`. With an index that lists only `a_b`, `a_b` is first
+and the other three follow in that id order.
+
+**Opaque fields of an index entry.** The preflight takes an index entry's identity, decodes no entry as an entity type and
+reads the rest of the entry as raw JSON, so a field of a valid entry that holds a number outside the range of a JSON value
+(`1e999`) is neither a refusal nor a reason to change the order. Three rules follow:
+
+- *Acceptance stays native.* A file that the typed reader accepts is accepted even if an ignored field of it
+  holds `1e999`; the same number in a field the type knows (`value` of a context entry) is refused, as before.
+- *Whole-array precedence is unchanged.* In every directory, `[{id:b, x:1e999}, {id:b}, 0]` and
+  `[0, {id:b, x:1e999}, {id:b}]` each give one refusal, `index_entry`, never `index_duplicate`; the position of
+  the malformed entry does not matter (`key` replaces `id` under `context/`). An array of `{id:b, x:1e999}` and
+  `{id:a}` is usable and orders `b`, `a`, then the unlisted file `c`.
+- *Comparison with the file (`index_differs`) is structural.* Objects compare by member, ignoring order, spacing
+  and string escapes (`"\u0061"` equals `"a"`); arrays compare element by element in order; a number that
+  does not fit a JSON value compares by its text (`1e999` is not `2e999`). A different number, or the same
+  elements in another order, notes `index_differs`; the same content in another layout does not. The order and the
+  count of the entities are unchanged either way.
+
 **Order preview.** `order` lists `store`, `id` and `position` for the entities the import
 would order: indexed ones at their index position, the others after them. Ids are escaped
 and cut like a finding. The list holds at most 1,000 entries for all stores together, and
@@ -114,10 +139,11 @@ synthetic sources in disposable directories:
 
 | Vectors | Test |
 |---|---|
-| C-V2 to C-V6, C-V9, C-V12 and the C-V13 wording | `config_empty_null_and_non_mapping_diagnostics_match_the_contract` |
+| C-V2 to C-V4, C-V6, C-V9, C-V12 and the C-V13 wording, and the preflight's result for the tab-only stream of C-V5 | `config_empty_null_and_non_mapping_diagnostics_match_the_contract` |
 | C-V1, C-V7, C-V8, C-V14 | `omitted_config_run_cap_uses_frozen_legacy_default_and_a_note` |
 | C-V10, X-V12, X-V14 | `budgets_and_file_kind_stops_never_become_index_unreadable` |
 | C-V11 | `an_entity_file_with_no_document_is_refused_as_1_0_refuses_it`, which also runs 1.0's `FileTaskStore`, `FileAgentStore`, `FileGoalStore` and `FileTeamStore` `get` on a separately created zero-byte file for each and requires each to error, as the preflight does |
+| C-V5 | `a_config_that_does_not_scan_stops_before_its_documents_are_counted`, a unit test of the bounded reader in `crates/orch-infra/src/import/tests/compatibility.rs` (PR 239). It runs six tab-only streams through 1.0's `FileConfigStore::read_merged` (each fails) and requires rule `parse`, limit 0 and observed 0 from `check_yaml`, `parse_yaml` and `decode_yaml`, while five streams that scan and hold no document keep `documents`. The preflight's result for one such stream, `unreadable` with no statement about 1.0, is a row of the C-V2 test above |
 | X-V4, X-V6 | `whole_array_bad_entry_precedes_duplicates_in_all_five_directories` |
 | X-V5, X-V7 | `both_duplicate_shapes_and_missing_files_stop_in_all_five_directories`, which also runs 1.0's `IndexManager::read_index` on a second, disposable source for each case in each of the five directories: it keeps a complete-entity duplicate and rebuilds an array of identities |
 | X-V1 to X-V3, X-V8 to X-V11 | `index_order_and_named_problems_use_files_and_never_open_index_identities` |
@@ -127,6 +153,10 @@ synthetic sources in disposable directories:
 | Entity documents decode as before | `typed_json_documents_still_refuse_duplicate_identity_members`, `typed_yaml_entities_keep_ignored_yaml_only_fields` |
 | Report caps | `order_and_notes_are_capped_without_changing_counts` |
 | A present file that is refused is not also a missing file | `an_unreadable_entity_is_not_reported_as_a_missing_file` |
+| Numeric and boolean YAML keys read as 1.0 reads them (issue 270) | `numeric_and_boolean_yaml_keys_follow_the_effective_legacy_reader`, which runs 1.0's `FileConfigStore::read_merged` on the same bytes and requires the strings `200` and `true`, then the unknown keys `200`, `extras.200` and `extras.true` from the preflight, then a null key refused by both |
+| Id order does not depend on the document extension (issue 270) | `prefix_id_order_is_independent_of_the_document_extension_in_every_store`: five directories, each with no index, `[]` and an index that lists `a_b` |
+| Ignored opaque JSON numbers (issue 270) | `opaque_ignored_json_numbers_preserve_acceptance_order_and_structural_comparison`: a context file with an ignored `1e999` is accepted by the typed reader and by the preflight, three index variants give `index_differs` 0, 1 and 1 times with the order unchanged, and the same number in the known `value` field is refused |
+| Opaque index members and whole-array precedence (issue 270) | `opaque_index_members_do_not_change_whole_array_precedence_in_any_store`: both entry positions of the malformed entry in all five directories, then the usable array |
 
 X-V13 is a unit test of the module, where a reader can be injected:
 `an_index_read_error_stops_and_an_interrupted_read_is_retried`, in
@@ -158,9 +188,13 @@ These reader-level checks pre-date the wiring and still stand.
 
 ## Still open
 
+The four regression vectors of issue 270 and the tab-only vector of PR 239 are checks of the whole-source
+preflight on synthetic sources. They add no runtime behavior and no acceptance claim. Every item below stays
+open.
+
 - The importer, the `orch import` command, the writer, dry run and resume. Integrated
   dry-run/import parity and zero writes on refusal are acceptance of issue 146, not of
-  this check.
+  this check. The authorization of the importing session is not proved by these tests either.
 - The lock held across the check and cancellation of a blocked read (issue 192).
 - The reader-level `import::index::reconcile` and its test are an older, unwired
   classifier, kept as historical evidence. It disagrees with the contract on a repeated

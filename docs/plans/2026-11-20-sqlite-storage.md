@@ -1465,7 +1465,10 @@ The whole-source check now classifies `config.yml` and the five `_index.json` fi
 its tests calls it, and there is still no `orch import` command.
 
 - `config.yml`: a missing file is the empty mapping; a stream of no document is refused under `documents` and a
-  null, scalar or sequence document as `unreadable`, each saying that 1.0 read the file as its defaults; two
+  null, scalar or sequence document as `unreadable`, each saying that 1.0 read the file as its defaults; a stream
+  that 1.0's scanner rejects, such as one with a tab at the start of a line (C-V5), is refused as `unreadable`
+  without that statement and is never counted as a stream of no document (the bounded reader checks the scan
+  before it refuses for the count, PR 239); two
   documents are refused under `documents` without that statement; the mapping is merged over a private copy
   of 1.0's defaults that no later default changes. A key the defaults do not hold is noted as `unknown_config`
   by its bounded dotted path, its value never reported, and the compact JSON of those keys above 65,536 bytes
@@ -1473,6 +1476,8 @@ its tests calls it, and there is still no `orch import` command.
   set it, with a `config_default` note that says so) and `preapproval_requires_confirmation`, true when an
   agent is `auto` or inherits an `auto` project default. That flag, with its note, is a preview: input never
   grants trust (R93, R133), and nothing sets a policy.
+  A numeric or boolean mapping key reads as the string 1.0 reads (`200` and `true`), at the top and in a nested
+  mapping, and a null key is refused as `unreadable`, as 1.0 refuses it.
 - `_index.json`: the array is examined whole, so a bad entry anywhere is `index_entry` before any
   `index_duplicate`, which holds for bare identities and for whole entities alike. A missing, unparsable,
   object or `null` index is a note `index_unreadable` and the files go in id order; the budget, file-kind and
@@ -1480,13 +1485,25 @@ its tests calls it, and there is still no `orch import` command.
   no file, never opened as a path; a present file that is refused gets its own refusal and is not also reported
   as missing) and `index_differs` are notes, and the file's content wins. The report's `order` previews at most
   1,000 positions for all stores together and counts the rest in `more`; it is not a load manifest.
+  Files with no index entry are ordered by id, which is the file name without its document extension, in all five
+  directories, so `a` precedes `a-b`, `a.b` and `a_b` although `a-b.json` sorts before `a.json` as a file name. A
+  field of an index entry that the check does not read stays raw JSON: a number outside the range of a JSON value
+  (`1e999`) in an ignored field neither refuses the entry nor changes the whole-array precedence, and the comparison
+  with the file for `index_differs` is structural (objects by member, arrays in order, such a number by its text).
+  A file that the typed reader accepts is accepted whatever such an ignored field holds.
 - Tests: `crates/orch-infra/tests/import_preflight_compat.rs`, named in the compatibility record. The same
   test that pins C-V11 runs 1.0's task, agent, goal and team readers on a separately created zero-byte file
   for each, and X-V5 and X-V7 run 1.0's `IndexManager` on a second, disposable source for each of the five
   directories. X-V13 is the unit test `an_index_read_error_stops_and_an_interrupted_read_is_retried`, which
   injects the read fault into the method the whole-source check reads every index through. The tests also
   pin that a JSON message or context document with a repeated field the entity type knows is refused as before, and that a YAML
-  entity keeps an ignored YAML-only key.
+  entity keeps an ignored YAML-only key. C-V5 is the unit test `a_config_that_does_not_scan_stops_before_its_documents_are_counted`
+  (PR 239), which runs six tab-only streams through 1.0's `FileConfigStore::read_merged` beside the bounded reader. Four later
+  regression vectors of the caller are named in the same test file (issue 270, `docs/internal/import-reader-compatibility.md`):
+  `numeric_and_boolean_yaml_keys_follow_the_effective_legacy_reader`,
+  `prefix_id_order_is_independent_of_the_document_extension_in_every_store`,
+  `opaque_ignored_json_numbers_preserve_acceptance_order_and_structural_comparison` and
+  `opaque_index_members_do_not_change_whole_array_precedence_in_any_store`. All of them run on synthetic sources.
 
 Held, and not claimed by this slice: the writer, the importer and its command, integrated dry run, resume and
 zero-write acceptance (issue 146), and the lock held across the check and the cancellation of a blocked read
