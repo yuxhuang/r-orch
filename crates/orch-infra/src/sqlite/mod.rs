@@ -216,3 +216,9 @@ mod task_adapter;
     reason = "inactive borrowed entity router awaits the owned Storage session"
 )]
 mod entity_router;
+
+#[allow(
+    dead_code,
+    reason = "inactive non-Task inline cursor awaits the key-taking leaves and the page PR"
+)]
+mod non_task_cursor;
