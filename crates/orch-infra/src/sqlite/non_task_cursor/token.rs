@@ -29,7 +29,7 @@ pub(in crate::sqlite) const INLINE_SKEW_MS: i64 = 5 * 60 * 1000;
 const INLINE: u8 = 1;
 const DIGEST: usize = 16;
 /// The text of a token that fits a `Cursor`: the hex of at most `MAX_RAW` bytes.
-const MAX_TEXT: usize = 2 * MAX_RAW;
+pub(super) const MAX_TEXT: usize = 2 * MAX_RAW;
 
 const SORTS: [Sort; 8] = [
     Sort::Default,
@@ -45,13 +45,15 @@ const SORTS: [Sort; 8] = [
 /// The generation that issued a token. A restore and every start take a new one
 /// (R41, R77), so a token from before is refused as stale.
 pub(in crate::sqlite) struct NonTaskCursors {
-    generation: String,
+    pub(super) generation: String,
+    pub(super) held: super::held::HeldTable,
 }
 
 impl NonTaskCursors {
     pub(in crate::sqlite) fn new(generation: impl Into<String>) -> Self {
         Self {
             generation: generation.into(),
+            held: super::held::HeldTable::new(),
         }
     }
 
@@ -250,7 +252,7 @@ pub(super) fn hex(bytes: &[u8]) -> String {
 }
 
 /// Lowercase only: one position has one token.
-fn unhex(text: &str) -> Option<Vec<u8>> {
+pub(super) fn unhex(text: &str) -> Option<Vec<u8>> {
     let nibble = |c: u8| match c {
         b'0'..=b'9' => Some(c - b'0'),
         b'a'..=b'f' => Some(c - b'a' + 10),

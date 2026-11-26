@@ -1,12 +1,12 @@
-//! The inline cursor of the eight families other than Task (spec "Cursors of the
-//! eight families other than Task", ADR 0024, plan "Non-Task cursors" step 2).
+//! The cursors of the eight families other than Task (spec "Cursors of the
+//! eight families other than Task", ADR 0024, plan "Non-Task cursors" steps 2 and 4).
 //!
-//! Inactive: nothing here is wired into a leaf or into `Storage`. It holds the
-//! part of the contract that needs no state of the adapter's: the typed ordering
-//! of each family and sort ([`Layout`], [`Tuple`]), the binding of a token to its
-//! project, generation, family and filter, and the inline token with its
-//! expiry. Steps 3 (key-taking leaves) and 4 (the table of retained entries and
-//! entries by lookup) build on the interface below.
+//! Inactive: nothing here is wired into a leaf or into `Storage`. The typed
+//! ordering and inline format remain the step 2 interface; step 4 adds bounded
+//! retained/lookup entries, monotonic age and an unfiltered identity scan.
+//! `issue` selects the arm; `resume` verifies the original tuple. The caller
+//! supplies the resuming connection and a same-view validated tuple hydrator.
+//! Step 5 owns its wiring into the native leaves and the public page path.
 //!
 //! The interface that step 4 relies on, and that a change here must keep:
 //!
@@ -24,13 +24,14 @@
 //!   tuple that its request's layout does not admit.
 //! - [`NonTaskCursors::binding`] is the 16-byte digest that every kind of token
 //!   carries; [`NonTaskCursors::sort_tag`] is the byte that says the sort. A
-//!   held token (retained or by lookup) is the same header, with
-//!   `RETAINED` or `LOOKUP` as its version (2 and 3, reserved), followed by the
-//!   adapter's nonce and a handle. This module refuses those versions until step 4
-//!   reads them. [`NonTaskCursors::resume_inline`] refuses a token of more than 512
+//!   held token uses version 2 (retained) or 3 (lookup), sort, binding (16),
+//!   nonce (8), handle (8): 34 raw bytes, with no expiry field, as ADR 0024
+//!   specifies. The inline header remains 26 bytes. [`NonTaskCursors::resume`]
+//!   and [`NonTaskCursors::resume_inline`] refuse a token of more than 512
 //!   characters before decoding it, because a deserialized `Cursor` is not bounded
-//!   by its constructor; the page that calls it still validates the request.
+//!   by its constructor; the page that calls them still validates the request.
 //! - [`INLINE_TTL_MS`] and [`INLINE_SKEW_MS`] are the owner's inline clock rule.
+mod held;
 mod layout;
 mod token;
 
@@ -39,11 +40,11 @@ mod tests;
 
 #[allow(
     unused_imports,
-    reason = "the frozen interface of step 4, which has no caller until the table lands"
+    reason = "the frozen interface stays private until step 5 wires public pages"
 )]
 pub(in crate::sqlite) use layout::{Arm, Component, Layout, Tuple};
 #[allow(
     unused_imports,
-    reason = "the frozen interface of step 4, which has no caller until the table lands"
+    reason = "the frozen interface stays private until step 5 wires public pages"
 )]
 pub(in crate::sqlite) use token::NonTaskCursors;
