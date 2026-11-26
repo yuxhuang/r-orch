@@ -181,6 +181,12 @@ mod task_sql;
 
 #[allow(
     dead_code,
+    reason = "the shared time projection serves the inactive entity mappings"
+)]
+mod time_projection;
+
+#[allow(
+    dead_code,
     reason = "internal retry mapping awaits the combined T10 Storage adapter"
 )]
 mod retry_message;
