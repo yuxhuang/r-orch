@@ -499,7 +499,11 @@ fn slots(family: Family, value: &Value) -> Result<Vec<String>> {
 }
 
 #[cfg(test)]
+mod time_tests;
+
+#[cfg(test)]
 mod tests {
+    use crate::sqlite::time_projection::MIN_MILLIS;
     // Keep the qualified prerequisite corpus byte-for-byte while native tests
     // grow separately in this bounded leaf.
     include!("tests.rs");
@@ -524,8 +528,8 @@ mod tests {
             SqlValue::Null => None,
             other => panic!("unexpected {other:?}"),
         };
-        assert_eq!(int("0000-01-01T00:00:00.000Z"), Some(TIME_MIN_MS));
-        assert_eq!(int("0000-01-01T00:00:00.001Z"), Some(TIME_MIN_MS + 1));
+        assert_eq!(int("0000-01-01T00:00:00.000Z"), Some(MIN_MILLIS));
+        assert_eq!(int("0000-01-01T00:00:00.001Z"), Some(MIN_MILLIS + 1));
         assert_eq!(int("-000001-12-31T23:59:59.999Z"), None);
         assert_eq!(int("-009999-01-01T00:00:00Z"), None);
         assert_eq!(int("1970-01-01T00:00:00Z"), Some(0));
@@ -537,7 +541,7 @@ mod tests {
                 .parse::<jiff::Timestamp>()
                 .unwrap()
                 .as_millisecond(),
-            TIME_MIN_MS
+            MIN_MILLIS
         );
     }
 
@@ -549,7 +553,7 @@ mod tests {
         let tx = conn.transaction().unwrap();
         let mut sql = NativeSql::new(&tx, &disk, "p", 123);
         for (id, text, expected) in [
-            ("first", "0000-01-01T00:00:00.000Z", Some(TIME_MIN_MS)),
+            ("first", "0000-01-01T00:00:00.000Z", Some(MIN_MILLIS)),
             ("below", "-000001-12-31T23:59:59.999Z", None),
         ] {
             let mut r = run();
@@ -2463,16 +2467,10 @@ fn nullable_text(value: Option<&str>) -> SqlValue {
         .map(|v| SqlValue::Text(v.into()))
         .unwrap_or(SqlValue::Null)
 }
-/// UTC milliseconds of `0000-01-01T00:00:00.000Z`, the documented lower bound
-/// of a native time column; jiff also parses earlier expanded-year instants.
-const TIME_MIN_MS: i64 = -62_167_219_200_000;
+/// The native millisecond column of a time string: the one rule of
+/// `time_projection`, NULL when the text is not an exact in-range instant.
 fn time(value: &str) -> SqlValue {
-    value
-        .parse::<jiff::Timestamp>()
-        .ok()
-        .filter(|t| t.as_nanosecond() % 1_000_000 == 0 && t.as_millisecond() >= TIME_MIN_MS)
-        .map(|t| SqlValue::Integer(t.as_millisecond()))
-        .unwrap_or(SqlValue::Null)
+    super::time_projection::rfc3339_millis(value).map_or(SqlValue::Null, SqlValue::Integer)
 }
 fn quartet(value: Option<&str>, identity: bool) -> Vec<SqlValue> {
     match value {
