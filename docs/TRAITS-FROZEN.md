@@ -24,8 +24,8 @@ Everything returns `orch_core::Result<T>` = `Result<T, orch_core::Error>` unless
 stated otherwise. Every trait is `Send + Sync` and takes `&self`, never
 `&mut self`: stores are shared as `Arc<dyn …>` and own their interior
 mutability. The additive v2 write traits (`UnitOfWork` and the six it extends,
-§2) are the exception: they take `&mut self` and, since Amendment 3, are not
-`Send`.
+§2) are the exception: their changes take `&mut self` (some of their reads take `&self`), they were `Send` and not
+`Sync`, and since Amendment 3 they are not `Send`.
 
 ---
 

@@ -927,7 +927,7 @@ owner-landing receipt for each exists.
 **Holds that stay.** The file runtime stays until the switch (T24). Nothing here wires the daemon or the public cursor,
 releases a slice that depends on the writer, or consumes an unmerged slice. Every hold of the task mapping carries over:
 the typed stored-data error of R140 and issue 127, issues 149, 152, 166, 167, 203 and 209, the signed, time, revision and cursor
-bounds, the writer policy, checkpoint and backlog rules, the obligations of Amendment 3 (the unit of work stays on the writer's thread, a callback needs no runtime and a panic in it is contained), the shared conformance suites on SQLite
+bounds, the writer policy, checkpoint and backlog rules, the obligations of Amendment 3 (the unit of work stays on the writer's thread, a callback needs no runtime, a panic in it is contained, and the read side keeps `Send + Sync`), the shared conformance suites on SQLite
 and on both references, and the combined crash proof. The first complete frozen storage head goes to the combined crash proof of
 issue 149 and to the check of transaction-local intent reads and retention of issue 167 before any writer-dependent
 work is released. Independent code review

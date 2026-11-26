@@ -205,7 +205,7 @@ The revision that carries this paragraph records the owner's ruling of 2026-11-2
 applies its answer D1 and no more) and changes nothing else. It removes the `Send` bound from `UnitOfWork` and its six
 write traits, and states what the callback, the borrowed unit, a Tokio runtime and a panic mean after that
 ("Amendment 3: the unit of work stays on the writer's thread" under "Storage port v2",
-[ADR 0023](../decisions/0023-unit-of-work-on-the-writer-thread.md)). The rows edited are the `Storage::write` row of the
+[ADR 0023](../decisions/0023-unit-of-work-on-the-writer-thread.md)). The rows edited are the `decision:` line of the front matter, the `Storage::write` row of the
 port table (and a new `UnitOfWork` row), the paragraph of Amendment 3, and record M with the count of its parts. It
 changes no requirement row, no cursor text (R10, the `Cursor` row and the Task exception stand as written) and no read
 bound. No independent review had read this revision when it was written.
@@ -997,7 +997,7 @@ that asks of a callback. It changes no stored data, no protocol and no other sig
 - *The callback is owned and runs once, on the writer.* A backend invokes an admitted callback exactly once, on the
   thread that performs its writes (the writer's thread on SQLite, a blocking-pool thread in the file reference, the
   caller's own task in the memory fake), and never replays it. A request that a backend refuses before it is admitted
-  (answered `overloaded` at its deadline, R98 and R128; refused because the writer has failed) never runs its callback.
+  (answered `overloaded` at its deadline, R26 and R128; refused because the writer has failed) never runs its callback.
 - *A borrowed view stays on its thread.* The `&mut dyn UnitOfWork` that a callback receives, and anything borrowed from
   it, is used only on the thread that runs the callback and only until it returns. It is not sent to another thread, to
   a spawned task or into a scoped thread. The compiler enforces this: `dyn UnitOfWork` is not `Send`, so a
@@ -1006,8 +1006,9 @@ that asks of a callback. It changes no stored data, no protocol and no other sig
 - *A callback depends on no Tokio runtime.* The SQLite adapter runs the writer (`Writer::run`, a blocking function) on a plain
   thread, which has no runtime context. A callback calls neither `Handle::current()` nor `block_on` nor anything else
   that needs a runtime. Sending its result on a `tokio::sync::oneshot` channel, which `StorageExt::transaction` does,
-  needs none and stays allowed. The two references run a callback on a Tokio thread, where such a call would work by
-  accident, so the shared suites run on SQLite are what catch it.
+  needs none and stays allowed. The two references run a callback on a Tokio thread, where `Handle::current()` would work by
+  accident (and `block_on` would work only on the file reference's blocking-pool thread), so the shared suites run on
+  SQLite are what catch it.
 - *A panic in a callback is contained.* The SQLite `Storage::write` catches the unwind before it leaves the writer's
   job. Nothing that the callback did is committed. The awaiting caller observes the panic: it is resumed on the caller,
   as the file reference resumes it (`blocking` in `crates/orch-infra/src/storage/v2.rs`) and as the memory fake, which
@@ -1028,7 +1029,7 @@ had refused the amendment) are not used.
 
 | Vector | Input | Must |
 |---|---|---|
-| A3-W1 | `cargo check --workspace --all-targets` on the head of the PR that carries the seven removals (a condition of that PR, run before it was drafted) | Exit 0. The PR's change to `crates/` is those seven bounds in seven files (`git diff --shortstat -- crates`: 7 files changed, 6 insertions, 7 deletions) and no other line |
+| A3-W1 | `cargo check --workspace --all-targets` on the head of the PR that carries the seven removals (a condition of that PR: it was run once before the amendment was drafted, on a base whose `crates/` are identical, and the PR's own head needs its own run) | Exit 0. The PR's change to `crates/` is those seven bounds in seven files (`git diff --shortstat -- crates`: 7 files changed, 6 insertions, 7 deletions) and no other line |
 | A3-W2 | A callback that calls `create` once and then panics, through `StorageExt::transaction` on SQLite, then a second write | The first leaves nothing: a snapshot opened afterwards does not see the row. The awaiting caller observes the panic. The failure state shows no cause and the writer still serves. The second write commits and reads back. The references already behave this way; the vector may be registered as a shared case if its harness can catch the panic on all three |
 | A3-W3 | A `compile_fail` doctest: a callback that moves the `&mut dyn UnitOfWork` it was lent into `std::thread::scope(\|s\| s.spawn(..))`, and a control doctest that uses the same unit on the callback's own thread | The first does not compile, the control does, so the failure is the `Send` requirement and not another error. The precedent is the `compile_fail` doctest of `ConnectionHandle` in `crates/orch-infra/src/sqlite/connection.rs` |
 | A3-W6 | Two requests through `Storage::write`: the first holds the writer, and the second's deadline passes while it is queued behind it. A third request that is admitted and commits | The second is answered `overloaded` and its callback's invocation counter is 0 after the first finishes. The third callback's counter is exactly 1 |
@@ -4666,7 +4667,7 @@ non-Task cursors that answers no id and changes none of the answers:
     stays on the writer's thread" carries it.
   - *The conditions D1 carries.* The seven-bound diff is checked with `cargo check --workspace --all-targets` before
     the amendment PR is drafted (vector A3-W1). The planned consumers are confirmed never to transfer a borrowed view
-    across threads, and if that check fails the change stops and the failing consumer is reported. A panic in a
+    across threads. If W1 fails, D1 stops and the failing consumer is reported. A panic in a
     callback is contained, with a rollback, an observable panic and a later write that succeeds (A3-W2). The
     restriction on Tokio runtime context in callback bodies is enforced.
   - *What D1 does not do.* It changes no read, no cursor rule and no stored data, and it releases no implementation:

@@ -27,7 +27,7 @@ Facts read from `main` at `075f2b124`:
   only ever lent to the callback as `&mut dyn UnitOfWork`.
 - The SQLite adapter's unit of work is a view over the writer's open transaction. `rusqlite` 0.41.1 (the pinned
   version, ADR 0017 decision 19) implements `Send` for `Connection` and does not implement `Sync`, so a borrow of its
-  transaction is not `Send`, and no type that holds one can meet `UnitOfWork: Send`. One writer thread performs every
+  transaction is not `Send`, and no type that holds one can meet `UnitOfWork: Send`. One writer performs every
   write (ADR 0017 decision 6), and the landed event adapter already runs a `Send` closure against a borrowed,
   locally built view (`event_job` in `crates/orch-infra/src/sqlite/events/adapter.rs`).
 - The landed writer documents that a panic of its callback rolls the transaction back and drops the worker, closing
@@ -35,9 +35,9 @@ Facts read from `main` at `075f2b124`:
   the memory fake runs the work on the caller's own task, so on both a panic unwinds the caller and storage goes on
   serving. The spec's record L records that the owner declined to map "a panic of the writer's thread" to
   `storage_unavailable`.
-- The owner's ruling of 2026-11-26 (record M) approved removing the bounds from these seven traits only, on three
+- The owner's ruling of 2026-11-26 (record M) approved removing the bounds from these seven traits only, on four
   conditions: the change is checked as a seven-bound diff, no planned consumer moves a borrowed view across threads,
-  and a panic in a callback is contained.
+  a panic in a callback is contained, and the restriction on Tokio runtime context in callback bodies is enforced.
 
 ## Decision
 
@@ -60,8 +60,8 @@ Facts read from `main` at `075f2b124`:
 5. **A panic in a callback is contained.** The SQLite `Storage::write` catches it before it leaves the job, rolls the
    transaction back so that nothing the callback did is committed, and lets the awaiting caller observe the panic by
    resuming it there (as the file reference does). The writer thread survives, no cause is latched in the failure
-   state, and the next write on the same storage commits. This maps no panic to `storage_unavailable` and changes
-   record L.
+   state, and the next write on the same storage commits. This maps no panic to `storage_unavailable` and leaves
+   record L unchanged.
 6. **Proof is an obligation of the SQLite adapter's PR.** It must show decisions 2 to 5 with named tests: the vectors
    A3-W2, A3-W3 and A3-W6 of the spec. The workspace compile check of the seven-bound diff (A3-W1) is a condition of
    the PR that carries this record.
