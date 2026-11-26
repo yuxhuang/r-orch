@@ -1,11 +1,15 @@
 //! Isolated reservation slice of R35, on the landed entity and lease port.
 //!
-//! This is not a process-start operation. The integrator must supply retry
-//! removal, start intents, admission (disk floor/run cap/unspooled finishes),
-//! dependency/goal/scope checks and dispatcher authorization before wiring it.
-//! Retrying tasks are deliberately refused until their queue can participate.
-//! An automatic retry keeps its attempt count, so it never resets the budget;
-//! only [`claim_explicit_rerun`] does, and only for a failed or cancelled task.
+//! This is not a process-start operation. The integrator must supply start
+//! intents, retry-row removal for the other two reservations (only
+//! [`claim_due_retry`] deletes a row), admission (disk floor/run cap/unspooled
+//! finishes), dependency/goal/scope checks and dispatcher authorization before
+//! wiring it.
+//! A `retrying` task is reserved only by [`claim_due_retry`], and only once the
+//! `due_at` of its retry row has passed; [`claim`] and [`claim_explicit_rerun`]
+//! refuse it. An automatic retry keeps its attempt count, so it never resets the
+//! budget; only [`claim_explicit_rerun`] does, and only for a failed or
+//! cancelled task.
 //! Prompt blobs (#134), workspace preparation and peer submission stay outside
 //! this helper. A preparing run stores empty prompt/workspace placeholders;
 //! nothing here emits a started event or launches a process.
@@ -40,6 +44,14 @@ pub enum Refusal {
     TaskUnavailable,
     AgentUnavailable,
     Held(Lease),
+    /// A due-retry reservation of a `retrying` task that has no retry row.
+    /// 1.0 dispatched such a task at once; whether and how a task whose row
+    /// is gone is recovered is for the integrator (T12), not for this helper.
+    NoRetry,
+    /// A due-retry reservation before the row's `due_at` (UTC milliseconds).
+    RetryNotDue {
+        due_at: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,6 +72,9 @@ enum Mode {
     /// A `failed` or `cancelled` task starts again with a fresh budget, which
     /// is what 1.0's `retry` followed by the next dispatch did in two saves.
     ExplicitRerun,
+    /// A `retrying` task whose retry row is due keeps the attempts it has and
+    /// loses its row.
+    DueRetry,
 }
 
 impl Mode {
@@ -67,6 +82,7 @@ impl Mode {
         match self {
             Self::Dispatch => status == TaskStatus::Todo,
             Self::ExplicitRerun => matches!(status, TaskStatus::Failed | TaskStatus::Cancelled),
+            Self::DueRetry => status == TaskStatus::Retrying,
         }
     }
 }
@@ -104,6 +120,32 @@ pub async fn claim_explicit_rerun(
     storage
         .transaction(caller, Lane::Claims, move |unit| {
             reserve(unit, request, Mode::ExplicitRerun)
+        })
+        .await
+}
+
+/// The reservation of an automatic retry that has come due. The task must be
+/// `retrying` and its retry row must be due (`due_at <= now_ms`, the retry
+/// port's rule and 1.0's `now >= due_at`; a row that 1.0 could not parse has no
+/// counterpart, since `due_at` is a number here). The row is read inside the
+/// transaction, so a row replaced after the scheduler chose the task is judged
+/// by its stored deadline. The budget is kept, not reset: the run is attempt
+/// `attempts + 1` of the task, as for [`claim`]; the row's own `attempt` is
+/// not interpreted (retry port). The row is deleted with the lease, the run row
+/// and the task update, so a refusal (approval hold, no row, not yet due,
+/// unavailable agent, held lease) or a storage error leaves the task, its row
+/// and its attempts as they were. A `todo`, failed or cancelled task is refused
+/// whatever rows it has, and any other row of the table is untouched. Like
+/// [`claim`] it checks no admission, dependency or goal rule and starts
+/// nothing.
+pub async fn claim_due_retry(
+    storage: &(impl Storage + ?Sized),
+    caller: Caller,
+    request: ClaimRequest,
+) -> Result<ClaimResult> {
+    storage
+        .transaction(caller, Lane::Claims, move |unit| {
+            reserve(unit, request, Mode::DueRetry)
         })
         .await
 }
@@ -147,13 +189,23 @@ fn reserve(unit: &mut dyn UnitOfWork, request: ClaimRequest, mode: Mode) -> Resu
     if !mode.accepts(task_data.status) || task_data.awaits_approval() {
         return Ok(ClaimResult::Refused(Refusal::TaskUnavailable));
     }
+    if mode == Mode::DueRetry {
+        let Some(retry) = unit.get_retry(&request.task_id)? else {
+            return Ok(ClaimResult::Refused(Refusal::NoRetry));
+        };
+        if retry.due_at > request.now_ms {
+            return Ok(ClaimResult::Refused(Refusal::RetryNotDue {
+                due_at: retry.due_at,
+            }));
+        }
+    }
     if crate::agent_service::AgentService::find_best_in(&task_data, vec![*agent_data]).is_none() {
         return Ok(ClaimResult::Refused(Refusal::AgentUnavailable));
     }
     // The reset is only a local value until the task update below, so every
     // refusal and error before it leaves the stored budget as it was.
     let spent = match mode {
-        Mode::Dispatch => task_data.attempts,
+        Mode::Dispatch | Mode::DueRetry => task_data.attempts,
         Mode::ExplicitRerun => 0,
     };
     let attempt = spent.checked_add(1).ok_or(StoreError::CounterExhausted)?;
@@ -168,6 +220,9 @@ fn reserve(unit: &mut dyn UnitOfWork, request: ClaimRequest, mode: Mode) -> Resu
         ClaimOutcome::Granted(lease) => lease,
         ClaimOutcome::Held(lease) => return Ok(ClaimResult::Refused(Refusal::Held(lease))),
     };
+    if mode == Mode::DueRetry {
+        unit.delete_retry(&request.task_id)?;
+    }
     let now = iso_from_epoch_ms(request.now_ms);
     let run = unit.create(Entity::Run(Box::new(Run {
         id: request.run_id,
