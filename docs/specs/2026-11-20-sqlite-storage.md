@@ -387,7 +387,7 @@ holds them.
 | R7 | When the work of a unit of work returns an error or the process stops before the commit, the storage shall keep none of its changes. | F, B3 | must | Bare filters `unit_of_work_keeps_nothing_after_an_error` and `a_failed_unit_of_work_keeps_no_setting_or_template_row_or_position`, each selecting the 3 entity references `memory_v2`, `queued_memory_v2` and `file_v2` (the plan's "T8 consumer contracts (issue 109)"; `cargo test -p orch-engine --test storage_conformance -- <filter>`); `cargo test -p orch-infra --test sqlite_crash -- kill_before_commit_keeps_nothing`, the production writer's process-crash boundary. SQLite shared registration at the port: T10; Linux |
 | R8 | Every entity shall carry a revision that is 1 at creation and goes up by one on every update, and an update or delete whose expected revision is not the stored one shall fail with `StaleRevision` and change nothing. | F, B3 | must | `revisions_and_positions_for_every_entity_family`, `stale_revision_is_refused_and_changes_nothing`; entity references (see plan crosswalk); Linux |
 | R9 | A list shall return at most 100 rows by default and at most 1,000 on request, shall refuse a larger limit, shall return a cursor while more rows remain, and shall count the matching rows only when asked. | F | must | `page_bounds_defaults_and_optional_count`; entity references; Linux |
-| R10 | A walk through a list by cursor shall return every row whose sort values did not change during the walk exactly once, whatever is inserted or deleted meanwhile, and a cursor used with another filter or sort shall be refused. One exception (issue 277, approved by the owner as option A) concerns only a cursor whose anchor, the last row of the page that issued it, is deleted before resume. In that case `InvalidCursor` (the client restarts) is allowed only when the cursor is a long-ID Task cursor (an ID too long for the token to carry whole; see the `Cursor` row) that falls back to its immediate successor, that successor is deleted before resume too, their integer sort keys tie, and their IDs first differ beyond the prefix the cursor carries (the boundary is set by the token's actual prefix capacity). Resuming from the shared prefix could skip or repeat surviving rows, so then the adapter returns `InvalidCursor` and the client must restart; a client that deletes only the rows of its returned page leaves the successor intact. The exception allows no other refusal for a deleted row. Every other obligation of R10 is unchanged. | F | must | `cursor_walk_is_stable_under_inserts_and_deletes`, `cursor_is_bound_to_project_filter_and_sort`; entity references; Task SQLite adapter (`orch-infra`, `sqlite::task_adapter::tests`): `a_deleted_row_is_resumed_at_the_shortest_fallback_and_without_one_it_is_refused` (the refusal) and `a_walk_returns_every_row_once_when_the_row_each_page_ends_on_is_deleted` (the continuation, with the successor intact); Linux |
+| R10 | A walk through a list by cursor shall return every row whose sort values did not change during the walk exactly once, whatever is inserted or deleted meanwhile, and a cursor used with another filter or sort shall be refused. One exception (issue 277, approved by the owner as option A) concerns only a cursor whose anchor, the last row of the page that issued it, is deleted before resume. In that case `InvalidCursor` (the client restarts) is allowed only when the cursor is a long-ID Task cursor (an ID too long for the token to carry whole; see the `Cursor` row) that falls back to its immediate successor, that successor is deleted before resume too, their integer sort keys tie, and their IDs first differ beyond the prefix the cursor carries (the boundary is set by the token's actual prefix capacity). Resuming from the shared prefix could skip or repeat surviving rows, so then the adapter returns `InvalidCursor` and the client must restart; a client that deletes only the rows of its returned page leaves the successor intact. The exception allows no other refusal for a deleted row. Every other obligation of R10 is unchanged. For the eight families other than Task (Agent, Team, Run, Message, Context, Config, Template and Goal) the owner's rulings of 2026-11-26 replace that exception with a list of refusals that is complete and holds no other: a cursor is refused only when it is malformed, bound to another project, generation, family, filter or sort, expired by the clock rules of "Cursors of the eight families other than Task", no longer held by the adapter (evicted, or the daemon stopped), or, for an anchor whose ordering tuple is over 65,536 bytes, when its row is not found with the tuple the cursor was issued with. A deleted, changed or recreated anchor whose tuple is at most 65,536 bytes, an anchor that has left the filter, an unrelated edit and a rolled-back unit of work refuse nothing, and no path may shift the boundary without an error. | F | must | `cursor_walk_is_stable_under_inserts_and_deletes`, `cursor_is_bound_to_project_filter_and_sort`; entity references; Task SQLite adapter (`orch-infra`, `sqlite::task_adapter::tests`): `a_deleted_row_is_resumed_at_the_shortest_fallback_and_without_one_it_is_refused` (the refusal) and `a_walk_returns_every_row_once_when_the_row_each_page_ends_on_is_deleted` (the continuation, with the successor intact); the eight other families on SQLite: the vectors of "Cursors of the eight families other than Task", named tests of the page PR, none built yet (pending); Linux |
 | R11 | Creating an entity shall give it the next `position` of its project and table, an update shall leave `position` unchanged, and `move_to_end` shall give it the next `position`. | F, B3 | must | `revisions_and_positions_for_every_entity_family`, `deletion_never_reuses_a_position`; entity references; Linux |
 | R12 | When several callers claim a lease for one task at once, exactly one shall be granted and the others shall be told who holds it; no agent shall hold two active leases. | F, B9 | must | `one_of_many_concurrent_claims_wins`, `an_agent_holds_at_most_one_active_lease`; memory and file lease references; SQLite shared registration: T10; Linux |
 | R13 | Every lease shall carry an epoch larger than every epoch issued before for that task, and a renew, release, event append or finish that names an older epoch shall be refused and change nothing. | F, S1 | must | `epochs_only_grow`, `a_stale_epoch_is_refused`, `release_ends_the_lease_and_keeps_the_epoch_counter`; memory and file lease references; `stale_lineage_epoch_missing_lease_and_task_mismatch_change_nothing` on memory and file event references covers append. Finish/restart: T12; SQLite shared registration: T10; Linux |
@@ -542,7 +542,7 @@ The contract of deliverable F. Rust signatures are fixed by the port PR and reco
 | `Revision` | Positive integer on every entity. `create` stores 1. `update(entity, expected)`, `delete(kind, id, expected)` and `move_to_end(kind, id, expected)` compare `expected` with the stored value and fail with `StaleRevision { kind, id, expected, actual }`. |
 | `PageRequest` | `{ limit, cursor, sort, with_count }`. `limit` defaults to 100; 0 or more than 1,000 is refused. |
 | `Page<T>` | `{ items, next_cursor, total }`. `next_cursor` is absent on the last page. `total` is present only when `with_count` was set. |
-| `Cursor` | Opaque text of at most 512 bytes: the sort, the last row's sort values and id, and a hash of the filter. It holds no snapshot. A Task cursor is the hex of at most 256 bytes: its digest also binds the project and the daemon generation, and it expires after 24 hours. When the last row's ID is longer than the token can carry whole (a long ID: 230 − 8 × k bytes, where k is the number of integer sort keys, so 230 for `Id`, 222 for `Position`, 214 for `Priority`, `CreatedAt` and `UpdatedAt`, 206 for `Default`), the cursor carries a reference instead of the ID: its byte length, a 16-byte SHA-256 digest, a fallback position for a row deleted before resume, and the longest prefix of the ID that fits (the prefix R10 refers to). |
+| `Cursor` | Opaque text of at most 512 bytes: the sort, the last row's sort values and id, and a hash of the filter. It holds no snapshot. A Task cursor is the hex of at most 256 bytes: its digest also binds the project and the daemon generation, and it expires after 24 hours. When the last row's ID is longer than the token can carry whole (a long ID: 230 − 8 × k bytes, where k is the number of integer sort keys, so 230 for `Id`, 222 for `Position`, 214 for `Priority`, `CreatedAt` and `UpdatedAt`, 206 for `Default`), the cursor carries a reference instead of the ID: its byte length, a 16-byte SHA-256 digest, a fallback position for a row deleted before resume, and the longest prefix of the ID that fits (the prefix R10 refers to). A cursor of any of the eight other families is also hex of at most 256 bytes, and one of three kinds, by the size of the anchor's ordering tuple: *inline*, which carries the whole tuple and an expiry; *retained*, which names a held copy of the whole original tuple; or *by lookup*, which names a held digest of it. It binds the project, the daemon generation, the family, the filter and the sort, and it expires after 24 hours (the kind decides on which clock). "Cursors of the eight families other than Task" under "Storage port v2" is the rule; the Task text of this row does not apply to them. |
 | `position` | Explicit order (R11). `move_to_end(kind, id, expected)`, which also raises the revision, is its only other writer. |
 | `claim_lease(new, now_ms)` | Inserts a lease only if the task has none and the agent has no active one, and gives it the task's next epoch. Returns `Granted(lease)` or `Held(lease)`. `now_ms` is UTC milliseconds from `Clock::now_ms()`; `expires_at` is checked `now_ms + LEASE_MS` (`LEASE_MS: i64 = 120_000`). |
 | `renew_lease`, `release_lease` | Renew takes `(task, lineage, epoch, now_ms)` and sets the same checked millisecond deadline as claim; release takes `(task, lineage, epoch)` without a clock input. Both refuse with `StaleEpoch` unless lineage and epoch are the lease's (R132). |
@@ -829,6 +829,223 @@ change (R49):
   change in the file reference only: the memory fake already told a present empty `updated_at` from an absent one,
   and the run key changed in both. Nothing here shows SQLite. T10 registers the same two scenarios on SQLite, and
   until they pass there this section is only the contract that SQLite has to meet.
+
+**Cursors of the eight families other than Task** (2026-11-26; the owner's rulings, quoted below;
+[ADR 0024](../decisions/0024-non-task-cursors.md)). A list of Agent, Team, Run, Message (`Messages` and
+`PendingMessages`), Context, Config, Template or Goal returns a cursor that resumes from the last row's *original
+ordering tuple* and never from the row's state at resume time. Task keeps its own cursor and its issue 277 exception,
+unchanged, and nothing below applies to it. What is written here is the contract; no code implements it yet and no
+vector below has run.
+
+The owner's words, as the lead recorded them. The answer to the two decisions of the lead's eighth escalation of this
+goal was "d1 approve; d2 - p / all new refusals and 64KiB rule are acceptable" (D2 approves option P for the eight
+families, with authority over the refusals listed under "The refusals" and no others; D1 concerns the `Send` bounds of
+the unit of work and is not treated here). The lead's ninth escalation put two questions on what an independent
+challenge of P found, and the owner's answer 1 was: "For anchors over 65,536 bytes, keep row lookup. Verify the
+bindings and the digest of the original ordering tuple before resuming. A missing anchor or a changed tuple returns
+`InvalidCursor`. C5b covers recreation at a different position. An unchanged tuple resumes after unrelated edits when
+the cursor is otherwise valid. No path may silently shift the boundary." Answer 2 was: "For inline non-Task tokens,
+expire only when `now > expires`. Reject as future-dated only when `expires - now > 24 h + 5 min`. Equality at either
+boundary passes that clock check. Ordinary clock corrections within those bounds permit resume. A forward step past
+expiry can expire the token early. Retained tokens use monotonic age." (C5b is the name the review gave to the refusal
+of a changed or recreated anchor over 65,536 bytes.) The two answers authorize no other refusal, no measurement of the
+owner's live copy and nothing beyond this wording.
+
+- *The tuple and its size.* The ordering tuple is the values the sort compares, in order, ending with the identity: the
+  integers (a position, an attempt, a status rank, the presence of `updated_at`) and the texts (a name, a time, the
+  identity). Its size *S* is the sum of the UTF-8 byte lengths of its texts plus 8 for each integer. A text counts
+  at its original length whether the row keeps it native or behind blob objects (R97), and *S* is taken from the
+  original values, before anything is hashed. An absent text (a goal's absent `updated_at`) counts 0 bytes, and the
+  presence integer of the goal default order counts 8 whether `updated_at` is absent, present and empty, or present.
+  "Bytes" always means UTF-8 bytes: a character count, and SQLite's `length()` on a TEXT value (which counts
+  characters), never stand for it.
+- *Three kinds of cursor, by the anchor's tuple.* The anchor is the last row of the page that issues the cursor, and
+  a cursor is issued only when more rows remain.
+
+  | Kind | When | The token holds | The adapter holds |
+  |---|---|---|---|
+  | Inline | The texts of the tuple fit the capacity of the table below | The whole tuple, an expiry and the binding | Nothing |
+  | Retained | Not inline, and *S* is at most 65,536 | A handle, the adapter's nonce and the binding | The whole original tuple, as bytes and integers |
+  | By lookup | *S* is at least 65,537, whether one component is behind blob objects or every component is native | A handle, the nonce and the binding | For each text, including the identity, its full SHA-256 and its byte length (40 bytes), and for each integer its value (8 bytes) |
+
+  A tuple that has a text over 65,536 bytes is over 65,536 bytes by itself, so a retained entry is always all native
+  and needs no blob read. At *S* of 65,536 the original tuple is retained; at 65,537 the cursor is by lookup, even
+  when every component is native. A tuple is never carried as a prefix, so no character is split and the arms leave no
+  prefix exception of the issue 277 kind.
+- *Inline capacity.* A token is the hex of at most 256 bytes, so the text of the `Cursor` is at most 512 bytes (the
+  Task token's own bound). The layout that gives the figures below is a header of 26 bytes (a version, the sort tag,
+  an expiry of 8 bytes and the 16-byte binding digest, as the Task token's `HEADER`), 8 bytes for each integer
+  component and one length byte for each text that comes before the identity, which takes the rest. The sum of the
+  texts' bytes, the identity included, is inline when it is at most 230 − 8*k* − *t*, where *k* is the number of
+  integer components and *t* the number of texts before the identity (counted whether or not the anchor's value is
+  absent):
+
+  | List and sort | Components, in order | Capacity in text bytes |
+  |---|---|---|
+  | Any list, sort `id`; context, config and templates by default | identity | 230 |
+  | Agents, default | `position`, identity | 222 |
+  | Agents, `name` | `name`, `position`, identity | 221 |
+  | Teams, default and `name` | `created_at` or `name`, identity | 229 |
+  | Runs, default with no task in the filter | `started_at`, identity | 229 |
+  | Runs, filter names a task (default and `Attempt`) | `attempt`, identity | 222 |
+  | Goals, default | status rank, presence of `updated_at`, `updated_at`, `position`, identity | 205 |
+  | Goals, `created_at` | `created_at`, `position`, identity | 221 |
+  | Messages, default | `created_at`, `position`, identity | 221 |
+
+  The figures are derived from the Task token's constants (`HEADER`, `MAX_RAW`) and have not been checked against an
+  encoding, because no encoder exists. The change that lands the encoder confirms or corrects this table in the same
+  PR. The table decides the arm, and the boundary vectors test it.
+- *What the adapter holds.* The retained entries and the entries by lookup are one table in the adapter's memory. It is
+  never written to the database: a list is a read, and a durable entry would turn every long-anchor page into a write
+  through the single writer, so a failed writer (R128) would stop reads. An entry records the tuple or its digests, the
+  project, the generation, the family, the filter, the sort and the instant of issue on a monotonic clock that is private
+  to the adapter. A page that issues a retained cursor creates its entry outside the transaction. If the unit of work
+  then rolls back, the entry names a position and is harmless.
+  - *Bounds.* At most 1,024 entries and at most 8,388,608 bytes (8 MiB) of charge, and both apply. A retained entry is
+    charged *S* (at most 65,536); an entry by lookup 40 bytes for each text and 8 for each integer (at most 104: a
+    goal in the default order has two texts and three integers). Fixed state (the digest, the handle, the instant, the
+    map slots) is not charged and is bounded by the entry count. On insert the oldest entries, by issue, are dropped
+    until both bounds hold with the new entry included, and no entry is refused admission. An entry is not refreshed
+    by use. The bounds are the owner's starting bounds and are unmeasured against how often walks run.
+  - *Expiry.* An entry that is older than 24 hours on the monotonic clock is dropped when a resume finds it or an
+    insert reaches it; no timer runs. Whether that clock counts the time of a suspended host is the host's, and this spec
+    makes no promise of wall-clock hours across a suspend.
+  - *The lock.* The table is behind a mutex that is taken with poison recovery (AGENTS.md), held only across map and
+    queue operations and never across a call into a leaf or a blob read. A panic in a unit of work that the writer contains
+    (the owner's D1, the unit of work on the writer's thread) leaves the table usable.
+- *The token.* An inline token is the hex of: version, sort tag, expiry (`i64` milliseconds, big-endian), the binding
+  digest, the tuple. A retained token or a token by lookup is the hex of: version, sort tag, the binding digest, the
+  adapter's 8-byte nonce and an 8-byte handle. It has no expiry field and no tuple. The binding digest covers the
+  project, the daemon generation, the family and the filter, under a domain string of its own (as the Task token's
+  does for Task). The nonce is random and made when the adapter is built, so a handle from an earlier process
+  cannot name a different anchor in a new one. The token is not secret and has no MAC, as for Task: a guessed or edited
+  handle that names a live entry of the same binding and sort can only start its holder's own walk at another valid
+  position within their own project, filter and sort, and shows no row that a walk from the start does not.
+- *Generation.* The daemon takes a new generation at every start (R41) and a restore takes another (R77). Every
+  non-Task cursor therefore ends at a restart, an inline one through its binding and a retained one through the nonce and
+  the table. A cursor ends at a restart for Task too, so this is not a new behaviour.
+- *Time.*
+  - *Inline.* The expiry is the wall-clock time of issue plus 24 hours. A resume is refused when `now > expires`, and
+    when `expires − now > 24 h + 5 min`. Equality passes both checks. So a clock set back by up to 5 minutes does not
+    refuse a token, a clock set back by *s* minutes (more than 5) refuses the tokens issued in the last *s* − 5 minutes
+    before the step, a clock set forward past an expiry expires the token early, and an expiry that a forger writes is
+    accepted up to `now + 24 h + 5 min` and not beyond. The Task token's check is the same without the 5 minutes and is unchanged.
+  - *Retained and by lookup.* The age is read from the monotonic clock held in the entry. A resume is refused when the
+    age is more than 24 hours; exactly 24 hours passes. A step of the wall clock in either direction changes nothing.
+- *Resume, all kinds: the checks before any row is read.* The token must parse; its sort tag must equal the request's sort;
+  its binding digest must equal the one computed for the request's project, generation, family and filter; an inline
+  token must pass the inline time rule; a retained token or one by lookup must carry this adapter's nonce. These checks
+  need only the token and are made before the table or a row is read. Then a retained token or one by lookup must name a
+  live entry whose stored binding and sort equal the request's and whose age passes. Any failure is `InvalidCursor`.
+- *Resume, inline and retained.* The page is the rows greater than the original tuple in the family's total order, in the
+  snapshot or unit of work that serves it, with the filter applied, up to the limit. No row is looked up. The anchor may
+  have been deleted, edited, recreated at another position or have left the filter: the boundary is the tuple the cursor
+  was issued with. A rolled-back unit of work leaves the cursor resuming at that boundary over the committed rows.
+- *Resume by lookup.* In the resuming snapshot or unit of work:
+  1. Scan the identities of the family in the project, unfiltered. The scan does not go through the filter or through any
+     query that the filter narrows (the message candidates query, for one, would not see an anchor that left the filter),
+     and it keeps the rows whose identity has the entry's byte length and the entry's SHA-256. A native identity is kept
+     only as a digest and a length, so no existing lookup by identity can find it; an indirect one is found by its stored
+     form, digest and length. An identity is unique in its project and family, so at most one row is kept, up to a
+     collision of SHA-256, which is the assumption the format already makes ("Indirect keys").
+  2. Read that row, compute its tuple for the token's sort, and compare every component with the entry: an integer must be
+     equal, a text must have the same byte length and the same SHA-256. Together with the bindings checked before, this
+     is the verification of the digest of the original ordering tuple that the owner's answer asks for.
+  3. All equal: the row's current tuple is the original tuple, and the page is the rows greater than it. No row found, or
+     any component unequal: `InvalidCursor`. The row is not checked against the filter and its revision is not consulted,
+     so an edit outside the order and a departure from the filter resume.
+  A row whose hydrated identity does not hash to its stored form is stored-data damage by R140, as on every read, and
+  is not `InvalidCursor`. A rename, a new time, a move, a goal's status change that changes its rank, a deletion and a
+  recreation at another position each give another tuple or no row. In an order that has `position`, a recreated row
+  always differs, because a position is never reused (R142, R143). A row deleted and recreated with the same identity and
+  the same ordering values, in an order without a position, is at the same place and resumes.
+  What the lookup proves: a resume goes on only from a row whose current tuple is the issued one, so the boundary is the
+  original tuple, and no path shifts it without an error. A rolled-back unit of work that created or changed the anchor
+  leaves no row, or other values, in a later view, so the cursor is `InvalidCursor` and never yields a row of the
+  rolled-back work.
+- *Resume from a key, never from a record.* A leaf takes the tuple as the position, compares the candidates with it by
+  the leaf's own order, and does no check of the anchor against the filter. The family, the filter and the sort stay
+  bound by the token's digest, which replaces the leaf's family check. The composition never passes a stored,
+  synthetic or looked-up record as the anchor; in the lookup arm it takes the tuple from the verified row. As built,
+  the three leaves (`sqlite::agent_team_run`, `sqlite::cctg` and `sqlite::retry_message::message`) take an anchor
+  record and answer `InvalidCursor` for one that the filter refuses. That refusal is withdrawn (pending: the page PR adds
+  a key-taking entry to each leaf), because an anchor that has left the filter alone refuses nothing. The memory
+  and the file reference already resume from a stored key and never read the anchor's row.
+- *The refusals.* A cursor of these eight families is refused, as `InvalidCursor`, only when it is: malformed, or
+  bound to another project, generation, family, filter or sort, or to another adapter instance (the nonce); expired by
+  the rules of "Time"; no longer held (evicted, or the adapter was stopped and built again); or in the arm by lookup
+  and its row is not found with its original tuple. Nothing else refuses: a deleted anchor of an inline or retained
+  cursor, an edit outside the order, a departure from the filter, a rolled-back unit of work, another `limit` or
+  `with_count`, and resuming on a reader after issuing on the writer or the reverse refuse nothing. A goal that
+  leaves a status filter *alone* is not refused; in the default order its status rank is part of the tuple, so a
+  lookup cursor whose goal changed status is refused for its changed tuple, and in the `created_at` order, where the
+  tuple holds no status, it resumes. The client rule is one for every refusal: restart the walk.
+- *Walkers (R49).* A CLI, TUI or web walk through every page buffers the pages; when a resume answers `InvalidCursor` it
+  drops its partial result and starts again at the first page, a small fixed number of times (the number is T17's), and
+  then ends with a defined error. It never shows a partial or repeated list. T17 owns this half.
+- *Unmeasured and open.* The 1,024 entries, the 8 MiB and the 24 hours are not measured against walk frequency, and the
+  length of real identifiers, names and times is not known (a count on the owner's live copy is reserved). A count of
+  evictions of entries that had not expired would supply that evidence; it is a follow-up and no condition. Before a
+  caller other than the owner can list (release 1.3), one caller's walks can evict another's: a per-principal limit on the
+  table is open. Option 1 of the review (keep the original bytes, or verified blob references, so that a changed or
+  recreated large anchor resumes instead of refusing) stays possible later as a relaxation, because every entry by
+  lookup already holds the digest and the length of each text; it was not chosen (ADR 0024).
+
+Vectors. Every one runs on the SQLite adapter for each family it names. The two shared cases
+`cursor_walk_is_stable_under_inserts_and_deletes` and `cursor_is_bound_to_project_filter_and_sort` also run on SQLite
+for all eight families. The references keep every bookmark for ever and neither expire nor evict, so the expiry,
+eviction, nonce and lookup rows are SQLite-only, as the Task long-ID tests are. The ids are those of the design review
+that proposed them. Its first draft's vectors C5 and C6 are replaced by P-L1, P-L2, P-T1, P-T3 and I-T1 to I-T4, and its
+C9 (a resume at the anchor's current row) is withdrawn. A result is a receipt of the PR that carries the test.
+
+| Vector | Input | Must |
+|---|---|---|
+| C7 | An anchor that fits the capacity of its list and sort, in each family | No table entry is made; the walk is exact |
+| P-B1 | For each row of the capacity table: a tuple whose text bytes equal the capacity, then capacity + 1, with multi-byte characters so that the characters are fewer than the bytes | Capacity: inline, no entry. +1: one retained entry. Both resume exactly after the anchor is deleted, and no character is split |
+| P-B2 | Sort `id`: an identity of 65,536 bytes, then 65,537. Agents in the default order: an identity of 65,536 bytes (a tuple of 65,544) | 65,536: retained, exact after deletion. 65,537: by lookup, `InvalidCursor` after deletion, exact while the row is unchanged. The agent: by lookup |
+| P-B3 | Teams by `name`: 32,768 and 32,768 bytes, then one byte more. Goal, default order: `updated_at` and identity of 40,000 bytes each | 65,536: retained, exact after deletion. One byte more, every text native: by lookup, `InvalidCursor` after deletion. The goal (80,024): by lookup |
+| Q1 | Agents by `name`: a name and an identity of 40,000 bytes each (a tuple of 80,008); the anchor is deleted | By lookup: `InvalidCursor`; the entry is charged 88 |
+| Q9 | Goal, default order: `updated_at` and identity of 65,536 bytes each | By lookup (a tuple of 131,096): admitted, charged 104, `InvalidCursor` after deletion; both bounds hold |
+| D3-A | Goal, default order, `updated_at` absent and then present and empty, identity of 65,512 bytes (a tuple of 65,536), then 65,513 | Retained at 65,512 and by lookup at 65,513, in both forms: the absent text counts 0 and the presence integer 8 |
+| D2-T | Sort `id`: an identity of 32,768 `é` (65,536 bytes), then 32,768 `é` and one ASCII byte (65,537 bytes; 32,769 characters) | Retained, then by lookup: the threshold counts bytes |
+| P-L1 | Fill 1,024 entries; issue one more | Only the oldest is `InvalidCursor`; the newest resumes; 1,024 entries remain |
+| P-L2 | 128 retained entries of 65,536 bytes each (integers count inside the 65,536, so any order serves), all resumed; then one more. And 1,025 entries by lookup of 104 bytes each | The charge of the first is exactly 8,388,608; exactly the oldest is evicted; the bytes never exceed 8,388,608. The 1,025th entry by lookup evicts exactly the oldest, because they are bound by count and not by bytes |
+| C3 | A token used with another filter, sort or project | `InvalidCursor` |
+| C4 | A retained token from one adapter instance, presented to a new instance on the same data directory that has issued the same handle number | `InvalidCursor`, never a page |
+| P-X1 | A retained token presented with another family whose filter is unit-like (Context, Config, Templates) | `InvalidCursor` |
+| P-X2 | A token with another sort, another project or a later generation (a restore or a new start) | `InvalidCursor`, decided from the token before the table is read |
+| P-X3 | The same token with another `limit` and `with_count` | Resumes exactly |
+| P-X4 | A token issued on the writer inside a unit of work and resumed on a reader snapshot, and the reverse | Inline and retained: exact. By lookup: judged against the resuming view |
+| P-S1 | A retained token; the adapter closed and opened again on the same data directory, the test passing the same generation value | `InvalidCursor`, by the nonce |
+| P-S2 | An inline token across the same reopen: with a new generation, and with the same generation value | New generation: `InvalidCursor`. Same value: resumes exactly (documents statelessness; the product never does this) |
+| P-T3 | A retained token of another length, or with a changed nonce or digest; and one with a changed handle | `InvalidCursor`; a changed handle that names a live entry of the same binding and sort resumes at that entry's position (the Task precedent: no MAC) |
+| P-W2 | A unit of work pages (issuing a retained entry) and then panics; the next list on the same storage | The list succeeds; earlier tokens resume |
+| P-T1 | A retained token at monotonic age 24 h exactly, and at 24 h + 1 ms | Resumes; then `InvalidCursor` |
+| P-T2, Q6 | A retained token; the wall clock stepped −30 s, +30 s and +48 h while the injected monotonic clock advances 1 h | Resumes in each case |
+| I-T1 | An inline token with `now == expires`, then `now == expires + 1 ms` | Resumes; then `InvalidCursor` |
+| I-T2 | A backward step of exactly 5 minutes right after issue (`expires − now == 24 h + 5 min`), then 5 minutes + 1 ms | Resumes; then `InvalidCursor` |
+| I-T3 | A forward step past the expiry | `InvalidCursor` (the approved early expiry) |
+| I-T4 | An inline token whose expiry claim is forged to `now + 24 h + 5 min`, then to `+ 1 ms` | Resumes; then `InvalidCursor` |
+| Q7′ | An inline token with the wall clock at −30 days, then at +30 days | `InvalidCursor` in both |
+| C1 | A Team page ending on a row whose name is 300 bytes; the row is deleted; resume | Every surviving row exactly once; no refusal |
+| C2 | Team names that share their first 300 bytes; a page ends on one; that row and the next two are deleted; resume | Every surviving row exactly once; no refusal (the Task scheme would refuse) |
+| P-F1 | `goals --status active`; a page ends on goal g (inline or retained); g is achieved; resume | Exact continuation after g's original tuple; no refusal |
+| P-F2 | Runs filtered by agent; the anchor is deleted (retained, an identity of 300 bytes) | Exact |
+| C8′ | A page issued inside a unit of work that returns an error; resume in a later view | Inline and retained: resumes at the exact original boundary over the committed rows. By lookup: see Q2 |
+| P-R1 | Teams by `name`: three names with a 60,000-byte prefix in common, the middle one of 130,000 bytes; the page ends on it; it is renamed past the third; resume | `InvalidCursor`; the third row is not skipped silently |
+| P-R2 | The same anchor deleted, then recreated with the same identity and another name | `InvalidCursor` |
+| P-R3 | A lookup anchor whose field outside the order (a team's task pool) is updated | Exact; no refusal |
+| P-R4 | A goal with an identity of 70,000 bytes, default order; an edit rewrites its `updated_at` | `InvalidCursor` |
+| Q4 | A lookup anchor whose name is replaced by another value of the same length | `InvalidCursor` |
+| Q5 | Teams by `name`, an identity over 65,536 bytes; the anchor is deleted and recreated with the same identity, name and other fields | Exact; no refusal |
+| Q2 | A unit of work creates a team with a name of 130,000 bytes, pages to it and rolls back; resume | `InvalidCursor`; never a row of the rolled-back work |
+| Q8 | Pending messages for a recipient; a native identity and a `created_at` that put the tuple over 65,536 bytes (by lookup); the anchor is delivered, so it leaves the filter and its ordering values do not change | Exact; no refusal |
+| N3a | A goal by lookup with native texts, default order, `--status active`; the anchor is achieved | `InvalidCursor` (its status rank changed) |
+| N3b | The same goal in the `created_at` order | Exact (it left the filter alone) |
+| D1-S | Two rows of one family whose identities have one byte length and different content, by lookup; an unrelated edit of both; resume | Exact: the row found is the anchor and not the other |
+| D2-L | An agent by `name`: a native identity of 30,000 `é` (60,000 bytes) and a name of 10,000 bytes; an unrelated edit; resume | Exact: the scan matched the byte length of 60,000, not 30,000 characters |
+| Q10 | Three mutants: the tuple comparison removed from the lookup; the unfiltered scan replaced by a find through the filter; SQLite `length()` on TEXT in place of the byte length | P-R1, P-R2, P-R4 or Q4 fails; Q8 and N3b fail; D2-L fails. Executed in the page PR, with the results recorded there |
+| P-E4 | An R49 full walk with an eviction, an expiry or a stop injected between two pages | Storage half: the resume is `InvalidCursor`, never a page. Walker half (T17): the output equals the 1.0 shape and order after the restart, or the walk ends with the defined error; never partial or repeated rows |
 
 The engine calls `move_to_end` only at the call sites deliverable B lists as observable. Until that list
 exists the rule is: wherever 1.0 saved a task, agent, goal or message.
@@ -1868,8 +2085,10 @@ default order itself.
 - *Indirect keys.* An identity, a name or an ordered time that is over 65,536 bytes has no native copy, so SQLite
   cannot order it from a column. It is ordered on the original bytes: a lookup uses the digest only to find candidates
   and compares bytes before it answers; a comparison that a digest, a truncated prefix or a normalized instant cannot
-  decide reads the original bytes through the blob adapter in the same snapshot; a cursor naming such a row resumes
-  at the same place. A page over rows of both kinds returns the same rows and cursors as the reference. The columns
+  decide reads the original bytes through the blob adapter in the same snapshot; a cursor naming such a row is a
+  cursor by lookup ("Cursors of the eight families other than Task" under "Storage port v2"): it resumes at the same
+  place only while the row is found with the ordering tuple the cursor was issued with, and is `InvalidCursor` when the
+  row is missing or its tuple changed. A page over rows of both kinds returns the same rows and cursors as the reference. The columns
   that hold the digest are those of "Physical schema of migration 004"; the way a page merges inline and indirect rows is
   the native CRUD slice's (see "Open").
   Speed for indirect keys is not a goal: R97's premise is that they are rare.
@@ -1878,7 +2097,9 @@ default order itself.
   rollback", so one corrupt row fails the whole page and no partial page is returned), applies the filter, sorts by the
   total order of the table above on the original UTF-8 bytes in Rust, continues after the saved anchor and then limits.
   The page limit is 1 to 1,000. An anchor that is an entity of another one of the four families, or one that the filter
-  refuses, is `InvalidCursor`; an anchor that is not an entity of these four families at all is `Unrepresentable`, and a
+  refuses, is `InvalidCursor` (pending: the refusal for a filter is withdrawn by "Cursors of the eight families other than
+  Task", which resumes from the anchor's ordering tuple and never from a record, and the page PR adds a key-taking entry
+  to the driver); an anchor that is not an entity of these four families at all is `Unrepresentable`, and a
   sort the family lacks (`created_at` on any family but Goal) is `InvalidPage`. The digest of an indirect key finds its
   row and decides no order. An exact lookup by an indirect key checks that the hydrated identity hashes to the stored digest and form, and then returns the record only if its identifier is exactly the bytes asked for: the digest locates a candidate and the requested bytes decide, so a different identifier that shares the locator is not found (`a_lookup_returns_only_the_identifier_that_was_asked_for`; the two are equal unless two texts share one SHA-256). This settles "Open in this section", item 1, for these
   four families by a method that costs one hydration of the family per page; it is correct for the rare large text
@@ -4260,7 +4481,7 @@ Security checklist:
 - Default bind and exposure: the Unix socket in `run/`, 0600 in a 0700 directory, same-uid check as in 1.0.
   Nothing listens on a network. `orch db` and `orch import` have no remote form.
 - Bounds on input size, count and rate: the frame and admission limits of protocol 2 stand. Added: 4 read
-  connections; list limit 1,000; key 128 characters; cursor 512 bytes; kept result 64 KiB; `db.query` 100,000 rows and 5 s; the
+  connections; list limit 1,000; key 128 characters; cursor 512 bytes; retained cursors 1,024 entries and 8 MiB of charge in the adapter's memory ("Cursors of the eight families other than Task"); kept result 64 KiB; `db.query` 100,000 rows and 5 s; the
   budgets of "Import bounds" on every 1.0 document (bytes, depth, nodes, aliases, expansion, tags), event
   line, listing and export file, each checked before anything is built from the input (R109 to R116);
   `.orch-project` 64 bytes; `legacy.config` 64 KiB.
