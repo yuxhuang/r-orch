@@ -1821,16 +1821,15 @@ entries (T15), and whatever the engine's context service does with an expired en
 
 *As built (the driver of PR 317).* `create` of a context entry stores what the `Principal` it was given holds, and no
 more: an Owner or a Worker gives its kind (`owner`, `worker`) and its identity, with the agent and the run NULL; a Task
-gives kind `task`, its `identity` and its `run` (`set_by_run_id`). The Task principal's `task`, `lineage` and `epoch` are
-not stored: they are the fencing token that the combined adapter authorizes (R132) before it passes the principal on,
-and the run names its task. No `Principal` variant carries an authoritative agent binding, so `create` never writes
-`set_by_agent_id`; the column is only preserved. The decision's words "its run and task binding" are therefore met for
-the run and not for the task, which has no column in this spec's table; whether one is needed is open (item 6 of "Open in
-this section"). A `create` of a context entry with no principal (the goal adapter passes none) is refused as
+gives kind `task`, its `identity` and its `run` (`set_by_run_id`). The driver reads no other member of the
+`Principal`; authorizing the principal (R132) belongs to the combined adapter, before it passes the principal on. No `Principal` variant carries an
+authoritative agent binding, so `create` never writes `set_by_agent_id`; the column is only preserved. How the combined
+adapter binds an authenticated caller is that adapter's prerequisite for composition (item 6 of "Open in this section").
+A `create` of a context entry with no principal (the goal adapter passes none) is refused as
 `Unrepresentable` before any write, and so is a principal whose identity or run is over 65,536 UTF-8 bytes, whose column
 is bounded; nothing is written, and no position is consumed. Config, Template and Goal creation need no principal.
 `update` and `move_to_end` never write the four `set_by_*` columns; a row whose kind is another word (`agent`, with a
-NULL identity) from an earlier source is kept byte for byte in the columns. The crate-private accessor that reads a row's provenance back, meant for export, reports a NULL identity as `None`, which it keeps apart from a stored empty identity (`Some("")`), reports a missing row as no provenance, and reports as stored-data damage (`EntityCorrupt`, family `context`, check `provenance`) a row whose kind is NULL or not a text, whose identity, agent or run is neither text nor NULL, or that does not hold the four columns; any text kind is valid, a legacy `agent` included (`a_null_identity_is_kept_apart_from_an_empty_one` and `a_provenance_row_that_is_not_kind_and_text_columns_is_damage`; the columns themselves are unchanged). Composing or consuming Context, which the staged Goal adapter does not do, has one prerequisite that this text records and does not decide: the combined adapter must bind the task as well as the run from an independently asserted, authenticated caller (open item 6), and the driver stays inactive until that composition is reviewed.
+NULL identity) from an earlier source is kept byte for byte in the columns. The crate-private accessor that reads a row's provenance back, meant for export, reports a NULL identity as `None`, which it keeps apart from a stored empty identity (`Some("")`), reports a missing row as no provenance, and reports as stored-data damage (`EntityCorrupt`, family `context`, check `provenance`) a row whose kind is NULL or not a text, whose identity, agent or run is neither text nor NULL, or that does not hold the four columns; any text kind is valid, a legacy `agent` included (`a_null_identity_is_kept_apart_from_an_empty_one` and `a_provenance_row_that_is_not_kind_and_text_columns_is_damage`; the columns themselves are unchanged). Composing or consuming Context, which the staged Goal adapter does not do, has one prerequisite that this text records and does not decide: the combined adapter must bind the caller's provenance from an independently asserted, authenticated caller (open item 6), and the driver stays inactive until that composition is reviewed.
 
 **Goal.** The goal adapter's columns for integration and publication (`integration_branch`, `integration_head`,
 `published_at`, `published_commit`, `published_by`) are not owned by the entity: a typed update and a move preserve
@@ -2131,8 +2130,8 @@ pull requests, not one, because the whole change was about 4,000 changed lines a
 (the migration) depends on no driver code, so the owner of the Message migration can build on 005 without waiting, and
 PR 317 (the driver, which needs 005's tables) and PR 318 (the goal adapter, which needs the driver) are a true code stack
 merged bottom to top. (2) `goals.created_at_text` carries a temporary `DEFAULT ''` (see "Physical schema of migration
-005"). (3) No `Principal` carries an authoritative agent binding, so `set_by_agent_id` is only ever preserved, and the
-Task principal's `task` is not stored beside its run (see "Context provenance"). (4) A native time column is NULL unless
+005"). (3) No `Principal` carries an authoritative agent binding, so `set_by_agent_id` is only ever preserved (see
+"Context provenance"). (4) A native time column is NULL unless
 the original string is an instant of whole milliseconds, as "Time and unsigned integers" says; the original string stays
 the authority. The range of that paragraph is enforced at both ends: the lower bound `0000-01-01T00:00:00.000Z` (`-62167219200000`) by a check in the driver's time helper and in that of the landed Agent, Team and Run adapter, which PR 314's layer therefore also changes, and the upper end by the parser's own ceiling. A parseable expanded negative year such as `-000001-12-31T23:59:59.999Z` projects NULL, and its original text stays the authority (`native_time_projection_is_bounded_below_by_year_zero` and `native_run_time_column_is_null_below_year_zero_and_text_stays_authoritative` in `sqlite::agent_team_run`, and the five added cases of `opaque_and_equivalent_instant_times_are_kept_and_project_only_when_exact`). (5) A page of one of the four families hydrates the whole family and sorts in Rust (see "Order, filters and
 cursors"). (6) The driver is tested by unit tests inside the library, because it is crate-private (R143). (7) The
@@ -2154,9 +2153,7 @@ authority. No code of the migration slice writes `local`, so nothing depends on 
 than 67,108,864 bytes can occur; if not, the multi-chunk prompt rule is untested weight and a prompt over that size is
 refused instead (see "The prompt of a run"). (4) Whether T21 keeps `local`'s record of a repeated 1.0 attempt now that
 the payload keeps its attempt. (5) The mapping of an authenticated Task principal to an agent association for Context
-provenance is the dispatcher's, not defined here; the driver never writes the agent column (see "Context provenance"). (6) Whether the
-Task principal's `task` needs a column of its own: the decision of 2026-11-23 says a Task principal supplies "its run and
-task binding", and this spec's table has only `set_by_run_id`. Composition makes it a prerequisite: before Context is composed or consumed, the combined adapter must bind the task as well as the run from an independently asserted, authenticated caller, in a form that the lead approves. The lead decides; the driver stays inactive until then. (7) Whether a later rebuild removes the
+provenance is the dispatcher's, not defined here; the driver never writes the agent column (see "Context provenance"). (6) The caller binding of Context provenance. Before Context is composed or consumed, the combined adapter must bind the provenance of a `create` from an independently asserted, authenticated caller, in a form that the lead approves. The lead decides; the driver stays inactive until then. (7) Whether a later rebuild removes the
 temporary `DEFAULT ''` of `goals.created_at_text`. (8) Whether the hydrate-the-family page of the four families is
 acceptable until a native merge of inline and indirect keys is asked for (it is correct and not fast; no performance
 budget exists for it). None blocks the documentation; (2) must be settled in the code
