@@ -68,6 +68,14 @@ pub enum SqliteError {
     LeaseCorrupt(String),
     #[error("stored retry data is damaged: {0}")]
     RetryMessageCorrupt(&'static str),
+    /// R140: names the family, the stored key form, the check and the locator,
+    /// never a text, a key or a path (R101).
+    #[error("stored message form {form} failed {check} at {locator}")]
+    MessageCorrupt {
+        form: i64,
+        check: &'static str,
+        locator: &'static str,
+    },
     #[error("SQLite writer is closed")]
     WriterClosed,
     #[error("SQLite connection and queue capacities must be greater than zero")]
