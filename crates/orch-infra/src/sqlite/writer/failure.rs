@@ -160,8 +160,9 @@ fn walk(error: &SqliteError, out: &mut Observation) {
         }
         Sql(error) => classify_sql(error),
         // Reading or opening a file can fail for reasons that prove nothing.
-        Io(_) | Confined(_) | TaskAccess(_) | TaskPublication(_) => Class::Transient,
-        TaskCorrupt { .. } => Class::Fatal(FatalCause::LogicalCorruption),
+        Io(_) | Confined(_) | TaskAccess(_) | TaskPublication(_) | EntityAccess(_)
+        | EntityPublication(_) => Class::Transient,
+        TaskCorrupt { .. } | EntityCorrupt { .. } => Class::Fatal(FatalCause::LogicalCorruption),
         // The error that a latched state answers with: already latched.
         StorageUnavailable(_) => Class::Ordinary,
         // R140 names SQLITE_CORRUPT, SQLITE_NOTADB and `TaskCorrupt` as fatal.
