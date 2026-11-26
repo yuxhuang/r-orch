@@ -4,7 +4,7 @@ status: proposed
 owner: architect; the lead turns the task table into tasks; the owner approves at the gate after the entry steps
 date: 2026-11-20
 spec: [../specs/2026-11-20-sqlite-storage.md](../specs/2026-11-20-sqlite-storage.md)
-decision: [ADR 0017](../decisions/0017-sqlite-storage.md) (proposed)
+decision: [ADR 0017](../decisions/0017-sqlite-storage.md) (proposed); [ADR 0023](../decisions/0023-unit-of-work-on-the-writer-thread.md) (accepted)
 
 ## Goal
 
@@ -927,7 +927,7 @@ owner-landing receipt for each exists.
 **Holds that stay.** The file runtime stays until the switch (T24). Nothing here wires the daemon or the public cursor,
 releases a slice that depends on the writer, or consumes an unmerged slice. Every hold of the task mapping carries over:
 the typed stored-data error of R140 and issue 127, issues 149, 152, 166, 167, 203 and 209, the signed, time, revision and cursor
-bounds, the writer policy, checkpoint and backlog rules, the contracts of `Send`, the shared conformance suites on SQLite
+bounds, the writer policy, checkpoint and backlog rules, the obligations of Amendment 3 (the unit of work stays on the writer's thread, a callback needs no runtime and a panic in it is contained), the shared conformance suites on SQLite
 and on both references, and the combined crash proof. The first complete frozen storage head goes to the combined crash proof of
 issue 149 and to the check of transaction-local intent reads and retention of issue 167 before any writer-dependent
 work is released. Independent code review
@@ -1090,6 +1090,31 @@ SQL round trip of the oversized-identity, name, task-pool and maximal-counter ca
 Config, Template or Goal, and no second migration. The slice releases none of the holds listed above; it is not a
 Storage acceptance and gives no credit for R142, R140, issue 127 or any gate line.
 
+### Amendment 3: the unit of work on the writer's thread
+
+The owner's ruling of 2026-11-26 (the spec's record M, answer D1; [ADR 0023](../decisions/0023-unit-of-work-on-the-writer-thread.md))
+removes the `Send` bound from `UnitOfWork` and its six write traits. The contract is the spec's "Amendment 3: the unit of
+work stays on the writer's thread" under "Storage port v2"; `docs/TRAITS-FROZEN.md` carries the signatures.
+
+| Step | What | Owner task | Verify |
+|---|---|---|---|
+| 1 | One PR carries this documentation and the seven-bound source change in `crates/orch-core/src/store*`: `Send` removed from `UnitOfWork`, `AttentionWrite`, `EventWrite`, `IntentWrite`, `LeaseWrite`, `RequestKeyWrite` and `RetryWrite`, one bound in each of seven files and no other line of `crates/`. No adapter and no caller is added | the T8 port | A3-W1: `cargo check --workspace --all-targets` on the PR's head, exit 0; `git diff --shortstat -- crates` reads 7 files changed, 6 insertions, 7 deletions; the PR's own Linux check and test |
+| 2 | The SQLite `Storage::write` runs the callback once, on the writer's thread, against the borrowed unit; it contains a panic (roll back, resume it on the awaiting caller, keep the thread, latch nothing); it never invokes the callback of a request it refuses | T10 | A3-W2, A3-W6, named tests of the adapter's PR |
+| 3 | The `compile_fail` doctest that shows a callback cannot move its unit to another thread, with a control that compiles | T10 | A3-W3 |
+| 4 | Every engine callback of T12 and later keeps its unit on its thread and its body free of a Tokio runtime | T12 to T24 | The shared suites on SQLite; review of each callback |
+
+Order. Step 1 comes first and needs no other slice. Steps 2 and 3 are part of the PR that makes SQLite a `Storage` and
+may not land without their vectors; nothing in step 1 wires a daemon path or the public cursor. Step 4 applies to
+each later PR.
+
+What this plan does not decide, and leaves with its owner: how the SQLite adapter serves a `ReadSnapshot` (thread, bound,
+R140 per reply); how R128's "tried again" reads for a failure inside a callback; the `Cursor` and R10 wording for the
+families other than Task (record M, D2). The cursor text is a separate revision and lands before public paging.
+
+Rollback. Step 1 is source-level: it touches no stored data, protocol or file format, and reverting it restores the
+bounds. Once the SQLite adapter lends a borrowed unit, restoring them would first need a different way to run the
+callback, which a new design review would have to supply (ADR 0023, "Consequences").
+
 ## Status
 
 | Item | State (implemented / verified on <platform> / pending) |
@@ -1106,6 +1131,7 @@ Storage acceptance and gives no credit for R142, R140, issue 127 or any gate lin
 | T10, failed top-level rollback (the spec's record L) | The contract is written by one documentation PR (spec R128, "Writer lanes", record L, and this plan), pending its review and the owner's merge. Nothing is built from it yet. PR 249 (the shared failure state) and PR 188 (the executor's hooks) are open and unwired, and PR 188 is to be resynchronised on PR 249 and corrected for the new cause. The writer on `main` still neither classifies nor latches |
 | T10, RFC 3339 time projection (issue 335) | One function, `rfc3339_millis` in `crates/orch-infra/src/sqlite/time_projection.rs`, fills the native time columns of the Team, Run and Message mappings (`teams.created_at` and `updated_at`, `team_members.joined_at`, `runs.started_at` and `finished_at`, `messages.created_at`, `expires_at` and `delivered_at`); the Agent adapter fills none. Issue 341 then adopted it for the Context and Goal columns (next row). Each mapping used a `jiff` parse of its own that accepted wider ISO 8601 spellings than RFC 3339 (a space separator, no seconds, an offset without a colon) and silently folded a leap second onto `:59`. The spec's "What is an RFC 3339 `date-time` (issue 335)" states the rule: `T`/`t` and `Z`/`z`, `-00:00` accepted as UTC, a space separator and a leap second NULL, a fraction of any length when its digits past the third are all `0`, and the range of "Time and unsigned integers"; it also lists which columns are filled and which reads compare them (every point read and every page selection of a team, a run, a message, and, since issue 341, a context entry or a goal). It was written as draft PR 337 (code head `a672e2ced`, on the Message mapping's PR 333 at `bdd32621a`; PRs 333 and 337 were closed unmerged) and was delivered by PR 350, which the owner squashed on 2026-11-26 as `372361041` (tree `af1bb485c`, the same as that of its earlier head `ad0a65a21`), on the replayed Message mapping, PR 349, squashed as `356e37666`; PR 351 (the Message boundary regression controls) followed as `87aae416f`. It is inactive: the daemon uses files. On Linux its author ran the `time_` tests (15 passed, 0 failed; the writer of this text re-ran them on that head with the same result) and `./xtask/gate.sh fast` three times: the first run failed the `orch-engine` `token_eco_preparation` guard on non-literal `.execute(` calls in the new test files (fixed), the second failed one unrelated `orch-daemon` timing test, and the third, on the same head as the second, passed (6,006 passed, 0 failed, 8 ignored). Its independent code review passed with conditions (this wording, and the tracking of the driver below) and its security review found nothing, both of the code at that head. Its hosted Linux check and test passed on PR 350's exact head `992032738` (tree `af1bb485c`) before the owner's squash. It did not change the Context, Config, Template and Goal driver (R143), which kept its own `jiff` helper until PR 354 (next row); the Task rule and the events' time are other contracts. The importer (T21) and `orch db verify` (T22) must call the same function and keep no parser of their own; neither has confirmed it yet. |
 | T10, RFC 3339 time projection of Context and Goal (issue 341) | The Context, Config, Template and Goal driver's time helper (`time` in `crates/orch-infra/src/sqlite/cctg/mod.rs`) is now a wrapper of `rfc3339_millis`, so `create`, `update` and the strict comparison of every read (point read and page selection) use the rule of the spec's "What is an RFC 3339 `date-time` (issue 335)". It fills `context_entries.created_at`, `updated_at` and `expires_at` and `goals.created_at` and `updated_at`; Config and Template have no time column, and the goal adapter, a wrapper over the driver, has no rule of its own. The driver's former `jiff` parse and its `TIME_MIN_MS` check are removed, and its tests use the shared `MIN_MILLIS`. It was PR 354, 4 paths and +166/-13 lines (the driver, its two test files and a changelog fragment, no schema, importer or verifier change), which the owner squashed on 2026-11-26 as `3a8909977` (tree `37ca3f29e`, sole parent `8b3ca7c24`). Its one regression test, `sqlite::cctg::time_tests::every_cctg_time_slot_follows_the_spelling_table_on_create_update_and_read`, runs the shared `SPELLINGS` table (84 rows) through the five columns: both families, each optional time present and absent, a `create` and an `update`, the storage class of each column, an exact read in a new transaction, and each column damaged by the kinds that apply to it (a wrong integer or a NULL where it holds an integer, an integer where it holds NULL) (672 stored records); it failed against the previous helper and passed with the change. On Linux the independent code review ran the `sqlite::cctg::` module (26 passed, 0 failed), `sqlite::goal_adapter::` (15 passed) and `sqlite::time_projection::` (2 passed), and four mutants (the old helper, a reader that skips the comparison, an update that keeps the old columns, a NULL written as 0) were each killed; its security review passed. The hosted Linux check and test passed on the combined merge of the replacement head with its base, and on the owner's squash on `main` (8,871 passed, 0 failed, 10 ignored or skipped). The previous helper projected spellings that the rule leaves NULL, and the reverse for two long zero fractions: on a disposable database that it wrote (336 synthetic rows), the new reader accepted 272 and refused 64 as `Corrupt` with check `projection`, in 128 time columns across 16 spellings. The disposition, in the spec's "Development databases written before issue 341", is to recreate an affected development database from its authoritative source before the mapping is consumed; no migration, repair, importer or verifier change; no real database was assessed. This lifts only the time-rule condition on consuming the four-family mapping. The caller binding of Context provenance, the R140 observation of caught corruption, the combined Storage adapter with R142 and R143's shared suites, the activation by T24, and the importer (T21) and `orch db verify` (T22) calling the same function, all stay pending, and the driver stays inactive: nothing outside the crate's SQLite module constructs it. |
+| T10 and T8, Amendment 3 (the unit of work on the writer's thread) | The contract is written by the documentation of one PR (ADR 0023, the spec's "Amendment 3" and record M, `docs/TRAITS-FROZEN.md` and this plan), which also carries the seven-bound source change and nothing else. The SQLite adapter, its vectors A3-W2, A3-W3 and A3-W6 and every engine caller are pending, and the daemon uses files. The PR is pending its independent review, its successful Linux check and test on the exact head, a CLEAN merge state, the lead's recommendation and the owner's merge. It records no result: a result is a receipt of the PR |
 | T2 to T27, except T4 and T4b | pending, as this table stood before 2026-11-21; this revision brings no other row up to date |
 
 ### Train 14: size of the replacement for PR 324 and PR 326
@@ -1286,6 +1312,7 @@ PR 323, PR 324 and PR 326 as the way the work lands, this note supersedes the la
   stop intent still crosses the skew.
 - **Peers.** The peer protocol does not change; a 1.0 peer and a 1.1 daemon are expected to interoperate, and
   T27 records the check.
+- **Amendment 3.** A source-level change with no on-disk effect; see "Amendment 3: the unit of work on the writer's thread".
 - **Schema.** Forward-only. A newer database refuses an older binary. The copy the daemon makes before each
   migration (spec R124) is the way back; a scheduled backup is not in 1.1 (AP9).
 
@@ -1297,7 +1324,7 @@ backup and restore, the copy before a migration, a failed writer, never writing 
 revision, the removed file procedures), ARCHITECTURE (§1, §2.1,
 §3.1 and §3.3, §4, §5.1 to §5.3, §6.1), `docs/TRAITS-FROZEN.md` §2, the manual (storage, import, `orch db`,
 attention, the plain statement about `preapproval`), a new `docs/storage.md` (schema, data directory, export
-format), CHANGELOG, ADR 0017, `docs/decisions/README.md`.
+format), CHANGELOG, ADR 0017, ADR 0023, `docs/decisions/README.md`.
 
 ## Open questions
 

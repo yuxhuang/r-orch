@@ -4,7 +4,7 @@ status: draft
 owner: architect; requirements approval: the owner, at the approval gate that follows the entry steps
 date: 2026-11-20
 plan: [SQLite storage for release 1.1](../plans/2026-11-20-sqlite-storage.md)
-decision: [ADR 0017](../decisions/0017-sqlite-storage.md) (proposed); consumer contracts: [ADR 0020](../decisions/0020-storage-consumer-contracts.md) (proposed)
+decision: [ADR 0017](../decisions/0017-sqlite-storage.md) (proposed); consumer contracts: [ADR 0020](../decisions/0020-storage-consumer-contracts.md) (proposed); the unit of work on the writer's thread: [ADR 0023](../decisions/0023-unit-of-work-on-the-writer-thread.md) (accepted)
 
 This spec is longer than the page that [the specs README](README.md) asks for. The goal requires it to fix
 names, bounds and the schema split before any code, so those are kept here as reference sections after the
@@ -200,6 +200,15 @@ the fatal row of "When a transaction fails", the paragraph "On the writer" and t
 record L itself; the plan's T10 rows follow. It maps no panic to `storage_unavailable`, reopens no connection, and
 changes no retry rule, time, other class or finish-spool rule. No independent review had read this revision when it was
 written.
+
+The revision that carries this paragraph records the owner's ruling of 2026-11-26 on the unit of work (record M, which
+applies its answer D1 and no more) and changes nothing else. It removes the `Send` bound from `UnitOfWork` and its six
+write traits, and states what the callback, the borrowed unit, a Tokio runtime and a panic mean after that
+("Amendment 3: the unit of work stays on the writer's thread" under "Storage port v2",
+[ADR 0023](../decisions/0023-unit-of-work-on-the-writer-thread.md)). The rows edited are the `Storage::write` row of the
+port table (and a new `UnitOfWork` row), the paragraph of Amendment 3, and record M with the count of its parts. It
+changes no requirement row, no cursor text (R10, the `Cursor` row and the Task exception stand as written) and no read
+bound. No independent review had read this revision when it was written.
 
 ## Source
 
@@ -538,7 +547,8 @@ The contract of deliverable F. Rust signatures are fixed by the port PR and reco
 |---|---|
 | `Caller` | `{ principal, project }`, passed to both entry points. `Principal` is `Owner { identity }`, `Worker { identity }` or `Task { identity, task, run, lineage, epoch }`. The lineage is the restore lineage of R77; a caller holds it with its epoch (R132). |
 | `Storage::read(caller)` | Returns a `ReadSnapshot`: every read through it sees the same committed state. |
-| `Storage::write(caller, lane, work)` | Runs `work` on a `UnitOfWork` in one transaction on the writer. An error from `work` rolls everything back. `lane` is `Claims`, `Entities`, `Events` or `Maintenance`. |
+| `Storage::write(caller, lane, work)` | Runs `work`, an owned `Send + 'static` callback, once and on the writer's thread, on a `UnitOfWork` that it lends for the call, in one transaction. An error from `work` rolls everything back, and so does a panic of `work` ("Amendment 3" below). `lane` is `Claims`, `Entities`, `Events` or `Maintenance`. |
+| `UnitOfWork` | The `&mut dyn UnitOfWork` that `work` receives. It is not `Send`: it is used on the thread that runs `work` and only until `work` returns ("Amendment 3" below). |
 | `Revision` | Positive integer on every entity. `create` stores 1. `update(entity, expected)`, `delete(kind, id, expected)` and `move_to_end(kind, id, expected)` compare `expected` with the stored value and fail with `StaleRevision { kind, id, expected, actual }`. |
 | `PageRequest` | `{ limit, cursor, sort, with_count }`. `limit` defaults to 100; 0 or more than 1,000 is refused. |
 | `Page<T>` | `{ items, next_cursor, total }`. `next_cursor` is absent on the last page. `total` is present only when `with_count` was set. |
@@ -971,6 +981,61 @@ nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or
   durable restore with a new lineage (AP14 is open) and the whole-retry export and import round trip. T27 owns the
   second-host peer check (R89). The plan's "T8 consumer contracts (issue 109)" lists the verification names and the
   follow-ups N-a to N-c.
+
+**Amendment 3: the unit of work stays on the writer's thread** (2026-11-26; the owner's ruling, record M of "Owner's
+answers"; [ADR 0023](../decisions/0023-unit-of-work-on-the-writer-thread.md)). The port's write traits were `Send`, and
+no consumer needs that. The SQLite adapter's unit of work borrows the writer's open transaction, and a borrow of it
+cannot be `Send`: `rusqlite`'s `Connection` is `Send` and not `Sync`. The amendment removes the bound and states what
+that asks of a callback. It changes no stored data, no protocol and no other signature.
+
+- *Exactly seven removals.* `Send` is removed from `UnitOfWork` (a supertrait), `AttentionWrite`, `EventWrite`,
+  `IntentWrite`, `LeaseWrite`, `RequestKeyWrite` and `RetryWrite`, one bound in each of seven files of
+  `crates/orch-core/src/store*`, and from nothing else.
+- *Preserved.* `ReadSnapshot`, `AttentionRead`, `EventRead`, `IntentRead`, `LeaseRead` and `RetryRead` keep `Send + Sync`;
+  `Storage` keeps `Send + Sync`; `StorageExt` and `WriteWork` keep their signatures and their `Send + 'static` bounds.
+  Task cursors, R10 and the `Cursor` row are not touched.
+- *The callback is owned and runs once, on the writer.* A backend invokes an admitted callback exactly once, on the
+  thread that performs its writes (the writer's thread on SQLite, a blocking-pool thread in the file reference, the
+  caller's own task in the memory fake), and never replays it. A request that a backend refuses before it is admitted
+  (answered `overloaded` at its deadline, R98 and R128; refused because the writer has failed) never runs its callback.
+- *A borrowed view stays on its thread.* The `&mut dyn UnitOfWork` that a callback receives, and anything borrowed from
+  it, is used only on the thread that runs the callback and only until it returns. It is not sent to another thread, to
+  a spawned task or into a scoped thread. The compiler enforces this: `dyn UnitOfWork` is not `Send`, so a
+  `&mut dyn UnitOfWork` is not either. The reference types `Session` and `View` stay `Send` as concrete types, and a
+  callback does not see them.
+- *A callback depends on no Tokio runtime.* The SQLite adapter runs the writer (`Writer::run`, a blocking function) on a plain
+  thread, which has no runtime context. A callback calls neither `Handle::current()` nor `block_on` nor anything else
+  that needs a runtime. Sending its result on a `tokio::sync::oneshot` channel, which `StorageExt::transaction` does,
+  needs none and stays allowed. The two references run a callback on a Tokio thread, where such a call would work by
+  accident, so the shared suites run on SQLite are what catch it.
+- *A panic in a callback is contained.* The SQLite `Storage::write` catches the unwind before it leaves the writer's
+  job. Nothing that the callback did is committed. The awaiting caller observes the panic: it is resumed on the caller,
+  as the file reference resumes it (`blocking` in `crates/orch-infra/src/storage/v2.rs`) and as the memory fake, which
+  runs the callback on the caller's own task, unwinds it. The writer's thread survives and serves the requests that
+  follow. No cause is latched in the failure state and no request is answered `storage_unavailable` for it, so record
+  L stands: the owner declined to map "a panic of the writer's thread" to that code, and this panic never unwinds past
+  the job. The next write on the same storage commits. A panic in the adapter's own code, outside the callback, is not
+  contained by this amendment: `Writer::run` keeps its documented behaviour for it (the worker is dropped and every
+  queued receipt is closed).
+- *Not decided here.* How the SQLite adapter serves a `ReadSnapshot` (its thread, its bound and its R140 handling per
+  reply). How R128's "tried again" reads for a failure that happens inside a callback: a callback is `FnOnce` and is
+  never replayed, so only what the writer itself issues (`BEGIN`, `COMMIT`) can be tried again; R128's text is unchanged
+  and the point is open. The wording of the `Cursor` row and R10 for the families other than Task (record M, D2).
+
+What the adapter's PR must show. A result is a receipt of the PR that carries the check, not a statement of this spec.
+The vector numbers keep the order of the design review that proposed them, so 4 and 5 (which applied only if the owner
+had refused the amendment) are not used.
+
+| Vector | Input | Must |
+|---|---|---|
+| A3-W1 | `cargo check --workspace --all-targets` on the head of the PR that carries the seven removals (a condition of that PR, run before it was drafted) | Exit 0. The PR's change to `crates/` is those seven bounds in seven files (`git diff --shortstat -- crates`: 7 files changed, 6 insertions, 7 deletions) and no other line |
+| A3-W2 | A callback that calls `create` once and then panics, through `StorageExt::transaction` on SQLite, then a second write | The first leaves nothing: a snapshot opened afterwards does not see the row. The awaiting caller observes the panic. The failure state shows no cause and the writer still serves. The second write commits and reads back. The references already behave this way; the vector may be registered as a shared case if its harness can catch the panic on all three |
+| A3-W3 | A `compile_fail` doctest: a callback that moves the `&mut dyn UnitOfWork` it was lent into `std::thread::scope(\|s\| s.spawn(..))`, and a control doctest that uses the same unit on the callback's own thread | The first does not compile, the control does, so the failure is the `Send` requirement and not another error. The precedent is the `compile_fail` doctest of `ConnectionHandle` in `crates/orch-infra/src/sqlite/connection.rs` |
+| A3-W6 | Two requests through `Storage::write`: the first holds the writer, and the second's deadline passes while it is queued behind it. A third request that is admitted and commits | The second is answered `overloaded` and its callback's invocation counter is 0 after the first finishes. The third callback's counter is exactly 1 |
+
+*Owners.* T10 owns the SQLite write path and the vectors A3-W2, A3-W3 and A3-W6. Every engine callback of T12 and
+later follows the rules above: its unit stays on its thread and its body needs no runtime. A later requirement to move a
+unit between threads needs a new design review and an owner's ruling, and is not met by restoring the bound silently.
 
 ## Schema for 1.1
 
@@ -4420,9 +4485,10 @@ overlaps. A decision and a point that overlap are still two questions.
 
 ### Owner's answers
 
-One row for each id. The record has twelve parts, named by a letter in the table; the tenth records that no
-answer was given, the eleventh a ruling on platforms that answers no id, and the twelfth a ruling on one cause of
-R128's fatal class that answers no id either and changes none of the answers:
+One row for each id. The record has thirteen parts, named by a letter in the table; the tenth records that no
+answer was given, the eleventh a ruling on platforms that answers no id, the twelfth a ruling on one cause of
+R128's fatal class that answers no id either, and the thirteenth a ruling on the thread of the unit of work and on
+non-Task cursors that answers no id and changes none of the answers:
 
 - **A.** The owner's first answers of 2026-11-20, to six points. Their message could not be read again
   when this table was written. Nothing here quotes it; the six rows are carried from the earlier revision
@@ -4590,6 +4656,25 @@ R128's fatal class that answers no id either and changes none of the answers:
     answered. It approves no PR. PR 249 and the corrected PR 188 each still need their independent reviews, a
     successful Linux check and test on the exact head, a CLEAN merge state and the lead's recommendation, and the owner
     alone merges them, bottom to top.
+- **M.** The owner's ruling of 2026-11-26, recorded by the lead as the answer to the two decisions of escalation 8 of
+  this goal: D1, whether the unit of work may lose its `Send` bounds, and D2, how the families other than Task page. The
+  answer as recorded, kept word for word: "d1 approve; d2 - p / all new refusals and 64KiB rule are acceptable". This
+  spec reads D1 as follows and restates no more.
+  - *What D1 settles.* The bounds are removed from `UnitOfWork`, `AttentionWrite`, `EventWrite`, `IntentWrite`,
+    `LeaseWrite`, `RequestKeyWrite` and `RetryWrite` only. Every read, `Storage`, `StorageExt` and `WriteWork` are
+    preserved. The callback is a `Send` closure that runs once on the writer's thread. "Amendment 3: the unit of work
+    stays on the writer's thread" carries it.
+  - *The conditions D1 carries.* The seven-bound diff is checked with `cargo check --workspace --all-targets` before
+    the amendment PR is drafted (vector A3-W1). The planned consumers are confirmed never to transfer a borrowed view
+    across threads, and if that check fails the change stops and the failing consumer is reported. A panic in a
+    callback is contained, with a rollback, an observable panic and a later write that succeeds (A3-W2). The
+    restriction on Tokio runtime context in callback bodies is enforced.
+  - *What D1 does not do.* It changes no read, no cursor rule and no stored data, and it releases no implementation:
+    the SQLite adapter and every engine caller keep their own reviews, their successful Linux check and test on the
+    exact head, a CLEAN merge state and the lead's recommendation, and the owner alone merges.
+  - *D2 is not applied by this revision.* The answer to D2 is quoted above so that the record is whole. The wording of
+    the `Cursor` row and of R10 for the families other than Task is a separate revision of this spec, which extends this
+    record and lands before any public paging; this revision changes no cursor text.
 
 "As recommended" means, for O1 to O10, AP1 to AP13 and D1 to D8, the recommendation and its condition in
 the approval request of 2026-11-20; and for AP14 to AP20, which that request did not hold, the
