@@ -1675,16 +1675,70 @@ absent `ttl_ms` and `0`.
 **Time and unsigned integers.** Every time is stored in the detail as the exact string the caller supplied, so an
 opaque string, a numeric offset, a fractional precision and two spellings of one instant are all kept and are all
 different values. A native time column serves time queries only and is never the order of a text: it holds UTC
-milliseconds (the unit of this schema) when the string parses as an RFC 3339 instant that is a whole number of
-milliseconds within `0000-01-01T00:00:00.000Z` to `9999-12-30T22:00:00.999Z`, by checked arithmetic, and NULL
-otherwise: an opaque string, a value out of range, a fraction finer than a millisecond (no rounding), or an absent
-time. These columns are nullable for that reason. An unsigned 64-bit value is stored in the detail as an exact
-integer. A native signed counter column holds the value when it is at most `9223372036854775807` and NULL above it
+milliseconds (the unit of this schema) when the string is an RFC 3339 section 5.6 `date-time` that names an instant
+that is a whole number of milliseconds within `0000-01-01T00:00:00.000Z` to `9999-12-30T22:00:00.999Z`, by checked
+arithmetic, and NULL otherwise. These columns are nullable for that reason. An unsigned 64-bit value is stored in the
+detail as an exact integer. A native signed counter column holds the value when it is at most `9223372036854775807`
+and NULL above it
 (or when the value is absent); the detail tells an overflow from an absence, and any calculation that needs the whole
 range reads the exact value from the detail. Nothing is truncated, saturated, clamped or converted through a
 floating-point value, and no clock supplies a default. The port's own counters (revision, position, the claim
 counters) keep the independently checked bounds of the entity port and of "Task format v1" (checked signed range,
 refusal with no change before anything is written).
+
+**What is an RFC 3339 `date-time` (issue 335).** A string projects only if every part below is present, in this form,
+in ASCII, with nothing before or after it; any other string keeps its original text and has a NULL column, and is never
+refused, rounded or normalized.
+
+- `YYYY-MM-DD`, then `T` or `t`, then `hh:mm:ss`: four, two and two digits, a month and a day the calendar has,
+  hours `00` to `23`, minutes `00` to `59`, seconds `00` to `59`. The lower-case `t` and `z` are the ones that
+  RFC 3339 section 5.6 allows for its upper-case literals, and are accepted.
+- An optional fraction: `.` and one or more digits, of any length (the RFC's `1*DIGIT` has no bound). It is whole
+  milliseconds when every digit after the third is `0`, so `.5`, `.50`, `.500000000` and `.5000000000000` name 500
+  milliseconds, and `.0005`, `.0000000001` and `.5000000000001` are NULL.
+- The offset: `Z` or `z`, or `+` or `-` followed by `hh:mm` with a colon, hours `00` to `23` and minutes `00` to
+  `59`. `-00:00` is accepted and is UTC; the original string stays the authority, so it is not rewritten.
+- A leap second (`:60`) is NULL, whatever the date: it names no instant of the millisecond timeline, and folding it
+  onto `:59` would give two different strings one value.
+- The instant, after the offset is applied, is inside the range above. A valid `date-time` after it, such as
+  `9999-12-31T23:59:59Z`, is NULL.
+- Wider ISO 8601 spellings are NULL even where a date library would parse them: a space for `T` (RFC 3339 allows it
+  only as an application's choice outside its grammar, and this format does not make that choice), no seconds,
+  basic format (`20261120T100000Z`), an offset without a colon or with hours alone, a comma fraction, a bracketed
+  zone or annotation, a signed, expanded or five-digit year, a missing offset, and any surrounding white space.
+
+The syntax is checked by this format's own code and not by a library's parser, so a library upgrade cannot widen or
+narrow it: only the calendar and the offset arithmetic are the library's (`jiff`), on fields already parsed
+(`rfc3339_millis` in `crates/orch-infra/src/sqlite/time_projection.rs`). Its test table `SPELLINGS` is the
+reference: `time_projection::tests::every_spelling_projects_or_stays_null_exactly_as_the_table_says` runs it, and the
+Agent, Team and Run adapter (`agent_team_run::time_tests::every_native_time_slot_follows_the_spelling_table_on_write_and_on_read`)
+and the Message mapping (`retry_message::message::time_tests::every_message_time_slot_follows_the_spelling_table_on_write_and_on_read`)
+write and read every row through each of their time slots. A read compares each stored column with this derivation, so
+a row whose column came from a wider spelling reads as stored-data damage. No released version writes one, because 1.0
+has no SQLite backend and these mappings are not constructed outside the crate's SQLite module; a development database
+that a build from before this rule wrote can hold one, and this rule adds no migration for it.
+
+*Which columns it fills, and which reads check them.* `rfc3339_millis` fills `teams.created_at`, `teams.updated_at`,
+`team_members.joined_at`, `runs.started_at` and `runs.finished_at` of the Agent, Team and Run adapter, and
+`messages.created_at`, `messages.expires_at` and `messages.delivered_at` of the Message mapping. The Agent adapter fills
+no time column: `agents.created_at`, `updated_at` and `last_run_finished_at` exist in the table, but it neither derives
+nor compares them, and an update or a move keeps what is stored. Every point read of a team, a run or a message, and
+every page selection of them (it reads each candidate row through the same read), compares the columns above with the
+derivation and refuses a difference as corruption, never repairing it; a team's `team_members.joined_at` is compared
+with the rest of its member rows. Nothing outside the crate's SQLite module constructs these mappings, so no daemon
+path, importer or `orch db verify` reads these columns yet.
+
+*Which families follow it.* The Agent, Team and Run adapter and the Message mapping call this one function for every
+column listed above. The Context, Config, Template and Goal driver (R143) does not call it, and the grammar above is
+not a statement about its four families: its own time helper parses with `jiff` directly, so it projects spellings that
+this rule leaves NULL (checked with `jiff` 0.2.38: a space separator, no seconds, an offset without a colon, and a leap
+second folded onto `:59`), in the same range. Issue 341 tracks the adoption of this function there. It is a change of
+its own, made on a base that holds both mappings and qualified independently: the spelling table runs through the
+driver's persisted writes and reads, the original text and a mismatched projection are checked, and rows written
+earlier in development are assessed. Consuming the four-family mapping stays gated until that change has landed. The
+Task (its canonical-only rule, "Task format v1") and the staged goal adapter (the canonical-only rule of "Staged SQLite
+goal timestamp and position limits") keep the rules those sections state, and the events' time keeps its own; this
+function does not change them.
 
 **Revision and position.** Both are native port metadata and are in no detail. `create` stores revision 1, and `update`,
 `delete` and `move_to_end` check the caller's expected revision, as for tasks. A position is monotonic per project and
