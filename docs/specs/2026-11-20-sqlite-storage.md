@@ -2189,9 +2189,20 @@ under single-parent squash merges they cannot land as two squashes, because the 
 that the lower one added, and the driver's integrity tests must land with the implementation they check; so they are
 one pull request. PRs 314, 317, 318, 324 and 326 are kept open as history, not to be merged. (2) `goals.created_at_text` carries a temporary `DEFAULT ''` (see "Physical schema of migration
 005"). (3) No `Principal` carries an authoritative agent binding, so `set_by_agent_id` is only ever preserved (see
-"Context provenance"). (4) A native time column is NULL unless
-the original string is an instant of whole milliseconds, as "Time and unsigned integers" says; the original string stays
-the authority. The range of that paragraph is enforced at both ends: the lower bound `0000-01-01T00:00:00.000Z` (`-62167219200000`) by a check in the driver's time helper and in that of the landed Agent, Team and Run adapter, which PR 314's layer therefore also changes, and the upper end by the parser's own ceiling. A parseable expanded negative year such as `-000001-12-31T23:59:59.999Z` projects NULL, and its original text stays the authority (`native_time_projection_is_bounded_below_by_year_zero` and `native_run_time_column_is_null_below_year_zero_and_text_stays_authoritative` in `sqlite::agent_team_run`, and the five added cases of `opaque_and_equivalent_instant_times_are_kept_and_project_only_when_exact`). (5) A page of one of the four families hydrates the whole family and sorts in Rust (see "Order, filters and
+"Context provenance"). (4) A native time column of the four families is
+NULL unless the original string is an instant of whole milliseconds that the driver's own time helper (`time` in
+`cctg/mod.rs`) accepts; the original string stays the authority. That helper parses with `jiff::Timestamp`. It does not
+follow the RFC 3339 rule of "Time and unsigned integers" (`rfc3339_millis`, "What is an RFC 3339 `date-time` (issue
+335)"), so it also projects the spellings that rule leaves NULL (a space separator, no seconds, an offset without a
+colon, and a leap second folded onto `:59`; checked with `jiff` 0.2.38), and issue 341 tracks its adoption of that
+function ("Which families follow it"). Its range is the one of that paragraph, enforced at both ends: the lower bound
+`0000-01-01T00:00:00.000Z` (`-62167219200000`) by a check in the helper (`TIME_MIN_MS`), and the upper end
+`9999-12-30T22:00:00.999Z` by the ceiling of the parser. The Agent, Team and Run adapter has no helper of its own: it
+calls `rfc3339_millis`, which applies the grammar and the range itself. A parseable expanded negative year such as
+`-000001-12-31T23:59:59.999Z` projects NULL in both, and its original text stays the authority (the driver:
+`opaque_and_equivalent_instant_times_are_kept_and_project_only_when_exact` in `sqlite::cctg`; the adapter:
+`native_time_projection_is_bounded_below_by_year_zero` and
+`native_run_time_column_is_null_below_year_zero_and_text_stays_authoritative` in `sqlite::agent_team_run`). (5) A page of one of the four families hydrates the whole family and sorts in Rust (see "Order, filters and
 cursors"). (6) The driver is tested by unit tests inside the library, because it is crate-private (R143). (7) The
 migration refuses every populated predecessor of the four tables, as "Migrations and compatibility" says, and its
 guard is the registry's atomic one of 003 and 004. (8) Blob garbage collection reaching `entity_blob_refs` stays T15's
