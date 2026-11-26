@@ -194,7 +194,7 @@ pub trait IntentRead: Send + Sync {
 
 /// Operations share the enclosing unit of work, so an intent commits or rolls
 /// back with the run, the lease and the task status written beside it.
-pub trait IntentWrite: Send {
+pub trait IntentWrite {
     /// Stores a pending intent with the next id. Payloads are never merged: two
     /// adds of one payload are two intents. Refused as
     /// [`StoreError::InvalidIntent`] for a payload that fails

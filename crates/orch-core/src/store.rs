@@ -131,7 +131,6 @@ pub trait UnitOfWork:
     + leases::LeaseWrite
     + request_keys::RequestKeyWrite
     + retries::RetryWrite
-    + Send
 {
     fn caller(&self) -> &Caller;
     fn get(&self, kind: EntityKind, id: &str) -> Result<Option<Record>>;

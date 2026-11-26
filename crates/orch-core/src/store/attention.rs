@@ -342,7 +342,7 @@ pub trait AttentionRead: Send + Sync {
     ) -> Result<AttentionPage>;
 }
 
-pub trait AttentionWrite: Send {
+pub trait AttentionWrite {
     fn get_attention(&self, id: u64) -> Result<Option<Attention>>;
     fn attention_page(
         &self,

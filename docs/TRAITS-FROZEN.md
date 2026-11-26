@@ -15,11 +15,17 @@ against it. Changing anything here needs an explicit amendment — it breaks
 > `AsyncRead`/`AsyncWrite` trait objects instead of `tokio::process::Child*`
 > handles — see [Amendment 1](#amendment-1--spawnedchild-stdio-is-boxed-wp-2)
 > below. Build with `SpawnedChild::from_tokio(..)` and nothing else changes.
+>
+> **Amendment 3 removes seven `Send` bounds** from the additive v2 write side: `UnitOfWork` and its six write
+> traits. Nothing else in `orch_core::store` moved — see
+> [Amendment 3](#amendment-3--the-unit-of-work-stays-on-the-writers-thread) below.
 
 Everything returns `orch_core::Result<T>` = `Result<T, orch_core::Error>` unless
 stated otherwise. Every trait is `Send + Sync` and takes `&self`, never
 `&mut self`: stores are shared as `Arc<dyn …>` and own their interior
-mutability.
+mutability. The additive v2 write traits (`UnitOfWork` and the six it extends,
+§2) are the exception: their changes take `&mut self` (some of their reads take `&self`), they were `Send` and not
+`Sync`, and since Amendment 3 they are not `Send`.
 
 ---
 
@@ -179,7 +185,7 @@ pub enum Principal {                          // serde: tag "kind", snake_case
 }
 pub enum Lane { Claims, Entities, Events, Maintenance }      // choosing a lane grants nothing
 pub type Result<T> = std::result::Result<T, StoreError>;
-pub type WriteWork = Box<dyn FnOnce(&mut dyn UnitOfWork) -> Result<()> + Send + 'static>;
+pub type WriteWork = Box<dyn FnOnce(&mut dyn UnitOfWork) -> Result<()> + Send + 'static>;   // owned: invoked once, on the writer
 
 // The only entry points (async_trait). Backends serialize writers.
 trait Storage: Send + Sync {
@@ -199,7 +205,8 @@ trait ReadSnapshot: AttentionRead + EventRead + IntentRead + LeaseRead + RetryRe
     async fn list(&self, filter: &Filter, page: &PageRequest) -> Result<Page<Record>>;
 }
 // Synchronous, inside one transaction. An error from the callback discards every operation.
-trait UnitOfWork: AttentionWrite + EventWrite + IntentWrite + LeaseWrite + RequestKeyWrite + RetryWrite + Send {
+// Not `Send` (Amendment 3): lent to the callback as `&mut dyn UnitOfWork`, used on the thread that runs it.
+trait UnitOfWork: AttentionWrite + EventWrite + IntentWrite + LeaseWrite + RequestKeyWrite + RetryWrite {
     fn caller(&self) -> &Caller;
     fn get(&self, kind: EntityKind, id: &str) -> Result<Option<Record>>;
     fn list(&self, filter: &Filter, page: &PageRequest) -> Result<Page<Record>>;
@@ -278,7 +285,7 @@ trait RetryRead: Send + Sync {
     async fn read_due_retries(&self, now_ms: i64, limit: usize) -> Result<Vec<Retry>>;
     async fn read_retries(&self, after: Option<&RetryCursor>, limit: usize) -> Result<RetryPage>;
 }
-trait RetryWrite: Send {
+trait RetryWrite {
     fn put_retry(&mut self, retry: &Retry) -> Result<()>;                 // inserts or replaces the whole row
     fn delete_retry(&mut self, task: &str) -> Result<bool>;               // a missing row is not an error
     fn get_retry(&self, task: &str) -> Result<Option<Retry>>;
@@ -310,7 +317,7 @@ trait IntentRead: Send + Sync {
     async fn read_intent(&self, id: u64) -> Result<Option<Intent>>;
     async fn read_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<Intent>>;
 }
-trait IntentWrite: Send {
+trait IntentWrite {
     fn add_intent(&mut self, payload: &IntentPayload, now_ms: i64) -> Result<Intent>;
     fn finish_intent(&mut self, id: u64, now_ms: i64) -> Result<FinishOutcome>;
     fn delete_finished_intents(&mut self, now_ms: i64, max_rows: usize) -> Result<usize>;
@@ -332,7 +339,7 @@ pub fn check_now(now_ms: i64) -> Result<()>;              // UTC milliseconds, n
 pub fn expires_at(now_ms: i64) -> Result<i64>;            // checked now_ms + KEY_TTL_MS
 pub fn check_bound(value: usize) -> Result<()>;           // 1..=MAX_ROWS, the bound on one expiry call
 pub enum KeyCheck { New, Replay(String), ReplayWithoutResult, Mismatch }
-trait RequestKeyWrite: Send {
+trait RequestKeyWrite {
     fn check_request_key(&self, scope: &RequestScope, op: &str, req_sha256: &str, now_ms: i64) -> Result<KeyCheck>;
     fn store_request_key(&mut self, scope: &RequestScope, op: &str, req_sha256: &str, result: &str, now_ms: i64) -> Result<()>;
     fn delete_expired_request_keys(&mut self, now_ms: i64, max_rows: usize) -> Result<usize>;
@@ -367,7 +374,7 @@ trait AttentionRead: Send + Sync {
     async fn read_attention(&self, id: u64) -> Result<Option<Attention>>;
     async fn read_attention_page(&self, filter: AttentionFilter, after: Option<&AttentionCursor>, limit: usize) -> Result<AttentionPage>;
 }
-trait AttentionWrite: Send {
+trait AttentionWrite {
     fn get_attention(&self, id: u64) -> Result<Option<Attention>>;
     fn attention_page(&self, filter: AttentionFilter, after: Option<&AttentionCursor>, limit: usize) -> Result<AttentionPage>;
     fn open_attention(&mut self, facts: &AttentionFacts, at: i64) -> Result<Attention>;
@@ -732,6 +739,55 @@ caller. A hook error goes through the same cleanup as a spawn error.
 `source_run_id`, `task_rows` and `depends_on` fields are `#[serde(skip)]`, so
 the context a normal render sees is the same as before. Every variable the
 normal templates use is still always present.
+
+### Amendment 3 — the unit of work stays on the writer's thread
+
+Decided in [ADR 0023](decisions/0023-unit-of-work-on-the-writer-thread.md); the contract and its obligations are the
+storage spec's "Amendment 3: the unit of work stays on the writer's thread".
+
+```rust
+// before: each of the seven was Send
+pub trait UnitOfWork: AttentionWrite + EventWrite + IntentWrite + LeaseWrite
+    + RequestKeyWrite + RetryWrite + Send { .. }
+pub trait AttentionWrite:  Send { .. }
+pub trait EventWrite:      Send { .. }
+pub trait IntentWrite:     Send { .. }
+pub trait LeaseWrite:      Send { .. }
+pub trait RequestKeyWrite: Send { .. }
+pub trait RetryWrite:      Send { .. }
+// after: none of the seven is Send
+pub trait UnitOfWork: AttentionWrite + EventWrite + IntentWrite + LeaseWrite
+    + RequestKeyWrite + RetryWrite { .. }
+pub trait AttentionWrite  { .. }   // likewise EventWrite, IntentWrite, LeaseWrite,
+                                   // RequestKeyWrite and RetryWrite
+```
+
+**Not changed.** `WriteWork` (`Box<dyn FnOnce(&mut dyn UnitOfWork) -> Result<()> + Send + 'static>`), `Storage: Send + Sync`,
+`StorageExt` (`T: Send + 'static`, `F: … + Send + 'static`), `ReadSnapshot: … + Send + Sync` and every read trait
+(`AttentionRead`, `EventRead`, `IntentRead`, `LeaseRead`, `RetryRead`: `Send + Sync`). No method of any trait changes.
+The cursor rules (spec R10, the `Cursor` row and the Task cursor exception of issue 277) are not touched.
+
+**Why.** The SQLite adapter's unit of work borrows the writer's open transaction, which cannot be `Send` (`rusqlite`'s
+`Connection` is `Send` and not `Sync`). Nothing needs a unit of work to move between threads: the callback is the owned,
+`Send` part of a write, and the unit is only lent to it.
+
+**What it costs.** `dyn UnitOfWork` is no longer `Send`, so `&mut dyn UnitOfWork` is not `Send` either, and a consumer
+can never hand the unit it was lent to another thread. The reference types `Session` and `View` stay `Send` as concrete
+types; a callback does not see them.
+
+**Rules for a callback.**
+
+1. It is an owned `Send + 'static` closure, invoked once on the writer when admitted, never replayed, and never
+   invoked when the backend refuses admission.
+2. The `&mut dyn UnitOfWork` it receives, and anything borrowed from it, is used on the thread that runs it, and not
+   after it returns. No thread, task or scope receives it.
+3. Its body depends on no Tokio runtime: no `Handle::current()`, no `block_on`. `oneshot::Sender::send` needs none.
+4. A panic in it is contained by the SQLite adapter: the transaction rolls back, the awaiting caller observes the
+   panic, the writer thread survives and latches nothing, and the next write commits.
+
+**What changes for you.** Nothing at a call site that compiled before. Code that needs `UnitOfWork: Send` stops
+compiling and needs a design review, not the bound back. The workspace compile check that the PR carrying the
+seven-bound diff must pass is what shows that nothing on `main` is such code. That diff is the only source change.
 
 ---
 
