@@ -95,6 +95,11 @@ impl<'a, 'conn> EntityRead<'a, 'conn> {
 
     fn active(&self) -> Result<()> {
         self.state.ensure_available()?;
+        if self.source == FailureSource::Writer
+            && let Some(error) = self.state.transaction_must_abort()
+        {
+            return Err(error);
+        }
         if self.tx.is_autocommit() {
             Err(SqliteError::TransactionAborted)
         } else {
@@ -107,6 +112,13 @@ impl<'a, 'conn> EntityRead<'a, 'conn> {
             self.state.observe(self.source, error);
         }
         result
+    }
+
+    /// Converts only after observation through the trusted executor source.
+    /// Operations already observe before returning, so catching their typed
+    /// error without converting it cannot bypass the shared failure policy.
+    pub(super) fn port<T>(&self, result: Result<T>) -> orch_core::store::Result<T> {
+        port(self.observed(result))
     }
 
     fn task(&self) -> TaskSql<'a, 'conn> {
@@ -122,8 +134,9 @@ impl<'a, 'conn> EntityRead<'a, 'conn> {
     pub(super) fn get(&self, family: Family, id: &str) -> Result<Option<Record>> {
         self.active()?;
         let result = match family {
-            // TaskSql observes its own errors at their source. Avoid a second
-            // observation here: fatal_observations counts observations, not incidents.
+            // TaskSql observes reads at source. Composite operations such as
+            // move_task also observe their cleanup result; the metric counts
+            // observations and is not a count of distinct incidents.
             Family::Task => return self.task().get(id),
             Family::Message => MessageReader::new(self.tx, &self.caller.project, self.disk).get(id),
             Family::Agent | Family::Team | Family::Run => {
@@ -166,8 +179,9 @@ pub(super) struct EntityWrite<'a, 'conn> {
 
 impl<'a, 'conn> EntityWrite<'a, 'conn> {
     /// Only inside the writer job, after dispatcher authorization and fencing.
-    /// Keep this view for the entire callback: leaf rollback poison must survive
-    /// an operation error caught by that callback.
+    /// Every reconstructed view must receive the same executor state: failed
+    /// cleanup and event backend errors poison the entire callback, including
+    /// when the callback catches the operation error.
     pub(super) fn new(
         tx: &'a Transaction<'conn>,
         caller: &'a Caller,
@@ -194,6 +208,9 @@ impl<'a, 'conn> EntityWrite<'a, 'conn> {
 
     pub(super) fn caller(&self) -> &Caller {
         self.read.caller()
+    }
+    pub(super) fn port<T>(&self, result: Result<T>) -> orch_core::store::Result<T> {
+        self.read.port(result)
     }
     pub(super) fn get(&self, family: Family, id: &str) -> Result<Option<Record>> {
         self.ensure_committable()?;
@@ -346,5 +363,21 @@ impl<'a, 'conn> EntityWrite<'a, 'conn> {
     }
 }
 
+/// Only after the structured result has been observed. Private diagnostics
+/// remain in the internal error; callers receive no stored value or path.
+fn port<T>(result: Result<T>) -> orch_core::store::Result<T> {
+    result.map_err(|error| match error {
+        SqliteError::Store(refusal) => refusal,
+        _ => orch_core::store::StoreError::Backend(orch_core::Error::other(
+            "SQLite storage operation failed",
+        )),
+    })
+}
+
+mod operational;
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod operational_tests;

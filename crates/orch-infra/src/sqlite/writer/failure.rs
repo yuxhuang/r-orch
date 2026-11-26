@@ -353,9 +353,16 @@ impl FailureState {
             .store(false, Ordering::SeqCst);
     }
 
-    /// The enclosing transaction may not commit: a failed savepoint rollback or a
-    /// fatal cause was observed on the writer since BEGIN, or the state is latched.
-    pub(super) fn transaction_must_abort(&self) -> Option<SqliteError> {
+    /// A leaf that may have partially written requires callback-wide rollback,
+    /// even if trusted callback code catches its nonfatal error.
+    pub(in crate::sqlite) fn abort_transaction(&self) {
+        self.inner.transaction_aborted.store(true, Ordering::SeqCst);
+    }
+
+    /// The enclosing transaction may not commit: a leaf requested abort, a
+    /// failed savepoint rollback or fatal writer result was observed, or the
+    /// shared backend state is latched.
+    pub(in crate::sqlite) fn transaction_must_abort(&self) -> Option<SqliteError> {
         if let Err(error) = self.ensure_available() {
             return Some(error);
         }

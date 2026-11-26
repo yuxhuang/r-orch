@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
-fn execution(error: EventsError) -> SqliteError {
+pub(in crate::sqlite) fn execution(error: EventsError) -> SqliteError {
     match error {
         EventsError::Store(error) => SqliteError::Store(error),
         EventsError::Sql(error) => SqliteError::Sql(error),
