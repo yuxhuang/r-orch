@@ -1002,3 +1002,541 @@ fn the_aggregate_detail_is_indirect_even_when_every_text_fits_inline() {
     assert_eq!(db.get(Family::Context, "s").unwrap().unwrap().entity, small);
     assert_eq!(refs(&tx, Family::Context).len(), 1);
 }
+
+fn corrupt(error: NativeError) -> (&'static str, String) {
+    match error {
+        NativeError::Corrupt { check, locator, .. } => (check, locator),
+        other => panic!("expected stored-data damage: {other:?}"),
+    }
+}
+
+#[test]
+fn a_text_over_one_object_is_ordered_chunks_with_a_whole_hash_and_repeats() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = conn();
+    let tx = conn.transaction().unwrap();
+    let who = owner();
+    let mut db = sql(&tx, &disk, &who);
+    let chunk = MAX_BLOB_BYTES as usize;
+    // A two-byte character split by the chunk boundary, then a repeated chunk.
+    let mut body = "a".repeat(chunk - 1);
+    body.push('é');
+    body.push_str(&"a".repeat(chunk - 1));
+    body.push('é');
+    body.push_str("tail");
+    let e = tpl("big", &body);
+    db.create(e.clone()).unwrap();
+    let rows = refs(&tx, Family::Template);
+    assert_eq!(
+        rows,
+        [
+            ("/body".to_owned(), 0, chunk as i64),
+            ("/body".to_owned(), 1, chunk as i64),
+            ("/body".to_owned(), 2, 6)
+        ]
+    );
+    assert_eq!(db.get(Family::Template, "big").unwrap().unwrap().entity, e);
+    // Chunk 0 and 2 differ, 1 repeats nothing here; make a repeat: ordinal 1 = ordinal 0's object.
+    let (first, second): (String, String) = tx
+        .query_row(
+            "SELECT (SELECT sha256 FROM entity_blob_refs WHERE ordinal=0),(SELECT sha256 FROM entity_blob_refs WHERE ordinal=1)",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_ne!(first, second);
+    // Metadata damage is typed and no partial entity escapes, however it is damaged.
+    for damage in [
+        "UPDATE entity_blob_refs SET ordinal=ordinal+10 WHERE ordinal=2",
+        "DELETE FROM entity_blob_refs WHERE ordinal=2",
+        "UPDATE entity_blob_refs SET size=5 WHERE ordinal=2",
+        "UPDATE entity_blob_refs SET ordinal=CASE ordinal WHEN 0 THEN 1 WHEN 1 THEN 0 ELSE 2 END",
+        "UPDATE entity_blob_refs SET sha256=(SELECT sha256 FROM entity_blob_refs WHERE ordinal=0) WHERE ordinal=1",
+    ] {
+        tx.execute_batch("SAVEPOINT damage").unwrap();
+        // Swapping ordinals needs a deferred uniqueness check: use a temporary offset.
+        if damage.contains("CASE") {
+            tx.execute("UPDATE entity_blob_refs SET ordinal=ordinal+100", [])
+                .unwrap();
+            tx.execute("UPDATE entity_blob_refs SET ordinal=CASE ordinal WHEN 100 THEN 1 WHEN 101 THEN 0 ELSE 2 END", []).unwrap();
+        } else {
+            tx.execute(damage, []).unwrap();
+        }
+        let error = db.get(Family::Template, "big").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                NativeError::Corrupt {
+                    family: "template",
+                    ..
+                }
+            ),
+            "{damage}: {error:?}"
+        );
+        tx.execute_batch("ROLLBACK TO damage; RELEASE damage")
+            .unwrap();
+    }
+    // Registration and coverage damage is named, never repaired or skipped.
+    let first_chunk = "(SELECT sha256 FROM entity_blob_refs WHERE ordinal=0)";
+    for (damage, check) in [
+        (format!("DELETE FROM blobs WHERE sha256={first_chunk}"), "blob registration"),
+        (format!("UPDATE blobs SET size=size-1 WHERE sha256={first_chunk}"), "blob registration"),
+        (
+            "INSERT INTO entity_blob_refs SELECT project_id,family,key_form,entity_key,'/name',0,sha256,size FROM entity_blob_refs WHERE ordinal=0".into(),
+            "reference locators",
+        ),
+        ("DELETE FROM entity_blob_refs".into(), "reference metadata"),
+    ] {
+        tx.execute_batch("SAVEPOINT damage").unwrap();
+        tx.execute(&damage, []).unwrap();
+        assert_eq!(corrupt(db.get(Family::Template, "big").unwrap_err()).0, check, "{damage}");
+        tx.execute_batch("ROLLBACK TO damage; RELEASE damage").unwrap();
+    }
+    assert_eq!(db.get(Family::Template, "big").unwrap().unwrap().entity, e);
+    // A missing object is damage too, and a whole-hash mismatch cannot hide behind the chunks.
+    disk.remove(&first.parse().unwrap()).unwrap();
+    let error = db.get(Family::Template, "big").unwrap_err();
+    assert!(
+        matches!(
+            error,
+            NativeError::Corrupt {
+                check: "referenced bytes",
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert!(matches!(
+        db.select(
+            NativeSelection {
+                filter: &Filter::Templates,
+                sort: Sort::Id
+            },
+            None,
+            10
+        ),
+        Err(NativeError::Corrupt { .. })
+    ));
+}
+
+#[test]
+fn projection_drift_in_each_column_is_a_stored_data_error() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = conn();
+    let tx = conn.transaction().unwrap();
+    let who = owner();
+    for family in FAMILIES {
+        sql(&tx, &disk, &who).create(full(family)).unwrap();
+        let identity = family.identity();
+        for column in family.columns() {
+            if column.ends_with("_form")
+                || column.ends_with("_sha256")
+                || column.ends_with("_bytes")
+                || column == identity
+            {
+                continue;
+            }
+            // Text columns take another text; numbers move by one or appear from NULL.
+            let drift = if column == "status" {
+                "UPDATE goals SET status='paused'".to_owned()
+            } else {
+                format!(
+                    "UPDATE {t} SET {c}=CASE typeof({c}) WHEN 'text' THEN {c}||'!' WHEN 'integer' THEN {c}+1 ELSE 5 END",
+                    t = family.table(),
+                    c = column
+                )
+            };
+            tx.execute_batch("SAVEPOINT d").unwrap();
+            tx.execute(&drift, []).unwrap();
+            let error = sql(&tx, &disk, &who).get(family, "k").unwrap_err();
+            let (check, locator) = corrupt(error);
+            assert_eq!(
+                (check, locator.as_str()),
+                ("projection", column.as_str()),
+                "{family:?}"
+            );
+            assert!(
+                sql(&tx, &disk, &who)
+                    .select(
+                        NativeSelection {
+                            filter: &filter(family),
+                            sort: Sort::Id
+                        },
+                        None,
+                        1
+                    )
+                    .is_err()
+            );
+            tx.execute_batch("ROLLBACK TO d; RELEASE d").unwrap();
+        }
+        // Counters and identity cannot be repaired by the reader either.
+        tx.execute_batch("SAVEPOINT d").unwrap();
+        tx.execute(&format!("UPDATE {} SET revision=0", family.table()), [])
+            .unwrap_or(0);
+        tx.execute_batch("ROLLBACK TO d; RELEASE d").unwrap();
+        assert!(sql(&tx, &disk, &who).get(family, "k").unwrap().is_some());
+    }
+}
+
+#[test]
+fn detail_damage_and_a_detail_that_disagrees_with_its_row_are_stored_data_errors() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = conn();
+    let tx = conn.transaction().unwrap();
+    let who = owner();
+    let mut db = sql(&tx, &disk, &who);
+    db.create(ctx("k", "v")).unwrap();
+    let forge = |detail: &str| {
+        tx.execute(
+            "UPDATE entity_details SET detail=?1,detail_bytes=length(CAST(?1 AS BLOB)),detail_sha256=?2",
+            params![detail, BlobHash::of(detail.as_bytes()).to_string()],
+        )
+        .unwrap();
+    };
+    let good = r#"{"key":"k","value":"v","created_at":"2026-11-22T00:00:00.123Z","updated_at":"2026-11-22T00:00:01.000Z"}"#;
+    for (detail, check) in [
+        // A valid but different value: the projections no longer match the detail.
+        (good.replace(r#""v""#, r#""w""#), "projection"),
+        (good.replace(r#""k""#, r#""other""#), "identity projection"),
+        (
+            good.replace(r#"{"key""#, r#"{"extra":1,"key""#),
+            "object fields",
+        ),
+        (good.replace(r#""value":"v","#, ""), "object fields"),
+        (good.replace(r#""v""#, "null"), "object fields"),
+        (
+            good.replace(r#""value":"v""#, r#""value":"v","value":"w""#),
+            "strict JSON",
+        ),
+        (
+            good.replace(r#""updated_at""#, r#""ttl_ms":1.5,"updated_at""#),
+            "typed detail",
+        ),
+        (
+            good.replace(r#""updated_at""#, r#""ttl_ms":-1,"updated_at""#),
+            "typed detail",
+        ),
+        (good.replace(r#""v""#, "7"), "reference tag"),
+        ("[]".into(), "object type"),
+        ("".into(), "strict JSON"),
+    ] {
+        forge(&detail);
+        let error = db.get(Family::Context, "k").unwrap_err();
+        let (actual, _) = corrupt(error);
+        assert!(
+            actual == check || (check == "text type" && actual == "typed detail"),
+            "{detail}: {actual}"
+        );
+    }
+    forge(good);
+    assert!(db.get(Family::Context, "k").unwrap().is_some());
+    tx.execute(
+        "UPDATE entity_details SET detail_sha256=?1",
+        ["0".repeat(64)],
+    )
+    .unwrap();
+    assert_eq!(
+        corrupt(db.get(Family::Context, "k").unwrap_err()).0,
+        "detail length or hash"
+    );
+    forge(good);
+    tx.execute("UPDATE entity_details SET format=2", [])
+        .unwrap_or(0);
+    tx.execute("DELETE FROM entity_details", []).unwrap();
+    assert_eq!(
+        corrupt(db.get(Family::Context, "k").unwrap_err()).0,
+        "detail missing"
+    );
+}
+
+#[test]
+fn revision_races_and_exhausted_counters_refuse_before_any_change() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = conn();
+    let tx = conn.transaction().unwrap();
+    let who = owner();
+    let mut db = sql(&tx, &disk, &who);
+    for family in FAMILIES {
+        let first = db.create(entity(family, "k", "1")).unwrap();
+        let stale = Revision::ONE.next().unwrap();
+        assert!(matches!(
+            db.update(entity(family, "k", "2"), stale),
+            Err(NativeError::Store(StoreError::StaleRevision { .. }))
+        ));
+        assert!(matches!(
+            db.delete(family, "k", stale),
+            Err(NativeError::Store(StoreError::StaleRevision { actual: Some(a), .. })) if a == Revision::ONE
+        ));
+        assert!(matches!(
+            db.move_to_end(family, "missing", Revision::ONE),
+            Err(NativeError::Store(StoreError::StaleRevision {
+                actual: None,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            db.create(entity(family, "k", "dup")),
+            Err(NativeError::Store(StoreError::AlreadyExists { .. }))
+        ));
+        // Two writers racing on one revision: the second loses.
+        let winner = db.update(entity(family, "k", "w"), first.revision).unwrap();
+        assert!(matches!(
+            db.update(entity(family, "k", "late"), first.revision),
+            Err(NativeError::Store(StoreError::StaleRevision { .. }))
+        ));
+        assert_eq!(db.get(family, "k").unwrap().unwrap(), winner);
+        // The signed column bound: the next revision or position would not fit.
+        tx.execute(
+            &format!("UPDATE {} SET revision=?1", family.table()),
+            [i64::MAX],
+        )
+        .unwrap();
+        let max: Revision = serde_json::from_value(i64::MAX.into()).unwrap();
+        for op in 0..3 {
+            let error = match op {
+                0 => db.update(entity(family, "k", "x"), max).unwrap_err(),
+                1 => db.move_to_end(family, "k", max).unwrap_err(),
+                _ => {
+                    tx.execute(
+                        "UPDATE counters SET value=?1 WHERE name=?2",
+                        params![i64::MAX, family.counter()],
+                    )
+                    .unwrap();
+                    db.create(entity(family, "next", "x")).unwrap_err()
+                }
+            };
+            assert!(
+                matches!(error, NativeError::Store(StoreError::CounterExhausted)),
+                "{family:?} {op}: {error:?}"
+            );
+        }
+        assert!(db.get(family, "next").unwrap().is_none());
+        assert_eq!(db.get(family, "k").unwrap().unwrap().revision, max);
+    }
+}
+
+#[test]
+fn damaged_counters_and_orphan_rows_are_refused_without_mutation() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = conn();
+    let tx = conn.transaction().unwrap();
+    let who = owner();
+    let mut db = sql(&tx, &disk, &who);
+    for family in FAMILIES {
+        db.create(entity(family, "a", "1")).unwrap();
+        db.create(entity(family, "b", "1")).unwrap();
+        let counter = |db: &mut NativeSql<'_, '_>| db.create(entity(family, "c", "x")).unwrap_err();
+        let set = |sql: &str, value: Option<i64>| {
+            tx.execute(
+                "DELETE FROM counters WHERE project_id='p' AND name=?1",
+                [family.counter()],
+            )
+            .unwrap();
+            if let Some(value) = value {
+                tx.execute(sql, params![family.counter(), value]).unwrap();
+            }
+        };
+        let insert = "INSERT INTO counters(project_id,name,value) VALUES('p',?1,?2)";
+        set(insert, None);
+        assert!(
+            matches!(counter(&mut db), NativeError::Counter(e) if matches!(*e, crate::sqlite::SqliteError::CounterMissing { .. }))
+        );
+        set(insert, Some(-1));
+        assert!(
+            matches!(counter(&mut db), NativeError::Counter(e) if matches!(*e, crate::sqlite::SqliteError::CounterNegative { .. }))
+        );
+        set(insert, Some(1));
+        assert!(
+            matches!(counter(&mut db), NativeError::Counter(e) if matches!(*e, crate::sqlite::SqliteError::CounterBehind { .. }))
+        );
+        set(insert, Some(2));
+        assert!(db.get(family, "c").unwrap().is_none());
+        // A stale detail row without a native row is not adopted by a new entity.
+        let orphan = entity(family, "ghost", "x");
+        let detail = encode(&disk, &orphan).unwrap();
+        let (form, key) = key("ghost");
+        tx.execute(
+            "INSERT INTO entity_details VALUES('p',?1,?2,?3,1,?4,?5,?6)",
+            params![
+                family.name(),
+                form,
+                key,
+                detail.inline,
+                detail.bytes as i64,
+                detail.sha256
+            ],
+        )
+        .unwrap();
+        assert_eq!(corrupt(db.create(orphan).unwrap_err()).0, "orphan row");
+        assert_eq!(
+            one::<i64>(
+                &tx,
+                &format!(
+                    "SELECT value FROM counters WHERE name='{}'",
+                    family.counter()
+                )
+            ),
+            2
+        );
+    }
+}
+
+#[test]
+fn a_failed_step_leaves_the_old_row_and_references_readable_even_when_caught() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = conn();
+    let tx = conn.transaction().unwrap();
+    let who = owner();
+    let mut db = sql(&tx, &disk, &who);
+    for family in FAMILIES {
+        let old = entity(family, "k", &"o".repeat(BIG));
+        let created = db.create(old.clone()).unwrap();
+        let state = |tx: &Transaction<'_>| -> Vec<Vec<String>> {
+            ["entity_details", "entity_blob_refs", "blobs", "counters"]
+                .iter()
+                .map(|t| {
+                    tx.prepare(&format!("SELECT * FROM {t} ORDER BY 1,2,3"))
+                        .unwrap()
+                        .query_map([], |r| {
+                            Ok((0..r.as_ref().column_count())
+                                .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                                .collect::<String>())
+                        })
+                        .unwrap()
+                        .collect::<std::result::Result<Vec<_>, _>>()
+                        .unwrap()
+                })
+                .collect()
+        };
+        let before = (state(&tx), db.get(family, "k").unwrap().unwrap());
+        // The reference rows fail in the middle of an update, create and move.
+        tx.execute_batch("CREATE TRIGGER fail BEFORE INSERT ON entity_blob_refs BEGIN SELECT RAISE(ABORT,'synthetic'); END").unwrap();
+        assert!(matches!(
+            db.update(entity(family, "k", &"n".repeat(BIG)), created.revision),
+            Err(NativeError::Sql(_))
+        ));
+        assert!(matches!(
+            db.create(entity(family, "new", &"n".repeat(BIG))),
+            Err(NativeError::Sql(_))
+        ));
+        tx.execute_batch("DROP TRIGGER fail").unwrap();
+        assert_eq!((state(&tx), db.get(family, "k").unwrap().unwrap()), before);
+        assert!(db.get(family, "new").unwrap().is_none());
+        // The unit goes on: a later operation succeeds and nothing was consumed.
+        let later = db
+            .update(entity(family, "k", "small"), created.revision)
+            .unwrap();
+        assert_eq!(later.entity, entity(family, "k", "small"));
+        assert_eq!(db.create(entity(family, "new", "x")).unwrap().position, 2);
+        db.delete(family, "new", Revision::ONE).unwrap();
+        db.delete(family, "k", later.revision).unwrap();
+    }
+    // A failure that ends the whole transaction poisons it for later work.
+    tx.execute_batch("CREATE TRIGGER abort BEFORE INSERT ON project_config WHEN NEW.key='fatal' BEGIN SELECT RAISE(ROLLBACK,'synthetic'); END").unwrap();
+    assert!(matches!(
+        db.create(cfg("fatal", "x")),
+        Err(NativeError::Rollback { .. })
+    ));
+    assert!(matches!(
+        db.create(cfg("after", "x")),
+        Err(NativeError::Aborted)
+    ));
+    assert!(matches!(
+        db.get(Family::Config, "after"),
+        Err(NativeError::Aborted)
+    ));
+}
+
+#[test]
+fn snapshot_and_unit_of_work_hydrate_one_state() {
+    let (temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let path = temp.path().join("snapshot.db");
+    {
+        let c = Connection::open(&path).unwrap();
+        c.pragma_update(None, "journal_mode", "WAL").unwrap();
+        for step in [
+            crate::sqlite::migrations::INITIAL_SCHEMA,
+            crate::sqlite::migrations::ATTENTION_FACTS,
+            crate::sqlite::migrations::TASK_FORMAT,
+            crate::sqlite::migrations::AGENT_TEAM_RUN,
+            crate::sqlite::migrations::CONTEXT_CONFIG_TEMPLATE_GOAL,
+        ] {
+            c.execute_batch(step).unwrap();
+        }
+    }
+    let who = owner();
+    let mut writer = Connection::open(&path).unwrap();
+    let mut reader = Connection::open(&path).unwrap();
+    let tx = writer.transaction().unwrap();
+    for family in FAMILIES {
+        sql(&tx, &disk, &who)
+            .create(entity(family, "a", "1"))
+            .unwrap();
+    }
+    // The unit's own uncommitted writes are visible to it and to no one else.
+    assert!(list(&sql(&tx, &disk, &who), &Filter::Config, Sort::Id).len() == 1);
+    let snapshot = reader.transaction().unwrap();
+    assert!(
+        sql(&snapshot, &disk, &who)
+            .get(Family::Config, "a")
+            .unwrap()
+            .is_none()
+    );
+    tx.commit().unwrap();
+    // The snapshot began before the commit and keeps its state, across every family.
+    assert!(
+        sql(&snapshot, &disk, &who)
+            .get(Family::Config, "a")
+            .unwrap()
+            .is_none()
+    );
+    let tx = writer.transaction().unwrap();
+    let a = sql(&tx, &disk, &who)
+        .get(Family::Template, "a")
+        .unwrap()
+        .unwrap();
+    for family in FAMILIES {
+        let mut db = sql(&tx, &disk, &who);
+        let r = db.get(family, "a").unwrap().unwrap();
+        db.update(entity(family, "a", "2"), r.revision).unwrap();
+        db.create(entity(family, "b", "1")).unwrap();
+    }
+    tx.commit().unwrap();
+    for family in FAMILIES {
+        assert!(
+            sql(&snapshot, &disk, &who)
+                .get(family, "a")
+                .unwrap()
+                .is_none(),
+            "{family:?}"
+        );
+        assert_eq!(
+            list(&sql(&snapshot, &disk, &who), &filter(family), Sort::Id).len(),
+            0
+        );
+    }
+    drop(snapshot);
+    let fresh = reader.transaction().unwrap();
+    assert_eq!(
+        sql(&fresh, &disk, &who)
+            .get(Family::Template, "a")
+            .unwrap()
+            .unwrap()
+            .revision
+            .get(),
+        a.revision.get() + 1
+    );
+    for family in FAMILIES {
+        assert_eq!(
+            walk(&sql(&fresh, &disk, &who), &filter(family), Sort::Id),
+            ["a", "b"]
+        );
+    }
+}
