@@ -41,6 +41,8 @@ const SUITE_USER: &str =
     "          useradd --uid 1001 --user-group --create-home --home-dir /home/ci ci";
 const SUITE_OWNS: &str =
     "          chown -R ci:ci \"$GITHUB_WORKSPACE\" \"$CARGO_HOME\" \"$RUSTUP_HOME\"";
+/// The gate exports its receipt into a new directory under `$RUNNER_TEMP`.
+const SUITE_TEMP: &str = "          chown ci:ci \"$RUNNER_TEMP\"";
 const HOST_LABEL: &str = "          HOST_LABEL: ${{ runner.environment }}-linux";
 /// The suite runner, pinned. A job that runs tests installs exactly this.
 const INSTALL: &str = "      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir \"$RUNNER_TEMP/nextest-install\" --root \"$HOME/.nextest-bin\"";
@@ -283,6 +285,10 @@ fn contract(ci: &str) {
         assert!(
             prep.lines().any(|l| l == SUITE_OWNS),
             "{name}: suite ownership"
+        );
+        assert!(
+            prep.lines().any(|l| l == SUITE_TEMP),
+            "{name}: receipt directory"
         );
         let at = lane
             .find("      - name: Hand the checkout to the suite user")

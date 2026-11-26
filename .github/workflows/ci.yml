@@ -249,6 +249,7 @@ jobs:
           set -euo pipefail
           useradd --uid 1001 --user-group --create-home --home-dir /home/ci ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$CARGO_HOME" "$RUSTUP_HOME"
+          chown ci:ci "$RUNNER_TEMP"
           chmod 0711 "$HOME"
           git config --system --add safe.directory "$GITHUB_WORKSPACE"
       - name: Folded suite
@@ -371,6 +372,7 @@ jobs:
           set -euo pipefail
           useradd --uid 1001 --user-group --create-home --home-dir /home/ci ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$CARGO_HOME" "$RUSTUP_HOME"
+          chown ci:ci "$RUNNER_TEMP"
           chmod 0711 "$HOME"
           git config --system --add safe.directory "$GITHUB_WORKSPACE"
       - run: cargo nextest run --profile default --workspace --no-fail-fast --no-tests fail
