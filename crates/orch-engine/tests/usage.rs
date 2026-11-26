@@ -452,8 +452,7 @@ async fn without_an_observer_a_run_is_recorded_exactly_as_before() {
 
 #[tokio::test]
 async fn pi_wrapper_usage_reaches_the_observer_before_an_interrupted_exit() {
-    // Top-level usage is the existing observer's Pi carrier. Native nested
-    // message usage is retained by the adapter; its observation belongs to T20.
+    // Keep compatibility with the existing top-level Pi usage carrier.
     let (rig, recorder) = run_scripted(
         "pi",
         &[
@@ -469,4 +468,108 @@ async fn pi_wrapper_usage_reaches_the_observer_before_an_interrupted_exit() {
     assert_eq!(run.tokens, None, "metadata does not invent legacy tokens");
     assert_eq!(counters(&usage), [Some(17), Some(0), None, Some(4), None]);
     assert_eq!(usage.model.as_deref(), Some("synthetic-pi-model"));
+}
+
+#[tokio::test]
+async fn pi_native_usage_survives_interruption_before_stored_event_truncation() {
+    for kind in ["message_end", "turn_end"] {
+        // The usage follows the oversized content in serialized key order.
+        let report = serde_json::json!({"type":kind, "message":{"role":"assistant",
+            "content":[{"type":"text", "text":"x".repeat(16 * 1024)}],
+            "model":"synthetic-native-model", "stopReason":"aborted",
+            "usage":{"input":17, "output":0, "cacheRead":4}}})
+        .to_string();
+        let (rig, recorder) = run_scripted("pi", &[
+            &report,
+            r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"unfinished"}}"#,
+        ], 1, TaskStatus::Failed).await;
+        let (run_id, usage) = recorder.only();
+        let run = rig.runs.peek(&run_id).expect("run");
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.tokens, None, "metadata is not a legacy terminal total");
+        assert_eq!(counters(&usage), [Some(17), Some(0), None, Some(4), None]);
+        assert_eq!(usage.model.as_deref(), Some("synthetic-native-model"));
+        let stored = rig.runs.peek_events(&run_id);
+        let metadata = stored
+            .iter()
+            .find(|event| {
+                event
+                    .data
+                    .as_str()
+                    .is_some_and(|data| data.contains("message"))
+            })
+            .expect("stored native metadata");
+        let data = metadata.data.as_str().unwrap();
+        assert!(
+            data.ends_with('…'),
+            "the stored native record was truncated"
+        );
+        assert!(!data.contains("synthetic-native-model"));
+        assert!(!data.contains("cacheRead"));
+    }
+}
+
+#[tokio::test]
+async fn pi_native_repeated_reports_preserve_nullable_counts_and_legacy_terminal_totals() {
+    let message = serde_json::json!({"role":"assistant", "model":"synthetic-native-model",
+        "content":[{"type":"text", "text":"finished"}],
+        "usage":{"input":3, "output":2, "cacheRead":0}});
+    let message_end = serde_json::json!({"type":"message_end", "message":message}).to_string();
+    let turn_end = serde_json::json!({"type":"turn_end", "message":message}).to_string();
+    let agent_end = serde_json::json!({"type":"agent_end", "messages":[message]}).to_string();
+    let (rig, recorder) = run_scripted(
+        "pi",
+        &[&message_end, &turn_end, &message_end, &agent_end],
+        0,
+        TaskStatus::Done,
+    )
+    .await;
+    let (run_id, usage) = recorder.only();
+    assert_eq!(counters(&usage), [Some(3), Some(2), None, Some(0), None]);
+    assert_eq!(usage.model.as_deref(), Some("synthetic-native-model"));
+    assert_eq!(
+        rig.runs.peek(&run_id).unwrap().tokens,
+        Some(TokenUsage {
+            input: 3,
+            output: 2,
+            reasoning: 0,
+            cache_read: 0,
+            cache_write: 0,
+            total: 5
+        })
+    );
+}
+
+#[tokio::test]
+async fn pi_passive_usage_still_supplies_only_the_legacy_terminal_fallback() {
+    let (rig, recorder) = run_scripted(
+        "pi",
+        &[
+            r#"{"type":"turn_start","usage":{"input":3,"output":2}}"#,
+            r#"{"type":"agent_end","messages":[]}"#,
+        ],
+        0,
+        TaskStatus::Done,
+    )
+    .await;
+    let (run_id, usage) = recorder.only();
+    assert_eq!(
+        counters(&usage),
+        [None; 5],
+        "legacy fallback cannot establish presence"
+    );
+    assert_eq!(
+        rig.runs.peek(&run_id).unwrap().tokens,
+        Some(TokenUsage {
+            input: 3,
+            output: 2,
+            reasoning: 0,
+            cache_read: 0,
+            cache_write: 0,
+            total: 5
+        })
+    );
+    let events = rig.runs.peek_events(&run_id);
+    assert_eq!(events.len(), 1, "passive usage emits no output event");
+    assert_eq!(events[0].event_type, orch_domain::RunEventType::Done);
 }
