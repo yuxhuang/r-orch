@@ -565,6 +565,11 @@ mod tests {
             matches!(error, SqliteError::Sql(rusqlite::Error::SqliteFailure(ref code, _)) if code.extended_code == rusqlite::ffi::SQLITE_ERROR),
             "preflight lost its SQLite category: {error:?}"
         );
+        assert_eq!(
+            classify(&error).leaves(),
+            &[(Role::Operation, Class::Transient)],
+            "{error:?}"
+        );
     }
 
     #[test]
@@ -583,6 +588,11 @@ mod tests {
         assert!(
             matches!(error, SqliteError::Sql(rusqlite::Error::SqliteFailure(ref code, _)) if code.extended_code == rusqlite::ffi::SQLITE_ERROR),
             "preflight lost its SQLite category: {error:?}"
+        );
+        assert_eq!(
+            classify(&error).leaves(),
+            &[(Role::Operation, Class::Transient)],
+            "{error:?}"
         );
     }
 
