@@ -1,10 +1,11 @@
 //! Request keys on the enclosing writer transaction. Scope comes only from
 //! its authenticated caller; authorization remains the dispatcher's job.
 //! No snapshot read or runtime wiring exposes stored results.
+use crate::sqlite::{Result, SqliteError};
 use orch_core::store::request_keys::{
     KeyCheck, MAX_RESULT_BYTES, RequestScope, check_bound, check_now, check_request, expires_at,
 };
-use orch_core::store::{Caller, Result, StoreError};
+use orch_core::store::{Caller, StoreError};
 use rusqlite::{OptionalExtension, Transaction, params};
 
 pub(super) struct RequestKeys<'a, 'conn> {
@@ -18,14 +19,8 @@ impl<'a, 'conn> RequestKeys<'a, 'conn> {
     }
 }
 
-fn backend(error: rusqlite::Error) -> StoreError {
-    StoreError::Backend(orch_core::Error::other(format!(
-        "SQLite request key: {error}"
-    )))
-}
-
-fn invalid(detail: &str) -> StoreError {
-    StoreError::InvalidRequestKey(detail.into())
+fn invalid(detail: &str) -> SqliteError {
+    StoreError::InvalidRequestKey(detail.into()).into()
 }
 
 impl RequestKeys<'_, '_> {
@@ -64,7 +59,7 @@ impl RequestKeys<'_, '_> {
                 },
             )
             .optional()
-            .map_err(backend)?;
+            .map_err(SqliteError::from)?;
         let Some((stored_op, hash, result, truncated, state)) = found else {
             return Ok(KeyCheck::New);
         };
@@ -77,7 +72,8 @@ impl RequestKeys<'_, '_> {
         {
             return Err(StoreError::Backend(orch_core::Error::other(
                 "SQLite request key: invalid stored result",
-            )));
+            ))
+            .into());
         }
         if stored_op != op || hash != req_sha256 {
             Ok(KeyCheck::Mismatch)
@@ -112,7 +108,7 @@ impl RequestKeys<'_, '_> {
              WHERE request_keys.expires_at<=excluded.created_at",
             params![scope.identity(), scope.project(), scope.run(), epoch, scope.key(),
                 op, req_sha256, (!truncated).then_some(result), truncated, now_ms, expiry],
-        ).map_err(backend)?;
+        ).map_err(SqliteError::from)?;
         if changed == 0 {
             Err(invalid(
                 "the key is already stored; check first and store only a new one",
@@ -139,7 +135,7 @@ impl RequestKeys<'_, '_> {
               ORDER BY expires_at,identity_id,project_id,run_id,epoch,key LIMIT ?3)",
                 params![self.caller.project, now_ms, max_rows as i64],
             )
-            .map_err(backend)
+            .map_err(SqliteError::from)
     }
 }
 

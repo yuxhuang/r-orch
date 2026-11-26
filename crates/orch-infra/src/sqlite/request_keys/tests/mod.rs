@@ -87,7 +87,7 @@ fn caught_live_overwrite_refusal_keeps_first_result_and_expiry() {
         .unwrap();
     assert!(matches!(
         keys.store_request_key(&scope, "other", &"b".repeat(64), "second", 1),
-        Err(StoreError::InvalidRequestKey(_))
+        Err(SqliteError::Store(StoreError::InvalidRequestKey(_)))
     ));
     tx.commit().unwrap();
     let tx = conn.transaction().unwrap();
@@ -276,11 +276,11 @@ fn identity_project_run_epoch_and_key_are_isolated_and_foreign_scopes_refused() 
         for foreign in callers.iter().filter(|foreign| *foreign != caller) {
             assert!(matches!(
                 keys.check_request_key(&scope(foreign), OP, &hash(), 0),
-                Err(StoreError::InvalidRequestKey(_))
+                Err(SqliteError::Store(StoreError::InvalidRequestKey(_)))
             ));
             assert!(matches!(
                 keys.store_request_key(&scope(foreign), OP, &hash(), "leak", KEY_TTL_MS),
-                Err(StoreError::InvalidRequestKey(_))
+                Err(SqliteError::Store(StoreError::InvalidRequestKey(_)))
             ));
         }
         let other = RequestScope::of(caller, "another_key_12345").unwrap();
@@ -312,26 +312,26 @@ fn invalid_inputs_and_overflow_leave_no_rows_when_caught() {
     ] {
         assert!(matches!(
             keys.check_request_key(&scope, op, &hash, now),
-            Err(StoreError::InvalidRequestKey(_))
+            Err(SqliteError::Store(StoreError::InvalidRequestKey(_)))
         ));
         assert!(matches!(
             keys.store_request_key(&scope, op, &hash, "x", now),
-            Err(StoreError::InvalidRequestKey(_))
+            Err(SqliteError::Store(StoreError::InvalidRequestKey(_)))
         ));
     }
     assert!(matches!(
         keys.store_request_key(&scope, OP, &hash(), "x", i64::MAX),
-        Err(StoreError::InvalidRequestKey(_))
+        Err(SqliteError::Store(StoreError::InvalidRequestKey(_)))
     ));
     for bound in [0, 1001, usize::MAX] {
         assert!(matches!(
             keys.delete_expired_request_keys(0, bound),
-            Err(StoreError::InvalidRequestKey(_))
+            Err(SqliteError::Store(StoreError::InvalidRequestKey(_)))
         ));
     }
     assert!(matches!(
         keys.delete_expired_request_keys(-1, 1),
-        Err(StoreError::InvalidRequestKey(_))
+        Err(SqliteError::Store(StoreError::InvalidRequestKey(_)))
     ));
     tx.commit().unwrap();
     assert_eq!(
@@ -464,7 +464,7 @@ fn sql_failure_caught_by_callback_does_not_replace_expired_row() {
     tx.execute_batch("CREATE TRIGGER fail_key BEFORE UPDATE ON request_keys BEGIN SELECT RAISE(ABORT,'synthetic failure'); END;").unwrap();
     assert!(matches!(
         keys.store_request_key(&scope(&caller), OP, &hash(), "second", KEY_TTL_MS),
-        Err(StoreError::Backend(_))
+        Err(SqliteError::Sql(_))
     ));
     tx.commit().unwrap();
     assert_eq!(
@@ -495,7 +495,7 @@ fn impossible_stored_result_is_not_replayed() {
             .unwrap();
         assert!(matches!(
             keys.check_request_key(&scope(&caller), OP, &hash(), 0),
-            Err(StoreError::Backend(_))
+            Err(SqliteError::Store(StoreError::Backend(_)))
         ));
     }
 }

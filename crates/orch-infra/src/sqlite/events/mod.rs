@@ -87,7 +87,7 @@ pub(super) fn append_events(
     append_with_blobs(tx, caller, run, lineage, epoch, batch, None)
 }
 
-fn append_with_blobs(
+pub(in crate::sqlite) fn append_with_blobs(
     tx: &Transaction<'_>,
     caller: &Caller,
     run: &str,
@@ -222,7 +222,7 @@ pub(super) fn read_events(
     read_with_blobs(conn, project, run, after_seq, limit, None)
 }
 
-fn read_with_blobs(
+pub(in crate::sqlite) fn read_with_blobs(
     conn: &Connection,
     project: &str,
     run: &str,
@@ -258,7 +258,7 @@ pub(super) fn read_events_tail(
     tail_with_blobs(conn, project, run, count, None)
 }
 
-fn tail_with_blobs(
+pub(in crate::sqlite) fn tail_with_blobs(
     conn: &Connection,
     project: &str,
     run: &str,
@@ -491,3 +491,5 @@ fn unsigned(value: i64, what: &str) -> Result<u64> {
 mod tests;
 
 mod adapter;
+
+pub(super) use adapter::execution;
