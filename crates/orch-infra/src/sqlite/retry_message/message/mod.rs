@@ -26,19 +26,20 @@ use rusqlite::{
 use super::{publish_error, reference_error_for};
 use crate::blob::{BlobHash, BlobReferences, DiskBlobStore, INLINE_TEXT_MAX_BYTES, MAX_BLOB_BYTES};
 use crate::sqlite::task_format::{codec::Detail, text::Chunk};
+use crate::sqlite::time_projection::rfc3339_millis;
+#[cfg(test)]
+use crate::sqlite::time_projection::{MAX_MILLIS, MIN_MILLIS};
 use crate::sqlite::{Result, SqliteError};
 use format::{FormatError, SLOTS};
 
 mod format;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod time_tests;
 
 const FAMILY: &str = "message";
 const POSITION: &str = "position:message";
-/// The inclusive range of the millisecond projection: `0000-01-01T00:00:00.000Z`
-/// to `9999-12-30T22:00:00.999Z`.
-const MIN_MILLIS: i64 = -62_167_219_200_000;
-const MAX_MILLIS: i64 = 253_402_207_200_999;
 
 /// The text column that holds each slot, as `<column>`, `<column>_form`,
 /// `<column>_sha256`, `<column>_bytes`.
@@ -125,18 +126,12 @@ fn quartet(value: Option<&str>, identity: bool) -> [SqlValue; 4] {
     }
 }
 
-/// The integer projection of a time string, only when it is an exact whole
-/// number of milliseconds inside the range. It is never an order or a filter.
+/// The integer projection of a time string: the one rule of `time_projection`
+/// (an RFC 3339 instant of whole milliseconds inside the range). It is never an
+/// order or a filter.
 fn millis(text: Option<&str>) -> SqlValue {
-    let Some(Ok(instant)) = text.map(str::parse::<jiff::Timestamp>) else {
-        return SqlValue::Null;
-    };
-    let milli = instant.as_millisecond();
-    if instant.as_nanosecond() % 1_000_000 == 0 && (MIN_MILLIS..=MAX_MILLIS).contains(&milli) {
-        SqlValue::Integer(milli)
-    } else {
-        SqlValue::Null
-    }
+    text.and_then(rfc3339_millis)
+        .map_or(SqlValue::Null, SqlValue::Integer)
 }
 
 fn projection(message: &Message) -> Vec<SqlValue> {
