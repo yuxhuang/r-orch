@@ -172,10 +172,33 @@ jobs:
       # scripts and proc-macros -- inside this job, and cargo-deny covers only
       # r-orch's Cargo.lock, not that one. Deliberately accepted per ADR 0022,
       # bounded by what the job can reach: a read-only token, a checkout that
-      # persists no credentials, and no secrets. The build cost on a
-      # GitHub-hosted runner is not measured yet; if it eats the suite's
-      # saving, a commit-pinned install action is the follow-up.
-      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir "$RUNNER_TEMP/nextest-install"
+      # persists no credentials, and no secrets. Cache only this executable;
+      # a miss still builds from the locked crates.io source above.
+      # No prefix fallback: a changed toolchain must build its own runner.
+      - name: Restore nextest executable
+        id: nextest-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.nextest-bin/bin/cargo-nextest
+          key: nextest-${{ runner.os }}-${{ runner.arch }}-0.9.152-${{ hashFiles('rust-toolchain.toml') }}
+      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir "$RUNNER_TEMP/nextest-install" --root "$HOME/.nextest-bin"
+        if: steps.nextest-cache.outputs.cache-hit != 'true'
+      - name: Activate pinned nextest
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "$HOME/.nextest-bin/bin" >> "$GITHUB_PATH"
+          output="$("$HOME/.nextest-bin/bin/cargo-nextest" --version)"
+          read -r program version rest <<< "$output"
+          test "$program" = cargo-nextest && test "$version" = 0.9.152
+      # PRs can read main's entry but never save one. Both main lanes use
+      # the same immutable key/path; concurrent first saves are harmless.
+      - name: Save nextest executable
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.nextest-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.nextest-bin/bin/cargo-nextest
+          key: ${{ steps.nextest-cache.outputs.cache-primary-key }}
       # Replace the step shell so runner cancellation signals reach the gate.
       # Export time under real cancellation remains unverified; no receipt guarantee.
       - name: Folded suite
@@ -234,10 +257,33 @@ jobs:
       # scripts and proc-macros -- inside this job, and cargo-deny covers only
       # r-orch's Cargo.lock, not that one. Deliberately accepted per ADR 0022,
       # bounded by what the job can reach: a read-only token, a checkout that
-      # persists no credentials, and no secrets. The build cost on a
-      # GitHub-hosted runner is not measured yet; if it eats the suite's
-      # saving, a commit-pinned install action is the follow-up.
-      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir "$RUNNER_TEMP/nextest-install"
+      # persists no credentials, and no secrets. Cache only this executable;
+      # a miss still builds from the locked crates.io source above.
+      # No prefix fallback: a changed toolchain must build its own runner.
+      - name: Restore nextest executable
+        id: nextest-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.nextest-bin/bin/cargo-nextest
+          key: nextest-${{ runner.os }}-${{ runner.arch }}-0.9.152-${{ hashFiles('rust-toolchain.toml') }}
+      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir "$RUNNER_TEMP/nextest-install" --root "$HOME/.nextest-bin"
+        if: steps.nextest-cache.outputs.cache-hit != 'true'
+      - name: Activate pinned nextest
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "$HOME/.nextest-bin/bin" >> "$GITHUB_PATH"
+          output="$("$HOME/.nextest-bin/bin/cargo-nextest" --version)"
+          read -r program version rest <<< "$output"
+          test "$program" = cargo-nextest && test "$version" = 0.9.152
+      # PRs can read main's entry but never save one. Both main lanes use
+      # the same immutable key/path; concurrent first saves are harmless.
+      - name: Save nextest executable
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.nextest-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.nextest-bin/bin/cargo-nextest
+          key: ${{ steps.nextest-cache.outputs.cache-primary-key }}
       # nextest runs the test binaries itself, so Cargo's `[env]` table has to
       # reach the test processes; xtask/tests/ambient_env.rs fails this job if
       # it does not. Doc-tests are libtest's own and stay a cargo run.
