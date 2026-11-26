@@ -1,4 +1,5 @@
 //! Private, descriptor-confined state roots for the SQLite adapter.
+pub mod backup;
 pub mod confined;
 pub mod paths;
 
