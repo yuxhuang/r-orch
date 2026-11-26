@@ -12,7 +12,7 @@ const TEST_IF: &str = "github.event_name != 'schedule' && needs.changes.result =
 const AMBIENT_IF: &str = "github.event_name == 'push' && github.ref == 'refs/heads/main'";
 const AMBIENT_TARGET: &str = "${{ github.workspace }}/target/ci-ambient";
 /// The suite runner, pinned. A job that runs tests installs exactly this.
-const INSTALL: &str = "      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir \"$RUNNER_TEMP/nextest-install\"";
+const INSTALL: &str = "      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir \"$RUNNER_TEMP/nextest-install\" --root \"$HOME/.nextest-bin\"";
 /// One step per pass, in `nextest::PROFILES` order. The pass split itself is
 /// defined only in `.config/nextest.toml`; this pins that the ambient job runs
 /// both halves of it, and `xtask/tests/nextest_isolation.rs` pins that the
@@ -93,6 +93,27 @@ fn contract(ci: &str) {
             job.lines().any(|line| line == INSTALL),
             "{name} must install the pinned runner"
         );
+    }
+    for lane in [test, ambient] {
+        let restore = step(lane, "Restore nextest executable");
+        assert!(restore.contains("id: nextest-cache\n"));
+        assert!(restore.contains("actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830"));
+        assert!(restore.contains("path: ~/.nextest-bin/bin/cargo-nextest\n"));
+        assert!(restore.contains("key: nextest-${{ runner.os }}-${{ runner.arch }}-0.9.152-${{ hashFiles('rust-toolchain.toml') }}"));
+        assert!(!restore.contains("restore-keys:"));
+        assert!(lane.contains(&format!(
+            "{INSTALL}\n        if: steps.nextest-cache.outputs.cache-hit != 'true'\n"
+        )));
+        let activate = step(lane, "Activate pinned nextest");
+        assert!(activate.contains("echo \"$HOME/.nextest-bin/bin\" >> \"$GITHUB_PATH\""));
+        assert!(
+            activate.contains("test \"$program\" = cargo-nextest && test \"$version\" = 0.9.152")
+        );
+        let save = step(lane, "Save nextest executable");
+        assert!(save.contains("if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.nextest-cache.outputs.cache-hit != 'true'\n"));
+        assert!(save.contains("actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830"));
+        assert!(save.contains("path: ~/.nextest-bin/bin/cargo-nextest\n"));
+        assert!(save.contains("key: ${{ steps.nextest-cache.outputs.cache-primary-key }}"));
     }
     assert!(!check.contains("cargo install"));
     assert!(!changes.contains("cargo install"));
@@ -340,6 +361,95 @@ fn workflow_mutants_are_discriminated() {
             std::panic::catch_unwind(|| contract(&mutant)).is_err(),
             "survived {old}"
         );
+    }
+}
+
+#[test]
+fn nextest_activation_checks_hits_and_misses_before_use() {
+    for name in ["test", "ambient"] {
+        let f = Fixture::new();
+        for relative in ["home/.nextest-bin", "home/.nextest-bin/bin"] {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(f.0.join(relative))
+                .unwrap();
+        }
+        f.executable(
+            "home/.nextest-bin/bin/cargo-nextest",
+            "#!/bin/sh\nprintf '%s\\n' \"$RUNNER_VERSION\"\nexit \"$RUNNER_STATUS\"\n",
+        );
+        let body = script(step(job(CI, name), "Activate pinned nextest"));
+        let output = f.0.join("path");
+        for (version, status, expected) in [
+            (
+                "cargo-nextest 0.9.152 (26ebeda79 2026-11-13)\nrelease: 0.9.152",
+                "0",
+                true,
+            ),
+            ("cargo-nextest 0.9.153", "0", false),
+            ("cargo-nextest 0.9.1520", "0", false),
+            ("other 0.9.152", "0", false),
+            ("", "0", false),
+            ("cargo-nextest 0.9.152", "1", false),
+        ] {
+            assert_eq!(
+                f.run(
+                    &body,
+                    &[
+                        ("GITHUB_PATH", output.to_str().unwrap()),
+                        ("RUNNER_VERSION", version),
+                        ("RUNNER_STATUS", status)
+                    ]
+                ),
+                expected,
+                "{name}: {version}/{status}"
+            );
+        }
+        assert!(
+            fs::read_to_string(output)
+                .unwrap()
+                .lines()
+                .all(|line| line == f.0.join("home/.nextest-bin/bin").to_str().unwrap())
+        );
+    }
+}
+
+#[test]
+fn nextest_cache_boundary_regressions_are_rejected_in_both_lanes() {
+    for name in ["test", "ambient"] {
+        let original = job(CI, name);
+        for (old, new) in [
+            ("--root \"$HOME/.nextest-bin\"", ""),
+            (
+                "if: steps.nextest-cache.outputs.cache-hit != 'true'",
+                "if: false",
+            ),
+            (
+                "path: ~/.nextest-bin/bin/cargo-nextest",
+                "path: ~/.cargo/bin",
+            ),
+            (
+                "key: nextest-${{ runner.os }}",
+                "restore-keys: nextest-${{ runner.os }}",
+            ),
+            (
+                "github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.nextest-cache",
+                "steps.nextest-cache",
+            ),
+            ("test \"$version\" = 0.9.152", "test true"),
+            (
+                "key: ${{ steps.nextest-cache.outputs.cache-primary-key }}",
+                "key: unrelated",
+            ),
+        ] {
+            let changed = original.replacen(old, new, 1);
+            assert_ne!(original, changed, "{name}: {old}");
+            let mutant = CI.replacen(original, &changed, 1);
+            assert!(
+                std::panic::catch_unwind(|| contract(&mutant)).is_err(),
+                "{name}: {old}"
+            );
+        }
     }
 }
 
