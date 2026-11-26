@@ -10,6 +10,7 @@
 use super::SqliteError;
 use crate::blob::{BlobError, ReferenceError};
 
+mod message;
 mod retries;
 mod text;
 
@@ -18,6 +19,12 @@ mod text;
     reason = "internal retry mapping awaits the combined T10 Storage adapter"
 )]
 pub(super) use retries::{NamedObject, Retries, RetryReader};
+
+#[allow(
+    unused_imports,
+    reason = "internal message mapping awaits the combined T10 Storage adapter"
+)]
+pub(super) use message::{MessagePage, MessageReader, MessageSelection, Messages};
 
 #[cfg(test)]
 mod tests;
@@ -55,5 +62,21 @@ fn reference_error(error: ReferenceError) -> SqliteError {
         ReferenceError::MissingOwner { .. }
         | ReferenceError::Metadata
         | ReferenceError::PromptEncoding => corrupt("blob registration"),
+    }
+}
+
+/// A registration failure of a message object: a publication failure keeps its
+/// structure, and any other is damage of the stored key's reachability.
+fn reference_error_for(error: ReferenceError, form: i64) -> SqliteError {
+    match error {
+        ReferenceError::Blob(error) => publish_error(error),
+        ReferenceError::Sql(error) => SqliteError::Sql(error),
+        ReferenceError::MissingOwner { .. }
+        | ReferenceError::Metadata
+        | ReferenceError::PromptEncoding => SqliteError::MessageCorrupt {
+            form,
+            check: "blob registration",
+            locator: "refs",
+        },
     }
 }
