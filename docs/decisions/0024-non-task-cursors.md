@@ -1,7 +1,7 @@
 # 0024. Cursors of the eight families other than Task: inline, retained and by lookup
 
-- Status: accepted. The owner ruled on 2026-11-26 (the lead's eighth and ninth escalations of the storage goal); the ruling takes effect
-  when the owner merges the PR that carries it.
+- Status: accepted. The owner ruled on 2026-11-26 (the lead's eighth and ninth escalations of the storage goal); the ruling
+  took effect when the owner merged PR #369 (`20f95a672`), which carried it.
 - Date: 2026-11-26
 - Spec: [SQLite storage for release 1.1](../specs/2026-11-20-sqlite-storage.md) ("Cursors of the eight families other
   than Task" under "Storage port v2", R10 and the `Cursor` row); plan:
@@ -9,8 +9,9 @@
 - Amends: the `Cursor` contract of [0017](0017-sqlite-storage.md) decision 3 and the cursor text of
   [0020](0020-storage-consumer-contracts.md), for the families other than Task only. It changes no accepted decision's
   wording and supersedes no ADR. Task keeps its cursor and the issue 277 exception of R10.
-- Scope of the decision: the contract and its vectors. No code implements it, nothing is wired into the running
-  daemon, and no vector has run.
+- Scope of the decision: the contract and its vectors. As built, two private slices are on `main` (PR #376, the inline
+  arm, and PR #377, the key-taking entry of the three leaves). The retained and lookup arms are not built, nothing is
+  wired into the running daemon, and no vector has run end to end.
 
 ## Context
 
@@ -97,9 +98,11 @@
 - Up to 8 MiB of the daemon's memory holds anchors. The bounds are the owner's starting bounds, unmeasured against how
   often walks run and against real key lengths. An eviction counter is a follow-up. Before a caller other than the owner
   can list (release 1.3), one caller's walks can evict another's, and a per-principal limit is open.
-- The three leaves gain a key-taking entry and lose the filter check on the anchor, in the page PR. The spec's as-built
-  note for Context, Config, Template and Goal is marked pending until then.
+- The three leaves gain a key-taking entry, `select_after`, that does no filter check on the anchor (PR #377). The
+  record-taking `select` and its refusal stay in the leaves until the page PR retires their use. The leaf half of
+  P-F1, P-F2, Q8 and N3b is tested there; N3a and every integrated vector remain the page PR's (issue 370).
 - The `Cursor` text of the port, R10 and the vectors are in the spec. The page PR names every vector as a test and
-  executes the mutants. Public paging waits for the owner's landing of this wording.
-- The inline capacities are derived from the Task token's constants. The change that lands the encoder confirms or
-  corrects the table in the same PR.
+  executes the mutants. The wording is on `main` (PR #369); public paging waits for the table of retained entries and the
+  page PR (plan steps 4 and 5).
+- The inline capacities are derived from the Task token's constants. The encoder (PR #376) confirms all nine rows of the
+  spec's table, and the table needed no correction.

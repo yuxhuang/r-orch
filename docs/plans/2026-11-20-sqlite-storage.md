@@ -419,21 +419,44 @@ both on SQLite only after that PR has landed, and updates the expected registrat
 
 The owner's rulings of 2026-11-26 (the spec's "Cursors of the eight families other than Task" under "Storage port v2",
 which quotes them; [ADR 0024](../decisions/0024-non-task-cursors.md)) settle how Agent, Team, Run, Message, Context,
-Config, Template and Goal lists page when the anchor does not fit a 512-byte token. The contract is written and nothing
-implements it. Task keeps its cursor and the issue 277 exception.
+Config, Template and Goal lists page when the anchor does not fit a 512-byte token. The contract is written. Steps 1 to 3
+are on `main` (steps 2 and 3 private and unwired: nothing returns a non-Task cursor yet); steps 4 and 5 are not built.
+Task keeps its cursor and the issue 277 exception.
 
 | Step | What | Owner task | Verify |
 |---|---|---|---|
 | 1 | This documentation: R10, the `Cursor` row, the spec section with its vectors, ADR 0024 and this section. It lands before any public paging and wires nothing | the documentation writer | Links resolve; `cargo xtask crate-graph`; `cargo test -p orch-infra --test import_index_reference`; `./xtask/gate.sh fast --base origin/main` (not qualifying) |
-| 2 | The inline arm, inactive: encode and decode the token, expiry and binding, the capacity table of the spec confirmed against the encoder (a difference is a spec edit in the same PR) | T10 | Vectors C7, P-B1 (inline half), I-T1 to I-T4, Q7′, P-S2, P-X2, P-X3 |
-| 3 | A key-taking entry in the three leaves (`sqlite::agent_team_run`, `sqlite::cctg`, `sqlite::retry_message::message`) that resumes after an ordering tuple and does not check the anchor against the filter; the spec's as-built note for Context, Config, Template and Goal is edited when it lands | T10 | P-F1, P-F2, Q8, N3a, N3b |
+| 2 | The inline arm, inactive: encode and decode the token, expiry and binding, the capacity table of the spec confirmed against the encoder (a difference is a spec edit in the same PR). **Built** in PR #376 (`78846fed8`, `crates/orch-infra/src/sqlite/non_task_cursor`); the nine capacities are confirmed and the spec needed no correction | T10 | Vectors C7, P-B1 (inline half), I-T1 to I-T4, Q7′, P-S2, P-X2, P-X3, tested at the module's own interface (22 tests in `cargo test -p orch-infra --lib non_task_cursor`); no page exercises them |
+| 3 | A key-taking entry in the three leaves (`sqlite::agent_team_run`, `sqlite::cctg`, `sqlite::retry_message::message`) that resumes after an ordering tuple and does not check the anchor against the filter; the spec's as-built note for Context, Config, Template and Goal is edited when it lands. **Built** in PR #377 (`110002d86`) as `select_after` beside the unchanged record-taking `select`; the spec's as-built notes now say so | T10 | P-F1, P-F2, Q8, N3a, N3b: the **leaf half** of P-F1, P-F2, Q8 and N3b only (resume after the original tuple, anchor out of the filter, in the selecting view); N3a is not tested; each is due in full at step 5 (issue 370) |
 | 4 | The adapter's table of retained entries and entries by lookup: bounds, nonce, monotonic age injected at construction, poison-recovering lock, the unfiltered identity scan with UTF-8 byte lengths, the tuple comparison | T10 | P-B1 to P-B3, Q1, Q9, D3-A, D2-T, P-L1, P-L2, C1 to C4, P-X1, P-S1, P-T1 to P-T3, P-R1 to P-R4, Q4, Q5, D1-S, D2-L |
-| 5 | The page PR: wires steps 2 to 4 into `Storage` on SQLite for the eight families after the SQLite write path exists (the owner's D1: the unit of work on the writer's thread, with a contained panic). It names every vector as a test, runs the shared cases `cursor_walk_is_stable_under_inserts_and_deletes` and `cursor_is_bound_to_project_filter_and_sort` on SQLite for all eight families, and executes the mutants of Q10 | T10 | The vectors, with the results recorded in that PR; P-W2, P-X4, C8′ and Q2 need the write path |
+| 5 | The page PR: wires steps 2 to 4 into `Storage` on SQLite for the eight families after the SQLite write path exists (the owner's D1: the unit of work on the writer's thread, with a contained panic). It names every vector as a test, runs the shared cases `cursor_walk_is_stable_under_inserts_and_deletes` and `cursor_is_bound_to_project_filter_and_sort` on SQLite for all eight families, and executes the mutants of Q10. It also carries the integrated half of P-F1, P-F2, Q8, N3a and N3b, and the leaf conditions of issue 378 (see "As built, steps 2 and 3") | T10 | The vectors, with the results recorded in that PR; P-W2, P-X4, C8′ and Q2 need the write path |
 | 6 | The walker half of P-E4: a full CLI, TUI or web walk buffers its pages, restarts from page one on `InvalidCursor` a small fixed number of times and then ends with a defined error | T17 | P-E4 (walker half), `cargo test -p orch-cli --test list_paging` |
 | 7 | Follow-ups, not conditions: a count of evictions of unexpired entries, and a per-principal limit on the table before a caller other than the owner can list (release 1.3) | after the page PR | An issue each |
 
-Order. Step 1 first. Public paging, the wire of step 6 and every list that returns a non-Task cursor wait for the owner's
-landing of step 1. Steps 2 and 3 are independent of each other and of the table. The numbers of the table (1,024 entries,
+As built, steps 2 and 3 (PRs #376 and #377; both private, no `Storage` caller). Where the page PR must not trust them:
+
+- The encoder's `Layout`, `Tuple` and `Component` and each leaf's `OrderKey` are separate types with separate comparators
+  (`Layout::compare` and three `cmp_key`). The page PR bridges them (owned keys, the message key, the goal's absent
+  `updated_at` as presence 1 and an empty text on one side and an `Option` on the other) and keeps an all-shapes
+  equivalence test, or unifies the comparators; no test runs one against the other today (issue 378).
+- Issue 378 also holds two leaf test conditions: positive second pages over stored Config and Template rows (a mutation that
+  disabled them survived the suite), and `agent_team_run/key_tests.rs`, which `include!` hides from `cargo fmt`, is not
+  rustfmt-formatted.
+- The page enters the leaves through the router in the order `ensure_committable`, `read`, `port`, and an integration
+  test exercises that route so a direct leaf `select_after` call cannot bypass the transaction guard (issue 378).
+- The page authorizes the caller and takes the project from it, then validates project, generation, family, the whole
+  filter and the sort against the token before any table or row access, and derives the leaf's shape from that
+  validated request. A tuple of the right shape is not a binding, and `key_of`'s identity shape does not check family.
+- The lookup arm scans identities unfiltered, in the project and family, in the resuming view, then compares every
+  component of the tuple and only then calls `select_after`. The message leaf's narrowing query (status `pending`,
+  recipient) serves the page and must not serve the scan.
+- The leaf key tests use short texts. A tuple over the inline capacity, and rows whose texts are stored behind blob
+  objects, are exercised first at step 4 and in the page PR; the leaves compare the hydrated original bytes through the
+  same page code as `select`.
+
+Order. Step 1 first. Public paging, the wire of step 6 and every list that returns a non-Task cursor waited for the owner's
+landing of step 1, which has landed (PR #369); they now wait for steps 4 and 5. Steps 2 and 3 were independent of each
+other and of the table. The numbers of the table (1,024 entries,
 8 MiB, 24 hours) are the owner's starting bounds and are unmeasured; a change goes to the owner.
 
 Rollback. Nothing here touches stored data, a protocol or a file format: the table has no durable form and the tokens
