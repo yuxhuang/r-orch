@@ -210,3 +210,9 @@ mod retry_message;
     reason = "private Task list awaits Storage composition and the public cursor wiring"
 )]
 mod task_adapter;
+
+#[allow(
+    dead_code,
+    reason = "inactive borrowed entity router awaits the owned Storage session"
+)]
+mod entity_router;
