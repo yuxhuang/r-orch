@@ -161,6 +161,7 @@ pub(super) struct EntityWrite<'a, 'conn> {
     native: NativeSql<'a, 'conn>,
     messages: Messages<'a, 'conn>,
     now: i64,
+    poisoned: bool,
 }
 
 impl<'a, 'conn> EntityWrite<'a, 'conn> {
@@ -187,6 +188,7 @@ impl<'a, 'conn> EntityWrite<'a, 'conn> {
             messages: Messages::new(tx, caller, disk),
             read,
             now,
+            poisoned: false,
         }
     }
 
@@ -212,6 +214,9 @@ impl<'a, 'conn> EntityWrite<'a, 'conn> {
     /// The executor's shared latch also prevents commit after caught corruption.
     pub(super) fn ensure_committable(&self) -> Result<()> {
         self.read.active()?;
+        if self.poisoned {
+            return Err(SqliteError::TransactionAborted);
+        }
         self.task.ensure_committable()?;
         self.read
             .observed(self.native.ensure_committable().map_err(native))
@@ -271,6 +276,49 @@ impl<'a, 'conn> EntityWrite<'a, 'conn> {
         self.read.observed(result)
     }
 
+    // The leaf checks stale revisions before reading details. Protect both the
+    // move and its returned Record without changing that error precedence.
+    fn move_task(&mut self, id: &str, expected: Revision) -> Result<Record> {
+        self.read.observed(
+            self.read
+                .tx
+                .execute_batch("SAVEPOINT entity_task_move")
+                .map_err(SqliteError::from),
+        )?;
+        let result = self
+            .task
+            .move_to_end(id, expected)
+            .and_then(|_| {
+                self.read.task().get(id)?.ok_or(SqliteError::TaskCorrupt {
+                    task: id.into(),
+                    check: "moved row missing",
+                    locator: "tasks",
+                })
+            })
+            .and_then(|record| {
+                self.read.tx.execute_batch("RELEASE entity_task_move")?;
+                Ok(record)
+            });
+        let result = match result {
+            Ok(record) => Ok(record),
+            Err(operation) => match self
+                .read
+                .tx
+                .execute_batch("ROLLBACK TO entity_task_move; RELEASE entity_task_move")
+            {
+                Ok(()) => Err(operation),
+                Err(rollback) => {
+                    self.poisoned = true;
+                    Err(SqliteError::OperationRollback {
+                        operation: Box::new(operation),
+                        rollback,
+                    })
+                }
+            },
+        };
+        self.read.observed(result)
+    }
+
     pub(super) fn move_to_end(
         &mut self,
         family: Family,
@@ -279,23 +327,7 @@ impl<'a, 'conn> EntityWrite<'a, 'conn> {
     ) -> Result<Record> {
         self.ensure_committable()?;
         let result = match family {
-            Family::Task => {
-                self.task.move_to_end(id, expected)?;
-                // Rehydrate in this transaction: the port returns the complete
-                // new Record, not just the leaf's revision and position pair.
-                return self
-                    .read
-                    .task()
-                    .get(id)?
-                    .ok_or(SqliteError::TaskCorrupt {
-                        task: id.into(),
-                        check: "moved row missing",
-                        locator: "tasks",
-                    })
-                    .inspect_err(|error| {
-                        self.read.state.observe(FailureSource::Writer, error);
-                    });
-            }
+            Family::Task => return self.move_task(id, expected),
             Family::Agent => self
                 .native
                 .move_to_end(NativeFamily::Agent, id, expected)

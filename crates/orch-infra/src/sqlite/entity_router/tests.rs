@@ -599,3 +599,326 @@ fn failed_cleanup_with_active_transaction_also_refuses_reads_and_task_pages() {
     ));
     tx.rollback().unwrap();
 }
+
+fn assert_poisoned_mutations(trigger: &str, poison: Payload) {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    let (_temp, data) = crate::sqlite::test_data();
+    setup(&data);
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    conn.for_migration()
+        .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Savepoint {
+                operation: TransactionOperation::Rollback,
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    let caller = owner("p");
+    let state = FailureState::new();
+    let mut unit = EntityWrite::new(&tx, &caller, &disk, state.clone(), 0);
+    for family in FAMILIES {
+        unit.create(payload(family, "kept", "before")).unwrap();
+    }
+    tx.execute_batch(trigger).unwrap();
+    assert!(matches!(
+        unit.create(poison),
+        Err(SqliteError::OperationRollback { .. })
+    ));
+    assert!(!tx.is_autocommit());
+    assert_mutations_refused(&mut unit);
+    drop(unit);
+    tx.rollback().unwrap();
+}
+
+fn assert_mutations_refused(unit: &mut EntityWrite<'_, '_>) {
+    let mut out = Vec::new();
+    let aborted = |r: &Result<()>| matches!(r, Err(SqliteError::TransactionAborted));
+    for family in FAMILIES {
+        let n = format!("{:?}", entity(payload(family, "x", "x")).kind());
+        let r = unit.create(payload(family, "new", "after")).map(|_| ());
+        out.push((format!("{n} create"), aborted(&r)));
+        let r = unit
+            .update(payload(family, "kept", "after"), Revision::ONE)
+            .map(|_| ());
+        out.push((format!("{n} update"), aborted(&r)));
+        let r = unit.move_to_end(family, "kept", Revision::ONE).map(|_| ());
+        out.push((format!("{n} move"), aborted(&r)));
+        let r = unit.delete(family, "kept", Revision::ONE);
+        out.push((format!("{n} delete"), aborted(&r)));
+    }
+    out.push((
+        "ensure_committable".into(),
+        aborted(&unit.ensure_committable()),
+    ));
+    let bad: Vec<_> = out.into_iter().filter(|(_, ok)| !ok).collect();
+    assert!(bad.is_empty(), "operations not refused: {bad:?}");
+}
+
+#[test]
+fn native_cleanup_poison_refuses_every_mutation() {
+    assert_poisoned_mutations(
+        "CREATE TEMP TRIGGER fail_agent BEFORE INSERT ON agents BEGIN SELECT RAISE(ABORT,'injected'); END",
+        payload(Family::Agent, "broken", "agent"),
+    );
+}
+
+#[test]
+fn task_cleanup_poison_refuses_every_mutation() {
+    assert_poisoned_mutations(
+        "CREATE TEMP TRIGGER fail_task BEFORE INSERT ON tasks BEGIN SELECT RAISE(ABORT,'injected'); END",
+        payload(Family::Task, "broken", "task"),
+    );
+}
+
+#[test]
+fn every_native_write_observes_corruption_before_returning() {
+    for operation in ["create", "update", "move", "delete"] {
+        let (_temp, data) = crate::sqlite::test_data();
+        setup(&data);
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        let tx = conn.transaction().unwrap();
+        let caller = owner("p");
+        let state = FailureState::new();
+        let mut unit = EntityWrite::new(&tx, &caller, &disk, state.clone(), 0);
+        unit.create(payload(Family::Agent, "a", "agent")).unwrap();
+        if operation == "create" {
+            tx.execute("DELETE FROM agents WHERE project_id='p'", [])
+                .unwrap();
+        } else {
+            tx.execute("DELETE FROM entity_details WHERE project_id='p'", [])
+                .unwrap();
+        }
+        let error = match operation {
+            "create" => unit
+                .create(payload(Family::Agent, "a", "agent"))
+                .map(|_| ()),
+            "update" => unit
+                .update(payload(Family::Agent, "a", "agent"), Revision::ONE)
+                .map(|_| ()),
+            "move" => unit
+                .move_to_end(Family::Agent, "a", Revision::ONE)
+                .map(|_| ()),
+            "delete" => unit.delete(Family::Agent, "a", Revision::ONE),
+            _ => unreachable!(),
+        }
+        .unwrap_err();
+        assert!(
+            matches!(error, SqliteError::EntityCorrupt { .. }),
+            "{operation}: {error:?}"
+        );
+        let failure = state.failure().expect(operation);
+        assert_eq!(failure.source, FailureSource::Writer);
+        assert!(crate::sqlite::writer::failure::classify(&error).is_fatal());
+        assert!(matches!(
+            unit.ensure_committable(),
+            Err(SqliteError::StorageUnavailable(_))
+        ));
+        drop(unit);
+        tx.rollback().unwrap();
+    }
+}
+
+#[test]
+fn native_blob_registration_uses_signed_clock() {
+    let (_temp, data) = crate::sqlite::test_data();
+    setup(&data);
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let tx = conn.transaction().unwrap();
+    let caller = owner("p");
+    let mut unit = EntityWrite::new(&tx, &caller, &disk, FailureState::new(), -777);
+    unit.create(payload(Family::Run, "r", &"é".repeat(40000)))
+        .unwrap();
+    let (count, min, max): (i64, i64, i64) = tx
+        .query_row(
+            "SELECT count(*),min(created_at),max(created_at) FROM blobs WHERE project_id='p'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(count > 0);
+    assert_eq!((min, max), (-777, -777));
+    drop(unit);
+    tx.rollback().unwrap();
+}
+
+#[test]
+fn ended_read_refuses_task_page() {
+    scenario(|data, handle, disk| {
+        let pool = ReadPool::open_with_state(data, Synchronous::Normal, 1, handle.failure_state())
+            .unwrap();
+        let result = pool.read(Instant::now() + Duration::from_secs(10), |tx| {
+            let caller = owner("p");
+            let read = EntityRead::reader(tx, &caller, disk, pool.failure_state().clone());
+            tx.execute_batch("ROLLBACK")?;
+            let page = read.task_page(
+                &TaskCursors::new("generation"),
+                0,
+                &Filter::Tasks {
+                    status: None,
+                    goal: None,
+                },
+                &PageRequest {
+                    limit: 1,
+                    cursor: None,
+                    sort: Sort::Default,
+                    with_count: true,
+                },
+            );
+            assert!(matches!(page, Err(SqliteError::TransactionAborted)));
+            Err::<(), _>(SqliteError::TransactionAborted)
+        });
+        assert!(matches!(result, Err(SqliteError::TransactionAborted)));
+    });
+}
+
+fn task_storage(tx: &Transaction<'_>) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    [
+        "SELECT * FROM tasks WHERE project_id='p' ORDER BY id",
+        "SELECT * FROM task_details WHERE project_id='p' ORDER BY task_id",
+        "SELECT * FROM counters WHERE project_id='p' AND name='position:task'",
+    ]
+    .into_iter()
+    .map(|sql| {
+        let mut statement = tx.prepare(sql).unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    })
+    .collect()
+}
+
+#[test]
+fn caught_task_move_hydration_failure_preserves_rows_and_counter() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (_temp, data) = crate::sqlite::test_data();
+    setup(&data);
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let deny = Arc::new(AtomicBool::new(false));
+    let flag = deny.clone();
+    // Benign connection-local fault: only hydration's detail SELECT is
+    // refused. The move's revision/position queries and writes work.
+    conn.for_migration()
+        .authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Read {
+                table_name: "task_details",
+                ..
+            } if flag.load(Ordering::SeqCst) => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    let caller = owner("p");
+    let state = FailureState::new();
+    let mut unit = EntityWrite::new(&tx, &caller, &disk, state.clone(), 0);
+    let original = unit
+        .create(payload(Family::Task, "kept", "before"))
+        .unwrap();
+    unit.create(payload(Family::Task, "other", "second"))
+        .unwrap();
+    let before = task_storage(&tx);
+    deny.store(true, Ordering::SeqCst);
+    let error = unit
+        .move_to_end(Family::Task, "kept", original.revision)
+        .unwrap_err();
+    assert!(matches!(error, SqliteError::Sql(_)), "{error:?}");
+    let classification = crate::sqlite::writer::failure::classify(&error);
+    assert_eq!(
+        classification.leaves(),
+        &[(
+            crate::sqlite::writer::failure::Role::Operation,
+            crate::sqlite::writer::failure::Class::Transient,
+        )]
+    );
+    assert!(!classification.savepoint_rollback_failed());
+    // Even when hydration would fail, stale revision must win.
+    let stale: Revision = serde_json::from_value(9.into()).unwrap();
+    assert!(matches!(
+        unit.move_to_end(Family::Task, "kept", stale),
+        Err(SqliteError::Store(StoreError::StaleRevision { actual: Some(actual), .. })) if actual == Revision::ONE
+    ));
+    deny.store(false, Ordering::SeqCst);
+    assert_eq!(task_storage(&tx), before);
+    assert_eq!(unit.get(Family::Task, "kept").unwrap(), Some(original));
+    assert!(state.failure().is_none());
+    unit.create(payload(Family::Message, "unrelated", "committed"))
+        .unwrap();
+    unit.ensure_committable().unwrap();
+    drop(unit);
+    tx.commit().unwrap();
+    let pool = ReadPool::open_with_state(&data, Synchronous::Normal, 1, state).unwrap();
+    pool.read(Instant::now() + Duration::from_secs(10), |tx| {
+        assert_eq!(task_storage(tx), before);
+        let read = EntityRead::reader(tx, &caller, &disk, pool.failure_state().clone());
+        assert!(read.get(Family::Message, "unrelated")?.is_some());
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn task_move_cleanup_poison_refuses_all_reads_and_mutations() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    let (_temp, data) = crate::sqlite::test_data();
+    setup(&data);
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    conn.for_migration()
+        .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Savepoint {
+                savepoint_name: "entity_task_move",
+                operation: TransactionOperation::Release | TransactionOperation::Rollback,
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    let caller = owner("p");
+    let state = FailureState::new();
+    let mut unit = EntityWrite::new(&tx, &caller, &disk, state.clone(), 0);
+    for family in FAMILIES {
+        unit.create(payload(family, "kept", "before")).unwrap();
+    }
+    let error = unit
+        .move_to_end(Family::Task, "kept", Revision::ONE)
+        .unwrap_err();
+    assert!(matches!(error, SqliteError::OperationRollback { .. }));
+    assert!(crate::sqlite::writer::failure::classify(&error).savepoint_rollback_failed());
+    assert!(!tx.is_autocommit());
+    assert!(state.failure().is_none());
+    assert_mutations_refused(&mut unit);
+    for family in FAMILIES {
+        assert!(matches!(
+            unit.get(family, "kept"),
+            Err(SqliteError::TransactionAborted)
+        ));
+    }
+    assert!(matches!(
+        unit.task_page(
+            &TaskCursors::new("generation"),
+            0,
+            &Filter::Tasks {
+                status: None,
+                goal: None
+            },
+            &PageRequest {
+                limit: 1,
+                cursor: None,
+                sort: Sort::Default,
+                with_count: true
+            },
+        ),
+        Err(SqliteError::TransactionAborted)
+    ));
+    drop(unit);
+    tx.rollback().unwrap();
+}
