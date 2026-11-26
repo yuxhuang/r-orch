@@ -199,7 +199,7 @@ jobs:
           cache-bin: false
       # The TUI end-to-end tests drive the real binary in tmux and fail when
       # it is missing (AGENTS.md, "TUI end-to-end tests").
-      - run: apt-get update && apt-get install -y tmux
+      - run: apt-get update && apt-get install -y tmux tini
       # The suite runner is pinned: the gate refuses any other version and
       # prints this command. Built from crates.io with the tool's own lockfile
       # rather than fetched as a prebuilt binary or through a third-party
@@ -237,12 +237,26 @@ jobs:
           key: ${{ steps.nextest-cache.outputs.cache-primary-key }}
       # Replace the step shell so runner cancellation signals reach the gate.
       # Export time under real cancellation remains unverified; no receipt guarantee.
+      # The suite runs as an ordinary user, as on a VM. As root it cannot see a
+      # read-only directory refuse a write, and the container's PID 1 reaps no
+      # orphans, so killed children and detached daemons would stay visible.
+      # Each step that runs tests has a shell that drops to this user (and every
+      # capability) under tini as a subreaper. Root keeps git access for its own
+      # post-job steps.
+      - name: Hand the checkout to the suite user
+        shell: bash
+        run: |
+          set -euo pipefail
+          useradd --uid 1001 --user-group --create-home --home-dir /home/ci ci
+          chown -R ci:ci "$GITHUB_WORKSPACE" "$CARGO_HOME" "$RUSTUP_HOME"
+          chmod 0711 "$HOME"
+          git config --system --add safe.directory "$GITHUB_WORKSPACE"
       - name: Folded suite
         id: suite
         env:
           # The receipt's diagnostic label: github-hosted-linux or self-hosted-linux.
           HOST_LABEL: ${{ runner.environment }}-linux
-        shell: bash
+        shell: setpriv --reuid=1001 --regid=1001 --init-groups -- env HOME=/home/ci tini -s -- bash --noprofile --norc -eo pipefail {0}
         run: |
           set -euo pipefail
           exec ./xtask/gate.sh pr --part suite --receipt "$RUNNER_TEMP/pr3-suite-receipt" --lease-wait 5 --host-label "$HOST_LABEL"
@@ -251,7 +265,7 @@ jobs:
       - name: Verify diagnostic receipt
         id: receipt
         if: always()
-        shell: bash
+        shell: setpriv --reuid=1001 --regid=1001 --init-groups -- env HOME=/home/ci tini -s -- bash --noprofile --norc -eo pipefail {0}
         run: |
           set -euo pipefail
           target/gate-xtask/debug/xtask gate evidence verify-receipt "$RUNNER_TEMP/pr3-suite-receipt" --commit "$(git rev-parse HEAD)"
@@ -294,7 +308,7 @@ jobs:
           cache-bin: false
       # The TUI end-to-end tests drive the real binary in tmux and fail when
       # it is missing (AGENTS.md, "TUI end-to-end tests").
-      - run: apt-get update && apt-get install -y tmux
+      - run: apt-get update && apt-get install -y tmux tini
       # The suite runner is pinned: the gate refuses any other version and
       # prints this command. Built from crates.io with the tool's own lockfile
       # rather than fetched as a prebuilt binary or through a third-party
@@ -345,8 +359,25 @@ jobs:
       # pass's result or the doc-tests', which is the whole point of a job whose
       # failures are kept and diagnosed. A cancellation still stops the job, and
       # the job still fails if any step did.
+      # The suite runs as an ordinary user, as on a VM. As root it cannot see a
+      # read-only directory refuse a write, and the container's PID 1 reaps no
+      # orphans, so killed children and detached daemons would stay visible.
+      # Each step that runs tests has a shell that drops to this user (and every
+      # capability) under tini as a subreaper. Root keeps git access for its own
+      # post-job steps.
+      - name: Hand the checkout to the suite user
+        shell: bash
+        run: |
+          set -euo pipefail
+          useradd --uid 1001 --user-group --create-home --home-dir /home/ci ci
+          chown -R ci:ci "$GITHUB_WORKSPACE" "$CARGO_HOME" "$RUSTUP_HOME"
+          chmod 0711 "$HOME"
+          git config --system --add safe.directory "$GITHUB_WORKSPACE"
       - run: cargo nextest run --profile default --workspace --no-fail-fast --no-tests fail
+        shell: setpriv --reuid=1001 --regid=1001 --init-groups -- env HOME=/home/ci tini -s -- bash --noprofile --norc -eo pipefail {0}
       - if: ${{ !cancelled() }}
         run: cargo nextest run --profile alone --workspace --no-fail-fast --no-tests fail
+        shell: setpriv --reuid=1001 --regid=1001 --init-groups -- env HOME=/home/ci tini -s -- bash --noprofile --norc -eo pipefail {0}
       - if: ${{ !cancelled() }}
         run: cargo test --workspace --doc --no-fail-fast
+        shell: setpriv --reuid=1001 --regid=1001 --init-groups -- env HOME=/home/ci tini -s -- bash --noprofile --norc -eo pipefail {0}

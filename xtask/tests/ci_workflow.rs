@@ -33,6 +33,14 @@ const DENY_RUN: &str =
 /// The job container runs as root over a workspace the runner's user owns;
 /// git and the gate both require the checkout's owner to be the job's user.
 const OWN_WORKSPACE: &str = "      - run: chown -R \"$(id -u):$(id -g)\" \"$GITHUB_WORKSPACE\"";
+/// Steps that run tests drop to the suite user and every capability, under
+/// tini as a subreaper: as root a read-only directory never refuses a write,
+/// and the container's PID 1 reaps no orphans.
+const UNPRIVILEGED: &str = "        shell: setpriv --reuid=1001 --regid=1001 --init-groups -- env HOME=/home/ci tini -s -- bash --noprofile --norc -eo pipefail {0}";
+const SUITE_USER: &str =
+    "          useradd --uid 1001 --user-group --create-home --home-dir /home/ci ci";
+const SUITE_OWNS: &str =
+    "          chown -R ci:ci \"$GITHUB_WORKSPACE\" \"$CARGO_HOME\" \"$RUSTUP_HOME\"";
 const HOST_LABEL: &str = "          HOST_LABEL: ${{ runner.environment }}-linux";
 /// The suite runner, pinned. A job that runs tests installs exactly this.
 const INSTALL: &str = "      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir \"$RUNNER_TEMP/nextest-install\" --root \"$HOME/.nextest-bin\"";
@@ -260,6 +268,46 @@ fn contract(ci: &str) {
         );
     }
     assert_eq!(ci.matches(OWN_WORKSPACE).count(), 4);
+    // Test-running steps are unprivileged; the user is set up after everything
+    // root installs and before the first of them.
+    for (name, lane, steps) in [
+        (
+            "test",
+            test,
+            &["Folded suite", "Verify diagnostic receipt"][..],
+        ),
+        ("ambient", ambient, &[][..]),
+    ] {
+        let prep = step(lane, "Hand the checkout to the suite user");
+        assert!(prep.lines().any(|l| l == SUITE_USER), "{name}: suite user");
+        assert!(
+            prep.lines().any(|l| l == SUITE_OWNS),
+            "{name}: suite ownership"
+        );
+        let at = lane
+            .find("      - name: Hand the checkout to the suite user")
+            .unwrap();
+        assert!(lane.find("      - name: Save nextest executable").unwrap() < at);
+        assert!(
+            at < lane.find(UNPRIVILEGED).unwrap(),
+            "{name}: user before use"
+        );
+        for s in steps {
+            assert!(
+                step(lane, s).lines().any(|l| l == UNPRIVILEGED),
+                "{name}: {s} must run unprivileged"
+            );
+        }
+        assert!(lane.contains("      - run: apt-get update && apt-get install -y tmux tini\n"));
+    }
+    assert_eq!(test.matches(UNPRIVILEGED).count(), 2);
+    for pass in [AMBIENT_PASSES[0], AMBIENT_PASSES[1], AMBIENT_DOC] {
+        assert!(
+            ambient.contains(&format!("{pass}\n{UNPRIVILEGED}\n")),
+            "ambient: {pass} must run unprivileged"
+        );
+    }
+    assert_eq!(ci.matches(UNPRIVILEGED).count(), 5);
     assert!(check.contains("test -s Cargo.lock"));
     assert!(check.contains("! grep -qE '^name = \"(terminfo|termwiz)\"$' Cargo.lock"));
     assert!(test.contains("timeout-minutes: 50"));
@@ -477,6 +525,13 @@ fn workflow_mutants_are_discriminated() {
         ("--all-features check", "check"),
         // Ownership: only the top directory, or a git-only exception, is not enough.
         ("chown -R \"$(id -u)", "chown \"$(id -u)"),
+        // The suite as root, or without a subreaper, or as another user.
+        (
+            "--init-groups -- env HOME=/home/ci tini -s -- bash",
+            "--init-groups -- env HOME=/home/ci bash",
+        ),
+        ("--reuid=1001 --regid=1001", "--reuid=0 --regid=0"),
+        ("apt-get install -y tmux tini", "apt-get install -y tmux"),
     ] {
         let mutant = CI.replacen(old, new, 1);
         assert_ne!(mutant, CI);
@@ -753,9 +808,12 @@ fn ambient_workspace_target_resolves_from_package_cwd() {
 /// step before it failed, and nothing else.
 #[test]
 fn an_ambient_job_that_drops_reorders_or_merges_a_pass_is_rejected() {
-    // The three lines the split occupies: the first pass, then the guard and
-    // the second pass as one step.
-    let split = format!("{}\n{}\n{}\n", AMBIENT_PASSES[0], GUARD, AMBIENT_PASSES[1]);
+    // The lines the split occupies: the first pass, then the guard and the
+    // second pass as one step, each pass with its unprivileged shell.
+    let split = format!(
+        "{}\n{UNPRIVILEGED}\n{}\n{}\n{UNPRIVILEGED}\n",
+        AMBIENT_PASSES[0], GUARD, AMBIENT_PASSES[1]
+    );
     assert!(CI.contains(&split));
     for (why, mutant) in [
         (
