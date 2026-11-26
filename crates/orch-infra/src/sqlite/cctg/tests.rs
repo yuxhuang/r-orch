@@ -1252,12 +1252,6 @@ fn projection_drift_in_each_column_is_a_stored_data_error() {
             );
             tx.execute_batch("ROLLBACK TO d; RELEASE d").unwrap();
         }
-        // Counters and identity cannot be repaired by the reader either.
-        tx.execute_batch("SAVEPOINT d").unwrap();
-        tx.execute_batch(&format!("UPDATE {} SET revision=0", family.table()))
-            .unwrap_or(());
-        tx.execute_batch("ROLLBACK TO d; RELEASE d").unwrap();
-        assert!(sql(&tx, &disk, &who).get(family, "k").unwrap().is_some());
     }
 }
 
@@ -1307,10 +1301,7 @@ fn detail_damage_and_a_detail_that_disagrees_with_its_row_are_stored_data_errors
         forge(&detail);
         let error = db.get(Family::Context, "k").unwrap_err();
         let (actual, _) = corrupt(error);
-        assert!(
-            actual == check || (check == "text type" && actual == "typed detail"),
-            "{detail}: {actual}"
-        );
+        assert_eq!(actual, check, "{detail}");
     }
     forge(good);
     assert!(db.get(Family::Context, "k").unwrap().is_some());
@@ -1324,8 +1315,15 @@ fn detail_damage_and_a_detail_that_disagrees_with_its_row_are_stored_data_errors
         "detail length or hash"
     );
     forge(good);
-    tx.execute("UPDATE entity_details SET format=2", [])
-        .unwrap_or(0);
+    assert_eq!(
+        tx.execute("UPDATE entity_details SET format=2", [])
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        corrupt(db.get(Family::Context, "k").unwrap_err()).0,
+        "detail metadata"
+    );
     tx.execute("DELETE FROM entity_details", []).unwrap();
     assert_eq!(
         corrupt(db.get(Family::Context, "k").unwrap_err()).0,
@@ -1500,7 +1498,7 @@ fn a_failed_step_leaves_the_old_row_and_references_readable_even_when_caught() {
                 .collect()
         };
         let before = (state(&tx), db.get(family, "k").unwrap().unwrap());
-        // The reference rows fail in the middle of an update, create and move.
+        // The reference rows fail in the middle of an update and create.
         tx.execute_batch("CREATE TRIGGER fail BEFORE INSERT ON entity_blob_refs BEGIN SELECT RAISE(ABORT,'synthetic'); END").unwrap();
         assert!(matches!(
             db.update(entity(family, "k", &"n".repeat(BIG)), created.revision),
