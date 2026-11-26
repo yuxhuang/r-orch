@@ -915,6 +915,32 @@ async fn retry_state(storage: &dyn Storage) -> (Vec<Record>, Vec<Lease>, Vec<Ret
     (rows, leases, retries)
 }
 
+// Reopen through a fresh adapter so file registrations also check durable rows.
+async fn assert_retry_state_survives_reopen(storage: FileStorage, root: &std::path::Path) {
+    let committed = retry_state(&storage).await;
+    drop(storage);
+    assert_eq!(retry_state(&FileStorage::new(root)).await, committed);
+}
+
+async fn assert_due_success_preserves_other_rows(
+    storage: &dyn Storage,
+    before: &(Vec<Record>, Vec<Lease>, Vec<Retry>),
+) {
+    let after = retry_state(storage).await;
+    for stored in before
+        .0
+        .iter()
+        .filter(|row| row.entity.id() != "task-selected")
+    {
+        assert!(
+            after.0.contains(stored),
+            "unselected or earlier row changed"
+        );
+    }
+    assert_eq!(after.2, vec![row("task-other", 1, i64::MAX)]);
+    assert_eq!(after.1.len(), 1);
+}
+
 /// The selected task's row, if it still has one.
 fn selected_row(retries: &[Retry]) -> Option<&Retry> {
     retries.iter().find(|retry| retry.task == "task-selected")
@@ -1058,27 +1084,41 @@ async fn a_retry_is_refused_before_its_deadline_and_taken_at_it_on_files() {
     due_boundary(&FileStorage::new(root.path())).await;
 }
 
+async fn due_past_deadline(storage: &dyn Storage, due_at: i64, now_ms: i64) {
+    let revision = seed_retrying(storage, 1, due_at).await;
+    let before = retry_state(storage).await;
+    let mut req = rerun_request(revision);
+    req.now_ms = now_ms;
+    assert!(
+        matches!(
+            claim_due_retry(storage, caller(), req).await.unwrap(),
+            ClaimResult::Reserved { .. }
+        ),
+        "due_at {due_at} at {now_ms}"
+    );
+    assert_due_success_preserves_other_rows(storage, &before).await;
+}
+
 #[tokio::test]
 async fn a_deadline_long_past_or_at_the_epoch_is_due() {
     for (due_at, now_ms) in [(0, 0), (0, DUE), (DUE - 1, DUE), (DUE, DUE)] {
         let storage = FakeStorage::default();
-        let revision = seed_retrying(&storage, 1, due_at).await;
-        let mut req = rerun_request(revision);
-        req.now_ms = now_ms;
-        assert!(
-            matches!(
-                claim_due_retry(&storage, caller(), req).await.unwrap(),
-                ClaimResult::Reserved { .. }
-            ),
-            "due_at {due_at} at {now_ms}"
-        );
+        due_past_deadline(&storage, due_at, now_ms).await;
     }
 }
 
 #[tokio::test]
-async fn the_budget_comes_from_the_task_and_the_row_attempt_is_not_interpreted() {
-    let storage = FakeStorage::default();
-    let revision = seed_retrying(&storage, 2, DUE).await;
+async fn a_deadline_long_past_or_at_the_epoch_is_due_on_files() {
+    for (due_at, now_ms) in [(0, 0), (0, DUE), (DUE - 1, DUE), (DUE, DUE)] {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(root.path());
+        due_past_deadline(&storage, due_at, now_ms).await;
+        assert_retry_state_survives_reopen(storage, root.path()).await;
+    }
+}
+
+async fn due_task_budget(storage: &dyn Storage) {
+    let revision = seed_retrying(storage, 2, DUE).await;
     storage
         .transaction(caller(), Lane::Entities, |unit| {
             unit.put_retry(&row("task-selected", 1, DUE))?;
@@ -1086,8 +1126,9 @@ async fn the_budget_comes_from_the_task_and_the_row_attempt_is_not_interpreted()
         })
         .await
         .unwrap();
+    let before = retry_state(storage).await;
     let ClaimResult::Reserved { run, .. } =
-        claim_due_retry(&storage, caller(), rerun_request(revision))
+        claim_due_retry(storage, caller(), rerun_request(revision))
             .await
             .unwrap()
     else {
@@ -1097,12 +1138,25 @@ async fn the_budget_comes_from_the_task_and_the_row_attempt_is_not_interpreted()
         panic!("run")
     };
     assert_eq!(run.attempt, 3);
+    assert_due_success_preserves_other_rows(storage, &before).await;
 }
 
 #[tokio::test]
-async fn a_retrying_task_without_a_row_is_refused_and_nothing_changes() {
+async fn the_budget_comes_from_the_task_and_the_row_attempt_is_not_interpreted() {
     let storage = FakeStorage::default();
-    let revision = seed_retrying(&storage, 1, DUE).await;
+    due_task_budget(&storage).await;
+}
+
+#[tokio::test]
+async fn the_budget_comes_from_the_task_and_the_row_attempt_is_not_interpreted_on_files() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(root.path());
+    due_task_budget(&storage).await;
+    assert_retry_state_survives_reopen(storage, root.path()).await;
+}
+
+async fn due_missing_row(storage: &dyn Storage) {
+    let revision = seed_retrying(storage, 1, DUE).await;
     storage
         .transaction(caller(), Lane::Entities, |unit| {
             assert!(unit.delete_retry("task-selected")?);
@@ -1110,52 +1164,98 @@ async fn a_retrying_task_without_a_row_is_refused_and_nothing_changes() {
         })
         .await
         .unwrap();
-    due_refused(&storage, revision, DUE, Refusal::NoRetry).await;
+    due_refused(storage, revision, DUE, Refusal::NoRetry).await;
+}
+
+#[tokio::test]
+async fn a_retrying_task_without_a_row_is_refused_and_nothing_changes() {
+    let storage = FakeStorage::default();
+    due_missing_row(&storage).await;
+}
+
+#[tokio::test]
+async fn a_retrying_task_without_a_row_is_refused_and_nothing_changes_on_files() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = FileStorage::new(root.path());
+    due_missing_row(&storage).await;
+    assert_retry_state_survives_reopen(storage, root.path()).await;
+}
+
+async fn due_wrong_status(storage: &dyn Storage, status: TaskStatus) {
+    let revision = seed_retrying(storage, 2, DUE).await;
+    let revision = storage
+        .transaction(caller(), Lane::Entities, move |unit| {
+            let mut stored = unit.get(EntityKind::Task, "task-selected")?.expect("task");
+            let Entity::Task(task) = &mut stored.entity else {
+                panic!("task")
+            };
+            task.status = status;
+            Ok(unit.update(stored.entity, revision)?.revision)
+        })
+        .await
+        .unwrap();
+    due_refused(storage, revision, DUE, Refusal::TaskUnavailable).await;
+}
+
+async fn due_other_start_modes(storage: &dyn Storage) {
+    let revision = seed_retrying(storage, 2, DUE).await;
+    let before = retry_state(storage).await;
+    assert_eq!(
+        claim(storage, caller(), rerun_request(revision))
+            .await
+            .unwrap(),
+        ClaimResult::Refused(Refusal::TaskUnavailable)
+    );
+    assert_eq!(
+        claim_explicit_rerun(storage, caller(), rerun_request(revision))
+            .await
+            .unwrap(),
+        ClaimResult::Refused(Refusal::TaskUnavailable)
+    );
+    assert_eq!(retry_state(storage).await, before);
 }
 
 #[tokio::test]
 async fn only_a_retrying_task_is_reserved_as_a_due_retry_and_the_others_keep_their_contracts() {
-    // A stray row never makes another status reservable, and the row stays.
     for status in [
-        TaskStatus::Todo,
-        TaskStatus::InProgress,
-        TaskStatus::Review,
-        TaskStatus::Done,
-        TaskStatus::Failed,
-        TaskStatus::Cancelled,
+        Some(TaskStatus::Todo),
+        Some(TaskStatus::InProgress),
+        Some(TaskStatus::Review),
+        Some(TaskStatus::Done),
+        Some(TaskStatus::Failed),
+        Some(TaskStatus::Cancelled),
+        None,
     ] {
         let storage = FakeStorage::default();
-        let revision = seed_retrying(&storage, 2, DUE).await;
-        let revision = storage
-            .transaction(caller(), Lane::Entities, move |unit| {
-                let mut stored = unit.get(EntityKind::Task, "task-selected")?.expect("task");
-                let Entity::Task(task) = &mut stored.entity else {
-                    panic!("task")
-                };
-                task.status = status;
-                Ok(unit.update(stored.entity, revision)?.revision)
-            })
-            .await
-            .unwrap();
-        due_refused(&storage, revision, DUE, Refusal::TaskUnavailable).await;
+        due_start_mode_case(&storage, status).await;
     }
-    // The ordinary claim and the explicit rerun keep refusing a due retry.
-    let storage = FakeStorage::default();
-    let revision = seed_retrying(&storage, 2, DUE).await;
-    let before = retry_state(&storage).await;
-    assert_eq!(
-        claim(&storage, caller(), rerun_request(revision))
-            .await
-            .unwrap(),
-        ClaimResult::Refused(Refusal::TaskUnavailable)
-    );
-    assert_eq!(
-        claim_explicit_rerun(&storage, caller(), rerun_request(revision))
-            .await
-            .unwrap(),
-        ClaimResult::Refused(Refusal::TaskUnavailable)
-    );
-    assert_eq!(retry_state(&storage).await, before);
+}
+
+#[tokio::test]
+async fn only_a_retrying_task_is_reserved_as_a_due_retry_and_the_others_keep_their_contracts_on_files()
+ {
+    for status in [
+        Some(TaskStatus::Todo),
+        Some(TaskStatus::InProgress),
+        Some(TaskStatus::Review),
+        Some(TaskStatus::Done),
+        Some(TaskStatus::Failed),
+        Some(TaskStatus::Cancelled),
+        None,
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(root.path());
+        due_start_mode_case(&storage, status).await;
+        assert_retry_state_survives_reopen(storage, root.path()).await;
+    }
+}
+
+async fn due_start_mode_case(storage: &dyn Storage, status: Option<TaskStatus>) {
+    if let Some(status) = status {
+        due_wrong_status(storage, status).await;
+    } else {
+        due_other_start_modes(storage).await;
+    }
 }
 
 async fn due_approval_refusal(storage: &dyn Storage) {
@@ -1322,49 +1422,73 @@ async fn a_conflict_stale_revision_or_held_lease_keeps_the_retry_row_on_files() 
     due_conflict_keeps_the_row(&FileStorage::new(root.path())).await;
 }
 
-#[tokio::test]
-async fn an_unavailable_agent_or_an_exhausted_counter_keeps_the_row_and_the_budget() {
-    for disable in [true, false] {
-        let storage = FakeStorage::default();
-        let seeded = seed_retrying(&storage, 2, DUE).await;
-        let mut req = rerun_request(seeded);
-        let changed = storage
-            .transaction(caller(), Lane::Entities, move |unit| {
-                let (kind, id) = if disable {
-                    (EntityKind::Agent, "agent-selected")
-                } else {
-                    (EntityKind::Task, "task-selected")
-                };
-                let mut stored = unit.get(kind, id)?.expect("row");
-                match &mut stored.entity {
-                    Entity::Agent(agent) => agent.status = AgentStatus::Disabled,
-                    Entity::Task(task) => task.assignee = Some("agent-other".into()),
-                    _ => unreachable!(),
-                }
-                Ok(unit.update(stored.entity, stored.revision)?.revision)
-            })
-            .await
-            .unwrap();
-        if disable {
-            req.agent_revision = changed;
-        } else {
-            req.task_revision = changed;
-        }
-        let before = retry_state(&storage).await;
-        assert_eq!(
-            claim_due_retry(&storage, caller(), req).await.unwrap(),
-            ClaimResult::Refused(Refusal::AgentUnavailable)
-        );
-        assert_eq!(retry_state(&storage).await, before);
+async fn due_unavailable_agent(storage: &dyn Storage, disable: bool) {
+    let seeded = seed_retrying(storage, 2, DUE).await;
+    let mut req = rerun_request(seeded);
+    let changed = storage
+        .transaction(caller(), Lane::Entities, move |unit| {
+            let (kind, id) = if disable {
+                (EntityKind::Agent, "agent-selected")
+            } else {
+                (EntityKind::Task, "task-selected")
+            };
+            let mut stored = unit.get(kind, id)?.expect("row");
+            match &mut stored.entity {
+                Entity::Agent(agent) => agent.status = AgentStatus::Disabled,
+                Entity::Task(task) => task.assignee = Some("agent-other".into()),
+                _ => unreachable!(),
+            }
+            Ok(unit.update(stored.entity, stored.revision)?.revision)
+        })
+        .await
+        .unwrap();
+    if disable {
+        req.agent_revision = changed;
+    } else {
+        req.task_revision = changed;
     }
-    let storage = FakeStorage::default();
-    let revision = seed_retrying(&storage, u32::MAX, DUE).await;
-    let before = retry_state(&storage).await;
+    let before = retry_state(storage).await;
+    assert_eq!(
+        claim_due_retry(storage, caller(), req).await.unwrap(),
+        ClaimResult::Refused(Refusal::AgentUnavailable)
+    );
+    assert_eq!(retry_state(storage).await, before);
+}
+
+async fn due_counter_overflow(storage: &dyn Storage) {
+    let revision = seed_retrying(storage, u32::MAX, DUE).await;
+    let before = retry_state(storage).await;
     assert!(matches!(
-        claim_due_retry(&storage, caller(), rerun_request(revision)).await,
+        claim_due_retry(storage, caller(), rerun_request(revision)).await,
         Err(StoreError::CounterExhausted)
     ));
-    assert_eq!(retry_state(&storage).await, before);
+    assert_eq!(retry_state(storage).await, before);
+}
+
+#[tokio::test]
+async fn an_unavailable_agent_or_an_exhausted_counter_keeps_the_row_and_the_budget() {
+    for disable in [Some(true), Some(false), None] {
+        let storage = FakeStorage::default();
+        due_agent_or_counter_case(&storage, disable).await;
+    }
+}
+
+#[tokio::test]
+async fn an_unavailable_agent_or_an_exhausted_counter_keeps_the_row_and_the_budget_on_files() {
+    for disable in [Some(true), Some(false), None] {
+        let root = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(root.path());
+        due_agent_or_counter_case(&storage, disable).await;
+        assert_retry_state_survives_reopen(storage, root.path()).await;
+    }
+}
+
+async fn due_agent_or_counter_case(storage: &dyn Storage, disable: Option<bool>) {
+    if let Some(disable) = disable {
+        due_unavailable_agent(storage, disable).await;
+    } else {
+        due_counter_overflow(storage).await;
+    }
 }
 
 async fn due_race(storage: &dyn Storage) {
