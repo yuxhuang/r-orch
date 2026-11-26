@@ -518,6 +518,56 @@ mod tests {
     }
 
     #[test]
+    fn native_time_projection_is_bounded_below_by_year_zero() {
+        let int = |v: &str| match time(v) {
+            SqlValue::Integer(ms) => Some(ms),
+            SqlValue::Null => None,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(int("0000-01-01T00:00:00.000Z"), Some(TIME_MIN_MS));
+        assert_eq!(int("0000-01-01T00:00:00.001Z"), Some(TIME_MIN_MS + 1));
+        assert_eq!(int("-000001-12-31T23:59:59.999Z"), None);
+        assert_eq!(int("-009999-01-01T00:00:00Z"), None);
+        assert_eq!(int("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(int("9999-12-30T22:00:00.999Z"), Some(253_402_207_200_999));
+        assert_eq!(int("0000-01-01T00:00:00.0005Z"), None);
+        // The anchor itself is the calendar instant, not a copied number.
+        assert_eq!(
+            "0000-01-01T00:00:00Z"
+                .parse::<jiff::Timestamp>()
+                .unwrap()
+                .as_millisecond(),
+            TIME_MIN_MS
+        );
+    }
+
+    #[test]
+    fn native_run_time_column_is_null_below_year_zero_and_text_stays_authoritative() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        for (id, text, expected) in [
+            ("first", "0000-01-01T00:00:00.000Z", Some(TIME_MIN_MS)),
+            ("below", "-000001-12-31T23:59:59.999Z", None),
+        ] {
+            let mut r = run();
+            r.id = id.into();
+            r.started_at = text.into();
+            sql.create(Entity::Run(Box::new(r))).unwrap();
+            let actual: (Option<i64>, String) = tx
+                .query_row(
+                    "SELECT started_at,started_at_text FROM runs WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(actual, (expected, text.into()));
+        }
+    }
+
+    #[test]
     fn native_create_explicitly_projects_status_attempt_time_and_advancing_run_positions() {
         let (_temp, data) = crate::sqlite::test_data();
         let disk = DiskBlobStore::open(data.root()).unwrap();
@@ -2413,11 +2463,14 @@ fn nullable_text(value: Option<&str>) -> SqlValue {
         .map(|v| SqlValue::Text(v.into()))
         .unwrap_or(SqlValue::Null)
 }
+/// UTC milliseconds of `0000-01-01T00:00:00.000Z`, the documented lower bound
+/// of a native time column; jiff also parses earlier expanded-year instants.
+const TIME_MIN_MS: i64 = -62_167_219_200_000;
 fn time(value: &str) -> SqlValue {
     value
         .parse::<jiff::Timestamp>()
         .ok()
-        .filter(|t| t.as_nanosecond() % 1_000_000 == 0)
+        .filter(|t| t.as_nanosecond() % 1_000_000 == 0 && t.as_millisecond() >= TIME_MIN_MS)
         .map(|t| SqlValue::Integer(t.as_millisecond()))
         .unwrap_or(SqlValue::Null)
 }
