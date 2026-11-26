@@ -194,6 +194,7 @@ impl<'a, 'conn> EntityWrite<'a, 'conn> {
         self.read.caller()
     }
     pub(super) fn get(&self, family: Family, id: &str) -> Result<Option<Record>> {
+        self.ensure_committable()?;
         self.read.get(family, id)
     }
     pub(super) fn task_page(
@@ -203,6 +204,7 @@ impl<'a, 'conn> EntityWrite<'a, 'conn> {
         filter: &Filter,
         page: &PageRequest,
     ) -> Result<Page<Record>> {
+        self.ensure_committable()?;
         self.read.task_page(cursors, now, filter, page)
     }
 

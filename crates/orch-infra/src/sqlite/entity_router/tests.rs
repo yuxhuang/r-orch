@@ -544,3 +544,58 @@ fn ended_read_transaction_refuses_before_looking_up_any_family() {
         assert!(handle.failure_state().failure().is_none());
     });
 }
+
+#[test]
+fn failed_cleanup_with_active_transaction_also_refuses_reads_and_task_pages() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    let (_temp, data) = crate::sqlite::test_data();
+    setup(&data);
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    conn.for_migration()
+        .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Savepoint {
+                operation: TransactionOperation::Rollback,
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    let caller = owner("p");
+    let state = FailureState::new();
+    let mut unit = EntityWrite::new(&tx, &caller, &disk, state.clone(), 0);
+    unit.create(payload(Family::Task, "kept", "before failure"))
+        .unwrap();
+    tx.execute_batch("CREATE TEMP TRIGGER fail_agent BEFORE INSERT ON agents BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
+    assert!(matches!(
+        unit.create(payload(Family::Agent, "broken", "agent")),
+        Err(SqliteError::OperationRollback { .. })
+    ));
+    assert!(!tx.is_autocommit());
+    assert!(state.failure().is_none());
+    for family in FAMILIES {
+        assert!(matches!(
+            unit.get(family, "kept"),
+            Err(SqliteError::TransactionAborted)
+        ));
+    }
+    assert!(matches!(
+        unit.task_page(
+            &TaskCursors::new("generation"),
+            0,
+            &Filter::Tasks {
+                status: None,
+                goal: None
+            },
+            &PageRequest {
+                limit: 1,
+                cursor: None,
+                sort: Sort::Default,
+                with_count: true
+            }
+        ),
+        Err(SqliteError::TransactionAborted)
+    ));
+    tx.rollback().unwrap();
+}
