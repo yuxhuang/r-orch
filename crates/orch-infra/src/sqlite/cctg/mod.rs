@@ -747,6 +747,14 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
             })?
             .collect::<rusqlite::Result<_>>()?)
     }
+    /// Execute one compiled statement with every value bound.
+    fn run(&self, query: &str, values: &[SqlValue]) -> NativeResult<usize> {
+        let mut stmt = self.tx.prepare(query)?;
+        for (i, value) in values.iter().enumerate() {
+            stmt.raw_bind_parameter(i + 1, value)?;
+        }
+        Ok(stmt.raw_execute()?)
+    }
     fn locator(&self, form: i64, stored: &str) -> Vec<SqlValue> {
         vec![
             SqlValue::Text(self.project.into()),
@@ -1156,13 +1164,13 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
                 .map(|i| format!("?{i}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            this.tx.execute(
+            this.run(
                 &format!(
                     "INSERT INTO {}({}) VALUES({slots})",
                     family.table(),
                     columns.join(",")
                 ),
-                rusqlite::params_from_iter(values),
+                &values,
             )?;
             this.install(family, entity.id(), &detail)?;
             this.store_position(family, position)?;
@@ -1197,13 +1205,13 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
                 .map(|(i, c)| format!("{c}=?{}", i + 4))
                 .collect::<Vec<_>>();
             assignments.push(format!("revision=?{}", values.len()));
-            this.tx.execute(
+            this.run(
                 &format!(
                     "UPDATE {} SET {} WHERE project_id=?1 AND {identity}_form=?2 AND {identity}=?3",
                     family.table(),
                     assignments.join(",")
                 ),
-                rusqlite::params_from_iter(values),
+                &values,
             )?;
             this.install(family, entity.id(), &detail)?;
             Ok(Record {
@@ -1232,12 +1240,12 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
                 SqlValue::Integer(integer(position)?),
             ]);
             let identity = family.identity();
-            this.tx.execute(
+            this.run(
                 &format!(
                     "UPDATE {} SET revision=?4,position=?5 WHERE project_id=?1 AND {identity}_form=?2 AND {identity}=?3",
                     family.table()
                 ),
-                rusqlite::params_from_iter(values),
+                &values,
             )?;
             this.store_position(family, position)?;
             Ok(Record {
@@ -1259,12 +1267,12 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
         self.atomic(|this| {
             this.clear(family, id)?;
             let identity = family.identity();
-            this.tx.execute(
+            this.run(
                 &format!(
                     "DELETE FROM {} WHERE project_id=?1 AND {identity}_form=?2 AND {identity}=?3",
                     family.table()
                 ),
-                rusqlite::params_from_iter(this.identity(id)),
+                &this.identity(id),
             )?;
             Ok(())
         })
@@ -1274,7 +1282,7 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
         let mut values = self.identity(id);
         values.push(SqlValue::Text(family.name().into()));
         for table in ["entity_details", "entity_blob_refs"] {
-            self.tx.execute(&format!("DELETE FROM {table} WHERE project_id=?1 AND key_form=?2 AND entity_key=?3 AND family=?4"), rusqlite::params_from_iter(&values))?;
+            self.run(&format!("DELETE FROM {table} WHERE project_id=?1 AND key_form=?2 AND entity_key=?3 AND family=?4"), &values)?;
         }
         Ok(())
     }
