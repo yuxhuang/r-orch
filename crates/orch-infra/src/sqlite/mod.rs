@@ -19,6 +19,19 @@ pub enum SqliteError {
     },
     #[error("task object access failed: {0:?}")]
     TaskAccess(std::io::ErrorKind),
+    /// Context, Config, Template or Goal: names the family and the identity's key
+    /// form, never a text or a path.
+    #[error("stored {family} form {form} failed {check} at {locator}")]
+    EntityCorrupt {
+        family: &'static str,
+        form: i64,
+        check: &'static str,
+        locator: String,
+    },
+    #[error("entity object access failed: {0:?}")]
+    EntityAccess(std::io::ErrorKind),
+    #[error(transparent)]
+    EntityPublication(crate::blob::BlobError),
     #[error(transparent)]
     TaskPublication(crate::blob::BlobError),
     #[error("SQLite counter {name} is missing for project {project} with existing rows")]
@@ -125,6 +138,12 @@ fn test_data() -> (tempfile::TempDir, crate::data_dir::DataDir) {
     reason = "internal goal persistence slice; full Storage and safety policy are not wired yet"
 )]
 mod goal_adapter;
+
+#[allow(
+    dead_code,
+    reason = "Context, Config, Template and Goal mapping awaits the combined T10 Storage adapter"
+)]
+mod cctg;
 
 #[allow(
     dead_code,
