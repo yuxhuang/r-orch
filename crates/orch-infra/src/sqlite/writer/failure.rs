@@ -166,9 +166,11 @@ fn walk(error: &SqliteError, out: &mut Observation) {
         StorageUnavailable(_) => Class::Ordinary,
         // R140 names SQLITE_CORRUPT, SQLITE_NOTADB and `TaskCorrupt` as fatal.
         // The stored-data errors below are not among them.
-        EventCorrupt(_) | IntentCorrupt(_) | LeaseCorrupt(_) | RetryMessageCorrupt(_) => {
-            Class::Ordinary
-        }
+        EventCorrupt(_)
+        | IntentCorrupt(_)
+        | LeaseCorrupt(_)
+        | RetryMessageCorrupt(_)
+        | MessageCorrupt { .. } => Class::Ordinary,
         CounterMissing { .. }
         | CounterNegative { .. }
         | CounterBehind { .. }
