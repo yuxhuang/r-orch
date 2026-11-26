@@ -574,7 +574,11 @@ fn the_task_format_migration_keeps_earlier_versions_and_applies_to_a_populated_p
     )
     .unwrap();
     project(&conn);
-    conn.execute("INSERT INTO goals(project_id,id,title,description,status,position,created_at,revision) VALUES('p','g','keep','text','active',1,0,1)", []).unwrap();
+    conn.execute(
+        "INSERT INTO import_manifest VALUES('p','goal','g','keep',0)",
+        [],
+    )
+    .unwrap();
     let before: Vec<(i64, i64)> = conn
         .prepare("SELECT version,applied_at FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -586,11 +590,15 @@ fn the_task_format_migration_keeps_earlier_versions_and_applies_to_a_populated_p
     assert_eq!(
         conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
             .unwrap(),
-        4
+        5
     );
     assert_eq!(
-        conn.query_row::<String, _, _>("SELECT title FROM goals WHERE id='g'", [], |r| r.get(0))
-            .unwrap(),
+        conn.query_row::<String, _, _>(
+            "SELECT source_sha256 FROM import_manifest WHERE entity_id='g'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
         "keep"
     );
     let after: Vec<(i64, i64)> = conn
@@ -628,7 +636,11 @@ fn the_task_format_migration_keeps_earlier_versions_and_applies_to_a_populated_p
     );
     assert_eq!(
         backup
-            .query_row::<String, _, _>("SELECT title FROM goals WHERE id='g'", [], |r| r.get(0))
+            .query_row::<String, _, _>(
+                "SELECT source_sha256 FROM import_manifest WHERE entity_id='g'",
+                [],
+                |r| r.get(0)
+            )
             .unwrap(),
         "keep"
     );
@@ -784,11 +796,50 @@ fn agent_team_run_registry_reaches_four_and_repeats_without_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = data(&tmp);
     let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-    migrate(&dir, &mut conn).unwrap();
+    let four = [
+        INITIAL_SCHEMA,
+        orch_infra::sqlite::migrations::ATTENTION_FACTS,
+        orch_infra::sqlite::migrations::TASK_FORMAT,
+        orch_infra::sqlite::migrations::AGENT_TEAM_RUN,
+    ];
+    apply_migrations(&dir, &mut conn, &four, plenty()).unwrap();
     assert_eq!(
         conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
             .unwrap(),
         4
+    );
+    let history: Vec<(i64, i64)> = conn
+        .prepare("SELECT version,applied_at FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    apply_migrations(&dir, &mut conn, &four, plenty()).unwrap();
+    let after: Vec<(i64, i64)> = conn
+        .prepare("SELECT version,applied_at FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(history, after);
+    assert_eq!(
+        history.iter().map(|r| r.0).collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
+}
+
+#[test]
+fn settings_registry_reaches_five_and_repeats_without_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap(),
+        5
     );
     let history: Vec<(i64, i64)> = conn
         .prepare("SELECT version,applied_at FROM schema_migrations ORDER BY version")
@@ -808,7 +859,7 @@ fn agent_team_run_registry_reaches_four_and_repeats_without_changes() {
     assert_eq!(history, after);
     assert_eq!(
         history.iter().map(|r| r.0).collect::<Vec<_>>(),
-        [1, 2, 3, 4]
+        [1, 2, 3, 4, 5]
     );
 }
 
@@ -1017,5 +1068,291 @@ fn agent_team_run_upgrade_preserves_task_authority_and_other_families() {
         copy.query_row::<String, _, _>("SELECT detail FROM task_details", [], |r| r.get(0))
             .unwrap(),
         "{}"
+    );
+}
+
+fn four_steps() -> [&'static str; 4] {
+    use orch_infra::sqlite::migrations::{AGENT_TEAM_RUN, ATTENTION_FACTS, TASK_FORMAT};
+    [INITIAL_SCHEMA, ATTENTION_FACTS, TASK_FORMAT, AGENT_TEAM_RUN]
+}
+
+fn columns(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+    conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+#[test]
+fn the_context_config_template_goal_migration_keeps_earlier_versions_and_applies_to_a_predecessor_without_rows_in_these_tables_and_keeps_unrelated_rows()
+ {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    apply_migrations(&dir, &mut conn, &four_steps(), plenty()).unwrap();
+    project(&conn);
+    conn.execute(
+        "INSERT INTO import_manifest VALUES('p','goal','g','keep',0)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO entity_details VALUES('p','agent',0,'a',1,'{}',2,?1)",
+        ["0".repeat(64)],
+    )
+    .unwrap();
+    conn.execute("INSERT INTO counters VALUES('p','position:agent',7)", [])
+        .unwrap();
+    let before: Vec<(i64, i64)> = conn
+        .prepare("SELECT version,applied_at FROM schema_migrations ORDER BY version")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let earlier = |conn: &rusqlite::Connection| -> String {
+        conn.query_row("SELECT group_concat(sql) FROM (SELECT sql FROM sqlite_schema WHERE name NOT IN ('context_entries','project_config','templates','goals') ORDER BY name)", [], |r| r.get(0)).unwrap()
+    };
+    let sql = earlier(&conn);
+    migrate(&dir, &mut conn).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap(),
+        5
+    );
+    assert_eq!(earlier(&conn), sql, "no earlier table or index is touched");
+    let after: Vec<(i64, i64)> = conn
+        .prepare(
+            "SELECT version,applied_at FROM schema_migrations WHERE version<5 ORDER BY version",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(before, after);
+    for (table, new) in [
+        (
+            "context_entries",
+            ["ttl_ms", "created_at", "position", "set_by_identity"],
+        ),
+        (
+            "project_config",
+            ["position", "key_form", "value_sha256", "value_bytes"],
+        ),
+        (
+            "templates",
+            ["position", "name_form", "body_sha256", "body_bytes"],
+        ),
+        (
+            "goals",
+            [
+                "position",
+                "created_at_text",
+                "updated_at_text_form",
+                "assignee_agent_id_bytes",
+            ],
+        ),
+    ] {
+        let present = columns(&conn, table);
+        for column in new {
+            assert!(present.iter().any(|c| c == column), "{table}.{column}");
+        }
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT strict FROM pragma_table_list WHERE name=?1",
+                [table],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+    // Later-phase and legacy columns of the rebuilt tables are kept.
+    for column in [
+        "integration_branch",
+        "integration_head",
+        "published_at",
+        "published_commit",
+        "published_by",
+    ] {
+        assert!(columns(&conn, "goals").iter().any(|c| c == column));
+    }
+    for column in [
+        "set_by_kind",
+        "set_by_agent_id",
+        "set_by_run_id",
+        "expires_at",
+    ] {
+        assert!(
+            columns(&conn, "context_entries")
+                .iter()
+                .any(|c| c == column)
+        );
+    }
+    assert_eq!(
+        conn.query_row::<String, _, _>("SELECT source_sha256 FROM import_manifest", [], |r| r
+            .get(0))
+            .unwrap(),
+        "keep"
+    );
+    assert_eq!(
+        conn.query_row::<i64, _, _>(
+            "SELECT value FROM counters WHERE name='position:agent'",
+            [],
+            |r| r.get(0)
+        )
+        .unwrap(),
+        7
+    );
+    let copies: Vec<_> = std::fs::read_dir(tmp.path().join("data/backups"))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(copies.len(), 1);
+    let copy = rusqlite::Connection::open_with_flags(
+        copies[0].path().join("orch.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        copy.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        copy.query_row::<String, _, _>("SELECT detail FROM entity_details", [], |r| r.get(0))
+            .unwrap(),
+        "{}"
+    );
+    migrate(&dir, &mut conn).unwrap();
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join("data/backups"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_predecessor_with_any_context_config_template_or_goal_row_is_refused_and_left_readable() {
+    let fixtures = [
+        (
+            "context_entries",
+            "INSERT INTO context_entries(project_id,key,value,set_by_kind,updated_at,revision) VALUES('p','private-key','private-value','owner',0,1)",
+        ),
+        (
+            "project_config",
+            "INSERT INTO project_config VALUES('p','private-key','private-value',1)",
+        ),
+        (
+            "templates",
+            "INSERT INTO templates VALUES('p','private-name','private-body',1)",
+        ),
+        (
+            "goals",
+            "INSERT INTO goals(project_id,id,title,description,status,position,created_at,revision) VALUES('p','private-id','private-title','private-text','active',1,0,1)",
+        ),
+    ];
+    for version in [1, 4] {
+        for (table, insert) in fixtures {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = data(&tmp);
+            let mut conn =
+                open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+            apply_migrations(&dir, &mut conn, &four_steps()[..version], plenty()).unwrap();
+            project(&conn);
+            conn.execute(insert, []).unwrap();
+            let schema = |conn: &rusqlite::Connection| -> String {
+                conn.query_row(
+                    "SELECT group_concat(sql) FROM (SELECT sql FROM sqlite_schema ORDER BY name)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+            };
+            let before = schema(&conn);
+            for _ in 0..2 {
+                let error = migrate(&dir, &mut conn).unwrap_err().to_string();
+                assert!(error.contains(&format!("{table}=1")), "{error}");
+                assert!(!error.contains("private-"), "{error}");
+                assert_eq!(
+                    conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                        .unwrap(),
+                    version as i64
+                );
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        "SELECT count(*) FROM schema_migrations",
+                        [],
+                        |r| { r.get(0) }
+                    )
+                    .unwrap(),
+                    version as i64
+                );
+                assert_eq!(
+                    conn.query_row::<i64, _, _>(
+                        &format!("SELECT count(*) FROM {table}"),
+                        [],
+                        |r| r.get(0)
+                    )
+                    .unwrap(),
+                    1
+                );
+                assert_eq!(schema(&conn), before);
+                assert_eq!(
+                    std::fs::read_dir(tmp.path().join("data/backups"))
+                        .unwrap()
+                        .count(),
+                    0
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn context_config_template_goal_transactional_hook_refuses_rows_created_after_preflight() {
+    use orch_infra::sqlite::migrations::CONTEXT_CONFIG_TEMPLATE_GOAL;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    // Version zero has no preflight tables. This simulates a trusted intermediate
+    // migration creating a predecessor row: only the 005 hook can catch it.
+    let predecessor = format!(
+        "{INITIAL_SCHEMA}; INSERT INTO templates VALUES('p','private-name','private-body',1);"
+    );
+    let [_, attention, task, entities] = four_steps();
+    let error = apply_migrations(
+        &dir,
+        &mut conn,
+        &[
+            &predecessor,
+            attention,
+            task,
+            entities,
+            CONTEXT_CONFIG_TEMPLATE_GOAL,
+        ],
+        plenty(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("templates=1"), "{error}");
+    assert!(!error.contains("private-"));
+    assert_eq!(
+        conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM templates", [], |r| r.get(0))
+            .unwrap(),
+        1
+    );
+    assert!(
+        !columns(&conn, "templates").iter().any(|c| c == "position"),
+        "the predecessor table is not rebuilt"
     );
 }

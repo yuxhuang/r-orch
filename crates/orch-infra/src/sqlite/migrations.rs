@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
-pub const SCHEMA_VERSION: usize = 4;
+pub const SCHEMA_VERSION: usize = 5;
+pub const CONTEXT_CONFIG_TEMPLATE_GOAL: &str =
+    include_str!("migrations/005_context_config_template_goal.sql");
 pub const AGENT_TEAM_RUN: &str = include_str!("migrations/004_agent_team_run.sql");
 pub const TASK_FORMAT: &str = include_str!("migrations/003_task_format.sql");
 pub const ATTENTION_FACTS: &str = include_str!("migrations/002_attention_facts.sql");
@@ -44,7 +46,13 @@ pub fn migrate(data: &DataDir, conn: &mut ConnectionHandle<'_>) -> Result<()> {
     apply_migrations(
         data,
         conn,
-        &[INITIAL_SCHEMA, ATTENTION_FACTS, TASK_FORMAT, AGENT_TEAM_RUN],
+        &[
+            INITIAL_SCHEMA,
+            ATTENTION_FACTS,
+            TASK_FORMAT,
+            AGENT_TEAM_RUN,
+            CONTEXT_CONFIG_TEMPLATE_GOAL,
+        ],
         DiskSpace::read(data)?,
     )
 }
@@ -94,6 +102,14 @@ pub fn apply_migrations(
     {
         refuse_lossy_entities(conn).map_err(preflight_error)?;
     }
+    if version > 0
+        && steps
+            .iter()
+            .skip(version)
+            .any(|step| *step == CONTEXT_CONFIG_TEMPLATE_GOAL)
+    {
+        refuse_lossy_settings(conn).map_err(preflight_error)?;
+    }
     let holds_project = version > 0
         && conn.query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |r| r.get(0))? > 0;
     if holds_project {
@@ -130,6 +146,13 @@ pub fn apply_migrations(
                     let sql = sql.clone();
                     M::up_with_hook("", move |tx: &rusqlite::Transaction<'_>| {
                         refuse_lossy_entities(tx)?;
+                        tx.execute_batch(&sql)?;
+                        Ok(())
+                    })
+                } else if *step == CONTEXT_CONFIG_TEMPLATE_GOAL {
+                    let sql = sql.clone();
+                    M::up_with_hook("", move |tx: &rusqlite::Transaction<'_>| {
+                        refuse_lossy_settings(tx)?;
                         tx.execute_batch(&sql)?;
                         Ok(())
                     })
@@ -207,6 +230,29 @@ fn refuse_lossy_entities(conn: &Connection) -> rusqlite_migration::HookResult {
             .join(", ");
         return Err(rusqlite_migration::HookError::Hook(format!(
             "entity format v1 refuses ambiguous predecessor rows: {summary}"
+        )));
+    }
+    Ok(())
+}
+
+// The predecessor rows hold neither the original time spellings, the independent
+// TTL, positions nor an allocator high-water mark. Never invent them: refuse,
+// with counts only, and leave the previous schema and its contents readable.
+fn refuse_lossy_settings(conn: &Connection) -> rusqlite_migration::HookResult {
+    let mut counts = Vec::new();
+    for table in ["context_entries", "project_config", "templates", "goals"] {
+        let count: i64 =
+            conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))?;
+        counts.push((table, count));
+    }
+    if counts.iter().any(|(_, count)| *count != 0) {
+        let summary = counts
+            .iter()
+            .map(|(table, count)| format!("{table}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(rusqlite_migration::HookError::Hook(format!(
+            "settings entity format v1 refuses ambiguous predecessor rows: {summary}"
         )));
     }
     Ok(())
@@ -474,6 +520,39 @@ mod tests {
             matches!(error, SqliteError::Sql(rusqlite::Error::SqliteFailure(ref code, _)) if code.extended_code == rusqlite::ffi::SQLITE_ERROR),
             "preflight lost its SQLite category: {error:?}"
         );
+    }
+
+    #[test]
+    fn settings_format_preflight_statement_error_keeps_its_sqlite_category() {
+        let steps = [
+            INITIAL_SCHEMA,
+            ATTENTION_FACTS,
+            TASK_FORMAT,
+            AGENT_TEAM_RUN,
+            CONTEXT_CONFIG_TEMPLATE_GOAL,
+        ];
+        for version in [1, 4] {
+            let (_tmp, data) = test_data();
+            let mut conn =
+                open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+            apply_migrations(&data, &mut conn, &steps[..version], plenty()).unwrap();
+            conn.execute_batch("DROP TABLE templates").unwrap();
+            let error = apply_migrations(&data, &mut conn, &steps, plenty()).unwrap_err();
+            assert!(
+                matches!(&error, SqliteError::Sql(rusqlite::Error::SqliteFailure(code, _)) if code.extended_code == rusqlite::ffi::SQLITE_ERROR),
+                "v{version} preflight lost its SQLite category: {error:?}"
+            );
+            assert_eq!(
+                classify(&error).leaves(),
+                &[(Role::Operation, Class::Transient)],
+                "{error:?}"
+            );
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                version as i64
+            );
+        }
     }
 
     #[test]
