@@ -73,7 +73,7 @@ pub trait LeaseRead: Send + Sync {
 
 /// Operations share the enclosing unit of work, so a claim commits or rolls
 /// back with the run row and the task status the engine writes beside it.
-pub trait LeaseWrite: Send {
+pub trait LeaseWrite {
     /// Grants a lease only when the task has none and the agent has none.
     /// `now_ms` is from `Clock::now_ms()`; expiry is checked `now_ms + LEASE_MS`.
     fn claim_lease(&mut self, new: &NewLease, now_ms: i64) -> Result<ClaimOutcome>;

@@ -51,7 +51,7 @@ pub trait EventRead: Send + Sync {
 }
 
 /// Operations share the enclosing unit of work and its caller/project.
-pub trait EventWrite: Send {
+pub trait EventWrite {
     /// Checks the active lease even for an empty or wholly duplicate batch.
     /// First stored bytes win for each sequence; duplicates within a batch also
     /// count as skipped. Invalid sequences refuse the whole operation.

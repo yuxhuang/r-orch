@@ -152,7 +152,7 @@ pub trait RetryRead: Send + Sync {
 
 /// Operations share the enclosing unit of work, so a retry row commits or
 /// rolls back with the task status and the run the engine writes beside it.
-pub trait RetryWrite: Send {
+pub trait RetryWrite {
     /// Inserts the row, or replaces the task's row whole. Refused rows change
     /// nothing, and a refusal caught by the caller still leaves nothing behind.
     fn put_retry(&mut self, retry: &Retry) -> Result<()>;

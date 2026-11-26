@@ -204,7 +204,7 @@ pub enum KeyCheck {
 
 /// Operations share the enclosing unit of work, so a key commits or rolls back
 /// with the change it guards.
-pub trait RequestKeyWrite: Send {
+pub trait RequestKeyWrite {
     /// Looks the scope up as of `now_ms`. `op` is the operation name and
     /// `req_sha256` the request hash, 64 lowercase hex digits, computed by the
     /// caller (the canonical form is T17's). Sees this unit of work's own
