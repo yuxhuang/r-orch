@@ -222,7 +222,10 @@ unit tests, not by the conformance filters above, so they have no registrations 
 
 These two names cover only the Task cursor on SQLite. Every other obligation of
 R10, including the filter and sort binding and the walk for the other entity
-families, stays with the bare filters in the R10 row above.
+families, stays with the bare filters in the R10 row above. The cursors of the
+eight families other than Task (R10 as the owner's rulings of 2026-11-26 changed it)
+are proved by the vectors of "Non-Task cursors" below, which are named tests of the
+page PR and are not built yet: they have no registration and no result.
 
 PR142's file-specific R97 proof is
 `cargo test -p orch-infra --lib -- storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store --exact`
@@ -411,6 +414,30 @@ The two shared scenarios are `message_and_run_filters_stay_within_their_family` 
 and `file_v2` and is run by the crosswalk's rule (list, then run with
 `cargo test -p orch-engine --test storage_conformance -- <filter>`, three passing registrations each). T10 registers
 both on SQLite only after that PR has landed, and updates the expected registrations then.
+
+### Non-Task cursors
+
+The owner's rulings of 2026-11-26 (the spec's "Cursors of the eight families other than Task" under "Storage port v2",
+which quotes them; [ADR 0024](../decisions/0024-non-task-cursors.md)) settle how Agent, Team, Run, Message, Context,
+Config, Template and Goal lists page when the anchor does not fit a 512-byte token. The contract is written and nothing
+implements it. Task keeps its cursor and the issue 277 exception.
+
+| Step | What | Owner task | Verify |
+|---|---|---|---|
+| 1 | This documentation: R10, the `Cursor` row, the spec section with its vectors, ADR 0024 and this section. It lands before any public paging and wires nothing | the documentation writer | Links resolve; `cargo xtask crate-graph`; `cargo test -p orch-infra --test import_index_reference`; `./xtask/gate.sh fast --base origin/main` (not qualifying) |
+| 2 | The inline arm, inactive: encode and decode the token, expiry and binding, the capacity table of the spec confirmed against the encoder (a difference is a spec edit in the same PR) | T10 | Vectors C7, P-B1 (inline half), I-T1 to I-T4, Q7′, P-S2, P-X2, P-X3 |
+| 3 | A key-taking entry in the three leaves (`sqlite::agent_team_run`, `sqlite::cctg`, `sqlite::retry_message::message`) that resumes after an ordering tuple and does not check the anchor against the filter; the spec's as-built note for Context, Config, Template and Goal is edited when it lands | T10 | P-F1, P-F2, Q8, N3a, N3b |
+| 4 | The adapter's table of retained entries and entries by lookup: bounds, nonce, monotonic age injected at construction, poison-recovering lock, the unfiltered identity scan with UTF-8 byte lengths, the tuple comparison | T10 | P-B1 to P-B3, Q1, Q9, D3-A, D2-T, P-L1, P-L2, C1 to C4, P-X1, P-S1, P-T1 to P-T3, P-R1 to P-R4, Q4, Q5, D1-S, D2-L |
+| 5 | The page PR: wires steps 2 to 4 into `Storage` on SQLite for the eight families after the SQLite write path exists (the owner's D1: the unit of work on the writer's thread, with a contained panic). It names every vector as a test, runs the shared cases `cursor_walk_is_stable_under_inserts_and_deletes` and `cursor_is_bound_to_project_filter_and_sort` on SQLite for all eight families, and executes the mutants of Q10 | T10 | The vectors, with the results recorded in that PR; P-W2, P-X4, C8′ and Q2 need the write path |
+| 6 | The walker half of P-E4: a full CLI, TUI or web walk buffers its pages, restarts from page one on `InvalidCursor` a small fixed number of times and then ends with a defined error | T17 | P-E4 (walker half), `cargo test -p orch-cli --test list_paging` |
+| 7 | Follow-ups, not conditions: a count of evictions of unexpired entries, and a per-principal limit on the table before a caller other than the owner can list (release 1.3) | after the page PR | An issue each |
+
+Order. Step 1 first. Public paging, the wire of step 6 and every list that returns a non-Task cursor wait for the owner's
+landing of step 1. Steps 2 and 3 are independent of each other and of the table. The numbers of the table (1,024 entries,
+8 MiB, 24 hours) are the owner's starting bounds and are unmeasured; a change goes to the owner.
+
+Rollback. Nothing here touches stored data, a protocol or a file format: the table has no durable form and the tokens
+end at every restart, so reverting a later step needs no migration.
 
 ### Switch, removal, proof
 
