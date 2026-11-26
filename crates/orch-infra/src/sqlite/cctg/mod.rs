@@ -488,13 +488,17 @@ fn unsigned(value: u64) -> SqlValue {
         .map(SqlValue::Integer)
         .unwrap_or(SqlValue::Null)
 }
-/// Milliseconds only when the string is an instant of whole milliseconds. The
-/// original string stays authoritative and is never rewritten from this column.
+/// UTC milliseconds of `0000-01-01T00:00:00.000Z`, the documented lower bound
+/// of a native time column; jiff also parses earlier expanded-year instants.
+const TIME_MIN_MS: i64 = -62_167_219_200_000;
+/// Milliseconds only when the string is an instant of whole milliseconds at or
+/// after year 0000. The original string stays authoritative and is never
+/// rewritten from this column.
 fn time(value: &str) -> SqlValue {
     value
         .parse::<jiff::Timestamp>()
         .ok()
-        .filter(|t| t.as_nanosecond() % 1_000_000 == 0)
+        .filter(|t| t.as_nanosecond() % 1_000_000 == 0 && t.as_millisecond() >= TIME_MIN_MS)
         .map(|t| SqlValue::Integer(t.as_millisecond()))
         .unwrap_or(SqlValue::Null)
 }

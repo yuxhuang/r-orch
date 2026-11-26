@@ -373,6 +373,11 @@ fn opaque_and_equivalent_instant_times_are_kept_and_project_only_when_exact() {
         ("", None),
         ("+010000-01-01T00:00:00.000Z", None),
         ("1969-12-31T23:59:59.999Z", Some(-1)),
+        ("0000-01-01T00:00:00.000Z", Some(TIME_MIN_MS)),
+        ("0000-01-01T00:00:00.001Z", Some(TIME_MIN_MS + 1)),
+        ("-000001-12-31T23:59:59.999Z", None),
+        ("-009999-01-01T00:00:00Z", None),
+        ("9999-12-30T22:00:00.999Z", Some(253_402_207_200_999)),
     ];
     for (i, (text, ms)) in cases.into_iter().enumerate() {
         let id = format!("c{i}");
