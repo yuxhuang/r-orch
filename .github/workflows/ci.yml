@@ -54,11 +54,10 @@ jobs:
           # cargo-deny can read; nothing here pushes.
           persist-credentials: false
           fetch-depth: 0
-      # The workspace belongs to the runner's user and the job container runs as
-      # root, so git refuses it as dubious ownership; checkout's own exception
-      # does not outlive checkout. System scope, because the gate runs git under
-      # a sentinel HOME.
-      - run: git config --system --add safe.directory "$GITHUB_WORKSPACE"
+      # The workspace belongs to the runner's user but the job container runs as
+      # root: git calls that dubious ownership and the gate refuses any path its
+      # user does not own. Own the checkout instead of excepting it.
+      - run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
       # dtolnay/rust-toolchain ignores rust-toolchain.toml (it requires an
       # explicit version), so let rustup read the file: one pin, not two.
       - run: rustup toolchain install
@@ -132,11 +131,10 @@ jobs:
           # Keep the token out of .git/config, which build scripts and
           # cargo-deny can read; nothing here pushes.
           persist-credentials: false
-      # The workspace belongs to the runner's user and the job container runs as
-      # root, so git refuses it as dubious ownership; checkout's own exception
-      # does not outlive checkout. System scope, because the gate runs git under
-      # a sentinel HOME.
-      - run: git config --system --add safe.directory "$GITHUB_WORKSPACE"
+      # The workspace belongs to the runner's user but the job container runs as
+      # root: git calls that dubious ownership and the gate refuses any path its
+      # user does not own. Own the checkout instead of excepting it.
+      - run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
       # Lock guard also rejects a missing lockfile. Activated-graph deny alone
       # would miss termwiz/terminfo (WTFPL), see the ratatui manifest comment.
       - name: Cargo.lock has no termwiz/terminfo
@@ -188,11 +186,10 @@ jobs:
           # Keep the token out of .git/config, which build scripts and
           # cargo-deny can read; nothing here pushes.
           persist-credentials: false
-      # The workspace belongs to the runner's user and the job container runs as
-      # root, so git refuses it as dubious ownership; checkout's own exception
-      # does not outlive checkout. System scope, because the gate runs git under
-      # a sentinel HOME.
-      - run: git config --system --add safe.directory "$GITHUB_WORKSPACE"
+      # The workspace belongs to the runner's user but the job container runs as
+      # root: git calls that dubious ownership and the gate refuses any path its
+      # user does not own. Own the checkout instead of excepting it.
+      - run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
       # dtolnay/rust-toolchain ignores rust-toolchain.toml (it requires an
       # explicit version), so let rustup read the file: one pin, not two.
       - run: rustup toolchain install
@@ -284,11 +281,10 @@ jobs:
           # Keep the token out of .git/config, which build scripts and
           # cargo-deny can read; nothing here pushes.
           persist-credentials: false
-      # The workspace belongs to the runner's user and the job container runs as
-      # root, so git refuses it as dubious ownership; checkout's own exception
-      # does not outlive checkout. System scope, because the gate runs git under
-      # a sentinel HOME.
-      - run: git config --system --add safe.directory "$GITHUB_WORKSPACE"
+      # The workspace belongs to the runner's user but the job container runs as
+      # root: git calls that dubious ownership and the gate refuses any path its
+      # user does not own. Own the checkout instead of excepting it.
+      - run: chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE"
       # dtolnay/rust-toolchain ignores rust-toolchain.toml (it requires an
       # explicit version), so let rustup read the file: one pin, not two.
       - run: rustup toolchain install

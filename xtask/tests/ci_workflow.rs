@@ -30,9 +30,9 @@ const DENY_RUN: &str =
     "          \"$RUNNER_TEMP/cargo-deny\" --log-level warn --all-features check";
 /// `runner.environment` is `github-hosted` or `self-hosted`, so hosted
 /// receipts keep their `github-hosted-linux` label.
-/// The job container runs as root over a workspace the runner's user owns.
-const SAFE_DIRECTORY: &str =
-    "      - run: git config --system --add safe.directory \"$GITHUB_WORKSPACE\"";
+/// The job container runs as root over a workspace the runner's user owns;
+/// git and the gate both require the checkout's owner to be the job's user.
+const OWN_WORKSPACE: &str = "      - run: chown -R \"$(id -u):$(id -g)\" \"$GITHUB_WORKSPACE\"";
 const HOST_LABEL: &str = "          HOST_LABEL: ${{ runner.environment }}-linux";
 /// The suite runner, pinned. A job that runs tests installs exactly this.
 const INSTALL: &str = "      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir \"$RUNNER_TEMP/nextest-install\" --root \"$HOME/.nextest-bin\"";
@@ -237,8 +237,8 @@ fn contract(ci: &str) {
     assert!(!ci.contains("sudo "));
     assert!(step(test, "Folded suite").lines().any(|l| l == HOST_LABEL));
     assert!(!CONTAINER_WORKSPACE.ends_with('/'));
-    // Every job's checkout is followed by the ownership exception, before any
-    // other step can run git.
+    // Every job's checkout is followed by taking ownership of it, before any
+    // other step can run git or the gate.
     for (name, job) in [
         ("changes", changes),
         ("check", check),
@@ -251,15 +251,15 @@ fn contract(ci: &str) {
             .map(|n| checkout + n + 1)
             .unwrap();
         let safe = job
-            .find(SAFE_DIRECTORY)
-            .unwrap_or_else(|| panic!("{name} lacks {SAFE_DIRECTORY}"));
+            .find(OWN_WORKSPACE)
+            .unwrap_or_else(|| panic!("{name} lacks {OWN_WORKSPACE}"));
         let between = &job[next..safe];
         assert!(
             between.lines().all(|l| l.trim_start().starts_with('#')),
-            "{name}: the ownership exception must directly follow checkout"
+            "{name}: taking ownership must directly follow checkout"
         );
     }
-    assert_eq!(ci.matches(SAFE_DIRECTORY).count(), 4);
+    assert_eq!(ci.matches(OWN_WORKSPACE).count(), 4);
     assert!(check.contains("test -s Cargo.lock"));
     assert!(check.contains("! grep -qE '^name = \"(terminfo|termwiz)\"$' Cargo.lock"));
     assert!(test.contains("timeout-minutes: 50"));
@@ -475,11 +475,8 @@ fn workflow_mutants_are_discriminated() {
         ),
         ("releases/download/0.20.2/", "releases/download/0.20.1/"),
         ("--all-features check", "check"),
-        // Git ownership: a global exception is invisible under the gate's HOME.
-        (
-            "git config --system --add safe.directory",
-            "git config --global --add safe.directory",
-        ),
+        // Ownership: only the top directory, or a git-only exception, is not enough.
+        ("chown -R \"$(id -u)", "chown \"$(id -u)"),
     ] {
         let mutant = CI.replacen(old, new, 1);
         assert_ne!(mutant, CI);

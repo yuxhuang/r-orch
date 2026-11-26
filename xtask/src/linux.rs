@@ -837,11 +837,11 @@ mod tests {
             else {
                 continue;
             };
-            // The container's git ownership exception is CI's job-container
-            // plumbing, not a check: the Docker container runs as your uid.
+            // Taking ownership of the checkout is CI's job-container plumbing,
+            // not a check: the Docker container already runs as your uid.
             if run.starts_with("rustup ")
                 || run.contains("apt-get")
-                || run.starts_with("git config --system --add safe.directory ")
+                || run.starts_with("chown -R ")
                 || run == DOCS_ONLY_BUILD
                 || MIRROR_RUNNER_LINES.contains(&run)
             {
