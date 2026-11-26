@@ -1,0 +1,16 @@
+# Throwaway: a fork PR that targets the self-hosted runner directly, as an attacker would.
+# Expected: the runner-side guard refuses the job before any container starts; neither marker prints.
+name: arc-fork-test
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  fork-on-self-hosted:
+    runs-on: r-orch-2com
+    container:
+      image: docker.io/library/rust:1-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254
+    timeout-minutes: 10
+    steps:
+      - run: echo "FORK-CODE-RAN"
+      - if: always()
+        run: echo "FORK-CODE-RAN-ALWAYS"
