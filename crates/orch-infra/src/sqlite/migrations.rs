@@ -108,9 +108,7 @@ pub fn apply_migrations(
             .skip(version)
             .any(|step| *step == CONTEXT_CONFIG_TEMPLATE_GOAL)
     {
-        refuse_lossy_settings(conn).map_err(|error| {
-            SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
-        })?;
+        refuse_lossy_settings(conn).map_err(preflight_error)?;
     }
     let holds_project = version > 0
         && conn.query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |r| r.get(0))? > 0;
@@ -522,6 +520,39 @@ mod tests {
             matches!(error, SqliteError::Sql(rusqlite::Error::SqliteFailure(ref code, _)) if code.extended_code == rusqlite::ffi::SQLITE_ERROR),
             "preflight lost its SQLite category: {error:?}"
         );
+    }
+
+    #[test]
+    fn settings_format_preflight_statement_error_keeps_its_sqlite_category() {
+        let steps = [
+            INITIAL_SCHEMA,
+            ATTENTION_FACTS,
+            TASK_FORMAT,
+            AGENT_TEAM_RUN,
+            CONTEXT_CONFIG_TEMPLATE_GOAL,
+        ];
+        for version in [1, 4] {
+            let (_tmp, data) = test_data();
+            let mut conn =
+                open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+            apply_migrations(&data, &mut conn, &steps[..version], plenty()).unwrap();
+            conn.execute_batch("DROP TABLE templates").unwrap();
+            let error = apply_migrations(&data, &mut conn, &steps, plenty()).unwrap_err();
+            assert!(
+                matches!(&error, SqliteError::Sql(rusqlite::Error::SqliteFailure(code, _)) if code.extended_code == rusqlite::ffi::SQLITE_ERROR),
+                "v{version} preflight lost its SQLite category: {error:?}"
+            );
+            assert_eq!(
+                classify(&error).leaves(),
+                &[(Role::Operation, Class::Transient)],
+                "{error:?}"
+            );
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                version as i64
+            );
+        }
     }
 
     #[test]
