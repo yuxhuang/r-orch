@@ -1,9 +1,13 @@
 use super::*;
+use crate::blob::DiskBlobStore;
+use crate::sqlite::SqliteError;
 use crate::sqlite::{ConnectionRole, Synchronous, Writer, migrations, open_connection, test_data};
 use crate::storage::v2::FileStorage;
 use orch_core::store::{Caller, EntityKind, Principal, StorageExt, StoreError};
+use orch_core::test_support::FixedClock;
 use orch_domain::GoalStatus;
 use rusqlite::OptionalExtension;
+use std::sync::Arc;
 use std::time::Duration;
 
 struct Close<'a>(&'a WriterHandle);
@@ -26,6 +30,18 @@ fn goal(id: &str) -> Goal {
         created_at: "2026-11-22T00:00:00.123Z".into(),
         updated_at: None,
     }
+}
+fn adapter_for<'a, 'd>(
+    handle: &'a WriterHandle,
+    pool: &'a ReadPool<'d>,
+    data: &crate::data_dir::DataDir,
+) -> GoalAdapter<'a, 'd> {
+    GoalAdapter::new(
+        handle,
+        pool,
+        Arc::new(DiskBlobStore::open(data.root()).unwrap()),
+        Arc::new(FixedClock::new()),
+    )
 }
 fn owner(project: &str) -> Caller {
     Caller {
@@ -93,7 +109,7 @@ async fn committed_goal_lifecycle_matches_file_reference_and_reopens() {
         std::thread::scope(|scope| {
             let _close = Close(&handle);
             scope.spawn(move || writer.run());
-            let adapter = GoalAdapter::new(&handle, &pool);
+            let adapter = adapter_for(&handle, &pool, &data);
             let initial = adapter
                 .write("p".into(), deadline(), |u| {
                     Ok(vec![u.create(goal("z"))?, u.create(goal("a"))?])
@@ -155,7 +171,7 @@ async fn committed_goal_lifecycle_matches_file_reference_and_reopens() {
     std::thread::scope(|scope| {
         let _close = Close(&handle);
         scope.spawn(move || writer.run());
-        let adapter = GoalAdapter::new(&handle, &pool);
+        let adapter = adapter_for(&handle, &pool, &data);
         assert_eq!(
             adapter.read("p", deadline(), |u| u.get("z")).unwrap(),
             Some(recreated)
@@ -179,7 +195,7 @@ fn snapshot_keeps_goal_and_counter_state_across_concurrent_commit() {
     std::thread::scope(|scope| {
         let _close = Close(&handle);
         scope.spawn(move || writer.run());
-        let adapter = GoalAdapter::new(&handle, &pool);
+        let adapter = adapter_for(&handle, &pool, &data);
         let first = adapter
             .write("p".into(), deadline(), |u| u.create(goal("g")))
             .unwrap()
@@ -222,7 +238,7 @@ fn returned_error_rolls_back_whole_work_and_caught_stale_preserves_prior_work() 
     std::thread::scope(|scope| {
         let _close = Close(&handle);
         scope.spawn(move || writer.run());
-        let adapter = GoalAdapter::new(&handle, &pool);
+        let adapter = adapter_for(&handle, &pool, &data);
         let error = adapter
             .write("p".into(), deadline(), |u| {
                 u.create(goal("rolled-back"))?;
@@ -273,46 +289,7 @@ fn returned_error_rolls_back_whole_work_and_caught_stale_preserves_prior_work() 
 }
 
 #[test]
-fn timestamps_are_lossless_or_refused_before_any_write() {
-    for time in ["2026-11-22T00:00:00.123Z", "1969-12-31T23:59:59.999Z"] {
-        let goal = Goal {
-            created_at: time.into(),
-            updated_at: Some(time.into()),
-            ..goal("g")
-        };
-        let row = encode(&goal).unwrap();
-        assert_eq!(decode(row).unwrap().entity, Entity::Goal(Box::new(goal)));
-    }
-    for time in [
-        "bad",
-        "2026-11-22T00:00:00.123456Z",
-        "2026-11-22T00:00:00Z",
-        "2026-11-22T01:00:00.123+01:00",
-    ] {
-        assert!(
-            encode(&Goal {
-                created_at: time.into(),
-                ..goal("g")
-            })
-            .is_err(),
-            "{time}"
-        );
-        assert!(
-            encode(&Goal {
-                updated_at: Some(time.into()),
-                ..goal("g")
-            })
-            .is_err(),
-            "{time}"
-        );
-    }
-    let mut row = encode(&goal("g")).unwrap();
-    row.created_at = i64::MAX;
-    assert!(decode(row).is_err());
-}
-
-#[test]
-fn invalid_timestamp_and_exhausted_or_unseeded_counters_consume_nothing() {
+fn timestamps_are_kept_as_the_original_strings_through_the_executor() {
     let (_temp, data) = test_data();
     setup(&data);
     let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
@@ -320,16 +297,57 @@ fn invalid_timestamp_and_exhausted_or_unseeded_counters_consume_nothing() {
     std::thread::scope(|scope| {
         let _close = Close(&handle);
         scope.spawn(move || writer.run());
-        let adapter = GoalAdapter::new(&handle, &pool);
+        let adapter = adapter_for(&handle, &pool, &data);
+        let times = [
+            "2026-11-22T00:00:00.123Z",
+            "1969-12-31T23:59:59.999Z",
+            "0000-01-01T00:00:00.000Z",
+            "2026-11-22T00:00:00Z",
+            "2026-11-22T00:00:00.123456Z",
+            "2026-11-22T01:00:00.123+01:00",
+            "-001-12-31T23:59:59.999Z",
+            "+010000-01-01T00:00:00.000Z",
+            "opaque",
+            "",
+        ];
+        for (i, time) in times.iter().enumerate() {
+            let payload = Goal {
+                created_at: (*time).into(),
+                updated_at: Some((*time).into()),
+                ..goal(&format!("g{i}"))
+            };
+            let written = adapter
+                .write("p".into(), deadline(), {
+                    let payload = payload.clone();
+                    move |u| u.create(payload)
+                })
+                .unwrap()
+                .wait()
+                .unwrap();
+            assert_eq!(written.entity, Entity::Goal(Box::new(payload.clone())));
+            assert_eq!(
+                adapter
+                    .read("p", deadline(), |u| u.get(&format!("g{i}")))
+                    .unwrap(),
+                Some(written)
+            );
+        }
+        handle.close();
+    });
+}
+
+#[test]
+fn exhausted_or_unseeded_counters_consume_nothing() {
+    let (_temp, data) = test_data();
+    setup(&data);
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    std::thread::scope(|scope| {
+        let _close = Close(&handle);
+        scope.spawn(move || writer.run());
+        let adapter = adapter_for(&handle, &pool, &data);
         adapter
             .write("p".into(), deadline(), |u| {
-                assert!(matches!(
-                    u.create(Goal {
-                        created_at: "2026-11-22T00:00:00.123456Z".into(),
-                        ..goal("invalid")
-                    }),
-                    Err(SqliteError::Unrepresentable(_))
-                ));
                 let first = u.create(goal("g"))?;
                 assert_eq!(first.position, 1);
                 Ok(())
@@ -419,7 +437,7 @@ fn caught_rollback_failure_poison_prevents_later_operations_and_commit() {
             tx.execute_batch("CREATE TRIGGER abort_goal BEFORE INSERT ON goals WHEN NEW.id='fatal' BEGIN SELECT RAISE(ROLLBACK, 'synthetic'); END")?;
             Ok(())
         }).unwrap().wait().unwrap();
-        let adapter = GoalAdapter::new(&handle, &pool);
+        let adapter = adapter_for(&handle, &pool, &data);
         let error = adapter.write("p".into(), deadline(), |u| {
             u.create(goal("earlier"))?;
             assert!(matches!(u.create(goal("fatal")), Err(SqliteError::OperationRollback {operation, ..}) if matches!(*operation, SqliteError::Sql(_))));
@@ -458,14 +476,14 @@ fn ended_transaction_is_aborted(later_operation: bool) {
     std::thread::scope(|scope| {
         let _close = Close(&handle);
         scope.spawn(move || writer.run());
-        let adapter = GoalAdapter::new(&handle, &pool);
+        let adapter = adapter_for(&handle, &pool, &data);
         let result = adapter
             .write("p".into(), deadline(), move |u| {
                 u.create(goal("before"))?;
                 // Deterministically simulate SQLite ending the outer transaction
                 // on an error outside an operation's savepoint (e.g. IOERR).
-                u.read.tx.execute_batch("ROLLBACK")?;
-                assert!(u.read.tx.is_autocommit());
+                u.sql.tx().execute_batch("ROLLBACK")?;
+                assert!(u.sql.tx().is_autocommit());
                 if later_operation {
                     u.create(goal("after"))?;
                 }
@@ -478,7 +496,7 @@ fn ended_transaction_is_aborted(later_operation: bool) {
         }
         adapter
             .read("p", deadline(), |u| {
-                let counters: i64 = u.tx.query_row(
+                let counters: i64 = u.sql.tx().query_row(
                     "SELECT count(*) FROM counters WHERE project_id='p' AND name='position:goal'",
                     [],
                     |row| row.get(0),
@@ -506,7 +524,7 @@ fn ended_transaction_is_aborted(later_operation: bool) {
 }
 
 #[test]
-fn unrepresentable_stored_timestamp_does_not_partially_move_a_goal() {
+fn a_drifted_projection_does_not_partially_move_a_goal() {
     let (_temp, data) = test_data();
     setup(&data);
     let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
@@ -514,7 +532,7 @@ fn unrepresentable_stored_timestamp_does_not_partially_move_a_goal() {
     std::thread::scope(|scope| {
         let _close = Close(&handle);
         scope.spawn(move || writer.run());
-        let adapter = GoalAdapter::new(&handle, &pool);
+        let adapter = adapter_for(&handle, &pool, &data);
         adapter
             .write("p".into(), deadline(), |u| u.create(goal("g")))
             .unwrap()
@@ -522,10 +540,7 @@ fn unrepresentable_stored_timestamp_does_not_partially_move_a_goal() {
             .unwrap();
         handle
             .submit(Lane::Entities, None, |tx| {
-                tx.execute(
-                    "UPDATE goals SET created_at=?1 WHERE project_id='p'",
-                    [i64::MAX],
-                )?;
+                tx.execute("UPDATE goals SET title='drift' WHERE project_id='p'", [])?;
                 Ok(())
             })
             .unwrap()
@@ -535,7 +550,11 @@ fn unrepresentable_stored_timestamp_does_not_partially_move_a_goal() {
             .write("p".into(), deadline(), |u| {
                 assert!(matches!(
                     u.move_to_end("g", Revision::ONE),
-                    Err(SqliteError::Unrepresentable(_))
+                    Err(SqliteError::EntityCorrupt {
+                        family: "goal",
+                        check: "projection",
+                        ..
+                    })
                 ));
                 assert_eq!(u.create(goal("next"))?.position, 2);
                 Ok(())
@@ -545,8 +564,12 @@ fn unrepresentable_stored_timestamp_does_not_partially_move_a_goal() {
             .unwrap();
         handle
             .submit(Lane::Entities, None, |tx| {
-                let row = entity::get_goal(tx, "p", "g").map_err(classify)?.unwrap();
-                assert_eq!((row.revision, row.position), (Revision::ONE, 1));
+                let row: (i64, i64) = tx.query_row(
+                    "SELECT revision,position FROM goals WHERE project_id='p' AND id='g'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                assert_eq!(row, (1, 1));
                 Ok(())
             })
             .unwrap()
@@ -554,71 +577,6 @@ fn unrepresentable_stored_timestamp_does_not_partially_move_a_goal() {
             .unwrap();
         handle.close();
     });
-}
-
-#[test]
-fn timestamp_endpoints_match_core_and_round_trip_both_fields() {
-    assert_eq!(jiff::Timestamp::MAX.as_millisecond(), 253_402_207_200_999);
-    for (ms, text) in [
-        (-62_167_219_200_000, "0000-01-01T00:00:00.000Z"),
-        (-1, "1969-12-31T23:59:59.999Z"),
-        (0, "1970-01-01T00:00:00.000Z"),
-        (253_402_207_200_999, "9999-12-30T22:00:00.999Z"),
-    ] {
-        assert_eq!(
-            timestamp(ms).unwrap_or_else(|e| panic!("ms={ms}: {e}")),
-            text
-        );
-        assert_eq!(
-            timestamp(ms).unwrap(),
-            orch_core::clock::iso_from_epoch_ms(ms)
-        );
-        assert_eq!(orch_core::clock::epoch_ms_from_iso(text), Some(ms));
-        assert_eq!(milliseconds(text).unwrap(), ms);
-        let payload = Goal {
-            created_at: text.into(),
-            updated_at: Some(text.into()),
-            ..goal("endpoint")
-        };
-        let row = encode(&payload).unwrap();
-        assert_eq!((row.created_at, row.updated_at), (ms, Some(ms)));
-        assert_eq!(decode(row).unwrap().entity, Entity::Goal(Box::new(payload)));
-    }
-}
-
-#[test]
-fn timestamps_outside_common_canonical_range_are_unrepresentable() {
-    for ms in [i64::MIN, -62_167_219_200_001, 253_402_207_201_000, i64::MAX] {
-        assert!(matches!(
-            timestamp(ms),
-            Err(SqliteError::Unrepresentable(_))
-        ));
-        let mut row = encode(&goal("created")).unwrap();
-        row.created_at = ms;
-        assert!(matches!(decode(row), Err(SqliteError::Unrepresentable(_))));
-        let mut row = encode(&goal("updated")).unwrap();
-        row.updated_at = Some(ms);
-        assert!(matches!(decode(row), Err(SqliteError::Unrepresentable(_))));
-    }
-    // Jiff accepts this expanded negative year; core writes it as -001.
-    for text in [
-        "-000001-12-31T23:59:59.999Z",
-        "-001-12-31T23:59:59.999Z",
-        "+010000-01-01T00:00:00.000Z",
-    ] {
-        for updated in [false, true] {
-            let mut payload = goal("outside");
-            if updated {
-                payload.updated_at = Some(text.into());
-            } else {
-                payload.created_at = text.into();
-            }
-            assert!(
-                matches!(encode(&payload), Err(SqliteError::Unrepresentable(_))),
-                "{text}"
-            );
-        }
-    }
 }
 
 #[test]
@@ -631,7 +589,7 @@ fn damaged_position_counters_are_typed_and_refused_without_mutation() {
         std::thread::scope(|scope| {
             let _close = Close(&handle);
             scope.spawn(move || writer.run());
-            let adapter = GoalAdapter::new(&handle, &pool);
+            let adapter = adapter_for(&handle, &pool, &data);
             adapter
                 .write("p".into(), deadline(), |u| {
                     u.create(goal("first"))?;
@@ -662,7 +620,7 @@ fn damaged_position_counters_are_typed_and_refused_without_mutation() {
                 }
                 assert_eq!(u.get("first")?.unwrap(), before);
                 assert!(u.get("refused")?.is_none());
-                let actual: Option<i64> = u.read.tx.query_row(
+                let actual: Option<i64> = u.sql.tx().query_row(
                     "SELECT value FROM counters WHERE project_id='p' AND name='position:goal'", [], |r| r.get(0)
                 ).optional()?;
                 assert_eq!(actual, damaged);

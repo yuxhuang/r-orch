@@ -728,6 +728,10 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
             now,
         }
     }
+    #[cfg(test)]
+    pub(super) fn tx(&self) -> &Transaction<'conn> {
+        self.tx
+    }
     pub(super) fn ensure_committable(&self) -> NativeResult<()> {
         if self.poisoned || self.tx.is_autocommit() {
             Err(NativeError::Aborted)
