@@ -1016,7 +1016,7 @@ fn corrupt(error: NativeError) -> (&'static str, String) {
 }
 
 #[test]
-fn a_text_over_one_object_is_ordered_chunks_with_a_whole_hash_and_repeats() {
+fn a_text_over_one_object_is_ordered_chunks_with_a_whole_hash() {
     let (_temp, data) = crate::sqlite::test_data();
     let disk = DiskBlobStore::open(data.root()).unwrap();
     let mut conn = conn();
@@ -1024,7 +1024,8 @@ fn a_text_over_one_object_is_ordered_chunks_with_a_whole_hash_and_repeats() {
     let who = owner();
     let mut db = sql(&tx, &disk, &who);
     let chunk = MAX_BLOB_BYTES as usize;
-    // A two-byte character split by the chunk boundary, then a repeated chunk.
+    // A two-byte character split by each chunk boundary; the chunks all differ.
+    // `repeated_chunks_keep_every_ordinal` stores a repeated chunk.
     let mut body = "a".repeat(chunk - 1);
     body.push('é');
     body.push_str(&"a".repeat(chunk - 1));
@@ -1042,7 +1043,6 @@ fn a_text_over_one_object_is_ordered_chunks_with_a_whole_hash_and_repeats() {
         ]
     );
     assert_eq!(db.get(Family::Template, "big").unwrap().unwrap().entity, e);
-    // Chunk 0 and 2 differ, 1 repeats nothing here; make a repeat: ordinal 1 = ordinal 0's object.
     let (first, second): (String, String) = tx
         .query_row(
             "SELECT (SELECT sha256 FROM entity_blob_refs WHERE ordinal=0),(SELECT sha256 FROM entity_blob_refs WHERE ordinal=1)",
@@ -1123,6 +1123,82 @@ fn a_text_over_one_object_is_ordered_chunks_with_a_whole_hash_and_repeats() {
         ),
         Err(NativeError::Corrupt { .. })
     ));
+}
+
+#[test]
+fn repeated_chunks_keep_every_ordinal() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = conn();
+    let tx = conn.transaction().unwrap();
+    let who = owner();
+    let mut db = sql(&tx, &disk, &who);
+    let chunk = MAX_BLOB_BYTES as usize;
+    // Two byte-identical whole chunks, then a short tail: one object behind two ordinals.
+    let repeated = "a".repeat(chunk);
+    let body = format!("{repeated}{repeated}tail");
+    let e = tpl("rep", &body);
+    db.create(e.clone()).unwrap();
+    assert_eq!(
+        refs(&tx, Family::Template),
+        [
+            ("/body".to_owned(), 0, chunk as i64),
+            ("/body".to_owned(), 1, chunk as i64),
+            ("/body".to_owned(), 2, 4)
+        ]
+    );
+    let hashes: Vec<String> = tx
+        .prepare("SELECT sha256 FROM entity_blob_refs ORDER BY ordinal")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<std::result::Result<_, _>>()
+        .unwrap();
+    assert_eq!(hashes[0], hashes[1], "the repeat is one hash");
+    assert_ne!(hashes[0], hashes[2]);
+    assert_eq!(
+        one::<i64>(
+            &tx,
+            "SELECT count(*) FROM blobs WHERE sha256=(SELECT sha256 FROM entity_blob_refs WHERE ordinal=0)"
+        ),
+        1,
+        "one registered object behind both ordinals"
+    );
+    assert_eq!(one::<i64>(&tx, "SELECT count(*) FROM blobs"), 2);
+    // Every ordinal comes back, in order, byte for byte.
+    assert_eq!(db.get(Family::Template, "rep").unwrap().unwrap().entity, e);
+    // Dropping either ordinal of the repeat is typed damage: the shared object cannot cover for it.
+    for ordinal in [0, 1] {
+        tx.execute_batch("SAVEPOINT damage").unwrap();
+        tx.execute("DELETE FROM entity_blob_refs WHERE ordinal=?1", [ordinal])
+            .unwrap();
+        assert_eq!(
+            one::<i64>(&tx, "SELECT count(*) FROM entity_blob_refs"),
+            2,
+            "ordinal {ordinal}: the other repeat row remains"
+        );
+        let error = db.get(Family::Template, "rep").unwrap_err();
+        assert!(
+            matches!(
+                error,
+                NativeError::Corrupt {
+                    family: "template",
+                    ..
+                }
+            ),
+            "ordinal {ordinal}: {error:?}"
+        );
+        tx.execute_batch("ROLLBACK TO damage; RELEASE damage")
+            .unwrap();
+    }
+    assert_eq!(db.get(Family::Template, "rep").unwrap().unwrap().entity, e);
+    // Losing the one shared object is damage at the first ordinal that needs it.
+    let shared: String = hashes[0].clone();
+    disk.remove(&shared.parse().unwrap()).unwrap();
+    assert_eq!(
+        corrupt(db.get(Family::Template, "rep").unwrap_err()).0,
+        "referenced bytes"
+    );
 }
 
 #[test]
