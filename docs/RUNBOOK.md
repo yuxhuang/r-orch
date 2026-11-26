@@ -1812,6 +1812,13 @@ action (`uses: docker://…` or a Docker-based action) would run outside the job
 container on the self-hosted runner, so cargo-deny runs in the job from its
 release archive, checked against the published sha256.
 
+The suite runs as an ordinary user (uid 1001) through each test step's `shell:`,
+because as root a read-only directory never refuses a write. Its container needs
+a PID 1 that reaps orphans, as init does on a VM: tests find a detached server by
+`ppid == 1`. GitHub-hosted runners get it from `options: --init`; a Kubernetes
+runner ignores `options`, so its job pod must set `shareProcessNamespace: true`
+(the pause process is then PID 1).
+
 
 ## SQLite adapter groundwork
 

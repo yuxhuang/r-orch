@@ -33,10 +33,9 @@ const DENY_RUN: &str =
 /// The job container runs as root over a workspace the runner's user owns;
 /// git and the gate both require the checkout's owner to be the job's user.
 const OWN_WORKSPACE: &str = "      - run: chown -R \"$(id -u):$(id -g)\" \"$GITHUB_WORKSPACE\"";
-/// Steps that run tests drop to the suite user and every capability, under
-/// tini as a subreaper: as root a read-only directory never refuses a write,
-/// and the container's PID 1 reaps no orphans.
-const UNPRIVILEGED: &str = "        shell: setpriv --reuid=1001 --regid=1001 --init-groups -- env HOME=/home/ci tini -s -- bash --noprofile --norc -eo pipefail {0}";
+/// Steps that run tests drop to the suite user and every capability: as root
+/// a read-only directory never refuses a write.
+const UNPRIVILEGED: &str = "        shell: setpriv --reuid=1001 --regid=1001 --init-groups -- env HOME=/home/ci bash --noprofile --norc -eo pipefail {0}";
 const SUITE_USER: &str =
     "          useradd --uid 1001 --user-group --create-home --home-dir /home/ci ci";
 const SUITE_OWNS: &str =
@@ -240,6 +239,15 @@ fn contract(ci: &str) {
     assert!(ambient.contains(&format!("\n    container:\n{JOB_IMAGE}\n")));
     assert_eq!(ci.matches("    runs-on: ").count(), 4);
     assert_eq!(ci.matches("\n    container:\n").count(), 4);
+    // Orphans must reparent to a reaping PID 1, as on a VM: tests find a
+    // detached server by `ppid == 1`, so a subreaper is not a substitute.
+    assert_eq!(ci.matches(&format!("{JOB_IMAGE}\n")).count(), 4);
+    for job in [changes, check, test, ambient] {
+        let container = &job[job.find("\n    container:\n").unwrap()..];
+        let container = &container[..container[1..].find("\n    timeout-minutes:").unwrap() + 1];
+        assert!(container.lines().any(|l| l == "      options: --init"));
+    }
+    assert!(!ci.contains("tini"));
     assert_eq!(ci.matches(ROUTED).count(), 3);
     // Untranslated in a job container: these name the host's paths.
     assert!(!ci.contains("${{ github.workspace }}"));
@@ -304,7 +312,7 @@ fn contract(ci: &str) {
                 "{name}: {s} must run unprivileged"
             );
         }
-        assert!(lane.contains("      - run: apt-get update && apt-get install -y tmux tini\n"));
+        assert!(lane.contains("      - run: apt-get update && apt-get install -y tmux\n"));
     }
     assert_eq!(test.matches(UNPRIVILEGED).count(), 2);
     for pass in [AMBIENT_PASSES[0], AMBIENT_PASSES[1], AMBIENT_DOC] {
@@ -532,12 +540,12 @@ fn workflow_mutants_are_discriminated() {
         // Ownership: only the top directory, or a git-only exception, is not enough.
         ("chown -R \"$(id -u)", "chown \"$(id -u)"),
         // The suite as root, or without a subreaper, or as another user.
-        (
-            "--init-groups -- env HOME=/home/ci tini -s -- bash",
-            "--init-groups -- env HOME=/home/ci bash",
-        ),
+        ("      options: --init\n", ""),
         ("--reuid=1001 --regid=1001", "--reuid=0 --regid=0"),
-        ("apt-get install -y tmux tini", "apt-get install -y tmux"),
+        (
+            "env HOME=/home/ci bash",
+            "env HOME=/home/ci tini -s -- bash",
+        ),
     ] {
         let mutant = CI.replacen(old, new, 1);
         assert_ne!(mutant, CI);
