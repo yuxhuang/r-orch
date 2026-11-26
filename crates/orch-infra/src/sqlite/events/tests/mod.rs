@@ -339,8 +339,8 @@ fn transaction_error_rolls_back_append_gap_prune_and_entities() {
             record_event_gap(tx, "p", "run", 3, 2).unwrap();
             prune_events(tx, "p", "run", 1).unwrap();
             tx.execute(
-                "INSERT INTO context_entries (project_id, key, value, set_by_kind, updated_at, revision)
-                 VALUES ('p', 'rollback', 'v', 'owner', 0, 1)",
+                "INSERT INTO context_entries (project_id, key, value, set_by_kind, position, revision)
+                 VALUES ('p', 'rollback', 'v', 'owner', 1, 1)",
                 [],
             )?;
             Err::<(), _>(SqliteError::Migration("injected rollback".into()))
