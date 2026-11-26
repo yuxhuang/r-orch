@@ -116,8 +116,8 @@ reviewed or merged.
    b0 slice") do not belong there.
 3. Run `fast` after each commit, and the pre-PR check (see Verification tiers) before opening the PR.
 4. Open the PR using `.github/PULL_REQUEST_TEMPLATE.md`; fill every section, delete none. One concern per PR;
-   if the title needs "and", split it. A PR over about 3,000 changed lines is split, or the plan explains why
-   it cannot be.
+   if the title needs "and", split it. Normally keep a PR under about 4,000 changed lines. Split a PR over about 5,000
+   changed lines, or explain in the plan why it cannot be split.
 5. CI (`.github/workflows/ci.yml`, Linux only) must be green at the PR's final head, once (see "What gates a merge"):
    `changes` classifies the PR, `check` runs fmt, clippy `-D warnings`, `cargo xtask crate-graph` and cargo-deny (plus
    a workspace build for a documentation-only PR), and `test` runs the folded suite once for a code PR. A new push needs
