@@ -1,0 +1,1 @@
+Added a forward-only SQLite Message schema with lossless text projections and shared Entity blob reachability. Upgrades preserve the existing Entity families and refuse populated legacy Messages rather than inventing missing data. The file backend remains active.

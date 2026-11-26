@@ -1002,3 +1002,191 @@ fn settings_tables_enforce_key_forms_text_forms_provenance_and_bounds() {
     }
     assert!(context("set_by_kind=NULL").is_err());
 }
+
+#[test]
+fn message_family_extends_only_the_existing_entity_checks() {
+    use orch_infra::sqlite::migrations::{
+        AGENT_TEAM_RUN, ATTENTION_FACTS, CONTEXT_CONFIG_TEMPLATE_GOAL, DiskSpace, INITIAL_SCHEMA,
+        TASK_FORMAT, apply_migrations,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    apply_migrations(
+        &dir,
+        &mut conn,
+        &[
+            INITIAL_SCHEMA,
+            ATTENTION_FACTS,
+            TASK_FORMAT,
+            AGENT_TEAM_RUN,
+            CONTEXT_CONFIG_TEMPLATE_GOAL,
+        ],
+        DiskSpace {
+            available: u64::MAX,
+            total: 1,
+        },
+    )
+    .unwrap();
+    let ddl = |conn: &rusqlite::Connection, table: &str| -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_schema WHERE name=?1",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let old: Vec<_> = ["entity_details", "entity_blob_refs"]
+        .iter()
+        .map(|t| ddl(&conn, t))
+        .collect();
+    migrate(&dir, &mut conn).unwrap();
+    for (i, table) in ["entity_details", "entity_blob_refs"].iter().enumerate() {
+        // ALTER TABLE quotes the new table name; all constraints stay identical.
+        assert_eq!(
+            ddl(&conn, table).replace(&format!("\"{table}\""), table),
+            old[i].replace("'template','goal'", "'template','goal','message'")
+        );
+    }
+    for family in [
+        "agent", "team", "run", "context", "config", "template", "goal", "message", "unknown",
+    ] {
+        let detail = conn.execute(
+            "INSERT INTO entity_details VALUES('p',?1,0,'key',1,'{}',2,?2)",
+            rusqlite::params![family, "0".repeat(64)],
+        );
+        assert_eq!(detail.is_ok(), family != "unknown", "{family}");
+        for (locator, size) in [("/body", 65537), ("/prompt", 0), ("/body", 0)] {
+            conn.execute_batch("SAVEPOINT probe").unwrap();
+            let refs = conn.execute(
+                "INSERT INTO entity_blob_refs VALUES('p',?1,0,'key',?2,0,?3,?4)",
+                rusqlite::params![family, locator, "1".repeat(64), size],
+            );
+            assert_eq!(
+                refs.is_ok(),
+                family != "unknown" && (size > 0 || (family == "run" && locator == "/prompt")),
+                "{family} {locator} {size}"
+            );
+            conn.execute_batch("ROLLBACK TO probe; RELEASE probe")
+                .unwrap();
+        }
+    }
+    let partial: bool = conn
+        .query_row(
+            "SELECT partial FROM pragma_index_list('messages') WHERE name='messages_pending'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(partial);
+    let indexes:Vec<(String,i64)> = conn.prepare("SELECT name,desc FROM pragma_index_xinfo('messages_pending') WHERE key=1 ORDER BY seqno").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
+    assert_eq!(
+        indexes,
+        [
+            ("project_id".into(), 0),
+            ("to_agent_id_form".into(), 0),
+            ("to_agent_id".into(), 0)
+        ]
+    );
+}
+
+#[test]
+fn message_native_quartets_enforce_r97_bytes_presence_and_identity_forms() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    conn.execute("INSERT INTO messages(project_id,id,channel,from_agent_id,subject,body,status,position,revision,created_at_text) VALUES('p','m','lead','sender','','body','pending',1,1,'opaque')",[]).unwrap();
+    let hash = "a".repeat(64);
+    for (field, nullable) in [
+        ("id", false),
+        ("from_agent_id", false),
+        ("to_agent_id", true),
+        ("team_id", true),
+        ("reply_to", true),
+        ("subject", false),
+        ("body", false),
+        ("created_at_text", false),
+        ("expires_at_text", true),
+        ("delivered_at_text", true),
+    ] {
+        let sql = format!("UPDATE messages SET {field}=?1 WHERE project_id='p'");
+        for text in [
+            "".into(),
+            "é".repeat(32768),
+            format!("{}\0hidden", "x".repeat(65529)),
+        ] {
+            probe_update(&conn, &sql, &[&text], true);
+        }
+        probe_update(&conn, &sql, &[&"é".repeat(32769)], false);
+        probe_update(&conn, &sql, &[&Option::<String>::None], nullable);
+        let indirect = format!(
+            "UPDATE messages SET {field}=?1,{field}_form=1,{field}_sha256=?2,{field}_bytes=?3 WHERE project_id='p'"
+        );
+        let projection = if field == "id" { hash.as_str() } else { "" };
+        probe_update(&conn, &indirect, &[&projection, &hash, &65537], true);
+        let mismatch = if field == "id" {
+            "b".repeat(64)
+        } else {
+            "x".into()
+        };
+        probe_update(&conn, &indirect, &[&mismatch, &hash, &65537], false);
+        probe_update(
+            &conn,
+            &indirect,
+            &[&Option::<String>::None, &hash, &65537],
+            false,
+        );
+        probe_update(&conn, &indirect, &[&projection, &hash, &65536], false);
+        for bad in [
+            format!("{}\0", "a".repeat(63)),
+            "A".repeat(64),
+            "z".repeat(64),
+            "a".repeat(63),
+        ] {
+            let projection = if field == "id" { bad.as_str() } else { "" };
+            probe_update(&conn, &indirect, &[&projection, &bad, &65537], false);
+        }
+        probe_update(
+            &conn,
+            &indirect,
+            &[&projection, &Option::<String>::None, &65537],
+            false,
+        );
+        probe_update(
+            &conn,
+            &format!("UPDATE messages SET {field}_sha256=?1 WHERE project_id='p'"),
+            &[&hash],
+            false,
+        );
+        probe_update(
+            &conn,
+            &format!("UPDATE messages SET {field}_bytes=65537 WHERE project_id='p'"),
+            &[],
+            false,
+        );
+        probe_update(
+            &conn,
+            &format!("UPDATE messages SET {field}_form=2 WHERE project_id='p'"),
+            &[],
+            false,
+        );
+    }
+    for sql in [
+        "UPDATE messages SET revision=0",
+        "UPDATE messages SET position=-1",
+        "UPDATE messages SET channel='unknown'",
+        "UPDATE messages SET status='unknown'",
+    ] {
+        probe_update(&conn, sql, &[], false);
+    }
+    // A literal digest and the indirect identity/recipient must coexist.
+    conn.execute("INSERT INTO messages(project_id,id,channel,from_agent_id,to_agent_id,subject,body,status,position,revision,created_at_text) VALUES('p',?1,'direct','sender',?1,'','','pending',2,1,'')",[&hash]).unwrap();
+    conn.execute("INSERT INTO messages(project_id,id,id_form,id_sha256,id_bytes,channel,from_agent_id,to_agent_id,to_agent_id_form,to_agent_id_sha256,to_agent_id_bytes,subject,body,status,position,revision,created_at_text) VALUES('p',?1,1,?1,65537,'broadcast','sender','',1,?1,65537,'','','pending',3,1,'')",[&hash]).unwrap();
+    assert_eq!(
+        conn.query_row::<i64, _, _>("SELECT count(*) FROM messages WHERE id=?1", [&hash], |r| r
+            .get(0))
+            .unwrap(),
+        2
+    );
+}

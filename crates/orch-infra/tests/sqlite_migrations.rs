@@ -590,7 +590,7 @@ fn the_task_format_migration_keeps_earlier_versions_and_applies_to_a_populated_p
     assert_eq!(
         conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
             .unwrap(),
-        5
+        orch_infra::sqlite::migrations::SCHEMA_VERSION as i64
     );
     assert_eq!(
         conn.query_row::<String, _, _>(
@@ -835,7 +835,7 @@ fn settings_registry_reaches_five_and_repeats_without_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = data(&tmp);
     let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-    migrate(&dir, &mut conn).unwrap();
+    apply_migrations(&dir, &mut conn, &five_steps(), plenty()).unwrap();
     assert_eq!(
         conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
             .unwrap(),
@@ -848,7 +848,7 @@ fn settings_registry_reaches_five_and_repeats_without_changes() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    migrate(&dir, &mut conn).unwrap();
+    apply_migrations(&dir, &mut conn, &five_steps(), plenty()).unwrap();
     let after: Vec<(i64, i64)> = conn
         .prepare("SELECT version,applied_at FROM schema_migrations ORDER BY version")
         .unwrap()
@@ -1116,7 +1116,7 @@ fn the_context_config_template_goal_migration_keeps_earlier_versions_and_applies
         conn.query_row("SELECT group_concat(sql) FROM (SELECT sql FROM sqlite_schema WHERE name NOT IN ('context_entries','project_config','templates','goals') ORDER BY name)", [], |r| r.get(0)).unwrap()
     };
     let sql = earlier(&conn);
-    migrate(&dir, &mut conn).unwrap();
+    apply_migrations(&dir, &mut conn, &five_steps(), plenty()).unwrap();
     assert_eq!(
         conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
             .unwrap(),
@@ -1227,7 +1227,7 @@ fn the_context_config_template_goal_migration_keeps_earlier_versions_and_applies
             .unwrap(),
         "{}"
     );
-    migrate(&dir, &mut conn).unwrap();
+    apply_migrations(&dir, &mut conn, &five_steps(), plenty()).unwrap();
     assert_eq!(
         std::fs::read_dir(tmp.path().join("data/backups"))
             .unwrap()
@@ -1354,5 +1354,263 @@ fn context_config_template_goal_transactional_hook_refuses_rows_created_after_pr
     assert!(
         !columns(&conn, "templates").iter().any(|c| c == "position"),
         "the predecessor table is not rebuilt"
+    );
+}
+
+fn five_steps() -> [&'static str; 5] {
+    use orch_infra::sqlite::migrations::CONTEXT_CONFIG_TEMPLATE_GOAL;
+    let [initial, attention, task, entities] = four_steps();
+    [
+        initial,
+        attention,
+        task,
+        entities,
+        CONTEXT_CONFIG_TEMPLATE_GOAL,
+    ]
+}
+
+#[test]
+fn message_registry_reaches_six_and_repeats_without_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    assert_eq!(orch_infra::sqlite::migrations::SCHEMA_VERSION, 6);
+    assert_eq!(
+        conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap(),
+        6
+    );
+    let history = |conn: &rusqlite::Connection| -> Vec<(i64, i64)> {
+        conn.prepare("SELECT version,applied_at FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let before = history(&conn);
+    assert_eq!(
+        before.iter().map(|r| r.0).collect::<Vec<_>>(),
+        [1, 2, 3, 4, 5, 6]
+    );
+    migrate(&dir, &mut conn).unwrap();
+    assert_eq!(history(&conn), before);
+    assert!(columns(&conn, "messages").contains(&"revision".into()));
+}
+
+#[test]
+fn message_preflight_refuses_every_predecessor_before_copy_or_intermediate_changes() {
+    use orch_infra::sqlite::{Class, Role, SqliteError, classify};
+    for version in 1..=5 {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = data(&tmp);
+        let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        apply_migrations(&dir, &mut conn, &five_steps()[..version], plenty()).unwrap();
+        project(&conn);
+        conn.execute("INSERT INTO messages VALUES('p','private-message','direct','private-sender',NULL,NULL,NULL,'private-subject','private-body','pending',1,0,NULL,NULL)", []).unwrap();
+        let state = |conn: &rusqlite::Connection| -> (String, i64, i64, String) {
+            conn.query_row("SELECT (SELECT group_concat(sql) FROM (SELECT sql FROM sqlite_schema ORDER BY name)), (SELECT user_version FROM pragma_user_version), (SELECT count(*) FROM schema_migrations), (SELECT body FROM messages)", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap()
+        };
+        let before = state(&conn);
+        let files = snapshot(tmp.path());
+        for _ in 0..2 {
+            // Preflight takes precedence even over an insufficient copy budget.
+            let mut steps = five_steps().to_vec();
+            steps.push(orch_infra::sqlite::migrations::MESSAGE_FORMAT);
+            let error = apply_migrations(
+                &dir,
+                &mut conn,
+                &steps,
+                DiskSpace {
+                    available: 0,
+                    total: 1,
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, SqliteError::Migration(_)));
+            assert!(
+                error.to_string().ends_with(
+                    "message entity format v1 refuses ambiguous predecessor rows: messages=1"
+                ),
+                "{error}"
+            );
+            assert!(!error.to_string().contains("private-"));
+            assert_eq!(
+                classify(&error).leaves(),
+                &[(Role::Operation, Class::Ordinary)]
+            );
+            assert_eq!(state(&conn), before);
+            assert_eq!(snapshot(tmp.path()), files);
+        }
+        drop(conn);
+        let conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        assert_eq!(state(&conn), before);
+        assert_eq!(
+            std::fs::read_dir(tmp.path().join("data/backups"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+}
+
+#[test]
+fn message_transactional_hook_refuses_late_rows_and_rolls_back_its_whole_step() {
+    use orch_infra::sqlite::migrations::MESSAGE_FORMAT;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let predecessor = format!(
+        "{INITIAL_SCHEMA}; INSERT INTO messages VALUES('p','private-message','direct','private-sender',NULL,NULL,NULL,'private-subject','private-body','pending',1,0,NULL,NULL);"
+    );
+    let mut steps = five_steps().to_vec();
+    steps[0] = &predecessor;
+    steps.push(MESSAGE_FORMAT);
+    let error = apply_migrations(&dir, &mut conn, &steps, plenty()).unwrap_err();
+    assert!(error.to_string().contains("messages=1"), "{error}");
+    drop(conn);
+    let conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let state: (i64, i64, String, i64) = conn.query_row("SELECT (SELECT user_version FROM pragma_user_version), (SELECT count(*) FROM schema_migrations), (SELECT body FROM messages), (SELECT count(*) FROM sqlite_schema WHERE name IN ('entity_details_message','entity_blob_refs_message'))", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!(state, (5, 5, "private-body".into(), 0));
+    assert!(!columns(&conn, "messages").contains(&"revision".into()));
+}
+
+#[test]
+fn message_upgrade_copies_all_sibling_authority_and_references_and_keeps_checked_copy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    apply_migrations(&dir, &mut conn, &five_steps(), plenty()).unwrap();
+    project(&conn);
+    conn.execute_batch("
+        INSERT INTO agents(project_id,id,name,adapter,config,position,revision) VALUES('p','a','name','codex','{}',1,7);
+        INSERT INTO teams(project_id,id,name,lead_agent_id,created_at_text,status,config,position,revision) VALUES('p','team','name','a','opaque','active','{}',2,8);
+        INSERT INTO team_members(project_id,team_id,ordinal,agent_id,role,joined_at_text) VALUES('p','team',0,'a','member','opaque');
+        INSERT INTO team_tasks(project_id,team_id,task_id) VALUES('p','team','task');
+        INSERT INTO runs(project_id,id,task_id,agent_id,status,revision,position,attempt) VALUES('p','r','task','a','running',9,3,10);
+        INSERT INTO context_entries(project_id,key,value,set_by_kind,position,revision) VALUES('p','context','value','owner',4,10);
+        INSERT INTO project_config(project_id,key,value,position,revision) VALUES('p','config','value',5,11);
+        INSERT INTO templates(project_id,name,body,position,revision) VALUES('p','template','body',6,12);
+        INSERT INTO goals(project_id,id,title,description,status,position,revision) VALUES('p','goal','title','description','active',7,13);
+    ").unwrap();
+    let objects = orch_infra::blob::DiskBlobStore::open(dir.root()).unwrap();
+    let bytes = vec![b'x'; 65537];
+    let object = objects.put(&bytes).unwrap();
+    let families = [
+        "agent", "team", "run", "context", "config", "template", "goal",
+    ];
+    // More than two full batches; both key forms, NUL bytes and repeated hashes.
+    for family in families {
+        for i in 0..75 {
+            let form = i % 2;
+            let key = if form == 0 {
+                format!("key-{i}\0é")
+            } else {
+                format!("{i:064x}")
+            };
+            conn.execute(
+                "INSERT INTO entity_details VALUES('p',?1,?2,?3,1,?4,?5,?6)",
+                rusqlite::params![family, form, key, "{\"text\":\"é\"}", 13, "0".repeat(64)],
+            )
+            .unwrap();
+            for ordinal in 0..2 {
+                conn.execute(
+                    "INSERT INTO entity_blob_refs VALUES('p',?1,?2,?3,'/body',?4,?5,65537)",
+                    rusqlite::params![family, form, key, ordinal, object.to_string()],
+                )
+                .unwrap();
+            }
+        }
+        conn.execute(
+            "INSERT INTO counters VALUES('p',?1,999)",
+            [format!("position:{family}")],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO counters VALUES('p','position:message',4321)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO blobs VALUES('p',?1,65537,'disk',0,NULL)",
+        [object.to_string()],
+    )
+    .unwrap();
+    let rows = |conn: &rusqlite::Connection, table: &str| -> Vec<Vec<rusqlite::types::Value>> {
+        let n = conn
+            .prepare(&format!("SELECT * FROM {table}"))
+            .unwrap()
+            .column_count();
+        let order = (1..=n).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let mut stmt = conn
+            .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))
+            .unwrap();
+        stmt.query_map([], |r| (0..n).map(|i| r.get(i)).collect())
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    let tables = [
+        "entity_details",
+        "entity_blob_refs",
+        "counters",
+        "blobs",
+        "agents",
+        "teams",
+        "team_members",
+        "team_tasks",
+        "runs",
+        "context_entries",
+        "project_config",
+        "templates",
+        "goals",
+        "schema_migrations",
+    ];
+    let before: Vec<_> = tables.iter().map(|t| rows(&conn, t)).collect();
+    let untouched = |conn: &rusqlite::Connection| -> String {
+        conn.query_row("SELECT group_concat(sql) FROM (SELECT sql FROM sqlite_schema WHERE name NOT IN ('entity_details','entity_blob_refs','entity_blob_refs_by_hash','messages','messages_pending') AND name NOT LIKE 'sqlite_autoindex_%' ORDER BY name)", [], |r|r.get(0)).unwrap()
+    };
+    let schema = untouched(&conn);
+    migrate(&dir, &mut conn).unwrap();
+    assert_eq!(objects.get(&object).unwrap(), bytes);
+    assert_eq!(untouched(&conn), schema);
+    for (i, table) in tables[..tables.len() - 1].iter().enumerate() {
+        assert_eq!(rows(&conn, table), before[i], "{table}");
+    }
+    assert_eq!(
+        &rows(&conn, "schema_migrations")[..5],
+        before[tables.len() - 1]
+    );
+    assert_eq!(
+        conn.query_row::<String, _, _>("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap(),
+        "ok"
+    );
+    let copies: Vec<_> = std::fs::read_dir(tmp.path().join("data/backups"))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(copies.len(), 1);
+    let copy = rusqlite::Connection::open_with_flags(
+        copies[0].path().join("orch.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        copy.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap(),
+        5
+    );
+    for (i, table) in tables.iter().enumerate() {
+        assert_eq!(rows(&copy, table), before[i], "copy {table}");
+    }
+    migrate(&dir, &mut conn).unwrap();
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join("data/backups"))
+            .unwrap()
+            .count(),
+        1
     );
 }
