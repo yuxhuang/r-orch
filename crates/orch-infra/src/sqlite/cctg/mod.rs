@@ -577,7 +577,9 @@ fn format_error(family: Family, form: i64, error: FormatError, writing: bool) ->
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Provenance {
     pub kind: String,
-    pub identity: String,
+    /// `None` is a legacy row with no recorded identity, which an export must
+    /// keep apart from an identity that is the empty string.
+    pub identity: Option<String>,
     /// Only an authoritative binding sets an agent. No principal carries one
     /// today, so ordinary creation leaves it absent.
     pub agent: Option<String>,
@@ -595,11 +597,31 @@ impl Provenance {
     fn new(kind: &str, identity: &str, run: Option<&String>) -> Self {
         Self {
             kind: kind.into(),
-            identity: identity.into(),
+            identity: Some(identity.into()),
             agent: None,
             run: run.cloned(),
         }
     }
+}
+
+/// A context row's provenance columns. A row always names its kind, and every
+/// other column is text or absent: anything else is damage, not "no provenance".
+fn decode_provenance(form: i64, row: &[SqlValue]) -> NativeResult<Provenance> {
+    let damaged = |locator| native_corrupt(Family::Context, form, "provenance", locator);
+    let text = |value: &SqlValue, locator| match value {
+        SqlValue::Null => Ok(None),
+        SqlValue::Text(text) => Ok(Some(text.clone())),
+        _ => Err(damaged(locator)),
+    };
+    let [kind, identity, agent, run] = row else {
+        return Err(damaged("columns"));
+    };
+    Ok(Provenance {
+        kind: text(kind, "set_by_kind")?.ok_or_else(|| damaged("set_by_kind"))?,
+        identity: text(identity, "set_by_identity")?,
+        agent: text(agent, "set_by_agent_id")?,
+        run: text(run, "set_by_run_id")?,
+    })
 }
 
 /// Private query composition only; public cursor identity and validation remain
@@ -750,6 +772,15 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
     /// Execute one compiled statement with every value bound.
     fn run(&self, query: &str, values: &[SqlValue]) -> NativeResult<usize> {
         let mut stmt = self.tx.prepare(query)?;
+        // `raw_execute` binds an unbound parameter as NULL, so the count that
+        // `execute` would check is checked here.
+        if stmt.parameter_count() != values.len() {
+            return Err(rusqlite::Error::InvalidParameterCount(
+                values.len(),
+                stmt.parameter_count(),
+            )
+            .into());
+        }
         for (i, value) in values.iter().enumerate() {
             stmt.raw_bind_parameter(i + 1, value)?;
         }
@@ -770,9 +801,22 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
     pub(super) fn get(&self, family: Family, id: &str) -> NativeResult<Option<Record>> {
         self.ensure_committable()?;
         let (form, stored) = key(id);
-        // `row` compares the decoded identity's key with this one, so a digest
-        // match is also an equality of the original bytes up to SHA-256.
-        self.row(family, form, &stored)
+        self.lookup(family, id, form, &stored)
+    }
+
+    /// The row stored under `form` and `stored`, if its original identifier is
+    /// exactly `id`. A digest only locates the candidate: the requested bytes
+    /// decide, so a different identifier that shares the locator is not found.
+    fn lookup(
+        &self,
+        family: Family,
+        id: &str,
+        form: i64,
+        stored: &str,
+    ) -> NativeResult<Option<Record>> {
+        Ok(self
+            .row(family, form, stored)?
+            .filter(|record| record.entity.id() == id))
     }
 
     /// Hydrate one row by its stored key, or `None` when no row has it.
@@ -919,25 +963,15 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
 
     /// The caller's provenance as bound on create, for the export path and tests.
     pub(super) fn provenance(&self, id: &str) -> NativeResult<Option<Provenance>> {
+        let (form, stored) = key(id);
         let rows = self.rows(
             "SELECT set_by_kind,set_by_identity,set_by_agent_id,set_by_run_id FROM context_entries
              WHERE project_id=?1 AND key_form=?2 AND key=?3",
-            &self.identity(id),
+            &self.locator(form, &stored),
         )?;
-        let Some([SqlValue::Text(kind), identity, agent, run]) = rows.first().map(Vec::as_slice)
-        else {
-            return Ok(None);
-        };
-        let text = |value: &SqlValue| match value {
-            SqlValue::Text(text) => Some(text.clone()),
-            _ => None,
-        };
-        Ok(Some(Provenance {
-            kind: kind.clone(),
-            identity: text(identity).unwrap_or_default(),
-            agent: text(agent),
-            run: text(run),
-        }))
+        rows.first()
+            .map(|row| decode_provenance(form, row))
+            .transpose()
     }
 
     fn detail(&self, family: Family, form: i64, stored: &str) -> NativeResult<Detail> {
@@ -1102,7 +1136,9 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
             .map(Provenance::of)
             .ok_or(NativeError::Provenance)?;
         let long = |text: &str| text.len() > INLINE_TEXT_MAX_BYTES;
-        if long(&provenance.identity) || provenance.run.as_deref().is_some_and(long) {
+        if provenance.identity.as_deref().is_some_and(long)
+            || provenance.run.as_deref().is_some_and(long)
+        {
             return Err(NativeError::Encoding);
         }
         Ok(provenance)
@@ -1155,7 +1191,7 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
                 let text = |v: Option<String>| v.map(SqlValue::Text).unwrap_or(SqlValue::Null);
                 values.extend([
                     SqlValue::Text(p.kind),
-                    SqlValue::Text(p.identity),
+                    text(p.identity),
                     text(p.agent),
                     text(p.run),
                 ]);
@@ -1317,5 +1353,7 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
     }
 }
 
+#[cfg(test)]
+mod driver_regression;
 #[cfg(test)]
 mod tests;

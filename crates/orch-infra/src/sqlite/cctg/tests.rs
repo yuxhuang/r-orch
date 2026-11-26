@@ -250,7 +250,7 @@ fn provenance_is_bound_on_create_and_kept_by_an_update_or_move_from_another_prin
     let created = sql(&tx, &disk, &a).create(ctx("k", "v")).unwrap();
     let expected = Provenance {
         kind: "owner".into(),
-        identity: "owner-1".into(),
+        identity: Some("owner-1".into()),
         agent: None,
         run: None,
     };
@@ -271,7 +271,7 @@ fn provenance_is_bound_on_create_and_kept_by_an_update_or_move_from_another_prin
         other.provenance("k2").unwrap(),
         Some(Provenance {
             kind: "task".into(),
-            identity: "task-id".into(),
+            identity: Some("task-id".into()),
             agent: None,
             run: Some("run-9".into()),
         })
@@ -288,7 +288,7 @@ fn provenance_is_bound_on_create_and_kept_by_an_update_or_move_from_another_prin
         other.provenance("k").unwrap(),
         Some(Provenance {
             kind: "agent".into(),
-            identity: String::new(),
+            identity: None,
             agent: Some("a-1".into()),
             run: Some("r-1".into()),
         })
