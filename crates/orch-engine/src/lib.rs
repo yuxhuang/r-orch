@@ -104,6 +104,7 @@
 pub mod agent_factory;
 pub mod agent_service;
 pub mod container;
+pub mod disk_floor;
 pub mod doctor_service;
 pub mod events;
 pub mod goal_service;
