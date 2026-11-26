@@ -11,8 +11,11 @@
 //! What is fatal is decided here, by the structure of the error, and nowhere
 //! else. `classify` matches every `SqliteError` variant with no wildcard, so a
 //! new variant (the structured `TaskCorrupt` of R141, for one) cannot be added
-//! without a decision about its class. Task corruption is fatal; object access
-//! and publication failures alone prove nothing about the live database.
+//! without a decision about its class. Task corruption and the structured
+//! corruption of a Context, Config, Template or Goal (`EntityCorrupt`) are fatal;
+//! object access and publication failures of either (`TaskAccess`,
+//! `TaskPublication`, `EntityAccess`, `EntityPublication`) alone prove nothing
+//! about the live database.
 //!
 //! Corruption found in an external import, backup or export artifact is not
 //! the live database: it is classified, reported to the caller, and never
@@ -360,5 +363,222 @@ impl FailureState {
             .transaction_aborted
             .load(Ordering::SeqCst)
             .then_some(SqliteError::TransactionAborted)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Component-level pins for the classes of the structured corruption, access and
+    //! publication errors (issues 127 and 343). They exercise `classify` and
+    //! `FailureState` only: that the combined adapter catches a corruption, latches,
+    //! rolls back and refuses the next mutation is end-to-end evidence they do not give.
+    use super::*;
+    use crate::blob::BlobError;
+    use std::io::{self, ErrorKind};
+
+    fn task_corrupt() -> SqliteError {
+        SqliteError::TaskCorrupt {
+            task: "t".into(),
+            check: "typed detail",
+            locator: "detail",
+        }
+    }
+
+    fn entity_corrupt() -> SqliteError {
+        SqliteError::EntityCorrupt {
+            family: "context",
+            form: 1,
+            check: "typed detail",
+            locator: "detail".into(),
+        }
+    }
+
+    fn publication() -> BlobError {
+        BlobError::Io(io::Error::other("synthetic publication failure"))
+    }
+
+    /// One error per access or publication variant of the two families.
+    fn access_and_publication() -> [(&'static str, SqliteError); 4] {
+        [
+            ("TaskAccess", SqliteError::TaskAccess(ErrorKind::NotFound)),
+            (
+                "TaskPublication",
+                SqliteError::TaskPublication(publication()),
+            ),
+            (
+                "EntityAccess",
+                SqliteError::EntityAccess(ErrorKind::PermissionDenied),
+            ),
+            (
+                "EntityPublication",
+                SqliteError::EntityPublication(publication()),
+            ),
+        ]
+    }
+
+    fn operation(class: Class) -> Vec<(Role, Class)> {
+        vec![(Role::Operation, class)]
+    }
+
+    #[test]
+    fn entity_corrupt_is_fatal_logical_corruption_like_task_corrupt() {
+        let fatal = operation(Class::Fatal(FatalCause::LogicalCorruption));
+        assert_eq!(classify(&entity_corrupt()).leaves(), fatal);
+        assert_eq!(classify(&task_corrupt()).leaves(), fatal);
+        assert!(classify(&entity_corrupt()).is_fatal());
+        assert_eq!(
+            classify(&entity_corrupt()).fatal_causes(),
+            [(Role::Operation, FatalCause::LogicalCorruption)]
+        );
+    }
+
+    #[test]
+    fn access_and_publication_failures_of_both_families_are_transient_not_fatal() {
+        for (name, error) in access_and_publication() {
+            let observation = classify(&error);
+            assert_eq!(observation.leaves(), operation(Class::Transient), "{name}");
+            assert!(!observation.is_fatal(), "{name}");
+            assert!(observation.fatal_causes().is_empty(), "{name}");
+            assert!(!observation.savepoint_rollback_failed(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_corrupt_entity_on_a_live_connection_latches_and_refuses_the_gate() {
+        for source in [
+            FailureSource::Writer,
+            FailureSource::Reader,
+            FailureSource::Checkpoint,
+            FailureSource::Tool,
+        ] {
+            let state = FailureState::new();
+            state.ensure_available().expect("fresh state is available");
+            let observation = state.observe(source, &entity_corrupt());
+            assert!(observation.is_fatal(), "{source}");
+            let failure = state
+                .failure()
+                .unwrap_or_else(|| panic!("{source} latched"));
+            assert_eq!(failure.source, source);
+            assert_eq!(
+                failure.causes,
+                [(Role::Operation, FatalCause::LogicalCorruption)]
+            );
+            assert!(matches!(
+                state.ensure_available(),
+                Err(SqliteError::StorageUnavailable(latched)) if latched == failure
+            ));
+            assert_eq!(state.fatal_observations(), 1, "{source}");
+        }
+    }
+
+    #[test]
+    fn only_a_writer_observation_aborts_the_enclosing_transaction() {
+        let writer = FailureState::new();
+        writer.begin_transaction();
+        writer.observe(FailureSource::Writer, &entity_corrupt());
+        // `ensure_available` already fails once latched; the abort flag is its own bit.
+        assert!(writer.inner.transaction_aborted.load(Ordering::SeqCst));
+        assert!(matches!(
+            writer.transaction_must_abort(),
+            Some(SqliteError::StorageUnavailable(_))
+        ));
+
+        let reader = FailureState::new();
+        reader.observe(FailureSource::Reader, &entity_corrupt());
+        assert!(!reader.inner.transaction_aborted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_corrupt_entity_in_an_artifact_is_classified_and_never_latches() {
+        let state = FailureState::new();
+        let observation = state.observe(FailureSource::Artifact, &entity_corrupt());
+        assert!(observation.is_fatal());
+        assert_eq!(state.failure(), None);
+        assert_eq!(state.fatal_observations(), 0);
+        state.ensure_available().expect("an artifact never latches");
+        assert!(!state.inner.transaction_aborted.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn access_and_publication_failures_never_latch_from_any_source() {
+        for (name, error) in access_and_publication() {
+            for source in [
+                FailureSource::Writer,
+                FailureSource::Reader,
+                FailureSource::Checkpoint,
+                FailureSource::Tool,
+                FailureSource::Artifact,
+            ] {
+                let state = FailureState::new();
+                state.begin_transaction();
+                let observation = state.observe(source, &error);
+                assert_eq!(observation.leaves(), operation(Class::Transient), "{name}");
+                assert_eq!(state.failure(), None, "{name} from {source}");
+                assert_eq!(state.fatal_observations(), 0, "{name} from {source}");
+                state.ensure_available().expect("not latched");
+                assert!(
+                    state.transaction_must_abort().is_none(),
+                    "{name} from {source} must leave the transaction committable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pooled_read_counts_access_and_publication_failures_but_not_corruption() {
+        let state = FailureState::new();
+        for (index, (name, error)) in access_and_publication().into_iter().enumerate() {
+            state.pool_read_finished(Some(&error));
+            assert_eq!(state.pool_failure_streak(), index as u32 + 1, "{name}");
+        }
+        assert!(state.pool_degraded());
+        // Corruption is fatal, observed at its producer, and not a transient count.
+        let before = state.pool_failure_streak();
+        state.pool_read_finished(Some(&entity_corrupt()));
+        assert_eq!(state.pool_failure_streak(), before);
+        state.pool_read_finished(None);
+        assert_eq!(state.pool_failure_streak(), 0);
+        assert!(!state.pool_degraded());
+    }
+
+    #[test]
+    fn the_fatal_side_of_an_operation_rollback_wins_for_either_role() {
+        let rollback = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        let corrupt_operation = classify(&SqliteError::OperationRollback {
+            operation: Box::new(entity_corrupt()),
+            rollback,
+        });
+        assert_eq!(
+            corrupt_operation.leaves(),
+            [
+                (Role::Operation, Class::Fatal(FatalCause::LogicalCorruption)),
+                (Role::Rollback, Class::Transient),
+            ]
+        );
+        assert!(corrupt_operation.is_fatal());
+        assert!(corrupt_operation.savepoint_rollback_failed());
+
+        let rollback = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+            None,
+        );
+        let access_operation = classify(&SqliteError::OperationRollback {
+            operation: Box::new(SqliteError::EntityAccess(ErrorKind::NotFound)),
+            rollback,
+        });
+        assert_eq!(
+            access_operation.leaves(),
+            [
+                (Role::Operation, Class::Transient),
+                (Role::Rollback, Class::Fatal(FatalCause::SqliteCorrupt)),
+            ]
+        );
+        assert_eq!(
+            access_operation.fatal_causes(),
+            [(Role::Rollback, FatalCause::SqliteCorrupt)]
+        );
     }
 }
