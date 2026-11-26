@@ -1,0 +1,1 @@
+Fixed the inactive SQLite Context and Goal mappings to use the shared RFC 3339 timestamp projection on writes and reads, preserving the original text and absent optional fields while rejecting mismatched stored projections as corruption. Config and Template have no timestamp scalars; the daemon continues to use file storage.

@@ -488,18 +488,11 @@ fn unsigned(value: u64) -> SqlValue {
         .map(SqlValue::Integer)
         .unwrap_or(SqlValue::Null)
 }
-/// UTC milliseconds of `0000-01-01T00:00:00.000Z`, the documented lower bound
-/// of a native time column; jiff also parses earlier expanded-year instants.
-const TIME_MIN_MS: i64 = -62_167_219_200_000;
-/// Milliseconds only when the string is an instant of whole milliseconds at or
-/// after year 0000. The original string stays authoritative and is never
-/// rewritten from this column.
+/// The shared RFC 3339 projection is used on writes and hydration alike.
+/// The original string remains authoritative, including when the column is NULL.
 fn time(value: &str) -> SqlValue {
-    value
-        .parse::<jiff::Timestamp>()
-        .ok()
-        .filter(|t| t.as_nanosecond() % 1_000_000 == 0 && t.as_millisecond() >= TIME_MIN_MS)
-        .map(|t| SqlValue::Integer(t.as_millisecond()))
+    super::time_projection::rfc3339_millis(value)
+        .map(SqlValue::Integer)
         .unwrap_or(SqlValue::Null)
 }
 fn quartet(value: Option<&str>, identity: bool) -> Vec<SqlValue> {
@@ -1365,3 +1358,5 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
 mod driver_regression;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod time_tests;
