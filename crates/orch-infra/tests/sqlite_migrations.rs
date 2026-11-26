@@ -1483,6 +1483,17 @@ fn message_upgrade_copies_all_sibling_authority_and_references_and_keeps_checked
     let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
     apply_migrations(&dir, &mut conn, &five_steps(), plenty()).unwrap();
     project(&conn);
+    conn.execute_batch("
+        INSERT INTO agents(project_id,id,name,adapter,config,position,revision) VALUES('p','a','name','codex','{}',1,7);
+        INSERT INTO teams(project_id,id,name,lead_agent_id,created_at_text,status,config,position,revision) VALUES('p','team','name','a','opaque','active','{}',2,8);
+        INSERT INTO team_members(project_id,team_id,ordinal,agent_id,role,joined_at_text) VALUES('p','team',0,'a','member','opaque');
+        INSERT INTO team_tasks(project_id,team_id,task_id) VALUES('p','team','task');
+        INSERT INTO runs(project_id,id,task_id,agent_id,status,revision,position,attempt) VALUES('p','r','task','a','running',9,3,10);
+        INSERT INTO context_entries(project_id,key,value,set_by_kind,position,revision) VALUES('p','context','value','owner',4,10);
+        INSERT INTO project_config(project_id,key,value,position,revision) VALUES('p','config','value',5,11);
+        INSERT INTO templates(project_id,name,body,position,revision) VALUES('p','template','body',6,12);
+        INSERT INTO goals(project_id,id,title,description,status,position,revision) VALUES('p','goal','title','description','active',7,13);
+    ").unwrap();
     let objects = orch_infra::blob::DiskBlobStore::open(dir.root()).unwrap();
     let bytes = vec![b'x'; 65537];
     let object = objects.put(&bytes).unwrap();
@@ -1546,6 +1557,15 @@ fn message_upgrade_copies_all_sibling_authority_and_references_and_keeps_checked
         "entity_blob_refs",
         "counters",
         "blobs",
+        "agents",
+        "teams",
+        "team_members",
+        "team_tasks",
+        "runs",
+        "context_entries",
+        "project_config",
+        "templates",
+        "goals",
         "schema_migrations",
     ];
     let before: Vec<_> = tables.iter().map(|t| rows(&conn, t)).collect();
@@ -1556,10 +1576,13 @@ fn message_upgrade_copies_all_sibling_authority_and_references_and_keeps_checked
     migrate(&dir, &mut conn).unwrap();
     assert_eq!(objects.get(&object).unwrap(), bytes);
     assert_eq!(untouched(&conn), schema);
-    for (i, table) in tables[..4].iter().enumerate() {
+    for (i, table) in tables[..tables.len() - 1].iter().enumerate() {
         assert_eq!(rows(&conn, table), before[i], "{table}");
     }
-    assert_eq!(&rows(&conn, "schema_migrations")[..5], before[4]);
+    assert_eq!(
+        &rows(&conn, "schema_migrations")[..5],
+        before[tables.len() - 1]
+    );
     assert_eq!(
         conn.query_row::<String, _, _>("PRAGMA integrity_check", [], |r| r.get(0))
             .unwrap(),
