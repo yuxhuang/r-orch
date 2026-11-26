@@ -14,6 +14,7 @@
 //! commit it, and are not the Send-bound `UnitOfWork` facade. No clock is read:
 //! the time a blob registration is stamped is supplied by the caller, and so is
 //! `now` of `Filter::PendingMessages`.
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
@@ -91,6 +92,14 @@ fn key(id: &str) -> (i64, String) {
         (0, id.to_owned())
     } else {
         (1, BlobHash::of(id.as_bytes()).to_string())
+    }
+}
+
+fn check_limit(limit: usize) -> Result<()> {
+    if (1..=1000).contains(&limit) {
+        Ok(())
+    } else {
+        Err(StoreError::InvalidPage("limit must be 1..=1000".into()).into())
     }
 }
 
@@ -182,6 +191,47 @@ pub(in crate::sqlite) struct MessagePage {
     pub has_more: bool,
 }
 
+/// What a page is resumed after: the *original* values a message order
+/// compares, in order and ending with the identity ("Cursors of the eight
+/// families other than Task" in the spec). It is not a row, so a message that
+/// has since been deleted, changed or has left the filter (a pending message
+/// that was delivered) still names its place. Texts compare as bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::sqlite) enum OrderKey<'a> {
+    /// Sort `id`.
+    Id(Cow<'a, str>),
+    /// The default order: `created_at`, the position, then the id.
+    Default {
+        created_at: Cow<'a, str>,
+        position: u64,
+        id: Cow<'a, str>,
+    },
+}
+
+impl OrderKey<'_> {
+    /// The total order of the selection the two keys share; keys of another
+    /// shape are never compared, because a selection checks its keys first.
+    fn cmp_key(&self, other: &OrderKey<'_>) -> Ordering {
+        let bytes = |a: &str, b: &str| a.as_bytes().cmp(b.as_bytes());
+        match (self, other) {
+            (OrderKey::Id(a), OrderKey::Id(b)) => bytes(a, b),
+            (
+                OrderKey::Default {
+                    created_at: u,
+                    position: p,
+                    id: a,
+                },
+                OrderKey::Default {
+                    created_at: v,
+                    position: q,
+                    id: b,
+                },
+            ) => bytes(u, v).then(p.cmp(q)).then_with(|| bytes(a, b)),
+            _ => Ordering::Equal,
+        }
+    }
+}
+
 impl MessageSelection<'_> {
     fn check(&self) -> Result<()> {
         if !matches!(
@@ -217,22 +267,39 @@ impl MessageSelection<'_> {
         }
     }
 
+    /// The ordering tuple of a hydrated message, on its original bytes: the
+    /// `created_at`, the position and the id, or the id alone for the id sort.
+    /// `None` when the record is not a message.
+    pub(in crate::sqlite) fn key_of<'r>(&self, record: &'r Record) -> Option<OrderKey<'r>> {
+        let Entity::Message(message) = &record.entity else {
+            return None;
+        };
+        let id = Cow::Borrowed(message.id.as_str());
+        Some(match self.sort {
+            Sort::Id => OrderKey::Id(id),
+            _ => OrderKey::Default {
+                created_at: Cow::Borrowed(message.created_at.as_str()),
+                position: record.position,
+                id,
+            },
+        })
+    }
+
     /// The total order: the original `created_at`, then position, then the id
     /// as bytes; the id sort is the id alone.
     fn compare(&self, a: &Record, b: &Record) -> Ordering {
-        let (Entity::Message(x), Entity::Message(y)) = (&a.entity, &b.entity) else {
-            return Ordering::Equal;
-        };
-        let by_id = x.id.as_bytes().cmp(y.id.as_bytes());
-        match self.sort {
-            Sort::Id => by_id,
-            _ => x
-                .created_at
-                .as_bytes()
-                .cmp(y.created_at.as_bytes())
-                .then(a.position.cmp(&b.position))
-                .then(by_id),
+        match (self.key_of(a), self.key_of(b)) {
+            (Some(a), Some(b)) => a.cmp_key(&b),
+            _ => Ordering::Equal,
         }
+    }
+
+    /// Whether a recorded tuple is of the shape this selection's sort orders by.
+    fn accepts(&self, key: &OrderKey<'_>) -> bool {
+        matches!(
+            (self.sort, key),
+            (Sort::Id, OrderKey::Id(_)) | (Sort::Default, OrderKey::Default { .. })
+        )
     }
 
     /// The narrowing SQL: rows that cannot match are not hydrated. It is exact
@@ -463,6 +530,8 @@ impl<'a> MessageReader<'a> {
     /// prefix or projection can decide a comparison. Rows that the narrowing
     /// excludes are not read: damage there does not fail a page that cannot
     /// return them. Any candidate that is damaged fails the page.
+    /// The anchor is a record that must still match the filter; a page that
+    /// resumes after a recorded ordering tuple is [`Self::select_after`].
     pub(in crate::sqlite) fn select(
         &self,
         query: MessageSelection<'_>,
@@ -470,12 +539,47 @@ impl<'a> MessageReader<'a> {
         limit: usize,
     ) -> Result<MessagePage> {
         query.check()?;
-        if !(1..=1000).contains(&limit) {
-            return Err(StoreError::InvalidPage("limit must be 1..=1000".into()).into());
-        }
-        if after.is_some_and(|anchor| !query.matches(anchor)) {
+        check_limit(limit)?;
+        let key = match after {
+            Some(anchor) => {
+                if !query.matches(anchor) {
+                    return Err(StoreError::InvalidCursor.into());
+                }
+                Some(query.key_of(anchor).ok_or(StoreError::InvalidCursor)?)
+            }
+            None => None,
+        };
+        self.page(&query, key.as_ref(), limit)
+    }
+
+    /// The same page, resumed after the ordering tuple a cursor recorded. The
+    /// candidates are hydrated and filtered in this reader's own view, and the
+    /// first message returned is the first that sorts after `after` on the
+    /// original bytes. The tuple names a place, not a row: the message it came
+    /// from may be deleted, changed or no longer match the filter (a pending
+    /// message that was delivered), and nothing is refused for that. A tuple of
+    /// another shape than the sort's is `InvalidCursor`. Binding the cursor and
+    /// holding the tuple are the composition owner's.
+    pub(in crate::sqlite) fn select_after(
+        &self,
+        query: MessageSelection<'_>,
+        after: Option<&OrderKey<'_>>,
+        limit: usize,
+    ) -> Result<MessagePage> {
+        query.check()?;
+        check_limit(limit)?;
+        if after.is_some_and(|key| !query.accepts(key)) {
             return Err(StoreError::InvalidCursor.into());
         }
+        self.page(&query, after, limit)
+    }
+
+    fn page(
+        &self,
+        query: &MessageSelection<'_>,
+        after: Option<&OrderKey<'_>>,
+        limit: usize,
+    ) -> Result<MessagePage> {
         let (sql, values) = query.candidates(self.project);
         let mut stmt = self.conn.prepare(&sql)?;
         let keys = stmt
@@ -501,9 +605,13 @@ impl<'a> MessageReader<'a> {
         }
         records.sort_by(|a, b| query.compare(a, b));
         let total = records.len() as u64;
-        let mut remaining = records
-            .into_iter()
-            .filter(|row| after.is_none_or(|a| query.compare(row, a) == Ordering::Greater));
+        let mut remaining = records.into_iter().filter(|row| {
+            after.is_none_or(|key| {
+                query
+                    .key_of(row)
+                    .is_some_and(|row| row.cmp_key(key) == Ordering::Greater)
+            })
+        });
         let items = remaining.by_ref().take(limit).collect();
         let has_more = remaining.next().is_some();
         Ok(MessagePage {
@@ -862,5 +970,15 @@ impl<'a, 'conn> Messages<'a, 'conn> {
     ) -> Result<MessagePage> {
         self.active()?;
         self.reader().select(query, after, limit)
+    }
+
+    pub(in crate::sqlite) fn select_after(
+        &self,
+        query: MessageSelection<'_>,
+        after: Option<&OrderKey<'_>>,
+        limit: usize,
+    ) -> Result<MessagePage> {
+        self.active()?;
+        self.reader().select_after(query, after, limit)
     }
 }

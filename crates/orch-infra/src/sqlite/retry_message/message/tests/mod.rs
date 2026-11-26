@@ -11,6 +11,7 @@ use crate::sqlite::{SqliteError, migrations, test_data};
 
 mod boundaries;
 mod damage;
+mod keys;
 mod large;
 mod pages;
 

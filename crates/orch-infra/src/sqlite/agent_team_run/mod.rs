@@ -507,6 +507,7 @@ mod tests {
     // Keep the qualified prerequisite corpus byte-for-byte while native tests
     // grow separately in this bounded leaf.
     include!("tests.rs");
+    include!("key_tests.rs");
 
     fn native_conn() -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -2302,6 +2303,7 @@ mod tests {
 use crate::blob::{BlobReferences, ReferenceError};
 use orch_core::store::{Entity, EntityKind, Filter, Record, Revision, Sort, StoreError};
 use rusqlite::{OptionalExtension, Transaction, params, types::Value as SqlValue};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
 type NativeResult<T> = std::result::Result<T, NativeError>;
@@ -2657,33 +2659,171 @@ impl NativeSelection<'_> {
             _ => false,
         }
     }
+    /// The shape of the ordering tuple this selection compares. The family and
+    /// sort are validated by [`Self::family`] before this is read.
+    fn shape(&self) -> Shape {
+        match (self.filter, self.sort) {
+            (_, Sort::Id) => Shape::Id,
+            (Filter::Agents, Sort::Name) => Shape::AgentName,
+            (Filter::Agents, _) => Shape::AgentPosition,
+            (Filter::Teams, Sort::Name) => Shape::TeamName,
+            (Filter::Teams, _) => Shape::TeamCreated,
+            (Filter::Runs { task: Some(_), .. }, _) => Shape::RunAttempt,
+            _ => Shape::RunStarted,
+        }
+    }
+    /// The ordering tuple of a hydrated row, on its original bytes. `None` when
+    /// the row is not of this selection's family.
+    pub(super) fn key_of<'r>(&self, row: &'r Record) -> Option<OrderKey<'r>> {
+        let id = Cow::Borrowed(row.entity.id());
+        let position = row.position;
+        Some(match (self.shape(), &row.entity) {
+            (Shape::Id, _) => OrderKey::Id(id),
+            (Shape::AgentPosition, Entity::Agent(_)) => OrderKey::AgentPosition { position, id },
+            (Shape::AgentName, Entity::Agent(a)) => OrderKey::AgentName {
+                name: Cow::Borrowed(&a.name),
+                position,
+                id,
+            },
+            (Shape::TeamCreated, Entity::Team(t)) => OrderKey::TeamCreated {
+                created_at: Cow::Borrowed(&t.created_at),
+                id,
+            },
+            (Shape::TeamName, Entity::Team(t)) => OrderKey::TeamName {
+                name: Cow::Borrowed(&t.name),
+                id,
+            },
+            (Shape::RunStarted, Entity::Run(r)) => OrderKey::RunStarted {
+                started_at: Cow::Borrowed(&r.started_at),
+                id,
+            },
+            (Shape::RunAttempt, Entity::Run(r)) => OrderKey::RunAttempt {
+                attempt: r.attempt,
+                id,
+            },
+            _ => return None,
+        })
+    }
     fn compare(&self, a: &Record, b: &Record) -> Ordering {
-        let primary = match (&a.entity, &b.entity, self.sort) {
-            (_, _, Sort::Id) => Ordering::Equal,
-            (Entity::Agent(ae), Entity::Agent(be), Sort::Name) => ae
-                .name
-                .as_bytes()
-                .cmp(be.name.as_bytes())
-                .then(a.position.cmp(&b.position)),
-            (Entity::Agent(_), Entity::Agent(_), _) => a.position.cmp(&b.position),
-            (Entity::Team(a), Entity::Team(b), Sort::Name) => {
-                a.name.as_bytes().cmp(b.name.as_bytes())
-            }
-            (Entity::Team(a), Entity::Team(b), _) => {
-                a.created_at.as_bytes().cmp(b.created_at.as_bytes())
-            }
-            (Entity::Run(a), Entity::Run(b), _)
-                if matches!(self.filter, Filter::Runs { task: Some(_), .. }) =>
-            {
-                b.attempt.cmp(&a.attempt)
-            }
-            (Entity::Run(a), Entity::Run(b), _) => {
-                b.started_at.as_bytes().cmp(a.started_at.as_bytes())
-            }
+        match (self.key_of(a), self.key_of(b)) {
+            (Some(a), Some(b)) => a.cmp_key(&b),
             // Family and sort are validated before comparing, including anchors.
             _ => Ordering::Equal,
-        };
-        primary.then_with(|| a.entity.id().as_bytes().cmp(b.entity.id().as_bytes()))
+        }
+    }
+}
+
+/// The shapes of the ordering tuple. One per row of the spec's capacity table
+/// for Agent, Team and Run, plus the identity-only sort of every family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    Id,
+    AgentPosition,
+    AgentName,
+    TeamCreated,
+    TeamName,
+    RunStarted,
+    RunAttempt,
+}
+
+/// What a page is resumed after: the *original* values a selection's order
+/// compares, in order and ending with the identity ("Cursors of the eight
+/// families other than Task" in the spec). It is not a row, so a row that has
+/// since been deleted, changed or has left the filter still names its place.
+/// Texts compare as bytes. Runs order by `started_at` or `attempt` descending,
+/// and every other component ascending.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum OrderKey<'a> {
+    /// Sort `id`, every family.
+    Id(Cow<'a, str>),
+    /// Agents, default order.
+    AgentPosition { position: u64, id: Cow<'a, str> },
+    /// Agents by name.
+    AgentName {
+        name: Cow<'a, str>,
+        position: u64,
+        id: Cow<'a, str>,
+    },
+    /// Teams, default order.
+    TeamCreated {
+        created_at: Cow<'a, str>,
+        id: Cow<'a, str>,
+    },
+    /// Teams by name.
+    TeamName {
+        name: Cow<'a, str>,
+        id: Cow<'a, str>,
+    },
+    /// Runs, default order with no task in the filter.
+    RunStarted {
+        started_at: Cow<'a, str>,
+        id: Cow<'a, str>,
+    },
+    /// Runs whose filter names a task: default order and `Sort::Attempt`.
+    RunAttempt { attempt: u32, id: Cow<'a, str> },
+}
+impl OrderKey<'_> {
+    fn shape(&self) -> Shape {
+        match self {
+            Self::Id(_) => Shape::Id,
+            Self::AgentPosition { .. } => Shape::AgentPosition,
+            Self::AgentName { .. } => Shape::AgentName,
+            Self::TeamCreated { .. } => Shape::TeamCreated,
+            Self::TeamName { .. } => Shape::TeamName,
+            Self::RunStarted { .. } => Shape::RunStarted,
+            Self::RunAttempt { .. } => Shape::RunAttempt,
+        }
+    }
+    /// The total order of the selection the two keys share; keys of different
+    /// shapes are never compared, because a selection checks its keys first.
+    fn cmp_key(&self, other: &OrderKey<'_>) -> Ordering {
+        use OrderKey::*;
+        let bytes = |a: &str, b: &str| a.as_bytes().cmp(b.as_bytes());
+        match (self, other) {
+            (Id(a), Id(b)) => bytes(a, b),
+            (AgentPosition { position: p, id: a }, AgentPosition { position: q, id: b }) => {
+                p.cmp(q).then_with(|| bytes(a, b))
+            }
+            (
+                AgentName {
+                    name: n,
+                    position: p,
+                    id: a,
+                },
+                AgentName {
+                    name: m,
+                    position: q,
+                    id: b,
+                },
+            ) => bytes(n, m).then(p.cmp(q)).then_with(|| bytes(a, b)),
+            (
+                TeamCreated {
+                    created_at: n,
+                    id: a,
+                },
+                TeamCreated {
+                    created_at: m,
+                    id: b,
+                },
+            )
+            | (TeamName { name: n, id: a }, TeamName { name: m, id: b }) => {
+                bytes(n, m).then_with(|| bytes(a, b))
+            }
+            (
+                RunStarted {
+                    started_at: n,
+                    id: a,
+                },
+                RunStarted {
+                    started_at: m,
+                    id: b,
+                },
+            ) => bytes(m, n).then_with(|| bytes(a, b)),
+            (RunAttempt { attempt: p, id: a }, RunAttempt { attempt: q, id: b }) => {
+                q.cmp(p).then_with(|| bytes(a, b))
+            }
+            _ => Ordering::Equal,
+        }
     }
 }
 
@@ -2833,22 +2973,61 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
     /// exclude a row whose original key must participate in the total order.
     /// No records escape if any candidate is corrupt. The composition owner
     /// must bind the saved anchor to its project/filter/sort in the public cursor.
+    /// The anchor is a record that must still match the filter; a page that
+    /// resumes after a recorded ordering tuple is [`Self::select_after`].
     pub(super) fn select(
         &self,
         query: NativeSelection<'_>,
         after: Option<&Record>,
         limit: usize,
     ) -> NativeResult<NativePage> {
+        let family = self.check(&query, limit)?;
+        let key = match after {
+            Some(anchor) => {
+                if Family::of(&anchor.entity)? != family || !query.matches(anchor) {
+                    return Err(StoreError::InvalidCursor.into());
+                }
+                Some(query.key_of(anchor).ok_or(StoreError::InvalidCursor)?)
+            }
+            None => None,
+        };
+        self.page(&query, family, key.as_ref(), limit)
+    }
+    /// The same page, resumed after the ordering tuple a cursor recorded. Rows
+    /// are hydrated and filtered in this selecting transaction, and the first
+    /// row returned is the first that sorts after `after` on the original
+    /// bytes. The tuple names a place, not a row: the row it came from may be
+    /// deleted, changed or no longer match the filter, and nothing is refused
+    /// for that. A tuple of another shape than the selection's is
+    /// `InvalidCursor`. Binding the cursor and holding the tuple are the
+    /// composition owner's.
+    pub(super) fn select_after(
+        &self,
+        query: NativeSelection<'_>,
+        after: Option<&OrderKey<'_>>,
+        limit: usize,
+    ) -> NativeResult<NativePage> {
+        let family = self.check(&query, limit)?;
+        if after.is_some_and(|key| key.shape() != query.shape()) {
+            return Err(StoreError::InvalidCursor.into());
+        }
+        self.page(&query, family, after, limit)
+    }
+    fn check(&self, query: &NativeSelection<'_>, limit: usize) -> NativeResult<Family> {
         self.ensure_committable()?;
         let family = query.family()?;
         if !(1..=1000).contains(&limit) {
             return Err(StoreError::InvalidPage("limit must be 1..=1000".into()).into());
         }
-        if let Some(anchor) = after
-            && (Family::of(&anchor.entity)? != family || !query.matches(anchor))
-        {
-            return Err(StoreError::InvalidCursor.into());
-        }
+        Ok(family)
+    }
+    fn page(
+        &self,
+        query: &NativeSelection<'_>,
+        family: Family,
+        after: Option<&OrderKey<'_>>,
+        limit: usize,
+    ) -> NativeResult<NativePage> {
         let mut stmt = self.tx.prepare(&format!(
             "SELECT id_form,id FROM {} WHERE project_id=?1",
             family.table()
@@ -2938,7 +3117,11 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
         records.sort_by(|a, b| query.compare(a, b));
         let total = records.len() as u64;
         let mut remaining = records.into_iter().filter(|row| {
-            after.is_none_or(|anchor| query.compare(row, anchor) == Ordering::Greater)
+            after.is_none_or(|key| {
+                query
+                    .key_of(row)
+                    .is_some_and(|row| row.cmp_key(key) == Ordering::Greater)
+            })
         });
         let items = remaining.by_ref().take(limit).collect();
         let has_more = remaining.next().is_some();

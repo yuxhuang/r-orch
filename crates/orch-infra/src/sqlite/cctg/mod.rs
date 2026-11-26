@@ -24,6 +24,7 @@ use orch_core::store::{
 use orch_domain::{Goal, GoalStatus};
 use rusqlite::{OptionalExtension, Transaction, params, types::Value as SqlValue};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -659,31 +660,134 @@ impl NativeSelection<'_> {
             _ => false,
         }
     }
+    /// The shape of the ordering tuple this selection compares. The family and
+    /// sort are validated by [`Self::family`] before this is read.
+    fn shape(&self) -> Shape {
+        match (self.filter, self.sort) {
+            (Filter::Goals { .. }, Sort::CreatedAt) => Shape::GoalCreated,
+            (Filter::Goals { .. }, Sort::Id) => Shape::Id,
+            (Filter::Goals { .. }, _) => Shape::GoalDefault,
+            _ => Shape::Id,
+        }
+    }
+    /// The ordering tuple of a hydrated row, on its original bytes. `None` when
+    /// the row is not of this selection's family.
+    pub(super) fn key_of<'r>(&self, row: &'r Record) -> Option<OrderKey<'r>> {
+        let id = Cow::Borrowed(row.entity.id());
+        let position = row.position;
+        Some(match (self.shape(), &row.entity) {
+            (Shape::Id, _) => OrderKey::Id(id),
+            (Shape::GoalDefault, Entity::Goal(goal)) => OrderKey::GoalDefault {
+                rank: rank(goal.status) as u64,
+                updated_at: goal.updated_at.as_deref().map(Cow::Borrowed),
+                position,
+                id,
+            },
+            (Shape::GoalCreated, Entity::Goal(goal)) => OrderKey::GoalCreated {
+                created_at: Cow::Borrowed(&goal.created_at),
+                position,
+                id,
+            },
+            _ => return None,
+        })
+    }
     /// The reference's total order, on original bytes. The family and sort are
     /// validated before any comparison, anchors included.
     fn compare(&self, a: &Record, b: &Record) -> Ordering {
-        let primary = match (&a.entity, &b.entity, self.sort) {
-            (_, _, Sort::Id) => Ordering::Equal,
-            (Entity::Goal(a), Entity::Goal(b), _) if self.sort == Sort::CreatedAt => {
-                a.created_at.as_bytes().cmp(b.created_at.as_bytes())
-            }
-            (Entity::Goal(a), Entity::Goal(b), _) => rank(a.status).cmp(&rank(b.status)).then(
-                // Present before absent, an empty text included, newest text first.
-                match (&a.updated_at, &b.updated_at) {
-                    (Some(a), Some(b)) => b.as_bytes().cmp(a.as_bytes()),
+        match (self.key_of(a), self.key_of(b)) {
+            (Some(a), Some(b)) => a.cmp_key(&b),
+            _ => Ordering::Equal,
+        }
+    }
+}
+
+/// The shapes of the ordering tuple: a goal's two orders, and the identity
+/// alone for every other list and sort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    Id,
+    GoalDefault,
+    GoalCreated,
+}
+
+/// What a page is resumed after: the *original* values a selection's order
+/// compares, in order and ending with the identity ("Cursors of the eight
+/// families other than Task" in the spec). It is not a row, so a row that has
+/// since been deleted, changed or has left the filter (a goal that was
+/// achieved) still names its place. Texts compare as bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum OrderKey<'a> {
+    /// Context, config and templates in every order, and any family by id.
+    Id(Cow<'a, str>),
+    /// Goals, default order: the status rank, then `updated_at` newest first
+    /// with any text before an absent one (an empty text is present), then the
+    /// position and the identity.
+    GoalDefault {
+        rank: u64,
+        updated_at: Option<Cow<'a, str>>,
+        position: u64,
+        id: Cow<'a, str>,
+    },
+    /// Goals by `created_at`, then the position and the identity.
+    GoalCreated {
+        created_at: Cow<'a, str>,
+        position: u64,
+        id: Cow<'a, str>,
+    },
+}
+impl OrderKey<'_> {
+    fn shape(&self) -> Shape {
+        match self {
+            Self::Id(_) => Shape::Id,
+            Self::GoalDefault { .. } => Shape::GoalDefault,
+            Self::GoalCreated { .. } => Shape::GoalCreated,
+        }
+    }
+    /// The total order of the selection the two keys share; keys of different
+    /// shapes are never compared, because a selection checks its keys first.
+    fn cmp_key(&self, other: &OrderKey<'_>) -> Ordering {
+        use OrderKey::*;
+        let bytes = |a: &str, b: &str| a.as_bytes().cmp(b.as_bytes());
+        match (self, other) {
+            (Id(a), Id(b)) => bytes(a, b),
+            (
+                GoalDefault {
+                    rank: r,
+                    updated_at: u,
+                    position: p,
+                    id: a,
+                },
+                GoalDefault {
+                    rank: s,
+                    updated_at: v,
+                    position: q,
+                    id: b,
+                },
+            ) => r
+                .cmp(s)
+                .then_with(|| match (u, v) {
+                    // Present before absent, an empty text included, newest text first.
+                    (Some(u), Some(v)) => bytes(v, u),
                     (Some(_), None) => Ordering::Less,
                     (None, Some(_)) => Ordering::Greater,
                     (None, None) => Ordering::Equal,
+                })
+                .then(p.cmp(q))
+                .then_with(|| bytes(a, b)),
+            (
+                GoalCreated {
+                    created_at: u,
+                    position: p,
+                    id: a,
                 },
-            ),
+                GoalCreated {
+                    created_at: v,
+                    position: q,
+                    id: b,
+                },
+            ) => bytes(u, v).then(p.cmp(q)).then_with(|| bytes(a, b)),
             _ => Ordering::Equal,
-        };
-        let primary = if matches!(self.filter, Filter::Goals { .. }) && self.sort != Sort::Id {
-            primary.then(a.position.cmp(&b.position))
-        } else {
-            primary
-        };
-        primary.then_with(|| a.entity.id().as_bytes().cmp(b.entity.id().as_bytes()))
+        }
     }
 }
 fn rank(status: GoalStatus) -> usize {
@@ -886,22 +990,61 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
     /// takes part in the total order, and no record escapes if any candidate is
     /// corrupt. The composition owner binds the saved anchor to its project,
     /// filter and sort in the public cursor.
+    /// The anchor is a record that must still match the filter; a page that
+    /// resumes after a recorded ordering tuple is [`Self::select_after`].
     pub(super) fn select(
         &self,
         query: NativeSelection<'_>,
         after: Option<&Record>,
         limit: usize,
     ) -> NativeResult<NativePage> {
+        let family = self.check(&query, limit)?;
+        let key = match after {
+            Some(anchor) => {
+                if Family::of(&anchor.entity)? != family || !query.matches(anchor) {
+                    return Err(StoreError::InvalidCursor.into());
+                }
+                Some(query.key_of(anchor).ok_or(StoreError::InvalidCursor)?)
+            }
+            None => None,
+        };
+        self.page(&query, family, key.as_ref(), limit)
+    }
+    /// The same page, resumed after the ordering tuple a cursor recorded. Rows
+    /// are hydrated and filtered in this selecting transaction, and the first
+    /// row returned is the first that sorts after `after` on the original
+    /// bytes. The tuple names a place, not a row: the row it came from may be
+    /// deleted, changed or no longer match the filter, and nothing is refused
+    /// for that. A tuple of another shape than the selection's is
+    /// `InvalidCursor`. Binding the cursor and holding the tuple are the
+    /// composition owner's.
+    pub(super) fn select_after(
+        &self,
+        query: NativeSelection<'_>,
+        after: Option<&OrderKey<'_>>,
+        limit: usize,
+    ) -> NativeResult<NativePage> {
+        let family = self.check(&query, limit)?;
+        if after.is_some_and(|key| key.shape() != query.shape()) {
+            return Err(StoreError::InvalidCursor.into());
+        }
+        self.page(&query, family, after, limit)
+    }
+    fn check(&self, query: &NativeSelection<'_>, limit: usize) -> NativeResult<Family> {
         self.ensure_committable()?;
         let family = query.family()?;
         if !(1..=1000).contains(&limit) {
             return Err(StoreError::InvalidPage("limit must be 1..=1000".into()).into());
         }
-        if let Some(anchor) = after
-            && (Family::of(&anchor.entity)? != family || !query.matches(anchor))
-        {
-            return Err(StoreError::InvalidCursor.into());
-        }
+        Ok(family)
+    }
+    fn page(
+        &self,
+        query: &NativeSelection<'_>,
+        family: Family,
+        after: Option<&OrderKey<'_>>,
+        limit: usize,
+    ) -> NativeResult<NativePage> {
         let id = family.identity();
         let mut stmt = self.tx.prepare(&format!(
             "SELECT {id}_form,{id} FROM {} WHERE project_id=?1",
@@ -940,7 +1083,11 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
         records.sort_by(|a, b| query.compare(a, b));
         let total = records.len() as u64;
         let mut remaining = records.into_iter().filter(|row| {
-            after.is_none_or(|anchor| query.compare(row, anchor) == Ordering::Greater)
+            after.is_none_or(|key| {
+                query
+                    .key_of(row)
+                    .is_some_and(|row| row.cmp_key(key) == Ordering::Greater)
+            })
         });
         let items = remaining.by_ref().take(limit).collect();
         let has_more = remaining.next().is_some();
@@ -1356,6 +1503,8 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
 
 #[cfg(test)]
 mod driver_regression;
+#[cfg(test)]
+mod key_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
