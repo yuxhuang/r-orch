@@ -1728,10 +1728,10 @@ write and read every row through each of their time slots. The Context and Goal 
 both families, with each optional time present and absent, by a `create` and by an `update` that starts from the opposite
 optional state (84 rows at this writing, so 672 stored records). It checks the SQLite storage class of every time column
 after each write; then, in a new transaction, that the entity reads back equal, with the original text and the absent
-optional fields; then, for each time column of each record, three damages in turn (a wrong integer, an integer where
-NULL belongs, a NULL where an integer belongs), each of which `get` refuses as `Corrupt` with check `projection` and the
-column as its locator. A read compares each stored column with this derivation, so
-a row whose column came from a wider spelling reads as stored-data damage. No released version writes one, because 1.0
+optional fields; then, for each time column of each record, the damages that apply to it, each in turn (where the
+column holds an integer, a wrong integer and a NULL; where it holds NULL, an integer), each of which `get` refuses as
+`Corrupt` with check `projection` and the column as its locator. A read compares each stored column with this derivation,
+so a row whose column came from a wider spelling reads as stored-data damage. No released version writes one, because 1.0
 has no SQLite backend and these mappings are not constructed outside the crate's SQLite module; a development database
 that a build from before this rule wrote can hold one, and this rule adds no migration for it.
 
