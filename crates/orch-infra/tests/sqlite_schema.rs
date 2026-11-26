@@ -1079,6 +1079,13 @@ fn message_family_extends_only_the_existing_entity_checks() {
         )
         .unwrap();
     assert!(partial);
+    let pending_index = ddl(&conn, "messages_pending");
+    assert_eq!(
+        pending_index
+            .split_once(" WHERE ")
+            .map(|(_, predicate)| predicate),
+        Some("status = 'pending'")
+    );
     let indexes:Vec<(String,i64)> = conn.prepare("SELECT name,desc FROM pragma_index_xinfo('messages_pending') WHERE key=1 ORDER BY seqno").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
     assert_eq!(
         indexes,
