@@ -94,9 +94,7 @@ pub fn apply_migrations(
     // Refuse a known-lossy predecessor before any intermediate migration or
     // checked copy. Keep the hook too: it is the migration's transactional guard.
     if version > 0 && steps.iter().skip(version).any(|step| *step == TASK_FORMAT) {
-        refuse_lossy_tasks(conn).map_err(|error| {
-            SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
-        })?;
+        refuse_lossy_tasks(conn).map_err(preflight_error)?;
     }
     if version > 0
         && steps
@@ -104,9 +102,7 @@ pub fn apply_migrations(
             .skip(version)
             .any(|step| *step == AGENT_TEAM_RUN)
     {
-        refuse_lossy_entities(conn).map_err(|error| {
-            SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
-        })?;
+        refuse_lossy_entities(conn).map_err(preflight_error)?;
     }
     if version > 0
         && steps
@@ -114,9 +110,7 @@ pub fn apply_migrations(
             .skip(version)
             .any(|step| *step == CONTEXT_CONFIG_TEMPLATE_GOAL)
     {
-        refuse_lossy_settings(conn).map_err(|error| {
-            SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
-        })?;
+        refuse_lossy_settings(conn).map_err(preflight_error)?;
     }
     if version > 0
         && steps
@@ -124,9 +118,7 @@ pub fn apply_migrations(
             .skip(version)
             .any(|step| *step == MESSAGE_FORMAT)
     {
-        refuse_lossy_messages(conn).map_err(|error| {
-            SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
-        })?;
+        refuse_lossy_messages(conn).map_err(preflight_error)?;
     }
     let holds_project = version > 0
         && conn.query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |r| r.get(0))? > 0;
@@ -197,6 +189,16 @@ pub fn apply_migrations(
         tracing::warn!(%error, "could not prune old pre-migration copies after migration committed");
     }
     Ok(())
+}
+
+/// A preflight statement failure keeps its typed SQLite error, so `classify` sees
+/// SQLITE_CORRUPT, SQLITE_NOTADB or SQLITE_BUSY. Only the intentional row refusal
+/// is a `Migration` message: stringifying a statement failure would erase its code.
+fn preflight_error(error: rusqlite_migration::HookError) -> SqliteError {
+    match error {
+        rusqlite_migration::HookError::RusqliteError(error) => SqliteError::Sql(error),
+        refusal => SqliteError::Migration(rusqlite_migration::Error::from(refusal).to_string()),
+    }
 }
 
 // No predecessor task can recover ordered duplicates, absent lists, workspace
@@ -708,6 +710,11 @@ mod tests {
                     matches!(&error, rusqlite_migration::HookError::Hook(message) if message.contains("sibling copy differs: entity_details")),
                     "{error:?}"
                 );
+            } else {
+                assert!(
+                    matches!(&error, rusqlite_migration::HookError::RusqliteError(rusqlite::Error::SqliteFailure(_, Some(message))) if message.contains("missing_message_migration_table")),
+                    "{error:?}"
+                );
             }
             tx.rollback().unwrap();
             assert_eq!(
@@ -726,5 +733,124 @@ mod tests {
                 "{}"
             );
         }
+    }
+
+    #[test]
+    fn message_format_preflight_statement_error_keeps_its_sqlite_category() {
+        let steps = [
+            INITIAL_SCHEMA,
+            ATTENTION_FACTS,
+            TASK_FORMAT,
+            AGENT_TEAM_RUN,
+            CONTEXT_CONFIG_TEMPLATE_GOAL,
+            MESSAGE_FORMAT,
+        ];
+        for version in [1, 5] {
+            let (_tmp, data) = test_data();
+            let mut conn =
+                open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+            apply_migrations(&data, &mut conn, &steps[..version], plenty()).unwrap();
+            conn.execute_batch("DROP TABLE messages").unwrap();
+            let error = apply_migrations(&data, &mut conn, &steps, plenty()).unwrap_err();
+            assert!(
+                matches!(&error, SqliteError::Sql(rusqlite::Error::SqliteFailure(code, _)) if code.extended_code == rusqlite::ffi::SQLITE_ERROR),
+                "v{version} preflight lost its SQLite category: {error:?}"
+            );
+            assert_eq!(
+                classify(&error).leaves(),
+                &[(Role::Operation, Class::Transient)]
+            );
+            assert_eq!(
+                conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                version as i64
+            );
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM schema_migrations", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                version as i64
+            );
+            assert!(
+                data.root()
+                    .open_dir("backups")
+                    .unwrap()
+                    .list()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn message_registry_late_ledger_failure_rolls_back_copied_rows_and_ddl() {
+        let (_tmp, data) = test_data();
+        let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        let steps = [
+            INITIAL_SCHEMA,
+            ATTENTION_FACTS,
+            TASK_FORMAT,
+            AGENT_TEAM_RUN,
+            CONTEXT_CONFIG_TEMPLATE_GOAL,
+            MESSAGE_FORMAT,
+        ];
+        apply_migrations(&data, &mut conn, &steps[..5], plenty()).unwrap();
+        conn.execute(
+            "INSERT INTO entity_details VALUES('p','agent',0,'a',1,'{}',2,?1)",
+            ["0".repeat(64)],
+        )
+        .unwrap();
+        // The ledger is appended after the real hook copies and replaces both
+        // sibling tables. Refuse that final statement through SQLite itself.
+        conn.execute_batch("CREATE TRIGGER refuse_message_ledger BEFORE INSERT ON schema_migrations WHEN NEW.version=6 BEGIN SELECT RAISE(ABORT,'synthetic_message_ledger_failure'); END;").unwrap();
+        let schema: String = conn
+            .query_row(
+                "SELECT group_concat(sql) FROM (SELECT sql FROM sqlite_schema ORDER BY name)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let error = apply_migrations(&data, &mut conn, &steps, plenty()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("synthetic_message_ledger_failure"),
+            "{error:?}"
+        );
+        drop(conn);
+        let conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        assert_eq!(
+            conn.query_row::<String, _, _>(
+                "SELECT group_concat(sql) FROM (SELECT sql FROM sqlite_schema ORDER BY name)",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            schema
+        );
+        assert_eq!(
+            conn.query_row::<String, _, _>("SELECT detail FROM entity_details", [], |r| r.get(0))
+                .unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>("SELECT count(*) FROM schema_migrations", [], |r| r.get(0))
+                .unwrap(),
+            5
+        );
+        assert_eq!(
+            conn.query_row::<i64, _, _>(
+                "SELECT count(*) FROM sqlite_schema WHERE name LIKE '%_message'",
+                [],
+                |r| r.get(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 }

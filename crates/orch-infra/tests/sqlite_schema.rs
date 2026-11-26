@@ -1071,6 +1071,14 @@ fn message_family_extends_only_the_existing_entity_checks() {
                 .unwrap();
         }
     }
+    let partial: bool = conn
+        .query_row(
+            "SELECT partial FROM pragma_index_list('messages') WHERE name='messages_pending'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(partial);
     let indexes:Vec<(String,i64)> = conn.prepare("SELECT name,desc FROM pragma_index_xinfo('messages_pending') WHERE key=1 ORDER BY seqno").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<Result<_,_>>().unwrap();
     assert_eq!(
         indexes,
@@ -1117,6 +1125,18 @@ fn message_native_quartets_enforce_r97_bytes_presence_and_identity_forms() {
         );
         let projection = if field == "id" { hash.as_str() } else { "" };
         probe_update(&conn, &indirect, &[&projection, &hash, &65537], true);
+        let mismatch = if field == "id" {
+            "b".repeat(64)
+        } else {
+            "x".into()
+        };
+        probe_update(&conn, &indirect, &[&mismatch, &hash, &65537], false);
+        probe_update(
+            &conn,
+            &indirect,
+            &[&Option::<String>::None, &hash, &65537],
+            false,
+        );
         probe_update(&conn, &indirect, &[&projection, &hash, &65536], false);
         for bad in [
             format!("{}\0", "a".repeat(63)),
