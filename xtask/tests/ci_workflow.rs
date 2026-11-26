@@ -152,8 +152,8 @@ fn contract(ci: &str) {
     );
     assert!(check.contains("test -s Cargo.lock"));
     assert!(check.contains("! grep -qE '^name = \"(terminfo|termwiz)\"$' Cargo.lock"));
-    assert!(test.contains("timeout-minutes: 40"));
-    assert!(ambient.contains("timeout-minutes: 40"));
+    assert!(test.contains("timeout-minutes: 50"));
+    assert!(ambient.contains("timeout-minutes: 50"));
     // Event data belongs in env, never in shell source.
     for body in ci.split("        run: |\n").skip(1) {
         for line in body
@@ -299,7 +299,7 @@ fn workflow_mutants_are_discriminated() {
     contract(CI);
     for name in ["test", "ambient"] {
         let original = job(CI, name);
-        let changed = original.replacen("timeout-minutes: 40", "timeout-minutes: 30", 1);
+        let changed = original.replacen("timeout-minutes: 50", "timeout-minutes: 30", 1);
         assert_ne!(original, changed);
         let mutant = CI.replacen(original, &changed, 1);
         assert!(
