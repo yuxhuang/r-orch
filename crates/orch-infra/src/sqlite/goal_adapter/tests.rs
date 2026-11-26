@@ -523,6 +523,11 @@ fn ended_transaction_is_aborted(later_operation: bool) {
     });
 }
 
+// Pre-R140 observation scaffolding, not the composed Storage contract. This
+// private helper currently permits a callback to catch EntityCorrupt and commit.
+// Before composition/activation, every NativeError must be observed at its source:
+// caught logical corruption must latch failure and abort the whole transaction.
+// The composition and #127/R140 owners track that blocking precondition.
 #[test]
 fn a_drifted_projection_does_not_partially_move_a_goal() {
     let (_temp, data) = test_data();
@@ -650,4 +655,220 @@ fn damaged_position_counters_are_typed_and_refused_without_mutation() {
             );
         });
     }
+}
+
+// Compare stored values, including detail bytes, ordered chunk memberships, blob
+// registrations and the allocator. A hydrated record alone misses leaked state.
+fn stored_goal_state(tx: &rusqlite::Transaction<'_>) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    [
+        "goals",
+        "entity_details",
+        "entity_blob_refs",
+        "blobs",
+        "counters",
+    ]
+    .into_iter()
+    .map(|table| {
+        let columns = tx
+            .prepare(&format!("SELECT * FROM {table}"))
+            .unwrap()
+            .column_count();
+        let order = (1..=columns)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = tx
+            .prepare(&format!("SELECT * FROM {table} ORDER BY {order}"))
+            .unwrap();
+        stmt.query_map([], |row| (0..columns).map(|i| row.get(i)).collect())
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    })
+    .collect()
+}
+
+#[test]
+fn a_zero_stored_position_is_corruption_instead_of_a_readable_goal() {
+    let (_temp, data) = test_data();
+    setup(&data);
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    std::thread::scope(|scope| {
+        let _close = Close(&handle);
+        scope.spawn(move || writer.run());
+        let adapter = adapter_for(&handle, &pool, &data);
+        adapter
+            .write("p".into(), deadline(), |u| {
+                u.create(goal("damaged"))?;
+                // Zero is allowed by the schema, so this exercises reader validation.
+                assert_eq!(
+                    u.sql
+                        .tx()
+                        .execute("UPDATE goals SET position=0 WHERE id='damaged'", [])?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            adapter.read("p", deadline(), |u| u.get("damaged")),
+            Err(SqliteError::EntityCorrupt {
+                family: "goal",
+                check: "counter",
+                ..
+            })
+        ));
+    });
+}
+
+#[test]
+fn a_zero_surviving_position_refuses_create_and_move_without_mutation() {
+    let (_temp, data) = test_data();
+    setup(&data);
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    std::thread::scope(|scope| {
+        let _close = Close(&handle);
+        scope.spawn(move || writer.run());
+        let adapter = adapter_for(&handle, &pool, &data);
+        adapter
+            .write("p".into(), deadline(), |u| {
+                u.create(goal("damaged"))?;
+                let healthy = u.create(goal("healthy"))?;
+                assert_eq!(
+                    u.sql
+                        .tx()
+                        .execute("UPDATE goals SET position=0 WHERE id='damaged'", [])?,
+                    1
+                );
+                let before = stored_goal_state(u.sql.tx());
+                // Pre-R140 helper seam only; composition must observe caught corruption.
+                for operation in 0..2 {
+                    let result = if operation == 0 {
+                        u.create(goal("refused"))
+                    } else {
+                        u.move_to_end("healthy", healthy.revision)
+                    };
+                    assert!(matches!(
+                        result,
+                        Err(SqliteError::EntityCorrupt {
+                            family: "goal",
+                            check: "counter",
+                            locator,
+                            ..
+                        }) if locator == "position"
+                    ));
+                    assert_eq!(stored_goal_state(u.sql.tx()), before);
+                }
+                assert_eq!(u.get("healthy")?, Some(healthy));
+                Ok(())
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+    });
+}
+
+#[test]
+fn an_unsupported_detail_format_is_corruption_before_detail_is_removed() {
+    let (_temp, data) = test_data();
+    setup(&data);
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    std::thread::scope(|scope| {
+        let _close = Close(&handle);
+        scope.spawn(move || writer.run());
+        let adapter = adapter_for(&handle, &pool, &data);
+        adapter
+            .write("p".into(), deadline(), |u| {
+                u.create(goal("g"))?;
+                assert_eq!(
+                    u.sql
+                        .tx()
+                        .execute("UPDATE entity_details SET format=2 WHERE family='goal'", [])?,
+                    1
+                );
+                Ok(())
+            })
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(matches!(
+            adapter.read("p", deadline(), |u| u.get("g")),
+            Err(SqliteError::EntityCorrupt {
+                family: "goal",
+                check: "detail metadata",
+                ..
+            })
+        ));
+    });
+}
+
+#[test]
+fn a_caught_counter_write_failure_rolls_back_the_move_and_trigger_effects() {
+    caught_savepoint_failure_restores_goal_state(false);
+}
+
+#[test]
+fn a_caught_delete_failure_restores_detail_references_and_trigger_effects() {
+    caught_savepoint_failure_restores_goal_state(true);
+}
+
+fn caught_savepoint_failure_restores_goal_state(delete: bool) {
+    let (_temp, data) = test_data();
+    setup(&data);
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    std::thread::scope(|scope| {
+        let _close = Close(&handle);
+        scope.spawn(move || writer.run());
+        let adapter = adapter_for(&handle, &pool, &data);
+        let (original, next) = adapter.write("p".into(), deadline(), move |u| {
+            u.create(goal("earlier"))?;
+            let original = u.create(Goal { description: "λ".repeat(32_769), ..goal("g") })?;
+            let refs: i64 = u.sql.tx().query_row("SELECT count(*) FROM entity_blob_refs WHERE family='goal' AND entity_key='g'", [], |r| r.get(0))?;
+            assert!(refs > 0, "delete must clear actual indirect references");
+            let trigger = if delete {
+                "CREATE TEMP TRIGGER fail_delete BEFORE DELETE ON goals WHEN OLD.id='g' BEGIN
+                 INSERT INTO counters(project_id,name,value) VALUES('p','trigger-effect',99);
+                 SELECT RAISE(FAIL,'synthetic delete'); END"
+            } else {
+                "CREATE TEMP TRIGGER fail_move BEFORE UPDATE ON counters WHEN OLD.name='position:goal' BEGIN
+                 INSERT INTO counters(project_id,name,value) VALUES('p','trigger-effect',99);
+                 SELECT RAISE(FAIL,'synthetic move'); END"
+            };
+            u.sql.tx().execute_batch(trigger)?;
+            let before = stored_goal_state(u.sql.tx());
+            let error = if delete { u.delete("g", original.revision) }
+                else { u.move_to_end("g", original.revision).map(|_| ()) }.unwrap_err();
+            assert!(matches!(error, SqliteError::Sql(rusqlite::Error::SqliteFailure(ref e, _))
+                if e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER), "{error:?}");
+            // FAIL preserves trigger writes unless the operation rolls back its
+            // savepoint. Delete has already cleared detail/refs; move has already
+            // updated revision/position before its counter write fails.
+            assert_eq!(stored_goal_state(u.sql.tx()), before);
+            assert_eq!(u.get("g")?, Some(original.clone()));
+            u.sql.tx().execute_batch(if delete { "DROP TRIGGER fail_delete" } else { "DROP TRIGGER fail_move" })?;
+            let next = u.create(goal("after"))?;
+            assert_eq!(next.position, 3);
+            Ok((original, next))
+        }).unwrap().wait().unwrap();
+        adapter
+            .read("p", deadline(), |u| {
+                assert_eq!(u.get("g")?, Some(original));
+                assert!(u.get("earlier")?.is_some());
+                assert_eq!(u.get("after")?, Some(next));
+                let effects: i64 = u.sql.tx().query_row(
+                    "SELECT count(*) FROM counters WHERE name='trigger-effect'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                assert_eq!(effects, 0);
+                Ok(())
+            })
+            .unwrap();
+    });
 }
