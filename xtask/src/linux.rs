@@ -814,7 +814,7 @@ mod tests {
     /// qualified platform before 2.0 (AGENTS.md rule 10). These are exact
     /// lines: a new CI-only command is still caught.
     const MIRROR_RUNNER_LINES: &[&str] = &[
-        "cargo install cargo-nextest --locked --version 0.9.152 --target-dir \"$RUNNER_TEMP/nextest-install\"",
+        "cargo install cargo-nextest --locked --version 0.9.152 --target-dir \"$RUNNER_TEMP/nextest-install\" --root \"$HOME/.nextest-bin\"",
         "cargo nextest run --profile default --workspace --no-fail-fast --no-tests fail",
         "cargo nextest run --profile alone --workspace --no-fail-fast --no-tests fail",
         "cargo test --workspace --doc --no-fail-fast",
