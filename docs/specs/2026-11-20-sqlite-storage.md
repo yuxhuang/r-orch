@@ -1446,7 +1446,7 @@ format" says what it was and was not checked against), and migration 004, which 
 of migration 004"). Migration 004 creates `entity_details` and `entity_blob_refs` and rebuilds the five tables of
 difference 10, empty. That sentence is older than the private native adapter and selector for those three families that
 reached `main` afterwards (PRs 284, 288 and 296, no `Storage` method); this text and R142 are not yet reconciled with
-them (pending: a tracked follow-up task). For Context, Config, Template and Goal the implementation was first drafted as three stacked pull requests (PRs 314, 317 and 318, carried forward, repaired, by successor pull requests) and is proposed to land as two squashes, neither merged yet: migration 005 (PR 323) and one combined driver and goal-adapter pull request (PR 338, about 4,900 changed lines, within the limit of about 5,000; the plan's "T10 entity format", step 4, gives the size and the reason, and PRs 314, 317, 318, 324 and 326 are kept open as history, not to be merged). The three layers are:
+them (pending: a tracked follow-up task). For Context, Config, Template and Goal the implementation was first drafted as three stacked pull requests (PRs 314, 317 and 318, carried forward, repaired, by successor pull requests) and landed as two squashes on 2026-11-26: migration 005 (PR 323, `452e6f622`) and one combined driver and goal-adapter pull request (PR 338, `7aaaff7b2`, 4,899 changed lines, within the limit of about 5,000; the plan's "T10 entity format", step 4, gives the size and the reason; PRs 314, 317 and 318 stay open as history, not to be merged, and PRs 324 and 326 were closed unmerged). The three layers are:
 migration 005, which rebuilds the four tables of difference 11
 and creates no table ("Physical schema of migration 005"); a crate-private native driver,
 `crates/orch-infra/src/sqlite/cctg`, which creates, reads, updates, moves, deletes and pages those four families in this
@@ -2178,20 +2178,31 @@ the schema (`runs.prompt_sha256` equal to that tag's hash, and the size check of
 waited for the migration owner, whose confirmation is the status above.
 
 **Derived from migration 005 and the driver, to be confirmed.** Status: stated by the implementation's author in its handoff
-(2026-11-25) and checked by the writer of this text against the code of the repaired stack: PR 314's successor (PR 323) ends at `2d1b9eb30`, PR 317's successor (PR 324) at `5c5ff9922` and PR 318's source head at `e45545321` (branch `feature/sqlite-goal-adapter-repaired-public`; its successor, PR 326, is at `d818a4f97` and differs from it in the plan and the spec only, and PR 338 replaces PRs 324 and 326 with the same code), and the stack's documentation commit changes no code; the migration owner has not confirmed any item, and no review of the repaired heads has accepted the code. (1) The work is proposed to land as two
-pull requests, not one, neither merged yet: migration 005 (PR 323) and one combined driver and goal-adapter pull request
-(PR 338). The whole repaired change is 5,623 changed lines (19 files, +4,447/-1,176, at PR 338's first head), over the limit of about 5,000,
+(2026-11-25) and checked by the writer of this text against the code of the repaired stack: PR 314's successor (PR 323) ends at `2d1b9eb30`, PR 317's successor (PR 324) at `5c5ff9922` and PR 318's source head at `e45545321` (branch `feature/sqlite-goal-adapter-repaired-public`; its successor, PR 326, is at `d818a4f97` and differs from it in the plan and the spec only, and PR 338 replaces PRs 324 and 326 with the same code), and the stack's documentation commit changes no code; the migration owner has not confirmed any item, and no review of the repaired heads has accepted the code. (1) The work landed as two
+pull requests, not one, squashed on 2026-11-26: migration 005 (PR 323, `452e6f622`) and one combined driver and goal-adapter pull request
+(PR 338, `7aaaff7b2`). The whole repaired change is 5,623 changed lines (19 files, +4,447/-1,176, at PR 338's first head), over the limit of about 5,000,
 and PR 338 alone is about 4,900, within it (12 files, +3,725/-1,164 at its first head). It was first drafted as three
 pull requests (PRs 314, 317 and 318, 4,785 changed lines together).
 PR 323 (the migration) depends on no driver code, so the owner of the Message migration can build on 005 without
 waiting. The driver (which needs 005's tables) and the goal adapter (which needs the driver) are a true code stack, but
 under single-parent squash merges they cannot land as two squashes, because the upper one re-adds the driver files
 that the lower one added, and the driver's integrity tests must land with the implementation they check; so they are
-one pull request. PRs 314, 317, 318, 324 and 326 are kept open as history, not to be merged. (2) `goals.created_at_text` carries a temporary `DEFAULT ''` (see "Physical schema of migration
+one pull request. PRs 314, 317 and 318 stay open as history, not to be merged, and PRs 324 and 326 were closed unmerged. (2) `goals.created_at_text` carries a temporary `DEFAULT ''` (see "Physical schema of migration
 005"). (3) No `Principal` carries an authoritative agent binding, so `set_by_agent_id` is only ever preserved (see
-"Context provenance"). (4) A native time column is NULL unless
-the original string is an instant of whole milliseconds, as "Time and unsigned integers" says; the original string stays
-the authority. The range of that paragraph is enforced at both ends: the lower bound `0000-01-01T00:00:00.000Z` (`-62167219200000`) by a check in the driver's time helper and in that of the landed Agent, Team and Run adapter, which PR 314's layer therefore also changes, and the upper end by the parser's own ceiling. A parseable expanded negative year such as `-000001-12-31T23:59:59.999Z` projects NULL, and its original text stays the authority (`native_time_projection_is_bounded_below_by_year_zero` and `native_run_time_column_is_null_below_year_zero_and_text_stays_authoritative` in `sqlite::agent_team_run`, and the five added cases of `opaque_and_equivalent_instant_times_are_kept_and_project_only_when_exact`). (5) A page of one of the four families hydrates the whole family and sorts in Rust (see "Order, filters and
+"Context provenance"). (4) A native time column of the four families is
+NULL unless the original string is an instant of whole milliseconds that the driver's own time helper (`time` in
+`cctg/mod.rs`) accepts; the original string stays the authority. That helper parses with `jiff::Timestamp`. It does not
+follow the RFC 3339 rule of "Time and unsigned integers" (`rfc3339_millis`, "What is an RFC 3339 `date-time` (issue
+335)"), so it also projects the spellings that rule leaves NULL (a space separator, no seconds, an offset without a
+colon, and a leap second folded onto `:59`; checked with `jiff` 0.2.38), and issue 341 tracks its adoption of that
+function ("Which families follow it"). Its range is the one of that paragraph, enforced at both ends: the lower bound
+`0000-01-01T00:00:00.000Z` (`-62167219200000`) by a check in the helper (`TIME_MIN_MS`), and the upper end
+`9999-12-30T22:00:00.999Z` by the ceiling of the parser. The Agent, Team and Run adapter has no helper of its own: it
+calls `rfc3339_millis`, which applies the grammar and the range itself. A parseable expanded negative year such as
+`-000001-12-31T23:59:59.999Z` projects NULL in both, and its original text stays the authority (the driver:
+`opaque_and_equivalent_instant_times_are_kept_and_project_only_when_exact` in `sqlite::cctg`; the adapter:
+`native_time_projection_is_bounded_below_by_year_zero` and
+`native_run_time_column_is_null_below_year_zero_and_text_stays_authoritative` in `sqlite::agent_team_run`). (5) A page of one of the four families hydrates the whole family and sorts in Rust (see "Order, filters and
 cursors"). (6) The driver is tested by unit tests inside the library, because it is crate-private (R143). (7) The
 migration refuses every populated predecessor of the four tables, as "Migrations and compatibility" says, and its
 guard is the registry's atomic one of 003 and 004. (8) Blob garbage collection reaching `entity_blob_refs` stays T15's
