@@ -9,6 +9,7 @@ use super::{MessageReader, MessageSelection, Messages};
 use crate::blob::{BlobHash, DiskBlobStore};
 use crate::sqlite::{SqliteError, migrations, test_data};
 
+mod boundaries;
 mod damage;
 mod large;
 mod pages;
