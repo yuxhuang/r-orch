@@ -12,7 +12,8 @@ use sha2::{Digest, Sha256};
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
-pub const SCHEMA_VERSION: usize = 5;
+pub const SCHEMA_VERSION: usize = 6;
+pub const MESSAGE_FORMAT: &str = include_str!("migrations/006_message_format.sql");
 pub const CONTEXT_CONFIG_TEMPLATE_GOAL: &str =
     include_str!("migrations/005_context_config_template_goal.sql");
 pub const AGENT_TEAM_RUN: &str = include_str!("migrations/004_agent_team_run.sql");
@@ -52,6 +53,7 @@ pub fn migrate(data: &DataDir, conn: &mut ConnectionHandle<'_>) -> Result<()> {
             TASK_FORMAT,
             AGENT_TEAM_RUN,
             CONTEXT_CONFIG_TEMPLATE_GOAL,
+            MESSAGE_FORMAT,
         ],
         DiskSpace::read(data)?,
     )
@@ -116,6 +118,16 @@ pub fn apply_migrations(
             SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
         })?;
     }
+    if version > 0
+        && steps
+            .iter()
+            .skip(version)
+            .any(|step| *step == MESSAGE_FORMAT)
+    {
+        refuse_lossy_messages(conn).map_err(|error| {
+            SqliteError::Migration(rusqlite_migration::Error::from(error).to_string())
+        })?;
+    }
     let holds_project = version > 0
         && conn.query_row::<i64, _, _>("SELECT count(*) FROM projects", [], |r| r.get(0))? > 0;
     if holds_project {
@@ -161,6 +173,12 @@ pub fn apply_migrations(
                         refuse_lossy_settings(tx)?;
                         tx.execute_batch(&sql)?;
                         Ok(())
+                    })
+                } else if *step == MESSAGE_FORMAT {
+                    let sql = sql.clone();
+                    M::up_with_hook("", move |tx: &rusqlite::Transaction<'_>| {
+                        refuse_lossy_messages(tx)?;
+                        apply_message_format(tx, &sql)
                     })
                 } else {
                     M::up(sql)
@@ -251,6 +269,54 @@ fn refuse_lossy_settings(conn: &Connection) -> rusqlite_migration::HookResult {
             "settings entity format v1 refuses ambiguous predecessor rows: {summary}"
         )));
     }
+    Ok(())
+}
+
+fn refuse_lossy_messages(conn: &Connection) -> rusqlite_migration::HookResult {
+    let count: i64 = conn.query_row("SELECT count(*) FROM messages", [], |r| r.get(0))?;
+    if count != 0 {
+        return Err(rusqlite_migration::HookError::Hook(format!(
+            "message entity format v1 refuses ambiguous predecessor rows: messages={count}"
+        )));
+    }
+    Ok(())
+}
+
+fn apply_message_format(conn: &Connection, sql: &str) -> rusqlite_migration::HookResult {
+    let (create, replace) = sql
+        .split_once("-- Copy sibling rows here, inside the registry hook, before any DROP.")
+        .expect("shipped Message migration has a copy boundary");
+    conn.execute_batch(create)?;
+    for (table, order) in [
+        ("entity_details", "project_id,family,key_form,entity_key"),
+        (
+            "entity_blob_refs",
+            "project_id,family,key_form,entity_key,locator,ordinal",
+        ),
+    ] {
+        let mut copied = 0i64;
+        loop {
+            // The source cannot change inside this transaction. Each statement
+            // copies at most 256 rows without materializing their text in Rust.
+            let mut copy = conn.prepare(&format!("INSERT INTO {table}_message SELECT * FROM {table} ORDER BY {order} LIMIT 256 OFFSET ?1"))?;
+            copy.raw_bind_parameter(1, copied)?;
+            let count = copy.raw_execute()?;
+            copied += count as i64;
+            if count < 256 {
+                break;
+            }
+        }
+        let equal: bool = conn.query_row(
+            &format!("SELECT (SELECT count(*) FROM {table}) = (SELECT count(*) FROM {table}_message) AND NOT EXISTS (SELECT * FROM {table} EXCEPT SELECT * FROM {table}_message) AND NOT EXISTS (SELECT * FROM {table}_message EXCEPT SELECT * FROM {table})"),
+            [], |r| r.get(0),
+        )?;
+        if !equal {
+            return Err(rusqlite_migration::HookError::Hook(format!(
+                "message entity format v1 sibling copy differs: {table}"
+            )));
+        }
+    }
+    conn.execute_batch(replace)?;
     Ok(())
 }
 
@@ -476,5 +542,65 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn message_copy_verification_and_late_sql_failure_roll_back_the_rebuild() {
+        for corrupt in [true, false] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            for sql in [
+                INITIAL_SCHEMA,
+                ATTENTION_FACTS,
+                TASK_FORMAT,
+                AGENT_TEAM_RUN,
+                CONTEXT_CONFIG_TEMPLATE_GOAL,
+            ] {
+                conn.execute_batch(sql).unwrap();
+            }
+            conn.execute(
+                "INSERT INTO entity_details VALUES('p','agent',0,'a',1,'{}',2,?1)",
+                ["0".repeat(64)],
+            )
+            .unwrap();
+            let schema: String = conn
+                .query_row(
+                    "SELECT group_concat(sql) FROM (SELECT sql FROM sqlite_schema ORDER BY name)",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let sql = if corrupt {
+                MESSAGE_FORMAT.replace("-- Copy sibling rows here", "CREATE TRIGGER damage_copy AFTER INSERT ON entity_details_message BEGIN UPDATE entity_details_message SET detail='[]'; END;\n-- Copy sibling rows here")
+            } else {
+                MESSAGE_FORMAT.replace(
+                    "DROP TABLE messages;",
+                    "SELECT * FROM missing_message_migration_table; DROP TABLE messages;",
+                )
+            };
+            let tx = conn.transaction().unwrap();
+            let error = apply_message_format(&tx, &sql).unwrap_err();
+            if corrupt {
+                assert!(
+                    matches!(&error, rusqlite_migration::HookError::Hook(message) if message.contains("sibling copy differs: entity_details")),
+                    "{error:?}"
+                );
+            }
+            tx.rollback().unwrap();
+            assert_eq!(
+                conn.query_row::<String, _, _>(
+                    "SELECT group_concat(sql) FROM (SELECT sql FROM sqlite_schema ORDER BY name)",
+                    [],
+                    |r| r.get(0)
+                )
+                .unwrap(),
+                schema
+            );
+            assert_eq!(
+                conn.query_row::<String, _, _>("SELECT detail FROM entity_details", [], |r| r
+                    .get(0))
+                    .unwrap(),
+                "{}"
+            );
+        }
     }
 }
