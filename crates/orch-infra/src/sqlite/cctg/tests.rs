@@ -1066,7 +1066,7 @@ fn a_text_over_one_object_is_ordered_chunks_with_a_whole_hash_and_repeats() {
                 .unwrap();
             tx.execute("UPDATE entity_blob_refs SET ordinal=CASE ordinal WHEN 100 THEN 1 WHEN 101 THEN 0 ELSE 2 END", []).unwrap();
         } else {
-            tx.execute(damage, []).unwrap();
+            tx.execute_batch(damage).unwrap();
         }
         let error = db.get(Family::Template, "big").unwrap_err();
         assert!(
@@ -1094,7 +1094,7 @@ fn a_text_over_one_object_is_ordered_chunks_with_a_whole_hash_and_repeats() {
         ("DELETE FROM entity_blob_refs".into(), "reference metadata"),
     ] {
         tx.execute_batch("SAVEPOINT damage").unwrap();
-        tx.execute(&damage, []).unwrap();
+        tx.execute_batch(&damage).unwrap();
         assert_eq!(corrupt(db.get(Family::Template, "big").unwrap_err()).0, check, "{damage}");
         tx.execute_batch("ROLLBACK TO damage; RELEASE damage").unwrap();
     }
@@ -1154,7 +1154,7 @@ fn projection_drift_in_each_column_is_a_stored_data_error() {
                 )
             };
             tx.execute_batch("SAVEPOINT d").unwrap();
-            tx.execute(&drift, []).unwrap();
+            tx.execute_batch(&drift).unwrap();
             let error = sql(&tx, &disk, &who).get(family, "k").unwrap_err();
             let (check, locator) = corrupt(error);
             assert_eq!(
@@ -1178,8 +1178,8 @@ fn projection_drift_in_each_column_is_a_stored_data_error() {
         }
         // Counters and identity cannot be repaired by the reader either.
         tx.execute_batch("SAVEPOINT d").unwrap();
-        tx.execute(&format!("UPDATE {} SET revision=0", family.table()), [])
-            .unwrap_or(0);
+        tx.execute_batch(&format!("UPDATE {} SET revision=0", family.table()))
+            .unwrap_or(());
         tx.execute_batch("ROLLBACK TO d; RELEASE d").unwrap();
         assert!(sql(&tx, &disk, &who).get(family, "k").unwrap().is_some());
     }
@@ -1295,10 +1295,11 @@ fn revision_races_and_exhausted_counters_refuse_before_any_change() {
         ));
         assert_eq!(db.get(family, "k").unwrap().unwrap(), winner);
         // The signed column bound: the next revision or position would not fit.
-        tx.execute(
-            &format!("UPDATE {} SET revision=?1", family.table()),
-            [i64::MAX],
-        )
+        tx.execute_batch(&format!(
+            "UPDATE {} SET revision={}",
+            family.table(),
+            i64::MAX
+        ))
         .unwrap();
         let max: Revision = serde_json::from_value(i64::MAX.into()).unwrap();
         for op in 0..3 {
@@ -1336,30 +1337,33 @@ fn damaged_counters_and_orphan_rows_are_refused_without_mutation() {
         db.create(entity(family, "a", "1")).unwrap();
         db.create(entity(family, "b", "1")).unwrap();
         let counter = |db: &mut NativeSql<'_, '_>| db.create(entity(family, "c", "x")).unwrap_err();
-        let set = |sql: &str, value: Option<i64>| {
+        let set = |value: Option<i64>| {
             tx.execute(
                 "DELETE FROM counters WHERE project_id='p' AND name=?1",
                 [family.counter()],
             )
             .unwrap();
             if let Some(value) = value {
-                tx.execute(sql, params![family.counter(), value]).unwrap();
+                tx.execute_batch(&format!(
+                    "INSERT INTO counters(project_id,name,value) VALUES('p','{}',{value})",
+                    family.counter()
+                ))
+                .unwrap();
             }
         };
-        let insert = "INSERT INTO counters(project_id,name,value) VALUES('p',?1,?2)";
-        set(insert, None);
+        set(None);
         assert!(
             matches!(counter(&mut db), NativeError::Counter(e) if matches!(*e, crate::sqlite::SqliteError::CounterMissing { .. }))
         );
-        set(insert, Some(-1));
+        set(Some(-1));
         assert!(
             matches!(counter(&mut db), NativeError::Counter(e) if matches!(*e, crate::sqlite::SqliteError::CounterNegative { .. }))
         );
-        set(insert, Some(1));
+        set(Some(1));
         assert!(
             matches!(counter(&mut db), NativeError::Counter(e) if matches!(*e, crate::sqlite::SqliteError::CounterBehind { .. }))
         );
-        set(insert, Some(2));
+        set(Some(2));
         assert!(db.get(family, "c").unwrap().is_none());
         // A stale detail row without a native row is not adopted by a new entity.
         let orphan = entity(family, "ghost", "x");
