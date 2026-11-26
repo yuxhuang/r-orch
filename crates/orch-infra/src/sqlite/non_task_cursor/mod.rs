@@ -18,13 +18,18 @@
 //! - [`Tuple`] is the original ordering tuple, built from the row's original
 //!   values (the goal's absent `updated_at` is presence 1 and an empty text).
 //!   [`Tuple::size`] is the spec's *S* in UTF-8 bytes, [`Layout::arm`] the arm that
-//!   *S* selects, and [`Layout::inline_capacity`] the capacity table.
+//!   *S* selects, and [`Layout::inline_capacity`] the capacity table. A tuple
+//!   does not remember its layout: [`Layout::admits`] says whether values have
+//!   the shape and ranges of one, and [`NonTaskCursors::issue_inline`] refuses a
+//!   tuple that its request's layout does not admit.
 //! - [`NonTaskCursors::binding`] is the 16-byte digest that every kind of token
 //!   carries; [`NonTaskCursors::sort_tag`] is the byte that says the sort. A
 //!   held token (retained or by lookup) is the same header, with
 //!   `RETAINED` or `LOOKUP` as its version (2 and 3, reserved), followed by the
 //!   adapter's nonce and a handle. This module refuses those versions until step 4
-//!   reads them.
+//!   reads them. [`NonTaskCursors::resume_inline`] refuses a token of more than 512
+//!   characters before decoding it, because a deserialized `Cursor` is not bounded
+//!   by its constructor; the page that calls it still validates the request.
 //! - [`INLINE_TTL_MS`] and [`INLINE_SKEW_MS`] are the owner's inline clock rule.
 mod layout;
 mod token;

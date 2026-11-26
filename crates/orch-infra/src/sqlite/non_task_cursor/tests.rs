@@ -387,6 +387,126 @@ fn the_order_is_the_one_the_leaves_compare_by() {
     assert_eq!(teams.compare(&n("é"), &n("f")), Ordering::Greater);
 }
 
+fn n(value: i64) -> Component {
+    Component::Int(value)
+}
+fn s(value: &str) -> Component {
+    Component::Text(value.to_owned())
+}
+
+/// The rows of one table row in the order their leaf lists them, written out by
+/// hand from the leaves' comparators (`agent_team_run`, `cctg`, `message`) and
+/// the spec, never from `Layout::compare`, so a layout that is wrong cannot
+/// grade itself. Ids and texts differ in case, in length-as-prefix and in a
+/// two-byte character, so bytes decide; positions pass 9 so that the integers
+/// are numbers and not text.
+fn expected_order(label: &str) -> Vec<Vec<Component>> {
+    match label {
+        l if l.ends_with(" id")
+            || matches!(
+                l,
+                "context default" | "config default" | "templates default"
+            ) =>
+        {
+            ["Z", "a", "aa", "b", "é"].map(|id| vec![s(id)]).into()
+        }
+        // Position, then id.
+        "agents default" => vec![
+            vec![n(0), s("z")],
+            vec![n(1), s("a")],
+            vec![n(1), s("b")],
+            vec![n(2), s("a")],
+            vec![n(10), s("a")],
+        ],
+        // Name, then position, then id; the names disagree with the positions.
+        "agents name" => vec![
+            vec![s("B"), n(5), s("q")],
+            vec![s("a"), n(9), s("z")],
+            vec![s("b"), n(1), s("y")],
+            vec![s("b"), n(2), s("a")],
+            vec![s("b"), n(2), s("b")],
+            vec![s("b"), n(10), s("a")],
+            vec![s("é"), n(0), s("a")],
+        ],
+        // Created time or name, then id.
+        "teams default" | "teams name" => vec![
+            vec![s("B"), s("z")],
+            vec![s("a"), s("y")],
+            vec![s("a"), s("z")],
+            vec![s("aa"), s("a")],
+            vec![s("é"), s("a")],
+        ],
+        // The newest start first, a longer text of one prefix before the shorter,
+        // then the id.
+        "runs default" => vec![
+            vec![s("2026-03"), s("x")],
+            vec![s("2026-02-01"), s("a")],
+            vec![s("2026-02"), s("a")],
+            vec![s("2026-02"), s("b")],
+            vec![s("2026-01"), s("a")],
+        ],
+        // The latest attempt first, then the id.
+        "runs of a task default" | "runs of a task attempt" => vec![
+            vec![n(10), s("a")],
+            vec![n(3), s("a")],
+            vec![n(3), s("b")],
+            vec![n(2), s("z")],
+            vec![n(0), s("a")],
+        ],
+        // Status, present before absent, the newest first, position, id.
+        "goals default" => vec![
+            vec![n(0), n(0), s("2026-02"), n(9), s("z")],
+            vec![n(0), n(0), s("2026-01"), n(1), s("a")],
+            vec![n(0), n(0), s(""), n(1), s("a")],
+            vec![n(0), n(1), s(""), n(1), s("a")],
+            vec![n(0), n(1), s(""), n(2), s("a")],
+            vec![n(0), n(1), s(""), n(10), s("a")],
+            vec![n(0), n(1), s(""), n(10), s("b")],
+            vec![n(1), n(0), s("2026-03"), n(0), s("a")],
+        ],
+        // Created time, then position, then id.
+        "goals created_at" | "messages default" | "pending messages default" => vec![
+            vec![s("2026-01-02"), n(9), s("z")],
+            vec![s("2026-01-03"), n(1), s("a")],
+            vec![s("2026-01-03"), n(2), s("a")],
+            vec![s("2026-01-03"), n(2), s("b")],
+            vec![s("2026-01-03"), n(10), s("a")],
+            vec![s("2026-01-03T"), n(0), s("a")],
+        ],
+        other => panic!("{other}: a row of the table has no expected order"),
+    }
+}
+
+/// I1 of the review of the encoder: every family and sort of the table orders
+/// its rows as the leaf does, against a list written independently of the code
+/// under test. It pins both the order of each layout and which layout each
+/// (filter, sort) pair gets.
+#[test]
+fn every_layout_orders_its_rows_as_its_leaf_does() {
+    for row in table() {
+        let layout = layout(&row);
+        let rows: Vec<Tuple> = expected_order(row.label)
+            .into_iter()
+            .map(|values| {
+                Tuple::new(&layout, values)
+                    .unwrap_or_else(|| panic!("{}: a tuple of its own layout", row.label))
+            })
+            .collect();
+        for (i, a) in rows.iter().enumerate() {
+            for (j, b) in rows.iter().enumerate() {
+                assert_eq!(
+                    layout.compare(a, b),
+                    i.cmp(&j),
+                    "{}: {a:?} against {b:?}",
+                    row.label
+                );
+            }
+        }
+        // A walk through the real tokens pages the same list, a row at a time.
+        assert_eq!(walk(&row, &rows, 1, true), rows, "{}", row.label);
+    }
+}
+
 #[test]
 fn the_families_offer_the_sorts_the_leaves_accept_and_no_others() {
     let none = |filter: Filter, sort: Sort| assert!(Layout::of(&filter, sort).is_none());
@@ -507,6 +627,105 @@ fn a_tuple_is_built_only_in_the_shape_and_range_of_its_layout() {
     assert_eq!(GoalStatus::ALL.len(), 4, "rank 3 is the highest");
 }
 
+/// I2 of the review: a tuple does not remember its layout, so `issue_inline`
+/// asks the layout of the request whether it admits the tuple. Before, a tuple
+/// of another layout was encoded under this sort and resumed as another
+/// identity (a teams tuple `ab`, `cd` issued under the id sort came back as
+/// the identity "ab\u{2}cd").
+#[test]
+fn a_tuple_of_another_layout_is_refused_at_issue_not_encoded() {
+    let issue = |filter: &Filter, sort: Sort, anchor: &Tuple| {
+        cursors().issue_inline(PROJECT, filter, sort, anchor, NOW)
+    };
+    let unrepresentable = |result: crate::sqlite::Result<Option<Cursor>>, what: &str| {
+        assert!(
+            matches!(result, Err(crate::sqlite::SqliteError::Unrepresentable(_))),
+            "{what}: {result:?}"
+        );
+    };
+    let teams = Layout::of(&Filter::Teams, Sort::Default).unwrap();
+    let pair = Tuple::new(&teams, vec![s("ab"), s("cd")]).unwrap();
+    // Two components under a one-component sort.
+    unrepresentable(
+        issue(&Filter::Teams, Sort::Id, &pair),
+        "teams tuple under id",
+    );
+    // Too few components; the id tuple of a context under the agents' order.
+    let id = Layout::of(&Filter::Context, Sort::Id).unwrap();
+    let one = Tuple::new(&id, vec![s("ctx")]).unwrap();
+    unrepresentable(issue(&Filter::Agents, Sort::Default, &one), "one under two");
+    // The right count and the wrong kinds.
+    let agent = Layout::of(&Filter::Agents, Sort::Default).unwrap();
+    let position = Tuple::new(&agent, vec![n(3), s("a")]).unwrap();
+    unrepresentable(issue(&Filter::Teams, Sort::Name, &position), "kinds");
+    // The right count and kinds, a value that the other layout's range refuses:
+    // a position is no attempt above `u32::MAX`.
+    let far = Tuple::new(&agent, vec![n(i64::from(u32::MAX) + 1), s("a")]).unwrap();
+    let task_runs = runs(Some("t"));
+    unrepresentable(issue(&task_runs, Sort::Attempt, &far), "range");
+    // A tuple too long for the token is as wrong as a short one: not `None`.
+    let long = Tuple::new(&teams, vec![s("x"), s(&"y".repeat(300))]).unwrap();
+    unrepresentable(issue(&Filter::Teams, Sort::Id, &long), "long and wrong");
+    // The same tuple under its own layout, and under another that has the same
+    // shape (so the same bytes), is issued.
+    assert!(
+        issue(&Filter::Teams, Sort::Default, &pair)
+            .unwrap()
+            .is_some()
+    );
+    let by_start = Layout::of(&runs(None), Sort::Default).unwrap();
+    assert!(by_start.admits(pair.components()));
+    assert!(issue(&runs(None), Sort::Default, &pair).unwrap().is_some());
+    assert!(
+        issue(&task_runs, Sort::Attempt, &position)
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// N1 of the review and I1 of the security review: a `Cursor` built by serde
+/// has not been through `Cursor::new`, so the decoder bounds the token itself.
+/// This token is valid in every other way (one byte past the capacity, so one
+/// character pair past 512): before the bound it resumed as a longer identity.
+#[test]
+fn a_token_over_five_hundred_and_twelve_characters_is_refused_before_decoding() {
+    let row = teams_row();
+    let layout = layout(&row);
+    let over = tuple(&layout, row.capacity + 1, Shape::LongIdentity, false);
+    let raw = cursors()
+        .encode(
+            PROJECT,
+            &row.filter,
+            row.sort,
+            &layout,
+            &over,
+            NOW + INLINE_TTL_MS,
+        )
+        .unwrap();
+    let text = super::token::hex(&raw);
+    assert_eq!(text.len(), 514);
+    assert!(
+        Cursor::new(text.clone()).is_err(),
+        "the constructor refuses it"
+    );
+    let forged: Cursor = serde_json::from_str(&format!("\"{text}\"")).unwrap();
+    assert!(matches!(
+        resume(&row, &forged, NOW),
+        Err(StoreError::InvalidCursor)
+    ));
+    // 512 characters, the most a constructed cursor holds, still resumes; and a
+    // deserialized empty one is a refusal and not a panic.
+    let at = tuple(&layout, row.capacity, Shape::LongIdentity, false);
+    let cursor = issue(&row, &at, NOW).unwrap();
+    let cursor: Cursor = serde_json::from_str(&format!("\"{}\"", cursor.as_str())).unwrap();
+    assert_eq!(resume(&row, &cursor, NOW).unwrap(), at);
+    let empty: Cursor = serde_json::from_str("\"\"").unwrap();
+    assert!(matches!(
+        resume(&row, &empty, NOW),
+        Err(StoreError::InvalidCursor)
+    ));
+}
+
 fn teams_row() -> Row {
     row("teams name", Filter::Teams, Sort::Name, 229)
 }
@@ -579,6 +798,44 @@ fn a_forged_expiry_is_accepted_up_to_a_day_and_five_minutes_ahead() {
             Err(StoreError::InvalidCursor)
         ));
     }
+}
+
+/// N2 of the review: the distance to the expiry is computed in `i128`. In `i64`
+/// it wraps: an expiry of `i64::MIN` against a clock of `i64::MAX` would read
+/// as 1 ms ahead, inside the window, though it is 2^64 - 1 ms behind. Each case
+/// below has a distance that `i64` cannot hold, or one of its exact edges.
+#[test]
+fn the_expiry_distance_is_exact_where_a_sixty_four_bit_one_wraps() {
+    let (row, anchor, _) = teams_token();
+    let layout = layout(&row);
+    let forged = |expires: i64| {
+        let raw = cursors()
+            .encode(PROJECT, &row.filter, row.sort, &layout, &anchor, expires)
+            .unwrap();
+        Cursor::new(super::token::hex(&raw)).unwrap()
+    };
+    let at = |expires: i64, now: i64| resume(&row, &forged(expires), now);
+    let refused = |expires: i64, now: i64| {
+        assert!(
+            matches!(at(expires, now), Err(StoreError::InvalidCursor)),
+            "expires {expires} at {now}"
+        );
+    };
+    let window = INLINE_TTL_MS + INLINE_SKEW_MS;
+    // Far behind, and the wrap of it lands inside the window: 1 ms ahead, and
+    // the whole window ahead. These are the cases a sixty-four bit distance
+    // accepts. Far ahead is refused either way and is here for the pair.
+    refused(i64::MIN, i64::MAX);
+    refused(i64::MIN, i64::MAX - window + 1);
+    refused(i64::MAX, i64::MIN);
+    // Exact at the ends of the range: equality, and the window's last millisecond.
+    assert_eq!(at(i64::MAX, i64::MAX).unwrap(), anchor);
+    assert_eq!(at(i64::MIN, i64::MIN).unwrap(), anchor);
+    assert_eq!(at(i64::MAX, i64::MAX - window).unwrap(), anchor);
+    assert_eq!(at(i64::MIN + window, i64::MIN).unwrap(), anchor);
+    refused(i64::MAX, i64::MAX - window - 1);
+    refused(i64::MIN + window + 1, i64::MIN);
+    refused(i64::MIN, i64::MIN + 1);
 }
 
 /// Q7': a wall clock 30 days away, either way, in every family.

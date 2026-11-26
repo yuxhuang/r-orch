@@ -28,6 +28,8 @@ pub(in crate::sqlite) const INLINE_SKEW_MS: i64 = 5 * 60 * 1000;
 /// token and the token by lookup of step 4; every other value is refused.
 const INLINE: u8 = 1;
 const DIGEST: usize = 16;
+/// The text of a token that fits a `Cursor`: the hex of at most `MAX_RAW` bytes.
+const MAX_TEXT: usize = 2 * MAX_RAW;
 
 const SORTS: [Sort; 8] = [
     Sort::Default,
@@ -116,6 +118,11 @@ impl NonTaskCursors {
     ) -> Result<Option<Cursor>> {
         let shape = || SqliteError::Unrepresentable("non-task cursor family or sort".into());
         let layout = Layout::of(filter, sort).ok_or_else(shape)?;
+        // A `Tuple` does not remember its layout. One of another layout would
+        // be encoded under this sort and resume as another identity.
+        if !layout.admits(anchor.components()) {
+            return Err(shape());
+        }
         if layout.arm(anchor) != Arm::Inline {
             return Ok(None);
         }
@@ -176,6 +183,11 @@ impl NonTaskCursors {
         now_ms: i64,
     ) -> Result<Tuple> {
         let invalid = || SqliteError::from(StoreError::InvalidCursor);
+        // `Cursor::new` bounds the text, but a cursor that serde built has not
+        // been through it: bound the token here, before any of it is decoded.
+        if cursor.as_str().len() > MAX_TEXT {
+            return Err(invalid());
+        }
         let raw = unhex(cursor.as_str()).ok_or_else(invalid)?;
         if raw.len() < HEADER || raw[0] != INLINE {
             return Err(invalid());

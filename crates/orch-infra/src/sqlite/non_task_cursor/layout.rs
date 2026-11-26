@@ -110,6 +110,41 @@ impl Layout {
         Some(Self { parts })
     }
 
+    /// Whether `values` has this layout's shape and ranges: one component of
+    /// the right kind for each part, an integer within its kind's range, and an
+    /// absent goal time (presence 1) with an empty text. A [`Tuple`] does not
+    /// remember its layout, so every entry that takes one asks again.
+    pub(in crate::sqlite) fn admits(&self, values: &[Component]) -> bool {
+        if values.len() != self.parts.len() {
+            return false;
+        }
+        // After presence 1 the next text is the absent goal time: empty.
+        let mut absent = false;
+        for (part, value) in self.parts.iter().zip(values) {
+            let ok = match (part.kind, value) {
+                (Kind::Text, Component::Text(text)) => {
+                    let ok = !absent || text.is_empty();
+                    absent = false;
+                    ok
+                }
+                (Kind::Rank, Component::Int(v)) => {
+                    usize::try_from(*v).is_ok_and(|v| v < GoalStatus::ALL.len())
+                }
+                (Kind::Presence, Component::Int(v)) => {
+                    absent = *v == 1;
+                    matches!(v, 0 | 1)
+                }
+                (Kind::Position, Component::Int(v)) => *v >= 0,
+                (Kind::Attempt, Component::Int(v)) => u32::try_from(*v).is_ok(),
+                _ => false,
+            };
+            if !ok {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(in crate::sqlite) fn parts(&self) -> &'static [Part] {
         self.parts
     }
@@ -169,38 +204,10 @@ pub(in crate::sqlite) enum Component {
 pub(in crate::sqlite) struct Tuple(Vec<Component>);
 
 impl Tuple {
-    /// `None` unless `values` has the layout's shape and ranges: one component
-    /// of the right kind for each part, an integer within its kind's range, and
-    /// an absent goal time (presence 1) with an empty text.
+    /// `None` unless `values` has the layout's shape and ranges (see
+    /// [`Layout::admits`]).
     pub(in crate::sqlite) fn new(layout: &Layout, values: Vec<Component>) -> Option<Self> {
-        if values.len() != layout.parts.len() {
-            return None;
-        }
-        // After presence 1 the next text is the absent goal time: empty.
-        let mut absent = false;
-        for (part, value) in layout.parts.iter().zip(&values) {
-            let ok = match (part.kind, value) {
-                (Kind::Text, Component::Text(text)) => {
-                    let ok = !absent || text.is_empty();
-                    absent = false;
-                    ok
-                }
-                (Kind::Rank, Component::Int(v)) => {
-                    usize::try_from(*v).is_ok_and(|v| v < GoalStatus::ALL.len())
-                }
-                (Kind::Presence, Component::Int(v)) => {
-                    absent = *v == 1;
-                    matches!(v, 0 | 1)
-                }
-                (Kind::Position, Component::Int(v)) => *v >= 0,
-                (Kind::Attempt, Component::Int(v)) => u32::try_from(*v).is_ok(),
-                _ => false,
-            };
-            if !ok {
-                return None;
-            }
-        }
-        Some(Self(values))
+        layout.admits(&values).then_some(Self(values))
     }
 
     pub(in crate::sqlite) fn components(&self) -> &[Component] {
