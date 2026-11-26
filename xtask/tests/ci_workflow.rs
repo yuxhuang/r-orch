@@ -30,6 +30,9 @@ const DENY_RUN: &str =
     "          \"$RUNNER_TEMP/cargo-deny\" --log-level warn --all-features check";
 /// `runner.environment` is `github-hosted` or `self-hosted`, so hosted
 /// receipts keep their `github-hosted-linux` label.
+/// The job container runs as root over a workspace the runner's user owns.
+const SAFE_DIRECTORY: &str =
+    "      - run: git config --system --add safe.directory \"$GITHUB_WORKSPACE\"";
 const HOST_LABEL: &str = "          HOST_LABEL: ${{ runner.environment }}-linux";
 /// The suite runner, pinned. A job that runs tests installs exactly this.
 const INSTALL: &str = "      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir \"$RUNNER_TEMP/nextest-install\" --root \"$HOME/.nextest-bin\"";
@@ -234,6 +237,29 @@ fn contract(ci: &str) {
     assert!(!ci.contains("sudo "));
     assert!(step(test, "Folded suite").lines().any(|l| l == HOST_LABEL));
     assert!(!CONTAINER_WORKSPACE.ends_with('/'));
+    // Every job's checkout is followed by the ownership exception, before any
+    // other step can run git.
+    for (name, job) in [
+        ("changes", changes),
+        ("check", check),
+        ("test", test),
+        ("ambient", ambient),
+    ] {
+        let checkout = job.find("persist-credentials: false\n").expect("checkout");
+        let next = job[checkout..]
+            .find("\n      - ")
+            .map(|n| checkout + n + 1)
+            .unwrap();
+        let safe = job
+            .find(SAFE_DIRECTORY)
+            .unwrap_or_else(|| panic!("{name} lacks {SAFE_DIRECTORY}"));
+        let between = &job[next..safe];
+        assert!(
+            between.lines().all(|l| l.trim_start().starts_with('#')),
+            "{name}: the ownership exception must directly follow checkout"
+        );
+    }
+    assert_eq!(ci.matches(SAFE_DIRECTORY).count(), 4);
     assert!(check.contains("test -s Cargo.lock"));
     assert!(check.contains("! grep -qE '^name = \"(terminfo|termwiz)\"$' Cargo.lock"));
     assert!(test.contains("timeout-minutes: 50"));
@@ -449,6 +475,11 @@ fn workflow_mutants_are_discriminated() {
         ),
         ("releases/download/0.20.2/", "releases/download/0.20.1/"),
         ("--all-features check", "check"),
+        // Git ownership: a global exception is invisible under the gate's HOME.
+        (
+            "git config --system --add safe.directory",
+            "git config --global --add safe.directory",
+        ),
     ] {
         let mutant = CI.replacen(old, new, 1);
         assert_ne!(mutant, CI);
