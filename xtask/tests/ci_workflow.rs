@@ -10,7 +10,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const CI: &str = include_str!("../../.github/workflows/ci.yml");
 const TEST_IF: &str = "github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all')";
 const AMBIENT_IF: &str = "github.event_name == 'push' && github.ref == 'refs/heads/main'";
-const AMBIENT_TARGET: &str = "${{ github.workspace }}/target/ci-ambient";
+/// The workspace's path inside a job container, on GitHub-hosted and
+/// self-hosted runners alike. The `github.workspace` context holds the host's
+/// path instead, which does not exist inside the container.
+const CONTAINER_WORKSPACE: &str = "/__w/r-orch/r-orch";
+const AMBIENT_TARGET: &str = "/__w/r-orch/r-orch/target/ci-ambient";
+/// Every job runs in this container, so hosted and self-hosted runs match.
+const JOB_IMAGE: &str = "      image: docker.io/library/rust:1-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254";
+/// Trusted events and same-repo pull requests use the self-hosted runner the
+/// repository variable names; fork pull requests, and everything while the
+/// variable is unset, stay on GitHub-hosted runners.
+const ROUTED: &str = "    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_SELF_HOSTED_RUNNER || 'ubuntu-latest' }}";
+/// `ambient` runs on pushes to main only, so it never sees fork code.
+const AMBIENT_ROUTED: &str = "    runs-on: ${{ vars.CI_SELF_HOSTED_RUNNER || 'ubuntu-latest' }}";
+/// cargo-deny 0.20.2, the release `cargo-deny-action` v2.1.1 ran, by digest.
+const DENY_FETCH: &str = "          curl -fsSL --proto '=https' -o \"$archive\" https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz";
+const DENY_VERIFY: &str = "          echo \"9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $archive\" | sha256sum -c -";
+const DENY_RUN: &str =
+    "          \"$RUNNER_TEMP/cargo-deny\" --log-level warn --all-features check";
+/// `runner.environment` is `github-hosted` or `self-hosted`, so hosted
+/// receipts keep their `github-hosted-linux` label.
+const HOST_LABEL: &str = "          HOST_LABEL: ${{ runner.environment }}-linux";
 /// The suite runner, pinned. A job that runs tests installs exactly this.
 const INSTALL: &str = "      - run: cargo install cargo-nextest --locked --version 0.9.152 --target-dir \"$RUNNER_TEMP/nextest-install\" --root \"$HOME/.nextest-bin\"";
 /// One step per pass, in `nextest::PROFILES` order. The pass split itself is
@@ -123,10 +143,10 @@ fn contract(ci: &str) {
     assert!(!ambient.contains("./xtask/gate.sh"));
     let suite = step(test, "Folded suite");
     assert!(
-        script(suite).lines().any(|line| line == "exec ./xtask/gate.sh pr --part suite --receipt \"$RUNNER_TEMP/pr3-suite-receipt\" --lease-wait 5 --host-label github-hosted-linux"),
+        script(suite).lines().any(|line| line == "exec ./xtask/gate.sh pr --part suite --receipt \"$RUNNER_TEMP/pr3-suite-receipt\" --lease-wait 5 --host-label \"$HOST_LABEL\""),
         "folded producer must replace the step shell with unchanged argv"
     );
-    assert!(suite.contains("--lease-wait 5 --host-label github-hosted-linux"));
+    assert!(suite.contains("--lease-wait 5 --host-label \"$HOST_LABEL\""));
     assert!(!ci.contains("--no-lease"));
     assert!(!ci.contains("XTASK_GATE_LEASE_DIR"));
     assert!(!ci.contains("continue-on-error:"));
@@ -138,7 +158,9 @@ fn contract(ci: &str) {
     ));
     let upload = step(test, "Retain verified redacted receipt");
     assert!(upload.contains("if: always() && steps.receipt.outcome == 'success'"));
-    assert!(upload.contains("path: ${{ runner.temp }}/pr3-suite-receipt\n"));
+    // The runner.temp context names the host's directory; this is $RUNNER_TEMP
+    // inside the job container.
+    assert!(upload.contains("path: /__w/_temp/pr3-suite-receipt\n"));
     assert!(upload.contains("if-no-files-found: error"));
     assert!(upload.contains("include-hidden-files: false"));
     assert_eq!(ci.matches("Swatinem/rust-cache@").count(), 4);
@@ -168,9 +190,50 @@ fn contract(ci: &str) {
         assert_eq!(pin.len(), 40, "action must be commit-pinned");
         assert!(pin.bytes().all(|b| b.is_ascii_hexdigit()));
     }
+    // cargo-deny runs in the job: a container action would start a pod of its
+    // own on a Kubernetes-mode self-hosted runner, outside the job's hardening.
+    let deny = step(check, "cargo deny");
+    for line in [DENY_FETCH, DENY_VERIFY, DENY_RUN] {
+        assert!(
+            deny.lines().any(|l| l == line),
+            "cargo deny step lost {line}"
+        );
+    }
+    let fetch = deny.find(DENY_FETCH).unwrap();
+    let verify = deny.find(DENY_VERIFY).unwrap();
+    let run = deny.find(DENY_RUN).unwrap();
     assert!(
-        check.contains("EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25")
+        fetch < verify && verify < run,
+        "verify the archive before running it"
     );
+    assert!(script(deny).starts_with("set -euo pipefail\n"));
+    assert!(
+        !ci.lines()
+            .any(|l| l.contains("uses:") && l.contains("cargo-deny-action"))
+    );
+    assert!(!ci.contains("uses: docker://"));
+    // Runners: one container for every job, routing only through the variable.
+    for (name, job) in [("changes", changes), ("check", check), ("test", test)] {
+        assert!(
+            job.lines().any(|l| l == ROUTED),
+            "{name} must use the fork-aware route"
+        );
+        assert!(
+            job.contains(&format!("\n    container:\n{JOB_IMAGE}\n")),
+            "{name} must run in the pinned job container"
+        );
+    }
+    assert!(ambient.lines().any(|l| l == AMBIENT_ROUTED));
+    assert!(ambient.contains(&format!("\n    container:\n{JOB_IMAGE}\n")));
+    assert_eq!(ci.matches("    runs-on: ").count(), 4);
+    assert_eq!(ci.matches("\n    container:\n").count(), 4);
+    assert_eq!(ci.matches(ROUTED).count(), 3);
+    // Untranslated in a job container: these name the host's paths.
+    assert!(!ci.contains("${{ github.workspace }}"));
+    assert!(!ci.contains("${{ runner.temp }}"));
+    assert!(!ci.contains("sudo "));
+    assert!(step(test, "Folded suite").lines().any(|l| l == HOST_LABEL));
+    assert!(!CONTAINER_WORKSPACE.ends_with('/'));
     assert!(check.contains("test -s Cargo.lock"));
     assert!(check.contains("! grep -qE '^name = \"(terminfo|termwiz)\"$' Cargo.lock"));
     assert!(test.contains("timeout-minutes: 50"));
@@ -354,6 +417,38 @@ fn workflow_mutants_are_discriminated() {
             "steps.receipt.outcome == 'success'",
             "steps.suite.outcome == 'success'",
         ),
+        // Routing: dropping the fork check, or hard-coding either runner.
+        (
+            "(github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && ",
+            "",
+        ),
+        (
+            "vars.CI_SELF_HOSTED_RUNNER || 'ubuntu-latest' }}",
+            "'ubuntu-latest' }}",
+        ),
+        (
+            "    container:\n      image: docker.io/library/rust:1-trixie@",
+            "    container:\n      image: docker.io/library/rust:1-bookworm@",
+        ),
+        (
+            "path: /__w/_temp/pr3-suite-receipt",
+            "path: /home/runner/work/_temp/pr3-suite-receipt",
+        ),
+        (
+            "      - run: apt-get update",
+            "      - run: sudo apt-get update",
+        ),
+        (
+            "--host-label \"$HOST_LABEL\"",
+            "--host-label github-hosted-linux",
+        ),
+        // cargo-deny: unverified archive, or a different release.
+        (
+            "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $archive",
+            "0000000000000000000000000000000000000000000000000000000000000000  $archive",
+        ),
+        ("releases/download/0.20.2/", "releases/download/0.20.1/"),
+        ("--all-features check", "check"),
     ] {
         let mutant = CI.replacen(old, new, 1);
         assert_ne!(mutant, CI);
@@ -459,9 +554,17 @@ fn suite_failure_cannot_be_replaced_by_verifier_success() {
     f.executable("xtask/gate.sh", "#!/bin/sh\nexit \"$PRODUCER_STATUS\"\n");
     let suite = script(step(job(CI, "test"), "Folded suite"));
     for status in ["1", "2", "3", "75", "143"] {
-        assert!(!f.run(&suite, &[("PRODUCER_STATUS", status)]));
+        assert!(!f.run(
+            &suite,
+            &[("PRODUCER_STATUS", status), ("HOST_LABEL", "self-hosted")]
+        ));
     }
-    assert!(f.run(&suite, &[("PRODUCER_STATUS", "0")]));
+    assert!(f.run(
+        &suite,
+        &[("PRODUCER_STATUS", "0"), ("HOST_LABEL", "self-hosted")]
+    ));
+    // An unset label fails the step rather than recording an empty one.
+    assert!(!f.run(&suite, &[("PRODUCER_STATUS", "0")]));
     // Verification is independent: even valid diagnostics for failed suites
     // cannot replace the producer step's nonzero status.
     let verify = script(step(job(CI, "test"), "Verify diagnostic receipt"));
@@ -475,7 +578,10 @@ fn suite_failure_cannot_be_replaced_by_verifier_success() {
     }
     f.executable("target/gate-xtask/debug/xtask", "#!/bin/sh\nexit 0\n");
     assert!(f.run(&verify, &[]));
-    assert!(!f.run(&suite, &[("PRODUCER_STATUS", "1")]));
+    assert!(!f.run(
+        &suite,
+        &[("PRODUCER_STATUS", "1"), ("HOST_LABEL", "self-hosted")]
+    ));
 }
 
 #[test]
@@ -592,7 +698,7 @@ fn ambient_target_resolves_from_package(ci: &str) -> bool {
         .open(&artifact)
         .unwrap();
     let raw = ambient_target_value(ci);
-    let target = match raw.strip_prefix("${{ github.workspace }}/") {
+    let target = match raw.strip_prefix(&format!("{CONTAINER_WORKSPACE}/")) {
         Some(suffix) => f.0.join(suffix),
         None => PathBuf::from(raw),
     };
@@ -706,7 +812,7 @@ fn ambient_relative_target_and_override_controls_are_discriminated() {
     let suite = AMBIENT_SUITE;
     for mutant in [
         relative,
-        CI.replacen(AMBIENT_TARGET, "${{ github.workspace }}/target/wrong", 1),
+        CI.replacen(AMBIENT_TARGET, "/__w/r-orch/r-orch/target/wrong", 1),
         CI.replacen(
             suite,
             &format!("{suite}\n        env:\n          CARGO_TARGET_DIR: target/wrong"),

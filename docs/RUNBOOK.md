@@ -1752,9 +1752,11 @@ answer); the live rules are unchanged.
 
 ### PR3 CI suite receipts and required-check transition
 
-The hosted `test` job runs exactly one
-`./xtask/gate.sh pr --part suite --receipt <new-dir> --lease-wait 5 --host-label github-hosted-linux`
-under the normal configured lease. It does not override the lease directory or
+The `test` job runs exactly one
+`./xtask/gate.sh pr --part suite --receipt <new-dir> --lease-wait 5 --host-label "$HOST_LABEL"`
+under the normal configured lease. `HOST_LABEL` is `github-hosted-linux` on a
+GitHub-hosted runner and `self-hosted-linux` on the self-hosted one (see "CI
+runners" below). It does not override the lease directory or
 bypass target lifecycle. Registry/git dependencies are cached; all build targets,
 state, raw records, exported receipts and cold paths are excluded. Hosted boot
 identity invalidates restored warm targets; do not weaken freshness checks.
@@ -1788,6 +1790,27 @@ neutral, failed or unexplained skipped jobs block merge. Record tested merge
 SHA/tree separately from PR head. Before the next stacked merge, require previous
 main-push test and ambient success at that merge commit. Rule readback and rollback
 are owner-only operations; no agent applies them. TV50–55/cache/native remain due.
+
+### CI runners
+
+Every `ci.yml` job runs in the same pinned `rust:1-trixie` job container, so a job
+behaves the same on either runner type. The repository variable
+`CI_SELF_HOSTED_RUNNER` names an owner-managed self-hosted runner:
+
+- **Set:** pushes to `main`, the weekly run and pull requests from branches of this
+  repository run there. Pull requests from forks always run on `ubuntu-latest`.
+- **Unset:** every job runs on `ubuntu-latest`. Deleting the variable
+  (`gh variable delete CI_SELF_HOSTED_RUNNER`) is the rollback, and needs no PR.
+
+Only repository admins can change the variable. The `runs-on` expression is routing,
+not security: a fork writes its own workflow file, so the self-hosted runner refuses
+fork jobs itself, before any container starts. Inside a job container the
+`github.workspace` and `runner.temp` contexts name the host's paths, so `ci.yml`
+uses the container's `/__w` paths or the shell's `$GITHUB_WORKSPACE` and
+`$RUNNER_TEMP`; `xtask/tests/ci_workflow.rs` rejects the contexts. A container
+action (`uses: docker://…` or a Docker-based action) would run outside the job
+container on the self-hosted runner, so cargo-deny runs in the job from its
+release archive, checked against the published sha256.
 
 
 ## SQLite adapter groundwork

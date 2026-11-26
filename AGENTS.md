@@ -427,8 +427,9 @@ cargo xtask linux clean                          # delete this checkout's target
 - **Image.** The official `rust:<channel>-trixie` (Debian 13), with `<channel>` read from `rust-toolchain.toml`, so
   the container runs the toolchain CI installs. The xtask adds tmux, rustfmt and clippy and tags the result
   `orch-linux:<channel>` locally; it is never pushed. The base already has the git, gcc, pkg-config and python3 the
-  suite needs (the `slim` variant has no git, python3 or pkg-config). It differs from CI's `ubuntu-latest` runner in
-  the distribution (Debian 13, glibc 2.41), the tmux version (3.5a) and the user (your uid, not `runner`).
+  suite needs (the `slim` variant has no git, python3 or pkg-config). CI's jobs run in the same Debian 13 base
+  (`rust:1-trixie`, pinned by digest in `ci.yml`, with the channel installed from `rust-toolchain.toml`), so the
+  distribution (glibc 2.41) and tmux (3.5a) match; the user differs (your uid here, root in CI's job container).
 - **What it runs.** CI's commands in CI's order: the `Cargo.lock` termwiz/terminfo check, `cargo fmt --all --check`,
   `cargo clippy --workspace --all-targets -- -D warnings`, `cargo xtask crate-graph` and `cargo test --workspace
   --no-fail-fast`, stopping at the first failing step. Not cargo-deny: `deny.toml` already selects the Linux target,

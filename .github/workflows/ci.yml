@@ -27,10 +27,21 @@ env:
   # ambient tests never touch ~/.orchestry on the runner. The folded gate
   # supplies its own sentinel HOME/global.yml outside the checkout.
 
+# Runners. Every job runs in the same pinned container, on either runner type.
+# CI_SELF_HOSTED_RUNNER is a repository variable naming an owner-managed
+# self-hosted runner. While it is set, pushes, the weekly run and same-repo
+# pull requests use it; fork pull requests, and every event while it is unset,
+# use GitHub-hosted runners. That is routing only: the self-hosted runner
+# refuses fork jobs on its own. Deleting the variable is the rollback.
+# Inside a job container, the github.workspace and runner.temp contexts are
+# the host's paths, not the container's, so paths below use the container's
+# /__w layout or the shell's $GITHUB_WORKSPACE and $RUNNER_TEMP.
 jobs:
   changes:
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_SELF_HOSTED_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: docker.io/library/rust:1-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254
     timeout-minutes: 30
     outputs:
       mode: ${{ steps.select.outputs.mode }}
@@ -39,8 +50,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Keep the token out of .git/config, which build scripts and the
-          # cargo-deny container can read; nothing here pushes.
+          # Keep the token out of .git/config, which build scripts and
+          # cargo-deny can read; nothing here pushes.
           persist-credentials: false
           fetch-depth: 0
       # dtolnay/rust-toolchain ignores rust-toolchain.toml (it requires an
@@ -78,7 +89,9 @@ jobs:
   check:
     needs: changes
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_SELF_HOSTED_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: docker.io/library/rust:1-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254
     timeout-minutes: 30
     env:
       CARGO_TARGET_DIR: target/ci-check
@@ -111,8 +124,8 @@ jobs:
           fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Keep the token out of .git/config, which build scripts and the
-          # cargo-deny container can read; nothing here pushes.
+          # Keep the token out of .git/config, which build scripts and
+          # cargo-deny can read; nothing here pushes.
           persist-credentials: false
       # Lock guard also rejects a missing lockfile. Activated-graph deny alone
       # would miss termwiz/terminfo (WTFPL), see the ratatui manifest comment.
@@ -133,26 +146,37 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo xtask crate-graph
-      # Runs in its own container; checks advisories, licences, bans and sources.
-      # Advisories are fetched live: a new RUSTSEC entry can redden an unchanged
-      # tree. That is intended.
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
-        with:
-          command: check
-          arguments: --all-features
+      # Checks advisories, licences, bans and sources. Advisories are fetched
+      # live: a new RUSTSEC entry can redden an unchanged tree. That is intended.
+      # cargo-deny 0.20.2 is the release EmbarkStudios/cargo-deny-action v2.1.1
+      # (3c634983) downloaded. That action is a container action, which a
+      # Kubernetes-mode self-hosted runner would start as a pod of its own, so
+      # the same release archive is fetched here and checked against its
+      # published sha256 before use.
+      - name: cargo deny
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-deny.tar.gz"
+          curl -fsSL --proto '=https' -o "$archive" https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz
+          echo "9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" --strip-components=1 cargo-deny-0.20.2-x86_64-unknown-linux-musl/cargo-deny
+          "$RUNNER_TEMP/cargo-deny" --log-level warn --all-features check
 
   test:
     needs: changes
     if: github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all')
-    runs-on: ubuntu-latest
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_SELF_HOSTED_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: docker.io/library/rust:1-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254
     # Six Linux main runs peaked at 29m42s (test) and 28m46s (ambient).
     # The 50-minute ceiling adds headroom; the <=20-minute PR target remains.
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Keep the token out of .git/config, which build scripts and the
-          # cargo-deny container can read; nothing here pushes.
+          # Keep the token out of .git/config, which build scripts and
+          # cargo-deny can read; nothing here pushes.
           persist-credentials: false
       # dtolnay/rust-toolchain ignores rust-toolchain.toml (it requires an
       # explicit version), so let rustup read the file: one pin, not two.
@@ -163,7 +187,7 @@ jobs:
           cache-bin: false
       # The TUI end-to-end tests drive the real binary in tmux and fail when
       # it is missing (AGENTS.md, "TUI end-to-end tests").
-      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: apt-get update && apt-get install -y tmux
       # The suite runner is pinned: the gate refuses any other version and
       # prints this command. Built from crates.io with the tool's own lockfile
       # rather than fetched as a prebuilt binary or through a third-party
@@ -203,10 +227,13 @@ jobs:
       # Export time under real cancellation remains unverified; no receipt guarantee.
       - name: Folded suite
         id: suite
+        env:
+          # The receipt's diagnostic label: github-hosted-linux or self-hosted-linux.
+          HOST_LABEL: ${{ runner.environment }}-linux
         shell: bash
         run: |
           set -euo pipefail
-          exec ./xtask/gate.sh pr --part suite --receipt "$RUNNER_TEMP/pr3-suite-receipt" --lease-wait 5 --host-label github-hosted-linux
+          exec ./xtask/gate.sh pr --part suite --receipt "$RUNNER_TEMP/pr3-suite-receipt" --lease-wait 5 --host-label "$HOST_LABEL"
       # No continue-on-error/status mapping: producer failure independently
       # fails the job. Integrity can pass for FAILED/INCOMPLETE diagnostics.
       - name: Verify diagnostic receipt
@@ -221,23 +248,26 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: pr3-suite-receipt-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/pr3-suite-receipt
+          path: /__w/_temp/pr3-suite-receipt
           if-no-files-found: error
           include-hidden-files: false
           retention-days: 30
 
   ambient:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_SELF_HOSTED_RUNNER || 'ubuntu-latest' }}
+    container:
+      image: docker.io/library/rust:1-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254
     timeout-minutes: 50
     env:
-      # concurrent_index reads this from its package cwd, so keep it absolute.
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/ci-ambient
+      # concurrent_index reads this from its package cwd, so keep it absolute:
+      # the workspace's path inside the job container (see "Runners" above).
+      CARGO_TARGET_DIR: /__w/r-orch/r-orch/target/ci-ambient
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Keep the token out of .git/config, which build scripts and the
-          # cargo-deny container can read; nothing here pushes.
+          # Keep the token out of .git/config, which build scripts and
+          # cargo-deny can read; nothing here pushes.
           persist-credentials: false
       # dtolnay/rust-toolchain ignores rust-toolchain.toml (it requires an
       # explicit version), so let rustup read the file: one pin, not two.
@@ -248,7 +278,7 @@ jobs:
           cache-bin: false
       # The TUI end-to-end tests drive the real binary in tmux and fail when
       # it is missing (AGENTS.md, "TUI end-to-end tests").
-      - run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: apt-get update && apt-get install -y tmux
       # The suite runner is pinned: the gate refuses any other version and
       # prints this command. Built from crates.io with the tool's own lockfile
       # rather than fetched as a prebuilt binary or through a third-party
