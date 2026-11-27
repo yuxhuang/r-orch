@@ -3,7 +3,9 @@
 //! Automatic retries, event coalescing and bulk accounting need producer support;
 //! a rebuilt caller request below does not claim to replay an admitted FnOnce.
 use orch_core::{
-    store::{Caller, Entity, EntityKind, Lane, Principal, Storage, StorageExt, StoreError},
+    store::{
+        Caller, Entity, EntityKind, Lane, Principal, Storage, StoreError, UnitOfWork, WriteWork,
+    },
     test_support::make_task,
 };
 use orch_infra::{
@@ -19,8 +21,61 @@ use std::{
         mpsc,
     },
     task::Poll,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+// These tests control the real executor with barriers. Daemon-owned admission
+// cannot expire while an unrelated host process delays the barrier's release.
+// Normal Storage::write budgets/withdrawal remain pinned in storage/tests.rs.
+trait FixtureAdmission {
+    async fn fixture_write(
+        &self,
+        caller: Caller,
+        lane: Lane,
+        work: WriteWork,
+    ) -> orch_core::store::Result<()>;
+    async fn fixture_transaction<F>(
+        &self,
+        caller: Caller,
+        lane: Lane,
+        work: F,
+    ) -> orch_core::store::Result<()>
+    where
+        F: FnOnce(&mut dyn UnitOfWork) -> orch_core::store::Result<()> + Send + 'static;
+}
+impl FixtureAdmission for SqliteStorage {
+    async fn fixture_write(
+        &self,
+        caller: Caller,
+        lane: Lane,
+        work: WriteWork,
+    ) -> orch_core::store::Result<()> {
+        let mut operation = self.retained_write(caller, lane, None);
+        let receipt = operation.attempt(work).await?;
+        assert!(
+            operation
+                .receive()
+                .await
+                .err()
+                .expect("no second receipt")
+                .to_string()
+                .contains("no pending"),
+            "an admitted attempt has exactly one original terminal receipt"
+        );
+        receipt.result
+    }
+    async fn fixture_transaction<F>(
+        &self,
+        caller: Caller,
+        lane: Lane,
+        work: F,
+    ) -> orch_core::store::Result<()>
+    where
+        F: FnOnce(&mut dyn UnitOfWork) -> orch_core::store::Result<()> + Send + 'static,
+    {
+        self.fixture_write(caller, lane, Box::new(work)).await
+    }
+}
 
 fn owner() -> Caller {
     Caller {
@@ -96,11 +151,11 @@ impl Fixture {
     }
     async fn corrupt_task(&self) {
         self.storage
-            .transaction(owner(), Lane::Entities, |u| {
+            .fixture_transaction(owner(), Lane::Entities, |u| {
                 let mut task = make_task();
                 task.created_at = "2025-01-01T00:00:00.000Z".into();
                 task.updated_at = task.created_at.clone();
-                u.create(Entity::Task(Box::new(task)))
+                u.create(Entity::Task(Box::new(task))).map(|_| ())
             })
             .await
             .unwrap();
@@ -144,7 +199,7 @@ async fn a_request_answered_overloaded_never_commits_and_a_rebuilt_retry_drops_n
     let (started, active) = tokio::sync::oneshot::channel();
     let (release, released) = mpsc::sync_channel(1);
     let mut release = Release(Some(release));
-    let first = f.storage.write(
+    let first = f.storage.fixture_write(
         owner(),
         Lane::Entities,
         Box::new(move |u| {
@@ -159,7 +214,7 @@ async fn a_request_answered_overloaded_never_commits_and_a_rebuilt_retry_drops_n
     tokio::pin!(first);
     admit(first.as_mut()).await;
     active.await.unwrap();
-    let queued = f.storage.write(
+    let queued = f.storage.fixture_write(
         owner(),
         Lane::Entities,
         Box::new(|u| {
@@ -171,7 +226,7 @@ async fn a_request_answered_overloaded_never_commits_and_a_rebuilt_retry_drops_n
     admit(queued.as_mut()).await;
     let invocations = Arc::new(AtomicUsize::new(0));
     let refused_count = invocations.clone();
-    let refused = f.storage.write(
+    let refused = f.storage.fixture_write(
         owner(),
         Lane::Entities,
         Box::new(move |u| {
@@ -194,7 +249,7 @@ async fn a_request_answered_overloaded_never_commits_and_a_rebuilt_retry_drops_n
     assert_eq!(f.team_ids(), ["active", "queued"]);
     let retry_count = invocations.clone();
     f.storage
-        .transaction(owner(), Lane::Entities, move |u| {
+        .fixture_transaction(owner(), Lane::Entities, move |u| {
             retry_count.fetch_add(1, Ordering::SeqCst);
             u.create(team("retry-a"))?;
             u.create(team("retry-b"))?;
@@ -219,7 +274,7 @@ async fn a_failed_request_rolls_back_all_writes_and_a_rebuilt_request_commits_ea
     let f = Fixture::new();
     let failed = f
         .storage
-        .transaction(owner(), Lane::Entities, |u| {
+        .fixture_transaction(owner(), Lane::Entities, |u| {
             u.create(team("first"))?;
             u.create(team("second"))?;
             Err::<(), _>(StoreError::StaleEpoch)
@@ -228,7 +283,7 @@ async fn a_failed_request_rolls_back_all_writes_and_a_rebuilt_request_commits_ea
     assert!(matches!(failed, Err(StoreError::StaleEpoch)));
     assert!(f.team_ids().is_empty());
     f.storage
-        .transaction(owner(), Lane::Entities, |u| {
+        .fixture_transaction(owner(), Lane::Entities, |u| {
             u.create(team("first"))?;
             u.create(team("second"))?;
             Ok(())
@@ -259,7 +314,7 @@ async fn an_ordinary_failure_rolled_back_to_its_savepoint_may_be_caught_and_unre
         BEGIN SELECT RAISE(ABORT, 'synthetic constraint'); END",
     );
     f.storage
-        .transaction(owner(), Lane::Entities, |u| {
+        .fixture_transaction(owner(), Lane::Entities, |u| {
             u.create(team("before"))?;
             assert!(u.create(team("refused")).is_err());
             // The failed create had already inserted its native teams row. A working
@@ -286,7 +341,7 @@ async fn no_statement_is_durable_when_sqlite_ends_the_transaction_and_the_callba
     );
     let result = f
         .storage
-        .transaction(owner(), Lane::Entities, |u| {
+        .fixture_transaction(owner(), Lane::Entities, |u| {
             u.create(team("before"))?;
             assert!(u.create(team("refused")).is_err());
             assert!(u.create(team("after")).is_err());
@@ -303,7 +358,9 @@ async fn no_statement_is_durable_when_sqlite_ends_the_transaction_and_the_callba
     );
     // An independent successful receipt also proves the healthy writer survives.
     f.storage
-        .transaction(owner(), Lane::Entities, |u| u.create(team("following")))
+        .fixture_transaction(owner(), Lane::Entities, |u| {
+            u.create(team("following")).map(|_| ())
+        })
         .await
         .unwrap();
     let reopened = f.reopen().await;
@@ -318,7 +375,7 @@ async fn a_fatal_cause_that_the_callback_catches_still_fails_the_writer_and_abor
     f.corrupt_task().await;
     let result = f
         .storage
-        .transaction(owner(), Lane::Entities, |u| {
+        .fixture_transaction(owner(), Lane::Entities, |u| {
             u.create(team("before"))?;
             assert!(u.get(EntityKind::Task, "tsk_test1").is_err());
             assert!(u.create(team("after")).is_err());
@@ -395,7 +452,7 @@ async fn only_one_event_transaction_waits_across_runs_and_a_refused_batch_can_be
     let (started, active) = tokio::sync::oneshot::channel();
     let (release, released) = mpsc::sync_channel(1);
     let mut release = Release(Some(release));
-    let first = f.storage.write(
+    let first = f.storage.fixture_write(
         owner(),
         Lane::Entities,
         Box::new(move |_| {
@@ -409,7 +466,7 @@ async fn only_one_event_transaction_waits_across_runs_and_a_refused_batch_can_be
     tokio::pin!(first);
     admit(first.as_mut()).await;
     active.await.unwrap();
-    let queued = f.storage.write(
+    let queued = f.storage.fixture_write(
         owner(),
         Lane::Events,
         Box::new(|u| u.record_event_gap("run-one", 0, 1)),
@@ -418,7 +475,7 @@ async fn only_one_event_transaction_waits_across_runs_and_a_refused_batch_can_be
     admit(queued.as_mut()).await;
     let calls = Arc::new(AtomicUsize::new(0));
     let refused_calls = calls.clone();
-    let refused = f.storage.write(
+    let refused = f.storage.fixture_write(
         owner(),
         Lane::Events,
         Box::new(move |u| {
@@ -436,7 +493,7 @@ async fn only_one_event_transaction_waits_across_runs_and_a_refused_batch_can_be
     queued.await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     f.storage
-        .transaction(owner(), Lane::Events, |u| {
+        .fixture_transaction(owner(), Lane::Events, |u| {
             u.record_event_gap("run-two", 0, 2)
         })
         .await
@@ -460,11 +517,12 @@ async fn only_one_event_transaction_waits_across_runs_and_a_refused_batch_can_be
 async fn caught_native_entity_corruption_rolls_back_and_refuses_an_unrelated_queued_write() {
     let f = Fixture::with_capacity(8);
     f.storage
-        .transaction(owner(), Lane::Entities, |u| {
+        .fixture_transaction(owner(), Lane::Entities, |u| {
             u.create(Entity::Config(orch_core::store::ConfigEntry {
                 key: "damaged".into(),
                 value: "synthetic".into(),
             }))
+            .map(|_| ())
         })
         .await
         .unwrap();
@@ -472,7 +530,7 @@ async fn caught_native_entity_corruption_rolls_back_and_refuses_an_unrelated_que
     let (started, active) = tokio::sync::oneshot::channel();
     let (release, released) = mpsc::sync_channel(1);
     let mut release = Release(Some(release));
-    let first = f.storage.write(
+    let first = f.storage.fixture_write(
         owner(),
         Lane::Entities,
         Box::new(move |u| {
@@ -491,7 +549,7 @@ async fn caught_native_entity_corruption_rolls_back_and_refuses_an_unrelated_que
     active.await.unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
     let queued_calls = calls.clone();
-    let queued = f.storage.write(
+    let queued = f.storage.fixture_write(
         owner(),
         Lane::Entities,
         Box::new(move |u| {
@@ -545,4 +603,102 @@ async fn an_ordinary_public_close_is_distinct_from_a_failed_writer() {
     );
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(f.storage.failure_state().failure().is_none());
+}
+
+#[tokio::test]
+async fn an_original_expired_deadline_refuses_the_callback_and_has_one_terminal_receipt() {
+    let f = Fixture::new();
+    let mut operation = f.storage.retained_write(
+        owner(),
+        Lane::Entities,
+        Some(Instant::now() - Duration::from_secs(1)),
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let receipt = operation
+        .attempt(Box::new(move |u| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            u.create(team("expired")).map(|_| ())
+        }))
+        .await
+        .unwrap();
+    assert!(
+        receipt
+            .result
+            .unwrap_err()
+            .to_string()
+            .contains("overloaded")
+    );
+    assert_eq!(
+        receipt.outcome,
+        orch_infra::sqlite::WriteOutcome::NotStarted
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        operation
+            .receive()
+            .await
+            .err()
+            .expect("no second receipt")
+            .to_string()
+            .contains("no pending")
+    );
+    let reopened = f.reopen().await;
+    assert!(f.team_ids().is_empty());
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelling_delivery_recovers_the_original_receipt_without_reinvoking_the_callback() {
+    let f = Fixture::new();
+    let mut operation = f.storage.retained_write(owner(), Lane::Entities, None);
+    let (started, active) = tokio::sync::oneshot::channel();
+    let (release, released) = mpsc::sync_channel(1);
+    let mut release = Release(Some(release));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    let mut delivery = Box::pin(operation.attempt(Box::new(move |u| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        u.create(team("original"))?;
+        started.send(()).unwrap();
+        released
+            .recv_timeout(Duration::from_secs(10))
+            .expect("release original callback");
+        Ok(())
+    })));
+    admit(delivery.as_mut()).await;
+    active.await.unwrap();
+    drop(delivery);
+    // Cancellation does not permit a new attempt while the original is pending.
+    let retry_calls = calls.clone();
+    let refused = operation
+        .attempt(Box::new(move |_| {
+            retry_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }))
+        .await;
+    assert!(
+        refused
+            .err()
+            .expect("pending original must refuse reconstruction")
+            .to_string()
+            .contains("prior receipt")
+    );
+    release.now();
+    let receipt = operation.receive().await.unwrap();
+    receipt.result.unwrap();
+    assert_eq!(receipt.outcome, orch_infra::sqlite::WriteOutcome::Committed);
+    assert!(
+        operation
+            .receive()
+            .await
+            .err()
+            .expect("no second receipt")
+            .to_string()
+            .contains("no pending")
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let reopened = f.reopen().await;
+    assert_eq!(f.team_ids(), ["original"]);
+    reopened.close().await.unwrap();
 }
