@@ -73,10 +73,18 @@ pub(super) fn submit<T: Send + 'static>(
 pub(super) fn scenario(
     body: impl FnOnce(&crate::data_dir::DataDir, &WriterHandle, &Arc<DiskBlobStore>),
 ) {
+    scenario_configured(|_| {}, body);
+}
+
+fn scenario_configured(
+    configure: impl FnOnce(&mut Writer<'_>),
+    body: impl FnOnce(&crate::data_dir::DataDir, &WriterHandle, &Arc<DiskBlobStore>),
+) {
     let (_temp, data) = crate::sqlite::test_data();
     setup(&data);
     let disk = Arc::new(DiskBlobStore::open(data.root()).unwrap());
-    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    let (mut writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    configure(&mut writer);
     std::thread::scope(|scope| {
         let thread = scope.spawn(|| writer.run());
         struct Close<'a>(&'a WriterHandle);
@@ -945,42 +953,60 @@ fn task_move_cleanup_poison_refuses_all_reads_and_mutations() {
 // executor's abort guard before it considers committing an apparently Ok job.
 #[test]
 fn caught_router_cleanup_failure_arms_real_writer_before_public_conversion() {
-    scenario(|data, handle, disk| {
-        let state = handle.failure_state();
-        let blobs = disk.clone();
-        let result = submit(handle, move |tx| {
-            let caller = owner("p");
-            let mut unit = EntityWrite::new(tx, &caller, &blobs, state.clone(), 0);
-            unit.create(payload(Family::Task, "t", "before"))?;
-            tx.execute_batch(
-                "CREATE TEMP TRIGGER abort_move BEFORE UPDATE ON tasks
-                BEGIN SELECT RAISE(ROLLBACK, 'synthetic cleanup failure'); END",
-            )?;
-            let error = unit
-                .move_to_end(Family::Task, "t", Revision::ONE)
-                .unwrap_err();
-            assert!(matches!(error, SqliteError::OperationRollback { .. }));
-            assert!(
-                state.failure().is_none(),
-                "cleanup failure alone is not fatal"
-            );
-            // Deliberately do not propagate error or call ensure_committable.
-            Ok(())
-        });
-        assert!(
-            matches!(result, Err(SqliteError::TransactionAborted)),
-            "{result:?}"
-        );
-        let readers =
-            ReadPool::open_with_state(data, Synchronous::Normal, 1, handle.failure_state())
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    // Fail only the router's savepoint cleanup. The Task leaf succeeds, and
+    // the transaction stays open, so its guards cannot mask a missing observer.
+    scenario_configured(
+        |writer| {
+            writer
+                .connection_for_test()
+                .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+                    AuthAction::Savepoint {
+                        savepoint_name: "entity_task_move",
+                        operation: TransactionOperation::Release | TransactionOperation::Rollback,
+                    } => Authorization::Deny,
+                    _ => Authorization::Allow,
+                }))
                 .unwrap();
-        readers
-            .read(Instant::now() + Duration::from_secs(10), |tx| {
-                let count: i64 = tx.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))?;
-                assert_eq!(count, 0);
+        },
+        |data, handle, disk| {
+            let state = handle.failure_state();
+            let blobs = disk.clone();
+            let result = submit(handle, move |tx| {
+                let caller = owner("p");
+                let mut unit = EntityWrite::new(tx, &caller, &blobs, state.clone(), 0);
+                unit.create(payload(Family::Task, "t", "before"))?;
+                let error = unit
+                    .move_to_end(Family::Task, "t", Revision::ONE)
+                    .unwrap_err();
+                assert!(matches!(error, SqliteError::OperationRollback { .. }));
+                assert!(
+                    !tx.is_autocommit(),
+                    "router failure must leave an active transaction"
+                );
+                assert!(
+                    state.failure().is_none(),
+                    "cleanup failure alone is not fatal"
+                );
+                // Deliberately do not propagate error or call ensure_committable.
                 Ok(())
-            })
-            .unwrap();
-        submit(handle, |_| Ok(())).unwrap();
-    });
+            });
+            assert!(
+                matches!(result, Err(SqliteError::TransactionAborted)),
+                "{result:?}"
+            );
+            let readers =
+                ReadPool::open_with_state(data, Synchronous::Normal, 1, handle.failure_state())
+                    .unwrap();
+            readers
+                .read(Instant::now() + Duration::from_secs(10), |tx| {
+                    let count: i64 =
+                        tx.query_row("SELECT count(*) FROM tasks", [], |r| r.get(0))?;
+                    assert_eq!(count, 0);
+                    Ok(())
+                })
+                .unwrap();
+            submit(handle, |_| Ok(())).unwrap();
+        },
+    );
 }
