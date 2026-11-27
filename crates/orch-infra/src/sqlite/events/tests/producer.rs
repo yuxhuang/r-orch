@@ -8,8 +8,8 @@
 //! which a wrongly early commit would show.
 
 use super::super::producer::{
-    EventBatch, EventProducer, EventProducerOptions, Expected, Rejected, SubmitFailure,
-    TransactionReport, rows_are_durable,
+    EventBatch, EventProducer, EventProducerOptions, Expected, Rejected, Submission, SubmitFailure,
+    TransactionReport, accounted_bytes, encoded_events, rows_are_durable,
 };
 use super::{event, owner};
 use crate::sqlite::{SqliteStorage, StorageOptions};
@@ -22,6 +22,14 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 const SAFETY: Duration = Duration::from_secs(20);
+
+/// A submission's answer. A batch that is never answered fails the test within
+/// `SAFETY`; it does not hang it.
+async fn answered(submission: Submission) -> Result<AppendResult, SubmitFailure> {
+    tokio::time::timeout(SAFETY, submission)
+        .await
+        .unwrap_or_else(|_| panic!("the batch was not answered within {SAFETY:?}"))
+}
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -101,6 +109,13 @@ impl Fixture {
             epoch,
             events: seqs.map(event).collect(),
         }
+    }
+
+    /// A batch with no events: a lease check.
+    async fn empty_batch(&self, project: &str, run: &str) -> EventBatch {
+        let mut batch = self.batch(project, run, 1..=1).await;
+        batch.events.clear();
+        batch
     }
 
     async fn stored(&self, project: &str, run: &str) -> Vec<SequencedEvent> {
@@ -748,11 +763,13 @@ async fn an_empty_batch_still_checks_its_lease() {
     let mut batch = fx.batch("p", "run", 1..=1).await;
     batch.events.clear();
     assert_eq!(
-        producer.submit(batch.clone()).unwrap().await.unwrap(),
+        answered(producer.submit(batch.clone()).unwrap())
+            .await
+            .unwrap(),
         counts(0, 0)
     );
     batch.epoch += 1;
-    let failure = producer.submit(batch).unwrap().await.unwrap_err();
+    let failure = answered(producer.submit(batch).unwrap()).await.unwrap_err();
     assert!(matches!(failure.error, StoreError::StaleEpoch));
     producer.close().await;
 }
@@ -864,9 +881,15 @@ async fn too_many_waiting_events_return_the_batch_to_its_collector() {
     let lead = producer.submit(lead).unwrap();
     in_flight(&producer).await;
     let a = producer.submit(a).unwrap();
+    let encoded = encoded_events();
     let Err(Rejected::Full(returned)) = producer.submit(b) else {
         panic!("the second batch does not fit");
     };
+    assert_eq!(
+        encoded_events(),
+        encoded,
+        "a batch that cannot fit is returned before it is encoded"
+    );
     assert_eq!(
         returned.events.len(),
         8,
@@ -948,9 +971,9 @@ async fn a_batch_the_store_cannot_hold_fails_alone_and_the_runs_beside_it_commit
     in_flight(&producer).await;
     let [a, poison, c] = [a, poison, c].map(|b| producer.submit(b).unwrap());
     stall.end().await;
-    lead.await.unwrap();
-    assert_eq!(a.await.unwrap(), counts(3, 0));
-    let failure = poison.await.unwrap_err();
+    answered(lead).await.unwrap();
+    assert_eq!(answered(a).await.unwrap(), counts(3, 0));
+    let failure = answered(poison).await.unwrap_err();
     assert!(
         matches!(failure.error, StoreError::Backend(_)),
         "{failure:?}"
@@ -960,7 +983,7 @@ async fn a_batch_the_store_cannot_hold_fails_alone_and_the_runs_beside_it_commit
         (counts(0, 0), 2),
         "the first event rolled back with the transaction, and is the caller's to keep"
     );
-    assert_eq!(c.await.unwrap(), counts(2, 0));
+    assert_eq!(answered(c).await.unwrap(), counts(2, 0));
     assert!(fx.stored("p", "poison").await.is_empty());
     assert_eq!(fx.stored("p", "a").await.len(), 3);
     assert_eq!(fx.stored("p", "c").await.len(), 2);
@@ -1040,5 +1063,492 @@ async fn the_real_clock_may_cut_anywhere_and_every_event_still_commits_once_in_o
         let tail = snapshot.read_events(run, 600, 1000).await.unwrap();
         assert_eq!(tail, (601..=700).map(event).collect::<Vec<_>>());
     }
+    producer.close().await;
+}
+
+// ---- Admission: what the producer may hold (security review M1) ----
+
+fn same_batch(returned: &EventBatch, sent: &EventBatch) {
+    assert_eq!(returned.caller, sent.caller);
+    assert_eq!(returned.run, sent.run);
+    assert_eq!(returned.lineage, sent.lineage);
+    assert_eq!(returned.epoch, sent.epoch);
+    assert_eq!(
+        returned.events, sent.events,
+        "the caller still owns every event"
+    );
+}
+
+#[tokio::test]
+async fn a_first_batch_over_the_event_limit_is_returned_whole_and_unencoded() {
+    let mut fx = fixture();
+    fx.options.queue_limit = 10;
+    let producer = fx.producer();
+    let over = fx.batch("p", "over", 1..=11).await;
+    let encoded = encoded_events();
+    let Err(Rejected::TooLarge(returned)) = producer.submit(over.clone()) else {
+        panic!("eleven events can never fit a limit of ten");
+    };
+    same_batch(&returned, &over);
+    assert_eq!(encoded_events(), encoded, "nothing was encoded");
+    assert_eq!(producer.retained(), (0, 0, 0), "nothing is kept");
+    // Exactly the limit is admitted on an empty queue, and its capacity comes back.
+    let exact = fx.batch("p", "exact", 1..=10).await;
+    assert_eq!(
+        answered(producer.submit(exact).unwrap()).await.unwrap(),
+        counts(10, 0)
+    );
+    assert_eq!(producer.retained(), (0, 0, 0));
+    assert!(fx.stored("p", "over").await.is_empty());
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn empty_batches_saturate_their_own_limit_and_the_capacity_comes_back() {
+    let mut fx = fixture();
+    fx.options.batch_limit = 3;
+    let producer = fx.producer();
+    let [lead, e1, e2, e3] = [
+        fx.batch("p", "lead", 1..=1).await,
+        fx.empty_batch("p", "e1").await,
+        fx.empty_batch("p", "e2").await,
+        fx.batch("p", "e3", 1..=3).await,
+    ];
+    let stall = fx.stall().await;
+    let lead = producer.submit(lead).unwrap();
+    in_flight(&producer).await;
+    let e1 = producer.submit(e1.clone()).unwrap();
+    let e2 = producer.submit(e2).unwrap();
+    // The batch in the transaction counts: three batches wait, none of them for
+    // many events, and the limit on events (16,384) is nowhere near.
+    let (batches, events, _) = producer.retained();
+    assert_eq!((batches, events), (3, 1));
+    let encoded = encoded_events();
+    let Err(Rejected::Full(returned)) = producer.submit(e3.clone()) else {
+        panic!("a fourth batch does not fit a limit of three");
+    };
+    same_batch(&returned, &e3);
+    assert_eq!(encoded_events(), encoded, "refused before it was encoded");
+    stall.end().await;
+    answered(lead).await.unwrap();
+    assert_eq!(answered(e1).await.unwrap(), counts(0, 0));
+    assert_eq!(answered(e2).await.unwrap(), counts(0, 0));
+    assert_eq!(producer.retained(), (0, 0, 0), "all capacity came back");
+    assert_eq!(
+        answered(producer.submit(*returned).unwrap()).await.unwrap(),
+        counts(3, 0),
+        "the returned batch is admitted once there is room"
+    );
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn metadata_alone_counts_against_the_byte_limit() {
+    let mut fx = fixture();
+    let name = |i: u32| format!("{i}-{}", "r".repeat(4096));
+    let [a, b] = [
+        fx.empty_batch("p", &name(1)).await,
+        fx.empty_batch("p", &name(2)).await,
+    ];
+    let held = accounted_bytes(&a);
+    assert!(
+        held > 2 * 4096,
+        "the run name is held, and held again by its plan"
+    );
+    assert_eq!(held, accounted_bytes(&b));
+    // Room for one and a half: the second empty batch waits for the first.
+    fx.options.byte_limit = held + held / 2;
+    let producer = fx.producer();
+    let stall = fx.stall().await;
+    let first = producer.submit(a).unwrap();
+    assert_eq!(producer.retained(), (1, 0, held));
+    let Err(Rejected::Full(returned)) = producer.submit(b.clone()) else {
+        panic!("the second batch's strings do not fit beside the first's");
+    };
+    same_batch(&returned, &b);
+    stall.end().await;
+    assert_eq!(answered(first).await.unwrap(), counts(0, 0));
+    assert_eq!(producer.retained(), (0, 0, 0));
+    assert_eq!(
+        answered(producer.submit(*returned).unwrap()).await.unwrap(),
+        counts(0, 0)
+    );
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn the_byte_limit_is_exact_and_a_batch_past_it_is_returned_whole() {
+    let mut fx = fixture();
+    let batch = fx.batch("p", "run", 1..=5).await;
+    let held = accounted_bytes(&batch);
+    // Exactly the envelope is admitted on an empty queue.
+    fx.options.byte_limit = held;
+    let producer = fx.producer();
+    assert_eq!(
+        answered(producer.submit(batch.clone()).unwrap())
+            .await
+            .unwrap(),
+        counts(5, 0)
+    );
+    assert_eq!(producer.retained(), (0, 0, 0));
+    producer.close().await;
+    // One byte less can never be admitted, however little waits.
+    let other = fx.batch("p", "other", 1..=5).await;
+    let held_other = accounted_bytes(&other);
+    fx.options.byte_limit = held_other - 1;
+    let producer = fx.producer();
+    let Err(Rejected::TooLarge(returned)) = producer.submit(other.clone()) else {
+        panic!("one byte over the envelope");
+    };
+    same_batch(&returned, &other);
+    assert_eq!(producer.retained(), (0, 0, 0));
+    assert!(fx.stored("p", "other").await.is_empty());
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn an_event_that_does_not_fit_stops_the_encoding_of_the_rest() {
+    let mut fx = fixture();
+    let (lineage, epoch) = fx.lease("p", "run").await;
+    // Five events of one size: the envelope holds the strings and two of them,
+    // less a byte, so the second is the first that does not fit.
+    let big = |seq| big_event(seq, 10_000);
+    let batch = EventBatch {
+        caller: owner("p"),
+        run: "run".into(),
+        lineage,
+        epoch,
+        events: (1..=5).map(big).collect(),
+    };
+    let fixed = batch.fixed_bytes();
+    let one = (accounted_bytes(&batch) - fixed) / 5;
+    fx.options.byte_limit = fixed + 2 * one - 1;
+    let producer = fx.producer();
+    let encoded = encoded_events();
+    let Err(Rejected::TooLarge(returned)) = producer.submit(batch.clone()) else {
+        panic!("five events do not fit an envelope of fewer than two");
+    };
+    same_batch(&returned, &batch);
+    assert_eq!(
+        encoded_events() - encoded,
+        2,
+        "the first event fits, the second does not, the other three are never encoded"
+    );
+    assert_eq!(producer.retained(), (0, 0, 0));
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn a_full_queue_refuses_a_large_batch_without_encoding_it_and_the_default_envelope_takes_a_blob()
+ {
+    let mut fx = fixture();
+    let (lineage, epoch) = fx.lease("p", "run").await;
+    let large = EventBatch {
+        caller: owner("p"),
+        run: "run".into(),
+        lineage,
+        epoch,
+        events: vec![big_event(1, 1024 * 1024)],
+    };
+    let held = accounted_bytes(&large);
+    let lead = fx.batch("p", "lead", 1..=1).await;
+    let lead_held = accounted_bytes(&lead);
+    // Room for the lead and not for the large batch beside it.
+    fx.options.byte_limit = lead_held + held - 1;
+    let producer = fx.producer();
+    let stall = fx.stall().await;
+    let lead = producer.submit(lead).unwrap();
+    in_flight(&producer).await;
+    let encoded = encoded_events();
+    let Err(Rejected::Full(returned)) = producer.submit(large.clone()) else {
+        panic!("it fits the envelope alone, not beside the lead");
+    };
+    // The strings did not exclude it, so its one event was measured and found
+    // not to fit what is free; nothing past that was looked at.
+    assert!(encoded_events() - encoded <= 1);
+    same_batch(&returned, &large);
+    stall.end().await;
+    answered(lead).await.unwrap();
+    assert_eq!(
+        answered(producer.submit(*returned).unwrap()).await.unwrap(),
+        counts(1, 0),
+        "alone, it is admitted"
+    );
+    producer.close().await;
+    // The default envelope admits one event of the size of a blob, committed
+    // whole (`an_atomic_operation_over_the_bound_runs_whole_and_is_counted`
+    // stores 48 MiB through it) and an event one byte past what a blob holds, which
+    // fails alone (`a_batch_the_store_cannot_hold_fails_alone_...`).
+    assert!(EventProducerOptions::default().byte_limit >= 3 * 64 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn capacity_returns_after_completion_after_a_refusal_and_exactly_fills_again() {
+    let mut fx = fixture();
+    fx.options.queue_limit = 10;
+    let producer = fx.producer();
+    for run in ["x", "y", "z"] {
+        let batch = fx.batch("p", run, 1..=5).await;
+        assert_eq!(
+            answered(producer.submit(batch).unwrap()).await.unwrap(),
+            counts(5, 0)
+        );
+        assert_eq!(
+            producer.retained(),
+            (0, 0, 0),
+            "{run} gave its capacity back"
+        );
+    }
+    // A refused batch (its lease is stale) leaves nothing behind either.
+    let mut stale = fx.batch("p", "stale", 1..=4).await;
+    stale.epoch += 1;
+    let failure = answered(producer.submit(stale).unwrap()).await.unwrap_err();
+    assert!(matches!(failure.error, StoreError::StaleEpoch));
+    assert_eq!(producer.retained(), (0, 0, 0));
+    // So all ten events of the limit are free again, while one is in flight.
+    let lead = fx.batch("p", "lead", 1..=1).await;
+    let (a, b) = (
+        fx.batch("p", "a", 1..=4).await,
+        fx.batch("p", "b", 1..=5).await,
+    );
+    let stall = fx.stall().await;
+    let lead = producer.submit(lead).unwrap();
+    in_flight(&producer).await;
+    let a = producer.submit(a).unwrap();
+    let b = producer.submit(b).unwrap();
+    assert_eq!(producer.retained().1, 10, "exactly the limit");
+    stall.end().await;
+    answered(lead).await.unwrap();
+    assert_eq!(answered(a).await.unwrap(), counts(4, 0));
+    assert_eq!(answered(b).await.unwrap(), counts(5, 0));
+    assert_eq!(producer.retained(), (0, 0, 0));
+    producer.close().await;
+}
+
+// ---- The producer's task ends: nothing is left waiting (code review I1) ----
+
+/// A second producer on the same storage commits a batch: the writer that the
+/// first one used is healthy, and the failure was the task's, not the store's.
+async fn the_writer_still_serves(fx: &Fixture) {
+    assert!(fx.storage.failure_state().failure().is_none());
+    let next = EventProducer::new(fx.storage.clone(), EventProducerOptions::default());
+    let batch = fx.batch("p", "after", 1..=2).await;
+    assert_eq!(
+        answered(next.submit(batch).unwrap()).await.unwrap(),
+        counts(2, 0)
+    );
+    assert_eq!(fx.stored("p", "after").await.len(), 2);
+    fx.storage
+        .transaction(owner("p"), Lane::Maintenance, |_| Ok(()))
+        .await
+        .unwrap();
+    next.close().await;
+}
+
+#[tokio::test]
+async fn a_panic_in_the_clock_answers_every_held_batch_and_closes_intake() {
+    let mut fx = fixture();
+    // The clock runs inside the transaction, on the writer's thread; the retained
+    // write resumes its panic on the producer's task.
+    fx.options.now = Arc::new(|| panic!("synthetic clock panic"));
+    let producer = fx.producer();
+    let lead = fx.batch("p", "lead", 1..=3).await;
+    let waiting = fx.batch("p", "waiting", 1..=4).await;
+    let late = fx.batch("p", "late", 1..=2).await;
+    let stall = fx.stall().await;
+    let lead = producer.submit(lead).unwrap();
+    in_flight(&producer).await;
+    let waiting = producer.submit(waiting).unwrap();
+    stall.end().await;
+    let started = answered(lead).await.unwrap_err();
+    assert!(
+        started.outcome_unknown,
+        "the transaction it was in did not report: its outcome is unknown"
+    );
+    assert_eq!((started.committed, started.not_stored), (counts(0, 0), 3));
+    let queued = answered(waiting).await.unwrap_err();
+    assert!(!queued.outcome_unknown, "it never reached a transaction");
+    assert_eq!((queued.committed, queued.not_stored), (counts(0, 0), 4));
+    assert!(matches!(queued.error, StoreError::Backend(_)), "{queued:?}");
+    // Intake is closed and gives the batch back, unencoded; flush does not wait.
+    let encoded = encoded_events();
+    let Err(Rejected::Closed(returned, cause)) = producer.submit(late.clone()) else {
+        panic!("a producer whose task ended takes nothing");
+    };
+    same_batch(&returned, &late);
+    assert!(cause.contains("ended"), "{cause}");
+    assert_eq!(encoded_events(), encoded);
+    tokio::time::timeout(SAFETY, producer.flush())
+        .await
+        .expect("flush returns once nothing is held");
+    assert_eq!(producer.retained(), (0, 0, 0));
+    assert!(fx.stored("p", "lead").await.is_empty());
+    assert!(fx.stored("p", "waiting").await.is_empty());
+    the_writer_still_serves(&fx).await;
+    tokio::time::timeout(SAFETY, producer.close())
+        .await
+        .expect("close returns");
+}
+
+#[tokio::test]
+async fn a_panic_in_the_observer_answers_what_it_completed_and_then_everything_held() {
+    let mut fx = fixture();
+    // The first transaction is reported quietly; the second one's report panics.
+    let reports = Arc::new(AtomicU64::new(0));
+    fx.options.observer = Some(Arc::new(move |_| {
+        assert!(
+            reports.fetch_add(1, Ordering::SeqCst) == 0,
+            "synthetic observer panic"
+        );
+    }));
+    let producer = fx.producer();
+    let lead = fx.batch("p", "lead", 1..=1).await;
+    let short = fx.batch("p", "short", 1..=3).await;
+    let long = fx.batch("p", "long", 1..=1200).await;
+    let behind = fx.batch("p", "behind", 1..=2).await;
+    let stall = fx.stall().await;
+    let lead = producer.submit(lead).unwrap();
+    in_flight(&producer).await;
+    let [short, long, behind] = [short, long, behind].map(|b| producer.submit(b).unwrap());
+    stall.end().await;
+    answered(lead).await.unwrap();
+    // The second transaction holds `short` and the first 997 events of `long`,
+    // and commits. Its observer panics only after that is known and the batch
+    // it completed has been answered.
+    assert_eq!(answered(short).await.unwrap(), counts(3, 0));
+    let cut = answered(long).await.unwrap_err();
+    assert_eq!((cut.committed, cut.not_stored), (counts(997, 0), 203));
+    assert!(
+        !cut.outcome_unknown,
+        "the commit of its prefix was known, and nothing of its tail started"
+    );
+    let queued = answered(behind).await.unwrap_err();
+    assert!(!queued.outcome_unknown);
+    assert_eq!((queued.committed, queued.not_stored), (counts(0, 0), 2));
+    assert!(matches!(
+        producer.submit(fx.batch("p", "late", 1..=1).await),
+        Err(Rejected::Closed(..))
+    ));
+    tokio::time::timeout(SAFETY, producer.flush())
+        .await
+        .expect("flush returns once nothing is held");
+    assert_eq!(producer.retained(), (0, 0, 0));
+    assert_eq!(fx.stored("p", "short").await.len(), 3);
+    assert_eq!(fx.stored("p", "long").await.len(), 997);
+    assert!(fx.stored("p", "behind").await.is_empty());
+    the_writer_still_serves(&fx).await;
+    tokio::time::timeout(SAFETY, producer.close())
+        .await
+        .expect("close returns");
+}
+
+// ---- Order, plans and accounting that only the database can show ----
+
+#[tokio::test]
+async fn a_lost_unknown_commit_that_also_carried_stored_duplicates_stays_unknown() {
+    // Three of the ten events are already stored and are skipped as duplicates
+    // in the same statement as the seven new ones. The COMMIT then loses the
+    // seven and reports an error nobody can classify. Reconciliation finds three
+    // of the ten expected rows: neither all nor none. The producer does not turn
+    // that into "not stored" and rebuild; it says the outcome is unknown, closes,
+    // and leaves the collector to decide (code review N1, kept as it is).
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = Arc::clone(&armed);
+    let mut once = true;
+    let fx = fixture_with(StorageOptions {
+        writer_commit_probe: Some(Box::new(move |tx| {
+            if !flag.load(Ordering::SeqCst) || !once {
+                return None;
+            }
+            once = false;
+            tx.execute_batch("DELETE FROM run_events WHERE seq > 3; COMMIT")
+                .unwrap();
+            Some(Err(sql(10)))
+        })),
+        ..StorageOptions::default()
+    });
+    let producer = fx.producer();
+    let batch = fx.batch("p", "run", 1..=10).await;
+    let (lineage, epoch) = (batch.lineage.clone(), batch.epoch);
+    fx.storage
+        .transaction(owner("p"), Lane::Events, move |unit| {
+            unit.append_events("run", &lineage, epoch, &[event(1), event(2), event(3)])
+        })
+        .await
+        .unwrap();
+    armed.store(true, Ordering::SeqCst);
+    let failure = answered(producer.submit(batch.clone()).unwrap())
+        .await
+        .unwrap_err();
+    assert!(failure.outcome_unknown, "{failure:?}");
+    assert!(
+        failure.error.to_string().contains("only some rows"),
+        "{failure:?}"
+    );
+    assert_eq!(fx.reports().len(), 0, "no commit was ever reported");
+    assert!(matches!(producer.submit(batch), Err(Rejected::Closed(..))));
+    assert_eq!(fx.stored("p", "run").await.len(), 3, "only the duplicates");
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn an_event_with_a_blob_is_a_statement_of_its_own_and_the_cut_falls_around_it() {
+    // 7 ms a reading: the first statement is free and three fit before 20 ms.
+    // Light events, one that needs a blob, light events again, another blob:
+    // [3 light] [blob] [3 light] and the fourth statement is cut. If a blob event
+    // shared its statement, the whole batch would be one statement and no cut.
+    let mut fx = fixture();
+    fx.options.now = stepped_clock(Duration::from_millis(7));
+    let producer = fx.producer();
+    let (lineage, epoch) = fx.lease("p", "run").await;
+    let big = 64 * 1024 + 1;
+    let mut events: Vec<_> = (1..=3).map(event).collect();
+    events.push(big_event(4, big));
+    events.extend((5..=7).map(event));
+    events.push(big_event(8, big));
+    events.extend((9..=12).map(event));
+    let batch = EventBatch {
+        caller: owner("p"),
+        run: "run".into(),
+        lineage,
+        epoch,
+        events,
+    };
+    assert_eq!(
+        answered(producer.submit(batch).unwrap()).await.unwrap(),
+        counts(12, 0)
+    );
+    let shape: Vec<_> = fx
+        .reports()
+        .iter()
+        .map(|r| (r.events, r.cut_by_time))
+        .collect();
+    assert_eq!(shape, [(7, true), (5, false)]);
+    assert_eq!(fx.stored("p", "run").await.len(), 12);
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn the_planned_rows_equal_the_actual_rows_at_the_inline_threshold() {
+    // 65,536 bytes of JSON stay in the row, one more goes behind a blob (N5).
+    let fx = fixture();
+    let producer = fx.producer();
+    let (lineage, epoch) = fx.lease("p", "run").await;
+    let base = serde_json::to_vec(&big_event(1, 0).event).unwrap().len();
+    let to = |seq, total: usize| big_event(seq, total - base);
+    let batch = EventBatch {
+        caller: owner("p"),
+        run: "run".into(),
+        lineage,
+        epoch,
+        events: vec![to(1, 64 * 1024 - 1), to(2, 64 * 1024), to(3, 64 * 1024 + 1)],
+    };
+    assert_eq!(
+        answered(producer.submit(batch).unwrap()).await.unwrap(),
+        counts(3, 0)
+    );
+    // One row each for the first two, two for the third: the plan's cost is the
+    // writer's own count of rows it changed.
+    assert_eq!(fx.reports()[0].accounting.rows, 4);
     producer.close().await;
 }

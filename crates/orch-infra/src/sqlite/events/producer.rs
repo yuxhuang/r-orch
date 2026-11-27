@@ -17,30 +17,46 @@
 //!   when its payload goes behind a blob reference); the time is checked
 //!   between statements, never inside one. At least one statement always runs.
 //!   What is not committed is kept, in order, for the next transaction.
-//! * **Actual work.** The writer counts the actual rows and time of every
-//!   physical transaction, once, in `writer_txn_over_bound_total`. This module
-//!   never counts, so an indivisible event over the bound (one statement that
-//!   cannot be cut) is counted by the writer alone and a retry never counts it
+//! * **Actual work.** The writer counts every physical transaction once in
+//!   `writer_txn_over_bound_total` when its actual rows pass 1,000 or its
+//!   measured work, the COMMIT included, passes 20 ms. This module never counts.
+//!   A transaction that it cuts by time has already spent 20 ms of statements
+//!   before its COMMIT, so the writer counts it too: the counter does not
+//!   separate divisible bulk work that was cut from an indivisible event (one
+//!   statement that cannot be cut). That is the decided meaning (option 1 of the
+//!   lead's metric decision), not a defect. A retry never counts a transaction
 //!   twice.
+//! * **Admission.** What the producer keeps for batches that wait is bounded in
+//!   three independent ways, so that a collector cannot make it hold more than a
+//!   known amount: batches (an empty batch is a lease check and counts as one),
+//!   events, and accounted bytes, metadata included (see `QUEUE_LIMIT_BYTES`).
+//!   The cheap checks run first and a batch that is already excluded is never
+//!   encoded. A batch that is refused is returned to its caller whole.
 //! * **Retained input.** A batch is dropped from memory only on a known commit
 //!   or a definitive refusal. After a confirmed noncommit with a retryable cause
 //!   the same transaction is rebuilt from the retained input as a new request of
 //!   the same retry episode (`RetainedWrite`). After an unknown commit it is
 //!   first reconciled: the producer reads back the exact rows it expected and
 //!   commits to nothing until the database has answered.
+//! * **Failure of the task.** If the producer's task ends with batches still
+//!   held (a panic in the clock or the observer, or a runtime that shuts down),
+//!   every held batch is answered at once and intake closes. A batch that was in
+//!   a transaction at that moment says its outcome is unknown; the others were
+//!   not started.
 //!
 //! Not here (T16, later): numbering at handover, the collector's buffer and its
 //! gaps, the counters at start and the stop record (R61, R63, R139), and pruning.
 //! Daemon wiring and activation are not part of this slice.
 
 use super::MAX_ROWS;
-use crate::blob::INLINE_TEXT_MAX_BYTES;
+use crate::blob::{INLINE_TEXT_MAX_BYTES, MAX_BLOB_BYTES};
 use crate::sqlite::{RetainedWrite, SqliteStorage, WriteAccounting, WriteAttempt, WriteOutcome};
 use orch_core::store::events::{AppendResult, SequencedEvent};
-use orch_core::store::{Caller, Lane, ReadSnapshot, StoreError, UnitOfWork, WriteWork};
+use orch_core::store::{Caller, Lane, Principal, ReadSnapshot, StoreError, UnitOfWork, WriteWork};
 use orch_domain::RunEvent;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -53,9 +69,30 @@ pub(crate) const MAX_WORK: Duration = Duration::from_millis(20);
 /// Events per statement. The clock is read between statements, so this is also
 /// the grain of the 20 ms cut; an event with a blob is a statement of its own.
 const STEP_EVENTS: usize = 32;
-/// The most events that may wait in the producer; a collector that is refused
-/// keeps its buffer (R63) and tries again.
+/// The most events that may wait in the producer, and also the most one batch
+/// may hold: a collector that is refused keeps its buffer (R63) and tries again,
+/// or splits a batch that can never fit.
 const QUEUE_LIMIT_EVENTS: usize = 16_384;
+/// The most batches that may wait. It is independent of the events: an empty
+/// batch (a lease check) holds a caller, a run name and a reply channel, and a
+/// producer that counted only events would keep any number of them.
+const QUEUE_LIMIT_BATCHES: usize = 4_096;
+/// The most accounted bytes that may wait: four times the largest blob. A single
+/// event may be as large as the blob store takes (64 MiB, R97) and is one
+/// statement that cannot be cut, so the envelope has to hold one of them with
+/// room beside it; an event past what a blob holds is still admitted below this
+/// and fails alone at its statement. The figure is the encoded size of the
+/// events plus the strings and structures the producer holds for them (see
+/// `Measure`), not a measurement of the allocator.
+const QUEUE_LIMIT_BYTES: usize = 4 * MAX_BLOB_BYTES as usize;
+/// What a waiting batch holds besides its strings and events: its entry in the
+/// queue, the slice of the plan built from it, and a reply channel.
+const BATCH_FIXED_BYTES: usize = size_of::<Pending>() + size_of::<Slice>() + 128;
+/// What a waiting event holds besides its encoded form: the event, and its cost.
+const EVENT_FIXED_BYTES: usize = size_of::<SequencedEvent>() + 1;
+/// The caller and run strings live in the batch and again in each plan that is
+/// built from it.
+const STRING_COPIES: usize = 2;
 /// Waits of a producer whose submission the writer's queue did not admit.
 const ADMISSION_WAIT: Duration = Duration::from_millis(25);
 const ADMISSION_WAIT_MAX: Duration = Duration::from_millis(250);
@@ -90,8 +127,13 @@ pub struct SubmitFailure {
 /// Why `submit` returned the batch to its caller.
 #[derive(Debug)]
 pub enum Rejected {
-    /// Too many events wait. Keep the batch and submit it again later.
+    /// Too many batches, events or bytes wait. Keep the batch and submit it
+    /// again later.
     Full(Box<EventBatch>),
+    /// The batch could never be admitted, however little waits: it holds more
+    /// events than the limit, or more accounted bytes than the envelope. Split
+    /// it, or turn it into a gap; submitting it again is refused again.
+    TooLarge(Box<EventBatch>),
     /// The producer has failed or was closed; the text is the first cause.
     Closed(Box<EventBatch>, String),
 }
@@ -116,10 +158,20 @@ type Now = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 #[derive(Clone)]
 pub struct EventProducerOptions {
-    /// The clock of the 20 ms cut. The writer measures its own actual time.
+    /// The clock of the 20 ms cut. The writer measures its own actual time. It
+    /// runs inside the transaction, on the writer's thread; a panic in it ends
+    /// the producer (see the module's "Failure of the task").
     pub now: Now,
+    /// Called once for every committed transaction, after the table has been
+    /// updated and before the batches it completed are answered. A panic in it
+    /// ends the producer after those batches have been answered.
     pub observer: Option<Observer>,
+    /// The most events that may wait, and the most one batch may hold.
     pub queue_limit: usize,
+    /// The most batches that may wait, empty ones included.
+    pub batch_limit: usize,
+    /// The most accounted bytes that may wait, metadata included.
+    pub byte_limit: usize,
 }
 
 impl Default for EventProducerOptions {
@@ -128,6 +180,8 @@ impl Default for EventProducerOptions {
             now: Arc::new(Instant::now),
             observer: None,
             queue_limit: QUEUE_LIMIT_EVENTS,
+            batch_limit: QUEUE_LIMIT_BATCHES,
+            byte_limit: QUEUE_LIMIT_BYTES,
         }
     }
 }
@@ -166,6 +220,8 @@ struct Pending {
     epoch: u64,
     events: Arc<[SequencedEvent]>,
     costs: Arc<[u8]>,
+    /// What the batch holds, as `Measure` counted it; given back when it leaves.
+    accounted: usize,
     consumed: usize,
     /// A statement of this batch has committed. An empty batch is answered
     /// only after its lease check has committed.
@@ -196,9 +252,57 @@ impl Pending {
 #[derive(Default)]
 struct Queue {
     pending: VecDeque<Pending>,
+    /// Events not yet committed or answered, over every waiting batch.
     events: usize,
+    /// Accounted bytes of every waiting batch, whole until it is answered: the
+    /// events of a committed prefix stay in memory with their batch.
+    bytes: usize,
     busy: bool,
+    /// The batches of the transaction being driven. If the task ends while they
+    /// are set, their outcome is unknown.
+    in_flight: Vec<u64>,
     closed: Option<String>,
+}
+
+/// Why a batch was not admitted.
+enum Refusal {
+    Closed(String),
+    Full,
+    TooLarge,
+}
+
+impl Queue {
+    /// Whether a batch of `events`, holding `bytes` accounted bytes, may wait.
+    /// `TooLarge` does not depend on what waits; `Full` does.
+    fn admit(
+        &self,
+        limits: &EventProducerOptions,
+        events: usize,
+        bytes: usize,
+    ) -> Result<(), Refusal> {
+        if let Some(cause) = &self.closed {
+            return Err(Refusal::Closed(cause.clone()));
+        }
+        if events > limits.queue_limit || bytes > limits.byte_limit {
+            return Err(Refusal::TooLarge);
+        }
+        if self.pending.len() >= limits.batch_limit
+            || events > limits.queue_limit.saturating_sub(self.events)
+            || bytes > limits.byte_limit.saturating_sub(self.bytes)
+        {
+            return Err(Refusal::Full);
+        }
+        Ok(())
+    }
+}
+
+fn rejected(batch: EventBatch, refusal: Refusal) -> Rejected {
+    let batch = Box::new(batch);
+    match refusal {
+        Refusal::Closed(cause) => Rejected::Closed(batch, cause),
+        Refusal::Full => Rejected::Full(batch),
+        Refusal::TooLarge => Rejected::TooLarge(batch),
+    }
 }
 
 struct Shared {
@@ -245,20 +349,41 @@ impl EventProducer {
     }
 
     /// Takes ownership of the batch. It is returned when it cannot be kept.
+    ///
+    /// Admission goes from the cheap check to the dear one, and a batch that an
+    /// earlier check excludes is returned before anything is encoded: the strings
+    /// and the event count against the limits first, then the events' encoded
+    /// sizes against what is still free (the walk stops at the first event that
+    /// does not fit), and last the same limits again, because other submissions
+    /// may have arrived while the events were measured.
     pub fn submit(&self, batch: EventBatch) -> Result<Submission, Rejected> {
-        let costs: Arc<[u8]> = batch.events.iter().map(|e| row_cost(&e.event)).collect();
+        let options = &self.shared.options;
+        let fixed = batch.fixed_bytes();
+        let free = {
+            let queue = self.shared.queue();
+            match queue.admit(options, batch.events.len(), fixed) {
+                Ok(()) => options.byte_limit - queue.bytes - fixed,
+                Err(refusal) => return Err(rejected(batch, refusal)),
+            }
+        };
+        let Some(measured) = Measure::of(&batch.events, free) else {
+            // Past what was free. It could never fit if nothing else was waiting.
+            let refusal = match &self.shared.queue().closed {
+                Some(cause) => Refusal::Closed(cause.clone()),
+                None if free == options.byte_limit - fixed => Refusal::TooLarge,
+                None => Refusal::Full,
+            };
+            return Err(rejected(batch, refusal));
+        };
+        let accounted = fixed + measured.bytes;
+        let costs = measured.costs;
         let mut queue = self.shared.queue();
-        if let Some(cause) = &queue.closed {
-            let cause = cause.clone();
-            return Err(Rejected::Closed(Box::new(batch), cause));
-        }
-        if !queue.pending.is_empty()
-            && queue.events + batch.events.len() > self.shared.options.queue_limit
-        {
-            return Err(Rejected::Full(Box::new(batch)));
+        if let Err(refusal) = queue.admit(options, batch.events.len(), accounted) {
+            return Err(rejected(batch, refusal));
         }
         let (reply, receiver) = oneshot::channel();
         queue.events += batch.events.len();
+        queue.bytes += accounted;
         queue.pending.push_back(Pending {
             id: self.shared.next.fetch_add(1, Ordering::Relaxed),
             caller: batch.caller,
@@ -267,6 +392,7 @@ impl EventProducer {
             epoch: batch.epoch,
             events: Arc::from(batch.events),
             costs,
+            accounted,
             consumed: 0,
             touched: false,
             acc: AppendResult {
@@ -317,6 +443,14 @@ impl EventProducer {
         (queue.pending.len(), queue.busy)
     }
 
+    /// Batches, events and accounted bytes held; all zero once everything is
+    /// answered, so that the capacity a batch took is shown to come back.
+    #[cfg(test)]
+    pub(super) fn retained(&self) -> (usize, usize, usize) {
+        let queue = self.shared.queue();
+        (queue.pending.len(), queue.events, queue.bytes)
+    }
+
     fn stop(&self) {
         let mut queue = self.shared.queue();
         queue
@@ -351,25 +485,103 @@ fn copy_error(error: &StoreError) -> StoreError {
     }
 }
 
+impl EventBatch {
+    /// What the batch holds whatever its events encode to: the producer's
+    /// structures, the caller and run strings (each kept twice), and the fixed
+    /// part of every event. Every string is counted at its length, so a batch
+    /// with no events still has a size.
+    pub(super) fn fixed_bytes(&self) -> usize {
+        let principal = match &self.caller.principal {
+            Principal::Owner { identity } | Principal::Worker { identity } => identity.len(),
+            Principal::Task {
+                identity,
+                task,
+                run,
+                lineage,
+                ..
+            } => identity.len() + task.len() + run.len() + lineage.len(),
+        };
+        let strings = self.caller.project.len() + principal + self.run.len() + self.lineage.len();
+        BATCH_FIXED_BYTES
+            .saturating_add(strings.saturating_mul(STRING_COPIES))
+            .saturating_add(self.events.len().saturating_mul(EVENT_FIXED_BYTES))
+    }
+}
+
+/// What the events of a batch cost: the rows each changes, and their encoded bytes.
+struct Measure {
+    costs: Arc<[u8]>,
+    bytes: usize,
+}
+
+impl Measure {
+    /// `None` when the events encode to more than `free` bytes. The walk stops
+    /// at the first event that does not fit, so what a refused batch costs to
+    /// refuse is bounded by what was free, not by what it holds.
+    fn of(events: &[SequencedEvent], free: usize) -> Option<Self> {
+        let mut costs = Vec::with_capacity(events.len());
+        let mut bytes = 0usize;
+        for sequenced in events {
+            let (rows, size) = row_cost(&sequenced.event, free - bytes)?;
+            costs.push(rows);
+            bytes += size;
+        }
+        Some(Self {
+            costs: costs.into(),
+            bytes,
+        })
+    }
+}
+
+/// What `submit` counts for a batch, as it would hold it.
+#[cfg(test)]
+pub(super) fn accounted_bytes(batch: &EventBatch) -> usize {
+    batch.fixed_bytes() + Measure::of(&batch.events, usize::MAX).unwrap().bytes
+}
+
+/// Events encoded on this thread since it started.
+#[cfg(test)]
+pub(super) fn encoded_events() -> usize {
+    ENCODED.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Events encoded on this thread, so that a test can show that a refusal
+    /// came before any encoding.
+    static ENCODED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Rows a stored event changes (the actual `total_changes` of the writer): its
-/// own, plus the blob's when the stored payload does not fit in the row. This
-/// mirrors `stored_payload`; an event that cannot be encoded counts one row, and
-/// storage refuses it at its statement.
-fn row_cost(event: &RunEvent) -> u8 {
-    struct Count(usize);
+/// own, plus the blob's when the stored payload does not fit in the row; and its
+/// encoded size. This mirrors `stored_payload`; an event that cannot be encoded
+/// counts one row, and storage refuses it at its statement. `None` as soon as
+/// the encoded size passes `limit`.
+fn row_cost(event: &RunEvent, limit: usize) -> Option<(u8, usize)> {
+    struct Count {
+        size: usize,
+        limit: usize,
+    }
     impl std::io::Write for Count {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0 += buf.len();
+            self.size = self.size.saturating_add(buf.len());
+            if self.size > self.limit {
+                return Err(std::io::Error::other("over the limit"));
+            }
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
-    let mut size = Count(0);
-    match serde_json::to_writer(&mut size, event) {
-        Ok(()) if size.0 > INLINE_TEXT_MAX_BYTES => 2,
-        _ => 1,
+    #[cfg(test)]
+    ENCODED.with(|n| n.set(n.get() + 1));
+    let mut count = Count { size: 0, limit };
+    match serde_json::to_writer(&mut count, event) {
+        Ok(()) if count.size > INLINE_TEXT_MAX_BYTES => Some((2, count.size)),
+        Ok(()) => Some((1, count.size)),
+        Err(_) if count.size > count.limit => None,
+        Err(_) => Some((1, count.size)),
     }
 }
 
@@ -526,6 +738,27 @@ struct Drain {
     storage: SqliteStorage,
 }
 
+impl Drop for Drain {
+    /// The task is over. Normally nothing is left to answer; if it ended
+    /// otherwise (a panic in the clock or the observer, which the retained write
+    /// resumes on this task, or a runtime that is shutting down), every batch
+    /// still held is answered now and intake closes, so that no `Submission`
+    /// waits for a task that no longer exists.
+    fn drop(&mut self) {
+        let doubtful = {
+            let mut queue = self.shared.queue();
+            if queue.closed.is_some() && queue.pending.is_empty() {
+                return;
+            }
+            std::mem::take(&mut queue.in_flight)
+        };
+        self.shared.fail_all(
+            &backend("event producer task ended before it answered every batch"),
+            &doubtful,
+        );
+    }
+}
+
 impl Drain {
     async fn run(self) {
         let mut alone = false;
@@ -539,6 +772,7 @@ impl Drain {
                     let id = self.shared.transactions.fetch_add(1, Ordering::Relaxed);
                     if let Some(plan) = next_plan(&queue, id, alone) {
                         queue.busy = true;
+                        queue.in_flight = plan.slices.iter().map(|s| s.pending).collect();
                         break plan;
                     }
                     queue.busy = false;
@@ -550,7 +784,11 @@ impl Drain {
                 work.await;
             };
             let flow = self.drive(plan, &mut alone).await;
-            self.shared.queue().busy = false;
+            {
+                let mut queue = self.shared.queue();
+                queue.busy = false;
+                queue.in_flight.clear();
+            }
             self.shared.idle.notify_waiters();
             if matches!(flow, Flow::Stop) {
                 return;
@@ -704,9 +942,14 @@ impl Drain {
                 }
             }
             queue.events -= stepped.min(queue.events);
+            // Known: what is not answered below is a committed prefix and a tail.
+            queue.in_flight.clear();
         }
-        if let Some(observer) = &self.shared.options.observer {
-            observer(&TransactionReport {
+        // The observer is the caller's. If it panics, the batches this commit
+        // completed are still answered, and then the task ends the way any panic
+        // ends it: what is left is answered by `Drain::drop`.
+        let observed = self.shared.options.observer.as_ref().map(|observer| {
+            let report = TransactionReport {
                 id: plan.id,
                 runs: plan
                     .slices
@@ -717,10 +960,14 @@ impl Drain {
                 cut_by_time: done.cut_by_time,
                 attempts,
                 accounting,
-            });
-        }
+            };
+            catch_unwind(AssertUnwindSafe(|| observer(&report)))
+        });
         for (pending, answer) in answers {
             pending.finish(answer);
+        }
+        if let Some(Err(panic)) = observed {
+            resume_unwind(panic);
         }
     }
 
@@ -746,19 +993,32 @@ impl Drain {
     /// `in_doubt` is the transaction whose commit could not be established: its
     /// batches say so.
     fn fail_all(&self, error: &StoreError, in_doubt: Option<&Plan>) -> Flow {
+        let doubtful: Vec<u64> = in_doubt
+            .map(|plan| plan.slices.iter().map(|s| s.pending).collect())
+            .unwrap_or_default();
+        self.shared.fail_all(error, &doubtful);
+        Flow::Stop
+    }
+}
+
+impl Shared {
+    /// Closes intake and answers every held batch; those of `doubtful` say that
+    /// their outcome is unknown. Nothing is kept: capacity is all returned.
+    fn fail_all(&self, error: &StoreError, doubtful: &[u64]) {
         let drained: Vec<Pending> = {
-            let mut queue = self.shared.queue();
+            let mut queue = self.queue();
             queue.closed = Some(error.to_string());
             queue.events = 0;
+            queue.bytes = 0;
+            queue.busy = false;
+            queue.in_flight.clear();
             queue.pending.drain(..).collect()
         };
         for pending in drained {
-            let doubtful =
-                in_doubt.is_some_and(|plan| plan.slices.iter().any(|s| s.pending == pending.id));
-            let failure = pending.failure(copy_error(error), doubtful);
+            let failure = pending.failure(copy_error(error), doubtful.contains(&pending.id));
             pending.finish(Err(failure));
         }
-        Flow::Stop
+        self.idle.notify_waiters();
     }
 }
 
@@ -778,6 +1038,7 @@ fn take(queue: &mut Queue, id: u64) -> Option<Pending> {
     let position = queue.pending.iter().position(|p| p.id == id)?;
     let pending = queue.pending.remove(position)?;
     queue.events -= pending.events.len() - pending.consumed;
+    queue.bytes -= pending.accounted;
     Some(pending)
 }
 
@@ -891,7 +1152,10 @@ mod tests {
     }
 
     fn pending(id: u64, who: Caller, run: &str, events: Vec<SequencedEvent>) -> Pending {
-        let costs: Arc<[u8]> = events.iter().map(|e| row_cost(&e.event)).collect();
+        let costs: Arc<[u8]> = events
+            .iter()
+            .map(|e| row_cost(&e.event, usize::MAX).unwrap().0)
+            .collect();
         Pending {
             id,
             caller: who,
@@ -900,6 +1164,7 @@ mod tests {
             epoch: 1,
             events: Arc::from(events),
             costs,
+            accounted: 0,
             consumed: 0,
             touched: false,
             acc: AppendResult {
@@ -914,8 +1179,7 @@ mod tests {
         Queue {
             events: items.iter().map(|p| p.events.len()).sum(),
             pending: items.into(),
-            busy: false,
-            closed: None,
+            ..Queue::default()
         }
     }
 
@@ -970,11 +1234,12 @@ mod tests {
     #[test]
     fn an_event_with_a_blob_costs_two_rows_and_the_cut_counts_them() {
         let big = INLINE_TEXT_MAX_BYTES + 1;
-        assert_eq!(row_cost(&event(1, 8).event), 1);
-        assert_eq!(row_cost(&event(1, big).event), 2);
+        let cost = |bytes| row_cost(&event(1, bytes).event, usize::MAX).unwrap().0;
+        assert_eq!(cost(8), 1);
+        assert_eq!(cost(big), 2);
         // The stored payload is the whole event JSON, so a payload that only
         // fits without its envelope is already a blob.
-        assert_eq!(row_cost(&event(1, INLINE_TEXT_MAX_BYTES - 8).event), 2);
+        assert_eq!(cost(INLINE_TEXT_MAX_BYTES - 8), 2);
         let p = caller("p", "a");
         let heavy: Vec<_> = (1..=501).map(|seq| event(seq, big)).collect();
         let q = queue(vec![pending(1, p, "r", heavy)]);
@@ -1011,6 +1276,124 @@ mod tests {
             pending(2, p, "b", small(3)),
         ]);
         assert_eq!(shape(&next_plan(&q, 1, true).unwrap()), [(1, 0, 3)]);
+    }
+
+    #[test]
+    fn a_cut_tail_is_not_overtaken_by_a_later_batch_of_its_run() {
+        // 999 light events and one that needs a blob stop at 999 rows, because the
+        // blob (two rows) does not fit. A later one-row batch of the same run must
+        // not be planned ahead of that tail: seq 1001 would commit before 1000.
+        let p = caller("p", "a");
+        let mut first = small(999);
+        first.push(event(1000, INLINE_TEXT_MAX_BYTES + 1));
+        let q = queue(vec![
+            pending(1, p.clone(), "r", first),
+            pending(2, p, "r", vec![event(1001, 8)]),
+        ]);
+        assert_eq!(shape(&next_plan(&q, 1, false).unwrap()), [(1, 0, 999)]);
+    }
+
+    /// An event whose JSON is exactly `total` bytes.
+    fn encoded_to(total: usize) -> SequencedEvent {
+        let base = serde_json::to_vec(&event(1, 0).event).unwrap().len();
+        let at = event(1, total - base);
+        assert_eq!(serde_json::to_vec(&at.event).unwrap().len(), total);
+        at
+    }
+
+    #[test]
+    fn the_blob_threshold_is_pinned_at_equality_and_the_size_is_the_encoded_one() {
+        // `placement` keeps 65,536 bytes inline and sends one more behind a blob.
+        let at = |total| row_cost(&encoded_to(total).event, usize::MAX).unwrap();
+        assert_eq!(
+            at(INLINE_TEXT_MAX_BYTES - 1),
+            (1, INLINE_TEXT_MAX_BYTES - 1)
+        );
+        assert_eq!(at(INLINE_TEXT_MAX_BYTES), (1, INLINE_TEXT_MAX_BYTES));
+        assert_eq!(
+            at(INLINE_TEXT_MAX_BYTES + 1),
+            (2, INLINE_TEXT_MAX_BYTES + 1)
+        );
+    }
+
+    #[test]
+    fn an_event_is_encoded_only_as_far_as_the_limit_and_the_limit_is_exact() {
+        let e = encoded_to(1000).event;
+        assert_eq!(row_cost(&e, 1000), Some((1, 1000)));
+        assert_eq!(row_cost(&e, 999), None);
+        assert_eq!(row_cost(&e, 0), None);
+    }
+
+    #[test]
+    fn a_batch_is_measured_until_the_first_event_that_does_not_fit() {
+        let events: Vec<_> = (1..=5).map(|_| encoded_to(1000)).collect();
+        let before = encoded_events();
+        assert!(Measure::of(&events, 5000).is_some_and(|m| m.bytes == 5000));
+        assert_eq!(encoded_events() - before, 5);
+        let before = encoded_events();
+        assert!(Measure::of(&events, 1999).is_none());
+        assert_eq!(
+            encoded_events() - before,
+            2,
+            "the second event does not fit, so the other three are not looked at"
+        );
+    }
+
+    fn batch_of(caller: Caller, run: &str, lineage: &str, events: usize) -> EventBatch {
+        EventBatch {
+            caller,
+            run: run.into(),
+            lineage: lineage.into(),
+            epoch: 1,
+            events: small(events as u64),
+        }
+    }
+
+    #[test]
+    fn metadata_is_counted_at_its_length_even_with_no_events() {
+        let p = caller("p", "a");
+        let bare = batch_of(p.clone(), "r", "l", 0).fixed_bytes();
+        assert_eq!(
+            bare,
+            BATCH_FIXED_BYTES + STRING_COPIES * ("p".len() + "a".len() + 2)
+        );
+        let long = batch_of(p.clone(), &"r".repeat(4096), "l", 0).fixed_bytes();
+        assert_eq!(long - bare, STRING_COPIES * 4095, "a run name is held");
+        let more = batch_of(p.clone(), "r", "l", 3).fixed_bytes();
+        assert_eq!(
+            more - bare,
+            3 * EVENT_FIXED_BYTES,
+            "and so is each event's fixed part"
+        );
+        let task = Caller {
+            project: "p".into(),
+            principal: Principal::Task {
+                identity: "a".into(),
+                task: "t".repeat(10),
+                run: "u".repeat(20),
+                lineage: "v".repeat(30),
+                epoch: 1,
+            },
+        };
+        let held = batch_of(task, "r", "l", 0).fixed_bytes();
+        assert_eq!(
+            held - bare,
+            STRING_COPIES * 60,
+            "every string of a task principal"
+        );
+        assert_eq!(
+            batch_of(p, "r", "l", 0).fixed_bytes(),
+            bare,
+            "the count is a function of the batch"
+        );
+    }
+
+    #[test]
+    fn the_default_envelope_holds_a_whole_blob_with_room_beside_it() {
+        // One event may be as large as a blob (64 MiB) and is one statement.
+        const BLOB: usize = MAX_BLOB_BYTES as usize;
+        const { assert!(QUEUE_LIMIT_BYTES >= 3 * BLOB) };
+        const { assert!(QUEUE_LIMIT_BATCHES * BATCH_FIXED_BYTES < QUEUE_LIMIT_BYTES) };
     }
 
     #[test]
