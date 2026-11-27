@@ -1264,7 +1264,7 @@ clients <── WriteReceipt::wait() ──────────────�
   timeout is classified: when the deadline has passed the receipt is `Overloaded` and the closure has not run (a probe
   with a 100 ms deadline and a 300 ms busy timeout was answered after 301 ms), and otherwise the `BEGIN` is tried
   again (next bullet). A queued request is checked only when the worker reaches it.
-- **Retry and retained writes** (spec R128, record P; a development input at `2a7cb83e4`, not wired to the daemon).
+- **Retry and retained writes** (spec R128, record P; landed in PR #412 as `53136a969`, source equal to `2a7cb83e4`; not wired to the daemon).
   The writer retries what it issues itself and never a closure. A failed `BEGIN IMMEDIATE` with a primary result of
   `SQLITE_BUSY`, `SQLITE_LOCKED`, `SQLITE_FULL` or `SQLITE_IOERR` keeps the request, waits 50 ms doubling to 2 s on
   the writer's thread, and tries again within the original deadline; the closure runs once. A `COMMIT` that fails with
@@ -1277,9 +1277,14 @@ clients <── WriteReceipt::wait() ──────────────�
   (`sqlite/storage/retained.rs`; `SqliteStorage::retained_write`) lets a producer that kept its input submit a new
   closure after a confirmed noncommit and reconcile an unknown commit with a new snapshot of the bound caller;
   `Storage::write` is one attempt of its own. One episode (`sqlite/writer/policy.rs`) spans a logical request, holds
-  its deadline and backoff, and while it is open the worker runs no queued job but the retained continuation, so claims
-  and every other lane wait: one logical operation owns the writer until its outcome is known (a built choice of the
-  source, stated in the spec). The worker retires an episode whose last outcome is a known noncommit at its original
+  its deadline and backoff, and while it is open the worker runs no queued job but the retained continuation. `Writer::run`
+  takes a queued job only while `FailureState::claims_suppressed()` is false (the name is narrower than the use: it is true
+  while any episode is open), so `Claims`, `Entities`, `Events` and `Maintenance` all wait, and one logical operation owns
+  the writer until its outcome is known. R128 requires only that no claim is granted; the rest is how the source is built,
+  not a ruling of the owner. A request that carries a deadline (`Storage::write`: 200 ms, 1 s or 5 s for the three lanes
+  that are not claims) is answered `Overloaded` when the worker reaches it past that deadline, which can be well after it;
+  no time bound is given (the spec's "While one logical operation is retained"; no permanent test covers the lanes other
+  than claims, issue 429). The worker retires an episode whose last outcome is a known noncommit at its original
   deadline, between the producer's submissions; an unknown commit stays fenced until it is reconciled. A second
   `SQLITE_IOERR` in a row, counted by the writer across logical requests and ended by a known commit or another SQL
   failure, and sixty seconds from an episode's first failure without a known commit latch
