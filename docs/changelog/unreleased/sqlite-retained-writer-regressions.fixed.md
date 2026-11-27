@@ -1,0 +1,1 @@
+Guard retained SQLite writer expiry, reconciliation, shared I/O-error recovery and transaction accounting with permanent executor and Storage regression tests, including persistent BUSY commit withdrawal without callback replay.
