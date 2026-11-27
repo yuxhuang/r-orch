@@ -246,11 +246,15 @@ refusal of a leaf may commit its unrelated work. It leaves one question open and
 cleanup (record O). It states nothing about the event producer, which is not built. No independent review had read this
 revision when it was written.
 
-The revision that carries this paragraph states, as built, the first event producer: the commit `9b55edbf4` on the writer
-of `2a7cb83e4`, in the integrated development head `07fecf1ed` ("As built: the event producer" under "When a transaction
-fails"). It changes no rule of records O and P, no class, time or limit of R26, R27, R63 or R128, no trait, no schema and no
-other requirement. It is a development member, not wired to the daemon or to a collector, and it is not the T10 freeze or
-the acceptance of issue 127. No independent review had read this revision when it was written.
+The revision that carries this paragraph (issue 428) was written on 2026-11-27, after PR #412 landed the writer as
+`53136a969`. It dates the statements above and below that were true at `2a7cb83e4` only, names the squash, and says that
+PR #411 is a different PR (a test slice, `a84ac78a6`) that carries none of the writer. In R128 and "Writer lanes" it
+states what the landed writer does while one logical operation is retained: that operation holds the Entities, Events
+and Maintenance lanes as well as Claims. It maps the four test names that R128 listed and that no test bears to the
+tests that exist, and marks what is missing. It changes no requirement, no class, time or limit of R128, no record, and
+it is not a ruling of the owner. It gives no latency guarantee. Daemon activation, the T10 acceptance, the
+`SQLITE_IOERR` question of a leaf's cleanup (issue 410) and the untested reuse of a token after an admission refusal stay
+open. No independent review had read this revision when it was written.
 
 ## Source
 
@@ -455,7 +459,7 @@ holds them.
 | R24 | Exactly one connection shall write, every write shall start with `BEGIN IMMEDIATE`, and every other connection shall be read-only. | B6, B12 | must | `sqlite_connection::a_read_connection_refuses_writes`, `crates/orch-infra/tests/sqlite_writer.rs::writes_run_one_at_a_time_on_one_connection`; both |
 | R25 | A read shall see one consistent snapshot from its first statement to its last, whatever commits meanwhile. | B6 | must | `sqlite_writer::a_read_snapshot_does_not_see_a_later_commit`; both |
 | R26 | The writer shall always take a queued claim or lease transaction first, and otherwise the queued transaction with the earliest deadline, where the deadline is arrival plus 200 ms for entity changes, 1 s for events and 5 s for maintenance; a bulk job shall have at most one transaction queued at a time, and the event lane at most one for all runs together, holding the batches that wait, up to R27's bound. A claim shall therefore wait behind at most the one transaction in progress. That is an order and not a time: the waits of "Writer lanes" are targets that no check of 1.1 measures (the measurement of R5 is deferred: record I of "Owner's answers"), and a test with a fake clock proves the order only. | G; red team W1, W4 | must | `sqlite_writer::a_claim_runs_before_everything_queued` (fake clock), `::earliest_deadline_runs_first_among_the_other_lanes`, `::overdue_maintenance_does_not_delay_a_claim`, `::no_lane_starves_under_a_flood_of_another`, `::waiting_event_batches_share_one_transaction`; both |
-| R27 | Bulk work (event batches, pruning, expiry, import) shall be cut into transactions of at most 1,000 rows or 20 ms of work; an atomic operation over that bound shall run whole and be counted in `writer_txn_over_bound_total`, once for each transaction over the bound and not once for each attempt that a retry makes of it. The writer measures a transaction by its actual rows and its actual elapsed time, the `COMMIT` included, and counts it if it has more than 1,000 rows or took more than 20 ms; it does not ask why the transaction ended there, so an ordinary divisible batch that its producer cut at 20 ms is counted as well, and the counter alone does not identify an indivisible operation (I2, below). The producer that owns the input cuts it at 1,000 rows or 20 ms, checking between statements, and keeps the part that is not yet committed. (AP8; record P) | G | must | `sqlite_writer::bulk_work_is_cut_at_1000_rows`, `::an_atomic_operation_over_the_bound_runs_whole_and_is_counted`; both |
+| R27 | Bulk work (event batches, pruning, expiry, import) shall be cut into transactions of at most 1,000 rows or 20 ms of work; an atomic operation over that bound shall run whole and be counted in `writer_txn_over_bound_total`, once for each indivisible transaction and not once for each attempt that a retry makes of it. The producer that owns the input cuts it at 1,000 rows or 20 ms, checking between statements, and keeps the part that is not yet committed. (AP8; record P) | G | must | `sqlite_writer::bulk_work_is_cut_at_1000_rows`, `::an_atomic_operation_over_the_bound_runs_whole_and_is_counted`; both |
 | R28 | A side effect outside the database shall be written as an `intents` row in the transaction that decides it, performed after the commit, and marked done; an intent left by a stopped daemon shall be handled at the next start as its kind states in "Transactions and intents". | G, H | must | `crates/orch-engine/tests/intents.rs::intent_is_written_with_its_change`, `::pending_intent_is_handled_after_restart`, `::a_repeated_intent_has_no_second_effect`; both |
 | R29 | The data directory shall have the layout and modes in "Data directory"; the daemon shall create it with those modes and refuse to start when it exists with group or other access or another owner. | B5 | must | `crates/orch-daemon/tests/daemon_data_dir.rs::layout_and_modes_are_as_specified`, `::a_directory_open_to_others_is_refused`; both |
 | R30 | When a daemon or an offline command is pointed at a data directory that another holds, it shall change nothing, exit 4 and print the holder's kind, pid and start time. | B5, G6 | must | `crates/orch-daemon/tests/daemon_data_dir.rs::second_daemon_refuses_and_names_the_holder`, `crates/orch-cli/tests/db_offline.rs::offline_command_refuses_while_a_daemon_holds_the_directory`; both |
@@ -556,7 +560,7 @@ holds them.
 | R125 | A stop after an import is recorded as finished and before `.orch-project` is written shall be repaired by running the same `orch import` command again: where the data directory holds a finished import of this project directory and the pointer is absent, the command shall write the pointer (R107), change nothing else and say so, where R68 would otherwise refuse a second project. The dry run shall report that state. | Red team I6 | must | `import::a_stop_before_the_pointer_is_repaired_by_running_again` (a 1.0 directory and an export file), `::the_dry_run_reports_a_finished_import_without_its_pointer`; both |
 | R126 | The writer's connection shall run with automatic checkpointing off (`wal_autocheckpoint = 0`): no commit of the writer shall run a checkpoint. The `wal.checkpoint` job shall run passive checkpoints on a connection of its own, outside the writer task and outside the lanes, when 5 minutes have passed since its last completed checkpoint or when the log's backlog reaches 64 MiB, which it shall look at once a second at least. The backlog is a logical measure: the frames written to the write-ahead log and not yet copied into the database, times the page size, within one generation of the log (a log that starts again after a complete checkpoint counts from nothing). It shall be kept from SQLite's own counts, the writer's commit callback and each checkpoint's result; the result is exact and resets it, and where a change of generation cannot be told the larger backlog shall be assumed. It shall never be the length of the `-wal` file, which SQLite does not shorten after a checkpoint, and no checkpoint shall be run to learn it. `writer_commit_seconds` shall record the time of each commit apart from `writer_txn_seconds`; `wal_bytes` shall be the backlog and `wal_file_bytes` the file's length, shown apart, and no rule shall act on the file's length. Each checkpoint's start, duration, result and frame counts shall be recorded. Every connection that can write, the checkpoint connection included, shall set `fullfsync = ON` and `checkpoint_fullfsync = ON` and read both back; "Writer lanes" says what they mean on each platform, and they change nothing in `synchronous`. The sync settings are a proposal under AP13. The owner's ruling on that proposal is deferred with the measurement (record I of "Owner's answers"), and in 1.1 the settings are built as this requirement states them. | Red team W1 and its residual W1-R2 (a trigger on the file's length latches: the file keeps its size after every frame has been checkpointed); AP13 | must | `crates/orch-infra/tests/sqlite_settings.rs::the_writer_never_checkpoints_in_a_commit`, `::every_writing_connection_reads_back_its_sync_settings`, `sqlite_writer::checkpoints_run_on_their_own_connection`, `::the_backlog_is_zero_after_a_complete_checkpoint_while_the_file_keeps_its_length`, `::a_backlog_of_64_mib_starts_a_checkpoint`, `crates/orch-daemon/tests/ops_metrics.rs::commit_time_is_recorded_apart`, `::backlog_and_file_length_are_reported_apart`; both |
 | R127 | While the log's backlog (R126's measure, not the file's length) is over 256 MiB, a read transaction of the pool that has been open for more than 30 s shall be interrupted with the typed error `snapshot_expired`, so that a checkpoint can copy the frames it holds back; a read under either limit shall be left alone, and so shall every read while the backlog is under the limit, however long the file. `orch db status` shall show the backlog, the file's length and the age of the oldest read. Both numbers are proposals that no measurement backs yet. R127 does not govern a snapshot handle that has no call in flight: that is released by its own rule, at any backlog ("Reader snapshots on SQLite"), and its release is no evidence for R127. | Red team W1, W1-R2 | should | `crates/orch-infra/tests/sqlite_pool.rs::a_long_read_is_interrupted_when_the_backlog_is_over_its_ceiling`, `::a_read_under_either_limit_is_left_alone`, `::a_long_file_with_no_backlog_interrupts_no_read`; both |
-| R128 | The writer shall handle a transaction that fails for a reason outside its own logic by the classes of "Writer lanes". A retryable failure (`SQLITE_BUSY` or `SQLITE_LOCKED` past the busy timeout, `SQLITE_FULL`, a first `SQLITE_IOERR`) shall be tried again after 50 ms, doubling to at most 2 s, and never dropped; no claim shall be granted while it lasts. What is tried again depends on where the failure happened (record P). A failure of `BEGIN IMMEDIATE` keeps the admitted request, with its original deadline; its callback has not run. A failure of `COMMIT` is tried again on the same transaction only where SQLite documents that retry as safe and the transaction is still active, and is otherwise rolled back. The callback of an admitted request is invoked at most once and is never replayed by the writer. After a rollback that is confirmed, only a producer that holds the original logical operation rebuilds the work, as a new request; where the outcome of a commit is unknown, the producer reconciles it against the database before it submits again, and the connection being outside a transaction establishes no outcome by itself. A storage fault inside a callback's own body is not retried by the writer: it is classified under R140 and the request ends with that outcome after its cleanup. One retry episode counts for a logical request across its attempts and the producer's submissions, with its deadline and the suppression of claims. A request answered `overloaded` at its deadline shall be withdrawn, shall receive exactly that one terminal answer and shall never be committed afterwards; work of the daemon that has no deadline stays owned and is not withdrawn. `SQLITE_CORRUPT`, `SQLITE_NOTADB`, a second `SQLITE_IOERR` in a row, one transaction retried for 60 s without committing, and an explicit rollback of the writer's top-level transaction that fails while the connection is still inside a transaction shall fail the writer, the last by a cause of its own. A rollback that returns an error but leaves the connection outside a transaction is not that cause: its result is classified as any other result. A request that would be answered `TransactionAborted` shall be answered `storage_unavailable` when the writer has failed. A writer with nothing to commit is idle, and shall never fail for that. A failed writer shall refuse every mutation with the typed error `storage_unavailable`, grant no claim, keep supervising its runs and spooling their finishes (R129), and be reported by `daemon.status`, `orch status` and `orch doctor` (exit 1) from memory, since the attention queue needs the writer; only a restart shall end that state. (AP18; records L and P) | Red team W3 and its residual W3-R1 (read to the letter, "60 s without a commit" failed an idle daemon); the resilience review of PR 249 (C2) and the owner's rulings of 2026-11-24 for the failed rollback and of 2026-11-27 for what is retried (record P) | must | `sqlite_writer::a_busy_database_is_retried_and_nothing_is_dropped` (a second connection holds the write lock), `::a_withdrawn_request_is_never_committed`, `::a_full_disk_is_retried_and_then_fails_the_writer`, `::a_corrupt_database_fails_the_writer_at_once`, `::an_idle_writer_never_fails`, `::a_failed_top_level_rollback_that_leaves_the_transaction_open_fails_the_writer`, `::a_rollback_error_that_leaves_the_connection_outside_a_transaction_is_not_that_cause`, `::a_latched_writer_answers_storage_unavailable_before_transaction_aborted`, `crates/orch-daemon/tests/daemon_storage_failure.rs::a_failed_writer_refuses_mutations_and_is_reported` (once the daemon is wired, the failed rollback is one of the causes it plants), and the vectors WP1 to WP11 of the plan's "Writer retry policy", whose as-built tests (a development input at `2a7cb83e4`, WP9 not built) the plan's table "As built" names; both |
+| R128 | The writer shall handle a transaction that fails for a reason outside its own logic by the classes of "Writer lanes". A retryable failure (`SQLITE_BUSY` or `SQLITE_LOCKED` past the busy timeout, `SQLITE_FULL`, a first `SQLITE_IOERR`) shall be tried again after 50 ms, doubling to at most 2 s, and never dropped; no claim shall be granted while it lasts. What is tried again depends on where the failure happened (record P). A failure of `BEGIN IMMEDIATE` keeps the admitted request, with its original deadline; its callback has not run. A failure of `COMMIT` is tried again on the same transaction only where SQLite documents that retry as safe and the transaction is still active, and is otherwise rolled back. The callback of an admitted request is invoked at most once and is never replayed by the writer. After a rollback that is confirmed, only a producer that holds the original logical operation rebuilds the work, as a new request; where the outcome of a commit is unknown, the producer reconciles it against the database before it submits again, and the connection being outside a transaction establishes no outcome by itself. A storage fault inside a callback's own body is not retried by the writer: it is classified under R140 and the request ends with that outcome after its cleanup. One retry episode counts for a logical request across its attempts and the producer's submissions, with its deadline and the suppression of claims. As built (the source at `53136a969`, not a ruling of the owner), the suppression holds every lane and not only lane 1: while an episode is open the worker takes no queued job of `Claims`, `Entities`, `Events` or `Maintenance` except that operation's own next submission, so a request of another lane waits, and one whose deadline has passed when the worker reaches it is answered `overloaded` and never runs ("Writer lanes", "While one logical operation is retained"). A request answered `overloaded` at its deadline shall be withdrawn, shall receive exactly that one terminal answer and shall never be committed afterwards; work of the daemon that has no deadline stays owned and is not withdrawn. `SQLITE_CORRUPT`, `SQLITE_NOTADB`, a second `SQLITE_IOERR` in a row, one transaction retried for 60 s without committing, and an explicit rollback of the writer's top-level transaction that fails while the connection is still inside a transaction shall fail the writer, the last by a cause of its own. A rollback that returns an error but leaves the connection outside a transaction is not that cause: its result is classified as any other result. A request that would be answered `TransactionAborted` shall be answered `storage_unavailable` when the writer has failed. A writer with nothing to commit is idle, and shall never fail for that. A failed writer shall refuse every mutation with the typed error `storage_unavailable`, grant no claim, keep supervising its runs and spooling their finishes (R129), and be reported by `daemon.status`, `orch status` and `orch doctor` (exit 1) from memory, since the attention queue needs the writer; only a restart shall end that state. (AP18; records L and P) | Red team W3 and its residual W3-R1 (read to the letter, "60 s without a commit" failed an idle daemon); the resilience review of PR 249 (C2) and the owner's rulings of 2026-11-24 for the failed rollback and of 2026-11-27 for what is retried (record P) | must | Library tests of `orch-infra` by module path and integration tests by file under `crates/orch-infra/tests/`. Existing at `53136a969`: `sqlite::writer::tests::a_withdrawn_request_is_never_committed`, `sqlite::writer::tests::a_failed_top_level_rollback_that_leaves_the_transaction_open_fails_the_writer`, `sqlite::writer::tests::a_rollback_error_that_leaves_the_connection_outside_a_transaction_is_not_that_cause`, `sqlite_writer_policy.rs::a_latched_writer_answers_storage_unavailable_before_transaction_aborted`, and the vectors WP1 to WP11 of the plan's "Writer retry policy", whose tests the plan's table "As built at `2a7cb83e4`" names (the source landed in #412 as `53136a969`; WP9 is not built). The four names that this row listed until 2026-11-27, `a_busy_database_is_retried_and_nothing_is_dropped`, `a_full_disk_is_retried_and_then_fails_the_writer`, `a_corrupt_database_fails_the_writer_at_once` and `an_idle_writer_never_fails`, are proposals that no test bears, and `sqlite_writer` is no test target; "R128's tests" under "When a transaction fails" maps each to the tests that exist and says what is missing. Not written: `crates/orch-daemon/tests/daemon_storage_failure.rs::a_failed_writer_refuses_mutations_and_is_reported` (the file does not exist, and nothing wires the writer to the daemon; the failed rollback is one of the causes it will plant); no test shows an `Entities`, `Events` or `Maintenance` request waiting behind an open episode (issue 429); both |
 | R129 | Before a run's finish (status, result, usage, last event number, and the lineage and epoch of the run's lease) is queued for the writer, the daemon shall write it, synced, to `spool/finish/<name>` in the data directory, and shall remove the file after the commit. The name is the finish file name of "Filesystem names", computed from the project id and the run id with the label `orch-finish-file-v1`, and R101 holds for it whatever the two ids contain; the file is created and reached as R102 says and is at most 128 KiB, a result over 64 KiB being stored as a blob first (R97). When the write or its sync fails, the finish is not safe and the daemon shall not act as if it were: it shall keep the finish in memory, try the spool again at the intervals of R128, hand the finish to the writer all the same (a commit ends the need for the file), grant no claim while any finish is unspooled, and report the number of unspooled finishes in `daemon.status`, `orch status` and `orch doctor` (exit 1). `orch daemon stop` shall still stop; it shall name each run whose finish is neither spooled nor committed and say that the stop loses that result. That is the one loss this requirement allows while a daemon runs, and R41 then ends the run as one whose process is gone. At a start, recovery shall apply every spooled finish whose run is unfinished before it judges that run (R41), by R36's rule for lineage and epoch, so that the run is finished and not cancelled. A file that names no unfinished run, carries another lineage or fails its check shall be removed and counted. A backup and an export hold no spool. (AP18) | Red team W3 and its residual W3-R1 (the spool write can fail, most likely when the disk is full and the writer is retrying for the same reason); R86 | must | `crates/orch-engine/tests/leases.rs::a_spooled_finish_survives_a_stop_before_its_commit`, `::a_spooled_finish_is_applied_before_recovery_judges_the_run`, `::a_stray_or_damaged_spool_file_is_removed_and_counted`, `::a_finish_that_cannot_be_spooled_is_kept_reported_and_committed_when_the_writer_recovers` (the spool directory refuses writes; no claim is granted meanwhile), `crates/orch-daemon/tests/daemon_storage_failure.rs::stop_names_a_finish_that_is_neither_spooled_nor_committed`, `crates/orch-infra/tests/fs_names.rs::finish_file_name_vector`, `::the_finish_file_name_is_the_whole_hash_for_any_run_id` (every finish-file row of the vectors of "Filesystem names", as a name), `crates/orch-engine/tests/leases.rs::a_finish_is_spooled_and_removed_under_its_hash_name_for_any_run_id` and `::recovery_reaches_a_spooled_finish_under_its_hash_name_for_any_run_id` (the same rows through the daemon's own operations, in a data directory made for the test: for a running run stored under each row's ids, the finish path writes exactly `spool/finish/<the row's name>` and removes it after the commit, and a start that finds that file applies it and removes it; a test passes the ids and computes a name only to compare; each asserts that nothing else was created below the data directory, that nothing was created, changed or removed outside it, and that a canary outside it keeps its bytes and metadata); both |
 | R130 | `orch db query` shall use a connection opened read-only for that command alone, never the writer and never a pooled connection, with an authorizer that denies by default from prepare to the last row: it allows reading the listed columns of the diagnostic views through those views and calling the functions listed in "`orch db` commands", and nothing else. The statement shall be at most 16 KiB; the result at most 100,000 rows and 16 MiB; the run at most 5 s, stopped by the progress handler; and the connection's run-time limits shall be: a string or blob 1 MiB, expression depth 64, compound selects 8, function arguments 8, a `LIKE` pattern 1,000 bytes, attached databases 0. | Security review S3; ADR 0017 decision 19 (`hooks`, `limits`) | must | `db_query::a_function_outside_the_list_is_refused`, `::stops_at_its_statement_row_byte_and_time_limits`, `::each_run_time_limit_is_set_on_the_connection`, `::the_query_connection_is_not_the_writer_or_the_pool`; both |
 | R131 | In 1.1 an attention item shall hold no text from an agent or any other source outside the daemon: its title and body are fixed text for its kind plus values the daemon derived (sizes, counts, ids checked as ids). The remedy shown for an item shall be fixed text chosen by its kind, with the subject id checked again when it is shown. A later kind that quotes outside text shall store it apart from the daemon's own fields, bounded, with its author's kind, id and run, shall show it escaped and marked as quoted, and shall build any action from a closed set and a checked subject id, never from stored text. | Security review S5 | must | `crates/orch-engine/tests/attention.rs::items_hold_only_text_the_daemon_derived` (task titles, agent names and run output holding `$(touch canary); --yes`, control bytes and a forged instruction), `crates/orch-cli/tests/attention.rs::the_remedy_is_fixed_text_for_the_kind`; both |
@@ -2774,8 +2778,7 @@ to disk before it is queued (R129), so neither a failed writer nor a restart los
 
 **What the lanes do not bound.** The lanes fix an order. The waits in the table are budgets, and only a
 measurement shows whether a platform meets them (R5, R63). R27's 20 ms is checked between statements: a
-statement that is running, and a commit, are not cut short, so a transaction that the producer cut at 20 ms has taken longer
-than 20 ms by the end of its commit, and the first measurement saw both take hundreds
+statement that is running, and a commit, are not cut short, and the first measurement saw both take hundreds
 of milliseconds on macOS (AP13). No requirement here derives a time from the order. Since the owner's
 decision of 2026-11-21 no such measurement is part of 1.1 (record I of "Owner's answers"): the waits stay
 as written, as the deadlines that order lanes 2 to 4 and as figures that the writer's metrics show, and
@@ -2809,14 +2812,13 @@ that the adapter owns. Its two figures, 200 ms and 5 s, are starting values that
 256 MiB, so that a checkpoint can copy the frames it holds back. The idle release is another rule: it applies at any
 backlog, to a handle with no call in flight. It is no evidence that R127's interruption works and does none of the work of
 the checkpoint job (R126, R137, T15). A snapshot that is used at least every 5 s is never released as idle and meets R127
-alone. The adapter's side of R127 is described in "As built: active readers and the passive checkpoint" below.
+alone.
 
 *Error representation (open).* The names are promised: `overloaded` for an open that was not admitted in time,
 `snapshot_expired` after an idle release and `storage_unavailable` for a failed writer (R51, R98, R128). The port's
 `StoreError` has no variant for any of the three, and this spec does not yet say whether a read returns a typed variant
 (a change to `docs/TRAITS-FROZEN.md` that needs the contract decision of the R140 and T17 owner) or a message that is
-fixed and tested. The plan's "Reader snapshots on SQLite" lists the message texts that PR 385 returns today; R127's expiry returns the
-same `snapshot_expired` text at the port. The
+fixed and tested. The plan's "Reader snapshots on SQLite" lists the message texts that PR 385 returns today. The
 representation is decided and written here before activation (record N), and the code on the activation head must match it.
 
 **Checkpoints** (R126, R127). The writer never checkpoints in a commit: automatic checkpointing is off on
@@ -2844,8 +2846,7 @@ outcomes of a call and says which of them move the timer.
   pooled read older than 30 s is interrupted (`snapshot_expired`): a backup or an export that this stops
   is run again, and succeeds once the backlog has fallen. A snapshot handle with no call in flight is released by its
   own rule ("Reader snapshots on SQLite"), not by this one. A reader outside the daemon, such as a `sqlite3`
-  shell left inside a transaction, cannot be interrupted; the RUNBOOK names the cause. The adapter's interruption is
-  built and its checkpoint job is not ("As built: active readers and the passive checkpoint").
+  shell left inside a transaction, cannot be interrupted; the RUNBOOK names the cause.
 - **What is synced, and when.** With the write-ahead log and `synchronous = NORMAL` (B12), a commit is not
   synced: the log is synced before a checkpoint, and the database file when the checkpoint has copied its
   frames. The database stays consistent across a power loss, and the commits since the last sync can be
@@ -2863,19 +2864,26 @@ outcomes of a call and says which of them move the timer.
 
 | Class | SQLite results | The writer |
 |---|---|---|
-| Retryable | `SQLITE_BUSY` or `SQLITE_LOCKED` past the busy timeout, `SQLITE_FULL`, a first `SQLITE_IOERR` | Tries again after 50 ms, doubling to 2 s, as R128 says of what is tried again: a failed `BEGIN` keeps the request; a failed `COMMIT` is tried again on the same transaction only where SQLite documents that as safe and otherwise rolls back; the callback is never replayed. Nothing is dropped. No claim is granted meanwhile. A request whose deadline passes is answered `overloaded` once, withdrawn, and never committed later; the daemon's own work (finishes, lease changes, events) stays queued |
+| Retryable | `SQLITE_BUSY` or `SQLITE_LOCKED` past the busy timeout, `SQLITE_FULL`, a first `SQLITE_IOERR` | Tries again after 50 ms, doubling to 2 s, as R128 says of what is tried again: a failed `BEGIN` keeps the request; a failed `COMMIT` is tried again on the same transaction only where SQLite documents that as safe and otherwise rolls back; the callback is never replayed. Nothing is dropped. No claim is granted meanwhile, and as built no job of another lane runs either ("While one logical operation is retained" under "Writer lanes"). A request whose deadline passes is answered `overloaded` once, withdrawn, and never committed later; the daemon's own work (finishes, lease changes, events) stays queued |
 | Fatal | `SQLITE_CORRUPT`, `SQLITE_NOTADB`, a second `SQLITE_IOERR` in a row, one transaction retried for 60 s without committing (an idle writer has nothing to retry and never fails for that), an explicit rollback of the top-level transaction that fails while the connection is still inside a transaction (the state of the connection after the rollback is the proof, whatever the rollback's own result was) | Fails: every mutation is refused with `storage_unavailable`, no claim is granted, runs stay supervised and their finishes are spooled, and `daemon.status`, `orch status` and `orch doctor` report it from memory. A restart is the only way out |
 
 The times are proposals. A logic error (a stale revision, a constraint) is the request's own answer and is
 not in this table.
 
-**As built: the retained writer (issue 127, record P; a development input, not the T10 freeze).** The common writer
-policy of record P exists in the source of PR 411's writer member at `2a7cb83e4`: `execute_episode` in
+**As built: the retained writer (issue 127, record P; landed in #412 as `53136a969`; not the T10 freeze).** The common writer
+policy of record P is in the source that PR #412 landed on `main` as `53136a969` on 2026-11-27 (its parent is `8e4b39223`;
+PR #411 is a separate test PR, `a84ac78a6`, and carries none of the writer). That source is the source of `2a7cb83e4`:
+the `crates/` tree, `e4a40d17b732f7f393b2c093196128b7fb40370f`, is the same at `2a7cb83e4`, at the replay head `1406466ed` and at the squash. The text below was
+written at `2a7cb83e4`; where it says that something is not reviewed or has no hosted run, that was true then and is dated
+("Status on 2026-11-27" in the plan's "Writer retry policy" says what has happened since). The policy is in
+`execute_episode` in
 `crates/orch-infra/src/sqlite/writer.rs`, `writer/policy.rs` (the episode, `RetryCode`, `WriteOutcome`,
 `WriteAccounting`), `writer/failure.rs` (the raw retry observation, two new causes) and `storage/retained.rs` (the
-retained write). It is read from that source and its tests on Linux, and it is not reviewed, not wired to the daemon
-(which uses files) and not accepted: no T10 vector is accepted, and the plan's Status table keeps the held items. The
-first head of the member, `f262da952`, is superseded and is not described here: the builder amended it to `2a7cb83e4`
+retained write). It is read from that source and its tests on Linux. On 2026-11-27 it has been independently reviewed
+(a code review of `2a7cb83e4` that passed with conditions, a security review that passed, and a delta review of the replay onto `main`), and
+the hosted Linux `check` and `test` passed on the tested merge of #412 (run 45969062931). It is not wired to the daemon
+(which uses files) and not accepted for T10: no T10 vector is accepted, daemon activation has not happened, and the
+plan's Status table keeps the held items. The first head of the member, `f262da952`, is superseded and is not described here: the builder amended it to `2a7cb83e4`
 after three defects were found in it (the last bullet below lists them). What it does, by where the failure happens:
 
 | Where | Result | As built | Test |
@@ -2907,8 +2915,7 @@ after three defects were found in it (the last bullet below lists them). What it
   has none (a daemon-owned operation): the deadline is never renewed, and one that has passed ends the token (read from the source;
   no test). `Storage::write` is one `attempt` of its own retained write with the lane
   budgets of 50 ms, 200 ms, 1 s and 5 s, so an ordinary caller gets the in-place `BEGIN` and `COMMIT` retries and the
-  error of anything else; the first producer that rebuilds is the event producer of issue 127 ("As built: the event
-  producer" below).
+  error of anything else; the first producer that rebuilds is the event producer of issue 127, which is not built.
   Tests: `unknown_real_commit_requires_same_caller_snapshot_reconciliation`,
   `cancelled_await_recovers_one_receipt_without_replaying_the_callback`,
   `no_new_deadline_or_callback_after_one_terminal_withdrawal`.
@@ -2917,10 +2924,11 @@ after three defects were found in it (the last bullet below lists them). What it
   first failure. It ends at a known commit, at a terminal answer, when the retained write is dropped, when a
   reconciliation permits no rebuild, or when its original deadline passes while the last outcome is a known noncommit
   (below). While it is open the worker runs no queued job of any lane: no claim is granted and the daemon's own work stays
-  queued, and only the retained operation's own next submission runs. That serialization is deliberate: one logical
-  operation owns the writer from its first retryable failure until its outcome is known or it is withdrawn, and a
-  parallel logical writer would run while an ambiguous outcome is fenced. A queued request waits; one whose deadline
-  passes meanwhile is answered `overloaded` when the worker reaches it. Tests:
+  queued, and only the retained operation's own next submission runs. As built, one logical operation owns the writer
+  from its first retryable failure until its outcome is known or it is withdrawn: the backoff waits run on the writer's
+  own thread, and between the producer's submissions the worker takes nothing from the queue ("While one logical
+  operation is retained" under "Writer lanes" gives the rule, the source and what is not tested). A queued request waits;
+  one whose deadline passes meanwhile is answered `overloaded` when the worker reaches it. Tests:
   `retained_rebuild_uses_the_running_slot_before_a_full_queue_of_claims` (a claim waits for the event commit and runs after
   it), `expiry_withdraws_before_another_attempt_and_drop_releases_claims`. A retained write that is rebuilt after a failure
   owns the writer's one in-progress slot, so that it cannot wait behind a full queue of claims that its own episode
@@ -2949,25 +2957,28 @@ after three defects were found in it (the last bullet below lists them). What it
   `sqlite::writer::tests::a_known_commit_breaks_the_writer_ioerr_streak_between_requests`,
   `reader_and_artifact_sql_failures_cannot_contaminate_transaction_observation`.
 - *Accounting (R27).* For each physical transaction the writer counts the changes SQLite reports for the connection from
-  the end of `BEGIN` to the end of the attempt, the `COMMIT` or the rollback included (so work that was rolled back still counts), and the
-  elapsed time of the same span, `COMMIT` included, without the writer's own backoff waits. `WriteAttempt.accounting` returns both, and
-  `FailureState::writer_txn_over_bound_total()` rises once for a transaction with more than 1,000 rows or more than 20 ms of that elapsed time.
+  the end of `BEGIN` to the end of the attempt, rollback included (so work that was rolled back still counts), and the
+  elapsed time of the same span without the writer's own backoff waits. `WriteAttempt.accounting` returns both, and
+  `FailureState::writer_txn_over_bound_total()` rises once for a transaction with more than 1,000 rows or more than 20 ms.
   A `COMMIT` retried in place is the same transaction and counts once; a rebuilt transaction is a new one and reports
-  its own work. The producer cuts its input and keeps its tail; the writer cuts nothing. The count measures what a
-  transaction cost, not why it ended: see "The cut (R27)" and "What the counter does not tell (I2)" below. Nothing exposes the counter
+  its own work. The producer cuts its input and keeps its tail; the writer cuts nothing. Nothing exposes the counter
   outside the library yet.
 - *Three readings that the source builds (a built choice, not a new owner decision and not a hold).* At three points the
   wording of R128 is silent or can be read either way, and the source at `2a7cb83e4` reads each as follows. (1) Every lane
   waits, not only claims, while one logical operation is retained: a probe's `Entities` write (200 ms budget) queued
-  behind an open episode did not run and was answered `overloaded` after 1.55 s, when the episode resumed. This is the
-  serialization stated under the episode, the deliberate reading of "the daemon's own work stays queued", and it ends at
-  a known outcome or at a known-noncommit withdrawal. (2) "A second `SQLITE_IOERR` in a row" is the writer's count, as
+  behind an open episode did not run and was answered `overloaded` after 1.55 s, when the episode resumed. R128 says that
+  no claim is granted; the worker also takes no job of the other three lanes. This is the serialization stated under the
+  episode and the implementation's reading of "the daemon's own work stays queued", and it ends at a known outcome or at a
+  known-noncommit withdrawal. The supervising session accepted it on 2026-11-27 as the T10 reading of R128. That is not a
+  ruling of the owner, and it carries no time bound. The probe is not kept as a test. (2) "A second `SQLITE_IOERR` in a row" is the writer's count, as
   the latch bullet states. (3) A callback that catches a clean nonfatal refusal of a leaf returns success and commits its
   unrelated work, as the body rows state; "On the writer" lets an ordinary failure that was rolled back to its savepoint be
   caught, and the source does not make the caught result's class a reason to abort.
 - *Open, unchanged.* An `SQLITE_IOERR` on either side of a leaf's cleanup pair is not exercised by a test, and the
   question of "A transient cleanup" in Amendment 3 stays open and is not answered by this text; the source follows record
-  O (nothing latches). The final IOERR cleanup ruling is the owner's.
+  O (nothing latches). The final IOERR cleanup ruling is the owner's. Whether such a result counts toward R128's second
+  consecutive `SQLITE_IOERR` is the open question that "A transient cleanup" in Amendment 3 states (issue 410). The reuse of a retained token after an `overloaded` refusal at admission
+  is untested (above). The T10 acceptance and daemon activation are open and are not decided by this text.
 - *Probes run again at `2a7cb83e4` (throwaway tests, not kept).* While `f262da952` was being documented, probes found
   three defects in it, and the builder accepted all three and fixed them in `2a7cb83e4`, with a permanent test for each
   (named above). The same probes now give: two `SQLITE_IOERR` on two separate retained writes latch
@@ -2979,130 +2990,60 @@ after three defects were found in it (the last bullet below lists them). What it
   `Entities` write queued behind an open episode is answered `overloaded` after 1.56 s, when the episode resumed, which is
   the choice (1) above and was never a defect. The expiry of a settled token was not probed again: it has its permanent
   test.
-- *Not built here.* At `2a7cb83e4` the event producer (the coalescing of several runs, the cut at 1,000 rows or 20 ms with
-  the kept tail, the reconciliation of an unknown commit: vector WP9) was not built; it is built at `9b55edbf4`, below. Still
-  not built: the final proofs of issue 127 and the other callers of record P. The deterministic admission fixtures of issue
-  408, which the source of `2a7cb83e4` does not change, are in the integrated head `07fecf1ed`.
+- *Not built here.* The event producer (the coalescing of several runs, the cut at 1,000 rows or 20 ms with the kept tail,
+  the sequence reconciliation: vector WP9), the deterministic admission fixtures of issue 408 (the source does not change
+  them), the final proofs of issue 127 and the other callers of record P.
 
-**As built: the event producer (issue 127, T16's first slice, record P item 2; a development input, not the T10 freeze).**
-`EventProducer` (`crates/orch-infra/src/sqlite/events/producer.rs`, exported from `orch_infra::sqlite`) is the first caller of
-the retained write. It exists on the integrated development head `07fecf1ed` as the commit `9b55edbf4` on the writer of
-`2a7cb83e4`; it is read from the source and its tests on Linux, it is not wired to the daemon (which uses files) or to a
-collector, and it is not reviewed or accepted here: no T10 vector and no proof of issue 127 is accepted. It adds no trait, no
-schema and no authentication, and it changes no class, time or limit of R26, R27, R63 or R128. The plan's "As built at
-`9b55edbf4`" lists its tests and what the head's runs showed, including a whole `fast` run of that head that failed.
-- *Coalescing and isolation (R26).* One task owns every numbered batch (`EventBatch`: caller, run, lineage, epoch and the
-  events, each with its sequence number) until the writer has answered for it, and it has at most one transaction in
-  flight, so the event lane holds the one transaction that R26 allows. Everything that waits goes into the next
-  transaction in arrival order, of any number of runs and up to R27's bound, with each run's events in their order; a
-  transaction has one caller, so a batch of another caller or project waits, and a later batch of a run never overtakes an
-  earlier one that still waits. A batch whose lease is stale (`StaleEpoch`) or whose events are invalid is answered alone
-  and wrote nothing; the other batches of the transaction commit. An empty batch takes a turn so that its lease is checked.
-- *The cut (R27).* Rows are planned from each event's stored form, one row or two when its payload goes behind a blob
-  reference, so that a transaction holds at most 1,000 rows; exactly 1,000 are one transaction and the 1,001st is the tail.
-  The time is read between statements, never inside one, from `EventProducerOptions::now`; a statement holds at most 32
-  events, or one event that has a blob, and one statement always runs, so the grain of the 20 ms cut is that statement. A
-  transaction that runs over the bound by one long statement is not interrupted. The writer counts the actual rows and the
-  actual elapsed time of every transaction, once, in `writer_txn_over_bound_total`, and the producer counts nothing, so a retry
-  never counts it twice (R27). The elapsed time includes the `COMMIT`, and a time cut is taken only after 20 ms of statements
-  have run, so a transaction that the producer cut by time is over the writer's 20 ms bound and is counted, although the cut
-  worked as intended (see below). What is
-  not committed is kept in order and planned again. At most 16,384 events wait (`queue_limit`); a batch that would pass that
-  is returned as `Rejected::Full` for its collector to keep (R63), and an empty queue accepts a batch of any size.
-- *What the counter does not tell (I2; decided 2026-11-27, the writer's accounting is kept).* The writer's predicate is
-  `rows > 1000 || work > 20 ms`, where `work` is the elapsed time from the end of `BEGIN` to the end of the attempt, the
-  `COMMIT` included, less the writer's own backoff waits (`writer/policy.rs`, `accounting`; `writer.rs`, `execute_episode`).
-  The producer's time cut is taken at the start of the next statement, when at least 20 ms of statements have run, and the
-  `COMMIT` then adds more, so with the system clock every transaction that the producer cut by time is over the writer's
-  20 ms and is counted once, although the cut worked as intended. The independent review of the integrated head recorded 11
-  increments for 11 time-cut transactions in one probe. A second probe on Linux, with the system clock, three runs of 6,000
-  events in three batches, counted 8 of 8 time-cut transactions in each run (640 to 736 rows, 20.2 to 21.5 ms of elapsed
-  time); the ninth, last transaction, which the producer did not cut, was counted in one run of the three (464 rows,
-  28.1 ms; the other two took 8.9 and 13.7 ms and were not). So a transaction that the producer did not cut by time can be
-  counted as well (its last statement or its commit ran long), and one cut by rows can be counted if it was slow. Read the counter as the number of transactions that cost more than the
-  bound, whatever ended them. It cannot tell an ordinary divisible event batch from an indivisible operation. The only
-  signal in the counter that is specific to an operation that cannot be cut is rows over 1,000, which the producer never
-  plans; that figure is in the per-transaction accounting (`WriteAttempt.accounting`, `TransactionReport.accounting`), not
-  in the counter. The review's suggestion to cut earlier, by an estimate of the longest statement, was not adopted: it
-  would change the metric's contract, and a cut that ends under 20 ms could still be counted when its last statement or
-  its commit ran long. AP8's words "lane waits are budgeted only while that count is zero" were written when only an
-  operation over the bound could raise the counter; a nonzero count no longer shows that such an operation ran, and
-  whether those words should change is not decided here. Nothing exposes the counter outside the
-  library yet, so no alarm reads it. The test helper `assert_counted_by_time_alone` compares the counter with the writer's own `over_bound` flag
-  and so asserts neither that a time cut is counted nor that it is not.
-- *Rebuild.* The producer opens its retained write on the `Events` lane with no deadline, so that the one-second budget
-  that `Storage::write` gives the lane does not apply to it; the writer's queue order is its arrival plus the lane's
-  budget in either case, and an episode is bounded by the sixty seconds and the latches of R128. After a confirmed noncommit
-  with a retryable cause it builds the same transaction again from the retained input as a new request of the same episode.
-  An `overloaded` that the writer's queue gives at admission ran nothing, and the submission is tried again after 25 ms,
-  doubling to 250 ms, without a limit. Another failure while the writer has not failed answers one batch: a coalesced
-  transaction is planned again with its first batch alone.
-- *Reconcile.* After an unknown commit nothing is submitted until the database has answered: a snapshot of the bound caller
-  reads the sequence range that each step stored and compares each event with its input. All found: the commit happened.
-  None found: a rebuild if the cause was retryable, and an answer of failure if not. Some found, a stored event that differs
-  or a read that fails is an error, tried up to five times (20 ms, doubling), and the producer then fails closed: it answers
-  every waiting batch with its counts, refuses later submissions (`Rejected::Closed`) and sets
-  `SubmitFailure::outcome_unknown` on the batches of the transaction whose commit it could not establish, which a collector
-  must not turn into a gap row (R139). A writer that has latched a failure ends the producer the same way.
-- *Not built here.* The numbering of an event at its handover and the counters at start and stop (R61, R139), the collector's
-  buffer and its gaps (R63), pruning, an export of the counter, and every caller in the daemon (T16's remaining work). R127's
-  checkpoint job and its schedule have no code (its adapter-side rule is the next subsection). A reconciliation of a step that mixes duplicates that an
-  earlier commit had stored with new rows has no test (a reading of the source that its review has been asked about, not a
-  finding). The failures of its tests are injected through the writer's test-only commit probe; no real `SQLITE_FULL` or
-  `SQLITE_IOERR` is provoked. The tests that R26 and R27 name in their rows exist under the module path
-  `sqlite::events::tests::producer` and not `sqlite_writer`: `waiting_event_batches_share_one_transaction`,
-  `bulk_work_is_cut_at_1000_rows` and `an_atomic_operation_over_the_bound_runs_whole_and_is_counted`; the other tests that
-  R26's row names are not claimed here.
+**R128's tests (issue 428).** Until 2026-11-27 the test column of R128 gave four names that no test bears and put the
+prefix `sqlite_writer::` before the others, which is no test target. The writer's tests are library tests of `orch-infra`
+(`sqlite::writer::tests::`, `sqlite::writer::policy::tests::`, `sqlite::storage::retained::tests::`,
+`sqlite::storage::containment_tests::`) and the integration targets `sqlite_writer_policy` and `sqlite_public_writer` under
+`crates/orch-infra/tests/`. Each proposed name is mapped here to what exists at `53136a969`. "Injected" means that a test
+probe supplies the SQLite result; "real" means that the condition comes from SQLite itself. R140's column has the same
+prefix and is not re-mapped by this revision (issue 430).
 
-**As built: active readers and the passive checkpoint (R127; development source `6706afcbc`, not a freeze).** This is a
-reading of `sqlite/read_pool/active.rs`, `read_pool.rs` and `storage/mod.rs` at that head, which is on `07fecf1ed`, and of
-the tests named below. It is a development input: no independent review of it, no hosted run and no daemon wiring is
-recorded here, and nothing is accepted by it. It changes no trait, no schema and no authorization, and it gives no
-credit to a first Task-authenticated call (issue 397).
+| Proposed name (no such test) | What exists | Missing |
+|---|---|---|
+| `a_busy_database_is_retried_and_nothing_is_dropped` | `sqlite::writer::tests::begin_busy_retains_the_original_callback_until_the_lock_clears` (WP1: a second connection really holds the write lock, `BEGIN` is retried, the callback runs once and its row is stored once; through the writer's `execute`, not through `Storage`); `a_withdrawn_request_is_never_committed` and `a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body` (WP2: a real lock and a deadline); `busy_commit_retries_the_same_transaction_and_counts_over_bound_once` (WP3: `SQLITE_BUSY` injected at `COMMIT`, three retries of the same transaction, 1,001 rows stored once) | `SQLITE_BUSY` at `COMMIT` from a real lock; a busy `BEGIN` through `Storage::write` or a retained write with a real second connection; a `COMMIT` that stays busy until the original deadline (issue 417, PR 421, open when this was written) |
+| `a_full_disk_is_retried_and_then_fails_the_writer` | `sqlite::writer::policy::tests::backoff_caps_and_sixty_second_episode_excludes_idle_time` (WP6, partly: `RetryCode::Full` on an episode with supplied times; the waits are 50, 100, 200, 400, 800, 1,600, 2,000 and 2,000 ms, claims are suppressed, nothing latches at 59 s and `RetryWithoutCommit` latches at 60 s); `sqlite::writer::tests::unsafe_commit_failure_is_rolled_back_and_never_replays_callback` (`SQLITE_FULL` injected at `COMMIT`: `RolledBack`, one callback call, no row, nothing latched); `sqlite::storage::containment_tests::retryable_leaf_cleanup_ends_writer_without_starting_a_retry_episode` (WP11: `SQLITE_FULL` at a leaf's cleanup) | `SQLITE_FULL` on every attempt of a real writer, through the backoff to the latch at 60 s and the `storage_unavailable` refusal of a later mutation: no test (plan step 3, issue 127's proof). No test fills a disk; every `SQLITE_FULL` is injected |
+| `a_corrupt_database_fails_the_writer_at_once` | `sqlite_writer_policy.rs::a_real_damaged_database_fails_the_writer_at_begin_and_nothing_runs_after` (a real file damaged under an idle writer, both `SQLITE_NOTADB` and `SQLITE_CORRUPT`: the cause is latched by the first request, a second write answers `storage_unavailable` and a claim is refused); `sqlite_writer_policy.rs::only_corrupt_and_notadb_are_fatal_and_a_constraint_or_a_busy_connection_is_not` (the classification) | Nothing for the writer's own connection. The same results on a read, the checkpoint or the query connection are R140's |
+| `an_idle_writer_never_fails` | `sqlite::writer::policy::tests::backoff_caps_and_sixty_second_episode_excludes_idle_time` (partly: an episode that is created and checked 600 s later with no failure latches nothing, and the 60 s run from the first failure only) | A real `Writer` left idle for a period that is shown not to have failed: no test (plan step 3, "an idle control"). The idle rule is shown on the episode with a supplied clock only |
 
-- *The call.* `ReadPool::checkpoint()` and the asynchronous `SqliteStorage::checkpoint()` (on a blocking task) run one
-  `wal_checkpoint_v2(PASSIVE)` on a connection of their own (`ConnectionRole::Checkpoint`): not the writer's, and not one
-  that a read holds. The call first refuses when the shared failure state has latched, so no checkpoint is called after
-  a fatal observation (R140); a failure of the call is reported to that state as `FailureSource::Checkpoint`. Its result
-  is a `CheckpointObservation`: the frames in the log, the frames copied, `backlog_bytes`, the age of the oldest
-  registered read and the number of reads it interrupted.
-- *The backlog is that call's own result.* It is (frames in the log minus frames copied) times the page size, read from
-  the counts that the call returns after it has copied what it could; a result of -1 (a database that is not in WAL
-  mode) gives zero. It is never the file's length: after a complete checkpoint a test leaves a `-wal` file longer than
-  256 MiB with a backlog of zero, and a read older than 30 s is not interrupted (R126, R127). The writer's commit callback
-  and its running count of the backlog (R126) are not kept by this adapter, and no rule here reads them.
-- *Both limits are strict and both are needed.* A read is interrupted only when the backlog is **over** 256 MiB and the
-  read is **older than** 30 s, counted from the registration of its transaction; for an owned snapshot that is when its
-  view was opened, not its last call. Exactly 256 MiB, or exactly 30 s, interrupts nothing, and so does either limit
-  alone. A read is interrupted once; a later call does not count it again.
-- *What an interruption does.* It sets the read's expiry flag and calls `sqlite3_interrupt` on the SQL that is
-  running. An interrupt has no effect between two statements, so a progress handler that checks the flag every 1,000
-  virtual-machine steps also stops SQL that begins after the flag is set. The read answers `snapshot_expired`: a typed
-  variant inside the adapter (`SqliteError::SnapshotExpired`, an ordinary result that latches nothing and does not move
-  the pool's transient streak) and, at the `Storage` port, the same message text in `StoreError::Backend` as the idle
-  release, so the error representation of "Reader snapshots on SQLite" is still open. The connection is discarded and
-  opened again on its next use. A callback that catches the raw interrupt error still cannot publish a value, because
-  the expiry answer wins. A raw error that the read has observed is classified first, so a fatal one is answered as
-  `storage_unavailable` (R140) and the expiry does not hide it.
-- *The same snapshot, and no other.* The flag belongs to one owned snapshot of `Storage::read`: its call in flight ends
-  with `snapshot_expired`, a later call on that handle answers it, and a snapshot opened afterwards is served. Once the
-  reader has gone, a later call of the checkpoint copies the frames that it had held back (each of the tests below ends on a
-  backlog of zero).
-- *Not built (T15 and later).* No timer, no 64 MiB size trigger, no 5-minute rule, no report of a backlog that stays
-  over 256 MiB for 5 minutes, no outcome of R137 (the call returns counts, not `copied_all`, `copied_part`,
-  `nothing_to_copy`, `held_back`, `busy` or `failed`), no `wal_bytes` or `wal_file_bytes` metric, no field of
-  `orch db status`, and the daemon never calls `checkpoint()`. A reader outside the daemon still cannot be interrupted.
-- *Tests.* The permanent tests of the rule are in the crate, and R127's row names `sqlite_pool.rs` tests that do not
-  exist: `read_pool::active::tests::exact_limits_do_not_expire_and_interruption_counts_once` (an injected clock: 30 s exactly with
-  one byte over, 256 MiB exactly with one nanosecond over, both over, and then a second call that interrupts nothing);
-  `read_pool::tests::active::actual_checkpoint_backlog_and_age_are_both_required_and_a_long_file_is_not_backlog`,
-  `::both_limits_interrupt_current_sql_and_caught_interrupt_cannot_publish_a_snapshot` and
-  `::sql_started_after_checkpoint_expiry_cannot_escape_the_progress_guard`; and
-  `storage::tests::active_checkpoint_expiry_interrupts_owned_sql_and_expires_that_same_snapshot` (the public snapshot, a
-  running recursive query, 258 MiB of real writes and its expiry, with a finite safety hook that fails the test if the
-  production interrupt does not come first). The tests make a read older by a test-only call
-  (`ActiveReads::age_for_test`); none of them waits 30 s, so none of them measures the 30 s on a clock. The counts that
-  passed are in the plan's "As built at `6706afcbc`".
+**While one logical operation is retained (as built; R128).** The order of this section is the order while no retry episode
+is open. From the first retryable failure of one logical operation until its outcome is known or it is withdrawn (the
+episode of "When a transaction fails"), the writer that #412 landed takes no queued job of any lane, and not only of
+lane 1. `Writer::run` in `crates/orch-infra/src/sqlite/writer.rs` takes a job from the queue only while
+`FailureState::claims_suppressed()` is false or the writer has failed, and that method is true while any episode is open
+(the name is narrower than the use). The retained operation's own next submission is kept apart (`State::continuation`)
+and goes first. This is the behaviour of the source and the implementation's reading of R128; it is not a ruling of the
+owner, and it is not a latency guarantee.
+
+- *`Claims`.* No claim is granted while the failure lasts. This is what R128 says.
+- *`Entities`, `Events` and `Maintenance`.* A queued request of these lanes does not run while the episode is open. R128
+  does not say this; the worker does it. The backoff waits run on the writer's own thread, so nothing else could run
+  during them, and between the producer's submissions the worker still takes nothing.
+- *A request with a deadline.* `Storage::write` gives a request the deadline of arrival plus its lane's budget: 50 ms
+  for `Claims`, 200 ms for `Entities`, 1 s for `Events`, 5 s for `Maintenance`. The worker checks it when it reaches the
+  job. A non-claim request whose budget passes while the episode is open is therefore answered `overloaded` when the
+  worker reaches it, its callback never runs and it never commits later; a claim whose budget passes meanwhile is
+  answered the same way. The answer is sent when the worker reaches the job and not at the deadline: a probe at
+  `2a7cb83e4` (not kept) answered an `Entities` write after 1.55 s. A request that is still within its budget when the
+  episode ends runs normally. A request with no deadline (work of the daemon that a producer holds) is not withdrawn
+  and runs after the episode.
+- *Admission.* The queue is bounded, and one event transaction waits at most (R26). A request that finds the queue full
+  is refused at admission with `overloaded`, as it is with no episode open.
+- *How it ends.* An episode ends at a known commit, at a terminal answer, when its token is dropped, when a
+  reconciliation permits no rebuild, or at its original deadline while its last outcome is a known noncommit (an
+  unknown outcome stays fenced). Otherwise R128's sixty seconds without a commit fail the writer, and the queued
+  requests are then refused with `storage_unavailable`. Nothing here promises that a request waits less than that, and no
+  measurement of a wait is part of 1.1 (R5, record I).
+- *What tests it.* A permanent test shows a claim waiting behind a retained episode and then running
+  (`sqlite::storage::retained::tests::retained_rebuild_uses_the_running_slot_before_a_full_queue_of_claims`). No
+  permanent test shows an `Entities`, `Events` or `Maintenance` request waiting, being answered `overloaded` or running
+  after the episode (issue 429); the evidence is the source above and the probe. The unit test
+  `sqlite::writer::policy::tests::expiry_withdraws_before_another_attempt_and_drop_releases_claims` calls
+  `Schedule::pop_allowed(false)`, a gate that skips claims alone and lets the other lanes through, which the worker does
+  not use: it shows the episode's suppression flag and not the worker's queue rule.
 
 **A failed top-level rollback** (R128; the owner's ruling of 2026-11-24, record L). The writer rolls back the
 transaction of a request that ended in an error, and the transaction of a retryable failure before it tries again. If that
@@ -3188,7 +3129,7 @@ commit.
 At the base of this text `SqliteError` has `OperationRollback` and `TransactionAborted` (the goal adapter marks its
 unit of work unusable after a failed rollback), but the writer neither classifies nor latches: its module comment
 says a failed `BEGIN`, commit or rollback is "not classified, retried or made a shared fatal state", that nothing detects "that a failed rollback left the connection outside autocommit", and issue 127
-tracks the work. (At `2a7cb83e4` that comment is replaced and the writer retries and classifies, as "As built: the
+tracks the work. (In the source of #412, landed as `53136a969`, that comment is replaced and the writer retries and classifies, as "As built: the
 retained writer" above says; this paragraph describes the base.) Building the shared state is part of what remains of T10 (the plan's "What remains of T10 after the
 foundation"); the mapping's error integration needs it, and none of this text wires it.
 
@@ -5449,11 +5390,11 @@ lifetime of a reader's snapshot that answers no id and changes none of the answe
     command protocol (a new port, with its own review) or a different milestone allocation. It accepts no T10 vector,
     releases no hold on issue 127, T10 acceptance, activation or release, and changes no other row of R128: the classes, the
     times, the idle-writer rule, the finish spool and the latch stand as written.
-  - *What was built afterwards.* A development implementation of item 1 exists at `2a7cb83e4` and is described under
-    "When a transaction fails" ("As built: the retained writer"); it is not reviewed or accepted. A development
-    implementation of item 2's event producer exists at `9b55edbf4` (integrated head `07fecf1ed`) and is described under
-    "As built: the event producer"; it is not wired, reviewed or accepted. The remaining collection and the other callers
-    are not built.
+  - *What was built afterwards.* Item 1 was built at `2a7cb83e4` and landed on `main` in PR #412 as `53136a969` on
+    2026-11-27; it is described under "When a transaction fails" ("As built: the retained writer"). It was independently
+    reviewed (the code review with conditions), is not wired to the daemon and is not accepted for T10. As built, the suppression of claims
+    holds all four lanes ("While one logical operation is retained" under "Writer lanes"); that is not a part of record P
+    and not a ruling of the owner. Item 2's event producer is not built.
 
 "As recommended" means, for O1 to O10, AP1 to AP13 and D1 to D8, the recommendation and its condition in
 the approval request of 2026-11-20; and for AP14 to AP20, which that request did not hold, the
