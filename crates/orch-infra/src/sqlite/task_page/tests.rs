@@ -1052,3 +1052,26 @@ fn the_prefix_lookup_stops_at_the_first_id_taken() {
     assert_eq!(found.as_deref(), Some("ab2"));
     assert_eq!(seen, ["ab1", "ab2"]);
 }
+
+#[test]
+fn unresolved_token_keeps_invalid_request_precedence() {
+    let root = tempfile::tempdir().unwrap();
+    let data = data(&root);
+    let mut db = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&data, &mut db).unwrap();
+    let tx = db.transaction().unwrap();
+    for (filter, sort) in [
+        (filter(), Sort::Attempt),
+        (filter(), Sort::Name),
+        (Filter::Agents, Sort::Id),
+    ] {
+        let req = PageRequest {
+            cursor: Some(orch_core::store::Cursor::new("opaque".into()).unwrap()),
+            ..request(sort, 1)
+        };
+        assert!(matches!(
+            query(&tx, "p", &filter, &req, None),
+            Err(task_page::Error::Page(StoreError::InvalidPage(_)))
+        ));
+    }
+}
