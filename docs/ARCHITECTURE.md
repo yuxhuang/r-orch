@@ -1291,8 +1291,9 @@ clients <── WriteReceipt::wait() ──────────────�
   are specific to the latter, and only the per-transaction accounting shows them). A leaf's cleanup unwind is
   outside all of this (record O).
 - **Event producer** (`sqlite/events/producer.rs`, exported from `orch_infra::sqlite`; spec "As built: the event producer",
-  plan "As built at `9b55edbf4`"; a development member of the integrated head `07fecf1ed`, not wired to the daemon or to a
-  collector; the daemon still uses files). `EventProducer` is the first caller of `retained_write`, on the `Events` lane
+  plan "As built at `9b55edbf4`" and "As built at `4e80198f0`"; a development member of the integrated head `07fecf1ed`,
+  read at its later development head `4e80198f0`, not wired to the daemon or to a collector; the daemon still uses files).
+  `EventProducer` is the first caller of `retained_write`, on the `Events` lane
   with no request deadline. One task owns every numbered `EventBatch` until the writer has answered for it and has one
   transaction in flight, which is the one that the spec's R26 allows the event lane. Each transaction takes the waiting
   batches of the first batch's caller, of any number of runs, in arrival order, and cuts them at 1,000 rows (an event
@@ -1304,9 +1305,25 @@ clients <── WriteReceipt::wait() ──────────────�
   producer closed and marks the batches in doubt (`SubmitFailure::outcome_unknown`). A stale lease or invalid events
   answer one batch alone; another failure of a coalesced transaction replans it with its first batch alone. The producer
   never counts the rows and time of a transaction: the writer does, once, and it counts a transaction that the producer cut by
-  time (the spec's "What the counter does not tell (I2)"). At most 16,384 events wait; past that
-  `Rejected::Full` returns the batch to its collector. Not here: numbering at handover, the counters at start and stop, the
-  collector's buffer and its gaps, pruning, an export of the counter and every caller in the daemon (T16).
+  time (the spec's "What the counter does not tell (I2)"). What waits is bounded by three independent limits (by default
+  16,384 events, which is also the most one batch may hold; 4,096 batches, an empty one counting as one; and 256 MiB of
+  accounted bytes), checked cheapest first and before anything is encoded. A batch that can never fit, over the event or
+  the byte limit even with nothing waiting, comes back whole as `Rejected::TooLarge`; one that fits only when waiting
+  batches have been answered comes back whole as `Rejected::Full`; a failed or closed producer returns
+  `Rejected::Closed`. The producer keeps an accepted event as one buffer holding exactly its whole-event JSON, the bytes that
+  the physical encoder writes and that reconciliation compares, and no decoded value, so its charge is that length plus a
+  fixed record and does not depend on the JSON's shape: an event of at most 64 MiB (67,108,864 bytes, inclusive) is
+  admitted by an empty producer whatever it holds, and one of more than 64 MiB that still fits the 256 MiB fails alone at its statement.
+  The metadata (the caller's, the run's and the lineage's strings at their capacities, eight times, and a run name for up to
+  1,000 statements) is charged as well. A batch holds one charge, shared by its queue entry, its plans, the attempt's copies
+  and the reconciliation's rows, and the charge comes back when the last of them is dropped, so a transaction in flight,
+  a committed prefix and an unknown outcome stay counted. The counter is not a bound on process memory: the submitter's own
+  input and serialization buffer, and the transient copies of the SQL and blob code, are outside it (the spec's "Admission
+  and retained bytes"). The producer submits through the same retained write and unit of work as every callback (an
+  internal typed entry that shares `RetainedWrite::attempt`'s implementation and episode) and reconciles through the
+  snapshot helper that `Storage::read` also uses, so it adds no writer, trait or schema. Not here: numbering at handover, the
+  counters at start and stop, the collector's buffer and its gaps, pruning, an export of the counter and every caller in the
+  daemon (T16).
 - **Receipts.** `wait` blocks and returns the closure's result. Dropping a receipt does not cancel the work: an
   accepted transaction still commits. Do not call `wait` on an async runtime thread. The internal event adapter
   (`sqlite/events/adapter.rs`) adapts it for event writes and prunes: `write_async` and `prune_async` queue the

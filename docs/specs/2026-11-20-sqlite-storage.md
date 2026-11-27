@@ -252,6 +252,15 @@ fails"). It changes no rule of records O and P, no class, time or limit of R26, 
 other requirement. It is a development member, not wired to the daemon or to a collector, and it is not the T10 freeze or
 the acceptance of issue 127. No independent review had read this revision when it was written.
 
+The revision that carries this paragraph states, as built, the encoded form of that producer at `4e80198f0` (tree
+`6db7dc8eb`; "As built: the event producer", the bullets "Admission and retained bytes" and "The shared retained path"):
+the producer keeps each accepted event as its exact serialization, so an event of at most 64 MiB encoded is admitted by an
+empty producer whatever its JSON shape, and the earlier sentence that an empty queue accepts a batch of any size is
+replaced by the three limits of that bullet. It changes no rule of records O and P, no class, time or limit of R26, R27,
+R63 or R128 that this spec gave, no trait, no schema, no authorization and no dependency. It is a development input: it
+is not the T10 freeze, not the acceptance of issue 127 and not a readiness claim, and no independent review had read this
+revision when it was written.
+
 ## Source
 
 Verbatim excerpts of the owner's request as recorded in the goal "orch 2.0 phase 1: SQLite storage (release
@@ -455,7 +464,7 @@ holds them.
 | R24 | Exactly one connection shall write, every write shall start with `BEGIN IMMEDIATE`, and every other connection shall be read-only. | B6, B12 | must | `sqlite_connection::a_read_connection_refuses_writes`, `crates/orch-infra/tests/sqlite_writer.rs::writes_run_one_at_a_time_on_one_connection`; both |
 | R25 | A read shall see one consistent snapshot from its first statement to its last, whatever commits meanwhile. | B6 | must | `sqlite_writer::a_read_snapshot_does_not_see_a_later_commit`; both |
 | R26 | The writer shall always take a queued claim or lease transaction first, and otherwise the queued transaction with the earliest deadline, where the deadline is arrival plus 200 ms for entity changes, 1 s for events and 5 s for maintenance; a bulk job shall have at most one transaction queued at a time, and the event lane at most one for all runs together, holding the batches that wait, up to R27's bound. A claim shall therefore wait behind at most the one transaction in progress. That is an order and not a time: the waits of "Writer lanes" are targets that no check of 1.1 measures (the measurement of R5 is deferred: record I of "Owner's answers"), and a test with a fake clock proves the order only. | G; red team W1, W4 | must | `sqlite_writer::a_claim_runs_before_everything_queued` (fake clock), `::earliest_deadline_runs_first_among_the_other_lanes`, `::overdue_maintenance_does_not_delay_a_claim`, `::no_lane_starves_under_a_flood_of_another`, `::waiting_event_batches_share_one_transaction`; both |
-| R27 | Bulk work (event batches, pruning, expiry, import) shall be cut into transactions of at most 1,000 rows or 20 ms of work; an atomic operation over that bound shall run whole and be counted in `writer_txn_over_bound_total`, once for each transaction over the bound and not once for each attempt that a retry makes of it. The writer measures a transaction by its actual rows and its actual elapsed time, the `COMMIT` included, and counts it if it has more than 1,000 rows or took more than 20 ms; it does not ask why the transaction ended there, so an ordinary divisible batch that its producer cut at 20 ms is counted as well, and the counter alone does not identify an indivisible operation (I2, below). The producer that owns the input cuts it at 1,000 rows or 20 ms, checking between statements, and keeps the part that is not yet committed. (AP8; record P) | G | must | `sqlite_writer::bulk_work_is_cut_at_1000_rows`, `::an_atomic_operation_over_the_bound_runs_whole_and_is_counted`; both |
+| R27 | Bulk work (event batches, pruning, expiry, import) shall be cut into transactions of at most 1,000 rows or 20 ms of work; an atomic operation over that bound shall run whole and be counted in `writer_txn_over_bound_total`, once for each transaction over the bound and not once for each attempt that a retry makes of it. The writer measures a transaction by its actual rows and its actual elapsed time, the `COMMIT` included, and counts it if it has more than 1,000 rows or took more than 20 ms; it does not ask why the transaction ended there, so an ordinary divisible batch that its producer cut at 20 ms is counted as well, and the counter alone does not identify an indivisible operation (I2, below). The producer that owns the input cuts it at 1,000 rows or 20 ms, checking between statements, and keeps the part that is not yet committed. What the event producer keeps is bounded by three independent limits (16,384 events, 4,096 batches, 256 MiB of accounted bytes, by default), and the bytes are those of the events' encoded payloads plus their metadata, so an indivisible event whose encoded payload is at most 67,108,864 bytes (64 MiB, inclusive) is admitted by an empty producer whatever its JSON shape, and a batch over a limit is returned whole to its caller ("As built: the event producer", "Admission and retained bytes"). (AP8; record P) | G | must | `sqlite_writer::bulk_work_is_cut_at_1000_rows`, `::an_atomic_operation_over_the_bound_runs_whole_and_is_counted`; admission, as built at `4e80198f0`, in `sqlite::events::tests::producer`: `::encoded_dense_shapes_fit_the_default_producer_and_store`, `::encoded_boundaries_store_exact_physical_bytes_and_isolate_plus_one`, `::a_first_batch_over_the_event_limit_is_returned_whole_and_unencoded`, `::empty_batches_saturate_their_own_limit_and_the_capacity_comes_back`, `::metadata_alone_counts_against_the_byte_limit`, `::the_byte_limit_is_exact_and_a_batch_past_it_is_returned_whole`, `::concurrent_submissions_never_exceed_the_byte_limit`; both |
 | R28 | A side effect outside the database shall be written as an `intents` row in the transaction that decides it, performed after the commit, and marked done; an intent left by a stopped daemon shall be handled at the next start as its kind states in "Transactions and intents". | G, H | must | `crates/orch-engine/tests/intents.rs::intent_is_written_with_its_change`, `::pending_intent_is_handled_after_restart`, `::a_repeated_intent_has_no_second_effect`; both |
 | R29 | The data directory shall have the layout and modes in "Data directory"; the daemon shall create it with those modes and refuse to start when it exists with group or other access or another owner. | B5 | must | `crates/orch-daemon/tests/daemon_data_dir.rs::layout_and_modes_are_as_specified`, `::a_directory_open_to_others_is_refused`; both |
 | R30 | When a daemon or an offline command is pointed at a data directory that another holds, it shall change nothing, exit 4 and print the holder's kind, pid and start time. | B5, G6 | must | `crates/orch-daemon/tests/daemon_data_dir.rs::second_daemon_refuses_and_names_the_holder`, `crates/orch-cli/tests/db_offline.rs::offline_command_refuses_while_a_daemon_holds_the_directory`; both |
@@ -525,7 +534,7 @@ holds them.
 | R94 | — | X | won't | Evidence, quarantine, uploads, text search, HTTP, TLS, tokens, enrolment, certificates, workers, the hub, landing, proposals, many projects per daemon, removing orch-peer, Postgres, an indexed scheduler, object storage, token budgets, outbound notification and Windows are out of scope (X). |
 | R95 | — | DL | won't | No tag and no version bump: cutting 1.1.0 is the owner's separate decision. |
 | R96 | An agent process shall not run its agent unless the run's pid and start time were committed first: the daemon shall create the process held, commit, then release it, and a held process whose daemon is gone shall exit without running the agent. | review finding (a stop between starting a process and recording it left an untracked agent on a workspace that recovery would hand to a second run) | must | `crates/orch-engine/tests/transactions.rs::a_stop_between_spawn_and_commit_runs_no_agent`, `crates/orch-infra` process test `held_process_exits_when_its_parent_is_gone`; both |
-| R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. | B7; review finding | must | `text_over_64_kib_round_trips_through_the_blob_store` in `storage_conformance` checks whole values on entity references; `storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store` in the `orch-infra` library pins file row hashes and disk bytes, with `inline_threshold_counts_utf8_bytes_and_preserves_empty_values`. Retry rows were not covered on `main` at `07b5f967`, which refused text over 65,536 bytes; this change covers them by the tests that "T8 consumer-contract amendment (issue 109)" names (65,536 and 65,537 bytes in `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, registered as `memory_retries_v2`, `blob_memory_retries_v2` and `file_retries_v2`; and 67,108,864 and 67,108,865 bytes, a character split across a chunk boundary, a failed publication, a failure on a later chunk, a missing and a corrupt blob and chunk, a reordered chunk, repeated chunks, a rollback that leaves published bytes unreferenced and a one-object row of the documented form in `storage::v2::tests::retry_*` of the `orch-infra` library, each run with `-- <name> --exact` and required to execute one test; a retry with no run is in the first, a restore of 67,108,865 bytes with no run is in `retry_chunked_text_survives_restore_without_a_run`, and a reordered chunk of the disk-backed fake is in the private unit test `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read`). SQLite backing assertions for tasks: R141's `sqlite_task_format` tests; for the other seven families (Agent, Team, Run, Context, Config, Template, Goal): the R97 tests of R142 and R143 (T10; Message and the retry diagnostic keep their own mappings and are not covered by them); importer backing assertions: T21 (pending, no executable import filter yet); Linux |
+| R97 | A text value over 64 KiB, written through the API or imported, shall be stored in the blob store, with the row holding its hash, and shall be returned whole on read. A run event's JSON payload is such a text value: it is stored in the blob store when it is over 65,536 bytes, by the same threshold, and an event of at most 67,108,864 bytes (64 MiB, inclusive) is one blob object; the blob store refuses one byte more, and that refusal fails only the batch that holds the event ("As built: the event producer", "Admission and retained bytes"). | B7; review finding | must | `text_over_64_kib_round_trips_through_the_blob_store` in `storage_conformance` checks whole values on entity references; `storage::v2::tests::text_over_64_kib_round_trips_through_the_blob_store` in the `orch-infra` library pins file row hashes and disk bytes, with `inline_threshold_counts_utf8_bytes_and_preserves_empty_values`. Run events, as built at `4e80198f0`: `sqlite::events::tests::producer::encoded_boundaries_store_exact_physical_bytes_and_isolate_plus_one` stores an event of exactly 67,108,864 encoded bytes, as a scalar and in a container of four million numbers, as one blob object with the exact bytes and hash and the rows in order, and isolates one byte more. Retry rows were not covered on `main` at `07b5f967`, which refused text over 65,536 bytes; this change covers them by the tests that "T8 consumer-contract amendment (issue 109)" names (65,536 and 65,537 bytes in `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, registered as `memory_retries_v2`, `blob_memory_retries_v2` and `file_retries_v2`; and 67,108,864 and 67,108,865 bytes, a character split across a chunk boundary, a failed publication, a failure on a later chunk, a missing and a corrupt blob and chunk, a reordered chunk, repeated chunks, a rollback that leaves published bytes unreferenced and a one-object row of the documented form in `storage::v2::tests::retry_*` of the `orch-infra` library, each run with `-- <name> --exact` and required to execute one test; a retry with no run is in the first, a restore of 67,108,865 bytes with no run is in `retry_chunked_text_survives_restore_without_a_run`, and a reordered chunk of the disk-backed fake is in the private unit test `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read`). SQLite backing assertions for tasks: R141's `sqlite_task_format` tests; for the other seven families (Agent, Team, Run, Context, Config, Template, Goal): the R97 tests of R142 and R143 (T10; Message and the retry diagnostic keep their own mappings and are not covered by them); importer backing assertions: T21 (pending, no executable import filter yet); Linux |
 | R98 | Reads shall be served by a pool of `storage.read_connections` connections (default 4); a read that finds none free shall wait up to the admission deadline and then fail with `overloaded`, never open another connection. | B6; review finding | should | `sqlite_writer::reads_wait_for_a_free_connection_then_fail_overloaded`; both |
 | R99 | `orch import` shall account for every entry of the source `.orchestry/` and of each directory that "Import rules" has it list: each is imported, or left in place as "Import rules" lists, or named by the dry run and by the import's report as not imported; a directory it does not enter is one entry. Project prompt template files shall become `templates` rows, byte for byte. | N, S2, B2 | must | `import::every_source_path_is_accounted_for` (a corpus with an unknown file and an unknown directory), `::templates_are_imported_byte_for_byte`, `::a_template_that_is_not_utf8_text_is_refused_before_any_write` (prospective: the issue 192 importer caller writes it, and no such test is on `main`); both |
 | R100 | `orch db restore` shall refuse, changing nothing, while a process that the replaced state or the backup records as a run's is alive (pid and start time), naming each run and pid and which of the two records it. With `--stop-runs` it shall first stop the process groups that the replaced state records, which this daemon wrote in this data directory. It shall never signal a process because a backup records it: such a process keeps the restore refused until it has ended or the owner names its run with `--assume-stopped <run id>`. No waiting period shall stand in for either: a run's process in 1.1 keeps no deadline of its own (R42), so the passing of time never shows that an earlier holder has stopped. After a restore no lease of the backup shall be active: each is ended and its run closed as R41 closes a run whose process is gone, and the spool of the replaced state (R129) is set aside with it. | G9; the lease prototype and its review (a restore that frees every task at once lets a holder from the replaced state and a new one work on one task); the security re-review's condition S2-C2 (a pid and a start time do not show who wrote a backup); the review of the prototype's corrections, N1 (its waiting-period alternative holds only where a holder stops itself, which arrives in 1.5); AP14 | must | `crates/orch-cli/tests/restore_fencing.rs::restore_refuses_while_a_recorded_process_is_alive`, `::stop_runs_stops_only_what_the_replaced_state_records`, `::a_process_only_the_backup_records_is_never_signalled` (a fake process table records every call), `::assume_stopped_lets_the_restore_proceed_for_the_named_run`, `::restored_leases_are_ended`; both |
@@ -2991,6 +3000,11 @@ the retained write. It exists on the integrated development head `07fecf1ed` as 
 collector, and it is not reviewed or accepted here: no T10 vector and no proof of issue 127 is accepted. It adds no trait, no
 schema and no authentication, and it changes no class, time or limit of R26, R27, R63 or R128. The plan's "As built at
 `9b55edbf4`" lists its tests and what the head's runs showed, including a whole `fast` run of that head that failed.
+The producer was changed after that commit. Its admission and its retained form are read below at the later development
+head `4e80198f0` (tree `6db7dc8eb`, on `c3d009ab9`, on `c51daaea9`; the plan's "As built at `4e80198f0`" has the tests
+and the runs), and the bullets that say so name it. The coalescing, the cut, the rebuild and the reconcile bullets were read
+again at that head and describe it, apart from what the reconcile bullet and the admission bullet say. The frozen head is
+a development input like the first: it is not the T10 freeze and is not accepted here.
 - *Coalescing and isolation (R26).* One task owns every numbered batch (`EventBatch`: caller, run, lineage, epoch and the
   events, each with its sequence number) until the writer has answered for it, and it has at most one transaction in
   flight, so the event lane holds the one transaction that R26 allows. Everything that waits goes into the next
@@ -3007,8 +3021,62 @@ schema and no authentication, and it changes no class, time or limit of R26, R27
   never counts it twice (R27). The elapsed time includes the `COMMIT`, and a time cut is taken only after 20 ms of statements
   have run, so a transaction that the producer cut by time is over the writer's 20 ms bound and is counted, although the cut
   worked as intended (see below). What is
-  not committed is kept in order and planned again. At most 16,384 events wait (`queue_limit`); a batch that would pass that
-  is returned as `Rejected::Full` for its collector to keep (R63), and an empty queue accepts a batch of any size.
+  not committed is kept in order and planned again. What waits is bounded by three independent limits, which the next
+  bullet states.
+- *Admission and retained bytes (R27, R63; as built at `4e80198f0`).* `EventProducerOptions::default()` sets three limits,
+  and each is checked on its own: 16,384 events (`queue_limit`, which is also the most that one batch may hold), 4,096
+  batches (`batch_limit`; an empty batch is a lease check and counts as one), and 268,435,456 bytes, 256 MiB, of accounted
+  bytes (`byte_limit`, four times `MAX_BLOB_BYTES`). What a batch is charged is the encoded payload of its events (below)
+  plus its metadata, so one limit's room says nothing about another's: a thousand empty batches use no event capacity, and
+  a few large events use no batch capacity.
+  - *What is charged.* Each accepted event is kept as one record (its sequence number, its time in milliseconds, its type)
+    and one buffer that holds exactly the whole-event JSON that the physical encoder writes, as UTF-8 and with no spare
+    capacity, so an event's charge is the length of its encoded payload plus a fixed record, and the shape of the JSON
+    value, whether one long string, a dense array of numbers or objects, or a deep nesting, changes nothing but that
+    length. No decoded value tree and no multiplier for objects is held or reserved. The metadata is charged at the
+    capacities of its strings, the caller's project and principal, the run and the lineage, eight times (the copies that
+    the plan, an attempt, a reconciliation and the report hold at once), plus one run name for each of the first 1,000
+    events (the names that reconciliation can hold for one transaction), plus a fixed amount for the batch and for each
+    event. An empty batch is charged its metadata alone.
+  - *The ceiling of one event.* An otherwise valid event whose encoded payload is at most 67,108,864 bytes (64 MiB,
+    inclusive, the size that the physical encoder and `DiskBlobStore` measure) is admitted by an open producer that holds
+    nothing, with metadata that fits beside it, whatever its JSON shape. The default byte limit leaves 192 MiB of the 256
+    MiB, less the event's fixed record, for that metadata. An event of more than 64 MiB that still fits the byte limit is admitted too, and the store
+    refuses it at its own statement: the blob store refuses the object, and the batch that holds it is answered alone with an
+    error, `outcome_unknown` false and nothing stored, while the batches beside it commit (the isolation of "Rebuild"
+    below). Occupied capacity keeps its ordinary meaning: the same event is returned as
+    `Rejected::Full` while enough bytes wait, and is admitted once they are answered.
+  - *The three refusals.* `Rejected::Closed` when the producer has failed or was closed. `Rejected::TooLarge` when the batch
+    could never be admitted however little waits: more events than `queue_limit`, or more accounted bytes than
+    `byte_limit`, metadata alone included (a first batch counts as much as a later one; the empty producer accepts no
+    batch over a limit). `Rejected::Full` when it would be admitted if enough of what waits were answered: the batches
+    waiting are at `batch_limit`, or its events or bytes do not fit beside the waiting ones. The caller keeps a `Full` batch
+    and submits it again, or, for `TooLarge`, splits it or records a gap (R63).
+  - *The order of the checks.* The cheap checks come first: closed, the event count, the batch count and the bytes that the
+    batch holds whatever its events encode to (its metadata and the fixed record of each event). A batch excluded by them is returned before anything is encoded. Then the events are encoded one
+    after another against the bytes still free, and the walk stops at the first event that does not fit, so a refusal costs
+    at most the free allowance. The same limits are checked again under the lock that adds the batch, because other
+    submissions may have arrived meanwhile; the capacity is taken there, and a concurrent pair that does not both fit is
+    admitted one and refused one.
+  - *Refusal returns the original whole.* The producer takes ownership of the batch at `submit` and returns it as it was, with
+    every allocation, including the spare capacity of its strings, on every refusal, the final recheck included. The
+    caller's original events and their spare allocations are dropped only after the batch has been admitted. A spare
+    capacity of the metadata strings is counted as held (an oversized one is refused whole as `TooLarge`); a spare
+    capacity inside an event's data is not retained, because the retained form is the exact encoding.
+  - *When capacity comes back.* A batch holds one charge that its queue entry, the plans cut from it, the copies that an
+    attempt holds and the rows that a reconciliation expects each share. The charge is returned when the last of them is
+    dropped, and not when the batch leaves the queue: a transaction in flight, a committed prefix whose batch still waits
+    for its tail and an unknown outcome that reconciliation still holds keep it charged. After a failure of the whole
+    producer (a panic in the clock or the observer, or a writer that has failed) every held batch is answered once and
+    intake closes; the capacity returns as the remaining owners are dropped. The queue's vacant slots are shrunk when
+    batches leave. After a success, a known failure, an unknown outcome and a panic the producer holds nothing once the
+    last owner has gone.
+  - *What the counter does not measure.* The retained counter is not a bound on the process's memory. A submitter's own
+    input and the serialization buffer that it fills (at most the free allowance that it saw at its first check, for each
+    concurrent submitter), the moment at which a vector becomes a shared slice, the copies that the existing SQL and blob
+    code may make of one payload or one statement group while it runs, and the one stored blob (at most 64 MiB) that a
+    reconciliation reads at a time, are transient costs outside it, as are the allocator's headers and caches and the
+    readers. No bound is given for any number of independent submitters beyond what each of them can see.
 - *What the counter does not tell (I2; decided 2026-11-27, the writer's accounting is kept).* The writer's predicate is
   `rows > 1000 || work > 20 ms`, where `work` is the elapsed time from the end of `BEGIN` to the end of the attempt, the
   `COMMIT` included, less the writer's own backoff waits (`writer/policy.rs`, `accounting`; `writer.rs`, `execute_episode`).
@@ -3038,12 +3106,27 @@ schema and no authentication, and it changes no class, time or limit of R26, R27
   doubling to 250 ms, without a limit. Another failure while the writer has not failed answers one batch: a coalesced
   transaction is planned again with its first batch alone.
 - *Reconcile.* After an unknown commit nothing is submitted until the database has answered: a snapshot of the bound caller
-  reads the sequence range that each step stored and compares each event with its input. All found: the commit happened.
+  reads each row that a step stored, by its sequence number, and compares its time, type and payload bytes with the frozen
+  encoding of the input (as built at `4e80198f0`; at `9b55edbf4` it paged through the sequence range and compared decoded
+  events). A row whose payload is behind a blob reference is loaded through the blob store, which checks its size and hash,
+  one row at a time, and no decoded value is rebuilt. All found: the commit happened.
   None found: a rebuild if the cause was retryable, and an answer of failure if not. Some found, a stored event that differs
   or a read that fails is an error, tried up to five times (20 ms, doubling), and the producer then fails closed: it answers
   every waiting batch with its counts, refuses later submissions (`Rejected::Closed`) and sets
   `SubmitFailure::outcome_unknown` on the batches of the transaction whose commit it could not establish, which a collector
   must not turn into a gap row (R139). A writer that has latched a failure ends the producer the same way.
+- *The shared retained path (as built at `4e80198f0`).* The producer adds no second writer, factory or registry. Its work
+  is submitted by `RetainedWrite::attempt_unit`, which `RetainedWrite::attempt` also calls for the public `FnOnce` callback,
+  so both share one implementation and the same writer episode. Each attempt makes the real unit of work outside the catch of
+  Amendment 3 and contains only the callback; `ensure_committable` runs after it, outside the catch. The callback calls
+  `Unit::append_encoded_events`, which takes the same guard (`event_operation`), the same transaction, caller and disk, and
+  the same trusted `FailureSource::Writer` and failure state as every event operation, and which ends in the one
+  statement implementation (`append_rows`) that the earlier `append_with_blobs` also uses, so the lease check, the
+  sequence and duplicate rules and the publication of a blob are the same code for both. A reconciliation reads through a
+  concrete snapshot helper (`SqliteStorage::snapshot`) that the public `Storage::read` also calls: the same read worker, the
+  same transaction, caller, capacity, expiry and fatal guards and `FailureSource::Reader`. The all-or-none rule stands
+  (some found, or a differing row, is an error and the producer fails closed) and no callback is replayed. No trait, schema,
+  authorization, dependency or `unsafe` changes.
 - *Not built here.* The numbering of an event at its handover and the counters at start and stop (R61, R139), the collector's
   buffer and its gaps (R63), pruning, an export of the counter, and every caller in the daemon (T16's remaining work). R127's
   checkpoint job and its schedule have no code (its adapter-side rule is the next subsection). A reconciliation of a step that mixes duplicates that an
