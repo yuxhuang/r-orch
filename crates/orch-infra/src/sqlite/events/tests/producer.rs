@@ -239,7 +239,11 @@ async fn waiting_event_batches_share_one_transaction() {
     );
     assert_eq!(reports[1].events, 12);
     assert_eq!(reports[1].accounting.rows, 12);
-    assert!(!reports[1].accounting.over_bound);
+    assert_eq!(
+        reports[1].accounting.over_bound,
+        reports[1].accounting.work > Duration::from_millis(20),
+        "the signed accounting includes actual COMMIT time, even for a small planned transaction"
+    );
     assert_eq!(
         fx.stored("p", "run-1").await,
         (1..=6).map(event).collect::<Vec<_>>()
@@ -1551,4 +1555,858 @@ async fn the_planned_rows_equal_the_actual_rows_at_the_inline_threshold() {
     // writer's own count of rows it changed.
     assert_eq!(fx.reports()[0].accounting.rows, 4);
     producer.close().await;
+}
+
+/// Allocation capacities, not just visible JSON bytes, stay inside the envelope.
+#[tokio::test]
+async fn metadata_spares_are_refused_and_payload_spares_are_released() {
+    let mut fx = fixture();
+    fx.options.byte_limit = 8192;
+    let producer = fx.producer();
+    for kind in 0..9 {
+        let mut batch = fx.empty_batch("p", &format!("capacity-{kind}")).await;
+        let mut spare = String::with_capacity(32768);
+        spare.push('x');
+        match kind {
+            0 => batch.run = spare,
+            1 => batch.lineage = spare,
+            2 => batch.caller.project = spare,
+            3 => batch.caller.principal = orch_core::store::Principal::Owner { identity: spare },
+            _ => {
+                let mut item = event(1);
+                match kind {
+                    4 => item.event.timestamp = spare,
+                    5 => item.event.data = serde_json::Value::String(spare),
+                    6 => item.event.data = serde_json::Value::Array(Vec::with_capacity(32768)),
+                    7 => {
+                        item.event.data =
+                            serde_json::Value::Array(vec![serde_json::Value::Null; 200])
+                    }
+                    _ => {
+                        let mut object = serde_json::Map::new();
+                        object.insert(spare, serde_json::Value::Null);
+                        item.event.data = serde_json::Value::Object(object);
+                    }
+                }
+                batch.events.push(item);
+            }
+        }
+        if kind >= 4 {
+            let expected = serde_json::to_string(&batch.events[0].event).unwrap();
+            let charged = accounted_bytes(&batch);
+            assert!(charged < 8192, "only the live encoding is retained: {kind}");
+            assert_eq!(
+                answered(producer.submit(batch).unwrap()).await.unwrap(),
+                counts(1, 0)
+            );
+            let stored = fx.stored("p", &format!("capacity-{kind}")).await;
+            assert_eq!(serde_json::to_string(&stored[0].event).unwrap(), expected);
+            assert_eq!(producer.retained(), (0, 0, 0));
+            continue;
+        }
+        let pointer = batch.run.as_ptr();
+        let capacity = batch.run.capacity();
+        let expected = batch.clone();
+        let Err(Rejected::TooLarge(returned)) = producer.submit(batch) else {
+            panic!("capacity-heavy input {kind} escaped the retained-byte envelope");
+        };
+        same_batch(&returned, &expected);
+        assert_eq!(
+            returned.run.as_ptr(),
+            pointer,
+            "refusal preserves allocation"
+        );
+        assert_eq!(returned.run.capacity(), capacity);
+        assert_eq!(producer.retained(), (0, 0, 0));
+    }
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn principal_spare_fields_are_returned_whole_before_encoding() {
+    use orch_core::store::Principal;
+
+    fn selected(principal: &Principal, kind: usize) -> &String {
+        match principal {
+            Principal::Worker { identity } => identity,
+            Principal::Task {
+                identity,
+                task,
+                run,
+                lineage,
+                ..
+            } => [identity, task, run, lineage][kind - 1],
+            _ => unreachable!("the fixture supplies Worker or Task"),
+        }
+    }
+
+    let mut fx = fixture();
+    fx.options.byte_limit = 8192;
+    let producer = fx.producer();
+    for kind in 0..5 {
+        let mut batch = fx.empty_batch("p", &format!("principal-{kind}")).await;
+        let mut spare = String::with_capacity(32768);
+        spare.push('x');
+        batch.caller.principal = if kind == 0 {
+            Principal::Worker { identity: spare }
+        } else {
+            let mut fields = std::array::from_fn::<_, 4, _>(|_| String::from("x"));
+            fields[kind - 1] = spare;
+            let [identity, task, run, lineage] = fields;
+            Principal::Task {
+                identity,
+                task,
+                run,
+                lineage,
+                epoch: 1,
+            }
+        };
+        batch.events.push(event(1));
+        let pointer = selected(&batch.caller.principal, kind).as_ptr();
+        let capacity = selected(&batch.caller.principal, kind).capacity();
+        let expected = batch.clone();
+        let encoded = encoded_events();
+        let Err(Rejected::TooLarge(returned)) = producer.submit(batch) else {
+            panic!("principal field {kind} escaped the metadata envelope");
+        };
+        same_batch(&returned, &expected);
+        assert_eq!(selected(&returned.caller.principal, kind).as_ptr(), pointer);
+        assert_eq!(
+            selected(&returned.caller.principal, kind).capacity(),
+            capacity
+        );
+        assert_eq!(encoded_events(), encoded, "metadata refusal is cheap");
+        assert_eq!(producer.retained(), (0, 0, 0));
+    }
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn observer_panic_on_the_last_commit_closes_intake() {
+    let mut fx = fixture();
+    fx.options.observer = Some(Arc::new(|_| panic!("synthetic observer panic, last batch")));
+    let producer = fx.producer();
+    let b = fx.batch("p", "only", 1..=3).await;
+    assert_eq!(
+        answered(producer.submit(b).unwrap()).await.unwrap(),
+        counts(3, 0)
+    );
+    // Nothing left to answer. Is intake closed, or does it accept work nobody will process?
+    let late = fx.batch("p", "late", 1..=2).await;
+    match producer.submit(late) {
+        Err(Rejected::Closed(..)) => {}
+        Ok(s) => {
+            let r = tokio::time::timeout(Duration::from_secs(3), s).await;
+            panic!(
+                "PROBE-A FAIL: submit accepted after the task ended; answer within 3s: {:?}",
+                r.is_ok()
+            );
+        }
+        Err(other) => panic!("unexpected {other:?}"),
+    }
+    tokio::time::timeout(SAFETY, producer.flush())
+        .await
+        .expect("flush");
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn a_waiting_flush_is_released_when_the_task_panics() {
+    let mut fx = fixture();
+    fx.options.now = Arc::new(|| panic!("synthetic clock panic"));
+    let producer = Arc::new(fx.producer());
+    let lead = fx.batch("p", "lead", 1..=3).await;
+    let stall = fx.stall().await;
+    let lead = producer.submit(lead).unwrap();
+    in_flight(&producer).await;
+    let mut flusher = Box::pin(producer.flush());
+    assert!(
+        futures::poll!(flusher.as_mut()).is_pending(),
+        "flush must register and wait while a transaction is held"
+    );
+    stall.end().await;
+    let started = answered(lead).await.unwrap_err();
+    assert!(started.outcome_unknown);
+    tokio::time::timeout(Duration::from_secs(5), flusher)
+        .await
+        .expect("PROBE-B FAIL: a flush that was already waiting never returns");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_submissions_never_exceed_the_byte_limit() {
+    for round in 0..6 {
+        let mut fx = fixture();
+        let big = |seq| big_event(seq, 2 * 1024 * 1024);
+        let lead = fx.batch("p", "lead", 1..=1).await;
+        let lead_held = accounted_bytes(&lead);
+        let mut cands = Vec::new();
+        for i in 0..16 {
+            let (lineage, epoch) = fx.lease("p", &format!("c{i}")).await;
+            cands.push(EventBatch {
+                caller: owner("p"),
+                run: format!("c{i}"),
+                lineage,
+                epoch,
+                events: vec![big(1)],
+            });
+        }
+        let held = accounted_bytes(&cands[0]);
+        fx.options.byte_limit = lead_held + held + held / 2;
+        let producer = Arc::new(fx.producer());
+        let stall = fx.stall().await;
+        let lead = producer.submit(lead).unwrap();
+        in_flight(&producer).await;
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = cands
+            .into_iter()
+            .map(|b| {
+                let (p, bar) = (Arc::clone(&producer), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    bar.wait();
+                    p.submit(b).is_ok()
+                })
+            })
+            .collect();
+        let ok = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|x| *x)
+            .count();
+        let (_, _, bytes) = producer.retained();
+        assert!(
+            bytes <= fx.options.byte_limit,
+            "round {round}: PROBE-D FAIL held {bytes} > {} ({ok} admitted)",
+            fx.options.byte_limit
+        );
+        assert_eq!(
+            ok, 1,
+            "round {round}: PROBE-D exactly one candidate fits ({ok})"
+        );
+        stall.end().await;
+        answered(lead).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_nonretryable_commit_with_no_durable_rows_is_never_rebuilt() {
+    let mut once = true;
+    let fx = fixture_with(StorageOptions {
+        writer_commit_probe: Some(Box::new(move |tx| {
+            let events: i64 = tx
+                .query_row("SELECT count(*) FROM run_events", [], |r| r.get(0))
+                .unwrap();
+            if events == 0 || !once {
+                return None;
+            }
+            once = false;
+            // Nothing becomes durable, the transaction is no longer open, and the
+            // error (SQLITE_ERROR) is one that allows no retry.
+            tx.execute_batch("DELETE FROM run_events; COMMIT").unwrap();
+            Some(Err(sql(1)))
+        })),
+        ..StorageOptions::default()
+    });
+    let producer = fx.producer();
+    let first = fx.batch("p", "run", 1..=4).await;
+    let other = fx.batch("p", "other", 1..=2).await;
+    let failure = answered(producer.submit(first).unwrap()).await.unwrap_err();
+    assert!(
+        !failure.outcome_unknown,
+        "found none of its rows: {failure:?}"
+    );
+    assert_eq!((failure.committed, failure.not_stored), (counts(0, 0), 4));
+    assert!(fx.stored("p", "run").await.is_empty(), "never replayed");
+    // The producer survives and serves the next batch.
+    assert_eq!(
+        answered(producer.submit(other).unwrap()).await.unwrap(),
+        counts(2, 0)
+    );
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn encoded_dense_shapes_fit_the_default_producer_and_store() {
+    for shape in 0..2 {
+        let fx = fixture();
+        let producer = fx.producer();
+        let mut batch = fx.batch("p", "dense", 1..=1).await;
+        batch.events[0].event.data = if shape == 0 {
+            serde_json::Value::Array(
+                (0..100_000)
+                    .map(|_| serde_json::json!({"a": 1, "b": 2, "c": 3}))
+                    .collect(),
+            )
+        } else {
+            serde_json::Value::Array(vec![serde_json::json!(1); 4_000_000])
+        };
+        let expected = serde_json::to_string(&batch.events[0].event).unwrap();
+        let submission = producer
+            .submit(batch)
+            .unwrap_or_else(|_| panic!("dense shape {shape} below 64MiB must fit"));
+        assert_eq!(answered(submission).await.unwrap(), counts(1, 0));
+        let stored = fx.stored("p", "dense").await;
+        assert_eq!(serde_json::to_string(&stored[0].event).unwrap(), expected);
+        assert_eq!(producer.retained(), (0, 0, 0));
+        producer.close().await;
+    }
+}
+
+#[tokio::test]
+async fn encoded_boundaries_store_exact_physical_bytes_and_isolate_plus_one() {
+    use sha2::{Digest, Sha256};
+    let maximum = crate::blob::MAX_BLOB_BYTES as usize;
+    for shape in 0..2 {
+        let fx = fixture();
+        let producer = fx.producer();
+        let mut batch = fx.batch("p", "boundary", 1..=2).await;
+        let mut item = event(1);
+        item.event.data = if shape == 0 {
+            serde_json::Value::String(String::new())
+        } else {
+            let mut items = vec![serde_json::json!(1); 4_000_000];
+            items.push(serde_json::Value::String(String::new()));
+            serde_json::Value::Array(items)
+        };
+        let base = super::super::encode(&item.event).unwrap().2.len();
+        let padding = "x".repeat(maximum - base);
+        match &mut item.event.data {
+            serde_json::Value::String(s) => *s = padding,
+            serde_json::Value::Array(a) => *a.last_mut().unwrap() = padding.into(),
+            _ => unreachable!(),
+        }
+        let (at, kind, bytes) = super::super::encode(&item.event).unwrap();
+        assert_eq!(bytes.len(), maximum);
+        let expected_hash = format!("{:x}", Sha256::digest(bytes.as_bytes()));
+        drop(bytes);
+        batch.events[0] = item;
+        assert!(accounted_bytes(&batch) < EventProducerOptions::default().byte_limit);
+        assert_eq!(
+            answered(producer.submit(batch).unwrap()).await.unwrap(),
+            counts(2, 0)
+        );
+        let conn = rusqlite::Connection::open(&fx.database).unwrap();
+        let (stored_at, stored_kind, tag): (i64, String, String) = conn.query_row(
+            "SELECT at,type,payload FROM run_events WHERE project_id='p' AND run_id='boundary' AND seq=1",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        let tag: [String; 2] = serde_json::from_str(&tag).unwrap();
+        assert_eq!(
+            tag,
+            ["orch.event.blob.v1".to_owned(), expected_hash.clone()]
+        );
+        assert_eq!((stored_at, stored_kind.as_str()), (at, kind));
+        let path = fx
+            .database
+            .parent()
+            .unwrap()
+            .join("blobs/sha256")
+            .join(&expected_hash[..2])
+            .join(&expected_hash[2..4])
+            .join(&expected_hash);
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes.len(), maximum);
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), expected_hash);
+        drop(bytes);
+        let order: Vec<i64> = conn
+            .prepare("SELECT seq FROM run_events WHERE run_id='boundary' ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(order, [1, 2]);
+        assert_eq!(producer.retained(), (0, 0, 0));
+        producer.close().await;
+    }
+    let fx = fixture();
+    let producer = fx.producer();
+    let mut poison = fx.batch("p", "plus-one", 1..=1).await;
+    let base = super::super::encode(&big_event(1, 0).event)
+        .unwrap()
+        .2
+        .len();
+    poison.events[0] = big_event(1, maximum + 1 - base);
+    assert_eq!(
+        super::super::encode(&poison.events[0].event)
+            .unwrap()
+            .2
+            .len(),
+        maximum + 1
+    );
+    let good = fx.batch("p", "beside", 1..=2).await;
+    let stall = fx.stall().await;
+    let poison = producer.submit(poison).unwrap();
+    let good = producer.submit(good).unwrap();
+    stall.end().await;
+    let failure = answered(poison).await.unwrap_err();
+    assert!(!failure.outcome_unknown);
+    assert_eq!(failure.not_stored, 1);
+    assert_eq!(answered(good).await.unwrap(), counts(2, 0));
+    assert!(fx.stored("p", "plus-one").await.is_empty());
+    assert_eq!(producer.retained(), (0, 0, 0));
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn encoded_unknown_commit_reconciles_escaped_ordered_numbers_and_accepted_nesting() {
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = armed.clone();
+    let mut once = true;
+    let fx = fixture_with(StorageOptions {
+        writer_commit_probe: Some(Box::new(move |tx| {
+            if !flag.load(Ordering::SeqCst) || !once {
+                return None;
+            }
+            once = false;
+            tx.execute_batch("COMMIT").unwrap();
+            Some(Err(sql(10)))
+        })),
+        ..StorageOptions::default()
+    });
+    let producer = fx.producer();
+    let mut batch = fx.batch("p", "exact-nested", 1..=2).await;
+    batch.events[0].event.timestamp = "2026-11-27T01:02:03.456-05:00".into();
+    let mut data = serde_json::json!({"z": "\n\t\"\\é", "a": [18446744073709551615u64, -0.0, 1.25e100], "m": {"b": 1, "a": 2}});
+    for _ in 0..160 {
+        data = serde_json::json!([data]);
+    }
+    batch.events[0].event.data = data;
+    let expected: Vec<_> = batch
+        .events
+        .iter()
+        .map(|e| super::super::encode(&e.event).unwrap())
+        .collect();
+    armed.store(true, Ordering::SeqCst);
+    assert_eq!(
+        answered(producer.submit(batch).unwrap()).await.unwrap(),
+        counts(2, 0)
+    );
+    assert_eq!(
+        fx.reports()[0].attempts,
+        1,
+        "lost acknowledgement reconciles without replay"
+    );
+    let conn = rusqlite::Connection::open(&fx.database).unwrap();
+    for (index, (at, kind, payload)) in expected.into_iter().enumerate() {
+        let stored: (i64, String, String) = conn
+            .query_row(
+                "SELECT at,type,payload FROM run_events WHERE run_id='exact-nested' AND seq=?1",
+                [(index + 1) as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (at, kind.to_owned(), payload));
+    }
+    assert_eq!(producer.retained(), (0, 0, 0));
+    producer.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encoded_budget_stays_charged_through_in_flight_ownership() {
+    let mut fx = fixture();
+    let batch = fx.batch("p", "charged", 1..=1).await;
+    let held = accounted_bytes(&batch);
+    let next = fx.batch("p", "another", 1..=1).await;
+    fx.options.byte_limit = held.max(accounted_bytes(&next));
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (release, blocked) = mpsc::sync_channel(1);
+    let blocked = Mutex::new(blocked);
+    fx.options.observer = Some(Arc::new(move |_| {
+        if let Some(entered) = entered.lock().unwrap().take() {
+            let _ = entered.send(());
+            blocked.lock().unwrap().recv_timeout(SAFETY).unwrap();
+        }
+    }));
+    let producer = fx.producer();
+    let submission = producer.submit(batch).unwrap();
+    tokio::time::timeout(SAFETY, observed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        producer.retained(),
+        (0, 0, held),
+        "completed plan still owns frozen bytes"
+    );
+    let Err(Rejected::Full(next)) = producer.submit(next) else {
+        panic!("in-flight ownership must consume the budget");
+    };
+    release.send(()).unwrap();
+    assert_eq!(answered(submission).await.unwrap(), counts(1, 0));
+    tokio::time::timeout(SAFETY, producer.flush())
+        .await
+        .unwrap();
+    assert_eq!(producer.retained(), (0, 0, 0));
+    assert_eq!(
+        answered(producer.submit(*next).unwrap()).await.unwrap(),
+        counts(1, 0)
+    );
+    producer.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answered_encoded_batch_has_already_returned_its_exact_budget() {
+    let mut fx = fixture();
+    let batch = fx.batch("p", "r", 1..=1).await;
+    fx.options.byte_limit = accounted_bytes(&batch);
+    let producer = fx.producer();
+    for _ in 0..1000 {
+        let result = producer
+            .submit(batch.clone())
+            .expect("a received receipt returns exact admission capacity");
+        answered(result).await.unwrap();
+        assert_eq!(
+            producer.retained(),
+            (0, 0, 0),
+            "receipt must follow the final owner and refund"
+        );
+    }
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn encoded_reconciliation_refuses_changed_payload_time_or_type_without_replay() {
+    for changed in 0..3 {
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = armed.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let mut replacement = event(1).event;
+        replacement.data = serde_json::json!("different durable bytes");
+        let replacement = serde_json::to_string(&replacement).unwrap();
+        let fx = fixture_with(StorageOptions {
+            writer_commit_probe: Some(Box::new(move |tx| {
+                if !flag.load(Ordering::SeqCst) {
+                    return None;
+                }
+                seen.fetch_add(1, Ordering::SeqCst);
+                match changed {
+                    0 => {
+                        tx.execute(
+                            "UPDATE run_events SET payload=?1 WHERE run_id='changed' AND seq=1",
+                            [&replacement],
+                        )
+                        .unwrap();
+                    }
+                    1 => {
+                        tx.execute(
+                            "UPDATE run_events SET at=at+1 WHERE run_id='changed' AND seq=1",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                    _ => {
+                        tx.execute(
+                            "UPDATE run_events SET type='error' WHERE run_id='changed' AND seq=1",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                }
+                tx.execute_batch("COMMIT").unwrap();
+                Some(Err(sql(10)))
+            })),
+            ..StorageOptions::default()
+        });
+        let producer = fx.producer();
+        let batch = fx.batch("p", "changed", 1..=1).await;
+        armed.store(true, Ordering::SeqCst);
+        let failure = answered(producer.submit(batch.clone()).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            failure.outcome_unknown,
+            "changed field {changed} cannot reconcile as committed"
+        );
+        assert_eq!((failure.committed, failure.not_stored), (counts(0, 0), 1));
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("differs from the expected"),
+            "{failure:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "unknown input is never replayed"
+        );
+        assert!(fx.reports().is_empty());
+        assert!(matches!(producer.submit(batch), Err(Rejected::Closed(..))));
+        assert_eq!(producer.retained(), (0, 0, 0));
+        producer.close().await;
+    }
+}
+
+#[tokio::test]
+async fn encoded_unknown_commit_reconciles_the_first_duplicate_bytes() {
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = armed.clone();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let fx = fixture_with(StorageOptions {
+        writer_commit_probe: Some(Box::new(move |tx| {
+            if !flag.load(Ordering::SeqCst) {
+                return None;
+            }
+            seen.fetch_add(1, Ordering::SeqCst);
+            tx.execute_batch("COMMIT").unwrap();
+            Some(Err(sql(10)))
+        })),
+        ..StorageOptions::default()
+    });
+    let producer = fx.producer();
+    let mut batch = fx.batch("p", "duplicate-bytes", 1..=1).await;
+    let first = batch.events[0].clone();
+    let mut other = first.clone();
+    other.event.data = serde_json::json!({"same sequence": "different bytes"});
+    batch.events.push(other);
+    armed.store(true, Ordering::SeqCst);
+    assert_eq!(
+        answered(producer.submit(batch).unwrap()).await.unwrap(),
+        counts(1, 1)
+    );
+    assert_eq!(fx.stored("p", "duplicate-bytes").await, [first]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fx.reports()[0].attempts, 1);
+    assert!(!fx.storage.failure_state().claims_suppressed());
+    assert_eq!(producer.retained(), (0, 0, 0));
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn encoded_unknown_empty_or_duplicate_commit_needs_no_rebuild() {
+    for empty in [true, false] {
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = armed.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let fx = fixture_with(StorageOptions {
+            writer_commit_probe: Some(Box::new(move |tx| {
+                if !flag.load(Ordering::SeqCst) {
+                    return None;
+                }
+                if seen.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return None;
+                }
+                tx.execute_batch("COMMIT").unwrap();
+                Some(Err(sql(10)))
+            })),
+            ..StorageOptions::default()
+        });
+        let mut batch = fx.batch("p", "no-new-rows", 1..=1).await;
+        if empty {
+            batch.events.clear();
+        } else {
+            let seed = batch.clone();
+            fx.storage
+                .transaction(owner("p"), Lane::Events, move |unit| {
+                    unit.append_events(&seed.run, &seed.lineage, seed.epoch, &seed.events)
+                })
+                .await
+                .unwrap();
+        }
+        let producer = fx.producer();
+        armed.store(true, Ordering::SeqCst);
+        let skipped = usize::from(!empty);
+        assert_eq!(
+            answered(producer.submit(batch).unwrap()).await.unwrap(),
+            counts(0, skipped)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no durable rows expected; do not rebuild a consumed operation"
+        );
+        assert_eq!(fx.reports()[0].attempts, 1);
+        assert!(!fx.storage.failure_state().claims_suppressed());
+        assert_eq!(producer.retained(), (0, 0, 0));
+        producer.close().await;
+    }
+}
+
+#[tokio::test]
+async fn encoded_invalid_sequences_refuse_the_whole_batch_and_leave_neighbors_committable() {
+    for seq in [0, i64::MAX as u64 + 1] {
+        let fx = fixture();
+        let producer = fx.producer();
+        let mut bad = fx.batch("p", "bad-sequence", 1..=2).await;
+        bad.events[1].seq = seq;
+        let good = fx.batch("p", "good-sequence", 1..=2).await;
+        let stall = fx.stall().await;
+        let bad = producer.submit(bad).unwrap();
+        let good = producer.submit(good).unwrap();
+        stall.end().await;
+        let failure = answered(bad).await.unwrap_err();
+        assert!(
+            matches!(failure.error, StoreError::InvalidEvents(_)),
+            "{failure:?}"
+        );
+        assert_eq!(
+            (
+                failure.committed,
+                failure.not_stored,
+                failure.outcome_unknown
+            ),
+            (counts(0, 0), 2, false)
+        );
+        assert_eq!(answered(good).await.unwrap(), counts(2, 0));
+        assert!(fx.stored("p", "bad-sequence").await.is_empty());
+        assert_eq!(fx.stored("p", "good-sequence").await, [event(1), event(2)]);
+        assert_eq!(producer.retained(), (0, 0, 0));
+        producer.close().await;
+    }
+}
+
+#[test]
+fn encoded_input_stays_charged_when_runtime_cancels_a_running_callback() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut fx = fixture();
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (release, blocked) = mpsc::sync_channel(1);
+    let blocked = Mutex::new(blocked);
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let at = Instant::now();
+    fx.options.now = Arc::new(move || {
+        if first.swap(false, Ordering::SeqCst) {
+            let _ = entered.lock().unwrap().take().unwrap().send(());
+            blocked.lock().unwrap().recv_timeout(SAFETY).unwrap();
+        }
+        at
+    });
+    let (producer, submission, held) = runtime.block_on(async {
+        let batch = fx.batch("p", "cancelled-runtime", 1..=1).await;
+        let held = accounted_bytes(&batch);
+        let producer = fx.producer();
+        let submission = producer.submit(batch).unwrap();
+        tokio::time::timeout(SAFETY, observed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(producer.retained(), (1, 1, held));
+        (producer, submission, held)
+    });
+    runtime.shutdown_background();
+    let failure = futures::FutureExt::now_or_never(submission)
+        .expect("runtime cancellation must answer unknown without waiting for the callback")
+        .unwrap_err();
+    assert!(failure.outcome_unknown);
+    assert_eq!((failure.committed, failure.not_stored), (counts(0, 0), 1));
+    assert_eq!(
+        producer.retained(),
+        (0, 0, held),
+        "the real running callback still owns its encoded input"
+    );
+    release.send(()).unwrap();
+    let deadline = Instant::now() + SAFETY;
+    while producer.retained().2 != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the final callback owner did not refund its budget"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(producer.retained(), (0, 0, 0));
+    drop(producer);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(fx.storage.close())
+        .unwrap();
+}
+
+#[test]
+fn encoded_input_stays_charged_while_cancelled_reconciliation_still_reads() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, blocked) = mpsc::sync_channel(1);
+    let hook = Mutex::new(Some((entered, blocked)));
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = armed.clone();
+    let mut once = true;
+    let fx = fixture_with(StorageOptions {
+        read_connections: 1,
+        unbounded_read_admission: true,
+        reader_setup: Some(Box::new(move |conn| {
+            let (entered, blocked) = hook.lock().unwrap().take().unwrap();
+            let mut entered = Some(entered);
+            conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+                if matches!(
+                    ctx.action,
+                    AuthAction::Read {
+                        table_name: "run_events",
+                        ..
+                    }
+                ) && let Some(entered) = entered.take()
+                {
+                    let _ = entered.send(());
+                    let _ = blocked.recv_timeout(SAFETY);
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        })),
+        writer_commit_probe: Some(Box::new(move |tx| {
+            if !flag.load(Ordering::SeqCst) || !once {
+                return None;
+            }
+            once = false;
+            tx.execute_batch("COMMIT").unwrap();
+            Some(Err(sql(10)))
+        })),
+        ..StorageOptions::default()
+    });
+    let (producer, submission, held) = runtime.block_on(async {
+        let batch = fx.batch("p", "cancelled-reconciliation", 1..=1).await;
+        let held = accounted_bytes(&batch);
+        let producer = fx.producer();
+        armed.store(true, Ordering::SeqCst);
+        let submission = producer.submit(batch).unwrap();
+        tokio::time::timeout(SAFETY, observed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(producer.retained(), (1, 1, held));
+        (producer, submission, held)
+    });
+    runtime.shutdown_background();
+    let failure = futures::FutureExt::now_or_never(submission)
+        .expect("the unknown receipt must not wait for the selecting lookup")
+        .unwrap_err();
+    assert!(failure.outcome_unknown);
+    assert_eq!(
+        producer.retained(),
+        (0, 0, held),
+        "the real selecting read still owns its expected encoded bytes"
+    );
+    release.send(()).unwrap();
+    let deadline = Instant::now() + SAFETY;
+    while producer.retained().2 != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the selecting lookup did not release its byte charge"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        fx.reports().is_empty(),
+        "cancellation cannot invent a known commit"
+    );
+    drop(producer);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(fx.storage.close())
+        .unwrap();
 }

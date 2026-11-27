@@ -99,7 +99,7 @@ impl<'a, 'conn> ReadView<'a, 'conn> {
     }
 }
 
-pub(super) struct Unit<'a, 'conn> {
+pub(in crate::sqlite) struct Unit<'a, 'conn> {
     pub(super) router: EntityWrite<'a, 'conn>,
     native: cctg::NativeSql<'a, 'conn>,
     tx: &'a Transaction<'conn>,
@@ -124,6 +124,19 @@ impl<'a, 'conn> Unit<'a, 'conn> {
             shared,
             now,
         }
+    }
+    pub(in crate::sqlite) fn append_encoded_events(
+        &mut self,
+        run: &str,
+        lineage: &str,
+        epoch: u64,
+        batch: &[super::super::events::encoded::EncodedEvent],
+    ) -> store::Result<store::events::AppendResult> {
+        port(self.ensure_committable())?;
+        let result = self
+            .router
+            .append_encoded_events(run, lineage, epoch, batch);
+        self.observed(result)
     }
     pub(super) fn observed<T>(&self, result: Result<T>) -> store::Result<T> {
         #[cfg(test)]

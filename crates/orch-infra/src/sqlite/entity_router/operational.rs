@@ -67,6 +67,16 @@ impl EntityRead<'_, '_> {
             .map_err(events::execution)
         })
     }
+    pub(in crate::sqlite) fn matches_encoded_event(
+        &self,
+        run: &str,
+        event: &events::encoded::EncodedEvent,
+    ) -> Result<Option<bool>> {
+        self.operation(|| {
+            events::encoded::matches(self.tx, &self.caller.project, run, event, self.disk)
+                .map_err(events::execution)
+        })
+    }
     pub(in crate::sqlite) fn read_events_tail(
         &self,
         run: &str,
@@ -319,6 +329,17 @@ impl EntityWrite<'_, '_> {
     ) -> Result<AppendResult> {
         self.event_operation(|r| {
             events::append_with_blobs(r.tx, r.caller, run, lineage, epoch, batch, Some(r.disk))
+        })
+    }
+    pub(in crate::sqlite) fn append_encoded_events(
+        &mut self,
+        run: &str,
+        lineage: &str,
+        epoch: u64,
+        batch: &[events::encoded::EncodedEvent],
+    ) -> Result<AppendResult> {
+        self.event_operation(|r| {
+            events::append_encoded(r.tx, r.caller, run, lineage, epoch, batch, r.disk)
         })
     }
     pub(in crate::sqlite) fn record_event_gap(

@@ -1296,9 +1296,13 @@ clients <── WriteReceipt::wait() ──────────────�
   are specific to the latter, and only the per-transaction accounting shows them). A leaf's cleanup unwind is
   outside all of this (record O).
 - **Event producer** (`sqlite/events/producer.rs`, exported from `orch_infra::sqlite`; spec "As built: the event producer",
-  plan "As built at `9b55edbf4`"; a development member of the integrated head `07fecf1ed`, not wired to the daemon or to a
-  collector; the daemon still uses files). `EventProducer` is the first caller of `retained_write`, on the `Events` lane
-  with no request deadline. One task owns every numbered `EventBatch` until the writer has answered for it and has one
+  plan "As built: the event producer, first form" and "As built: the event producer, encoded form"; a development member
+  of the draft train, read in its encoded form with the corrected order of receipts (spec bullet "When capacity comes
+  back"), which is the producer on the draft train and not on `main`; not wired to the daemon or to a collector; the daemon
+  still uses files).
+  `EventProducer` is the first caller of `retained_write`, on the `Events` lane
+  with no request deadline; while one of its writes has an episode open, the rule of the bullet above holds for it, so the
+  worker runs no job of another lane until that write is answered. One task owns every numbered `EventBatch` until the writer has answered for it and has one
   transaction in flight, which is the one that the spec's R26 allows the event lane. Each transaction takes the waiting
   batches of the first batch's caller, of any number of runs, in arrival order, and cuts them at 1,000 rows (an event
   whose payload goes behind a blob reference counts two) or at 20 ms read between statements of at most 32 events (one
@@ -1309,9 +1313,29 @@ clients <── WriteReceipt::wait() ──────────────�
   producer closed and marks the batches in doubt (`SubmitFailure::outcome_unknown`). A stale lease or invalid events
   answer one batch alone; another failure of a coalesced transaction replans it with its first batch alone. The producer
   never counts the rows and time of a transaction: the writer does, once, and it counts a transaction that the producer cut by
-  time (the spec's "What the counter does not tell (I2)"). At most 16,384 events wait; past that
-  `Rejected::Full` returns the batch to its collector. Not here: numbering at handover, the counters at start and stop, the
-  collector's buffer and its gaps, pruning, an export of the counter and every caller in the daemon (T16).
+  time (the spec's "What the counter does not tell (I2)"). What waits is bounded by three independent limits (by default
+  16,384 events, which is also the most one batch may hold; 4,096 batches, an empty one counting as one; and 256 MiB of
+  accounted bytes), checked cheapest first and before anything is encoded. A batch that can never fit, over the event or
+  the byte limit even with nothing waiting, comes back whole as `Rejected::TooLarge`; one that fits only when waiting
+  batches have been answered comes back whole as `Rejected::Full`; a failed or closed producer returns
+  `Rejected::Closed`. The producer keeps an accepted event as one buffer holding exactly its whole-event JSON, the bytes that
+  the physical encoder writes and that reconciliation compares, and no decoded value, so its charge is that length plus a
+  fixed record and does not depend on the JSON's shape: an event of at most 64 MiB (67,108,864 bytes, inclusive) is
+  admitted by an empty producer whatever it holds, and one of more than 64 MiB that still fits the 256 MiB fails alone at its statement.
+  The metadata (the caller's, the run's and the lineage's strings at their capacities, eight times, and a run name for up to
+  1,000 statements) is charged as well. A batch holds one charge, shared by its queue entry, its plans, the attempt's copies
+  and the reconciliation's rows, and the charge comes back when the last of them is dropped, so a transaction in flight,
+  a committed prefix and an unknown outcome stay counted. An answer whose outcome is known (a commit, a failure whose
+  outcome is known, or a drain of a batch that was not in doubt) is kept in the charge and sent once, after the bytes
+  are returned, so a caller that holds the answer can submit again at once into the room that the answered batch held; an
+  answer that says the outcome is unknown is sent at once, with the bytes still charged while a callback or a
+  reconciliation owns a part of the batch. The counter is not a bound on process memory: the submitter's own
+  input and serialization buffer, and the transient copies of the SQL and blob code, are outside it (the spec's "Admission
+  and retained bytes"). The producer submits through the same retained write and unit of work as every callback (an
+  internal typed entry that shares `RetainedWrite::attempt`'s implementation and episode) and reconciles through the
+  snapshot helper that `Storage::read` also uses, so it adds no writer, trait or schema. Not here: numbering at handover, the
+  counters at start and stop, the collector's buffer and its gaps, pruning, an export of the counter and every caller in the
+  daemon (T16).
 - **Receipts.** `wait` blocks and returns the closure's result. Dropping a receipt does not cancel the work: an
   accepted transaction still commits. Do not call `wait` on an async runtime thread. The internal event adapter
   (`sqlite/events/adapter.rs`) adapts it for event writes and prunes: `write_async` and `prune_async` queue the
@@ -1359,6 +1383,23 @@ clients <── WriteReceipt::wait() ──────────────�
 - A failed read discards its connection, and the slot reopens on its next use. A connection returned inside an open
   transaction, including by a panic, is discarded the same way, so no reader inherits it. WAL readers do not block
   the writer.
+- **Active reads and the passive checkpoint (R127; `sqlite/read_pool/active.rs`, development source, not wired).** Every
+  read of the pool, and so every owned snapshot of `Storage::read`, registers its transaction with a start time, an
+  interrupt handle and an expiry flag. `ReadPool::checkpoint()`, and `SqliteStorage::checkpoint()`, which runs it on a
+  blocking task, refuse first with a latched failure state (R140), then open a connection of their own
+  (`ConnectionRole::Checkpoint`, never the writer's and never one held by a read), run one
+  `wal_checkpoint_v2(PASSIVE)` and take the backlog from its two frame counts: (frames in the log minus frames
+  copied) times the page size; a database that is not in WAL mode answers -1 and gives no backlog. When the backlog is
+  **over** 256 MiB, every registered read **older than** 30 s is flagged once, its running SQL is interrupted
+  (`sqlite3_interrupt`) and the read answers `snapshot_expired`. Exactly 256 MiB or exactly 30 s leaves a read alone,
+  and a long `-wal` file with a backlog of zero interrupts nothing. An interrupt has no effect between two statements,
+  so a progress handler (every 1,000 virtual-machine steps) also refuses SQL that starts after the flag is set. The
+  call returns a `CheckpointObservation` (frames in the log, frames copied, the backlog in bytes, the age of the oldest
+  registered read, and how many reads it interrupted). The expiry belongs to the one owned snapshot: its call in flight
+  ends, its later calls answer `snapshot_expired`, its connection is dropped and reopened on next use, and no other
+  snapshot is touched. A raw error that a read meets at the same time is classified first, so concurrent corruption is
+  answered as `storage_unavailable` and the expiry does not hide it. `snapshot_expired` is an ordinary result: it
+  latches nothing and does not move the transient streak of pool reads.
 
 **Limits of this slice** (follow-ups tracked in [issue 127](https://github.com/yuxhuang/r-orch/issues/127)):
 
@@ -1377,8 +1418,11 @@ clients <── WriteReceipt::wait() ──────────────�
   rows and elapsed time (the `COMMIT` included) of each transaction, and the producer that owns the input owns the cut, the kept tail and the merge. The
   event producer does this for run events (bullet "Event producer" above); pruning, expiry and the importer's chunks have
   no producer yet, and nothing calls the event producer from the daemon.
-- Nothing checkpoints the WAL while the executor runs: automatic checkpointing is off, and the checkpoint
-  connection, the backlog counters and the interruption of long reads (R126, R127, R137) are not built. Wiring this to the daemon waits for them.
+- Nothing schedules a checkpoint. Automatic checkpointing is off, and there is no timer, no 64 MiB size trigger, no
+  repeat while a backlog stays, no outcome record (R137), no commit-callback count of the backlog and no report of the
+  backlog or the file's length (R126, `wal_bytes`, `orch db status`). A checkpoint runs only when a caller calls
+  `checkpoint()` (the active-read bullet above); T15 owns the job that will, and the daemon does not call it. Wiring
+  the executor to the daemon waits for that job.
 - There is no query connection or authorizer for `orch db query` (R130) and no shutdown integration (R139).
 
 ---

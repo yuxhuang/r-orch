@@ -4,6 +4,9 @@ use crate::sqlite::writer::policy::Episode;
 use crate::sqlite::{RetryCode, WriteAccounting, WriteOutcome};
 use std::future::Future;
 
+pub(in crate::sqlite) type UnitWork =
+    Box<dyn FnOnce(&mut Unit<'_, '_>) -> store::Result<()> + Send>;
+
 /// A transaction's public answer together with authoritative durability and work.
 /// A failed result is not permission to rebuild: check `retryable()` first.
 pub struct WriteAttempt {
@@ -58,6 +61,13 @@ impl RetainedWrite {
     /// Submit a fresh FnOnce. The producer may rebuild only after a confirmed
     /// noncommit; the writer never replays a callback it has already consumed.
     pub async fn attempt(&mut self, work: WriteWork) -> store::Result<WriteAttempt> {
+        self.attempt_unit(Box::new(move |unit| work(unit))).await
+    }
+
+    pub(in crate::sqlite) async fn attempt_unit(
+        &mut self,
+        work: UnitWork,
+    ) -> store::Result<WriteAttempt> {
         if !self.may_submit || self.pending.is_some() {
             return Err(backend(
                 "write requires its prior receipt or outcome reconciliation",
@@ -101,6 +111,36 @@ impl RetainedWrite {
         self.pending = Some(tokio::task::spawn_blocking(move || receipt.wait()));
         self.receive().await
     }
+    pub(in crate::sqlite) async fn reconcile_encoded(
+        &mut self,
+        expected: Arc<Vec<super::super::events::producer::EncodedExpected>>,
+    ) -> store::Result<bool> {
+        self.reconcile_snapshot(move |snapshot| async move {
+            snapshot.call(move |view| {
+                let (mut wanted, mut found) = (0, 0);
+                for step in expected.iter() {
+                    let rows: std::collections::BTreeMap<_, _> = step.events[step.from..step.to]
+                        .iter().rev().map(|event| (event.seq, event)).collect();
+                    for event in rows.values() {
+                        wanted += 1;
+                        match view.router.matches_encoded_event(&step.run, event)? {
+                            Some(true) => found += 1,
+                            None => {},
+                            Some(false) => return Err(SqliteError::Store(backend(
+                                "reconciliation found a stored event that differs from the expected one"))),
+                        }
+                    }
+                }
+                match found {
+                    _ if wanted == 0 => Ok(true),
+                    0 => Ok(false),
+                    n if n == wanted => Ok(true),
+                    _ => Err(SqliteError::Store(backend("reconciliation found only some rows of an atomic transaction"))),
+                }
+            }).await
+        }).await
+    }
+
     /// Recover the single original receipt after cancellation of `attempt`'s
     /// future. A new submission cannot race an admitted or running callback.
     pub async fn receive(&mut self) -> store::Result<WriteAttempt> {
@@ -161,10 +201,19 @@ impl RetainedWrite {
         F: FnOnce(Box<dyn ReadSnapshot>) -> Fut,
         Fut: Future<Output = store::Result<bool>>,
     {
+        self.reconcile_snapshot(move |snapshot| check(Box::new(snapshot)))
+            .await
+    }
+
+    pub(super) async fn reconcile_snapshot<F, Fut>(&mut self, check: F) -> store::Result<bool>
+    where
+        F: FnOnce(Snapshot) -> Fut,
+        Fut: Future<Output = store::Result<bool>>,
+    {
         if self.pending.is_some() || !self.unknown {
             return Err(backend("write has no settled unknown outcome"));
         }
-        let snapshot = self.storage.read(self.caller.clone()).await?;
+        let snapshot = self.storage.snapshot(self.caller.clone()).await?;
         let committed = check(snapshot).await?;
         self.unknown = false;
         if committed {
