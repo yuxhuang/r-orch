@@ -33,7 +33,7 @@ pub(super) enum Payload {
     Message(Box<Message>),
 }
 
-fn native(error: NativeError) -> SqliteError {
+pub(super) fn native(error: NativeError) -> SqliteError {
     match error {
         NativeError::Corrupt {
             family,

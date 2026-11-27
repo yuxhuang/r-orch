@@ -3058,58 +3058,7 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
             };
             // Stored keys are locators, not original IDs: form 1's key can be
             // equal to a form 0 ID. Never feed a digest into get as an ID.
-            let candidate = (|| {
-                let detail = self.detail_key(
-                    family,
-                    "",
-                    vec![
-                        SqlValue::Text(self.project.into()),
-                        SqlValue::Integer(form),
-                        SqlValue::Text(stored.clone()),
-                    ],
-                )?;
-                let entity = match family {
-                    Family::Agent => {
-                        decode_agent(self.disk, &detail).map(|v| Entity::Agent(Box::new(v)))
-                    }
-                    Family::Team => {
-                        decode_team(self.disk, &detail).map(|v| Entity::Team(Box::new(v)))
-                    }
-                    Family::Run => decode_run(self.disk, &detail).map(|v| Entity::Run(Box::new(v))),
-                }
-                .map_err(|e| format_error(family, "", e, false))?;
-                if key(entity.id()) != (form, stored.clone()) {
-                    return Err(native_corrupt(
-                        family,
-                        entity.id(),
-                        "identity projection",
-                        "id",
-                    ));
-                }
-                self.get(family, entity.id())?.ok_or_else(|| {
-                    native_corrupt(family, entity.id(), "selected row missing", "id")
-                })
-            })()
-            .map_err(|error| match error {
-                NativeError::Corrupt {
-                    family,
-                    check,
-                    locator,
-                    ..
-                } => NativeError::Corrupt {
-                    family,
-                    form,
-                    check,
-                    locator,
-                },
-                NativeError::Sql(rusqlite::Error::Utf8Error(..)) => NativeError::Corrupt {
-                    family: family.name(),
-                    form,
-                    check: "text encoding",
-                    locator: "native/detail/ref".into(),
-                },
-                other => other,
-            })?;
+            let candidate = self.read_stored(family, form, &stored)?;
             if query.matches(&candidate) {
                 records.push(candidate);
             }
@@ -3129,6 +3078,65 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
             items,
             total,
             has_more,
+        })
+    }
+
+    /// Fully checked row by its native locator, for the same-view unfiltered
+    /// cursor lookup. A form-one digest is never interpreted as an original ID.
+    pub(super) fn read_stored(
+        &self,
+        family: Family,
+        form: i64,
+        stored: &str,
+    ) -> NativeResult<Record> {
+        (|| {
+            let detail = self.detail_key(
+                family,
+                "",
+                vec![
+                    SqlValue::Text(self.project.into()),
+                    SqlValue::Integer(form),
+                    SqlValue::Text(stored.to_owned()),
+                ],
+            )?;
+            let entity = match family {
+                Family::Agent => {
+                    decode_agent(self.disk, &detail).map(|v| Entity::Agent(Box::new(v)))
+                }
+                Family::Team => decode_team(self.disk, &detail).map(|v| Entity::Team(Box::new(v))),
+                Family::Run => decode_run(self.disk, &detail).map(|v| Entity::Run(Box::new(v))),
+            }
+            .map_err(|e| format_error(family, "", e, false))?;
+            if key(entity.id()) != (form, stored.to_owned()) {
+                return Err(native_corrupt(
+                    family,
+                    entity.id(),
+                    "identity projection",
+                    "id",
+                ));
+            }
+            self.get(family, entity.id())?
+                .ok_or_else(|| native_corrupt(family, entity.id(), "selected row missing", "id"))
+        })()
+        .map_err(|error| match error {
+            NativeError::Corrupt {
+                family,
+                check,
+                locator,
+                ..
+            } => NativeError::Corrupt {
+                family,
+                form,
+                check,
+                locator,
+            },
+            NativeError::Sql(rusqlite::Error::Utf8Error(..)) => NativeError::Corrupt {
+                family: family.name(),
+                form,
+                check: "text encoding",
+                locator: "native/detail/ref".into(),
+            },
+            other => other,
         })
     }
 

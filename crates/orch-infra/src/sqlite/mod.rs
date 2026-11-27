@@ -240,3 +240,9 @@ mod entity_router;
     reason = "inactive non-Task inline cursor awaits the key-taking leaves and the page PR"
 )]
 mod non_task_cursor;
+
+#[allow(
+    dead_code,
+    reason = "Storage composition is being qualified before activation"
+)]
+mod storage;

@@ -384,7 +384,7 @@ impl<'a> MessageReader<'a> {
 
     /// One hydrated, fully checked message by its stored key, or `None` when
     /// no row has the key.
-    fn read(&self, form: i64, stored: &str) -> Result<Option<Record>> {
+    pub(in crate::sqlite) fn read(&self, form: i64, stored: &str) -> Result<Option<Record>> {
         let mut names = columns();
         names.extend(["revision".into(), "position".into()]);
         let rows = self

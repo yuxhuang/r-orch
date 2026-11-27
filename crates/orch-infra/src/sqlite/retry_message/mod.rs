@@ -10,7 +10,7 @@
 use super::SqliteError;
 use crate::blob::{BlobError, ReferenceError};
 
-mod message;
+pub(super) mod message;
 mod retries;
 mod text;
 
