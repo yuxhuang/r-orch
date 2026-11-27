@@ -45,7 +45,14 @@
 //!   plans cut from it, an attempt's copies and the rows that a reconciliation
 //!   expects each hold that charge, and its bytes come back when the last of
 //!   them is dropped, not when the batch leaves the queue: a transaction in
-//!   flight, a committed prefix and an unknown outcome stay counted.
+//!   flight, a committed prefix and an unknown outcome stay counted. An answer
+//!   whose outcome is known waits in the charge and is sent by its last owner,
+//!   after the bytes are returned, so a caller that has the answer finds the room
+//!   back; an answer that says the outcome is unknown is sent at once. The fixed
+//!   amounts that a batch and an event are charged (`BATCH_FIXED_BYTES`,
+//!   `EVENT_FIXED_BYTES`) include the spare capacity of the vectors that carry
+//!   them (the queue, the plan, the steps and the expected rows), which are all
+//!   live together during a reconciliation.
 //! * **Retained input.** A batch is dropped from memory only on a known commit
 //!   or a definitive refusal. After a confirmed noncommit with a retryable cause
 //!   the same transaction is rebuilt from the retained input as a new request of
@@ -57,9 +64,10 @@
 //! * **Failure of the task.** If the producer's task ends with batches still
 //!   held (a panic in the clock or the observer, or a runtime that shuts down),
 //!   every held batch is answered at once and intake closes. A batch that was in
-//!   a transaction at that moment says its outcome is unknown; the others were
-//!   not started. The capacity of each returns as the last owner of its charge
-//!   is dropped, which can be after the answer.
+//!   a transaction at that moment says its outcome is unknown and is answered at
+//!   once, so its capacity can return after the answer; the others were not
+//!   started and are answered, like any known outcome, as the last owner of
+//!   their charge is dropped.
 //!
 //! Not here (T16, later): numbering at handover, the collector's buffer and its
 //! gaps, the counters at start and the stop record (R61, R63, R139), and pruning.
@@ -107,25 +115,40 @@ const QUEUE_LIMIT_BATCHES: usize = 4_096;
 /// room beside it; an event past what a blob holds is still admitted below this
 /// and fails alone at its statement. The figure counts what is retained: the
 /// exact encoded payload of each event (its length, whatever the shape of the
-/// value it came from), a fixed record per event and per batch, and the capacity
-/// of the metadata strings (see `fixed_bytes`). No decoded value is retained, so
+/// value it came from), a fixed reserve per event and per batch (the records and
+/// the spare capacity of the vectors that carry them, see `BATCH_FIXED_BYTES` and
+/// `EVENT_FIXED_BYTES`), and the capacity of the metadata strings (see
+/// `fixed_bytes`). No decoded value is retained, so
 /// no reserve for objects or arrays is counted. Allocator headers, the caller's
 /// own input, the buffer that an event is serialized into while it is measured,
 /// and the transient copies that the SQL and blob code makes are not measured by
 /// this counter, which is not a bound on the process's memory.
 const QUEUE_LIMIT_BYTES: usize = 4 * MAX_BLOB_BYTES as usize;
-/// What a waiting batch holds besides its strings and events: four `Pending`
-/// slots (the queue's growth), three `Slice` copies (the plan and its attempts),
-/// its `Charge`, and 256 bytes for the `Arc` headers, the reply channel and the
-/// fixed metadata.
+/// What a waiting batch holds besides its strings and events, counted at the
+/// capacity of the vectors that carry it. A vector that is filled by pushes has
+/// a capacity of at most four times its length (four for one element, just under
+/// twice the length for a long one), so a batch is charged for four `Pending`
+/// slots (the queue's growth), eight `Slice` slots (the plan's vector and an
+/// attempt's copy of it, four for each), its `Charge`, one `Caller` record for
+/// each of the `STRING_COPIES` copies whose strings `fixed_bytes` counts, and
+/// 1,024 bytes for the `Arc` headers, the reply channel and the other fixed
+/// metadata.
 const BATCH_FIXED_BYTES: usize = 4 * size_of::<Pending>()
     + 8 * size_of::<Slice>()
     + size_of::<Charge>()
     + 8 * size_of::<Caller>()
     + 1024;
 /// What a waiting event holds besides its encoded payload: its `EncodedEvent`
-/// record, its cost byte, one `Step`, one `EncodedExpected`, and 64 bytes for
-/// metadata and copy overhead.
+/// record, its cost byte, four `Step` slots and four `EncodedExpected` slots, and
+/// 64 bytes for metadata and copy overhead. A transaction's progress keeps one
+/// `Step` for each statement and a reconciliation one `EncodedExpected` for each
+/// step that stored rows, both in vectors filled by pushes (capacity at most four
+/// times their length) and both live at once. A statement carries at least one
+/// event, except an empty batch's lease check and a refusal; the fixed amount of
+/// the batch (`BATCH_FIXED_BYTES`) holds room for at least four `Step` slots
+/// whatever the number of its events, so those steps are covered there and not
+/// by this figure. At 257 appended steps each vector has a capacity of 512
+/// (`metadata_reserve_covers_simultaneous_vector_capacities`).
 const EVENT_FIXED_BYTES: usize =
     size_of::<EncodedEvent>() + 1 + 4 * (size_of::<Step>() + size_of::<EncodedExpected>()) + 64;
 /// Reserve for the original caller/run allocations and their simultaneous
@@ -279,6 +302,10 @@ struct Pending {
 }
 
 impl Pending {
+    /// Answers the batch once. An answer that says the outcome is unknown is
+    /// sent now. Any other answer is put in the batch's `Charge` and sent by its
+    /// last owner after the bytes are returned, so that the caller, who sees the
+    /// answer, finds the room that the batch held.
     fn finish(mut self, answer: Answer) {
         if let Some(reply) = self.reply.take() {
             if matches!(&answer, Err(failure) if failure.outcome_unknown) {
@@ -304,8 +331,10 @@ impl Pending {
     }
 }
 
-/// The accounted bytes that one accepted batch holds. They are subtracted when
-/// the last `Arc<Charge>` is dropped (see the module's "Capacity").
+/// The accounted bytes that one accepted batch holds, and the known answer that
+/// waits for them to return. The bytes are subtracted when the last
+/// `Arc<Charge>` is dropped, and the answer is sent after that (see the
+/// module's "Capacity" and `Pending::finish`).
 struct Charge {
     shared: Weak<Shared>,
     bytes: usize,
@@ -1126,9 +1155,10 @@ impl Drain {
 
 impl Shared {
     /// Closes intake and answers every held batch; those of `doubtful` say that
-    /// their outcome is unknown. The queue keeps nothing; the capacity of each
-    /// batch returns when the last owner of its charge is dropped, which can be
-    /// later, because a plan, an attempt or a reconciliation may still hold it.
+    /// their outcome is unknown and are answered now. The queue keeps nothing;
+    /// the capacity of each batch returns when the last owner of its charge is
+    /// dropped, which can be later, because a plan, an attempt or a reconciliation
+    /// may still hold it, and the answer of every other batch is sent then.
     fn fail_all(&self, error: &StoreError, doubtful: &[u64]) {
         let drained: Vec<Pending> = {
             let mut queue = self.queue();
@@ -1137,6 +1167,7 @@ impl Shared {
             queue.busy = false;
             queue.in_flight.clear();
             let drained = queue.pending.drain(..).collect();
+            // Nothing stays queued, so no slot of the queue stays allocated.
             queue.pending.shrink_to_fit();
             drained
         };
@@ -1164,6 +1195,9 @@ fn take(queue: &mut Queue, id: u64) -> Option<Pending> {
     let position = queue.pending.iter().position(|p| p.id == id)?;
     let pending = queue.pending.remove(position)?;
     queue.events -= pending.events.len() - pending.consumed;
+    // The vacated slots are returned, so the spare capacity of the queue stays
+    // within the four `Pending` slots for each batch that `BATCH_FIXED_BYTES`
+    // reserves.
     queue.pending.shrink_to_fit();
     Some(pending)
 }
