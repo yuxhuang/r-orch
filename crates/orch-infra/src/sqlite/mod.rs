@@ -6,6 +6,8 @@ pub use connection::{ConnectionHandle, ConnectionRole, Synchronous, open_connect
 
 #[derive(Debug, thiserror::Error)]
 pub enum SqliteError {
+    #[error("snapshot_expired")]
+    SnapshotExpired,
     #[error("stored task {task} failed {check} at {locator}")]
     TaskCorrupt {
         task: String,
@@ -133,7 +135,7 @@ pub use events::{
     EventBatch, EventProducer, EventProducerOptions, Rejected, Submission, SubmitFailure,
     TransactionReport,
 };
-pub use read_pool::ReadPool;
+pub use read_pool::{CheckpointObservation, ReadPool};
 pub use writer::contain::CallbackPanic;
 pub use writer::failure::{
     Class, Failure, FailureSource, FailureState, FatalCause, Observation, Role, classify,
@@ -252,3 +254,8 @@ mod non_task_cursor;
 )]
 mod storage;
 pub use storage::{RetainedWrite, SqliteStorage, StorageOptions, WriteAttempt};
+
+#[cfg(test)]
+mod r142_harness;
+#[cfg(test)]
+mod r142_physical;

@@ -1247,8 +1247,8 @@ clients <── WriteReceipt::wait() ──────────────�
   `WriterClosed`, with nothing latched, when both are ordinary. A failed outer rollback after a callback panic keeps the payload, which the
   caller can still reach with `SqliteError::callback_panic()`. A callback is trusted not to swallow an unwind itself.
 - **Queue.** `capacity` bounds the number of waiting transactions, not their bytes. A full queue, and a second
-  waiting `Events` transaction, return `Overloaded` at once; the producer keeps its batch. Nothing coalesces
-  events yet. A retained write that is rebuilt in an open episode takes the writer's one in-progress slot and does not
+  waiting `Events` transaction, return `Overloaded` at once; the producer keeps its batch. The writer itself coalesces
+  nothing: the event producer below does. A retained write that is rebuilt in an open episode takes the writer's one in-progress slot and does not
   wait in the queue.
 - **Order.** `Lane` is `Claims`, `Entities`, `Events` or `Maintenance`. The worker takes the oldest waiting
   `Claims` job first (but see "Retry and retained writes": while a retained write's episode is open the worker runs no queued job). Otherwise it takes the job with the earliest deadline, which is its arrival plus the lane's
@@ -1289,9 +1289,29 @@ clients <── WriteReceipt::wait() ──────────────�
   `SQLITE_IOERR` in a row, counted by the writer across logical requests and ended by a known commit or another SQL
   failure, and sixty seconds from an episode's first failure without a known commit latch
   `FatalCause::ConsecutiveIoErrors` and `FatalCause::RetryWithoutCommit`; the worker checks the sixty seconds every 50 ms. For each physical transaction
-  the writer counts the SQL changes and the execution time without its own waits, rollback included, and
-  `FailureState::writer_txn_over_bound_total()` rises once for more than 1,000 rows or 20 ms. A leaf's cleanup unwind is
+  the writer counts the SQL changes and the elapsed time, `COMMIT` included and without its own waits, rollback included, and
+  `FailureState::writer_txn_over_bound_total()` rises once for more than 1,000 rows or more than 20 ms of that time. The count
+  is of cost, not of cause: an ordinary event batch that the producer cut at 20 ms has by then run 20 ms of statements and a
+  `COMMIT`, so it is counted too, and the counter alone cannot tell it from an operation that cannot be cut (rows over 1,000
+  are specific to the latter, and only the per-transaction accounting shows them). A leaf's cleanup unwind is
   outside all of this (record O).
+- **Event producer** (`sqlite/events/producer.rs`, exported from `orch_infra::sqlite`; spec "As built: the event producer",
+  plan "As built at `9b55edbf4`"; a development member of the integrated head `07fecf1ed`, not wired to the daemon or to a
+  collector; the daemon still uses files). `EventProducer` is the first caller of `retained_write`, on the `Events` lane
+  with no request deadline. One task owns every numbered `EventBatch` until the writer has answered for it and has one
+  transaction in flight, which is the one that the spec's R26 allows the event lane. Each transaction takes the waiting
+  batches of the first batch's caller, of any number of runs, in arrival order, and cuts them at 1,000 rows (an event
+  whose payload goes behind a blob reference counts two) or at 20 ms read between statements of at most 32 events (one
+  statement always runs); a batch of another caller waits, and no later batch of a run overtakes an earlier one. What
+  is not committed is kept in order for the next transaction. After a confirmed noncommit with a retryable cause it builds
+  the same transaction again from the retained input in the same episode; after an unknown commit it reads the rows back
+  with a snapshot of the bound caller before it submits anything, and an answer that it cannot establish fails the
+  producer closed and marks the batches in doubt (`SubmitFailure::outcome_unknown`). A stale lease or invalid events
+  answer one batch alone; another failure of a coalesced transaction replans it with its first batch alone. The producer
+  never counts the rows and time of a transaction: the writer does, once, and it counts a transaction that the producer cut by
+  time (the spec's "What the counter does not tell (I2)"). At most 16,384 events wait; past that
+  `Rejected::Full` returns the batch to its collector. Not here: numbering at handover, the counters at start and stop, the
+  collector's buffer and its gaps, pruning, an export of the counter and every caller in the daemon (T16).
 - **Receipts.** `wait` blocks and returns the closure's result. Dropping a receipt does not cancel the work: an
   accepted transaction still commits. Do not call `wait` on an async runtime thread. The internal event adapter
   (`sqlite/events/adapter.rs`) adapts it for event writes and prunes: `write_async` and `prune_async` queue the
@@ -1345,7 +1365,7 @@ clients <── WriteReceipt::wait() ──────────────�
 - No replay of a closure. The writer retries only its own `BEGIN` and a `SQLITE_BUSY` `COMMIT` on the same transaction;
   every other SQL error goes to its receipt, after the policy's classification and its cleanup. The owner approved the
   policy on 2026-11-27 (spec record P, plan "Writer retry policy"); the development implementation is the bullet "Retry
-  and retained writes" above, with the one open question that the spec lists, and no producer that rebuilds work exists yet.
+  and retained writes" above, with the one open question that the spec lists, and one producer that rebuilds work, the event producer below ("Event producer"), which is a development member and not wired.
   The shared failure state, the classification of R128 and R140 and the `StorageUnavailable` answer of a latched writer
   are in `sqlite/writer/failure.rs`.
 - A closure must not issue `COMMIT`, `BEGIN` or `SAVEPOINT`, or any side effect outside the database. The executor
@@ -1353,9 +1373,10 @@ clients <── WriteReceipt::wait() ──────────────�
   belong in `intents` rows (ADR 0017 decision 10), which do not exist yet.
 - Claims always go first, so a steady stream of claims can delay every other lane. Bounded claim production is
   not implemented.
-- Nothing cuts bulk work to 1,000 rows or 20 ms, and nothing merges the event batches of several runs into one
-  transaction (ADR 0017 decision 9): the writer only counts the actual rows and time of each transaction, and the event
-  producer (issue 127) owns the cut, the kept tail and the merge.
+- The writer cuts no bulk work to 1,000 rows or 20 ms and merges nothing (ADR 0017 decision 9): it only counts the actual
+  rows and elapsed time (the `COMMIT` included) of each transaction, and the producer that owns the input owns the cut, the kept tail and the merge. The
+  event producer does this for run events (bullet "Event producer" above); pruning, expiry and the importer's chunks have
+  no producer yet, and nothing calls the event producer from the daemon.
 - Nothing checkpoints the WAL while the executor runs: automatic checkpointing is off, and the checkpoint
   connection, the backlog counters and the interruption of long reads (R126, R127, R137) are not built. Wiring this to the daemon waits for them.
 - There is no query connection or authorizer for `orch db query` (R130) and no shutdown integration (R139).

@@ -4,11 +4,18 @@
 //! Every read reports to the shared `FailureState` (R140): a fatal result on any
 //! pooled connection fails the writer at once, and a read whose callback
 //! observed one returns the refusal instead of its partial result.
+mod active;
+pub(in crate::sqlite) use active::ActiveReads;
+pub use active::CheckpointObservation;
+
 use super::writer::failure::{FailureSource, FailureState};
 use super::{ConnectionHandle, ConnectionRole, Result, SqliteError, Synchronous, open_connection};
 use crate::data_dir::DataDir;
 use rusqlite::Transaction;
-use std::sync::{Condvar, Mutex};
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Instant;
 
 pub struct ReadPool<'a> {
@@ -19,7 +26,13 @@ pub struct ReadPool<'a> {
     free: Mutex<Vec<Option<ConnectionHandle<'a>>>>,
     available: Condvar,
     state: FailureState,
+    pub(in crate::sqlite) active: Arc<ActiveReads>,
+    #[cfg(test)]
+    progress_probe: Option<ProgressProbe>,
 }
+
+#[cfg(test)]
+type ProgressProbe = Arc<Mutex<Box<dyn FnMut() -> bool + Send>>>;
 
 impl<'a> ReadPool<'a> {
     pub const DEFAULT_CONNECTIONS: usize = 4;
@@ -50,6 +63,9 @@ impl<'a> ReadPool<'a> {
             free: Mutex::new(free),
             available: Condvar::new(),
             state,
+            active: Arc::new(ActiveReads::default()),
+            #[cfg(test)]
+            progress_probe: None,
         })
     }
 
@@ -60,6 +76,14 @@ impl<'a> ReadPool<'a> {
         for connection in self.free.lock().unwrap().iter_mut().flatten() {
             setup(connection.for_migration());
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::sqlite) fn configure_progress_for_test(
+        &mut self,
+        probe: Box<dyn FnMut() -> bool + Send>,
+    ) {
+        self.progress_probe = Some(Arc::new(Mutex::new(probe)));
     }
 
     /// The state this pool reports to. A callback captures it to report what it catches.
@@ -75,6 +99,21 @@ impl<'a> ReadPool<'a> {
         deadline: Instant,
         read: impl FnOnce(&Transaction<'_>) -> Result<T>,
     ) -> Result<T> {
+        self.read_tracked(deadline, Arc::new(AtomicBool::new(false)), read)
+    }
+
+    /// Run a passive checkpoint and retire only readers over both R127 limits.
+    /// T15 owns scheduling and repeat/backlog reporting; this call starts no job.
+    pub fn checkpoint(&self) -> Result<CheckpointObservation> {
+        self.active.checkpoint(self.data, self.sync, &self.state)
+    }
+
+    pub(in crate::sqlite) fn read_tracked<T>(
+        &self,
+        deadline: Instant,
+        expired: Arc<AtomicBool>,
+        read: impl FnOnce(&Transaction<'_>) -> Result<T>,
+    ) -> Result<T> {
         let mut lease = self.acquire(deadline)?;
         let observed = self.state.fatal_observations();
         let result = (|| {
@@ -85,12 +124,48 @@ impl<'a> ReadPool<'a> {
                     self.sync,
                 )?);
             }
+            // sqlite3_interrupt is immediate for running SQL, but has no effect
+            // between statements. The progress guard also refuses a statement
+            // that starts just after the checkpoint marked this view expired.
+            let interrupted = expired.clone();
+            #[cfg(test)]
+            let probe = self.progress_probe.clone();
+            lease
+                .connection
+                .as_mut()
+                .expect("read slot opened")
+                .for_migration()
+                .progress_handler(
+                    1000,
+                    Some(move || {
+                        #[cfg(test)]
+                        if let Some(probe) = &probe
+                            && probe.lock().unwrap()()
+                        {
+                            return true;
+                        }
+                        interrupted.load(Ordering::SeqCst)
+                    }),
+                )?;
             let transaction = lease
                 .connection
                 .as_mut()
                 .expect("read slot opened")
                 .transaction()?;
-            let value = read(&transaction)?;
+            let registration = self.active.register(&transaction, expired.clone());
+            let result = read(&transaction);
+            if registration.finish() {
+                // Preserve any raw error before the typed retirement result.
+                // Concurrent expiry must never hide newly observed corruption.
+                if let Err(error) = &result {
+                    self.state.observe(FailureSource::Reader, error);
+                }
+                if self.state.fatal_observations() != observed {
+                    self.state.ensure_available()?;
+                }
+                return Err(SqliteError::SnapshotExpired);
+            }
+            let value = result?;
             transaction.commit()?;
             Ok(value)
         })();

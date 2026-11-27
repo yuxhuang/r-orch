@@ -318,7 +318,9 @@ async fn worker_snapshot(storage: &SqliteStorage) -> Snapshot {
     let (commands, receiver) = mpsc::sync_channel(SNAPSHOT_CALL_CAPACITY);
     let (ready, answer) = oneshot::channel();
     let observed = storage.failure_state().fatal_observations();
+    let expired = Arc::new(AtomicBool::new(false));
     let mut request = OpenRead {
+        expired: expired.clone(),
         caller: owner(),
         deadline: Instant::now() + Duration::from_secs(2),
         commands: receiver,
@@ -337,6 +339,7 @@ async fn worker_snapshot(storage: &SqliteStorage) -> Snapshot {
     }
     answer.await.unwrap().unwrap();
     Snapshot {
+        expired,
         owner: storage.owner.clone(),
         caller: owner(),
         commands,
@@ -600,6 +603,7 @@ async fn cancelled_and_expired_opens_do_not_retire_a_healthy_connection() {
             .owner
             .reads
             .try_send(OpenRead {
+                expired: Arc::new(AtomicBool::new(false)),
                 caller: owner(),
                 deadline,
                 commands: receiver,
@@ -673,21 +677,16 @@ async fn close_interrupts_a_statement_that_is_already_running() {
         Arc::new(data),
         StorageOptions {
             read_connections: 1,
-            reader_setup: Some(Box::new(move |conn| {
-                let mut entered = entered.lock().unwrap().take();
+            reader_progress: Some(Box::new({
                 let mut fallback = None;
-                conn.progress_handler(
-                    1000,
-                    Some(move || {
-                        if let Some(entered) = entered.take() {
-                            fallback = Some(Instant::now() + Duration::from_secs(4));
-                            let _ = entered.send(());
-                        }
-                        // A broken interrupt mutant still exits and cleans up.
-                        fallback.is_some_and(|deadline| Instant::now() >= deadline)
-                    }),
-                )
-                .unwrap();
+                move || {
+                    if let Some(entered) = entered.lock().unwrap().take() {
+                        fallback = Some(Instant::now() + Duration::from_secs(4));
+                        let _ = entered.send(());
+                    }
+                    // A broken stop interrupt still exits and cleans up.
+                    fallback.is_some_and(|deadline| Instant::now() >= deadline)
+                }
             })),
             ..Default::default()
         },
@@ -942,6 +941,7 @@ async fn cancelled_open_never_enters_pool_or_resets_its_failure_streak() {
         .owner
         .reads
         .try_send(OpenRead {
+            expired: Arc::new(AtomicBool::new(false)),
             caller: owner(),
             deadline: Instant::now() + Duration::from_secs(2),
             commands,
@@ -1441,6 +1441,7 @@ async fn expiry_inside_pool_refuses_before_the_schema_pin() {
         .owner
         .reads
         .try_send(OpenRead {
+            expired: Arc::new(AtomicBool::new(false)),
             caller: owner(),
             deadline: Instant::now() + Duration::from_secs(3600),
             commands: receiver,
@@ -1570,6 +1571,7 @@ async fn unbounded_fixture_read_pins_despite_an_expired_queue_deadline_and_pin_c
         .owner
         .reads
         .try_send(OpenRead {
+            expired: Arc::new(AtomicBool::new(false)),
             caller: owner(),
             deadline: Instant::now() - Duration::from_secs(1),
             commands: receiver,
@@ -1643,5 +1645,88 @@ async fn fixture_read_waits_for_the_real_pin_after_the_normal_caller_timer_would
             .is_none()
     );
     drop(snapshot);
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn active_checkpoint_expiry_interrupts_owned_sql_and_expires_that_same_snapshot() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let data = Arc::new(data);
+    let (entered, running) = oneshot::channel();
+    let entered = Arc::new(Mutex::new(Some(entered)));
+    let armed = Arc::new(AtomicBool::new(false));
+    let signal = armed.clone();
+    let storage = SqliteStorage::open(
+        data.clone(),
+        StorageOptions {
+            reader_progress: Some(Box::new(move || {
+                if signal.load(Ordering::SeqCst)
+                    && let Some(entered) = entered.lock().unwrap().take()
+                {
+                    let _ = entered.send(());
+                }
+                false
+            })),
+            read_connections: 1,
+            snapshot_idle: Duration::from_secs(60),
+            ..without_admission_expiry()
+        },
+    )
+    .unwrap();
+    let snapshot = worker_snapshot(&storage).await;
+    let work = snapshot.call(move |view| {
+        // The hook is armed only for SQL on this already selecting transaction.
+        armed.store(true, Ordering::SeqCst);
+        let result = view.tx.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n", [], |r| r.get::<_, i64>(0));
+        result.map_err(SqliteError::from)
+    });
+    tokio::pin!(work);
+    // Poll the public call concurrently with maintenance; receiving the hook
+    // signal proves the query is running inside that original snapshot.
+    let maintenance = async {
+        running.await.unwrap();
+        let mut writer =
+            open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        let tx = writer.transaction().unwrap();
+        tx.execute_batch("CREATE TABLE r127_pressure(value BLOB) STRICT")
+            .unwrap();
+        for _ in 0..258 {
+            tx.execute("INSERT INTO r127_pressure VALUES(zeroblob(1048576))", [])
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        storage
+            .owner
+            .shared
+            .active_reads
+            .age_for_test(Duration::from_secs(31));
+        let observation = storage.checkpoint().await.unwrap();
+        assert!(observation.backlog_bytes > 256 * 1024 * 1024);
+        assert_eq!(observation.interrupted, 1);
+    };
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(&mut work, maintenance)
+    })
+    .await
+    .expect("R127 interruption must terminate the actual SQL");
+    assert!(result.unwrap_err().to_string().contains("snapshot_expired"));
+    assert!(
+        snapshot
+            .get(EntityKind::Team, "absent")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot_expired")
+    );
+    let next = storage.read(owner()).await.unwrap();
+    assert!(
+        next.get(EntityKind::Team, "absent")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(storage.failure_state().failure().is_none());
+    assert_eq!(storage.checkpoint().await.unwrap().backlog_bytes, 0);
+    drop(next);
     storage.close().await.unwrap();
 }
