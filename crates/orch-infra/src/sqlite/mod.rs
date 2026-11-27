@@ -14,7 +14,7 @@ pub enum SqliteError {
     },
     #[error("task object access failed: {0:?}")]
     TaskAccess(std::io::ErrorKind),
-    /// Context, Config, Template or Goal: names the family and the identity's key
+    /// Agent, Team, Run, Context, Config, Template or Goal: names the family and the identity's key
     /// form, never a text or a path.
     #[error("stored {family} form {form} failed {check} at {locator}")]
     EntityCorrupt {
@@ -240,3 +240,10 @@ mod entity_router;
     reason = "inactive non-Task inline cursor awaits the key-taking leaves and the page PR"
 )]
 mod non_task_cursor;
+
+#[allow(
+    dead_code,
+    reason = "Storage composition is being qualified before activation"
+)]
+mod storage;
+pub use storage::{SqliteStorage, StorageOptions};

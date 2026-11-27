@@ -27,7 +27,7 @@
 //! write lock the open transaction holds. The latch is checked before
 //! `TransactionAborted` is chosen, so a latched request answers `StorageUnavailable`.
 //!
-//! `submit_contained` is the entry for a callback that must not end the writer
+//! The SQLite-private `contain` boundary contains a callback that must not end the writer
 //! (spec Amendment 3, issue 379; `contain`): a panic of the callback rolls the
 //! request back, is answered as `CallbackPanicked` for the caller to resume, and
 //! latches nothing, and the writer serves what follows. The typed unwind that a
@@ -52,6 +52,7 @@ pub(super) mod contain;
 pub(super) mod failure;
 use super::{ConnectionHandle, ConnectionRole, Result, SqliteError, Synchronous, open_connection};
 use crate::data_dir::DataDir;
+#[cfg(test)]
 use contain::contain;
 use failure::{FailureSource, FailureState, FatalCause};
 use rusqlite::{DropBehavior, Transaction};
@@ -446,7 +447,7 @@ impl<'a> Writer<'a> {
     /// `WriterHandle::close` or by dropping the final client handle. A panic of a callback
     /// submitted with `submit`, or the unwind of a leaf's failed savepoint cleanup under
     /// either entry, rolls back its transaction and drops this worker, closing every queued
-    /// receipt (`submit_contained` contains the former and observes the latter).
+    /// receipt (`contain` contains the former and observes the latter).
     /// So does a request that leaves the connection inside a transaction (a failed
     /// rollback, latched as `FatalCause::RollbackLeftTransactionOpen` before the
     /// answer): the worker refuses what is queued with `StorageUnavailable`, then
@@ -643,7 +644,8 @@ impl WriterHandle {
     /// Supply only the caller's callback here, never adapter setup, a setup
     /// clock read or completion checks. Storage instead uses the SQLite-private
     /// `contain` inside its `submit` job around the user `WriteWork` alone.
-    pub fn submit_contained<T, F>(
+    #[cfg(test)]
+    pub(in crate::sqlite) fn submit_contained<T, F>(
         &self,
         lane: Lane,
         deadline: Option<Instant>,

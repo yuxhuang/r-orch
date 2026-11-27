@@ -90,7 +90,11 @@ impl Intents {
 
     pub(super) fn delete_finished(&mut self, now_ms: i64, max_rows: usize) -> Result<usize> {
         check_bound(max_rows)?;
-        let cutoff = now_ms.saturating_sub(DONE_RETENTION_MS);
+        // Below the signed minimum no stored time is old enough: saturating
+        // would wrongly delete a row finished at `i64::MIN`.
+        let Some(cutoff) = now_ms.checked_sub(DONE_RETENTION_MS) else {
+            return Ok(0);
+        };
         let doomed: Vec<u64> = self
             .rows
             .iter()

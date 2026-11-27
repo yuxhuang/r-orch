@@ -251,7 +251,7 @@ pub async fn list_sorts_and_filters_match_the_reference(b: Backend) {
             ] {
                 u.create(Entity::Task(Box::new(Task {
                     status,
-                    updated_at: time.into(),
+                    updated_at: task_sort_time(time).into(),
                     goal_id: goal.map(str::to_owned),
                     ..task(id)
                 })))?;
@@ -318,8 +318,8 @@ pub async fn declared_secondary_sorts_use_values_then_tie_breakers(b: Backend) {
             owner("p"),
             Entity::Task(Box::new(Task {
                 priority,
-                created_at: created.into(),
-                updated_at: updated.into(),
+                created_at: task_sort_time(created).into(),
+                updated_at: task_sort_time(updated).into(),
                 ..task(id)
             })),
         )
@@ -595,4 +595,16 @@ pub async fn message_and_run_filters_stay_within_their_family(b: Backend) {
         .await),
         ["b"]
     );
+}
+
+// Task's persisted timestamp contract is canonical millisecond UTC. Keep the
+// original lexical ordering vectors while using representable Task values.
+fn task_sort_time(value: &str) -> &'static str {
+    match value {
+        "a" => "2025-01-01T00:00:00.000Z",
+        "b" => "2025-01-02T00:00:00.000Z",
+        "c" => "2025-01-03T00:00:00.000Z",
+        "z" => "2025-01-26T00:00:00.000Z",
+        _ => unreachable!("fixed task ordering vector"),
+    }
 }

@@ -1,5 +1,5 @@
 //! Typed intents on the enclosing writer transaction, with no external effects.
-//! Authorization and the Send-bound Storage facade remain integration duties.
+//! Authorization and the borrowed `UnitOfWork` facade remain integration duties.
 use orch_core::store::intents::{
     DONE_RETENTION_MS, FinishOutcome, Intent, IntentPayload, check_bound,
 };

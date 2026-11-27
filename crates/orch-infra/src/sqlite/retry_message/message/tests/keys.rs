@@ -79,6 +79,10 @@ fn a_walk_by_recorded_tuples_equals_the_walk_by_anchor_records_in_every_order() 
                 );
                 // The total counts every match, not the rows after the tuple.
                 assert_eq!(total, 5);
+                assert!(
+                    seen.len() + ids.len() <= whole.len(),
+                    "message cursor did not advance: {sort:?}, limit {limit}, seen {seen:?}, page {ids:?}"
+                );
                 seen.extend(ids.clone());
                 if !more {
                     break;

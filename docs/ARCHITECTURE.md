@@ -1235,8 +1235,10 @@ clients <── WriteReceipt::wait() ──────────────�
   the closure in `contain`, which catches that closure's own panic: the transaction rolls back, the receipt returns
   `CallbackPanicked` for the caller to resume, nothing is latched and the writer serves the next job. Give it only the
   caller's callback, never adapter setup, a `Clock` read or a completion check, which would then be taken for the
-  caller's panic. The `Storage` composition is to call the SQLite-private `contain` inside its own `submit` job, around
-  the user `WriteWork` alone; nothing outside tests calls either entry yet.
+  caller's panic. `SqliteStorage::write` (PR 385) calls the SQLite-private `contain` inside its own `submit` job, around
+  the user `WriteWork` alone; `submit_contained` is `cfg(test)` and only tests call it. Two tests in
+  `sqlite/storage/containment_tests.rs` show that a panic in the `Clock` read and one in the completion check after a
+  successful callback reach the caller as an error, not as a resumed callback panic.
   A leaf whose savepoint cleanup fails (the lease, intent, retry and message leaves) does not return an error that a
   callback could catch and commit past. It unwinds with a typed `CleanupUnwind`, which `contain` reports to the failure
   state, so that `SQLITE_CORRUPT` or `SQLITE_NOTADB` latches although the outer rollback would succeed, and then raises

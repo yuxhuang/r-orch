@@ -457,7 +457,7 @@ holds them.
 | R48 | Every entity returned by the API shall carry its `revision`; a change that names `expected_revision` shall fail with `stale_revision` when it is not the stored one; a change that names none shall apply as in 1.0. | I | must | `crates/orch-daemon/tests/ops_revisions.rs::entities_carry_a_revision`, `::stale_expected_revision_is_refused`, `::a_change_without_one_applies`; both |
 | R49 | Every list operation shall accept `limit`, `cursor`, `sort` and `with_count` with the bounds of R9. CLI list commands shall return all rows in their 1.0 shape and order unless `--limit` or `--cursor` is given: they walk the pages by the immutable sort `id`, so that every row present throughout the walk is returned exactly once, and order the result as 1.0 did. (AP4) | I | must | `crates/orch-daemon/tests/ops_paging.rs::list_operations_page`, `crates/orch-cli/tests/list_paging.rs::default_output_is_unchanged`, `::a_row_changed_during_the_walk_is_returned_once`, `::limit_returns_one_page_and_a_cursor`; both |
 | R50 | `LOCAL_PROTOCOL` shall be 3, and a client and a daemon of different protocol versions shall refuse each other as in 1.0, with the frozen handshake and the stop intent unchanged. | I | must | `crates/orch-proto` test `protocol_is_3`, `crates/orch-daemon/tests/daemon_wire.rs::protocol_2_client_is_refused_by_a_protocol_3_daemon`, `::stop_intent_crosses_the_skew`; both |
-| R51 | The error codes `stale_revision`, `quota_exceeded`, `storage_unavailable` (R128) and `snapshot_expired` (R127) shall be added with exit 1; the twelve existing codes and exits 1 to 7 shall keep their meanings. | I | must | `crates/orch-proto` test `existing_error_codes_and_exits_are_unchanged`, `::new_codes_exit_1`; both |
+| R51 | The error codes `stale_revision`, `quota_exceeded`, `storage_unavailable` (R128) and `snapshot_expired` (R127 for an interrupted read; "Reader snapshots on SQLite" for an idle one) shall be added with exit 1; the twelve existing codes and exits 1 to 7 shall keep their meanings. | I | must | `crates/orch-proto` test `existing_error_codes_and_exits_are_unchanged`, `::new_codes_exit_1`; both |
 | R52 | The dispatcher shall decide whether a principal may run an operation in one function with an exhaustive match and no default arm, before any admission or storage call. | J | must | `crates/orch-daemon/tests/ops_authorization.rs::every_operation_has_a_row_for_every_principal_kind`; a reviewer confirms no other check site; both |
 | R53 | A test principal of kind worker and one of kind task shall be refused every operation the matrix denies them, with `not_permitted` and no change, including any call for another project and any lease-bound call with a stale epoch. | J, G5 | must | `ops_authorization::worker_is_refused_what_the_matrix_denies`, `::task_is_refused_what_the_matrix_denies`, `::another_project_is_refused`; both |
 | R54 | Every `db.*` operation, `attention.ack`, `policy.set`, `orch import`, `orch db restore` and `orch db vacuum` shall be refused over anything but the local socket or the local lock, to an MCP session of any mode, and in agent context. (AP3) | B8, B14 | must | `ops_authorization::owner_only_operations_are_refused_to_mcp_and_agent_context`, `crates/orch-cli/tests/db_offline.rs::offline_commands_refuse_in_agent_context`; both |
@@ -533,7 +533,7 @@ holds them.
 | R124 | Before it applies a pending migration to a database that holds a project, the daemon shall write `backups/pre-migration-v<from>-<UTC time>/` with a copy of the database made through the online backup API and a manifest holding its hash, shall check the copy with `integrity_check` and against the manifest, and only then migrate. It shall refuse the start, changing nothing, when free space is under the disk floor plus the database's size, or when the copy fails its check. A start that the Task format migration refuses ("Task format v1 (SQLite)", "Migration and compatibility"), or that migration 004 or 005 refuses ("Entity format v1 (SQLite)", "Migration and compatibility"), is refused before this copy is written. It shall keep the two newest such copies and remove older ones after a start that migrated. The copy holds no blobs: `orch db restore` of it replaces the database alone and is a restore in every other respect (R77, R100), and `orch db verify --blobs` then names each blob deleted since. This is not a scheduled backup; 1.1 has none (AP9). | Red team I5; `docs/sqlite-library.md` (a backup before a migration); AP9 | must | `crates/orch-infra/tests/sqlite_migrations.rs::a_pending_migration_is_preceded_by_a_checked_copy`, `::the_start_is_refused_without_space_for_the_copy`, `::a_copy_that_fails_its_check_stops_before_the_migration`, `::only_the_two_newest_copies_are_kept`, `db_backup_restore::a_pre_migration_copy_restores_the_database_alone`; both |
 | R125 | A stop after an import is recorded as finished and before `.orch-project` is written shall be repaired by running the same `orch import` command again: where the data directory holds a finished import of this project directory and the pointer is absent, the command shall write the pointer (R107), change nothing else and say so, where R68 would otherwise refuse a second project. The dry run shall report that state. | Red team I6 | must | `import::a_stop_before_the_pointer_is_repaired_by_running_again` (a 1.0 directory and an export file), `::the_dry_run_reports_a_finished_import_without_its_pointer`; both |
 | R126 | The writer's connection shall run with automatic checkpointing off (`wal_autocheckpoint = 0`): no commit of the writer shall run a checkpoint. The `wal.checkpoint` job shall run passive checkpoints on a connection of its own, outside the writer task and outside the lanes, when 5 minutes have passed since its last completed checkpoint or when the log's backlog reaches 64 MiB, which it shall look at once a second at least. The backlog is a logical measure: the frames written to the write-ahead log and not yet copied into the database, times the page size, within one generation of the log (a log that starts again after a complete checkpoint counts from nothing). It shall be kept from SQLite's own counts, the writer's commit callback and each checkpoint's result; the result is exact and resets it, and where a change of generation cannot be told the larger backlog shall be assumed. It shall never be the length of the `-wal` file, which SQLite does not shorten after a checkpoint, and no checkpoint shall be run to learn it. `writer_commit_seconds` shall record the time of each commit apart from `writer_txn_seconds`; `wal_bytes` shall be the backlog and `wal_file_bytes` the file's length, shown apart, and no rule shall act on the file's length. Each checkpoint's start, duration, result and frame counts shall be recorded. Every connection that can write, the checkpoint connection included, shall set `fullfsync = ON` and `checkpoint_fullfsync = ON` and read both back; "Writer lanes" says what they mean on each platform, and they change nothing in `synchronous`. The sync settings are a proposal under AP13. The owner's ruling on that proposal is deferred with the measurement (record I of "Owner's answers"), and in 1.1 the settings are built as this requirement states them. | Red team W1 and its residual W1-R2 (a trigger on the file's length latches: the file keeps its size after every frame has been checkpointed); AP13 | must | `crates/orch-infra/tests/sqlite_settings.rs::the_writer_never_checkpoints_in_a_commit`, `::every_writing_connection_reads_back_its_sync_settings`, `sqlite_writer::checkpoints_run_on_their_own_connection`, `::the_backlog_is_zero_after_a_complete_checkpoint_while_the_file_keeps_its_length`, `::a_backlog_of_64_mib_starts_a_checkpoint`, `crates/orch-daemon/tests/ops_metrics.rs::commit_time_is_recorded_apart`, `::backlog_and_file_length_are_reported_apart`; both |
-| R127 | While the log's backlog (R126's measure, not the file's length) is over 256 MiB, a read transaction of the pool that has been open for more than 30 s shall be interrupted with the typed error `snapshot_expired`, so that a checkpoint can copy the frames it holds back; a read under either limit shall be left alone, and so shall every read while the backlog is under the limit, however long the file. `orch db status` shall show the backlog, the file's length and the age of the oldest read. Both numbers are proposals that no measurement backs yet. | Red team W1, W1-R2 | should | `crates/orch-infra/tests/sqlite_pool.rs::a_long_read_is_interrupted_when_the_backlog_is_over_its_ceiling`, `::a_read_under_either_limit_is_left_alone`, `::a_long_file_with_no_backlog_interrupts_no_read`; both |
+| R127 | While the log's backlog (R126's measure, not the file's length) is over 256 MiB, a read transaction of the pool that has been open for more than 30 s shall be interrupted with the typed error `snapshot_expired`, so that a checkpoint can copy the frames it holds back; a read under either limit shall be left alone, and so shall every read while the backlog is under the limit, however long the file. `orch db status` shall show the backlog, the file's length and the age of the oldest read. Both numbers are proposals that no measurement backs yet. R127 does not govern a snapshot handle that has no call in flight: that is released by its own rule, at any backlog ("Reader snapshots on SQLite"), and its release is no evidence for R127. | Red team W1, W1-R2 | should | `crates/orch-infra/tests/sqlite_pool.rs::a_long_read_is_interrupted_when_the_backlog_is_over_its_ceiling`, `::a_read_under_either_limit_is_left_alone`, `::a_long_file_with_no_backlog_interrupts_no_read`; both |
 | R128 | The writer shall handle a transaction that fails for a reason outside its own logic by the classes of "Writer lanes". A retryable failure (`SQLITE_BUSY` or `SQLITE_LOCKED` past the busy timeout, `SQLITE_FULL`, a first `SQLITE_IOERR`) shall be rolled back and tried again after 50 ms, doubling to at most 2 s, and never dropped; no claim shall be granted while it lasts. A request answered `overloaded` at its deadline shall be withdrawn and never committed afterwards. `SQLITE_CORRUPT`, `SQLITE_NOTADB`, a second `SQLITE_IOERR` in a row, one transaction retried for 60 s without committing, and an explicit rollback of the writer's top-level transaction that fails while the connection is still inside a transaction shall fail the writer, the last by a cause of its own. A rollback that returns an error but leaves the connection outside a transaction is not that cause: its result is classified as any other result. A request that would be answered `TransactionAborted` shall be answered `storage_unavailable` when the writer has failed. A writer with nothing to commit is idle, and shall never fail for that. A failed writer shall refuse every mutation with the typed error `storage_unavailable`, grant no claim, keep supervising its runs and spooling their finishes (R129), and be reported by `daemon.status`, `orch status` and `orch doctor` (exit 1) from memory, since the attention queue needs the writer; only a restart shall end that state. (AP18; record L) | Red team W3 and its residual W3-R1 (read to the letter, "60 s without a commit" failed an idle daemon); the resilience review of PR 249 (C2) and the owner's ruling of 2026-11-24 for the failed rollback | must | `sqlite_writer::a_busy_database_is_retried_and_nothing_is_dropped` (a second connection holds the write lock), `::a_withdrawn_request_is_never_committed`, `::a_full_disk_is_retried_and_then_fails_the_writer`, `::a_corrupt_database_fails_the_writer_at_once`, `::an_idle_writer_never_fails`, `::a_failed_top_level_rollback_that_leaves_the_transaction_open_fails_the_writer`, `::a_rollback_error_that_leaves_the_connection_outside_a_transaction_is_not_that_cause`, `::a_latched_writer_answers_storage_unavailable_before_transaction_aborted`, `crates/orch-daemon/tests/daemon_storage_failure.rs::a_failed_writer_refuses_mutations_and_is_reported` (once the daemon is wired, the failed rollback is one of the causes it plants); both |
 | R129 | Before a run's finish (status, result, usage, last event number, and the lineage and epoch of the run's lease) is queued for the writer, the daemon shall write it, synced, to `spool/finish/<name>` in the data directory, and shall remove the file after the commit. The name is the finish file name of "Filesystem names", computed from the project id and the run id with the label `orch-finish-file-v1`, and R101 holds for it whatever the two ids contain; the file is created and reached as R102 says and is at most 128 KiB, a result over 64 KiB being stored as a blob first (R97). When the write or its sync fails, the finish is not safe and the daemon shall not act as if it were: it shall keep the finish in memory, try the spool again at the intervals of R128, hand the finish to the writer all the same (a commit ends the need for the file), grant no claim while any finish is unspooled, and report the number of unspooled finishes in `daemon.status`, `orch status` and `orch doctor` (exit 1). `orch daemon stop` shall still stop; it shall name each run whose finish is neither spooled nor committed and say that the stop loses that result. That is the one loss this requirement allows while a daemon runs, and R41 then ends the run as one whose process is gone. At a start, recovery shall apply every spooled finish whose run is unfinished before it judges that run (R41), by R36's rule for lineage and epoch, so that the run is finished and not cancelled. A file that names no unfinished run, carries another lineage or fails its check shall be removed and counted. A backup and an export hold no spool. (AP18) | Red team W3 and its residual W3-R1 (the spool write can fail, most likely when the disk is full and the writer is retrying for the same reason); R86 | must | `crates/orch-engine/tests/leases.rs::a_spooled_finish_survives_a_stop_before_its_commit`, `::a_spooled_finish_is_applied_before_recovery_judges_the_run`, `::a_stray_or_damaged_spool_file_is_removed_and_counted`, `::a_finish_that_cannot_be_spooled_is_kept_reported_and_committed_when_the_writer_recovers` (the spool directory refuses writes; no claim is granted meanwhile), `crates/orch-daemon/tests/daemon_storage_failure.rs::stop_names_a_finish_that_is_neither_spooled_nor_committed`, `crates/orch-infra/tests/fs_names.rs::finish_file_name_vector`, `::the_finish_file_name_is_the_whole_hash_for_any_run_id` (every finish-file row of the vectors of "Filesystem names", as a name), `crates/orch-engine/tests/leases.rs::a_finish_is_spooled_and_removed_under_its_hash_name_for_any_run_id` and `::recovery_reaches_a_spooled_finish_under_its_hash_name_for_any_run_id` (the same rows through the daemon's own operations, in a data directory made for the test: for a running run stored under each row's ids, the finish path writes exactly `spool/finish/<the row's name>` and removes it after the commit, and a start that finds that file applies it and removes it; a test passes the ids and computes a name only to compare; each asserts that nothing else was created below the data directory, that nothing was created, changed or removed outside it, and that a canary outside it keeps its bytes and metadata); both |
 | R130 | `orch db query` shall use a connection opened read-only for that command alone, never the writer and never a pooled connection, with an authorizer that denies by default from prepare to the last row: it allows reading the listed columns of the diagnostic views through those views and calling the functions listed in "`orch db` commands", and nothing else. The statement shall be at most 16 KiB; the result at most 100,000 rows and 16 MiB; the run at most 5 s, stopped by the progress handler; and the connection's run-time limits shall be: a string or blob 1 MiB, expression depth 64, compound selects 8, function arguments 8, a `LIKE` pattern 1,000 bytes, attached databases 0. | Security review S3; ADR 0017 decision 19 (`hooks`, `limits`) | must | `db_query::a_function_outside_the_list_is_refused`, `::stops_at_its_statement_row_byte_and_time_limits`, `::each_run_time_limit_is_set_on_the_connection`, `::the_query_connection_is_not_the_writer_or_the_pool`; both |
@@ -864,8 +864,13 @@ change (R49):
 [ADR 0024](../decisions/0024-non-task-cursors.md)). A list of Agent, Team, Run, Message (`Messages` and
 `PendingMessages`), Context, Config, Template or Goal returns a cursor that resumes from the last row's *original
 ordering tuple* and never from the row's state at resume time. Task keeps its own cursor and its issue 277 exception,
-unchanged, and nothing below applies to it. What is written here is the contract; no code implements it yet and no
-vector below has run.
+unchanged, and nothing below applies to it. What is written here is the contract. As built on `main`, three private
+slices are wired to nothing: the inline arm (PR #376, `78846fed8`), the key-taking entry of the three leaves
+(PR #377, `110002d86`) and the table of retained entries and entries by lookup, with the unfiltered identity scan and
+its tuple comparison (PR #383). The composition (draft PR 385) adds the caller, the binding of a cursor in a page and the
+wire into `Storage` (`sqlite/storage/page.rs`), so below, "no `Storage` caller" and "nothing calls" describe `main`; no
+vector is signed off through it and the daemon uses files (issue 370; plan "Non-Task cursors", step 5). The test-only
+file reference and the memory fake already issue cursors for these families.
 
 The owner's words, as the lead recorded them. The answer to the two decisions of the lead's eighth escalation of this
 goal was "d1 approve; d2 - p / all new refusals and 64KiB rule are acceptable" (D2 approves option P for the eight
@@ -922,9 +927,15 @@ owner's live copy and nothing beyond this wording.
   | Goals, `created_at` | `created_at`, `position`, identity | 221 |
   | Messages, default | `created_at`, `position`, identity | 221 |
 
-  The figures are derived from the Task token's constants (`HEADER`, `MAX_RAW`) and have not been checked against an
-  encoding, because no encoder exists. The change that lands the encoder confirms or corrects this table in the same
-  PR. The table decides the arm, and the boundary vectors test it.
+  The figures follow from the Task token's constants (`HEADER` 26, `MAX_RAW` 256): 256 − 26 − 8*k* − *t*. As built,
+  the encoder (`crates/orch-infra/src/sqlite/non_task_cursor`, PR #376, `78846fed8`) confirms all nine rows and the
+  table needed no correction. The test `the_capacity_table_of_the_spec_is_what_the_layouts_derive` compares 24 list
+  and sort rows (every sort `id` and each other order the table names) with `Layout::inline_capacity`, and
+  `a_tuple_at_the_capacity_is_inline_and_one_byte_more_is_not` shows, for each of them, that a tuple at the capacity
+  (with one-byte and multi-byte characters) is inline and encodes to a token of exactly 512 characters, and that one
+  byte more is not inline and would encode to 514 characters, which `Cursor::new` refuses. These tests run at the
+  encoder's own interface; the retained and lookup halves of the boundary vectors need the table of step 4 (PR #383), which
+  is built and tested at its own interface, not through a page. The table decides the arm.
 - *What the adapter holds.* The retained entries and the entries by lookup are one table in the adapter's memory. It is
   never written to the database: a list is a read, and a durable entry would turn every long-anchor page into a write
   through the single writer, so a failed writer (R128) would stop reads. An entry records the tuple or its digests, the
@@ -950,7 +961,14 @@ owner's live copy and nothing beyond this wording.
   does for Task). The nonce is random and made when the adapter is built, so a handle from an earlier process
   cannot name a different anchor in a new one. The token is not secret and has no MAC, as for Task: a guessed or edited
   handle that names a live entry of the same binding and sort can only start its holder's own walk at another valid
-  position within their own project, filter and sort, and shows no row that a walk from the start does not.
+  position within their own project, filter and sort, and shows no row that a walk from the start does not. As built
+  (PR #376), the encoder issues and resumes the inline token only (version 1). As built (PR #383), the table issues and
+  resumes versions 2 and 3, the retained token and the token by lookup: 34 raw bytes (version, sort, binding of 16,
+  nonce of 8, handle of 8) and no expiry field, and `resume` checks the length, version, sort, binding and nonce
+  before it reads the table. `resume_inline` refuses a token of more
+  than 512 characters before it decodes anything, because a `Cursor` built by deserialization has not been through
+  `Cursor::new`, and `issue_inline` refuses a tuple that the request's layout does not admit, because a tuple does not
+  remember its layout and one of another layout would otherwise resume as another identity.
 - *Generation.* The daemon takes a new generation at every start (R41) and a restore takes another (R77). Every
   non-Task cursor therefore ends at a restart, an inline one through its binding and a retained one through the nonce and
   the table. A cursor ends at a restart for Task too, so this is not a new behaviour.
@@ -996,11 +1014,62 @@ owner's live copy and nothing beyond this wording.
 - *Resume from a key, never from a record.* A leaf takes the tuple as the position, compares the candidates with it by
   the leaf's own order, and does no check of the anchor against the filter. The family, the filter and the sort stay
   bound by the token's digest, which replaces the leaf's family check. The composition never passes a stored,
-  synthetic or looked-up record as the anchor; in the lookup arm it takes the tuple from the verified row. As built,
-  the three leaves (`sqlite::agent_team_run`, `sqlite::cctg` and `sqlite::retry_message::message`) take an anchor
-  record and answer `InvalidCursor` for one that the filter refuses. That refusal is withdrawn (pending: the page PR adds
-  a key-taking entry to each leaf), because an anchor that has left the filter alone refuses nothing. The memory
-  and the file reference already resume from a stored key and never read the anchor's row.
+  synthetic or looked-up record as the anchor; in the lookup arm it takes the tuple from the verified row. The
+  memory and the file reference already resume from a stored key and never read the anchor's row. As built (PR #377,
+  `110002d86`), each of the three leaves (`sqlite::agent_team_run`, `sqlite::cctg` and
+  `sqlite::retry_message::message`) has a second page entry, `select_after(query, after, limit)`, that takes the tuple
+  and does not check the anchor against the filter. Its refusal is withdrawn there, because an anchor that has left the
+  filter alone refuses nothing. The record-taking `select` stays, still answers `InvalidCursor` for an anchor that the
+  filter refuses or that is of another family, and now compares through the same code as `select_after`, so the two
+  entries cannot disagree; the page PR retires its use. Nothing calls `select_after` outside the leaves' tests.
+- *Key-taking leaves, as built* (PR #377, `110002d86`; three leaves, crate-private, no `Storage` caller). Each leaf
+  defines an `OrderKey`, the original ordering tuple ending with the identity, one shape per ordering; the leaf's
+  `key_of(&Record)` (`NativeSelection` and `MessageSelection`) returns the tuple that a page ending on that row records,
+  and that is what the encoder and the table of step 4 will call at issue time. Texts are `Cow<str>` compared as UTF-8
+  bytes, never by characters or locale; integers are `u64` (`attempt` is `u32`).
+
+  | Leaf | Shape (the selection that takes it) | Components, in order |
+  |---|---|---|
+  | `agent_team_run` | `Id` (sort `id` of Agent, Team or Run) | identity |
+  | | `AgentPosition` (Agents, default) | `position`, identity |
+  | | `AgentName` (Agents, `name`) | `name`, `position`, identity |
+  | | `TeamCreated` (Teams, default) | `created_at`, identity |
+  | | `TeamName` (Teams, `name`) | `name`, identity |
+  | | `RunStarted` (Runs, no task in the filter, default) | `started_at` (descending), identity |
+  | | `RunAttempt` (Runs, filter names a task, default or `attempt`) | `attempt` (descending), identity |
+  | `cctg` | `Id` (Context, Config, Template in every order; Goal by `id`) | identity |
+  | | `GoalDefault` (Goals, default) | status rank, `updated_at` (an `Option`, newest first, an absent one after every text), `position`, identity |
+  | | `GoalCreated` (Goals, `created_at`) | `created_at`, `position`, identity |
+  | `retry_message::message` | `Id` (sort `id`) | identity |
+  | | `Default` (Messages and `PendingMessages`, default) | `created_at`, `position`, identity |
+
+  - *The tuple names a place, not a row.* The first row returned is the first of the selecting view that sorts strictly
+    after the tuple on the original bytes. The row the tuple came from may be deleted, changed, recreated or may no
+    longer match the filter (a goal achieved under `--status active`, a pending message delivered, a run whose agent
+    changed) and nothing is refused for that; a changed row is returned at its new place if that is after the tuple.
+    Rows whose values did not change are neither skipped nor repeated. Ties (equal `created_at`, `name`, `started_at`,
+    `attempt` or `updated_at`) are decided by the later components, position and then identity, as in the reference.
+  - *Same view.* Hydration and filtering happen in the view the caller passes, a pooled read snapshot or the caller's own
+    writer transaction, as for `select`. `total` counts the rows that match now, before the cursor, as for `select`.
+    The limit is 1 to 1,000.
+  - *What a page reads.* Agent, Team, Run, Context, Config, Template and Goal hydrate every row of the family, each
+    through the usual checks, so one damaged row anywhere fails the page, including a row that sorts before the tuple.
+    Messages hydrate the candidates of the narrowing query only: `PendingMessages` rows with status `pending`, and rows
+    of the recipient for a recipient filter. A damaged message outside that narrowing is not read. The narrowing is a
+    superset and the hydrated original bytes decide, as for `select`; it is not the identity scan of the lookup arm,
+    which must be unfiltered.
+  - *Refusals.* An unsupported family or sort is `InvalidPage`, and the limit is checked before the tuple. A tuple of
+    another shape than the selection's is `InvalidCursor`, decided before any row is read. `key_of`'s identity shape is
+    not a family check: it returns the identity of any record, so the caller must already have bound the family (the
+    token's digest does that), and `Some(key)` is not evidence that a row is of the requested family.
+  - *Left to the page PR.* Using the encoder's inline token (PR #376, built) and the table (PR #383, built) in a page and
+    binding them to the validated request, authorization of the caller and the derivation of the project from it before any row access, and a bridge from the
+    encoder's `Layout`, `Tuple` and `Component` to each leaf's `OrderKey`. `Layout::compare` of the encoder and each
+    leaf's own `cmp_key` are separate implementations of one order. Each is pinned to a hand-written expected order,
+    but no test in the tree runs one against the other (a reviewer's local probe agreed on 271,068 pairs and was not
+    merged), so the page PR keeps an all-shapes equivalence test or unifies them (issue 378). The encoder's module doc
+    (`non_task_cursor/mod.rs`) calls `Layout::compare` "the one definition" of "after the anchor" for the leaves, which
+    is not what is built until then.
 - *The refusals.* A cursor of these eight families is refused, as `InvalidCursor`, only when it is: malformed, or
   bound to another project, generation, family, filter or sort, or to another adapter instance (the nonce); expired by
   the rules of "Time"; no longer held (evicted, or the adapter was stopped and built again); or in the arm by lookup
@@ -1027,6 +1096,15 @@ for all eight families. The references keep every bookmark for ever and neither 
 eviction, nonce and lookup rows are SQLite-only, as the Task long-ID tests are. The ids are those of the design review
 that proposed them. Its first draft's vectors C5 and C6 are replaced by P-L1, P-L2, P-T1, P-T3 and I-T1 to I-T4, and its
 C9 (a resume at the anchor's current row) is withdrawn. A result is a receipt of the PR that carries the test.
+
+As built, no vector is signed off. PR #376 tests the inline arm at the encoder's own interface, with no page: C7 and
+the inline half of P-B1, I-T1 to I-T4, Q7′, P-S2, P-X2 and C3 for the inline kind, and P-X3. PR #377 tests the leaf
+half of P-F1 and N3b (`cctg`), of P-F2 (`agent_team_run`) and of Q8 (`retry_message::message`): a resume after the
+original tuple, with the anchor out of the filter, in the selecting view. N3a is a comparison of the lookup arm and is
+not tested at all. PR #383 tests the table at its own interface, with real SQLite identity quartets and a synthetic
+hydrator, and no page; which vectors it covers is that PR's receipt. Each of these vectors, N3a included, stays an
+obligation of the integrated page PR once the encoder and the table of step 4 are wired (issue 370); the record of a
+vector passing is that PR's receipt.
 
 | Vector | Input | Must |
 |---|---|---|
@@ -1288,8 +1366,9 @@ that asks of a callback. It changes no stored data, no protocol and no other sig
   the job. The next write on the same storage commits. A panic in the adapter's own code, outside the callback, is not
   contained by this amendment: `Writer::run` keeps its documented behaviour for it (the worker is dropped and every
   queued receipt is closed).
-- *Not decided here.* How the SQLite adapter serves a `ReadSnapshot` (its thread, its bound and its R140 handling per
-  reply). How R128's "tried again" reads for a failure that happens inside a callback: a callback is `FnOnce` and is
+- *Reads.* How the SQLite adapter serves a `ReadSnapshot` (its bound, its admission and its R140 handling per reply) is
+  stated under "Writer lanes" ("Reader snapshots on SQLite", record N). Its error representation is open there.
+- *Not decided here.* How R128's "tried again" reads for a failure that happens inside a callback: a callback is `FnOnce` and is
   never replayed, so only what the writer itself issues (`BEGIN`, `COMMIT`) can be tried again; R128's text is unchanged
   and the point is open. The wording of the `Cursor` row and R10 for the families other than Task (record M, D2).
 
@@ -2220,9 +2299,10 @@ default order itself.
   rollback", so one corrupt row fails the whole page and no partial page is returned), applies the filter, sorts by the
   total order of the table above on the original UTF-8 bytes in Rust, continues after the saved anchor and then limits.
   The page limit is 1 to 1,000. An anchor that is an entity of another one of the four families, or one that the filter
-  refuses, is `InvalidCursor` (pending: the refusal for a filter is withdrawn by "Cursors of the eight families other than
-  Task", which resumes from the anchor's ordering tuple and never from a record, and the page PR adds a key-taking entry
-  to the driver); an anchor that is not an entity of these four families at all is `Unrepresentable`, and a
+  refuses, is `InvalidCursor` for the record-taking `select`, which stays. The refusal is withdrawn for a resume by key,
+  as "Cursors of the eight families other than Task" requires, and the driver now has that entry, `select_after`
+  (PR #377), which takes the ordering tuple and uses no record; the page PR retires its use of `select`. An anchor that is
+  not an entity of these four families at all is `Unrepresentable`, and a
   sort the family lacks (`created_at` on any family but Goal) is `InvalidPage`. The digest of an indirect key finds its
   row and decides no order. An exact lookup by an indirect key checks that the hydrated identity hashes to the stored digest and form, and then returns the record only if its identifier is exactly the bytes asked for: the digest locates a candidate and the requested bytes decide, so a different identifier that shares the locator is not found (`a_lookup_returns_only_the_identifier_that_was_asked_for`; the two are equal unless two texts share one SHA-256). This settles "Open in this section", item 1, for these
   four families by a method that costs one hydration of the family per page; it is correct for the rare large text
@@ -2661,6 +2741,34 @@ wait, the claim's own transaction and its commit. "Event measurement" says how t
 beside the 50 ms, the 1 s and the collector's 256 events or 250 ms. Since 2026-11-21 gate line 7 is retired
 and 1.1 has no gate on a time (record I of "Owner's answers").
 
+**Reader snapshots on SQLite** (R98, R127, R140; the owner's ruling of 2026-11-27, record N, which approved this wording
+with its numbers as starting values; the composition adjudication of 2026-11-26, objections O3 to O5). A `ReadSnapshot` is
+a read transaction on one connection of the pool (R98), held open for the life of the handle and served by a reader worker
+that the adapter owns. Its two figures, 200 ms and 5 s, are starting values that no measurement backs. The rules:
+
+| Rule | What the adapter does, and what a caller keeps to |
+|---|---|
+| One per task | A task of the caller (an asynchronous task, not an orch `Task`) holds at most one pinned snapshot at a time and awaits nothing unrelated to it while it holds one. A held snapshot keeps a read connection and keeps the log frames that it sees from being copied (R127), so a task that parks on something else while holding one holds both. This is a rule for callers and is kept by review; the idle release below bounds the damage when it is not kept |
+| Admission of an open | An open waits at most 200 ms for a connection (the admission deadline of R98). A queued open that its caller has cancelled, or whose deadline has passed, is skipped before it enters the pool, and the deadline is checked again just before the view is pinned. When the budget runs out the open fails with the overload error, `overloaded` (R26, R98) |
+| Pin | Once admitted, the adapter pins the consistent view before it acknowledges the open, by a real read (a deferred `BEGIN` takes no snapshot until its first read), so every call on the handle sees the state at the open even if no entity is ever asked for |
+| Calls | A call on the handle waits for bounded queue capacity: a caller with many valid calls in flight waits and is not refused for that. After the wait the call checks again that storage has not stopped and that the snapshot has not expired |
+| Idle release | After 5 s with no call in flight the adapter ends the read transaction and returns the connection to the pool, even when the handle was leaked and never dropped. A later call on the handle fails with `snapshot_expired`. A call that is in flight is never idle |
+| Stop | Dropping the last `Storage` client, or closing storage, stops the readers independently of the idle timer: a live snapshot does not hold the stop until its idle bound |
+| Writes | Write admission is the lane budgets above (50 ms, 200 ms, 1 s and 5 s); this section changes none of them |
+
+*Idle release is not R127.* R127 interrupts a pooled read that is active and older than 30 s while the backlog is over
+256 MiB, so that a checkpoint can copy the frames it holds back. The idle release is another rule: it applies at any
+backlog, to a handle with no call in flight. It is no evidence that R127's interruption works and does none of the work of
+the checkpoint job (R126, R137, T15). A snapshot that is used at least every 5 s is never released as idle and meets R127
+alone.
+
+*Error representation (open).* The names are promised: `overloaded` for an open that was not admitted in time,
+`snapshot_expired` after an idle release and `storage_unavailable` for a failed writer (R51, R98, R128). The port's
+`StoreError` has no variant for any of the three, and this spec does not yet say whether a read returns a typed variant
+(a change to `docs/TRAITS-FROZEN.md` that needs the contract decision of the R140 and T17 owner) or a message that is
+fixed and tested. The plan's "Reader snapshots on SQLite" lists the message texts that PR 385 returns today. The
+representation is decided and written here before activation (record N), and the code on the activation head must match it.
+
 **Checkpoints** (R126, R127). The writer never checkpoints in a commit: automatic checkpointing is off on
 its connection. The `wal.checkpoint` job runs passive checkpoints on a connection of its own, which SQLite
 allows beside a writer, 5 minutes after its last completed one or when the backlog reaches 64 MiB. A
@@ -2684,7 +2792,8 @@ outcomes of a call and says which of them move the timer.
   (record I of "Owner's answers"), so R126's tests are the first to run them as well.
 - **Long reads.** A read that stays open keeps frames from being copied, so over 256 MiB of backlog a
   pooled read older than 30 s is interrupted (`snapshot_expired`): a backup or an export that this stops
-  is run again, and succeeds once the backlog has fallen. A reader outside the daemon, such as a `sqlite3`
+  is run again, and succeeds once the backlog has fallen. A snapshot handle with no call in flight is released by its
+  own rule ("Reader snapshots on SQLite"), not by this one. A reader outside the daemon, such as a `sqlite3`
   shell left inside a transaction, cannot be interrupted; the RUNBOOK names the cause.
 - **What is synced, and when.** With the write-ahead log and `synchronous = NORMAL` (B12), a commit is not
   synced: the log is synced before a checkpoint, and the database file when the checkpoint has copied its
@@ -2753,6 +2862,16 @@ The reports are made from memory by `daemon.status`, `orch status` and `orch doc
 writer's is. A corrupt backup, export or import file is not the live database and is that command's own
 refusal. The threes, the 5 minutes and the use of R127's 256 MiB here are proposals with no measurement
 behind them. None of these is an attention item: 1.1 has two kinds and adds none (R81).
+
+*A pooled read after a writer latch (issue 389, option B as signed).* A latch that is set before a pooled read or a
+snapshot request permits that read to proceed: the pool serves it, and the latch goes on refusing mutations, claims,
+checkpoints and work on the writer connection (R128, R140). The adapter captures the count of fatal observations when the read or the
+snapshot is requested, including the time spent waiting for a connection. If any live connection records a new fatal
+observation before the call returns its result, the adapter discards that call's whole result, returns `storage_unavailable`
+and ends the snapshot; a later request takes a new baseline. An ordinary read failure keeps its handling in the table
+above. A new write callback never runs while the latch is set, and a callback already running when the latch trips refuses
+further work, and its transaction never commits ("On the writer"). A successful read during an incident establishes only that the read completed under these
+rules: R128's supervision and R140's classification stand.
 
 **When a Task read proves its data corrupt** (R140, R141). The lead's decision of 2026-11-23 extends R140's policy
 from SQLite's own results to proven logical corruption of live `Task` data, because reopening a healthy
@@ -3494,7 +3613,7 @@ against 50 ms and 100 ms stands whatever the owner rules. The owner rules on all
 | `stale_revision` | 1 | `expected_revision` is not the stored revision. Execution `not_executed`. The message names the entity and both revisions. |
 | `quota_exceeded` | 1 | The disk floor refuses new work (R85). Execution `not_executed`. Reserved for later storage limits. |
 | `storage_unavailable` | 1 | The writer has failed (R128). Execution `not_executed`. The message names the connection and the cause (a SQLite result, or a rollback that left the connection inside a transaction) and says that a restart is needed. |
-| `snapshot_expired` | 1 | A read was interrupted so that the write-ahead log could be shortened (R127). The read may be run again. |
+| `snapshot_expired` | 1 | A read was interrupted so that the write-ahead log could be shortened (R127), or a snapshot handle was released after 5 s with no call in flight ("Reader snapshots on SQLite"). The read may be run again; after an idle release the caller opens a new snapshot. |
 
 A reused key with another body is `conflict`; an operation the matrix denies is `not_permitted`. Exits 1 to 7
 keep their meanings: 1 general, 2 invalid arguments, 3 not initialized, 4 lock conflict, 5 adapter, 6

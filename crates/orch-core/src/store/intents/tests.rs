@@ -92,3 +92,20 @@ fn a_clock_before_the_epoch_deletes_nothing_and_does_not_overflow() {
     assert_eq!(state.delete_finished(i64::MIN, 10).unwrap(), 0);
     assert!(state.get(1).is_some());
 }
+
+#[test]
+fn a_row_finished_at_the_signed_minimum_is_kept_until_exactly_seven_days() {
+    let mut state = IntentState::default();
+    state.add(&blob(), i64::MIN).unwrap();
+    state.finish(1, i64::MIN).unwrap();
+    for now in [i64::MIN, i64::MIN + DONE_RETENTION_MS - 1] {
+        assert_eq!(state.delete_finished(now, 10).unwrap(), 0);
+        assert!(state.get(1).is_some());
+    }
+    assert_eq!(
+        state
+            .delete_finished(i64::MIN + DONE_RETENTION_MS, 10)
+            .unwrap(),
+        1
+    );
+}

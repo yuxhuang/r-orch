@@ -269,7 +269,7 @@ pub(crate) fn query(
     request: &PageRequest,
     after: Option<&Continuation>,
 ) -> Result<TaskIdPage, Error> {
-    request.validate()?;
+    validate_request(filter, request)?;
     if request.cursor.is_some() {
         return Err(StoreError::InvalidCursor.into());
     }

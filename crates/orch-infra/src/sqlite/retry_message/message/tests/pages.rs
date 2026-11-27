@@ -55,6 +55,10 @@ fn message_pages_order_on_original_created_at_then_position() {
                 .unwrap();
             // The total counts every match, not the remainder after the cursor.
             assert_eq!(page.total, 9);
+            assert!(
+                seen.len() + page.items.len() <= expected.len(),
+                "message cursor did not advance: limit {limit}, seen {seen:?}"
+            );
             seen.extend(page.items.iter().map(|r| id_of(r).to_owned()));
             match (page.has_more, page.items.last()) {
                 (true, Some(last)) => after = Some(last.clone()),

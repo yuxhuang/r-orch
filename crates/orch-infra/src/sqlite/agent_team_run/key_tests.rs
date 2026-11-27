@@ -1,4 +1,3 @@
-
 // Pages that resume after a recorded ordering tuple (D2, plan step 3): the leaf
 // half of the vector P-F2 of the spec's "Cursors of the eight families other
 // than Task", for Agent, Team and Run. The cursor, the held tuple and the
@@ -30,8 +29,16 @@ fn key_run(id: &str, task: &str, agent: &str, attempt: u32, started_at: &str) ->
 fn key_text(text: &str) -> Cow<'static, str> {
     Cow::Owned(text.into())
 }
-fn key_ids(sql: &NativeSql<'_, '_>, filter: &Filter, sort: Sort, after: Option<&OrderKey<'_>>) -> Vec<String> {
-    page_ids(&sql.select_after(selection(filter, sort), after, 1000).unwrap())
+fn key_ids(
+    sql: &NativeSql<'_, '_>,
+    filter: &Filter,
+    sort: Sort,
+    after: Option<&OrderKey<'_>>,
+) -> Vec<String> {
+    page_ids(
+        &sql.select_after(selection(filter, sort), after, 1000)
+            .unwrap(),
+    )
 }
 fn key_all(sql: &NativeSql<'_, '_>, filter: &Filter, sort: Sort) -> Vec<String> {
     page_ids(&sql.select(selection(filter, sort), None, 1000).unwrap())
@@ -108,7 +115,11 @@ fn key_walks_equal_anchor_walks_in_every_order_of_agents_teams_and_runs() {
         (Sort::Id, None, vec!["a", "b", "c", "d"]),
         (Sort::Name, Some("n"), vec!["b", "a", "d"]),
     ] {
-        assert_eq!(key_walk(&sql, &agents, sort, name, None), expected, "{sort:?}");
+        assert_eq!(
+            key_walk(&sql, &agents, sort, name, None),
+            expected,
+            "{sort:?}"
+        );
     }
     let teams = Filter::Teams;
     for (sort, expected) in [
@@ -117,7 +128,11 @@ fn key_walks_equal_anchor_walks_in_every_order_of_agents_teams_and_runs() {
         (Sort::Name, ["t1", "t3", "t4", "t2"]),
         (Sort::Id, ["t1", "t2", "t3", "t4"]),
     ] {
-        assert_eq!(key_walk(&sql, &teams, sort, None, None), expected, "{sort:?}");
+        assert_eq!(
+            key_walk(&sql, &teams, sort, None, None),
+            expected,
+            "{sort:?}"
+        );
     }
     let started = Filter::Runs {
         task: None,
@@ -225,11 +240,18 @@ fn key_resume_from_a_changed_anchor_uses_its_original_tuple() {
         name: key_text("n"),
         id: key_text("b"),
     };
-    assert_eq!(selection(&teams, Sort::Name).key_of(&anchor).unwrap(), tuple);
+    assert_eq!(
+        selection(&teams, Sort::Name).key_of(&anchor).unwrap(),
+        tuple
+    );
     // The anchor is renamed past every other row. The two rows that did not
     // change follow the original tuple, and the anchor is returned at its new place.
-    sql.update(key_team("b", "z", "t"), anchor.revision).unwrap();
-    assert_eq!(key_ids(&sql, &teams, Sort::Name, Some(&tuple)), ["c", "d", "b"]);
+    sql.update(key_team("b", "z", "t"), anchor.revision)
+        .unwrap();
+    assert_eq!(
+        key_ids(&sql, &teams, Sort::Name, Some(&tuple)),
+        ["c", "d", "b"]
+    );
     assert_eq!(key_all(&sql, &teams, Sort::Name), ["a", "c", "d", "b"]);
 }
 
@@ -258,7 +280,11 @@ fn key_resume_from_a_tuple_that_names_no_row_is_by_bytes_not_by_locale() {
         (at("a0", ""), vec!["h", "e"]),
         (at("é", "e"), vec![]),
     ] {
-        assert_eq!(key_ids(&sql, &teams, Sort::Name, Some(&key)), expected, "{key:?}");
+        assert_eq!(
+            key_ids(&sql, &teams, Sort::Name, Some(&key)),
+            expected,
+            "{key:?}"
+        );
     }
     // A run's started_at and attempt descend: the tuple names a place there too.
     for (id, attempt, at) in [("r1", 1, "b"), ("r2", 2, "a"), ("r3", 3, "c")] {
@@ -272,9 +298,18 @@ fn key_resume_from_a_tuple_that_names_no_row_is_by_bytes_not_by_locale() {
         attempt,
         id: key_text(""),
     };
-    assert_eq!(key_ids(&sql, &by_task, Sort::Default, Some(&attempt(u32::MAX))), ["r3", "r2", "r1"]);
-    assert_eq!(key_ids(&sql, &by_task, Sort::Default, Some(&attempt(2))), ["r2", "r1"]);
-    assert_eq!(key_ids(&sql, &by_task, Sort::Default, Some(&attempt(0))), Vec::<String>::new());
+    assert_eq!(
+        key_ids(&sql, &by_task, Sort::Default, Some(&attempt(u32::MAX))),
+        ["r3", "r2", "r1"]
+    );
+    assert_eq!(
+        key_ids(&sql, &by_task, Sort::Default, Some(&attempt(2))),
+        ["r2", "r1"]
+    );
+    assert_eq!(
+        key_ids(&sql, &by_task, Sort::Default, Some(&attempt(0))),
+        Vec::<String>::new()
+    );
     let all = Filter::Runs {
         task: None,
         agent: None,
@@ -283,9 +318,18 @@ fn key_resume_from_a_tuple_that_names_no_row_is_by_bytes_not_by_locale() {
         started_at: key_text(at),
         id: key_text(""),
     };
-    assert_eq!(key_ids(&sql, &all, Sort::Default, Some(&started("d"))), ["r3", "r1", "r2"]);
-    assert_eq!(key_ids(&sql, &all, Sort::Default, Some(&started("b"))), ["r1", "r2"]);
-    assert_eq!(key_ids(&sql, &all, Sort::Default, Some(&started("A"))), Vec::<String>::new());
+    assert_eq!(
+        key_ids(&sql, &all, Sort::Default, Some(&started("d"))),
+        ["r3", "r1", "r2"]
+    );
+    assert_eq!(
+        key_ids(&sql, &all, Sort::Default, Some(&started("b"))),
+        ["r1", "r2"]
+    );
+    assert_eq!(
+        key_ids(&sql, &all, Sort::Default, Some(&started("A"))),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -310,7 +354,11 @@ fn key_identity_order_is_bytes_not_characters() {
         ("é", vec![]),
     ] {
         let key = OrderKey::Id(key_text(at));
-        assert_eq!(key_ids(&sql, &agents, Sort::Id, Some(&key)), expected, "{at}");
+        assert_eq!(
+            key_ids(&sql, &agents, Sort::Id, Some(&key)),
+            expected,
+            "{at}"
+        );
     }
 }
 
@@ -336,27 +384,39 @@ fn key_resume_does_not_check_the_filter_so_an_anchor_that_left_it_still_names_it
         task: None,
         agent: Some("a".into()),
     };
-    let first = sql.select(selection(&filter, Sort::Default), None, 2).unwrap();
+    let first = sql
+        .select(selection(&filter, Sort::Default), None, 2)
+        .unwrap();
     assert_eq!(page_ids(&first), ["r1", "r2"]);
     let anchor = first.items.last().unwrap().clone();
     let tuple = OrderKey::RunStarted {
         started_at: key_text("s4"),
         id: key_text("r2"),
     };
-    assert_eq!(selection(&filter, Sort::Default).key_of(&anchor).unwrap(), tuple);
+    assert_eq!(
+        selection(&filter, Sort::Default).key_of(&anchor).unwrap(),
+        tuple
+    );
     // Changed to another agent: it leaves the filter and keeps its ordering values.
-    let moved = sql.update(key_run("r2", "k", "other", 1, "s4"), anchor.revision).unwrap();
+    let moved = sql
+        .update(key_run("r2", "k", "other", 1, "s4"), anchor.revision)
+        .unwrap();
     assert!(matches!(
         sql.select(selection(&filter, Sort::Default), Some(&moved), 10),
         Err(NativeError::Store(StoreError::InvalidCursor))
     ));
-    let rest = sql.select_after(selection(&filter, Sort::Default), Some(&tuple), 10).unwrap();
+    let rest = sql
+        .select_after(selection(&filter, Sort::Default), Some(&tuple), 10)
+        .unwrap();
     assert_eq!(page_ids(&rest), ["r4", "r5"]);
     // The total counts what matches now, before the cursor.
     assert_eq!((rest.total, rest.has_more), (3, false));
     // Deleted: no record is left, and the result does not change.
     sql.delete(Family::Run, "r2", moved.revision).unwrap();
-    assert_eq!(key_ids(&sql, &filter, Sort::Default, Some(&tuple)), ["r4", "r5"]);
+    assert_eq!(
+        key_ids(&sql, &filter, Sort::Default, Some(&tuple)),
+        ["r4", "r5"]
+    );
     // An agent, a team member and a name filter are no different.
     let agents = Filter::Agents;
     for (id, name) in [("a1", "n"), ("a2", "n"), ("a3", "n")] {
@@ -368,14 +428,25 @@ fn key_resume_does_not_check_the_filter_so_an_anchor_that_left_it_still_names_it
         name,
         member: None,
     };
-    let anchor = sql.select(by_name(Some("n")), None, 1).unwrap().items.remove(0);
+    let anchor = sql
+        .select(by_name(Some("n")), None, 1)
+        .unwrap()
+        .items
+        .remove(0);
     let tuple = OrderKey::AgentPosition {
         position: anchor.position,
         id: key_text("a1"),
     };
     assert_eq!(by_name(Some("n")).key_of(&anchor).unwrap(), tuple);
-    sql.update(key_agent("a1", "renamed"), anchor.revision).unwrap();
-    assert_eq!(page_ids(&sql.select_after(by_name(Some("n")), Some(&tuple), 10).unwrap()), ["a2", "a3"]);
+    sql.update(key_agent("a1", "renamed"), anchor.revision)
+        .unwrap();
+    assert_eq!(
+        page_ids(
+            &sql.select_after(by_name(Some("n")), Some(&tuple), 10)
+                .unwrap()
+        ),
+        ["a2", "a3"]
+    );
     let with_member = |id: &str, member: &str| {
         let Entity::Team(mut t) = key_team(id, "n", "t") else {
             unreachable!()
@@ -399,7 +470,8 @@ fn key_resume_does_not_check_the_filter_so_an_anchor_that_left_it_still_names_it
     };
     let tuple = OrderKey::Id(key_text("t2"));
     assert_eq!(by_member().key_of(&records[1]).unwrap(), tuple);
-    sql.update(with_member("t2", "m2"), records[1].revision).unwrap();
+    sql.update(with_member("t2", "m2"), records[1].revision)
+        .unwrap();
     assert_eq!(
         page_ids(&sql.select_after(by_member(), Some(&tuple), 10).unwrap()),
         ["t3"]
@@ -484,7 +556,11 @@ fn key_resume_refuses_a_tuple_of_another_shape_and_validates_limit_and_selection
     }
     for limit in [0, 1001] {
         assert!(matches!(
-            sql.select_after(selection(&Filter::Agents, Sort::Default), Some(&team_name), limit),
+            sql.select_after(
+                selection(&Filter::Agents, Sort::Default),
+                Some(&team_name),
+                limit
+            ),
             Err(NativeError::Store(StoreError::InvalidPage(_)))
         ));
     }

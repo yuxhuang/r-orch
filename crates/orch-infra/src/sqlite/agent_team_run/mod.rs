@@ -2023,6 +2023,45 @@ mod tests {
             Err(NativeError::Aborted)
         ));
         assert!(tx.is_autocommit());
+
+        // Keep the transaction-ended guard false so only poison can refuse this write.
+        tx.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(!tx.is_autocommit());
+        let result = sql.create(Entity::Team(Box::new(team())));
+        let rows: i64 = tx
+            .query_row("SELECT COUNT(*) FROM teams", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            matches!(result, Err(NativeError::Aborted)) && rows == 0,
+            "poisoned helper must refuse without writing: result={result:?}, rows={rows}"
+        );
+    }
+
+    #[test]
+    fn native_unpoisoned_helper_after_transaction_end_refuses_mutation_without_rows() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        sql.create(Entity::Agent(Box::new(agent()))).unwrap();
+
+        // The fresh helper after rollback has never observed a failing operation.
+        tx.execute_batch("ROLLBACK").unwrap();
+        assert!(tx.is_autocommit());
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let result = sql.create(Entity::Team(Box::new(team())));
+        let rows: i64 = tx
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM teams)+(SELECT COUNT(*) FROM agents)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            matches!(result, Err(NativeError::Aborted)) && rows == 0,
+            "ended transaction must refuse without writing: result={result:?}, rows={rows}"
+        );
     }
 
     #[test]
@@ -3058,58 +3097,7 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
             };
             // Stored keys are locators, not original IDs: form 1's key can be
             // equal to a form 0 ID. Never feed a digest into get as an ID.
-            let candidate = (|| {
-                let detail = self.detail_key(
-                    family,
-                    "",
-                    vec![
-                        SqlValue::Text(self.project.into()),
-                        SqlValue::Integer(form),
-                        SqlValue::Text(stored.clone()),
-                    ],
-                )?;
-                let entity = match family {
-                    Family::Agent => {
-                        decode_agent(self.disk, &detail).map(|v| Entity::Agent(Box::new(v)))
-                    }
-                    Family::Team => {
-                        decode_team(self.disk, &detail).map(|v| Entity::Team(Box::new(v)))
-                    }
-                    Family::Run => decode_run(self.disk, &detail).map(|v| Entity::Run(Box::new(v))),
-                }
-                .map_err(|e| format_error(family, "", e, false))?;
-                if key(entity.id()) != (form, stored.clone()) {
-                    return Err(native_corrupt(
-                        family,
-                        entity.id(),
-                        "identity projection",
-                        "id",
-                    ));
-                }
-                self.get(family, entity.id())?.ok_or_else(|| {
-                    native_corrupt(family, entity.id(), "selected row missing", "id")
-                })
-            })()
-            .map_err(|error| match error {
-                NativeError::Corrupt {
-                    family,
-                    check,
-                    locator,
-                    ..
-                } => NativeError::Corrupt {
-                    family,
-                    form,
-                    check,
-                    locator,
-                },
-                NativeError::Sql(rusqlite::Error::Utf8Error(..)) => NativeError::Corrupt {
-                    family: family.name(),
-                    form,
-                    check: "text encoding",
-                    locator: "native/detail/ref".into(),
-                },
-                other => other,
-            })?;
+            let candidate = self.read_stored(family, form, &stored)?;
             if query.matches(&candidate) {
                 records.push(candidate);
             }
@@ -3129,6 +3117,65 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
             items,
             total,
             has_more,
+        })
+    }
+
+    /// Fully checked row by its native locator, for the same-view unfiltered
+    /// cursor lookup. A form-one digest is never interpreted as an original ID.
+    pub(super) fn read_stored(
+        &self,
+        family: Family,
+        form: i64,
+        stored: &str,
+    ) -> NativeResult<Record> {
+        (|| {
+            let detail = self.detail_key(
+                family,
+                "",
+                vec![
+                    SqlValue::Text(self.project.into()),
+                    SqlValue::Integer(form),
+                    SqlValue::Text(stored.to_owned()),
+                ],
+            )?;
+            let entity = match family {
+                Family::Agent => {
+                    decode_agent(self.disk, &detail).map(|v| Entity::Agent(Box::new(v)))
+                }
+                Family::Team => decode_team(self.disk, &detail).map(|v| Entity::Team(Box::new(v))),
+                Family::Run => decode_run(self.disk, &detail).map(|v| Entity::Run(Box::new(v))),
+            }
+            .map_err(|e| format_error(family, "", e, false))?;
+            if key(entity.id()) != (form, stored.to_owned()) {
+                return Err(native_corrupt(
+                    family,
+                    entity.id(),
+                    "identity projection",
+                    "id",
+                ));
+            }
+            self.get(family, entity.id())?
+                .ok_or_else(|| native_corrupt(family, entity.id(), "selected row missing", "id"))
+        })()
+        .map_err(|error| match error {
+            NativeError::Corrupt {
+                family,
+                check,
+                locator,
+                ..
+            } => NativeError::Corrupt {
+                family,
+                form,
+                check,
+                locator,
+            },
+            NativeError::Sql(rusqlite::Error::Utf8Error(..)) => NativeError::Corrupt {
+                family: family.name(),
+                form,
+                check: "text encoding",
+                locator: "native/detail/ref".into(),
+            },
+            other => other,
         })
     }
 

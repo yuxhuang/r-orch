@@ -53,6 +53,15 @@ impl<'a> ReadPool<'a> {
         })
     }
 
+    // Install test SQL hooks before the owned workers borrow the pool. The
+    // production path exposes neither mutable connections nor hook callbacks.
+    #[cfg(test)]
+    pub(super) fn configure_test_readers(&self, setup: impl Fn(&mut rusqlite::Connection)) {
+        for connection in self.free.lock().unwrap().iter_mut().flatten() {
+            setup(connection.for_migration());
+        }
+    }
+
     /// The state this pool reports to. A callback captures it to report what it catches.
     pub fn failure_state(&self) -> &FailureState {
         &self.state

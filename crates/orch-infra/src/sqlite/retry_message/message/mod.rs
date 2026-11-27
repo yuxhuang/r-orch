@@ -11,7 +11,7 @@
 //! snapshot, before they are filtered, ordered, counted or cut.
 //!
 //! The helpers borrow the caller's connection or writer transaction, never
-//! commit it, and are not the Send-bound `UnitOfWork` facade. No clock is read:
+//! commit it, and are not the borrowed `UnitOfWork` facade. No clock is read:
 //! the time a blob registration is stamped is supplied by the caller, and so is
 //! `now` of `Filter::PendingMessages`.
 use std::borrow::Cow;
@@ -384,7 +384,7 @@ impl<'a> MessageReader<'a> {
 
     /// One hydrated, fully checked message by its stored key, or `None` when
     /// no row has the key.
-    fn read(&self, form: i64, stored: &str) -> Result<Option<Record>> {
+    pub(in crate::sqlite) fn read(&self, form: i64, stored: &str) -> Result<Option<Record>> {
         let mut names = columns();
         names.extend(["revision".into(), "position".into()]);
         let rows = self

@@ -797,6 +797,25 @@ mod tests {
             0,
         ));
     }
+    // #384: Team Name and Default share a binding and two-text shape.
+    #[test]
+    fn team_held_cursor_rejects_another_sort_with_the_same_tuple_shape() {
+        let (c, _) = clock();
+        let f = Filter::Teams;
+        for size in [300, 70_000] {
+            let tuple = make(&f, Sort::Name, &[&id(size), "anchor"]);
+            let db = database();
+            put(&db, "p", &f, &tuple);
+            let token = issue(&c, &f, Sort::Name, &tuple);
+            assert_eq!(read(&c, &token, &f, Sort::Name, &db).unwrap(), tuple);
+            // Change only the public header: the stored sort must still bind it.
+            let mut raw = unhex(token.as_str()).unwrap();
+            raw[1] = NonTaskCursors::sort_tag(Sort::Default).unwrap();
+            let edited = Cursor::new(hex(&raw)).unwrap();
+            refused(read(&c, &edited, &f, Sort::Default, &db));
+        }
+    }
+
     #[test]
     fn invalid_token_checks_precede_clock_table_and_database_access() {
         let c =

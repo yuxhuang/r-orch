@@ -925,7 +925,12 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
     }
 
     /// Hydrate one row by its stored key, or `None` when no row has it.
-    fn row(&self, family: Family, form: i64, stored: &str) -> NativeResult<Option<Record>> {
+    pub(super) fn row(
+        &self,
+        family: Family,
+        form: i64,
+        stored: &str,
+    ) -> NativeResult<Option<Record>> {
         self.row_inner(family, form, stored)
             .map_err(|error| match error {
                 NativeError::Sql(rusqlite::Error::Utf8Error(..)) => {
