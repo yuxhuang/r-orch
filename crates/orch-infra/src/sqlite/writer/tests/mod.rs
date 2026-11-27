@@ -1711,4 +1711,51 @@ fn a_known_commit_breaks_the_writer_ioerr_streak_between_requests() {
     assert!(state.failure().is_none());
 }
 
+// Issue 448. One retained producer is the supported cardinality: the Events lane
+// admits one queued entry and the executor has one continuation slot. A second
+// retained write that rebuilds while the slot is taken is refused `Overloaded`
+// with its episode kept live (the producer may resubmit); it is neither queued
+// behind the claims its retry suppresses nor a failure of the database.
+#[test]
+fn a_second_retained_rebuild_is_refused_until_the_continuation_slot_is_taken() {
+    let (_temp, data) = test_data();
+    let state = FailureState::new();
+    let (writer, handle) =
+        Writer::open_with_state(&data, Synchronous::Normal, 8, state.clone()).unwrap();
+    // Both episodes failed at the same instant: each must stay its own episode.
+    let now = Instant::now();
+    let first = Episode::new(state.clone(), None);
+    let second = Episode::new(state.clone(), None);
+    first.failed(RetryCode::Busy, now).unwrap();
+    second.failed(RetryCode::Busy, now).unwrap();
+    let held = handle
+        .submit_episode(Lane::Events, first.clone(), |_| Ok(1), || {})
+        .unwrap();
+    let refused = handle.submit_episode(Lane::Events, second.clone(), |_| Ok(2), || {});
+    assert!(matches!(refused, Err(SqliteError::Overloaded)));
+    assert!(
+        state.failure().is_none(),
+        "contention is not a database failure"
+    );
+    assert!(second.retrying(), "the refused episode stays live");
+    assert!(state.claims_suppressed());
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| writer.run());
+        let _close = CloseOnDrop(&handle);
+        assert_eq!(held.wait_bounded().unwrap(), 1);
+        // The first episode ended with its commit; the other one is untouched.
+        assert!(!first.retrying());
+        assert!(second.retrying(), "an episode ended another's registration");
+        assert!(state.claims_suppressed());
+        let resubmitted = handle
+            .submit_episode(Lane::Events, second.clone(), |_| Ok(2), || {})
+            .unwrap();
+        assert_eq!(resubmitted.wait_bounded().unwrap(), 2);
+        assert!(!second.retrying());
+        assert!(!state.claims_suppressed());
+        handle.close();
+        worker.join().unwrap();
+    });
+}
+
 mod retained_bounds;

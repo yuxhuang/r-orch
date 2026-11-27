@@ -507,7 +507,23 @@ impl Snapshot {
             mpsc::TrySendError::Full(_) => backend("overloaded"),
             mpsc::TrySendError::Disconnected(_) => backend("snapshot_expired"),
         })?;
-        answer.await.map_err(|_| backend("snapshot_expired"))?
+        match answer.await {
+            Ok(result) => result,
+            Err(_) => Err(self.dropped()),
+        }
+    }
+    /// The answer of an admitted call whose job was dropped unanswered because
+    /// the worker left the snapshot with it still queued. A fatal result is
+    /// classified and its connection retired before the worker drops the
+    /// channel, so a fatal observation since the snapshot was requested is
+    /// visible here and every sibling answers as the failing call did (spec,
+    /// "A pooled read after a writer latch"). Otherwise the view only ended (idle
+    /// or checkpoint expiry, or close). A call made after the view ended is
+    /// refused at `try_send` and always answers `snapshot_expired`.
+    fn dropped(&self) -> StoreError {
+        port(self.owner.shared.refuse_fresh_fatal(self.observed))
+            .err()
+            .unwrap_or_else(|| backend("snapshot_expired"))
     }
 }
 fn read_worker(
