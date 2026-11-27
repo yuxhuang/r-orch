@@ -993,6 +993,9 @@ impl Drain {
                         let error = attempt.result.err().unwrap_or_else(|| {
                             backend("unknown noncommit had no original failure")
                         });
+                        if self.storage.failure_state().failure().is_some() {
+                            return self.fail_all(&error, None);
+                        }
                         return self.fail_plan(&plan, &error, alone);
                     }
                     Reconciled::Stuck(error) => return self.fail_all(&error, Some(&plan)),
