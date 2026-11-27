@@ -12,7 +12,9 @@ fn family(kind: EntityKind) -> Option<Family> {
         EntityKind::Team => Family::Team,
         EntityKind::Run => Family::Run,
         EntityKind::Message => Family::Message,
-        _ => return None,
+        EntityKind::Context | EntityKind::Config | EntityKind::Template | EntityKind::Goal => {
+            return None;
+        }
     })
 }
 fn native_family(kind: EntityKind) -> cctg::Family {
@@ -20,7 +22,12 @@ fn native_family(kind: EntityKind) -> cctg::Family {
         EntityKind::Context => cctg::Family::Context,
         EntityKind::Config => cctg::Family::Config,
         EntityKind::Template => cctg::Family::Template,
-        _ => cctg::Family::Goal,
+        EntityKind::Goal => cctg::Family::Goal,
+        EntityKind::Task
+        | EntityKind::Agent
+        | EntityKind::Team
+        | EntityKind::Run
+        | EntityKind::Message => unreachable!("router kind handled before native dispatch"),
     }
 }
 enum RoutedEntity {

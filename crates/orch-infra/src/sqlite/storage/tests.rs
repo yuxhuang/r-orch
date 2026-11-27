@@ -281,3 +281,147 @@ async fn a_queued_snapshot_is_refused_at_admission_deadline() {
     );
     storage.close().await.unwrap();
 }
+
+// Exercise the real admission and worker path while supplying deterministic
+// adapter jobs, without test hooks in the production worker.
+async fn worker_snapshot(storage: &SqliteStorage) -> Snapshot {
+    let (commands, receiver) = mpsc::sync_channel(16);
+    let (ready, answer) = oneshot::channel();
+    storage
+        .owner
+        .reads
+        .try_send(OpenRead {
+            caller: owner(),
+            deadline: Instant::now() + Duration::from_secs(2),
+            commands: receiver,
+            ready,
+        })
+        .unwrap_or_else(|_| panic!("test admission"));
+    answer.await.unwrap().unwrap();
+    Snapshot {
+        owner: storage.owner.clone(),
+        caller: owner(),
+        commands,
+        capacity: Arc::new(Semaphore::new(16)),
+    }
+}
+
+#[tokio::test]
+async fn reader_operation_panic_retires_view_without_losing_worker() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            read_connections: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let snapshot = worker_snapshot(&storage).await;
+    let error = snapshot
+        .call::<()>(|_| panic!("synthetic reader panic"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("reader operation panicked"),
+        "{error}"
+    );
+    assert!(snapshot.get(EntityKind::Team, "absent").await.is_err());
+    let next = storage.read(owner()).await.unwrap();
+    assert!(
+        next.get(EntityKind::Team, "absent")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(storage.failure_state().failure().is_none());
+    drop(next);
+    storage.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn forty_snapshot_calls_wait_for_bounded_capacity() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(Arc::new(data), StorageOptions::default()).unwrap();
+    let snapshot = Arc::new(worker_snapshot(&storage).await);
+    let (release, blocked) = mpsc::sync_channel(1);
+    let (entered, started) = oneshot::channel();
+    let first = snapshot.clone();
+    let blocker = tokio::spawn(async move {
+        first
+            .call(move |_| {
+                let _ = entered.send(());
+                blocked.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    started.await.unwrap();
+    let mut calls = Vec::new();
+    for _ in 0..40 {
+        let snapshot = snapshot.clone();
+        calls.push(tokio::spawn(async move {
+            snapshot.get(EntityKind::Config, "absent").await
+        }));
+        tokio::task::yield_now().await;
+    }
+    // The runtime remained able to poll this task while the bounded queue was full.
+    release.send(()).unwrap();
+    blocker.await.unwrap().unwrap();
+    let mut failures = Vec::new();
+    for call in calls {
+        if let Err(e) = call.await.unwrap() {
+            failures.push(e.to_string());
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+    storage.close().await.unwrap();
+}
+
+fn corrupt_error() -> SqliteError {
+    SqliteError::Sql(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+        None,
+    ))
+}
+#[tokio::test]
+async fn first_fatal_read_replies_unavailable_after_observation() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(Arc::new(data), StorageOptions::default()).unwrap();
+    let snapshot = worker_snapshot(&storage).await;
+    let error = snapshot
+        .call::<()>(|_| Err(corrupt_error()))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("storage_unavailable"), "{error}");
+    let failure = storage.failure_state().failure().unwrap();
+    assert_eq!(failure.source, FailureSource::Reader);
+    assert_eq!(
+        failure.causes,
+        vec![(
+            super::super::Role::Operation,
+            super::super::FatalCause::SqliteCorrupt
+        )]
+    );
+    storage.close().await.unwrap();
+}
+#[tokio::test]
+async fn fatal_observation_during_successful_read_prevents_reply() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(Arc::new(data), StorageOptions::default()).unwrap();
+    let snapshot = worker_snapshot(&storage).await;
+    let state = storage.failure_state();
+    let error = snapshot
+        .call(move |_| {
+            // Another connection publishes the fatal observation after admission,
+            // before this successful operation can expose its value.
+            std::thread::spawn(move || state.observe(FailureSource::Writer, &corrupt_error()))
+                .join()
+                .unwrap();
+            Ok("must not escape")
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("storage_unavailable"), "{error}");
+    storage.close().await.unwrap();
+}

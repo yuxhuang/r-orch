@@ -30,7 +30,7 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 use view::{ReadView, Unit};
 
 /// Construction inputs, supplied by the daemon after acquiring its data lock.
@@ -108,7 +108,8 @@ impl Drop for Owner {
 }
 
 /// Owned entry point. Neither connection nor transaction crosses its worker
-/// boundary; snapshots and cloned storage handles retain the data-directory owner.
+/// boundary. The last storage client stops the workers even if snapshots remain.
+/// External `Arc<DataDir>` clones retain their own directory lock ownership.
 #[derive(Clone)]
 pub struct SqliteStorage {
     owner: Arc<Owner>,
@@ -227,7 +228,8 @@ impl SqliteStorage {
         self.owner.shared.state.clone()
     }
     /// Stop admission, interrupt readers, drain admitted writes and join every
-    /// worker off the runtime. Safe even when other handles still exist.
+    /// worker off the runtime. Safe even when other handles still exist. External
+    /// `Arc<DataDir>` clones must also be dropped to release the directory lock.
     pub async fn close(&self) -> store::Result<()> {
         self.owner.stop();
         let owner = self.owner.clone();
@@ -261,6 +263,12 @@ fn port<T>(result: Result<T>) -> store::Result<T> {
         _ => backend("SQLite storage operation failed"),
     })
 }
+// A fatal observation must be visible in the first public reply too. Keep the
+// original SQLite error on the worker/pool path for classification and retirement.
+fn public_result<T>(state: &FailureState, result: store::Result<T>) -> store::Result<T> {
+    port(state.ensure_available())?;
+    result
+}
 type ReadJob = Box<dyn FnOnce(&ReadView<'_, '_>) -> Result<()> + Send>;
 struct OpenRead {
     caller: Caller,
@@ -272,6 +280,7 @@ struct Snapshot {
     owner: Arc<Owner>,
     caller: Caller,
     commands: mpsc::SyncSender<ReadJob>,
+    capacity: Arc<Semaphore>,
 }
 impl Snapshot {
     async fn call<T: Send + 'static>(
@@ -279,9 +288,29 @@ impl Snapshot {
         f: impl FnOnce(&ReadView<'_, '_>) -> Result<T> + Send + 'static,
     ) -> store::Result<T> {
         port(self.owner.shared.available())?;
+        // Bound queued/running jobs without blocking an async caller. Recheck
+        // stop/fatal state after waiting: admission may have closed meanwhile.
+        let capacity = self
+            .capacity
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| backend("snapshot_expired"))?;
+        port(self.owner.shared.available())?;
         let (reply, answer) = oneshot::channel();
         let job: ReadJob = Box::new(move |view| {
-            let result = view.observed(f(view));
+            let _capacity = capacity;
+            // Only the reader operation is contained. An adapter panic retires
+            // this view, but is not evidence of database corruption (R140).
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(view))) {
+                Ok(result) => view.observed(result),
+                Err(_) => {
+                    let _ = reply.send(Err(backend("SQLite reader operation panicked")));
+                    return Err(SqliteError::Store(backend(
+                        "SQLite reader operation panicked",
+                    )));
+                }
+            };
             let result = result.and_then(|value| {
                 view.shared.state.ensure_available()?;
                 Ok(value)
@@ -292,17 +321,20 @@ impl Snapshot {
                     Ok(())
                 }
                 Err(SqliteError::Store(error)) => {
-                    let _ = reply.send(Err(error));
+                    let _ = reply.send(public_result(&view.shared.state, Err(error)));
                     Ok(())
                 }
                 Err(error) => {
-                    let _ = reply.send(Err(backend("SQLite storage operation failed")));
+                    let _ = reply.send(public_result(
+                        &view.shared.state,
+                        Err(backend("SQLite storage operation failed")),
+                    ));
                     Err(error)
                 }
             }
         });
         self.commands.try_send(job).map_err(|e| match e {
-            mpsc::TrySendError::Full(_) => backend("snapshot call queue is full"),
+            mpsc::TrySendError::Full(_) => backend("overloaded"),
             mpsc::TrySendError::Disconnected(_) => backend("snapshot_expired"),
         })?;
         answer.await.map_err(|_| backend("snapshot_expired"))?
@@ -330,6 +362,15 @@ fn read_worker(
             commands,
             ready,
         } = request;
+        // Cancellation and stale admission must not enter the pool, pin a
+        // snapshot, or retire a healthy connection at an overloaded boundary.
+        if ready.is_closed() {
+            continue;
+        }
+        if Instant::now() >= deadline {
+            let _ = ready.send(Err(SqliteError::Overloaded));
+            continue;
+        }
         let mut ready = Some(ready);
         let result = pool.read(deadline, |tx| {
             shared.available()?;
@@ -401,7 +442,7 @@ impl Storage for SqliteStorage {
         self.owner
             .reads
             .try_send(request)
-            .map_err(|_| backend("SQLite read admission overloaded"))?;
+            .map_err(|_| backend("overloaded"))?;
         let answer = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), answer)
             .await
             .map_err(|_| backend("overloaded"))?;
@@ -410,6 +451,7 @@ impl Storage for SqliteStorage {
             owner: self.owner.clone(),
             caller,
             commands,
+            capacity: Arc::new(Semaphore::new(16)),
         }))
     }
     async fn write(&self, caller: Caller, lane: store::Lane, work: WriteWork) -> store::Result<()> {
@@ -456,6 +498,6 @@ impl Storage for SqliteStorage {
         {
             std::panic::resume_unwind(payload);
         }
-        port(result)
+        public_result(&self.owner.shared.state, port(result))
     }
 }
