@@ -1569,8 +1569,30 @@ PR 323, PR 324 and PR 326 as the way the work lands, this note supersedes the la
   spec's "Gate lines" table.
 - The conformance suite runs on the file adapter from T2 and on both adapters from T10 to the end. Engine and
   daemon tests added by this stack run on both adapters until T25.
-- Crash points: T10's `sqlite_crash` stops a child process between statements and at commit; T12 and T13 inject
-  a stop before and after every statement of each multi-entity operation and assert all-or-nothing on SQLite.
+- Crash points (process kill; issue 149). T10's two crash test files each start a child process that reaches a
+  boundary, sends one marker byte over a private socket pair and blocks; the parent waits for that marker, requires
+  the expected one, sends `SIGKILL`, requires the child's status to be signal 9, reopens the data directory and
+  compares the complete rows. `sqlite_crash` does this to the production writer with two tables: (S) between two
+  statements, (B) with both statements run and the callback not yet returned to the writer's commit (both before
+  `COMMIT`, so nothing survives), and (C) after the successful receipt, which the writer sends only after its commit
+  returned (both rows survive). `sqlite_storage_crash` does it through the public `Storage::write` with a config
+  and a template: (S) the config is created, the template is not and the callback is blocked; (B) both are created
+  and the callback has not returned; neither family survives either. (C) is a successful receipt and both records
+  survive; (N) is a following write that has created both of its records and has not returned, and only the earlier
+  receipted records survive. The marker shows that the child reached the phase. The signal rules out a normal exit.
+  Neither shows that the transaction was still active at the instant of the kill: the child's wait for the release
+  is 10 seconds, so a parent delayed past it lets the callback start unwinding before the signal arrives, and the
+  parent's marker wait is bounded by the same 10 seconds. Not verified, and no case claims them: an interruption
+  inside SQLite's `COMMIT` call and a power loss (with `synchronous = FULL`, hardware or file system recovery).
+  T12 and T13 inject a stop before and after every statement of each multi-entity operation and assert
+  all-or-nothing on SQLite.
+- Sensitivity of the crash cases to timing. A deliberately premature receipt was caught in 31 of 31 macOS trials.
+  That is history, recorded from issue 149; further macOS timing and recovery measurements are issue 181 in the
+  After 2.0 milestone, and none of it is a release gate. On Linux, at `24c40bcf4`, one development measurement exists: a
+  temporary change to the writer alone made it send its receipt from inside the callback, before `COMMIT`, with no
+  added delay, and the public case (C), `public_kill_after_receipt_preserves_both_families`, failed in 31 of 31
+  separate runs at its complete-reopened-records check (exit status 101 each; the change is not in the tree). It is
+  a timing-dependent sample from one host. It does not guarantee that every premature receipt is caught.
 - The lanes' order is tested with a fake clock (T10). Their budgets are only measured, under load: by T4
   against the first budget, by T4b against the revised one, and by T16 on the path that ships. Every counted
   repetition of T4b and T16 holds checkpoints by the production rule. A green suite is not a performance
