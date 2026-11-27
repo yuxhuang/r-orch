@@ -1270,19 +1270,24 @@ PR 323, PR 324 and PR 326 as the way the work lands, this note supersedes the la
   request. With the latch set and the transaction ended by SQLite (a `RAISE(ROLLBACK)` trigger), the answer is
   `storage_unavailable` and not `TransactionAborted`, and a write made after the latch is not durable. A callback
   panic is not mapped.
-- The callback boundary (spec Amendment 3, record N; issue 149): five cases, each kept apart, none standing for another.
+- The callback boundary (spec Amendment 3, records N and O; issue 149): five cases, each kept apart, none standing for
+  another.
   (1) A callback that panics: rolled back, the panic resumed on the caller, nothing latched, and the worker serves the
-  queued request and the next write (A3-W2). (2) A leaf whose savepoint cleanup fails with no fatal cause: the worker
-  ends, the running and the queued receipt are `WriterClosed`, nothing is latched and a later submission is refused
-  (A3-W7). (3) The same with `SQLITE_CORRUPT` or `SQLITE_NOTADB` on the operation's side, which a successful outer
-  rollback would not have shown, and with a fatal result on the cleanup's side: the cause is latched before the unwind
-  is raised again, and the receipts are `storage_unavailable` (A3-W8). (4) A callback panic with a refused outer
+  queued request and the next write (A3-W2). (2) A leaf whose savepoint cleanup fails with no fatal cause, the
+  operation's cause being ordinary too (the ordinary pair, decided by record O): the worker ends, the running and the
+  queued receipt are `WriterClosed`, nothing is latched and a later submission is refused (A3-W7). (3) The same with
+  `SQLITE_CORRUPT` or `SQLITE_NOTADB` on the operation's side, which a successful outer rollback would not have shown,
+  and with a fatal result on the cleanup's side (the other side ordinary in each case): the cause is latched before the
+  unwind is raised again, and the receipts are `storage_unavailable` (A3-W8). (4) A callback panic with a refused outer
   rollback: the payload reaches the caller, the `RollbackLeftTransactionOpen` latch is set and the worker ends (A3-W9).
   (5) A panic of the adapter's own code outside the callback (A3-W10). Issue 149 carries (1) to (4) separately on the
-  combined adapter, and each ends with a reopen that shows no row of the failed request (for (1),
-  none of the panicking callback; the queued request's row is present). A real `SQLITE_CORRUPT` on the cleanup statement
-  itself cannot be produced through SQL while `rusqlite`'s `functions` feature is off, so the draft injects that one
-  directly at the leaf's cleanup call; the operation-side corruption is a damaged page.
+  combined adapter, and each ends with a reopen that shows no row of the failed request (for (1), none of the panicking
+  callback; the queued request's row is present). Case (2), the ordinary pair, and its reopen are evidence that issue 149
+  owes through `Storage::write`: the receipts are `WriterClosed`, no cause is in the failure state, a later submission is
+  refused, and after reopening on the same data directory neither request's rows are present and a new write commits.
+  A real `SQLITE_CORRUPT` on the cleanup statement itself cannot be produced through SQL while `rusqlite`'s `functions`
+  feature is off, so the draft injects that one directly at the leaf's cleanup call; the operation-side corruption is a
+  damaged page.
 - Other connections (spec R137, R140): a result is injected at the checkpoint, read, query and backup
   connections in turn. Corruption fails the writer from each; other failures are counted and reported at
   their thresholds and do not fail it; each outcome of a checkpoint call is produced from injected counts,

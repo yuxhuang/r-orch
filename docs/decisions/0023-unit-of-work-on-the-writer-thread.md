@@ -66,8 +66,9 @@ Facts read from `main` at `075f2b124`:
    success run outside it, and a panic there is a panic of adapter code that is not contained. A leaf of the adapter
    whose savepoint cleanup fails raises a typed unwind (`CleanupUnwind`) that is not contained either: it is observed
    under record L, so that a fatal cause latches even when the outer rollback would succeed, and raised again, and
-   `Writer::run` ends the worker. The running and the queued requests are then answered `storage_unavailable` when a
-   cause is latched and `WriterClosed` otherwise. If a callback panics and the outer rollback then fails, the payload
+   `Writer::run` ends the worker. Classification is by cause (record O, 2026-11-27): the operation's cause and the
+   cleanup's are observed separately. When both are ordinary the running and the queued requests are answered
+   `WriterClosed` and nothing is latched; when either is fatal it latches and they are answered `storage_unavailable`. If a callback panics and the outer rollback then fails, the payload
    stays in the error and reaches the caller. The spec's "Amendment 3" states the consequences.
 6. **Proof is an obligation of the SQLite adapter's PR.** It must show decisions 2 to 5 with named tests: the vectors
    A3-W2, A3-W3 and A3-W6 of the spec, and A3-W7 to A3-W10 for the scope of the catch and the typed unwind in

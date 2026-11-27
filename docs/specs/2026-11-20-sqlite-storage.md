@@ -221,6 +221,15 @@ written. Record N also records the owner's approval of the reader's snapshot wor
 snapshots on SQLite" under "Writer lanes", which lands with the reader's PR. No independent review had read this revision
 when it was written.
 
+The revision that carries this paragraph records the owner's ruling of 2026-11-27 on a leaf's failed cleanup (record O,
+"F2") and changes nothing else. It settles the case that record N held open: the operation's cause and the cleanup's
+cause are classified separately; when both are ordinary the worker ends, the receipts are `WriterClosed` and nothing
+is latched; when either is fatal the cause latches and the receipts are `storage_unavailable` ("Amendment 3: the unit of
+work stays on the writer's thread" under "Storage port v2", with the vectors A3-W7 and A3-W8; "A failed top-level
+rollback" under "Writer lanes"). It adds no `FatalCause` variant and changes no class, time or retry rule of R128, no
+cursor text and no read bound; record L stands as written. No independent review had read this revision when it was
+written.
+
 ## Source
 
 Verbatim excerpts of the owner's request as recorded in the goal "orch 2.0 phase 1: SQLite storage (release
@@ -1246,15 +1255,24 @@ that asks of a callback. It changes no stored data, no protocol and no other sig
 - *A leaf's failed cleanup is not a callback panic (record N).* A leaf is the adapter code that a `UnitOfWork` method
   calls. One that opens a savepoint and then cannot roll it back or release it raises a typed unwind, `CleanupUnwind`, whose
   payload is `SqliteError::OperationRollback { operation, rollback }`: the operation's error and the cleanup's. It is not
-  a `String` panic, and the catch does not contain it. It first observes that error under record L, which classifies
-  both sides ("When a Task read proves its data corrupt", "On the writer"), so that `SQLITE_CORRUPT` or `SQLITE_NOTADB`
-  on either side latches a fatal cause even when the outer rollback would succeed, and then raises the unwind again on the
-  writer's thread. `Writer::run` keeps its documented behaviour: the worker is dropped, the request that was running and
-  every queued one are closed (`storage_unavailable` when a cause is latched, `WriterClosed` otherwise), and later
-  submissions are refused. The adapter serves no other write after a failed savepoint cleanup. This maps no panic to
-  `storage_unavailable`: that answer comes from a latched cause that R128 and R140 already name, and an unwind with no
-  such cause is `WriterClosed`, so record L stands. The adapter does not defend against a callback that catches this
-  unwind itself and swallows it.
+  a `String` panic, and the catch does not contain it. Classification is by cause (record O, "F2"): the operation's
+  error and the cleanup's error are each observed under record L, which classifies both sides ("When a Task read proves
+  its data corrupt", "On the writer"), before the unwind is raised again on the writer's thread. `SQLITE_CORRUPT` or
+  `SQLITE_NOTADB` on either side latches a fatal cause even when the outer rollback would succeed. `Writer::run` keeps its
+  documented behaviour: the worker is dropped, the request that was running and every queued one are closed, and later
+  submissions are refused. The adapter serves no other write after a failed savepoint cleanup. What the receipts say
+  depends on the two causes and on nothing else:
+
+  | The operation's cause | The cleanup's cause | The worker | Latched | Receipts (running and queued) |
+  |---|---|---|---|---|
+  | not fatal (ordinary or transient) | not fatal (ordinary or transient) | ends | nothing | `WriterClosed`; a later submission is refused |
+  | fatal | fatal or not | ends | the fatal cause or causes of this observation, unless an earlier one is already latched (R140: the first stays) | `storage_unavailable` |
+  | not fatal | fatal | ends | the cleanup's fatal cause, on the same terms | `storage_unavailable` |
+
+  The unwind itself is no cause: a typed `CleanupUnwind` whose two causes are both ordinary latches nothing, because
+  `FatalCause` has no variant for a failed savepoint cleanup and none is added. This maps no panic to
+  `storage_unavailable`: that answer comes from a latched cause that R128 and R140 already name, so record L stands. The
+  adapter does not defend against a callback that catches this unwind itself and swallows it.
 - *A failed outer rollback keeps the payload (record N).* If the callback panicked and the writer's rollback of the
   top-level transaction then fails, the payload stays in the error (`SqliteError::OperationRollback`, reachable through
   `SqliteError::callback_panic()`), the rollback failure is classified under record L (it latches
@@ -1285,8 +1303,8 @@ had refused the amendment) are not used.
 | A3-W2 | A callback that calls `create` once and then panics (an ordinary panic of its body, not a leaf's failed cleanup: that is A3-W7 to A3-W9), through `StorageExt::transaction` on SQLite, then a second write | The first leaves nothing: a snapshot opened afterwards does not see the row. The awaiting caller observes the panic. The failure state shows no cause and the writer still serves. The second write commits and reads back. The references already behave this way; the vector may be registered as a shared case if its harness can catch the panic on all three |
 | A3-W3 | A `compile_fail` doctest: a callback that moves the `&mut dyn UnitOfWork` it was lent into `std::thread::scope(\|s\| s.spawn(..))`, and a control doctest that uses the same unit on the callback's own thread | The first does not compile, the control does, so the failure is the `Send` requirement and not another error. The precedent is the `compile_fail` doctest of `ConnectionHandle` in `crates/orch-infra/src/sqlite/connection.rs` |
 | A3-W6 | Two requests through `Storage::write`: the first holds the writer, and the second's deadline passes while it is queued behind it. A third request that is admitted and commits | The second is answered `overloaded` and its callback's invocation counter is 0 after the first finishes. The third callback's counter is exactly 1 |
-| A3-W7 | Through `Storage::write` on SQLite, a callback that uses a leaf (the lease, intent, retry or message leaf) so that the leaf's savepoint cleanup fails with no fatal cause, and that swallows the error it gets; a second request is queued behind it | The unwind is the typed `CleanupUnwind`, not a `String` panic, and the catch does not contain it. The first request and the queued one are answered `WriterClosed`, nothing is latched, and a later request is refused. After the storage is reopened on the same data directory neither request's rows are present and a new write commits. The first caller is not handed a resumed callback panic |
-| A3-W8 | As A3-W7, with a fatal cause: `SQLITE_CORRUPT` (or `SQLITE_NOTADB`) on the operation's side, whose outer rollback would succeed; and, as a separate case, a fatal result on the cleanup's side | The cause is observed under record L before the unwind is raised again: the failure state shows it, naming the connection and the result, and both requests and every later one are answered `storage_unavailable`. No row of either request is present after reopening |
+| A3-W7 | Through `Storage::write` on SQLite, a callback that uses a leaf (the lease, intent, retry or message leaf) so that the leaf's savepoint cleanup fails with no fatal cause, the operation's cause being ordinary too (record O: both causes not fatal), and that swallows the error it gets; a second request is queued behind it | The unwind is the typed `CleanupUnwind`, not a `String` panic, and the catch does not contain it. Both causes are observed, neither is fatal, the worker ends, the first request and the queued one are answered `WriterClosed`, nothing is latched, and a later request is refused. After the storage is reopened on the same data directory neither request's rows are present and a new write commits. The first caller is not handed a resumed callback panic |
+| A3-W8 | As A3-W7, with a fatal cause: `SQLITE_CORRUPT` (or `SQLITE_NOTADB`) on the operation's side with an ordinary cleanup, whose outer rollback would succeed; and, as a separate case, a fatal result on the cleanup's side with an ordinary operation (record O: either side fatal latches) | The cause is observed under record L before the unwind is raised again: the failure state shows it, naming the connection and the result, and both requests and every later one are answered `storage_unavailable`. No row of either request is present after reopening |
 | A3-W9 | A callback panics, and the writer's explicit rollback of the top-level transaction is then refused so that the connection stays inside a transaction (a test authorizer, as for R128) | The payload is kept in the error and reaches the caller, which resumes it. The failure state shows `RollbackLeftTransactionOpen`, the worker ends, and a queued request is answered `storage_unavailable`. No row of the request is present after reopening |
 | A3-W10 | A panic injected into the adapter's own code around the callback: where the unit of work is built (a `Clock` that panics), and in the check after a callback that returned success | Neither is contained as a callback panic: the caller is not handed a resumed callback panic, `Writer::run` behaviour applies (the worker is dropped and the receipts are closed with `WriterClosed`), nothing is latched, and the callback's invocation counter is 0 for the first and 1 for the second. If no seam can inject the second, the PR says so |
 
@@ -2714,8 +2732,9 @@ and the meaning and the report below are the rule.
   the connection. The owner was also offered the reopening and a mapping of a panic of the
   writer's thread to `storage_unavailable`, and chose neither (record L). A panic is neither mapped to this cause nor to
   any other by this text. The one unwind that the writer's thread still ends on by design, a leaf's failed savepoint
-  cleanup (record N, "Amendment 3"), is observed under this section's classification and is answered `storage_unavailable`
-  only when a cause is latched.
+  cleanup (record N, "Amendment 3"), is observed under this section's classification, operation and cleanup separately,
+  and is answered `storage_unavailable` only when either cause is fatal and so latched; with two ordinary causes the
+  receipts are `WriterClosed` and nothing is latched (record O).
 
 **When another connection fails** (R140). The writer is not the only connection on the live database: the
 pool reads, the checkpoint job has a connection of its own, `orch db query` has one (R130), and a backup or
@@ -4960,14 +4979,13 @@ lifetime of a reader's snapshot that answers no id and changes none of the answe
     proves nothing: A3-W7 to A3-W10 and issue 149's cases are pending, and the PR that carries the code keeps its
     independent review, its successful Linux check and test on the exact head, a CLEAN merge state and the lead's
     recommendation. The owner alone merges.
-  - *Held: the case of a failed leaf cleanup with no fatal cause.* This record, "Amendment 3" and the vector A3-W7
-    describe what the source does: such an unwind is observed, ends the worker and answers `WriterClosed`, and latches
-    nothing, because `FatalCause` has no variant for a failed savepoint cleanup. The wording of the owner's answer as
-    recorded, that a typed `CleanupUnwind` "latches as fatal", can also be read as saying that every such unwind
-    latches and is answered `storage_unavailable`. That reading would add a fatal cause and change record L, and
-    nothing here does either. Which reading is the contract is not ruled; the independent review of the lower PR holds
-    it open, and the PR's qualification waits for the ruling. Until then this spec, the ADR and the architecture
-    document describe the source's behaviour, and a ruling for the other reading changes them and A3-W7 together.
+  - *The case of a failed leaf cleanup with no fatal cause (held when this record was written; settled by record O).* This
+    record, "Amendment 3" and the vector A3-W7 described what the source does: such an unwind is observed, ends the
+    worker and answers `WriterClosed`, and latches nothing, because `FatalCause` has no variant for a failed savepoint
+    cleanup. The wording of the owner's answer as recorded, that a typed `CleanupUnwind` "latches as fatal", could also be
+    read as saying that every such unwind latches and is answered `storage_unavailable`. Record O is the owner's ruling
+    on which reading is the contract: the first, by cause. This bullet is kept as what record N said when it was
+    written.
   - *Second question, the reader's snapshot (the lead's "O4 wording", from the composition adjudication of 2026-11-26).*
     The answer as recorded: "Approve as proposed". The wording, with its numbers as starting values that no measurement
     backs: one pinned snapshot per task and no unrelated await while holding it; a 200 ms admission budget for an open,
@@ -4977,6 +4995,31 @@ lifetime of a reader's snapshot that answers no id and changes none of the answe
     B as signed. The writer of this spec records the error representation before activation. The rules are the spec's
     "Reader snapshots on SQLite" under "Writer lanes", which lands with the reader's PR. The owner's answer does not
     release that PR's qualification, a freeze or any acceptance.
+- **O.** The owner's ruling of 2026-11-27 on escalation 12 of the supervising session, given directly to that session and
+  recorded by it. The lead recommended option A and the supervisor's view was A as well. The question was the case that
+  record N held: a leaf whose savepoint cleanup fails with no fatal cause on either side. This spec reads the answer as
+  follows and restates no more.
+  - *The answer as recorded:* "F2 CleanupUnwind: A: classify by cause". Classify by the original causes. Observe the
+    operation's cause and the cleanup's cause separately. When both are ordinary (nonfatal), terminate the worker and
+    return `WriterClosed` without a fatal latch. When either is fatal, latch and return `StorageUnavailable`
+    (`storage_unavailable` on the wire). The record adds that this supersedes the summary line that "a typed
+    CleanupUnwind from a leaf latches as fatal", which misdescribed the prepared text of record N.
+  - *What it settles.* The first reading of record N's held bullet is the contract; the other reading is not. "Amendment 3"
+    (the bullet "A leaf's failed cleanup is not a callback panic" and its table) states the three cases, the vectors A3-W7
+    and A3-W8 carry them, and "A failed top-level rollback" under "Writer lanes" is unchanged. The source at the lower PR
+    already behaves this way, so no code change is asked for by this ruling.
+  - *What it does not do.* It adds no `FatalCause` variant, changes no class, time or retry rule of R128, maps no
+    panic to `storage_unavailable` and leaves record L as written. It proves nothing: A3-W7 and A3-W8 through
+    `Storage::write` are issue 149's, and the PR that carries the code keeps its independent review, its successful
+    Linux check and test on the exact head, a CLEAN merge state and the lead's recommendation. The owner alone merges.
+  - *Evidence owed by issue 149 (the ordinary pair and the reopen).* Through `Storage::write` on the combined adapter, one
+    case in which the operation's cause and the cleanup's cause are both ordinary, and a case for each side being fatal with
+    the other ordinary. For each, the first and the queued request are answered as the table says, a later submission is
+    refused, and the database is reopened on the same data directory, where neither request's rows are present and a new
+    write commits. The pair of ordinary causes is the case this record decides and the one that must not be left out.
+  - *The same message also approved three more things* (a retry policy for the writer, permission for a first event
+    submission, and the milestones that hold the remaining caller proofs). None of them is in the scope of this record
+    or of the PR that carries it, and nothing here applies them.
 
 "As recommended" means, for O1 to O10, AP1 to AP13 and D1 to D8, the recommendation and its condition in
 the approval request of 2026-11-20; and for AP14 to AP20, which that request did not hold, the
