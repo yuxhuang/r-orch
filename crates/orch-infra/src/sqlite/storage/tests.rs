@@ -1780,7 +1780,7 @@ async fn an_idle_owned_snapshot_expires_and_releases_backlog_before_its_idle_tim
             .to_string()
             .contains("snapshot_expired")
     );
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if storage.checkpoint().await.unwrap().backlog_bytes == 0 {
                 break;

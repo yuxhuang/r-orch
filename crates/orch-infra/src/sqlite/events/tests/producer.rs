@@ -1606,6 +1606,65 @@ async fn spare_allocations_are_refused_whole_and_dense_values_are_charged() {
 }
 
 #[tokio::test]
+async fn principal_spare_fields_are_returned_whole_before_encoding() {
+    use orch_core::store::Principal;
+
+    fn selected(principal: &Principal, kind: usize) -> &String {
+        match principal {
+            Principal::Worker { identity } => identity,
+            Principal::Task {
+                identity,
+                task,
+                run,
+                lineage,
+                ..
+            } => [identity, task, run, lineage][kind - 1],
+            _ => unreachable!("the fixture supplies Worker or Task"),
+        }
+    }
+
+    let mut fx = fixture();
+    fx.options.byte_limit = 8192;
+    let producer = fx.producer();
+    for kind in 0..5 {
+        let mut batch = fx.empty_batch("p", &format!("principal-{kind}")).await;
+        let mut spare = String::with_capacity(32768);
+        spare.push('x');
+        batch.caller.principal = if kind == 0 {
+            Principal::Worker { identity: spare }
+        } else {
+            let mut fields = std::array::from_fn::<_, 4, _>(|_| String::from("x"));
+            fields[kind - 1] = spare;
+            let [identity, task, run, lineage] = fields;
+            Principal::Task {
+                identity,
+                task,
+                run,
+                lineage,
+                epoch: 1,
+            }
+        };
+        batch.events.push(event(1));
+        let pointer = selected(&batch.caller.principal, kind).as_ptr();
+        let capacity = selected(&batch.caller.principal, kind).capacity();
+        let expected = batch.clone();
+        let encoded = encoded_events();
+        let Err(Rejected::TooLarge(returned)) = producer.submit(batch) else {
+            panic!("principal field {kind} escaped the metadata envelope");
+        };
+        same_batch(&returned, &expected);
+        assert_eq!(selected(&returned.caller.principal, kind).as_ptr(), pointer);
+        assert_eq!(
+            selected(&returned.caller.principal, kind).capacity(),
+            capacity
+        );
+        assert_eq!(encoded_events(), encoded, "metadata refusal is cheap");
+        assert_eq!(producer.retained(), (0, 0, 0));
+    }
+    producer.close().await;
+}
+
+#[tokio::test]
 async fn observer_panic_on_the_last_commit_closes_intake() {
     let mut fx = fixture();
     fx.options.observer = Some(Arc::new(|_| panic!("synthetic observer panic, last batch")));
