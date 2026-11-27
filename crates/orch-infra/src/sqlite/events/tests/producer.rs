@@ -179,15 +179,24 @@ fn sql(code: i32) -> rusqlite::Error {
 }
 
 /// Waits until the producer has taken its first transaction, so that the next
-/// batches wait in the producer and not in it.
+/// batches wait in the producer and not in it. A yield count cannot bound how
+/// long another runtime worker takes to run on a loaded host. Observe the state
+/// instead, with half the stall's watchdog left for assertions and release.
+/// This is only a deadlock watchdog; no production deadline or clock changes.
 async fn in_flight(producer: &EventProducer) {
-    for _ in 0..10_000 {
-        if producer.waiting().1 {
-            return;
+    tokio::time::timeout(SAFETY / 2, async {
+        while !producer.waiting().1 {
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
-    panic!("the producer never took a transaction");
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the producer never took a transaction: waiting={:?}, retained={:?}",
+            producer.waiting(),
+            producer.retained()
+        )
+    });
 }
 
 #[tokio::test]
@@ -1762,15 +1771,16 @@ async fn concurrent_submissions_never_exceed_the_byte_limit() {
             .map(|b| {
                 let (p, bar) = (Arc::clone(&producer), Arc::clone(&barrier));
                 std::thread::spawn(move || {
+                    let expected = b.clone();
                     bar.wait();
-                    p.submit(b).is_ok()
+                    (expected, p.submit(b))
                 })
             })
             .collect();
-        let ok = handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .filter(|x| *x)
+        let candidates: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok = candidates
+            .iter()
+            .filter(|(_, answer)| answer.is_ok())
             .count();
         let (_, _, bytes) = producer.retained();
         assert!(
@@ -1783,7 +1793,25 @@ async fn concurrent_submissions_never_exceed_the_byte_limit() {
             "round {round}: PROBE-D exactly one candidate fits ({ok})"
         );
         stall.end().await;
-        answered(lead).await.unwrap();
+        assert_eq!(answered(lead).await.unwrap(), counts(1, 0));
+        for (expected, answer) in candidates {
+            match answer {
+                Ok(submission) => {
+                    assert_eq!(answered(submission).await.unwrap(), counts(1, 0));
+                    assert_eq!(fx.stored("p", &expected.run).await, expected.events);
+                }
+                Err(Rejected::Full(returned)) => {
+                    same_batch(&returned, &expected);
+                    assert!(fx.stored("p", &expected.run).await.is_empty());
+                }
+                Err(other) => panic!("round {round}: unexpected refusal: {other:?}"),
+            }
+        }
+        assert_eq!(producer.retained(), (0, 0, 0));
+        Arc::try_unwrap(producer)
+            .unwrap_or_else(|_| panic!("all submitters have joined"))
+            .close()
+            .await;
     }
 }
 
