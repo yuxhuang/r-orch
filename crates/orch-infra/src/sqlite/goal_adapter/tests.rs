@@ -432,22 +432,40 @@ fn caught_rollback_failure_poison_prevents_later_operations_and_commit() {
     let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
     std::thread::scope(|scope| {
         let _close = Close(&handle);
-        scope.spawn(move || writer.run());
+        let running = scope.spawn(move || writer.run());
         handle.submit(Lane::Entities, None, |tx| {
             tx.execute_batch("CREATE TRIGGER abort_goal BEFORE INSERT ON goals WHEN NEW.id='fatal' BEGIN SELECT RAISE(ROLLBACK, 'synthetic'); END")?;
             Ok(())
         }).unwrap().wait().unwrap();
         let adapter = adapter_for(&handle, &pool, &data);
-        let error = adapter.write("p".into(), deadline(), |u| {
-            u.create(goal("earlier"))?;
-            assert!(matches!(u.create(goal("fatal")), Err(SqliteError::OperationRollback {operation, ..}) if matches!(*operation, SqliteError::Sql(_))));
-            assert!(matches!(u.create(goal("after")), Err(SqliteError::TransactionAborted)));
-            Ok(())
-        }).unwrap().wait().unwrap_err();
-        assert!(matches!(error, SqliteError::TransactionAborted));
+        let error = adapter
+            .write("p".into(), deadline(), |u| {
+                u.create(goal("earlier"))?;
+                // The cleanup unwind escapes instead of returning an error that
+                // this callback could catch and continue past.
+                let _ = u.create(goal("fatal"));
+                u.create(goal("after"))?;
+                Ok(())
+            })
+            .unwrap()
+            .wait()
+            .unwrap_err();
+        assert!(matches!(error, SqliteError::WriterClosed));
         for id in ["earlier", "fatal", "after"] {
             assert_eq!(adapter.read("p", deadline(), |u| u.get(id)).unwrap(), None);
         }
+        assert!(matches!(
+            adapter.write("p".into(), deadline(), |u| u.create(goal("fresh"))),
+            Err(SqliteError::WriterClosed)
+        ));
+        handle.close();
+        assert!(running.join().is_err(), "failed cleanup retires the worker");
+    });
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    std::thread::scope(|scope| {
+        let _close = Close(&handle);
+        scope.spawn(move || writer.run());
+        let adapter = adapter_for(&handle, &pool, &data);
         let fresh = adapter
             .write("p".into(), deadline(), |u| u.create(goal("fresh")))
             .unwrap()

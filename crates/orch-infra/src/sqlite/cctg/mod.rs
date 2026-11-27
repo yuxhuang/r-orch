@@ -425,11 +425,6 @@ pub(super) enum NativeError {
     Provenance,
     #[error("native transaction cannot commit after failed rollback")]
     Aborted,
-    #[error("operation failed: {operation}; rollback failed: {rollback}")]
-    Rollback {
-        operation: Box<NativeError>,
-        rollback: rusqlite::Error,
-    },
 }
 
 impl From<NativeError> for super::SqliteError {
@@ -454,13 +449,6 @@ impl From<NativeError> for super::SqliteError {
             NativeError::Encoding => Self::Unrepresentable("entity encoding".into()),
             NativeError::Provenance => Self::Unrepresentable("context provenance".into()),
             NativeError::Aborted => Self::TransactionAborted,
-            NativeError::Rollback {
-                operation,
-                rollback,
-            } => Self::OperationRollback {
-                operation: Box::new((*operation).into()),
-                rollback,
-            },
         }
     }
 }
@@ -848,7 +836,7 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
         match result {
             Ok(value) => Ok(value),
             // Some SQLite errors abort the whole transaction, savepoint included.
-            // Keep both results: the caller needs them to classify the failure.
+            // Keep both causes for classification at the containment boundary.
             Err(operation) => match self
                 .tx
                 .execute_batch("ROLLBACK TO cctg_entity; RELEASE cctg_entity")
@@ -856,10 +844,9 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
                 Ok(()) => Err(operation),
                 Err(rollback) => {
                     self.poisoned = true;
-                    Err(NativeError::Rollback {
-                        operation: Box::new(operation),
-                        rollback,
-                    })
+                    // A callback must not catch a returned cleanup error and
+                    // let the writer reuse this connection.
+                    super::writer::contain::cleanup_failed(operation, rollback)
                 }
             },
         }
