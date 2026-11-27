@@ -82,17 +82,20 @@ const QUEUE_LIMIT_BATCHES: usize = 4_096;
 /// statement that cannot be cut, so the envelope has to hold one of them with
 /// room beside it; an event past what a blob holds is still admitted below this
 /// and fails alone at its statement. The figure is the encoded size of the
-/// events plus the strings and structures the producer holds for them (see
-/// `Measure`), not a measurement of the allocator.
+/// events plus retained string/array capacities and a conservative reserve for
+/// compact object entries (see `Measure`). Accepted objects are rebuilt from
+/// live entries because serde_json hides their spare capacity. Allocator headers
+/// and transient SQL/serialization work are not measured by this counter.
 const QUEUE_LIMIT_BYTES: usize = 4 * MAX_BLOB_BYTES as usize;
 /// What a waiting batch holds besides its strings and events: its entry in the
 /// queue, the slice of the plan built from it, and a reply channel.
 const BATCH_FIXED_BYTES: usize = size_of::<Pending>() + size_of::<Slice>() + 128;
 /// What a waiting event holds besides its encoded form: the event, and its cost.
 const EVENT_FIXED_BYTES: usize = size_of::<SequencedEvent>() + 1;
-/// The caller and run strings live in the batch and again in each plan that is
-/// built from it.
-const STRING_COPIES: usize = 2;
+/// Reserve for the original caller/run allocations and their simultaneous
+/// plan, attempt, reconciliation and report copies. Clones have no more live
+/// bytes than the original capacities counted here.
+const STRING_COPIES: usize = 8;
 /// Waits of a producer whose submission the writer's queue did not admit.
 const ADMISSION_WAIT: Duration = Duration::from_millis(25);
 const ADMISSION_WAIT_MAX: Duration = Duration::from_millis(250);
@@ -356,7 +359,7 @@ impl EventProducer {
     /// sizes against what is still free (the walk stops at the first event that
     /// does not fit), and last the same limits again, because other submissions
     /// may have arrived while the events were measured.
-    pub fn submit(&self, batch: EventBatch) -> Result<Submission, Rejected> {
+    pub fn submit(&self, mut batch: EventBatch) -> Result<Submission, Rejected> {
         let options = &self.shared.options;
         let fixed = batch.fixed_bytes();
         let free = {
@@ -380,6 +383,12 @@ impl EventProducer {
         let mut queue = self.shared.queue();
         if let Err(refusal) = queue.admit(options, batch.events.len(), accounted) {
             return Err(rejected(batch, refusal));
+        }
+        // Map does not expose its backing capacity. Rebuild only accepted
+        // objects from their live entries, so an emptied map cannot retain an
+        // uncharged reservation. Refused input has not been changed at all.
+        for sequenced in &mut batch.events {
+            compact_objects(&mut sequenced.event.data);
         }
         let (reply, receiver) = oneshot::channel();
         queue.events += batch.events.len();
@@ -488,23 +497,36 @@ fn copy_error(error: &StoreError) -> StoreError {
 impl EventBatch {
     /// What the batch holds whatever its events encode to: the producer's
     /// structures, the caller and run strings (each kept twice), and the fixed
-    /// part of every event. Every string is counted at its length, so a batch
+    /// part of every event. Every string is counted at its capacity, so a batch
     /// with no events still has a size.
     pub(super) fn fixed_bytes(&self) -> usize {
         let principal = match &self.caller.principal {
-            Principal::Owner { identity } | Principal::Worker { identity } => identity.len(),
+            Principal::Owner { identity } | Principal::Worker { identity } => identity.capacity(),
             Principal::Task {
                 identity,
                 task,
                 run,
                 lineage,
                 ..
-            } => identity.len() + task.len() + run.len() + lineage.len(),
+            } => identity.capacity() + task.capacity() + run.capacity() + lineage.capacity(),
         };
-        let strings = self.caller.project.len() + principal + self.run.len() + self.lineage.len();
+        let strings = self
+            .caller
+            .project
+            .capacity()
+            .saturating_add(principal)
+            .saturating_add(self.run.capacity())
+            .saturating_add(self.lineage.capacity());
         BATCH_FIXED_BYTES
             .saturating_add(strings.saturating_mul(STRING_COPIES))
             .saturating_add(self.events.len().saturating_mul(EVENT_FIXED_BYTES))
+            // Reconciliation can keep one Expected run name per statement,
+            // at most one per event within the 1,000-row transaction.
+            .saturating_add(
+                self.run
+                    .capacity()
+                    .saturating_mul(self.events.len().min(1000)),
+            )
     }
 }
 
@@ -523,13 +545,69 @@ impl Measure {
         let mut bytes = 0usize;
         for sequenced in events {
             let (rows, size) = row_cost(&sequenced.event, free - bytes)?;
-            costs.push(rows);
             bytes += size;
+            let free = free - bytes;
+            let timestamp = sequenced.event.timestamp.capacity();
+            let payload =
+                retained_value_bytes(&sequenced.event.data, free.checked_sub(timestamp)?)?;
+            bytes += timestamp + payload;
+            costs.push(rows);
         }
         Some(Self {
             costs: costs.into(),
             bytes,
         })
+    }
+}
+
+/// Owned payload allocations in addition to the inline `Value` already charged
+/// by its parent/event. Arrays charge their whole capacity before walking live
+/// elements. Object capacity is opaque in serde_json: accepted maps are rebuilt
+/// below, and this conservative per-entry reserve covers their entries, hash
+/// indices and growth slack. The explicit work list avoids recursion on caller
+/// supplied shapes; its length is bounded by the charged containers.
+fn retained_value_bytes(value: &serde_json::Value, limit: usize) -> Option<usize> {
+    use serde_json::Value;
+    const OBJECT_ENTRY_BYTES: usize = 8 * (size_of::<(String, Value)>() + 2 * size_of::<usize>());
+    let mut remaining = limit;
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        let bytes = match value {
+            Value::String(text) => text.capacity(),
+            Value::Array(items) => items.capacity().checked_mul(size_of::<Value>())?,
+            Value::Object(items) => items.len().checked_mul(OBJECT_ENTRY_BYTES)?,
+            _ => 0,
+        };
+        remaining = remaining.checked_sub(bytes)?;
+        match value {
+            Value::Array(items) => pending.extend(items),
+            Value::Object(items) => {
+                for (key, value) in items {
+                    remaining = remaining.checked_sub(key.capacity())?;
+                    pending.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(limit - remaining)
+}
+
+fn compact_objects(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Object(items) => {
+                let old = std::mem::take(items);
+                let mut compact = serde_json::Map::with_capacity(old.len());
+                compact.extend(old);
+                *items = compact;
+                pending.extend(items.values_mut());
+            }
+            Value::Array(items) => pending.extend(items),
+            _ => {}
+        }
     }
 }
 
@@ -1327,11 +1405,16 @@ mod tests {
     #[test]
     fn a_batch_is_measured_until_the_first_event_that_does_not_fit() {
         let events: Vec<_> = (1..=5).map(|_| encoded_to(1000)).collect();
+        let one = Measure::of(&events[..1], usize::MAX).unwrap().bytes;
         let before = encoded_events();
-        assert!(Measure::of(&events, 5000).is_some_and(|m| m.bytes == 5000));
+        assert!(
+            one > 1000,
+            "owned allocations are charged beside the 1,000 encoded bytes"
+        );
+        assert!(Measure::of(&events, 5 * one).is_some_and(|m| m.bytes == 5 * one));
         assert_eq!(encoded_events() - before, 5);
         let before = encoded_events();
-        assert!(Measure::of(&events, 1999).is_none());
+        assert!(Measure::of(&events, 2 * one - 1).is_none());
         assert_eq!(
             encoded_events() - before,
             2,
@@ -1350,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn metadata_is_counted_at_its_length_even_with_no_events() {
+    fn metadata_is_counted_at_its_capacity_even_with_no_events() {
         let p = caller("p", "a");
         let bare = batch_of(p.clone(), "r", "l", 0).fixed_bytes();
         assert_eq!(
@@ -1362,8 +1445,8 @@ mod tests {
         let more = batch_of(p.clone(), "r", "l", 3).fixed_bytes();
         assert_eq!(
             more - bare,
-            3 * EVENT_FIXED_BYTES,
-            "and so is each event's fixed part"
+            3 * (EVENT_FIXED_BYTES + 1),
+            "and so is each event's fixed part and possible reconciliation run name"
         );
         let task = Caller {
             project: "p".into(),

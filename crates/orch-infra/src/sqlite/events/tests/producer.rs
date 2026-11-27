@@ -1552,3 +1552,198 @@ async fn the_planned_rows_equal_the_actual_rows_at_the_inline_threshold() {
     assert_eq!(fx.reports()[0].accounting.rows, 4);
     producer.close().await;
 }
+
+/// Allocation capacities, not just visible JSON bytes, stay inside the envelope.
+#[tokio::test]
+async fn spare_allocations_are_refused_whole_and_dense_values_are_charged() {
+    let mut fx = fixture();
+    fx.options.byte_limit = 8192;
+    let producer = fx.producer();
+    for kind in 0..9 {
+        let mut batch = fx.empty_batch("p", &format!("capacity-{kind}")).await;
+        let mut spare = String::with_capacity(32768);
+        spare.push('x');
+        match kind {
+            0 => batch.run = spare,
+            1 => batch.lineage = spare,
+            2 => batch.caller.project = spare,
+            3 => batch.caller.principal = orch_core::store::Principal::Owner { identity: spare },
+            _ => {
+                let mut item = event(1);
+                match kind {
+                    4 => item.event.timestamp = spare,
+                    5 => item.event.data = serde_json::Value::String(spare),
+                    6 => item.event.data = serde_json::Value::Array(Vec::with_capacity(32768)),
+                    7 => {
+                        item.event.data =
+                            serde_json::Value::Array(vec![serde_json::Value::Null; 200])
+                    }
+                    _ => {
+                        let mut object = serde_json::Map::new();
+                        object.insert(spare, serde_json::Value::Null);
+                        item.event.data = serde_json::Value::Object(object);
+                    }
+                }
+                batch.events.push(item);
+            }
+        }
+        let pointer = batch.run.as_ptr();
+        let capacity = batch.run.capacity();
+        let expected = batch.clone();
+        let Err(Rejected::TooLarge(returned)) = producer.submit(batch) else {
+            panic!("capacity-heavy input {kind} escaped the retained-byte envelope");
+        };
+        same_batch(&returned, &expected);
+        assert_eq!(
+            returned.run.as_ptr(),
+            pointer,
+            "refusal preserves allocation"
+        );
+        assert_eq!(returned.run.capacity(), capacity);
+        assert_eq!(producer.retained(), (0, 0, 0));
+    }
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn observer_panic_on_the_last_commit_closes_intake() {
+    let mut fx = fixture();
+    fx.options.observer = Some(Arc::new(|_| panic!("synthetic observer panic, last batch")));
+    let producer = fx.producer();
+    let b = fx.batch("p", "only", 1..=3).await;
+    assert_eq!(
+        answered(producer.submit(b).unwrap()).await.unwrap(),
+        counts(3, 0)
+    );
+    // Nothing left to answer. Is intake closed, or does it accept work nobody will process?
+    let late = fx.batch("p", "late", 1..=2).await;
+    match producer.submit(late) {
+        Err(Rejected::Closed(..)) => {}
+        Ok(s) => {
+            let r = tokio::time::timeout(Duration::from_secs(3), s).await;
+            panic!(
+                "PROBE-A FAIL: submit accepted after the task ended; answer within 3s: {:?}",
+                r.is_ok()
+            );
+        }
+        Err(other) => panic!("unexpected {other:?}"),
+    }
+    tokio::time::timeout(SAFETY, producer.flush())
+        .await
+        .expect("flush");
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn a_waiting_flush_is_released_when_the_task_panics() {
+    let mut fx = fixture();
+    fx.options.now = Arc::new(|| panic!("synthetic clock panic"));
+    let producer = Arc::new(fx.producer());
+    let lead = fx.batch("p", "lead", 1..=3).await;
+    let stall = fx.stall().await;
+    let lead = producer.submit(lead).unwrap();
+    in_flight(&producer).await;
+    let mut flusher = Box::pin(producer.flush());
+    assert!(
+        futures::poll!(flusher.as_mut()).is_pending(),
+        "flush must register and wait while a transaction is held"
+    );
+    stall.end().await;
+    let started = answered(lead).await.unwrap_err();
+    assert!(started.outcome_unknown);
+    tokio::time::timeout(Duration::from_secs(5), flusher)
+        .await
+        .expect("PROBE-B FAIL: a flush that was already waiting never returns");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_submissions_never_exceed_the_byte_limit() {
+    for round in 0..6 {
+        let mut fx = fixture();
+        let big = |seq| big_event(seq, 2 * 1024 * 1024);
+        let lead = fx.batch("p", "lead", 1..=1).await;
+        let lead_held = accounted_bytes(&lead);
+        let mut cands = Vec::new();
+        for i in 0..16 {
+            let (lineage, epoch) = fx.lease("p", &format!("c{i}")).await;
+            cands.push(EventBatch {
+                caller: owner("p"),
+                run: format!("c{i}"),
+                lineage,
+                epoch,
+                events: vec![big(1)],
+            });
+        }
+        let held = accounted_bytes(&cands[0]);
+        fx.options.byte_limit = lead_held + held + held / 2;
+        let producer = Arc::new(fx.producer());
+        let stall = fx.stall().await;
+        let lead = producer.submit(lead).unwrap();
+        in_flight(&producer).await;
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = cands
+            .into_iter()
+            .map(|b| {
+                let (p, bar) = (Arc::clone(&producer), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    bar.wait();
+                    p.submit(b).is_ok()
+                })
+            })
+            .collect();
+        let ok = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|x| *x)
+            .count();
+        let (_, _, bytes) = producer.retained();
+        assert!(
+            bytes <= fx.options.byte_limit,
+            "round {round}: PROBE-D FAIL held {bytes} > {} ({ok} admitted)",
+            fx.options.byte_limit
+        );
+        assert_eq!(
+            ok, 1,
+            "round {round}: PROBE-D exactly one candidate fits ({ok})"
+        );
+        stall.end().await;
+        answered(lead).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_nonretryable_commit_with_no_durable_rows_is_never_rebuilt() {
+    let mut once = true;
+    let fx = fixture_with(StorageOptions {
+        writer_commit_probe: Some(Box::new(move |tx| {
+            let events: i64 = tx
+                .query_row("SELECT count(*) FROM run_events", [], |r| r.get(0))
+                .unwrap();
+            if events == 0 || !once {
+                return None;
+            }
+            once = false;
+            // Nothing becomes durable, the transaction is no longer open, and the
+            // error (SQLITE_ERROR) is one that allows no retry.
+            tx.execute_batch("DELETE FROM run_events; COMMIT").unwrap();
+            Some(Err(sql(1)))
+        })),
+        ..StorageOptions::default()
+    });
+    let producer = fx.producer();
+    let first = fx.batch("p", "run", 1..=4).await;
+    let other = fx.batch("p", "other", 1..=2).await;
+    let failure = answered(producer.submit(first).unwrap()).await.unwrap_err();
+    assert!(
+        !failure.outcome_unknown,
+        "found none of its rows: {failure:?}"
+    );
+    assert_eq!((failure.committed, failure.not_stored), (counts(0, 0), 4));
+    assert!(fx.stored("p", "run").await.is_empty(), "never replayed");
+    // The producer survives and serves the next batch.
+    assert_eq!(
+        answered(producer.submit(other).unwrap()).await.unwrap(),
+        counts(2, 0)
+    );
+    producer.close().await;
+}

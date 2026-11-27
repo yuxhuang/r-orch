@@ -1730,3 +1730,67 @@ async fn active_checkpoint_expiry_interrupts_owned_sql_and_expires_that_same_sna
     drop(next);
     storage.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn an_idle_owned_snapshot_expires_and_releases_backlog_before_its_idle_timeout() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let data = Arc::new(data);
+    let storage = SqliteStorage::open(
+        data.clone(),
+        StorageOptions {
+            read_connections: 1,
+            snapshot_idle: Duration::from_secs(60),
+            ..without_admission_expiry()
+        },
+    )
+    .unwrap();
+    let snapshot = worker_snapshot(&storage).await;
+    assert!(
+        snapshot
+            .get(EntityKind::Team, "absent")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let mut writer = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let tx = writer.transaction().unwrap();
+    tx.execute_batch("CREATE TABLE r127_idle_pressure(value BLOB) STRICT")
+        .unwrap();
+    for _ in 0..258 {
+        tx.execute(
+            "INSERT INTO r127_idle_pressure VALUES(zeroblob(1048576))",
+            [],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    storage
+        .owner
+        .shared
+        .active_reads
+        .age_for_test(Duration::from_secs(31));
+    let observation = storage.checkpoint().await.unwrap();
+    assert_eq!(observation.interrupted, 1);
+    assert!(observation.backlog_bytes > 256 * 1024 * 1024);
+    assert!(
+        snapshot
+            .get(EntityKind::Team, "absent")
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("snapshot_expired")
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if storage.checkpoint().await.unwrap().backlog_bytes == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("R127 must release the idle selecting view without its 60s idle timeout");
+    assert!(storage.failure_state().failure().is_none());
+    drop(snapshot);
+    storage.close().await.unwrap();
+}

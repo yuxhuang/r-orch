@@ -174,3 +174,66 @@ fn sql_started_after_checkpoint_expiry_cannot_escape_the_progress_guard() {
         "the expiry guard must precede the finite safety limit"
     );
 }
+
+#[test]
+fn a_fatal_result_or_concurrent_observation_outranks_checkpoint_expiry() {
+    for returned in [true, false] {
+        let (_temp, data) = test_data();
+        let mut writer =
+            open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        writer
+            .execute_batch("CREATE TABLE sample(value BLOB) STRICT")
+            .unwrap();
+        let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+        let result: Result<()> = pool.read(deadline(), |tx| {
+            tx.query_row("SELECT count(*) FROM sample", [], |r| r.get::<_, i64>(0))?;
+            grow(&mut writer, 258);
+            pool.active.age_for_test(MAX_AGE + Duration::from_secs(1));
+            assert_eq!(pool.checkpoint()?.interrupted, 1);
+            let corrupt = SqliteError::Sql(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CORRUPT),
+                None,
+            ));
+            if returned {
+                Err(corrupt)
+            } else {
+                pool.state.observe(FailureSource::Reader, &corrupt);
+                Ok(())
+            }
+        });
+        assert!(
+            matches!(result, Err(SqliteError::StorageUnavailable(_))),
+            "{result:?}"
+        );
+        assert!(pool.failure_state().failure().is_some());
+    }
+}
+
+#[test]
+fn a_panicked_registration_cannot_expire_a_reused_connection() {
+    let (_temp, data) = test_data();
+    let mut writer = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    writer
+        .execute_batch("CREATE TABLE sample(value BLOB) STRICT")
+        .unwrap();
+    let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<()> = pool.read(deadline(), |tx| {
+            tx.query_row("SELECT count(*) FROM sample", [], |r| r.get::<_, i64>(0))?;
+            pool.active.age_for_test(MAX_AGE + Duration::from_secs(1));
+            panic!("synthetic registered read panic");
+        });
+    }));
+    assert!(panic.is_err());
+    pool.read(deadline(), |tx| {
+        tx.query_row("SELECT count(*) FROM sample", [], |r| r.get::<_, i64>(0))?;
+        grow(&mut writer, 258);
+        let observation = pool.checkpoint()?;
+        assert!(observation.backlog_bytes > MAX_BACKLOG);
+        assert_eq!(observation.interrupted, 0, "no old registration may survive the panic");
+        assert!(observation.oldest_read.unwrap() < MAX_AGE);
+        let n: i64 = tx.query_row("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<10000) SELECT sum(x) FROM n", [], |r| r.get(0))?;
+        assert_eq!(n, 50_005_000);
+        Ok(())
+    }).unwrap();
+}
