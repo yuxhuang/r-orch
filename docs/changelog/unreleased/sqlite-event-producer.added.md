@@ -1,0 +1,1 @@
+Add a SQLite event producer that coalesces waiting runs, preserves per-run order and retained tails, and cuts transactions at 1,000 rows or 20 ms between statements. Rebuild confirmed rollbacks from retained input and reconcile unknown commits against the stored event rows before retrying. The daemon continues using file storage until the SQLite switch.

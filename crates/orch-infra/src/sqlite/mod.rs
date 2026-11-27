@@ -129,6 +129,10 @@ pub type Result<T> = std::result::Result<T, SqliteError>;
 pub(crate) mod events;
 mod read_pool;
 mod writer;
+pub use events::{
+    EventBatch, EventProducer, EventProducerOptions, Rejected, Submission, SubmitFailure,
+    TransactionReport,
+};
 pub use read_pool::ReadPool;
 pub use writer::contain::CallbackPanic;
 pub use writer::failure::{
