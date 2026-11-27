@@ -1264,7 +1264,7 @@ clients <── WriteReceipt::wait() ──────────────�
   timeout is classified: when the deadline has passed the receipt is `Overloaded` and the closure has not run (a probe
   with a 100 ms deadline and a 300 ms busy timeout was answered after 301 ms), and otherwise the `BEGIN` is tried
   again (next bullet). A queued request is checked only when the worker reaches it.
-- **Retry and retained writes** (spec R128, record P; a development input at `2a7cb83e4`, not wired to the daemon).
+- **Retry and retained writes** (spec R128, record P; landed in PR #412 as `53136a969`, source equal to `2a7cb83e4`; not wired to the daemon).
   The writer retries what it issues itself and never a closure. A failed `BEGIN IMMEDIATE` with a primary result of
   `SQLITE_BUSY`, `SQLITE_LOCKED`, `SQLITE_FULL` or `SQLITE_IOERR` keeps the request, waits 50 ms doubling to 2 s on
   the writer's thread, and tries again within the original deadline; the closure runs once. A `COMMIT` that fails with
@@ -1277,9 +1277,14 @@ clients <── WriteReceipt::wait() ──────────────�
   (`sqlite/storage/retained.rs`; `SqliteStorage::retained_write`) lets a producer that kept its input submit a new
   closure after a confirmed noncommit and reconcile an unknown commit with a new snapshot of the bound caller;
   `Storage::write` is one attempt of its own. One episode (`sqlite/writer/policy.rs`) spans a logical request, holds
-  its deadline and backoff, and while it is open the worker runs no queued job but the retained continuation, so claims
-  and every other lane wait: one logical operation owns the writer until its outcome is known (a built choice of the
-  source, stated in the spec). The worker retires an episode whose last outcome is a known noncommit at its original
+  its deadline and backoff, and while it is open the worker runs no queued job but the retained continuation. `Writer::run`
+  takes a queued job only while `FailureState::claims_suppressed()` is false (the name is narrower than the use: it is true
+  while any episode is open), so `Claims`, `Entities`, `Events` and `Maintenance` all wait, and one logical operation owns
+  the writer until its outcome is known. R128 requires only that no claim is granted; the rest is how the source is built,
+  not a ruling of the owner. A request that carries a deadline (`Storage::write`: 200 ms, 1 s or 5 s for the three lanes
+  that are not claims) is answered `Overloaded` when the worker reaches it past that deadline, which can be well after it;
+  no time bound is given (the spec's "While one logical operation is retained"; no permanent test covers the lanes other
+  than claims, issue 429). The worker retires an episode whose last outcome is a known noncommit at its original
   deadline, between the producer's submissions; an unknown commit stays fenced until it is reconciled. A second
   `SQLITE_IOERR` in a row, counted by the writer across logical requests and ended by a known commit or another SQL
   failure, and sixty seconds from an episode's first failure without a known commit latch
@@ -1292,9 +1297,11 @@ clients <── WriteReceipt::wait() ──────────────�
   outside all of this (record O).
 - **Event producer** (`sqlite/events/producer.rs`, exported from `orch_infra::sqlite`; spec "As built: the event producer",
   plan "As built at `9b55edbf4`" and "As built at `4e80198f0`"; a development member of the integrated head `07fecf1ed`,
-  read at its later development head `4e80198f0`, not wired to the daemon or to a collector; the daemon still uses files).
+  read at its later development head `4e80198f0` with the receipt-order correction `c33037e98`, which is the producer on the
+  draft train and not on `main`; not wired to the daemon or to a collector; the daemon still uses files).
   `EventProducer` is the first caller of `retained_write`, on the `Events` lane
-  with no request deadline. One task owns every numbered `EventBatch` until the writer has answered for it and has one
+  with no request deadline; while one of its writes has an episode open, the rule of the bullet above holds for it, so the
+  worker runs no job of another lane until that write is answered. One task owns every numbered `EventBatch` until the writer has answered for it and has one
   transaction in flight, which is the one that the spec's R26 allows the event lane. Each transaction takes the waiting
   batches of the first batch's caller, of any number of runs, in arrival order, and cuts them at 1,000 rows (an event
   whose payload goes behind a blob reference counts two) or at 20 ms read between statements of at most 32 events (one
@@ -1317,7 +1324,11 @@ clients <── WriteReceipt::wait() ──────────────�
   The metadata (the caller's, the run's and the lineage's strings at their capacities, eight times, and a run name for up to
   1,000 statements) is charged as well. A batch holds one charge, shared by its queue entry, its plans, the attempt's copies
   and the reconciliation's rows, and the charge comes back when the last of them is dropped, so a transaction in flight,
-  a committed prefix and an unknown outcome stay counted. The counter is not a bound on process memory: the submitter's own
+  a committed prefix and an unknown outcome stay counted. An answer whose outcome is known (a commit, a failure whose
+  outcome is known, or a drain of a batch that was not in doubt) is kept in the charge and sent once, after the bytes
+  are returned, so a caller that holds the answer can submit again at once into the room that the answered batch held; an
+  answer that says the outcome is unknown is sent at once, with the bytes still charged while a callback or a
+  reconciliation owns a part of the batch. The counter is not a bound on process memory: the submitter's own
   input and serialization buffer, and the transient copies of the SQL and blob code, are outside it (the spec's "Admission
   and retained bytes"). The producer submits through the same retained write and unit of work as every callback (an
   internal typed entry that shares `RetainedWrite::attempt`'s implementation and episode) and reconciles through the
