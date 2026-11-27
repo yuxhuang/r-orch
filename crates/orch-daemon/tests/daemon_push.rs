@@ -150,17 +150,23 @@ impl Wire {
 
     /// The next pushed event of any subscription (kept or freshly read).
     async fn event(&mut self) -> Value {
-        if let Some(event) = self.events.pop_front() {
-            return event;
-        }
-        let mut text = String::new();
-        let read = tokio::time::timeout(EVENT_GUARD, self.reader.read_line(&mut text))
+        tokio::time::timeout(EVENT_GUARD, self.event_without_deadline())
             .await
             .unwrap_or_else(|_| {
                 panic!(
                     "no event was pushed within {EVENT_GUARD:?}: the subscription never delivered"
                 )
-            });
+            })
+    }
+
+    /// The caller owns the deadline and must abandon the wire if it expires:
+    /// cancelling `read_line` and retrying can discard a partial NDJSON frame.
+    async fn event_without_deadline(&mut self) -> Value {
+        if let Some(event) = self.events.pop_front() {
+            return event;
+        }
+        let mut text = String::new();
+        let read = self.reader.read_line(&mut text).await;
         assert!(
             matches!(read, Ok(n) if n > 0),
             "the daemon closed the connection while an event was expected"
@@ -827,6 +833,103 @@ async fn big_events_overflow_the_byte_budget_before_the_count_cap_and_control_st
     daemon.shutdown().await.unwrap();
 }
 
+/// One budget for the whole healthy stream, including producer scheduling.
+/// Unlike 1,200 per-event guards, this also bounds a trickling broken stream.
+const HEALTHY_DELIVERY_GUARD: Duration = Duration::from_secs(60);
+
+async fn healthy_delivery(
+    healthy: &mut Wire,
+    sub: &Sub,
+    total: u64,
+    acknowledged: &AtomicU32,
+) -> u64 {
+    let mut received = 0;
+    let mut last = 0;
+    // Keep each read alive until a whole line arrives. On timeout the caller
+    // fails and drops this wire; it never retries a cancelled partial frame.
+    tokio::time::timeout(HEALTHY_DELIVERY_GUARD, async {
+        for expected in 1..=total {
+            let event = healthy.event_without_deadline().await;
+            assert!(
+                event.get("resync").is_none(),
+                "healthy reader resynced: {event}"
+            );
+            assert_eq!(event["subscription"], sub.id);
+            assert_eq!(event["seq"], expected, "{event}");
+            last = event["commit_seq"].as_u64().unwrap();
+            received = expected;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "healthy delivery timed out after {HEALTHY_DELIVERY_GUARD:?}: \
+             received {received}/{total}, next seq {}, last commit {last}, \
+             writes acknowledged {} (subscription {})",
+            received + 1,
+            acknowledged.load(Ordering::SeqCst),
+            sub.id,
+        )
+    });
+    last
+}
+
+/// A socket-only fixture: no daemon, filesystem or real-time delays.
+fn healthy_wire_pair() -> (Wire, UnixStream, Sub) {
+    let (stream, peer) = UnixStream::pair().unwrap();
+    let (read, writer) = tokio::io::split(stream);
+    let wire = Wire {
+        reader: BufReader::new(read),
+        writer,
+        events: VecDeque::new(),
+        instance: String::new(),
+        next_id: 0,
+    };
+    let sub = Sub {
+        id: 1,
+        ack_instance: String::new(),
+        ack_seq: 0,
+        baseline: 0,
+    };
+    (wire, peer, sub)
+}
+
+#[tokio::test(start_paused = true)]
+async fn healthy_delivery_keeps_a_partial_frame_across_the_old_event_deadline() {
+    let (mut wire, mut peer, sub) = healthy_wire_pair();
+    let acknowledged = AtomicU32::new(1);
+    let delivery = healthy_delivery(&mut wire, &sub, 1, &acknowledged);
+    let producer = async {
+        peer.write_all(b"{\"ev\":{\"subscription\":1,")
+            .await
+            .unwrap();
+        tokio::time::advance(EVENT_GUARD + Duration::from_secs(1)).await;
+        peer.write_all(b"\"seq\":1,\"commit_seq\":42}}\n")
+            .await
+            .unwrap();
+    };
+    let (last, ()) = tokio::join!(delivery, producer);
+    assert_eq!(last, 42);
+}
+
+#[tokio::test(start_paused = true)]
+async fn healthy_delivery_reports_missing_progress_within_one_total_budget() {
+    let (mut wire, _peer, sub) = healthy_wire_pair();
+    wire.events
+        .push_back(json!({"subscription": 1, "seq": 1, "commit_seq": 42}));
+    let start = tokio::time::Instant::now();
+    let reader =
+        tokio::spawn(async move { healthy_delivery(&mut wire, &sub, 2, &AtomicU32::new(2)).await });
+    let error = reader.await.expect_err("missing delivery must fail");
+    assert_eq!(start.elapsed(), HEALTHY_DELIVERY_GUARD);
+    let panic = error.into_panic();
+    let message = panic.downcast_ref::<String>().expect("timeout diagnostic");
+    assert!(
+        message.contains("received 1/2, next seq 2, last commit 42, writes acknowledged 2"),
+        "{message}"
+    );
+}
+
 /// A subscriber that never reads must not slow a responsive session down, and
 /// stopping the daemon with that subscriber still attached completes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -840,19 +943,10 @@ async fn a_stalled_subscriber_never_blocks_writers_or_other_subscribers_or_shutd
 
     // The healthy reader consumes concurrently; only the stalled one is
     // allowed to lag. D5's write deadline also applies below the count cap.
+    let acknowledged = Arc::new(AtomicU32::new(0));
+    let reader_acknowledged = Arc::clone(&acknowledged);
     let reader = tokio::spawn(async move {
-        let mut last = 0;
-        for expected in 1..=1_200u64 {
-            let event = healthy.event().await;
-            assert!(
-                event.get("resync").is_none(),
-                "healthy reader resynced: {event}"
-            );
-            assert_eq!(event["subscription"], sub.id);
-            assert_eq!(event["seq"], expected, "{event}");
-            last = event["commit_seq"].as_u64().unwrap();
-        }
-        last
+        healthy_delivery(&mut healthy, &sub, 1_200, &reader_acknowledged).await
     });
     let mut last = 0;
     for n in 0..1_200 {
@@ -863,6 +957,7 @@ async fn a_stalled_subscriber_never_blocks_writers_or_other_subscribers_or_shutd
             )
             .await
             .1;
+        acknowledged.store(n + 1, Ordering::SeqCst);
     }
     assert_eq!(
         reader.await.unwrap(),
