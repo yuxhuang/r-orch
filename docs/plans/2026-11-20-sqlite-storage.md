@@ -1280,11 +1280,16 @@ result and the streak's break by another SQL failure). No red is recorded for tw
   `--test sqlite_writer_policy` 23 passed, 0 failed.
 - *Lanes.* While one logical operation is retained, all four lanes wait, not only `Claims`: the spec's "While one logical
   operation is retained" under "Writer lanes" gives the rule, the source and the missing test (issue 429). It is the
-  built behaviour, accepted by the supervising session on 2026-11-27 as the T10 reading of R128. It is not a ruling of the
-  owner and carries no latency guarantee.
+  built behaviour of `Writer::run` at `53136a969`, not a wording that R128 asks for and not a ruling of the
+  owner, and it carries no latency guarantee.
 - *Tests of R128.* The four names that R128 listed (busy, disk full, corrupt, idle) are mapped to the tests that exist, and
   to the missing coverage, in the spec's "R128's tests". WP6's real `SQLITE_FULL` exhaustion and an idle control on a real
   writer are step 3 and are not done.
+- *Tests of R140 and of the rows that shared the prefix (issue 430).* The spec's "R140's tests" maps the fourteen names of R140: three exist by
+  exact name, eleven are proposals, and the checkpoint, `Tool` and `Artifact` sources are exercised by an observation that the test supplies
+  (no test makes a real checkpoint call fail, and no query, backup or export connection exists). The three daemon tests and the two CLI tests
+  are not written: nothing wires the writer to the daemon, and there is no `orch db` command. R25, R26, R27, R98, R126 and R137 name real paths
+  in place of `sqlite_writer::`; four of the five names of R26, six of the seven of R126 and all five of R137 bear no test, and the spec says so.
 - *Still open, and not decided by this status:* daemon activation (nothing wires the writer to the daemon); the T10
   acceptance (the genuine freeze, the physical R142 corpus, issues 149, 167, 286 and 368); WP9 (there is no event producer on `main`; a development one is on the draft train, "As built: the event producer, first form" and "As built: the event producer, encoded form" below); the
   `SQLITE_IOERR` question of a leaf's cleanup and its count toward the consecutive-`SQLITE_IOERR` streak (issue 410); the
@@ -1668,7 +1673,9 @@ PR 323, PR 324 and PR 326 as the way the work lands, this note supersedes the la
 - Other connections (spec R137, R140): a result is injected at the checkpoint, read, query and backup
   connections in turn. Corruption fails the writer from each; other failures are counted and reported at
   their thresholds and do not fail it; each outcome of a checkpoint call is produced from injected counts,
-  and a running total repeated by the next call credits no second copy.
+  and a running total repeated by the next call credits no second copy. As of 2026-11-27 (issue 430) this is not built as written: results are injected at the shared
+  state for the checkpoint and tool sources and at a pooled reader, no real checkpoint call, query or backup connection is made to fail, and
+  R137's outcomes of a checkpoint call have no code (T15). The spec's "R140's tests" lists what exists.
 - Deferred on 2026-11-21 with T4b, kept as a record and not due in 1.1, where no verifier is built.
   The verdict (spec "The verdict", "What a miss selects"): the verifier of T4b gives every row of the
   spec's table of cases as written, from recorded inputs made for the purpose, the mixed cases included

@@ -1282,8 +1282,9 @@ clients <── WriteReceipt::wait() ──────────────�
   takes a queued job only while `FailureState::claims_suppressed()` is false (the name is narrower than the use: it is true
   while any episode is open), so `Claims`, `Entities`, `Events` and `Maintenance` all wait, and one logical operation owns
   the writer until its outcome is known. R128 requires only that no claim is granted; the rest is how the source is built,
-  not a ruling of the owner. A request that carries a deadline (`Storage::write`: 200 ms, 1 s or 5 s for the three lanes
-  that are not claims) is answered `Overloaded` when the worker reaches it past that deadline, which can be well after it;
+  not a ruling of the owner. A request that carries a deadline (`Storage::write`: 50 ms for `Claims`, 200 ms for `Entities`, 1 s for `Events`, 5 s
+  for `Maintenance`) is answered `Overloaded` when the worker reaches it past that deadline, which can be well after it, and
+  a queued claim is answered the same way, because the check does not depend on the lane;
   no time bound is given (the spec's "While one logical operation is retained"; no permanent test covers the lanes other
   than claims, issue 429). The worker retires an episode whose last outcome is a known noncommit at its original
   deadline, between the producer's submissions; an unknown commit stays fenced until it is reconciled. A second
@@ -1404,10 +1405,10 @@ clients <── WriteReceipt::wait() ──────────────�
 
 **Limits of this slice** (follow-ups tracked in [issue 127](https://github.com/yuxhuang/r-orch/issues/127)):
 
-- No replay of a closure. The writer retries only its own `BEGIN` and a `SQLITE_BUSY` `COMMIT` on the same transaction;
+- No replay of a closure. The writer retries only its own `BEGIN` (after `SQLITE_BUSY`, `SQLITE_LOCKED`, `SQLITE_FULL` or `SQLITE_IOERR`) and a `SQLITE_BUSY` `COMMIT` on the same transaction;
   every other SQL error goes to its receipt, after the policy's classification and its cleanup. The owner approved the
-  policy on 2026-11-27 (spec record P, plan "Writer retry policy"); the development implementation is the bullet "Retry
-  and retained writes" above, with the one open question that the spec lists, and one producer that rebuilds work, the event producer below ("Event producer"), which is a development member and not wired.
+  policy on 2026-11-27 (spec record P, plan "Writer retry policy"); the implementation landed in PR #412 as `53136a969` and is the
+  bullet "Retry and retained writes" above, with the one open question that the spec lists, and one producer that rebuilds work, the event producer below ("Event producer"), which is a development member and not wired.
   The shared failure state, the classification of R128 and R140 and the `StorageUnavailable` answer of a latched writer
   are in `sqlite/writer/failure.rs`.
 - A closure must not issue `COMMIT`, `BEGIN` or `SAVEPOINT`, or any side effect outside the database. The executor
