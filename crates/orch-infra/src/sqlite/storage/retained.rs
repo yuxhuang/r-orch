@@ -315,6 +315,51 @@ mod tests {
         write.receive().await.unwrap()
     }
 
+    #[tokio::test]
+    async fn refused_commit_does_not_mark_the_next_callback_only_failure_as_committed() {
+        let (_root, data) = crate::sqlite::test_data();
+        let mut first = true;
+        let storage = SqliteStorage::open(
+            Arc::new(data),
+            StorageOptions {
+                // Hide rollback evidence to exercise the defensive Unknown path.
+                // ROLLBACK below is real SQLite; FULL and IOERR are injected.
+                writer_setup: Some(Box::new(|connection| {
+                    connection.rollback_hook(None::<fn()>).unwrap();
+                })),
+                writer_commit_probe: Some(Box::new(move |_| {
+                    if first {
+                        first = false;
+                        // Executor reached COMMIT, but this probe refuses it
+                        // while the transaction remains open for real rollback.
+                        return Some(Err(rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                            None,
+                        )));
+                    }
+                    None
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut write = storage.retained_write(owner(), store::Lane::Events, None);
+        let first = write.attempt(Box::new(|_| Ok(()))).await.unwrap();
+        assert_eq!(first.outcome, WriteOutcome::RolledBack);
+        assert_eq!(first.retry_code, Some(RetryCode::Full));
+        assert!(first.retryable());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second = incomplete_unknown_receipt(&mut write, calls.clone(), false).await;
+        assert_eq!(second.outcome, WriteOutcome::Unknown);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !write.reconcile_encoded(Arc::new(Vec::new())).await.unwrap(),
+            "the second attempt never reached COMMIT; the first attempt's flag must not leak"
+        );
+        drop(write);
+        storage.close().await.unwrap();
+    }
+
     async fn incomplete_unknown_ioerr_streak(separate_episodes: bool, caught: bool) {
         let (_root, data) = crate::sqlite::test_data();
         let storage = SqliteStorage::open(
