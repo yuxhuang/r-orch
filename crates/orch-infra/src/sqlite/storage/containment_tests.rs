@@ -19,12 +19,26 @@ fn message() -> Entity {
 
 #[tokio::test(flavor = "current_thread")]
 async fn typed_leaf_cleanup_ends_writer_without_becoming_a_caller_panic() {
+    leaf_cleanup_case(None).await;
+}
+#[tokio::test(flavor = "current_thread")]
+async fn retryable_leaf_cleanup_ends_writer_without_starting_a_retry_episode() {
+    for code in [5, 6, 13] {
+        leaf_cleanup_case(Some(code)).await;
+    }
+}
+async fn leaf_cleanup_case(code: Option<i32>) {
     let (_temp, data) = crate::sqlite::test_data();
     let data = Arc::new(data);
     let storage = SqliteStorage::open(
         data.clone(),
         StorageOptions {
             writer_capacity: 1,
+            completion_probe: code.map(|code| {
+                Arc::new(move || {
+                    crate::sqlite::writer::contain::set_cleanup_error(code);
+                }) as Arc<dyn Fn() + Send + Sync>
+            }),
             writer_setup: Some(Box::new(|conn| {
                 conn.authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
                     AuthAction::Savepoint {
@@ -42,12 +56,15 @@ async fn typed_leaf_cleanup_ends_writer_without_becoming_a_caller_panic() {
     let (entered, running) = oneshot::channel();
     let (release, blocked) = mpsc::sync_channel(1);
     let first = storage.clone();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen_calls = calls.clone();
     let writing = tokio::spawn(async move {
         first
             .write(
                 owner(),
                 store::Lane::Entities,
                 Box::new(move |unit| {
+                    seen_calls.fetch_add(1, Ordering::SeqCst);
                     unit.create(team("partial"))?;
                     let _ = entered.send(());
                     blocked.recv().unwrap();
@@ -92,6 +109,21 @@ async fn typed_leaf_cleanup_ends_writer_without_becoming_a_caller_panic() {
         "{queued:?}"
     );
     assert!(!invoked.load(Ordering::SeqCst));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        !state.claims_suppressed(),
+        "leaf cleanup must never enter the retry policy"
+    );
+    assert!(
+        storage
+            .write(
+                owner(),
+                store::Lane::Entities,
+                Box::new(|_| panic!("closed callback"))
+            )
+            .await
+            .is_err()
+    );
     assert!(
         state.failure().is_none(),
         "ordinary cleanup failure proves no database corruption"

@@ -61,6 +61,8 @@ impl fmt::Display for FailureSource {
 pub enum FatalCause {
     SqliteCorrupt,
     SqliteNotADatabase,
+    ConsecutiveIoErrors,
+    RetryWithoutCommit,
     /// Proven logical corruption of live data (R141), though SQLite reports no error.
     LogicalCorruption,
     /// An explicit rollback of the writer's top-level transaction failed and the
@@ -74,6 +76,8 @@ impl fmt::Display for FatalCause {
         f.write_str(match self {
             Self::SqliteCorrupt => "SQLITE_CORRUPT",
             Self::SqliteNotADatabase => "SQLITE_NOTADB",
+            Self::ConsecutiveIoErrors => "second consecutive SQLITE_IOERR",
+            Self::RetryWithoutCommit => "sixty seconds of retry without a commit",
             Self::LogicalCorruption => "proven logical corruption of live data",
             Self::RollbackLeftTransactionOpen => {
                 "rollback left the writer connection inside a transaction"
@@ -243,6 +247,10 @@ struct Inner {
     /// Set by the writer's own observations; cleared at each BEGIN.
     transaction_aborted: AtomicBool,
     pool_failure_streak: AtomicU32,
+    writer_retry: Mutex<Option<super::policy::RetryCode>>,
+    retrying: AtomicU64,
+    retry_starts: Mutex<Vec<std::time::Instant>>,
+    over_bound: AtomicU64,
 }
 
 /// Shared by the writer, the read pool and every other live connection. Clone
@@ -272,6 +280,20 @@ impl FailureState {
         let observation = classify(error);
         if source == FailureSource::Artifact {
             return observation;
+        }
+        if source == FailureSource::Writer
+            && let Some(code) = super::policy::RetryCode::error(error)
+        {
+            let mut retry = self
+                .inner
+                .writer_retry
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // A source error can be observed again by an outer adapter.
+            // Keep one transaction observation, with I/O failure precedence.
+            if retry.is_none() || code == super::policy::RetryCode::Io {
+                *retry = Some(code);
+            }
         }
         let causes = observation.fatal_causes();
         if !causes.is_empty() {
@@ -352,7 +374,62 @@ impl FailureState {
         }
     }
 
+    pub(super) fn retry_started(&self, now: std::time::Instant) {
+        self.inner
+            .retry_starts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(now);
+        self.inner.retrying.fetch_add(1, Ordering::SeqCst);
+    }
+    pub(super) fn retry_finished(&self, since: std::time::Instant) {
+        let mut starts = self
+            .inner
+            .retry_starts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(i) = starts.iter().position(|start| *start == since) {
+            starts.remove(i);
+        }
+        self.inner.retrying.fetch_sub(1, Ordering::SeqCst);
+    }
+    pub(super) fn check_retry_timeout(&self, now: std::time::Instant) {
+        let expired = self
+            .inner
+            .retry_starts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|start| {
+                now.saturating_duration_since(*start) >= std::time::Duration::from_secs(60)
+            });
+        if expired && self.failure().is_none() {
+            self.latch(FailureSource::Writer, FatalCause::RetryWithoutCommit);
+        }
+    }
+    pub(in crate::sqlite) fn claims_suppressed(&self) -> bool {
+        self.inner.retrying.load(Ordering::SeqCst) != 0
+    }
+    pub(super) fn count_over_bound(&self) {
+        self.inner.over_bound.fetch_add(1, Ordering::SeqCst);
+    }
+    /// Indivisible transactions over 1,000 actual changed rows or 20 ms of execution.
+    pub fn writer_txn_over_bound_total(&self) -> u64 {
+        self.inner.over_bound.load(Ordering::SeqCst)
+    }
+    pub(super) fn writer_retry(&self) -> Option<super::policy::RetryCode> {
+        *self
+            .inner
+            .writer_retry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
     pub(super) fn begin_transaction(&self) {
+        *self
+            .inner
+            .writer_retry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         self.inner
             .transaction_aborted
             .store(false, Ordering::SeqCst);

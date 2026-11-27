@@ -33,6 +33,15 @@ use std::sync::{Mutex, PoisonError};
 /// savepoint rollback (`SqliteError::OperationRollback`).
 pub(in crate::sqlite) struct CleanupUnwind(SqliteError);
 
+#[cfg(test)]
+thread_local! {
+    static CLEANUP_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(in crate::sqlite) fn set_cleanup_error(code: i32) {
+    CLEANUP_ERROR.set(Some(code));
+}
+
 /// A leaf's savepoint cleanup failed after `operation` failed. Never returns an
 /// error a callback could catch and commit past: it unwinds with a
 /// [`CleanupUnwind`], which [`contain`] observes and re-raises.
@@ -40,6 +49,10 @@ pub(in crate::sqlite) fn cleanup_failed(
     operation: impl Into<SqliteError>,
     cleanup: rusqlite::Error,
 ) -> ! {
+    #[cfg(test)]
+    let cleanup = CLEANUP_ERROR.take().map_or(cleanup, |code| {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+    });
     let error = SqliteError::OperationRollback {
         operation: Box::new(operation.into()),
         rollback: cleanup,

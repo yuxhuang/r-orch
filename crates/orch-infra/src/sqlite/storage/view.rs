@@ -126,6 +126,16 @@ impl<'a, 'conn> Unit<'a, 'conn> {
         }
     }
     pub(super) fn observed<T>(&self, result: Result<T>) -> store::Result<T> {
+        #[cfg(test)]
+        let result = match self
+            .shared
+            .write_observation_probe
+            .as_ref()
+            .and_then(|probe| probe())
+        {
+            Some(error) => Err(error),
+            None => result,
+        };
         if let Err(error) = &result {
             self.shared.state.observe(FailureSource::Writer, error);
         }

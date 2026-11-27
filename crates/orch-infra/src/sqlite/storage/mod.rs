@@ -7,9 +7,11 @@ mod page_tests;
 mod ports;
 #[cfg(test)]
 mod prior_latch_tests;
+mod retained;
 #[cfg(test)]
 mod tests;
 mod view;
+pub use retained::{RetainedWrite, WriteAttempt};
 
 use super::{
     ConnectionRole, FailureSource, FailureState, ReadPool, Result, SqliteError, Synchronous,
@@ -51,9 +53,13 @@ pub struct StorageOptions {
     #[cfg(test)]
     pub(crate) writer_setup: Option<WriterSetup>,
     #[cfg(test)]
+    pub(crate) writer_commit_probe: Option<super::writer::CommitProbe>,
+    #[cfg(test)]
     pub(crate) completion_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     pub(crate) pin_now: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
+    #[cfg(test)]
+    pub(crate) write_observation_probe: Option<Arc<dyn Fn() -> Option<SqliteError> + Send + Sync>>,
 }
 #[cfg(test)]
 type ReaderSetup = Box<dyn Fn(&mut rusqlite::Connection) + Send>;
@@ -73,9 +79,13 @@ impl Default for StorageOptions {
             #[cfg(test)]
             writer_setup: None,
             #[cfg(test)]
+            writer_commit_probe: None,
+            #[cfg(test)]
             completion_probe: None,
             #[cfg(test)]
             pin_now: None,
+            #[cfg(test)]
+            write_observation_probe: None,
         }
     }
 }
@@ -92,6 +102,8 @@ struct Shared {
     completion_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     pin_now: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
+    #[cfg(test)]
+    write_observation_probe: Option<Arc<dyn Fn() -> Option<SqliteError> + Send + Sync>>,
 }
 impl Shared {
     fn stop(&self) {
@@ -201,6 +213,8 @@ impl SqliteStorage {
                         completion_probe: options.completion_probe,
                         #[cfg(test)]
                         pin_now: options.pin_now,
+                        #[cfg(test)]
+                        write_observation_probe: options.write_observation_probe,
                     });
                     let pool = ReadPool::open_with_state(
                         &data,
@@ -221,6 +235,9 @@ impl SqliteStorage {
                     #[cfg(test)]
                     let writer = {
                         let mut writer = writer;
+                        if let Some(probe) = options.writer_commit_probe {
+                            writer.set_commit_probe(probe);
+                        }
                         if let Some(setup) = options.writer_setup {
                             setup(writer.connection_for_test());
                         }
@@ -542,51 +559,18 @@ impl Storage for SqliteStorage {
         }))
     }
     async fn write(&self, caller: Caller, lane: store::Lane, work: WriteWork) -> store::Result<()> {
-        port(self.owner.shared.available())?;
-        let shared = self.owner.shared.clone();
-        let lane = match lane {
-            store::Lane::Claims => super::Lane::Claims,
-            store::Lane::Entities => super::Lane::Entities,
-            store::Lane::Events => super::Lane::Events,
-            store::Lane::Maintenance => super::Lane::Maintenance,
-        };
-        let budget = match lane {
-            super::Lane::Claims => Duration::from_millis(50),
-            super::Lane::Entities => Duration::from_millis(200),
-            super::Lane::Events => Duration::from_secs(1),
-            super::Lane::Maintenance => Duration::from_secs(5),
-        };
-        let receipt = port(self.owner.writer.submit(
-            lane,
-            Some(Instant::now() + budget),
-            move |tx| {
-                let mut unit = Unit::new(tx, &caller, &shared);
-                // The approved catch contains only the user's invocation.
-                // Unit construction/Clock and completion remain adapter code.
-                super::writer::contain::contain(&shared.state, || {
-                    work(&mut unit).map_err(SqliteError::Store)
-                })?;
-                unit.ensure_committable()
-            },
-        ))?;
-        let result = tokio::task::spawn_blocking(move || receipt.wait())
-            .await
-            .map_err(|_| backend("SQLite receipt worker failed"))?;
-        // A failed outer rollback may wrap the callback error. Recover its
-        // original payload before any public conversion or latch refusal.
-        if let Some(payload) = result
-            .as_ref()
-            .err()
-            .and_then(SqliteError::callback_panic)
-            .and_then(|panic| panic.take())
-        {
-            std::panic::resume_unwind(payload);
-        }
-        match result {
-            // The receipt is authoritative: a later, unrelated latch must not
-            // turn an already committed operation into an apparent failure.
-            Ok(()) => Ok(()),
-            Err(error) => public_result(&self.owner.shared.state, port(Err(error))),
-        }
+        let deadline = Some(
+            Instant::now()
+                + match lane {
+                    store::Lane::Claims => Duration::from_millis(50),
+                    store::Lane::Entities => Duration::from_millis(200),
+                    store::Lane::Events => Duration::from_secs(1),
+                    store::Lane::Maintenance => Duration::from_secs(5),
+                },
+        );
+        self.retained_write(caller, lane, deadline)
+            .attempt(work)
+            .await?
+            .result
     }
 }

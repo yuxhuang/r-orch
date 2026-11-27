@@ -1499,3 +1499,192 @@ fn lease_renew_release_and_claim_after_a_sqlite_rollback_are_not_durable() {
     });
     assert_eq!(granted.epoch, 1);
 }
+
+#[test]
+fn begin_busy_retains_the_original_callback_until_the_lock_clears() {
+    let (_root, data) = test_data();
+    let mut other = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    other
+        .execute_batch("CREATE TABLE retained_begin(id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+    let blocker = std::cell::RefCell::new(Some(other.transaction().unwrap()));
+    let mut connection =
+        open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    connection.busy_timeout(Duration::ZERO).unwrap();
+    let gate = Gate::install(&mut connection).unwrap();
+    let state = FailureState::new();
+    let now = Instant::now();
+    let ticks = std::cell::Cell::new(0);
+    let calls = std::cell::Cell::new(0);
+    let result = execute(
+        &mut connection,
+        &gate,
+        &state,
+        Some(now + BOUND),
+        || {
+            let tick = ticks.get() + 1;
+            ticks.set(tick);
+            if tick >= 2 {
+                drop(blocker.borrow_mut().take());
+            }
+            now
+        },
+        |tx| {
+            calls.set(calls.get() + 1);
+            tx.execute("INSERT INTO retained_begin VALUES(1)", [])?;
+            Ok(())
+        },
+    );
+    assert!(
+        result.is_ok(),
+        "BEGIN should retain the unconsumed callback: {result:?}"
+    );
+    assert_eq!(calls.get(), 1);
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM retained_begin", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+fn injected_sql(code: i32) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+}
+
+#[test]
+fn busy_commit_retries_the_same_transaction_and_counts_over_bound_once() {
+    let (_root, data) = test_data();
+    let mut connection =
+        open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    connection
+        .execute_batch("CREATE TABLE retry_rows(id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+    let gate = Gate::install(&mut connection).unwrap();
+    let mut attempts = 0;
+    *gate.commit_probe.lock().unwrap() = Some(Box::new(move |tx| {
+        attempts += 1;
+        assert!(!tx.is_autocommit());
+        assert_eq!(
+            tx.query_row("SELECT count(*) FROM retry_rows", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            1001
+        );
+        if attempts <= 3 {
+            Some(Err(injected_sql(5)))
+        } else {
+            None
+        }
+    }));
+    let state = FailureState::new();
+    let episode = Episode::new(state.clone(), None);
+    let calls = std::cell::Cell::new(0);
+    let waits = std::cell::RefCell::new(Vec::new());
+    execute_episode(&mut connection, &gate, &state, &episode, &Instant::now, &|delay| waits.borrow_mut().push(delay), |tx| {
+        calls.set(calls.get() + 1);
+        tx.execute_batch("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1001) INSERT INTO retry_rows SELECT x FROM n")?;
+        Ok(())
+    }).unwrap();
+    assert_eq!(calls.get(), 1);
+    assert_eq!(episode.snapshot().0, WriteOutcome::Committed);
+    assert_eq!(episode.snapshot().2.rows, 1001);
+    assert_eq!(state.writer_txn_over_bound_total(), 1);
+    assert_eq!(
+        waits.borrow().iter().copied().sum::<Duration>(),
+        Duration::from_millis(350)
+    );
+    assert!(!state.claims_suppressed());
+}
+
+#[test]
+fn commit_error_after_real_commit_is_unknown_until_producer_reconciliation() {
+    let (_root, data) = test_data();
+    let mut connection =
+        open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    connection
+        .execute_batch("CREATE TABLE unknown_commit(id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+    let gate = Gate::install(&mut connection).unwrap();
+    *gate.commit_probe.lock().unwrap() = Some(Box::new(|tx| {
+        tx.execute_batch("COMMIT").unwrap();
+        Some(Err(injected_sql(10)))
+    }));
+    let state = FailureState::new();
+    let start = Instant::now();
+    let clock = std::cell::Cell::new(start);
+    let episode = Episode::new(state.clone(), Some(start + Duration::from_secs(1)));
+    let error = execute_episode(
+        &mut connection,
+        &gate,
+        &state,
+        &episode,
+        &|| clock.get(),
+        &|_| {},
+        |tx| {
+            tx.execute("INSERT INTO unknown_commit VALUES(1)", [])?;
+            clock.set(start + Duration::from_secs(2));
+            Ok(())
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, SqliteError::Sql(_)));
+    assert!(connection.is_autocommit());
+    assert_eq!(
+        episode.snapshot().0,
+        WriteOutcome::Unknown,
+        "autocommit cannot prove noncommit"
+    );
+    assert_eq!(episode.snapshot().1, Some(RetryCode::Io));
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM unknown_commit", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert!(state.claims_suppressed());
+}
+
+#[test]
+fn unsafe_commit_failure_is_rolled_back_and_never_replays_callback() {
+    let (_root, data) = test_data();
+    let mut connection =
+        open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    connection
+        .execute_batch("CREATE TABLE rollback_commit(id INTEGER PRIMARY KEY) STRICT")
+        .unwrap();
+    let gate = Gate::install(&mut connection).unwrap();
+    *gate.commit_probe.lock().unwrap() = Some(Box::new(|_| Some(Err(injected_sql(13)))));
+    let state = FailureState::new();
+    let episode = Episode::new(state.clone(), None);
+    let calls = std::cell::Cell::new(0);
+    assert!(
+        execute_episode(
+            &mut connection,
+            &gate,
+            &state,
+            &episode,
+            &Instant::now,
+            &|_| {},
+            |tx| {
+                calls.set(calls.get() + 1);
+                tx.execute("INSERT INTO rollback_commit VALUES(1)", [])?;
+                Ok(())
+            }
+        )
+        .is_err()
+    );
+    assert_eq!(calls.get(), 1);
+    assert_eq!(episode.snapshot().0, WriteOutcome::RolledBack);
+    assert_eq!(episode.snapshot().1, Some(RetryCode::Full));
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM rollback_commit", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert!(state.failure().is_none());
+}
