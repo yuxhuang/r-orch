@@ -232,9 +232,13 @@ fn failed_cleanup_closes_writer_even_when_callback_handles_operation_errors() {
         panic!("operation returned after failed cleanup");
     }))
     .unwrap_err();
-    let message = panic.downcast_ref::<String>().unwrap();
+    let message = panic
+        .downcast_ref::<crate::sqlite::writer::contain::CleanupUnwind>()
+        .expect("a typed unwind, which the containing catch can tell from a callback's panic")
+        .error()
+        .to_string();
     assert!(message.contains("synthetic insert failure"), "{message}");
-    assert!(message.contains("cleanup failed"), "{message}");
+    assert!(message.contains("rollback failed"), "{message}");
     drop(tx); // same rollback-on-unwind used by Writer::submit
     let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
     pool.read(deadline(), |tx| {

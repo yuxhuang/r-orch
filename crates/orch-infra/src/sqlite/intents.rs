@@ -81,9 +81,10 @@ impl<'a, 'conn> Intents<'a, 'conn> {
                     .execute_batch("ROLLBACK TO orch_intent; RELEASE orch_intent")
                 {
                     // As with leases, a failed cleanup must escape a callback
-                    // that could otherwise catch the error and commit. Writer
-                    // catches the unwind and drops its transaction/connection.
-                    panic!("{error}; SQLite intent cleanup failed: {cleanup}");
+                    // that could otherwise catch the error and commit. The typed
+                    // unwind is observed and raised again by the containing
+                    // catch; the writer ends and drops its connection.
+                    crate::sqlite::writer::contain::cleanup_failed(error, cleanup);
                 }
                 Err(error)
             }

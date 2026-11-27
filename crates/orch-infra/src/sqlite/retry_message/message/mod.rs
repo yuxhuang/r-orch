@@ -669,9 +669,10 @@ impl<'a, 'conn> Messages<'a, 'conn> {
                 {
                     // As with leases, intents and retries, a failed cleanup must
                     // escape a callback that could otherwise catch the error and
-                    // commit. The writer catches the unwind and drops its
+                    // commit. The typed unwind is observed and raised again by
+                    // the containing catch; the writer ends and drops its
                     // connection.
-                    panic!("{error}; SQLite message cleanup failed: {cleanup}");
+                    crate::sqlite::writer::contain::cleanup_failed(error, cleanup);
                 }
                 Err(error)
             }

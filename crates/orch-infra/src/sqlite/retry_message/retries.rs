@@ -321,8 +321,9 @@ impl<'a, 'conn> Retries<'a, 'conn> {
                 {
                     // As with leases and intents, a failed cleanup must escape a
                     // callback that could otherwise catch the error and commit.
-                    // The writer catches the unwind and drops its connection.
-                    panic!("{error}; SQLite retry cleanup failed: {cleanup}");
+                    // The typed unwind is observed and raised again by the
+                    // containing catch; the writer ends and drops its connection.
+                    crate::sqlite::writer::contain::cleanup_failed(error, cleanup);
                 }
                 Err(error)
             }
