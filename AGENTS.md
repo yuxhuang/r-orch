@@ -127,6 +127,28 @@ reviewed or merged.
      merge commit for release PRs and multi-commit PRs whose commits are individually meaningful.
    - Never force-push `main`.
 
+### Owner’s review and merge rules of 2026-11-27
+
+- Each PR gets one independent code review. Add a security review only for untrusted input, file paths,
+  authorisation, importer, restore or process spawning. Skip separate per-PR resilience reviews, fact-checks,
+  review boards and CI-log verifier tasks.
+- Require green Linux `check` and `test` on the actual merge (`test` may skip for a CI-classified docs-only PR),
+  a `CLEAN` merge state and a short lead recommendation naming the head, base and merge tree.
+- If `main` moves and the unchanged head still merges cleanly, rerun only CI on the new merge. Review the delta
+  when the head changes. Use batch trains for independent PRs. Once #381 lands, CI fails fast on stale merge parents.
+- The supervising session checks each squash and watches the push to `main`. Skip separate landing and
+  terminal-main verifier tasks.
+- **Rolling deep review.** Review each subsystem’s changes on `main` since its last deep review after about
+  10 merged PRs or 10,000 changed lines. A rolling review never blocks a merge. Its only output is GitHub
+  issues. File each finding in `yuxhuang/r-orch` and follow `issue-triage-process.md`. Triage assigns priority
+  and milestone, and the supervising session accepts or escalates the determination. The lead picks up findings
+  through triaged issues and their `[issue N]` fix tasks. The reviewer sends no findings, recommendations or
+  fix requests directly to the lead. Close or explicitly defer each finding by the next milestone.
+- **Milestone deep review.** Plan a deep review as an acceptance step for each of T10 acceptance, T24
+  activation and T27 release. Report the verdict and findings directly to the lead, who uses them to decide
+  milestone acceptance. File a GitHub issue for each finding that will remain open at the gate.
+  Do not schedule a deep review per train or batch.
+
 ### Independent PRs, stacks and trains
 
 - **Base on `main`.** Branch every PR from current `main`. Independent PRs stay independent and are qualified
