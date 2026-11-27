@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const CI: &str = include_str!("../../.github/workflows/ci.yml");
-const TEST_IF: &str = "github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all')";
+const TEST_IF: &str = "${{ !cancelled() && (github.event_name != 'pull_request' || needs.preflight.result == 'success') && github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all') }}";
 const AMBIENT_IF: &str = "github.event_name == 'push' && github.ref == 'refs/heads/main'";
 /// The workspace's path inside a job container, on GitHub-hosted and
 /// self-hosted runners alike. The `github.workspace` context holds the host's
@@ -95,14 +95,30 @@ fn script(step: &str) -> String {
         .collect()
 }
 fn contract(ci: &str) {
+    let preflight = job(ci, "preflight");
+    assert!(preflight.contains("    if: github.event_name == 'pull_request'\n"));
+    assert!(preflight.contains("          ref: ${{ github.sha }}\n"));
+    assert!(preflight.contains("          fetch-depth: 2\n"));
+    assert!(preflight.contains("      merge: ${{ steps.verify.outputs.merge }}\n"));
+    assert!(preflight.contains("        run: bash scripts/ci/pr_merge_preflight.sh\n"));
+    assert!(!preflight.contains("cargo "));
     let changes = job(ci, "changes");
+    assert!(changes.contains("    needs: preflight\n"));
+    assert!(changes.contains("    if: ${{ !cancelled() && github.event_name != 'schedule' && (github.event_name != 'pull_request' || needs.preflight.result == 'success') }}\n"));
+    for name in ["changes", "check", "test"] {
+        assert!(
+            job(ci, name)
+                .contains("          ref: ${{ needs.preflight.outputs.merge || github.sha }}\n")
+        );
+    }
     let check = job(ci, "check");
     let test = job(ci, "test");
     let ambient = job(ci, "ambient");
     assert!(changes.contains("fetch-depth: 0"));
     assert!(changes.contains("--base \"$PR_BASE\" --format github"));
     assert!(changes.contains("printf 'mode=all\\n'"));
-    assert!(check.contains("    needs: changes\n    if: always()\n"));
+    assert!(check.contains("    needs: [preflight, changes]\n    if: always() && (github.event_name != 'pull_request' || needs.preflight.result == 'success')\n"));
+    assert!(test.contains("    needs: [preflight, changes]\n"));
     assert!(check.contains("- name: Require valid classification\n"));
     assert!(check.contains("[[ \"$CHANGES_RESULT\" == success ]] || exit 1"));
     assert!(check.contains("[[ \"$CHANGES_RESULT\" == skipped && -z \"$MODE\" ]] || exit 1"));
@@ -190,7 +206,7 @@ fn contract(ci: &str) {
         assert!(!ci.contains(forbidden), "unexpected {forbidden}");
     }
     assert!(ci.contains("permissions:\n  contents: read\n"));
-    assert_eq!(ci.matches("persist-credentials: false").count(), 4);
+    assert_eq!(ci.matches("persist-credentials: false").count(), 5);
     for line in ci.lines().filter(|l| l.contains("uses:")) {
         let pin = line
             .split('@')
@@ -225,7 +241,12 @@ fn contract(ci: &str) {
     );
     assert!(!ci.contains("uses: docker://"));
     // Runners: one container for every job, routing only through the variable.
-    for (name, job) in [("changes", changes), ("check", check), ("test", test)] {
+    for (name, job) in [
+        ("preflight", preflight),
+        ("changes", changes),
+        ("check", check),
+        ("test", test),
+    ] {
         assert!(
             job.lines().any(|l| l == ROUTED),
             "{name} must use the fork-aware route"
@@ -237,18 +258,18 @@ fn contract(ci: &str) {
     }
     assert!(ambient.lines().any(|l| l == AMBIENT_ROUTED));
     assert!(ambient.contains(&format!("\n    container:\n{JOB_IMAGE}\n")));
-    assert_eq!(ci.matches("    runs-on: ").count(), 4);
-    assert_eq!(ci.matches("\n    container:\n").count(), 4);
+    assert_eq!(ci.matches("    runs-on: ").count(), 5);
+    assert_eq!(ci.matches("\n    container:\n").count(), 5);
     // Orphans must reparent to a reaping PID 1, as on a VM: tests find a
     // detached server by `ppid == 1`, so a subreaper is not a substitute.
-    assert_eq!(ci.matches(&format!("{JOB_IMAGE}\n")).count(), 4);
-    for job in [changes, check, test, ambient] {
+    assert_eq!(ci.matches(&format!("{JOB_IMAGE}\n")).count(), 5);
+    for job in [preflight, changes, check, test, ambient] {
         let container = &job[job.find("\n    container:\n").unwrap()..];
         let container = &container[..container[1..].find("\n    timeout-minutes:").unwrap() + 1];
         assert!(container.lines().any(|l| l == "      options: --init"));
     }
     assert!(!ci.contains("tini"));
-    assert_eq!(ci.matches(ROUTED).count(), 3);
+    assert_eq!(ci.matches(ROUTED).count(), 4);
     // Untranslated in a job container: these name the host's paths.
     assert!(!ci.contains("${{ github.workspace }}"));
     assert!(!ci.contains("${{ runner.temp }}"));
@@ -258,6 +279,7 @@ fn contract(ci: &str) {
     // Every job's checkout is followed by taking ownership of it, before any
     // other step can run git or the gate.
     for (name, job) in [
+        ("preflight", preflight),
         ("changes", changes),
         ("check", check),
         ("test", test),
@@ -277,7 +299,7 @@ fn contract(ci: &str) {
             "{name}: taking ownership must directly follow checkout"
         );
     }
-    assert_eq!(ci.matches(OWN_WORKSPACE).count(), 4);
+    assert_eq!(ci.matches(OWN_WORKSPACE).count(), 5);
     // Test-running steps are unprivileged; the user is set up after everything
     // root installs and before the first of them.
     for (name, lane, steps) in [

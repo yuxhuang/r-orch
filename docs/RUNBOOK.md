@@ -1720,6 +1720,7 @@ unsuccessful, 75 the lease was busy and nothing ran,
 | Exit 3, `advisories` is `ENV-LIMITED`: `cargo-deny not installed` | The advisories, licences, bans and sources check was not evaluated | `cargo install cargo-deny --locked`, then rerun. `ENV-LIMITED` is not a pass. |
 | `fast` selects `all` and you expected one crate | A `global`, `unknown` or `error` row in the printed reasons (shared input, unclassified path, unreadable base, empty change set) | Read the row; this is the fail-closed design, not a fault. Use `--base` for the right base. |
 | `REFUSED` with `marker:` and `target in use` / `an earlier use did not finish` | A target use marker is held or left by an unfinished use | Do not remove the marker, `target/` or run `cargo clean`. Inspect read-only with `lsof` on the marker; preserve the target and diagnostics for the owner. |
+| CI `preflight` fails with `PR merge preflight:` | The checked-out PR merge has stale/invalid parents, or the bounded live-ref lookup failed | Read expected/observed hashes in the preflight log. Wait for GitHub to publish a merge with the current base/head pair, then request a fresh PR run. Do not treat skipped downstream jobs as qualifying evidence. |
 | CI `check` fails at `Require valid classification` (`invalid classification mode`) | The `changes` job did not produce `docs-only`, `packages` or `all` | Read the `changes` job log. Do not re-run it away; a missing or unresolvable base already selects `all`. |
 | A documentation-only PR shows `test` as skipped | By design: the `test` job's condition excludes `docs-only` | Nothing. A conditionally skipped job satisfies the required check; a skipped whole workflow would not. |
 
@@ -1776,9 +1777,21 @@ Do not rerun failures away.
 
 PR code executes static plus one suite; docs-only executes build/static without
 tests. Main forces all and retains a separate unwrapped ordinary ambient suite.
-Schedule deliberately skips classification and runs static checks alone. `check`
-runs with `always()` and refuses every invalid classifier status/mode; only the
-schedule's intentional skipped/empty classifier is exempt. Docker Linux checks
+Schedule deliberately skips classification and runs static checks alone. PRs first
+run `preflight`: its actual checkout must have exactly two ordered parents matching
+the live target branch tip and upstream PR head ref. A failed or indeterminate
+lookup refuses the run before classification, caches or builds. The ref lookup
+has a 20-second deadline (five-second kill grace); the preflight job has a
+two-minute ceiling, excluding queue time. On success, classification and both
+required jobs check out the same verified merge SHA. `check` retains `always()`
+for classifier failures but cannot run after a failed PR preflight. On pushes and
+schedules, preflight is intentionally skipped and existing lanes continue;
+only the schedule's skipped/empty classifier is exempt from classification.
+
+Preflight does not refresh merge refs or retry runs. It is a point-in-time check:
+before recommending or merging, still verify that the executed merge parents
+match the then-current base tip and PR head. Movement after preflight invalidates
+that pair's qualification. Docker Linux checks
 remain ordinary/probed-platform checks, never equivalent to the hosted fold.
 
 Both existing required checks remain until the owner applies the independently
