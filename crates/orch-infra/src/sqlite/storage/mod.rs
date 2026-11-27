@@ -563,6 +563,11 @@ impl Storage for SqliteStorage {
         {
             std::panic::resume_unwind(payload);
         }
-        public_result(&self.owner.shared.state, port(result))
+        match result {
+            // The receipt is authoritative: a later, unrelated latch must not
+            // turn an already committed operation into an apparent failure.
+            Ok(()) => Ok(()),
+            Err(error) => public_result(&self.owner.shared.state, port(Err(error))),
+        }
     }
 }

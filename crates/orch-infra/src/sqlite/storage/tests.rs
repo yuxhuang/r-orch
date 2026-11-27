@@ -1248,3 +1248,52 @@ async fn native_get_observes_fatal_damage_before_pool_cleanup() {
 async fn native_page_bridge_observes_fatal_damage_before_pool_cleanup() {
     native_fatal_read_is_observed_before_pool_cleanup(true).await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_known_commit_keeps_its_receipt_when_a_later_connection_latches() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let data = Arc::new(data);
+    let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+    let (entered, running) = oneshot::channel();
+    let (release, blocked) = mpsc::sync_channel(1);
+    let mut writing = Box::pin(storage.write(
+        owner(),
+        store::Lane::Entities,
+        Box::new(move |unit| {
+            unit.create(team("committed"))?;
+            let _ = entered.send(());
+            blocked.recv().unwrap();
+            Ok(())
+        }),
+    ));
+    assert!(futures::poll!(&mut writing).is_pending());
+    running.await.unwrap();
+    release.send(()).unwrap();
+    let conn = open_connection(&data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM teams", [], |row| row.get(0))
+            .unwrap();
+        if rows == 1 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "writer did not commit");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // The write future has not been polled since admission. A separate
+    // connection fails after the committed row is externally visible.
+    storage
+        .failure_state()
+        .observe(FailureSource::Checkpoint, &corrupt_error());
+    let outcome = writing.await;
+    let later = storage
+        .write(owner(), store::Lane::Entities, Box::new(|_| Ok(())))
+        .await;
+    storage.close().await.unwrap();
+    assert!(
+        outcome.is_ok(),
+        "known commit must retain its successful receipt: {outcome:?}"
+    );
+    assert!(matches!(later, Err(ref e) if e.to_string().contains("storage_unavailable")));
+}
