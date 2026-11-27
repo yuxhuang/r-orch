@@ -78,6 +78,11 @@ pub enum SqliteError {
     },
     #[error("SQLite writer is closed")]
     WriterClosed,
+    /// The callback of a contained request panicked (spec Amendment 3). Its
+    /// transaction was rolled back and the writer serves on; the caller resumes
+    /// the panic from the payload.
+    #[error("a storage callback panicked; its transaction was rolled back")]
+    CallbackPanicked(CallbackPanic),
     #[error("SQLite connection and queue capacities must be greater than zero")]
     InvalidCapacity,
     #[error(transparent)]
@@ -103,6 +108,18 @@ pub enum SqliteError {
     #[error("pre-migration backup verification failed: {0}")]
     Backup(String),
 }
+impl SqliteError {
+    /// The callback's own panic, when this answer carries one: as
+    /// `CallbackPanicked`, or inside an `OperationRollback` when the request's
+    /// rollback then failed too. Resume it on the caller with `resume_unwind`.
+    pub fn callback_panic(&self) -> Option<&CallbackPanic> {
+        match self {
+            Self::CallbackPanicked(panic) => Some(panic),
+            Self::OperationRollback { operation, .. } => operation.callback_panic(),
+            _ => None,
+        }
+    }
+}
 pub type Result<T> = std::result::Result<T, SqliteError>;
 
 #[allow(
@@ -113,6 +130,7 @@ pub(crate) mod events;
 mod read_pool;
 mod writer;
 pub use read_pool::ReadPool;
+pub use writer::contain::CallbackPanic;
 pub use writer::failure::{
     Class, Failure, FailureSource, FailureState, FatalCause, Observation, Role, classify,
 };

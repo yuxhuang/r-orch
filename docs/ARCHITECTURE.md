@@ -1228,8 +1228,22 @@ clients <── WriteReceipt::wait() ──────────────�
   timeout, `BEGIN IMMEDIATE` transactions, and automatic checkpointing off (`sqlite/connection.rs`).
 - **Transaction.** The closure receives a borrowed `rusqlite::Transaction` and returns `sqlite::Result<T>`. An
   error from the closure rolls the transaction back, a commit error is returned the same way, and the worker
-  takes the next job. A panic in a closure rolls back, ends `run` and drops the `Writer`, which closes admission and
-  drops every queued job. Their receipts then return `WriterClosed`.
+  takes the next job. A panic in a closure submitted with `submit` rolls back, ends `run` and drops the `Writer`,
+  which closes admission and drops every queued job. Their receipts then return `WriterClosed`, or
+  `StorageUnavailable` when a fatal cause was latched.
+  `submit_contained` is the entry for a callback that must not end the writer (spec Amendment 3, issue 379). It wraps
+  the closure in `contain`, which catches that closure's own panic: the transaction rolls back, the receipt returns
+  `CallbackPanicked` for the caller to resume, nothing is latched and the writer serves the next job. Give it only the
+  caller's callback, never adapter setup, a `Clock` read or a completion check, which would then be taken for the
+  caller's panic. The `Storage` composition is to call the SQLite-private `contain` inside its own `submit` job, around
+  the user `WriteWork` alone; nothing outside tests calls either entry yet.
+  A leaf whose savepoint cleanup fails (the lease, intent, retry and message leaves) does not return an error that a
+  callback could catch and commit past. It unwinds with a typed `CleanupUnwind`, which `contain` reports to the failure
+  state, so that `SQLITE_CORRUPT` or `SQLITE_NOTADB` latches although the outer rollback would succeed, and then raises
+  again. `run` ends as for any other panic under `submit`. The operation's cause and the cleanup's are observed
+  separately (spec record O): the receipts return `StorageUnavailable` when either is fatal and so latched, and
+  `WriterClosed`, with nothing latched, when both are ordinary. A failed outer rollback after a callback panic keeps the payload, which the
+  caller can still reach with `SqliteError::callback_panic()`. A callback is trusted not to swallow an unwind itself.
 - **Queue.** `capacity` bounds the number of waiting transactions, not their bytes. A full queue, and a second
   waiting `Events` transaction, return `Overloaded` at once; the producer keeps its batch. Nothing coalesces
   events yet.
@@ -1296,8 +1310,9 @@ clients <── WriteReceipt::wait() ──────────────�
 
 **Limits of this slice** (follow-ups tracked in [issue 127](https://github.com/yuxhuang/r-orch/issues/127)):
 
-- No retry and no replay: a SQL error goes to its receipt. There is no shared fatal state, no failure
-  classification (spec R128, R140) and no distinction between a failed writer and a clean close.
+- No retry and no replay: a SQL error goes to its receipt. The retry of R128's retryable class and its 60 s and
+  second-`IOERR` fatal rules are not built; the shared failure state, the classification of R128 and R140 and the
+  `StorageUnavailable` answer of a latched writer are (`sqlite/writer/failure.rs`).
 - A closure must not issue `COMMIT`, `BEGIN` or `SAVEPOINT`, or any side effect outside the database. The executor
   does not detect it; a manual `COMMIT` can persist rows although the wrapper then reports an error. Side effects
   belong in `intents` rows (ADR 0017 decision 10), which do not exist yet.

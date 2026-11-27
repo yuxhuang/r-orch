@@ -201,10 +201,12 @@ pub(crate) fn claim_lease(
             tx.execute_batch("ROLLBACK TO orch_lease_claim; RELEASE orch_lease_claim")
         {
             // The borrowed Transaction cannot install hooks or mark its writer
-            // poisoned. Unwind instead of returning a catchable operation error:
-            // Writer drops the transaction and connection and closes receipts.
-            // In particular, never silently ignore failed cleanup and commit.
-            panic!("{operation}; SQLite lease cleanup failed: {cleanup}");
+            // poisoned. Unwind instead of returning a catchable operation error,
+            // so a caller can never ignore the failed cleanup and commit. The
+            // unwind is typed: the containing catch reports both errors to the
+            // failure state (a fatal cause latches) and raises it again, and the
+            // writer ends, drops the transaction and connection and closes receipts.
+            crate::sqlite::writer::contain::cleanup_failed(operation, cleanup);
         }
         return Err(operation.into());
     }

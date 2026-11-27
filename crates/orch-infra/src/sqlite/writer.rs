@@ -27,6 +27,15 @@
 //! write lock the open transaction holds. The latch is checked before
 //! `TransactionAborted` is chosen, so a latched request answers `StorageUnavailable`.
 //!
+//! `submit_contained` is the entry for a callback that must not end the writer
+//! (spec Amendment 3, issue 379; `contain`): a panic of the callback rolls the
+//! request back, is answered as `CallbackPanicked` for the caller to resume, and
+//! latches nothing, and the writer serves what follows. The typed unwind that a
+//! leaf raises when its savepoint cleanup fails is not that panic: it is adapter
+//! code, reported to the failure state (so a fatal cause latches although the
+//! outer rollback succeeds) and raised again, and the `Writer::run` behaviour
+//! below applies. `submit` keeps that behaviour for every panic.
+//!
 //! What it does not enforce, and the adapter integration must (issue 127, R128,
 //! R130): a callback is trusted not to perform external side effects; a callback
 //! that catches an error must report it with `FailureState::observe` before it
@@ -39,9 +48,11 @@
 //! producer invariants of R26 (bounded claim production, event coalescing) are
 //! the producer's. Blocking `WriteReceipt::wait` must not be called on an async
 //! runtime thread.
+pub(super) mod contain;
 pub(super) mod failure;
 use super::{ConnectionHandle, ConnectionRole, Result, SqliteError, Synchronous, open_connection};
 use crate::data_dir::DataDir;
+use contain::contain;
 use failure::{FailureSource, FailureState, FatalCause};
 use rusqlite::{DropBehavior, Transaction};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -432,8 +443,10 @@ impl<'a> Writer<'a> {
     }
 
     /// Drain accepted work, then return once admission is closed, either by
-    /// `WriterHandle::close` or by dropping the final client handle. A callback panic rolls
-    /// back its transaction and drops this worker, closing every queued receipt.
+    /// `WriterHandle::close` or by dropping the final client handle. A panic of a callback
+    /// submitted with `submit`, or the unwind of a leaf's failed savepoint cleanup under
+    /// either entry, rolls back its transaction and drops this worker, closing every queued
+    /// receipt (`submit_contained` contains the former and observes the latter).
     /// So does a request that leaves the connection inside a transaction (a failed
     /// rollback, latched as `FatalCause::RollbackLeftTransactionOpen` before the
     /// answer): the worker refuses what is queued with `StorageUnavailable`, then
@@ -471,6 +484,12 @@ impl<'a> Writer<'a> {
                 None => break,
             }
         }
+    }
+
+    /// The writer's own connection, for a test that injects a failure into it.
+    #[cfg(test)]
+    pub(in crate::sqlite) fn connection_for_test(&mut self) -> &mut rusqlite::Connection {
+        self.connection.for_migration()
     }
 
     /// The request has its answer, and a rollback that failed left this connection
@@ -611,6 +630,31 @@ impl WriterHandle {
             response: receiver,
             state: self.state.clone(),
         })
+    }
+
+    /// `submit` for a callback whose own panic must not end the writer (spec
+    /// Amendment 3, issue 379; `contain`): the panic rolls the request back and is
+    /// answered as `CallbackPanicked`, which the caller resumes, and the writer
+    /// serves what follows with no cause latched. The unwind of a leaf whose
+    /// savepoint cleanup failed is not contained: it is reported to the failure
+    /// state (a fatal cause latches) and raised again, and the worker ends as it
+    /// does for any panic outside the callback.
+    ///
+    /// Supply only the caller's callback here, never adapter setup, a setup
+    /// clock read or completion checks. Storage instead uses the SQLite-private
+    /// `contain` inside its `submit` job around the user `WriteWork` alone.
+    pub fn submit_contained<T, F>(
+        &self,
+        lane: Lane,
+        deadline: Option<Instant>,
+        work: F,
+    ) -> Result<WriteReceipt<T>>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Transaction<'_>) -> Result<T> + Send + 'static,
+    {
+        let state = self.state.clone();
+        self.submit(lane, deadline, move |tx| contain(&state, || work(tx)))
     }
 
     /// Close admission and drain previously accepted transactions. Idempotent.

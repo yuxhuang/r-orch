@@ -783,7 +783,11 @@ types; a callback does not see them.
    after it returns. No thread, task or scope receives it.
 3. Its body depends on no Tokio runtime: no `Handle::current()`, no `block_on`. `oneshot::Sender::send` needs none.
 4. A panic in it is contained by the SQLite adapter: the transaction rolls back, the awaiting caller observes the
-   panic, the writer thread survives and latches nothing, and the next write commits.
+   panic, the writer thread survives and latches nothing, and the next write commits. The catch surrounds the
+   invocation of the callback and nothing else. A leaf's failed savepoint cleanup is not a callback panic: it is
+   observed under record L, operation and cleanup separately, and raised again, and the writer ends: `WriterClosed` and
+   no latch when both causes are ordinary, a latch and `storage_unavailable` when either is fatal (spec "Amendment 3",
+   records N and O).
 
 **What changes for you.** Nothing at a call site that compiled before. Code that needs `UnitOfWork: Send` stops
 compiling and needs a design review, not the bound back. The workspace compile check that the PR carrying the

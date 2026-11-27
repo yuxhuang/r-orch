@@ -61,10 +61,19 @@ Facts read from `main` at `075f2b124`:
    transaction back so that nothing the callback did is committed, and lets the awaiting caller observe the panic by
    resuming it there (as the file reference does). The writer thread survives, no cause is latched in the failure
    state, and the next write on the same storage commits. This maps no panic to `storage_unavailable` and leaves
-   record L unchanged.
+   record L unchanged. The catch surrounds the invocation of the caller's callback and nothing else (record N,
+   2026-11-27): building the unit of work, its one read of the `Clock` and the check after a callback that returned
+   success run outside it, and a panic there is a panic of adapter code that is not contained. A leaf of the adapter
+   whose savepoint cleanup fails raises a typed unwind (`CleanupUnwind`) that is not contained either: it is observed
+   under record L, so that a fatal cause latches even when the outer rollback would succeed, and raised again, and
+   `Writer::run` ends the worker. Classification is by cause (record O, 2026-11-27): the operation's cause and the
+   cleanup's are observed separately. When both are ordinary the running and the queued requests are answered
+   `WriterClosed` and nothing is latched; when either is fatal it latches and they are answered `storage_unavailable`. If a callback panics and the outer rollback then fails, the payload
+   stays in the error and reaches the caller. The spec's "Amendment 3" states the consequences.
 6. **Proof is an obligation of the SQLite adapter's PR.** It must show decisions 2 to 5 with named tests: the vectors
-   A3-W2, A3-W3 and A3-W6 of the spec. The workspace compile check of the seven-bound diff (A3-W1) is a condition of
-   the PR that carries this record.
+   A3-W2, A3-W3 and A3-W6 of the spec, and A3-W7 to A3-W10 for the scope of the catch and the typed unwind in
+   decision 5 (the plan's steps 2 and 2a say which PR shows which). The workspace compile check of the seven-bound
+   diff (A3-W1) is a condition of the PR that carries this record.
 
 ## Consequences
 

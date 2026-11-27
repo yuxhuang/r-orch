@@ -183,6 +183,7 @@ fn walk(error: &SqliteError, out: &mut Observation) {
         | Overloaded
         | Store(_)
         | WriterClosed
+        | CallbackPanicked(_)
         | InvalidCapacity
         | Setting { .. }
         | NewerSchema { .. }
