@@ -127,6 +127,22 @@ reviewed or merged.
      merge commit for release PRs and multi-commit PRs whose commits are individually meaningful.
    - Never force-push `main`.
 
+### Owner’s review and merge rules of 2026-11-27
+
+- Each PR gets one independent code review. Add a security review only for untrusted input, file paths,
+  authorisation, importer, restore or process spawning. Skip separate per-PR resilience reviews, fact-checks,
+  review boards and CI-log verifier tasks.
+- Require green Linux `check` and `test` on the actual merge (`test` may skip for a CI-classified docs-only PR),
+  a `CLEAN` merge state and a short lead recommendation naming the head, base and merge tree.
+- If `main` moves and the unchanged head still merges cleanly, rerun only CI on the new merge. Review the delta
+  when the head changes. Use batch trains for independent PRs. Once #381 lands, CI fails fast on stale merge parents.
+- The supervising session checks each squash and watches the push to `main`. Skip separate landing and
+  terminal-main verifier tasks.
+- Review each subsystem’s changes on `main` since its last deep review after about 10 merged PRs or 10,000
+  changed lines. This rolling review never blocks a merge. File findings as issues and close or explicitly
+  defer them by the next milestone. Deep reviews gate T10 acceptance, T24 activation and T27 release.
+  Do not schedule a deep review per train or batch.
+
 ### Independent PRs, stacks and trains
 
 - **Base on `main`.** Branch every PR from current `main`. Independent PRs stay independent and are qualified
