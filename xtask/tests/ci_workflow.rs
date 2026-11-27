@@ -145,7 +145,7 @@ fn contract(ci: &str) {
     for lane in [test, ambient] {
         let restore = step(lane, "Restore nextest executable");
         assert!(restore.contains("id: nextest-cache\n"));
-        assert!(restore.contains("actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830"));
+        assert!(restore.contains("actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25"));
         assert!(restore.contains("path: ~/.nextest-bin/bin/cargo-nextest\n"));
         assert!(restore.contains("key: nextest-${{ runner.os }}-${{ runner.arch }}-0.9.152-${{ hashFiles('rust-toolchain.toml') }}"));
         assert!(!restore.contains("restore-keys:"));
@@ -159,7 +159,7 @@ fn contract(ci: &str) {
         );
         let save = step(lane, "Save nextest executable");
         assert!(save.contains("if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.nextest-cache.outputs.cache-hit != 'true'\n"));
-        assert!(save.contains("actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830"));
+        assert!(save.contains("actions/cache/save@caa296126883cff596d87d8935842f9db880ef25"));
         assert!(save.contains("path: ~/.nextest-bin/bin/cargo-nextest\n"));
         assert!(save.contains("key: ${{ steps.nextest-cache.outputs.cache-primary-key }}"));
     }
