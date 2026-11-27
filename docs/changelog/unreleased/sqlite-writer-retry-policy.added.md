@@ -1,0 +1,1 @@
+Add retained SQLite writer retries with the original deadline, same-transaction BUSY commit handling, structured outcome reconciliation, claim suppression and actual transaction accounting. Callbacks run at most once per submission; the daemon continues using file storage until the SQLite switch.
