@@ -241,4 +241,6 @@ impl<'a, 'conn> Intents<'a, 'conn> {
 }
 
 #[cfg(test)]
+mod contract_tests;
+#[cfg(test)]
 mod tests;
