@@ -1284,8 +1284,11 @@ clients <── WriteReceipt::wait() ──────────────�
   `SQLITE_IOERR` in a row, counted by the writer across logical requests and ended by a known commit or another SQL
   failure, and sixty seconds from an episode's first failure without a known commit latch
   `FatalCause::ConsecutiveIoErrors` and `FatalCause::RetryWithoutCommit`; the worker checks the sixty seconds every 50 ms. For each physical transaction
-  the writer counts the SQL changes and the execution time without its own waits, rollback included, and
-  `FailureState::writer_txn_over_bound_total()` rises once for more than 1,000 rows or 20 ms. A leaf's cleanup unwind is
+  the writer counts the SQL changes and the elapsed time, `COMMIT` included and without its own waits, rollback included, and
+  `FailureState::writer_txn_over_bound_total()` rises once for more than 1,000 rows or more than 20 ms of that time. The count
+  is of cost, not of cause: an ordinary event batch that the producer cut at 20 ms has by then run 20 ms of statements and a
+  `COMMIT`, so it is counted too, and the counter alone cannot tell it from an operation that cannot be cut (rows over 1,000
+  are specific to the latter, and only the per-transaction accounting shows them). A leaf's cleanup unwind is
   outside all of this (record O).
 - **Event producer** (`sqlite/events/producer.rs`, exported from `orch_infra::sqlite`; spec "As built: the event producer",
   plan "As built at `9b55edbf4`"; a development member of the integrated head `07fecf1ed`, not wired to the daemon or to a
@@ -1300,7 +1303,8 @@ clients <── WriteReceipt::wait() ──────────────�
   with a snapshot of the bound caller before it submits anything, and an answer that it cannot establish fails the
   producer closed and marks the batches in doubt (`SubmitFailure::outcome_unknown`). A stale lease or invalid events
   answer one batch alone; another failure of a coalesced transaction replans it with its first batch alone. The producer
-  never counts the rows and time of a transaction: the writer does, once. At most 16,384 events wait; past that
+  never counts the rows and time of a transaction: the writer does, once, and it counts a transaction that the producer cut by
+  time (the spec's "What the counter does not tell (I2)"). At most 16,384 events wait; past that
   `Rejected::Full` returns the batch to its collector. Not here: numbering at handover, the counters at start and stop, the
   collector's buffer and its gaps, pruning, an export of the counter and every caller in the daemon (T16).
 - **Receipts.** `wait` blocks and returns the closure's result. Dropping a receipt does not cancel the work: an
@@ -1365,7 +1369,7 @@ clients <── WriteReceipt::wait() ──────────────�
 - Claims always go first, so a steady stream of claims can delay every other lane. Bounded claim production is
   not implemented.
 - The writer cuts no bulk work to 1,000 rows or 20 ms and merges nothing (ADR 0017 decision 9): it only counts the actual
-  rows and time of each transaction, and the producer that owns the input owns the cut, the kept tail and the merge. The
+  rows and elapsed time (the `COMMIT` included) of each transaction, and the producer that owns the input owns the cut, the kept tail and the merge. The
   event producer does this for run events (bullet "Event producer" above); pruning, expiry and the importer's chunks have
   no producer yet, and nothing calls the event producer from the daemon.
 - Nothing checkpoints the WAL while the executor runs: automatic checkpointing is off, and the checkpoint

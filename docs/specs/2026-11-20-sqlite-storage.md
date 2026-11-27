@@ -455,7 +455,7 @@ holds them.
 | R24 | Exactly one connection shall write, every write shall start with `BEGIN IMMEDIATE`, and every other connection shall be read-only. | B6, B12 | must | `sqlite_connection::a_read_connection_refuses_writes`, `crates/orch-infra/tests/sqlite_writer.rs::writes_run_one_at_a_time_on_one_connection`; both |
 | R25 | A read shall see one consistent snapshot from its first statement to its last, whatever commits meanwhile. | B6 | must | `sqlite_writer::a_read_snapshot_does_not_see_a_later_commit`; both |
 | R26 | The writer shall always take a queued claim or lease transaction first, and otherwise the queued transaction with the earliest deadline, where the deadline is arrival plus 200 ms for entity changes, 1 s for events and 5 s for maintenance; a bulk job shall have at most one transaction queued at a time, and the event lane at most one for all runs together, holding the batches that wait, up to R27's bound. A claim shall therefore wait behind at most the one transaction in progress. That is an order and not a time: the waits of "Writer lanes" are targets that no check of 1.1 measures (the measurement of R5 is deferred: record I of "Owner's answers"), and a test with a fake clock proves the order only. | G; red team W1, W4 | must | `sqlite_writer::a_claim_runs_before_everything_queued` (fake clock), `::earliest_deadline_runs_first_among_the_other_lanes`, `::overdue_maintenance_does_not_delay_a_claim`, `::no_lane_starves_under_a_flood_of_another`, `::waiting_event_batches_share_one_transaction`; both |
-| R27 | Bulk work (event batches, pruning, expiry, import) shall be cut into transactions of at most 1,000 rows or 20 ms of work; an atomic operation over that bound shall run whole and be counted in `writer_txn_over_bound_total`, once for each indivisible transaction and not once for each attempt that a retry makes of it. The producer that owns the input cuts it at 1,000 rows or 20 ms, checking between statements, and keeps the part that is not yet committed. (AP8; record P) | G | must | `sqlite_writer::bulk_work_is_cut_at_1000_rows`, `::an_atomic_operation_over_the_bound_runs_whole_and_is_counted`; both |
+| R27 | Bulk work (event batches, pruning, expiry, import) shall be cut into transactions of at most 1,000 rows or 20 ms of work; an atomic operation over that bound shall run whole and be counted in `writer_txn_over_bound_total`, once for each transaction over the bound and not once for each attempt that a retry makes of it. The writer measures a transaction by its actual rows and its actual elapsed time, the `COMMIT` included, and counts it if it has more than 1,000 rows or took more than 20 ms; it does not ask why the transaction ended there, so an ordinary divisible batch that its producer cut at 20 ms is counted as well, and the counter alone does not identify an indivisible operation (I2, below). The producer that owns the input cuts it at 1,000 rows or 20 ms, checking between statements, and keeps the part that is not yet committed. (AP8; record P) | G | must | `sqlite_writer::bulk_work_is_cut_at_1000_rows`, `::an_atomic_operation_over_the_bound_runs_whole_and_is_counted`; both |
 | R28 | A side effect outside the database shall be written as an `intents` row in the transaction that decides it, performed after the commit, and marked done; an intent left by a stopped daemon shall be handled at the next start as its kind states in "Transactions and intents". | G, H | must | `crates/orch-engine/tests/intents.rs::intent_is_written_with_its_change`, `::pending_intent_is_handled_after_restart`, `::a_repeated_intent_has_no_second_effect`; both |
 | R29 | The data directory shall have the layout and modes in "Data directory"; the daemon shall create it with those modes and refuse to start when it exists with group or other access or another owner. | B5 | must | `crates/orch-daemon/tests/daemon_data_dir.rs::layout_and_modes_are_as_specified`, `::a_directory_open_to_others_is_refused`; both |
 | R30 | When a daemon or an offline command is pointed at a data directory that another holds, it shall change nothing, exit 4 and print the holder's kind, pid and start time. | B5, G6 | must | `crates/orch-daemon/tests/daemon_data_dir.rs::second_daemon_refuses_and_names_the_holder`, `crates/orch-cli/tests/db_offline.rs::offline_command_refuses_while_a_daemon_holds_the_directory`; both |
@@ -2774,7 +2774,8 @@ to disk before it is queued (R129), so neither a failed writer nor a restart los
 
 **What the lanes do not bound.** The lanes fix an order. The waits in the table are budgets, and only a
 measurement shows whether a platform meets them (R5, R63). R27's 20 ms is checked between statements: a
-statement that is running, and a commit, are not cut short, and the first measurement saw both take hundreds
+statement that is running, and a commit, are not cut short, so a transaction that the producer cut at 20 ms has taken longer
+than 20 ms by the end of its commit, and the first measurement saw both take hundreds
 of milliseconds on macOS (AP13). No requirement here derives a time from the order. Since the owner's
 decision of 2026-11-21 no such measurement is part of 1.1 (record I of "Owner's answers"): the waits stay
 as written, as the deadlines that order lanes 2 to 4 and as figures that the writer's metrics show, and
@@ -2946,11 +2947,12 @@ after three defects were found in it (the last bullet below lists them). What it
   `sqlite::writer::tests::a_known_commit_breaks_the_writer_ioerr_streak_between_requests`,
   `reader_and_artifact_sql_failures_cannot_contaminate_transaction_observation`.
 - *Accounting (R27).* For each physical transaction the writer counts the changes SQLite reports for the connection from
-  the end of `BEGIN` to the end of the attempt, rollback included (so work that was rolled back still counts), and the
-  elapsed time of the same span without the writer's own backoff waits. `WriteAttempt.accounting` returns both, and
-  `FailureState::writer_txn_over_bound_total()` rises once for a transaction with more than 1,000 rows or more than 20 ms.
+  the end of `BEGIN` to the end of the attempt, the `COMMIT` or the rollback included (so work that was rolled back still counts), and the
+  elapsed time of the same span, `COMMIT` included, without the writer's own backoff waits. `WriteAttempt.accounting` returns both, and
+  `FailureState::writer_txn_over_bound_total()` rises once for a transaction with more than 1,000 rows or more than 20 ms of that elapsed time.
   A `COMMIT` retried in place is the same transaction and counts once; a rebuilt transaction is a new one and reports
-  its own work. The producer cuts its input and keeps its tail; the writer cuts nothing. Nothing exposes the counter
+  its own work. The producer cuts its input and keeps its tail; the writer cuts nothing. The count measures what a
+  transaction cost, not why it ended: see "The cut (R27)" and "What the counter does not tell (I2)" below. Nothing exposes the counter
   outside the library yet.
 - *Three readings that the source builds (a built choice, not a new owner decision and not a hold).* At three points the
   wording of R128 is silent or can be read either way, and the source at `2a7cb83e4` reads each as follows. (1) Every lane
@@ -2998,10 +3000,34 @@ schema and no authentication, and it changes no class, time or limit of R26, R27
   reference, so that a transaction holds at most 1,000 rows; exactly 1,000 are one transaction and the 1,001st is the tail.
   The time is read between statements, never inside one, from `EventProducerOptions::now`; a statement holds at most 32
   events, or one event that has a blob, and one statement always runs, so the grain of the 20 ms cut is that statement. A
-  transaction that runs over the bound by one long statement is not interrupted: the writer counts its actual rows and time
-  once in `writer_txn_over_bound_total`, and the producer counts nothing, so a retry never counts it twice (R27). What is
+  transaction that runs over the bound by one long statement is not interrupted. The writer counts the actual rows and the
+  actual elapsed time of every transaction, once, in `writer_txn_over_bound_total`, and the producer counts nothing, so a retry
+  never counts it twice (R27). The elapsed time includes the `COMMIT`, and a time cut is taken only after 20 ms of statements
+  have run, so a transaction that the producer cut by time is over the writer's 20 ms bound and is counted, although the cut
+  worked as intended (see below). What is
   not committed is kept in order and planned again. At most 16,384 events wait (`queue_limit`); a batch that would pass that
   is returned as `Rejected::Full` for its collector to keep (R63), and an empty queue accepts a batch of any size.
+- *What the counter does not tell (I2; decided 2026-11-27, the writer's accounting is kept).* The writer's predicate is
+  `rows > 1000 || work > 20 ms`, where `work` is the elapsed time from the end of `BEGIN` to the end of the attempt, the
+  `COMMIT` included, less the writer's own backoff waits (`writer/policy.rs`, `accounting`; `writer.rs`, `execute_episode`).
+  The producer's time cut is taken at the start of the next statement, when at least 20 ms of statements have run, and the
+  `COMMIT` then adds more, so with the system clock every transaction that the producer cut by time is over the writer's
+  20 ms and is counted once, although the cut worked as intended. The independent review of the integrated head recorded 11
+  increments for 11 time-cut transactions in one probe. A second probe on Linux, with the system clock, three runs of 6,000
+  events in three batches, counted 8 of 8 time-cut transactions in each run (640 to 736 rows, 20.2 to 21.5 ms of elapsed
+  time); the ninth, last transaction, which the producer did not cut, was counted in one run of the three (464 rows,
+  28.1 ms; the other two took 8.9 and 13.7 ms and were not). So a transaction that the producer did not cut by time can be
+  counted as well (its last statement or its commit ran long), and one cut by rows can be counted if it was slow. Read the counter as the number of transactions that cost more than the
+  bound, whatever ended them. It cannot tell an ordinary divisible event batch from an indivisible operation. The only
+  signal in the counter that is specific to an operation that cannot be cut is rows over 1,000, which the producer never
+  plans; that figure is in the per-transaction accounting (`WriteAttempt.accounting`, `TransactionReport.accounting`), not
+  in the counter. The review's suggestion to cut earlier, by an estimate of the longest statement, was not adopted: it
+  would change the metric's contract, and a cut that ends under 20 ms could still be counted when its last statement or
+  its commit ran long. AP8's words "lane waits are budgeted only while that count is zero" were written when only an
+  operation over the bound could raise the counter; a nonzero count no longer shows that such an operation ran, and
+  whether those words should change is not decided here. Nothing exposes the counter outside the
+  library yet, so no alarm reads it. The test helper `assert_counted_by_time_alone` compares the counter with the writer's own `over_bound` flag
+  and so asserts neither that a time cut is counted nor that it is not.
 - *Rebuild.* The producer opens its retained write on the `Events` lane with no deadline, so that the one-second budget
   that `Storage::write` gives the lane does not apply to it; the writer's queue order is its arrival plus the lane's
   budget in either case, and an episode is bounded by the sixty seconds and the latches of R128. After a confirmed noncommit
