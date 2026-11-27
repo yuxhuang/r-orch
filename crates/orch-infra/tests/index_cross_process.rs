@@ -116,6 +116,7 @@ fn collect_round(
     writers: &mut ProbeWriters,
     round: Option<usize>,
     budget: Duration,
+    retries: &mut usize,
 ) -> Result<(), String> {
     let deadline = Instant::now() + budget;
     let mut completed = BTreeSet::new();
@@ -143,7 +144,18 @@ fn collect_round(
                 round: retry,
                 error,
             }) if round == Some(retry) => {
-                eprintln!("writer={writer} round={retry} retryable save error: {error}");
+                *retries += 1;
+                let diagnostic = format!(
+                    "writer={writer} round={retry} retries={retries} retryable save error: {error}"
+                );
+                eprintln!("{diagnostic}");
+                // One isolated acquisition timeout is tolerable; a shared counter
+                // across all writers and rounds keeps repeated lock stalls red.
+                if *retries > 1 {
+                    return Err(format!(
+                        "{diagnostic}; retry ceiling exceeded (maximum 1 per iteration)"
+                    ));
+                }
             }
             Ok(Progress::Failed { round, error }) => {
                 return Err(format!("writer={writer} round={round} save error: {error}"));
@@ -161,12 +173,80 @@ fn collect_round(
     Ok(())
 }
 
+fn scripted_round(
+    retries: &mut usize,
+    round: usize,
+    retry_writers: &[usize],
+) -> Result<(), String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for &writer in retry_writers {
+        tx.send((
+            writer,
+            Ok(Progress::Retry {
+                round,
+                error: "injected timeout".into(),
+            }),
+        ))
+        .unwrap();
+    }
+    for writer in 0..WRITERS {
+        tx.send((writer, Ok(Progress::Saved { round }))).unwrap();
+    }
+    let mut writers = ProbeWriters {
+        children: Vec::new(),
+        readers: Vec::new(),
+    };
+    collect_round(
+        &rx,
+        &mut writers,
+        Some(round),
+        Duration::from_secs(1),
+        retries,
+    )
+}
+
+#[test]
+fn one_isolated_retry_is_tolerated_across_later_rounds() {
+    let mut retries = 0;
+    scripted_round(&mut retries, 0, &[]).unwrap();
+    scripted_round(&mut retries, 1, &[2]).unwrap();
+    scripted_round(&mut retries, 2, &[]).unwrap();
+    assert_eq!(retries, 1);
+}
+
+#[test]
+fn second_retry_in_one_round_fails_for_same_or_different_writers() {
+    for retry_writers in [[1, 1], [1, 3]] {
+        let mut retries = 0;
+        let error = scripted_round(&mut retries, 3, &retry_writers).unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "writer={} round=3 retries=2 retryable save error: injected timeout; retry ceiling exceeded (maximum 1 per iteration)",
+                retry_writers[1]
+            )
+        );
+    }
+}
+
+#[test]
+fn second_retry_in_a_later_round_exceeds_the_iteration_ceiling() {
+    let mut retries = 0;
+    scripted_round(&mut retries, 0, &[1]).unwrap();
+    let error = scripted_round(&mut retries, 5, &[2]).unwrap_err();
+    assert_eq!(
+        error,
+        "writer=2 round=5 retries=2 retryable save error: injected timeout; retry ceiling exceeded (maximum 1 per iteration)"
+    );
+}
+
 fn run_writers(
     root: &std::path::Path,
     fault: &str,
     budget: Duration,
     attempts: usize,
-) -> Result<(), String> {
+) -> Result<usize, String> {
+    let mut retries = 0;
     let (tx, rx) = std::sync::mpsc::channel();
     let mut writers = ProbeWriters {
         children: Vec::new(),
@@ -219,13 +299,19 @@ fn run_writers(
         writers.children.push(Writer(child));
     }
     drop(tx);
-    collect_round(&rx, &mut writers, None, Duration::from_secs(30))?;
+    collect_round(
+        &rx,
+        &mut writers,
+        None,
+        Duration::from_secs(30),
+        &mut retries,
+    )?;
     for round in 0..TASKS {
         for (writer, child) in writers.children.iter_mut().enumerate() {
             writeln!(child.0.stdin.as_mut().unwrap(), "save")
                 .map_err(|error| format!("writer={writer} round={round} send: {error}"))?;
         }
-        collect_round(&rx, &mut writers, Some(round), budget)?;
+        collect_round(&rx, &mut writers, Some(round), budget, &mut retries)?;
     }
     for (id, writer) in writers.children.iter_mut().enumerate() {
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -242,7 +328,7 @@ fn run_writers(
             std::thread::yield_now();
         }
     }
-    Ok(())
+    Ok(retries)
 }
 
 fn snapshot(paths: &Paths) -> (BTreeSet<String>, BTreeSet<String>) {
@@ -290,7 +376,8 @@ fn simultaneous_task_saves_keep_every_durable_task_in_the_index() {
             indexed.len(),
             missing.len()
         );
-        result.unwrap();
+        let retries = result.unwrap();
+        println!("PROBE iteration={iteration} retries={retries}");
         assert_eq!(
             durable.len(),
             WRITERS * TASKS,
