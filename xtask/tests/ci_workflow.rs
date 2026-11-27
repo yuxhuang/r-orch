@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const CI: &str = include_str!("../../.github/workflows/ci.yml");
-const TEST_IF: &str = "${{ !cancelled() && (github.event_name != 'pull_request' || (needs.preflight.result == 'success' && needs.preflight.outputs.merge != '')) && github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all') }}";
+const TEST_IF: &str = "${{ !cancelled() && (github.event_name != 'pull_request' || (needs.preflight.result == 'success' && needs.preflight.outputs.merge != '' && needs.preflight.outputs.base != '')) && github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all') }}";
 const AMBIENT_IF: &str = "github.event_name == 'push' && github.ref == 'refs/heads/main'";
 /// The workspace's path inside a job container, on GitHub-hosted and
 /// self-hosted runners alike. The `github.workspace` context holds the host's
@@ -102,9 +102,15 @@ fn contract(ci: &str) {
     assert!(preflight.contains("      merge: ${{ steps.verify.outputs.merge }}\n"));
     assert!(preflight.contains("        run: bash scripts/ci/pr_merge_preflight.sh\n"));
     assert!(!preflight.contains("cargo "));
+    assert!(preflight.contains("      base: ${{ steps.verify.outputs.base }}\n"));
+    assert!(
+        preflight.contains("          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}\n")
+    );
+    assert!(preflight.contains("          GH_TOKEN: ${{ github.token }}\n"));
+    assert!(preflight.contains("    timeout-minutes: 5\n"));
     let changes = job(ci, "changes");
     assert!(changes.contains("    needs: preflight\n"));
-    assert!(changes.contains("    if: ${{ !cancelled() && github.event_name != 'schedule' && (github.event_name != 'pull_request' || (needs.preflight.result == 'success' && needs.preflight.outputs.merge != '')) }}\n"));
+    assert!(changes.contains("    if: ${{ !cancelled() && github.event_name != 'schedule' && (github.event_name != 'pull_request' || (needs.preflight.result == 'success' && needs.preflight.outputs.merge != '' && needs.preflight.outputs.base != '')) }}\n"));
     for name in ["changes", "check", "test"] {
         assert!(
             job(ci, name)
@@ -115,6 +121,8 @@ fn contract(ci: &str) {
     let test = job(ci, "test");
     let ambient = job(ci, "ambient");
     assert!(changes.contains("fetch-depth: 0"));
+    assert!(changes.contains("          PR_BASE: ${{ needs.preflight.outputs.base }}\n"));
+    assert!(!changes.contains("github.event.pull_request.base.sha"));
     assert!(changes.contains("--base \"$PR_BASE\" --format github"));
     assert!(changes.contains("printf 'mode=all\\n'"));
     assert!(check.contains("    needs: [preflight, changes]\n    if: always()\n"));
@@ -467,6 +475,7 @@ fn classification_guard_executes_fail_closed_truth_table() {
                             ("REF", reference),
                             ("PREFLIGHT_RESULT", "success"),
                             ("PREFLIGHT_MERGE", "verified-merge"),
+                            ("PREFLIGHT_BASE", "verified-base"),
                             ("CHANGES_RESULT", result),
                             ("MODE", mode)
                         ]
@@ -486,6 +495,7 @@ fn classification_guard_executes_fail_closed_truth_table() {
             ("REF", "refs/pull/1/merge"),
             ("PREFLIGHT_RESULT", "success"),
             ("PREFLIGHT_MERGE", "verified-merge"),
+            ("PREFLIGHT_BASE", "verified-base"),
             ("CHANGES_RESULT", "failure"),
             ("MODE", "all")
         ]
