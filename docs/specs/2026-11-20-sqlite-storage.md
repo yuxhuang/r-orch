@@ -848,7 +848,8 @@ unchanged, and nothing below applies to it. What is written here is the contract
 `main` and wired to nothing: the inline arm (PR #376, `78846fed8`) and the key-taking entry of the three leaves
 (PR #377, `110002d86`). The table of retained entries and entries by lookup, the binding of a cursor in a page, the
 unfiltered identity scan with its tuple comparison, and the wire into `Storage` do not exist, so no vector has run
-end to end and no list returns a cursor of these eight families (issue 370; plan "Non-Task cursors", steps 4 and 5).
+end to end and no SQLite list returns a cursor of these eight families (issue 370; plan "Non-Task cursors", steps 4
+and 5). The test-only file reference and the memory fake already issue cursors for these families.
 
 The owner's words, as the lead recorded them. The answer to the two decisions of the lead's eighth escalation of this
 goal was "d1 approve; d2 - p / all new refusals and 64KiB rule are acceptable" (D2 approves option P for the eight
@@ -1038,14 +1039,15 @@ owner's live copy and nothing beyond this wording.
     another shape than the selection's is `InvalidCursor`, decided before any row is read. `key_of`'s identity shape is
     not a family check: it returns the identity of any record, so the caller must already have bound the family (the
     token's digest does that), and `Some(key)` is not evidence that a row is of the requested family.
-  - *Left to the page PR and the table.* The cursor encoding and its binding, the inline expiry, the retained and lookup
-    table, the identity scan and tuple comparison of the lookup arm, authorization of the caller and the derivation of
-    the project from it before any row access, and a bridge from the encoder's `Layout`, `Tuple` and `Component` to
-    each leaf's `OrderKey`. `Layout::compare` of the encoder and each leaf's own `cmp_key` are separate
-    implementations of one order. Each is pinned to a hand-written expected order, but no test in the tree runs one
-    against the other (a reviewer's local probe agreed on 271,068 pairs and was not merged), so the page PR keeps an
-    all-shapes equivalence test or unifies them (issue 378). The encoder's own `Layout::compare` doc calls itself
-    "the one definition" for the leaves, which is not what is built until then.
+  - *Left to the page PR and the table.* Using the encoder's inline token (PR #376, built) in a page and binding it to
+    the validated request, the retained and lookup table, the identity scan and tuple comparison of the lookup arm,
+    authorization of the caller and the derivation of the project from it before any row access, and a bridge from the
+    encoder's `Layout`, `Tuple` and `Component` to each leaf's `OrderKey`. `Layout::compare` of the encoder and each
+    leaf's own `cmp_key` are separate implementations of one order. Each is pinned to a hand-written expected order,
+    but no test in the tree runs one against the other (a reviewer's local probe agreed on 271,068 pairs and was not
+    merged), so the page PR keeps an all-shapes equivalence test or unifies them (issue 378). The encoder's module doc
+    (`non_task_cursor/mod.rs`) calls `Layout::compare` "the one definition" of "after the anchor" for the leaves, which
+    is not what is built until then.
 - *The refusals.* A cursor of these eight families is refused, as `InvalidCursor`, only when it is: malformed, or
   bound to another project, generation, family, filter or sort, or to another adapter instance (the nonce); expired by
   the rules of "Time"; no longer held (evicted, or the adapter was stopped and built again); or in the arm by lookup
