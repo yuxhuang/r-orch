@@ -780,7 +780,8 @@ them.
 **Rules for a callback.**
 
 1. It is an owned `Send + 'static` closure, invoked once on the writer when admitted, never replayed, and never
-   invoked when the backend refuses admission.
+   invoked when the backend refuses admission. A retry by the writer of its own `BEGIN` or `COMMIT` does not invoke it
+   again (spec R128, record P); work that must be redone is a new request.
 2. The `&mut dyn UnitOfWork` it receives, and anything borrowed from it, is used on the thread that runs it, and not
    after it returns. No thread, task or scope receives it.
 3. Its body depends on no Tokio runtime: no `Handle::current()`, no `block_on`. `oneshot::Sender::send` needs none.
