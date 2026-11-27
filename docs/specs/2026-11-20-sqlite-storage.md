@@ -246,6 +246,12 @@ refusal of a leaf may commit its unrelated work. It leaves one question open and
 cleanup (record O). It states nothing about the event producer, which is not built. No independent review had read this
 revision when it was written.
 
+The revision that carries this paragraph states, as built, the first event producer: the commit `9b55edbf4` on the writer
+of `2a7cb83e4`, in the integrated development head `07fecf1ed` ("As built: the event producer" under "When a transaction
+fails"). It changes no rule of records O and P, no class, time or limit of R26, R27, R63 or R128, no trait, no schema and no
+other requirement. It is a development member, not wired to the daemon or to a collector, and it is not the T10 freeze or
+the acceptance of issue 127. No independent review had read this revision when it was written.
+
 ## Source
 
 Verbatim excerpts of the owner's request as recorded in the goal "orch 2.0 phase 1: SQLite storage (release
@@ -2898,7 +2904,8 @@ after three defects were found in it (the last bullet below lists them). What it
   has none (a daemon-owned operation): the deadline is never renewed, and one that has passed ends the token (read from the source;
   no test). `Storage::write` is one `attempt` of its own retained write with the lane
   budgets of 50 ms, 200 ms, 1 s and 5 s, so an ordinary caller gets the in-place `BEGIN` and `COMMIT` retries and the
-  error of anything else; the first producer that rebuilds is the event producer of issue 127, which is not built.
+  error of anything else; the first producer that rebuilds is the event producer of issue 127 ("As built: the event
+  producer" below).
   Tests: `unknown_real_commit_requires_same_caller_snapshot_reconciliation`,
   `cancelled_await_recovers_one_receipt_without_replaying_the_callback`,
   `no_new_deadline_or_callback_after_one_terminal_withdrawal`.
@@ -2968,9 +2975,56 @@ after three defects were found in it (the last bullet below lists them). What it
   `Entities` write queued behind an open episode is answered `overloaded` after 1.56 s, when the episode resumed, which is
   the choice (1) above and was never a defect. The expiry of a settled token was not probed again: it has its permanent
   test.
-- *Not built here.* The event producer (the coalescing of several runs, the cut at 1,000 rows or 20 ms with the kept tail,
-  the sequence reconciliation: vector WP9), the deterministic admission fixtures of issue 408 (the source does not change
-  them), the final proofs of issue 127 and the other callers of record P.
+- *Not built here.* At `2a7cb83e4` the event producer (the coalescing of several runs, the cut at 1,000 rows or 20 ms with
+  the kept tail, the reconciliation of an unknown commit: vector WP9) was not built; it is built at `9b55edbf4`, below. Still
+  not built: the final proofs of issue 127 and the other callers of record P. The deterministic admission fixtures of issue
+  408, which the source of `2a7cb83e4` does not change, are in the integrated head `07fecf1ed`.
+
+**As built: the event producer (issue 127, T16's first slice, record P item 2; a development input, not the T10 freeze).**
+`EventProducer` (`crates/orch-infra/src/sqlite/events/producer.rs`, exported from `orch_infra::sqlite`) is the first caller of
+the retained write. It exists on the integrated development head `07fecf1ed` as the commit `9b55edbf4` on the writer of
+`2a7cb83e4`; it is read from the source and its tests on Linux, it is not wired to the daemon (which uses files) or to a
+collector, and it is not reviewed or accepted here: no T10 vector and no proof of issue 127 is accepted. It adds no trait, no
+schema and no authentication, and it changes no class, time or limit of R26, R27, R63 or R128. The plan's "As built at
+`9b55edbf4`" lists its tests and what the head's runs showed, including a whole `fast` run of that head that failed.
+- *Coalescing and isolation (R26).* One task owns every numbered batch (`EventBatch`: caller, run, lineage, epoch and the
+  events, each with its sequence number) until the writer has answered for it, and it has at most one transaction in
+  flight, so the event lane holds the one transaction that R26 allows. Everything that waits goes into the next
+  transaction in arrival order, of any number of runs and up to R27's bound, with each run's events in their order; a
+  transaction has one caller, so a batch of another caller or project waits, and a later batch of a run never overtakes an
+  earlier one that still waits. A batch whose lease is stale (`StaleEpoch`) or whose events are invalid is answered alone
+  and wrote nothing; the other batches of the transaction commit. An empty batch takes a turn so that its lease is checked.
+- *The cut (R27).* Rows are planned from each event's stored form, one row or two when its payload goes behind a blob
+  reference, so that a transaction holds at most 1,000 rows; exactly 1,000 are one transaction and the 1,001st is the tail.
+  The time is read between statements, never inside one, from `EventProducerOptions::now`; a statement holds at most 32
+  events, or one event that has a blob, and one statement always runs, so the grain of the 20 ms cut is that statement. A
+  transaction that runs over the bound by one long statement is not interrupted: the writer counts its actual rows and time
+  once in `writer_txn_over_bound_total`, and the producer counts nothing, so a retry never counts it twice (R27). What is
+  not committed is kept in order and planned again. At most 16,384 events wait (`queue_limit`); a batch that would pass that
+  is returned as `Rejected::Full` for its collector to keep (R63), and an empty queue accepts a batch of any size.
+- *Rebuild.* The producer opens its retained write on the `Events` lane with no deadline, so that the one-second budget
+  that `Storage::write` gives the lane does not apply to it; the writer's queue order is its arrival plus the lane's
+  budget in either case, and an episode is bounded by the sixty seconds and the latches of R128. After a confirmed noncommit
+  with a retryable cause it builds the same transaction again from the retained input as a new request of the same episode.
+  An `overloaded` that the writer's queue gives at admission ran nothing, and the submission is tried again after 25 ms,
+  doubling to 250 ms, without a limit. Another failure while the writer has not failed answers one batch: a coalesced
+  transaction is planned again with its first batch alone.
+- *Reconcile.* After an unknown commit nothing is submitted until the database has answered: a snapshot of the bound caller
+  reads the sequence range that each step stored and compares each event with its input. All found: the commit happened.
+  None found: a rebuild if the cause was retryable, and an answer of failure if not. Some found, a stored event that differs
+  or a read that fails is an error, tried up to five times (20 ms, doubling), and the producer then fails closed: it answers
+  every waiting batch with its counts, refuses later submissions (`Rejected::Closed`) and sets
+  `SubmitFailure::outcome_unknown` on the batches of the transaction whose commit it could not establish, which a collector
+  must not turn into a gap row (R139). A writer that has latched a failure ends the producer the same way.
+- *Not built here.* The numbering of an event at its handover and the counters at start and stop (R61, R139), the collector's
+  buffer and its gaps (R63), pruning, an export of the counter, and every caller in the daemon (T16's remaining work). R127's
+  age-and-backlog rule and the checkpoint job have no code. A reconciliation of a step that mixes duplicates that an
+  earlier commit had stored with new rows has no test (a reading of the source that its review has been asked about, not a
+  finding). The failures of its tests are injected through the writer's test-only commit probe; no real `SQLITE_FULL` or
+  `SQLITE_IOERR` is provoked. The tests that R26 and R27 name in their rows exist under the module path
+  `sqlite::events::tests::producer` and not `sqlite_writer`: `waiting_event_batches_share_one_transaction`,
+  `bulk_work_is_cut_at_1000_rows` and `an_atomic_operation_over_the_bound_runs_whole_and_is_counted`; the other tests that
+  R26's row names are not claimed here.
 
 **A failed top-level rollback** (R128; the owner's ruling of 2026-11-24, record L). The writer rolls back the
 transaction of a request that ended in an error, and the transaction of a retryable failure before it tries again. If that
@@ -5318,8 +5372,10 @@ lifetime of a reader's snapshot that answers no id and changes none of the answe
     releases no hold on issue 127, T10 acceptance, activation or release, and changes no other row of R128: the classes, the
     times, the idle-writer rule, the finish spool and the latch stand as written.
   - *What was built afterwards.* A development implementation of item 1 exists at `2a7cb83e4` and is described under
-    "When a transaction fails" ("As built: the retained writer"); it is not reviewed or accepted. Item 2's event
-    producer is not built.
+    "When a transaction fails" ("As built: the retained writer"); it is not reviewed or accepted. A development
+    implementation of item 2's event producer exists at `9b55edbf4` (integrated head `07fecf1ed`) and is described under
+    "As built: the event producer"; it is not wired, reviewed or accepted. The remaining collection and the other callers
+    are not built.
 
 "As recommended" means, for O1 to O10, AP1 to AP13 and D1 to D8, the recommendation and its condition in
 the approval request of 2026-11-20; and for AP14 to AP20, which that request did not hold, the
