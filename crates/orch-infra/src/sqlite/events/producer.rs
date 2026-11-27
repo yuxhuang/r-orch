@@ -1621,6 +1621,20 @@ mod tests {
     }
 
     #[test]
+    fn encoded_planner_costs_use_the_physical_inline_boundary() {
+        let events = [encoded_to(65_535), encoded_to(65_536), encoded_to(65_537)];
+        let measured = Measure::of(&events, usize::MAX).unwrap();
+        assert_eq!(measured.costs.as_ref(), &[1, 1, 2]);
+        assert_eq!(measured.bytes, 65_535 + 65_536 + 65_537);
+        for (encoded, original) in measured.events.iter().zip(events) {
+            assert_eq!(
+                encoded.payload.as_bytes(),
+                serde_json::to_vec(&original.event).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn the_blob_threshold_is_pinned_at_equality_and_the_size_is_the_encoded_one() {
         // `placement` keeps 65,536 bytes inline and sends one more behind a blob.
         let at = |total| row_cost(&encoded_to(total).event, usize::MAX).unwrap();
