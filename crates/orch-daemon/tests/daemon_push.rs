@@ -835,7 +835,9 @@ async fn big_events_overflow_the_byte_budget_before_the_count_cap_and_control_st
 
 /// One budget for the whole healthy stream, including producer scheduling.
 /// Unlike 1,200 per-event guards, this also bounds a trickling broken stream.
-const HEALTHY_DELIVERY_GUARD: Duration = Duration::from_secs(60);
+/// The 180 s cap leaves over 4x margin on a 40.714 s hosted pass and over
+/// 2x on a historical 70.42 s failed run, while still bounding missing events.
+const HEALTHY_DELIVERY_GUARD: Duration = Duration::from_secs(180);
 
 async fn healthy_delivery(
     healthy: &mut Wire,
@@ -895,7 +897,7 @@ fn healthy_wire_pair() -> (Wire, UnixStream, Sub) {
 }
 
 #[tokio::test(start_paused = true)]
-async fn healthy_delivery_keeps_a_partial_frame_across_the_old_event_deadline() {
+async fn healthy_delivery_keeps_a_partial_frame_across_the_old_event_and_stream_deadlines() {
     let (mut wire, mut peer, sub) = healthy_wire_pair();
     let acknowledged = AtomicU32::new(1);
     let delivery = healthy_delivery(&mut wire, &sub, 1, &acknowledged);
@@ -903,7 +905,8 @@ async fn healthy_delivery_keeps_a_partial_frame_across_the_old_event_deadline() 
         peer.write_all(b"{\"ev\":{\"subscription\":1,")
             .await
             .unwrap();
-        tokio::time::advance(EVENT_GUARD + Duration::from_secs(1)).await;
+        // Cross both the old 4 s event guard and the old 60 s stream cap.
+        tokio::time::advance(Duration::from_secs(75)).await;
         peer.write_all(b"\"seq\":1,\"commit_seq\":42}}\n")
             .await
             .unwrap();
