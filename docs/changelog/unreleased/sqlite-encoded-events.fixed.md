@@ -1,0 +1,1 @@
+Retain serialized run-event batches within the producer budget, including in-flight payloads and metadata, while admitting an indivisible event through the inclusive blob limit regardless of JSON shape.

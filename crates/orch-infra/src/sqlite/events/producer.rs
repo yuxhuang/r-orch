@@ -118,13 +118,16 @@ const QUEUE_LIMIT_BYTES: usize = 4 * MAX_BLOB_BYTES as usize;
 /// slots (the queue's growth), three `Slice` copies (the plan and its attempts),
 /// its `Charge`, and 256 bytes for the `Arc` headers, the reply channel and the
 /// fixed metadata.
-const BATCH_FIXED_BYTES: usize =
-    4 * size_of::<Pending>() + 3 * size_of::<Slice>() + size_of::<Charge>() + 256;
+const BATCH_FIXED_BYTES: usize = 4 * size_of::<Pending>()
+    + 8 * size_of::<Slice>()
+    + size_of::<Charge>()
+    + 8 * size_of::<Caller>()
+    + 1024;
 /// What a waiting event holds besides its encoded payload: its `EncodedEvent`
 /// record, its cost byte, one `Step`, one `EncodedExpected`, and 64 bytes for
 /// metadata and copy overhead.
 const EVENT_FIXED_BYTES: usize =
-    size_of::<EncodedEvent>() + 1 + size_of::<Step>() + size_of::<EncodedExpected>() + 64;
+    size_of::<EncodedEvent>() + 1 + 4 * (size_of::<Step>() + size_of::<EncodedExpected>()) + 64;
 /// Reserve for the original caller/run allocations and their simultaneous
 /// plan, attempt, reconciliation and report copies. Clones have no more live
 /// bytes than the original capacities counted here.
@@ -1331,6 +1334,75 @@ mod tests {
 
     fn small(n: u64) -> Vec<SequencedEvent> {
         (1..=n).map(|seq| event(seq, 8)).collect()
+    }
+
+    #[test]
+    fn metadata_reserve_covers_simultaneous_vector_capacities() {
+        let n = 257usize;
+        let mut batch = batch_of(caller("p", "o"), "r", "l", 0);
+        batch.events = (1..=n as u64)
+            .map(|seq| event(seq, INLINE_TEXT_MAX_BYTES + 1))
+            .collect();
+        let reserved = batch.fixed_bytes();
+        let q = queue(vec![pending(1, batch.caller, &batch.run, batch.events)]);
+        let plan = next_plan(&q, 1, false).unwrap();
+        let attempt_slices = plan.slices.clone();
+        let mut done = Progress::default();
+        for i in 0..n {
+            done.steps.push(Step::Appended {
+                slice: 0,
+                from: i,
+                to: i + 1,
+                result: AppendResult {
+                    stored: 1,
+                    skipped: 0,
+                },
+            });
+        }
+        let steps_capacity = done.steps.capacity();
+        let progress = Arc::new(Mutex::new(done));
+        let expected = expected_rows(&plan, &progress);
+        let actual = q.pending.capacity() * size_of::<Pending>()
+            + plan.slices.capacity() * size_of::<Slice>()
+            + attempt_slices.capacity() * size_of::<Slice>()
+            + n * (size_of::<EncodedEvent>() + 1)
+            + steps_capacity * size_of::<Step>()
+            + expected.capacity() * size_of::<EncodedExpected>();
+        assert!(
+            reserved >= actual,
+            "metadata reserve {reserved} is below actual live vector footprint {actual}; progress capacity {steps_capacity}, expected capacity {}",
+            expected.capacity()
+        );
+    }
+
+    #[test]
+    fn vacant_queue_slots_are_released_after_removal_or_failure() {
+        let make = || {
+            queue(
+                (0..64)
+                    .map(|id| pending(id, caller("p", "owner"), "r", small(1)))
+                    .collect(),
+            )
+        };
+        let mut q = make();
+        for id in 0..64 {
+            drop(take(&mut q, id).unwrap());
+            assert!(
+                q.pending.capacity() <= 4 * q.pending.len(),
+                "vacant slots must remain within the independently reserved metadata"
+            );
+        }
+        assert_eq!(q.pending.capacity(), 0);
+        let shared = Shared {
+            queue: Mutex::new(make()),
+            work: Notify::new(),
+            idle: Notify::new(),
+            next: AtomicU64::new(1),
+            transactions: AtomicU64::new(1),
+            options: EventProducerOptions::default(),
+        };
+        shared.fail_all(&backend("synthetic failure"), &[]);
+        assert_eq!(shared.queue().pending.capacity(), 0);
     }
 
     #[test]

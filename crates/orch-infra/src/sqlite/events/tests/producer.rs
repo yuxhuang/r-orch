@@ -2064,3 +2064,259 @@ async fn an_answered_encoded_batch_has_already_returned_its_exact_budget() {
     }
     producer.close().await;
 }
+
+#[tokio::test]
+async fn encoded_reconciliation_refuses_changed_payload_time_or_type_without_replay() {
+    for changed in 0..3 {
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = armed.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let mut replacement = event(1).event;
+        replacement.data = serde_json::json!("different durable bytes");
+        let replacement = serde_json::to_string(&replacement).unwrap();
+        let fx = fixture_with(StorageOptions {
+            writer_commit_probe: Some(Box::new(move |tx| {
+                if !flag.load(Ordering::SeqCst) {
+                    return None;
+                }
+                seen.fetch_add(1, Ordering::SeqCst);
+                match changed {
+                    0 => {
+                        tx.execute(
+                            "UPDATE run_events SET payload=?1 WHERE run_id='changed' AND seq=1",
+                            [&replacement],
+                        )
+                        .unwrap();
+                    }
+                    1 => {
+                        tx.execute(
+                            "UPDATE run_events SET at=at+1 WHERE run_id='changed' AND seq=1",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                    _ => {
+                        tx.execute(
+                            "UPDATE run_events SET type='error' WHERE run_id='changed' AND seq=1",
+                            [],
+                        )
+                        .unwrap();
+                    }
+                }
+                tx.execute_batch("COMMIT").unwrap();
+                Some(Err(sql(10)))
+            })),
+            ..StorageOptions::default()
+        });
+        let producer = fx.producer();
+        let batch = fx.batch("p", "changed", 1..=1).await;
+        armed.store(true, Ordering::SeqCst);
+        let failure = answered(producer.submit(batch.clone()).unwrap())
+            .await
+            .unwrap_err();
+        assert!(
+            failure.outcome_unknown,
+            "changed field {changed} cannot reconcile as committed"
+        );
+        assert_eq!((failure.committed, failure.not_stored), (counts(0, 0), 1));
+        assert!(
+            failure
+                .error
+                .to_string()
+                .contains("differs from the expected"),
+            "{failure:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "unknown input is never replayed"
+        );
+        assert!(fx.reports().is_empty());
+        assert!(matches!(producer.submit(batch), Err(Rejected::Closed(..))));
+        assert_eq!(producer.retained(), (0, 0, 0));
+        producer.close().await;
+    }
+}
+
+#[tokio::test]
+async fn encoded_unknown_commit_reconciles_the_first_duplicate_bytes() {
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = armed.clone();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let fx = fixture_with(StorageOptions {
+        writer_commit_probe: Some(Box::new(move |tx| {
+            if !flag.load(Ordering::SeqCst) {
+                return None;
+            }
+            seen.fetch_add(1, Ordering::SeqCst);
+            tx.execute_batch("COMMIT").unwrap();
+            Some(Err(sql(10)))
+        })),
+        ..StorageOptions::default()
+    });
+    let producer = fx.producer();
+    let mut batch = fx.batch("p", "duplicate-bytes", 1..=1).await;
+    let first = batch.events[0].clone();
+    let mut other = first.clone();
+    other.event.data = serde_json::json!({"same sequence": "different bytes"});
+    batch.events.push(other);
+    armed.store(true, Ordering::SeqCst);
+    assert_eq!(
+        answered(producer.submit(batch).unwrap()).await.unwrap(),
+        counts(1, 1)
+    );
+    assert_eq!(fx.stored("p", "duplicate-bytes").await, [first]);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fx.reports()[0].attempts, 1);
+    assert!(!fx.storage.failure_state().claims_suppressed());
+    assert_eq!(producer.retained(), (0, 0, 0));
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn encoded_unknown_empty_or_duplicate_commit_needs_no_rebuild() {
+    for empty in [true, false] {
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = armed.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let fx = fixture_with(StorageOptions {
+            writer_commit_probe: Some(Box::new(move |tx| {
+                if !flag.load(Ordering::SeqCst) {
+                    return None;
+                }
+                if seen.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return None;
+                }
+                tx.execute_batch("COMMIT").unwrap();
+                Some(Err(sql(10)))
+            })),
+            ..StorageOptions::default()
+        });
+        let mut batch = fx.batch("p", "no-new-rows", 1..=1).await;
+        if empty {
+            batch.events.clear();
+        } else {
+            let seed = batch.clone();
+            fx.storage
+                .transaction(owner("p"), Lane::Events, move |unit| {
+                    unit.append_events(&seed.run, &seed.lineage, seed.epoch, &seed.events)
+                })
+                .await
+                .unwrap();
+        }
+        let producer = fx.producer();
+        armed.store(true, Ordering::SeqCst);
+        let skipped = usize::from(!empty);
+        assert_eq!(
+            answered(producer.submit(batch).unwrap()).await.unwrap(),
+            counts(0, skipped)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no durable rows expected; do not rebuild a consumed operation"
+        );
+        assert_eq!(fx.reports()[0].attempts, 1);
+        assert!(!fx.storage.failure_state().claims_suppressed());
+        assert_eq!(producer.retained(), (0, 0, 0));
+        producer.close().await;
+    }
+}
+
+#[tokio::test]
+async fn encoded_invalid_sequences_refuse_the_whole_batch_and_leave_neighbors_committable() {
+    for seq in [0, i64::MAX as u64 + 1] {
+        let fx = fixture();
+        let producer = fx.producer();
+        let mut bad = fx.batch("p", "bad-sequence", 1..=2).await;
+        bad.events[1].seq = seq;
+        let good = fx.batch("p", "good-sequence", 1..=2).await;
+        let stall = fx.stall().await;
+        let bad = producer.submit(bad).unwrap();
+        let good = producer.submit(good).unwrap();
+        stall.end().await;
+        let failure = answered(bad).await.unwrap_err();
+        assert!(
+            matches!(failure.error, StoreError::InvalidEvents(_)),
+            "{failure:?}"
+        );
+        assert_eq!(
+            (
+                failure.committed,
+                failure.not_stored,
+                failure.outcome_unknown
+            ),
+            (counts(0, 0), 2, false)
+        );
+        assert_eq!(answered(good).await.unwrap(), counts(2, 0));
+        assert!(fx.stored("p", "bad-sequence").await.is_empty());
+        assert_eq!(fx.stored("p", "good-sequence").await, [event(1), event(2)]);
+        assert_eq!(producer.retained(), (0, 0, 0));
+        producer.close().await;
+    }
+}
+
+#[test]
+fn encoded_input_stays_charged_when_runtime_cancels_a_running_callback() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut fx = fixture();
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (release, blocked) = mpsc::sync_channel(1);
+    let blocked = Mutex::new(blocked);
+    let first = std::sync::atomic::AtomicBool::new(true);
+    let at = Instant::now();
+    fx.options.now = Arc::new(move || {
+        if first.swap(false, Ordering::SeqCst) {
+            let _ = entered.lock().unwrap().take().unwrap().send(());
+            blocked.lock().unwrap().recv_timeout(SAFETY).unwrap();
+        }
+        at
+    });
+    let (producer, submission, held) = runtime.block_on(async {
+        let batch = fx.batch("p", "cancelled-runtime", 1..=1).await;
+        let held = accounted_bytes(&batch);
+        let producer = fx.producer();
+        let submission = producer.submit(batch).unwrap();
+        tokio::time::timeout(SAFETY, observed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(producer.retained(), (1, 1, held));
+        (producer, submission, held)
+    });
+    runtime.shutdown_background();
+    let failure = futures::FutureExt::now_or_never(submission)
+        .expect("runtime cancellation must answer unknown without waiting for the callback")
+        .unwrap_err();
+    assert!(failure.outcome_unknown);
+    assert_eq!((failure.committed, failure.not_stored), (counts(0, 0), 1));
+    assert_eq!(
+        producer.retained(),
+        (0, 0, held),
+        "the real running callback still owns its encoded input"
+    );
+    release.send(()).unwrap();
+    let deadline = Instant::now() + SAFETY;
+    while producer.retained().2 != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the final callback owner did not refund its budget"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(producer.retained(), (0, 0, 0));
+    drop(producer);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(fx.storage.close())
+        .unwrap();
+}
