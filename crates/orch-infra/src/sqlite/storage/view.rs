@@ -129,7 +129,7 @@ impl<'a, 'conn> Unit<'a, 'conn> {
         if let Err(error) = &result {
             self.shared.state.observe(FailureSource::Writer, error);
         }
-        port(result)
+        public_result(&self.shared.state, port(result))
     }
     pub(super) fn ensure_committable(&self) -> Result<()> {
         self.router.ensure_committable()?;

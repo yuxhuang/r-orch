@@ -970,16 +970,29 @@ async fn first_fatal_writer_read_replies_unavailable_and_rolls_back() {
             [],
         )
         .unwrap();
+    let refused = Arc::new(AtomicBool::new(false));
+    let seen = refused.clone();
     let result = storage
         .write(
             owner(),
             store::Lane::Entities,
-            Box::new(|u| u.get(EntityKind::Team, "damaged").map(|_| ())),
+            Box::new(move |u| {
+                let result = u.get(EntityKind::Team, "damaged");
+                seen.store(
+                    matches!(&result, Err(e) if e.to_string().contains("storage_unavailable")),
+                    Ordering::SeqCst,
+                );
+                result.map(|_| ())
+            }),
         )
         .await;
     assert!(
         matches!(result, Err(ref e) if e.to_string().contains("storage_unavailable")),
         "{result:?}"
+    );
+    assert!(
+        refused.load(Ordering::SeqCst),
+        "the unit must expose the first fatal refusal before the callback handles it"
     );
     assert_eq!(
         storage.failure_state().failure().unwrap().source,

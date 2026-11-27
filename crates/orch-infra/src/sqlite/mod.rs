@@ -14,7 +14,7 @@ pub enum SqliteError {
     },
     #[error("task object access failed: {0:?}")]
     TaskAccess(std::io::ErrorKind),
-    /// Context, Config, Template or Goal: names the family and the identity's key
+    /// Agent, Team, Run, Context, Config, Template or Goal: names the family and the identity's key
     /// form, never a text or a path.
     #[error("stored {family} form {form} failed {check} at {locator}")]
     EntityCorrupt {

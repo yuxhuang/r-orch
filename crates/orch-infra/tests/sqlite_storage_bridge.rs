@@ -391,7 +391,7 @@ async fn caught_live_corruption_latches_the_writer_and_prevents_the_outer_commit
             unit.create(team("during"))
                 .expect("created before the read");
             let error = unit.get(EntityKind::Agent, "a").unwrap_err();
-            assert_eq!(backend_text(&error), FAILED);
+            assert_eq!(backend_text(&error), UNAVAILABLE);
             // Caught. The shared latch now refuses every statement of this unit.
             let error = unit.create(team("after")).unwrap_err();
             assert_eq!(backend_text(&error), UNAVAILABLE);
@@ -408,14 +408,19 @@ async fn caught_live_corruption_latches_the_writer_and_prevents_the_outer_commit
         failure.causes,
         [(Role::Operation, FatalCause::LogicalCorruption)]
     );
-    // The latch fails the whole storage: later writes and new snapshots refuse.
+    // Signed #389 B: a prior latch refuses mutations while a new snapshot
+    // may still serve reads that observe no fresh damage.
     let later = env.try_commit(|_| ()).await;
     assert_eq!(backend_text(&later.unwrap_err()), UNAVAILABLE);
-    let read = env.storage.read(owner()).await;
-    assert_eq!(
-        backend_text(&read.err().expect("read refused")),
-        UNAVAILABLE
+    let snapshot = env.storage.read(owner()).await.unwrap();
+    assert!(
+        snapshot
+            .get(EntityKind::Config, "healthy-absent")
+            .await
+            .unwrap()
+            .is_none()
     );
+    drop(snapshot);
     env.close().await;
 }
 
@@ -454,7 +459,7 @@ async fn the_operation_cause_and_the_rollback_cause_keep_their_own_class() {
     let outcome = env
         .try_commit(|unit| {
             let error = unit.get(EntityKind::Agent, "a").unwrap_err();
-            assert_eq!(backend_text(&error), FAILED);
+            assert_eq!(backend_text(&error), UNAVAILABLE);
         })
         .await;
     assert_eq!(backend_text(&outcome.unwrap_err()), UNAVAILABLE);
