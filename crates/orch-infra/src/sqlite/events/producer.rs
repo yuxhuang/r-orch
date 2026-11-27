@@ -989,7 +989,12 @@ impl Drain {
                         return Flow::Continue;
                     }
                     Reconciled::Rebuild => continue,
-                    Reconciled::NotStored(error) => return self.fail_plan(&plan, &error, alone),
+                    Reconciled::NotStored => {
+                        let error = attempt.result.err().unwrap_or_else(|| {
+                            backend("unknown noncommit had no original failure")
+                        });
+                        return self.fail_plan(&plan, &error, alone);
+                    }
                     Reconciled::Stuck(error) => return self.fail_all(&error, Some(&plan)),
                 }
             }
@@ -1027,12 +1032,14 @@ impl Drain {
             let check = Arc::clone(&expected);
             match write.reconcile_encoded(check).await {
                 Ok(true) => return Reconciled::Committed,
-                Ok(false) if attempt.retry_code.is_some() => return Reconciled::Rebuild,
+                Ok(false)
+                    if attempt.retry_code.is_some()
+                        && self.storage.failure_state().failure().is_none() =>
+                {
+                    return Reconciled::Rebuild;
+                }
                 Ok(false) => {
-                    return Reconciled::NotStored(backend(
-                        "commit outcome was unknown, reconciliation found none of its rows, \
-                         and the cause allows no retry",
-                    ));
+                    return Reconciled::NotStored;
                 }
                 Err(error) => {
                     if tries == RECONCILE_TRIES || self.storage.failure_state().failure().is_some()
@@ -1182,7 +1189,7 @@ impl Shared {
 enum Reconciled {
     Committed,
     Rebuild,
-    NotStored(StoreError),
+    NotStored,
     Stuck(StoreError),
 }
 

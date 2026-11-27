@@ -1,0 +1,1 @@
+Fixed the inactive SQLite event producer counting an incomplete callback as a commit when rollback evidence was missing. Failed callbacks retain their original error and I/O failure streak, permit reconstruction only after a known noncommit, and release their retained input without publishing a false commit receipt.
