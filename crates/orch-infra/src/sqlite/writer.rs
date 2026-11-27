@@ -477,6 +477,8 @@ fn abandon(
 type Job = Box<dyn FnOnce(&mut ConnectionHandle<'_>, &Gate) + Send>;
 
 struct State {
+    #[cfg(test)]
+    park_generation: u64,
     accepting: bool,
     queue: Schedule<Job>,
     // A retained logical operation still owns the executor's in-progress slot
@@ -582,6 +584,8 @@ impl<'a> Writer<'a> {
         let gate = Gate::install(&mut connection)?;
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
+                #[cfg(test)]
+                park_generation: 0,
                 accepting: true,
                 queue: Schedule::new(capacity),
                 continuation: None,
@@ -637,6 +641,11 @@ impl<'a> Writer<'a> {
                         // No running SQL remains: a retained producer can no
                         // longer submit. Close queued receipts on worker drop.
                         break None;
+                    }
+                    #[cfg(test)]
+                    {
+                        state.park_generation += 1;
+                        self.shared.available.notify_all();
                     }
                     state = self
                         .shared

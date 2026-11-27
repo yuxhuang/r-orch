@@ -168,6 +168,10 @@ fn idle_worker_retires_live_settled_token_at_its_original_deadline() {
         let receipt = handle.submit(Lane::Maintenance, None, |_| Ok(73)).unwrap();
         assert_eq!(receipt.wait_bounded().unwrap(), 73);
         assert!(!state.claims_suppressed());
+        assert!(
+            !episode.retrying(),
+            "the retired token is still live before Drop"
+        );
         assert!(state.failure().is_none());
         assert_eq!(calls.get(), 1);
         assert!(matches!(
@@ -182,6 +186,26 @@ fn idle_worker_retires_live_settled_token_at_its_original_deadline() {
 }
 
 impl WriterHandle {
+    /// Observe a complete worker queue-selection pass after this call, under
+    /// the queue mutex. A parked worker has selected no ordinary queued job;
+    /// this makes absence assertions independent of sleeps and executor speed.
+    pub(in crate::sqlite) fn wait_for_park_test(&self) {
+        let mut state = self.admission.shared.state.lock().unwrap();
+        let before = state.park_generation;
+        let bound = Instant::now() + BOUND;
+        self.admission.shared.available.notify_all();
+        while state.park_generation == before {
+            assert!(Instant::now() < bound, "worker did not park");
+            state = self
+                .admission
+                .shared
+                .available
+                .wait_timeout(state, bound.saturating_duration_since(Instant::now()))
+                .unwrap()
+                .0;
+        }
+    }
+
     /// Admit a fixture on the real worker using the executor's existing clock
     /// seam. Only admission is fixture setup: SQL, hooks, retry registration and
     /// the single receipt all use the production executor. This lets retained
