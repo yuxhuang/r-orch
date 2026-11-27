@@ -10,7 +10,8 @@ mod prior_latch_tests;
 mod retained;
 #[cfg(test)]
 mod tests;
-mod view;
+pub(in crate::sqlite) mod view;
+pub(in crate::sqlite) use retained::UnitWork;
 pub use retained::{RetainedWrite, WriteAttempt};
 
 use super::{
@@ -611,9 +612,8 @@ fn read_worker(
         }
     }
 }
-#[async_trait]
-impl Storage for SqliteStorage {
-    async fn read(&self, caller: Caller) -> store::Result<Box<dyn ReadSnapshot>> {
+impl SqliteStorage {
+    async fn snapshot(&self, caller: Caller) -> store::Result<Snapshot> {
         port(self.owner.shared.readable())?;
         let observed = self.owner.shared.state.fatal_observations();
         let (commands, receiver) = mpsc::sync_channel(SNAPSHOT_CALL_CAPACITY);
@@ -645,14 +645,20 @@ impl Storage for SqliteStorage {
         port(self.owner.shared.refuse_fresh_fatal(observed))?;
         let answer = answer.map_err(|_| backend("overloaded"))?;
         port(answer.map_err(|_| backend("SQLite reader closed"))?)?;
-        Ok(Box::new(Snapshot {
+        Ok(Snapshot {
             expired,
             owner: self.owner.clone(),
             caller,
             commands,
             capacity: Arc::new(Semaphore::new(SNAPSHOT_CALL_CAPACITY)),
             observed,
-        }))
+        })
+    }
+}
+#[async_trait]
+impl Storage for SqliteStorage {
+    async fn read(&self, caller: Caller) -> store::Result<Box<dyn ReadSnapshot>> {
+        Ok(Box::new(self.snapshot(caller).await?))
     }
     async fn write(&self, caller: Caller, lane: store::Lane, work: WriteWork) -> store::Result<()> {
         let now = Instant::now();

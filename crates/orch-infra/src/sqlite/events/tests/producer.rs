@@ -1555,7 +1555,7 @@ async fn the_planned_rows_equal_the_actual_rows_at_the_inline_threshold() {
 
 /// Allocation capacities, not just visible JSON bytes, stay inside the envelope.
 #[tokio::test]
-async fn spare_allocations_are_refused_whole_and_dense_values_are_charged() {
+async fn metadata_spares_are_refused_and_payload_spares_are_released() {
     let mut fx = fixture();
     fx.options.byte_limit = 8192;
     let producer = fx.producer();
@@ -1586,6 +1586,19 @@ async fn spare_allocations_are_refused_whole_and_dense_values_are_charged() {
                 }
                 batch.events.push(item);
             }
+        }
+        if kind >= 4 {
+            let expected = serde_json::to_string(&batch.events[0].event).unwrap();
+            let charged = accounted_bytes(&batch);
+            assert!(charged < 8192, "only the live encoding is retained: {kind}");
+            assert_eq!(
+                answered(producer.submit(batch).unwrap()).await.unwrap(),
+                counts(1, 0)
+            );
+            let stored = fx.stored("p", &format!("capacity-{kind}")).await;
+            assert_eq!(serde_json::to_string(&stored[0].event).unwrap(), expected);
+            assert_eq!(producer.retained(), (0, 0, 0));
+            continue;
         }
         let pointer = batch.run.as_ptr();
         let capacity = batch.run.capacity();
@@ -1803,6 +1816,227 @@ async fn an_unknown_nonretryable_commit_with_no_durable_rows_is_never_rebuilt() 
     assert_eq!(
         answered(producer.submit(other).unwrap()).await.unwrap(),
         counts(2, 0)
+    );
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn encoded_dense_shapes_fit_the_default_producer_and_store() {
+    for shape in 0..2 {
+        let fx = fixture();
+        let producer = fx.producer();
+        let mut batch = fx.batch("p", "dense", 1..=1).await;
+        batch.events[0].event.data = if shape == 0 {
+            serde_json::Value::Array(
+                (0..100_000)
+                    .map(|_| serde_json::json!({"a": 1, "b": 2, "c": 3}))
+                    .collect(),
+            )
+        } else {
+            serde_json::Value::Array(vec![serde_json::json!(1); 4_000_000])
+        };
+        let expected = serde_json::to_string(&batch.events[0].event).unwrap();
+        let submission = producer
+            .submit(batch)
+            .unwrap_or_else(|_| panic!("dense shape {shape} below 64MiB must fit"));
+        assert_eq!(answered(submission).await.unwrap(), counts(1, 0));
+        let stored = fx.stored("p", "dense").await;
+        assert_eq!(serde_json::to_string(&stored[0].event).unwrap(), expected);
+        assert_eq!(producer.retained(), (0, 0, 0));
+        producer.close().await;
+    }
+}
+
+#[tokio::test]
+async fn encoded_boundaries_store_exact_physical_bytes_and_isolate_plus_one() {
+    use sha2::{Digest, Sha256};
+    let maximum = crate::blob::MAX_BLOB_BYTES as usize;
+    for shape in 0..2 {
+        let fx = fixture();
+        let producer = fx.producer();
+        let mut batch = fx.batch("p", "boundary", 1..=2).await;
+        let mut item = event(1);
+        item.event.data = if shape == 0 {
+            serde_json::Value::String(String::new())
+        } else {
+            let mut items = vec![serde_json::json!(1); 4_000_000];
+            items.push(serde_json::Value::String(String::new()));
+            serde_json::Value::Array(items)
+        };
+        let base = super::super::encode(&item.event).unwrap().2.len();
+        let padding = "x".repeat(maximum - base);
+        match &mut item.event.data {
+            serde_json::Value::String(s) => *s = padding,
+            serde_json::Value::Array(a) => *a.last_mut().unwrap() = padding.into(),
+            _ => unreachable!(),
+        }
+        let (at, kind, bytes) = super::super::encode(&item.event).unwrap();
+        assert_eq!(bytes.len(), maximum);
+        let expected_hash = format!("{:x}", Sha256::digest(bytes.as_bytes()));
+        drop(bytes);
+        batch.events[0] = item;
+        assert!(accounted_bytes(&batch) < EventProducerOptions::default().byte_limit);
+        assert_eq!(
+            answered(producer.submit(batch).unwrap()).await.unwrap(),
+            counts(2, 0)
+        );
+        let conn = rusqlite::Connection::open(&fx.database).unwrap();
+        let (stored_at, stored_kind, tag): (i64, String, String) = conn.query_row(
+            "SELECT at,type,payload FROM run_events WHERE project_id='p' AND run_id='boundary' AND seq=1",
+            [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        ).unwrap();
+        let tag: [String; 2] = serde_json::from_str(&tag).unwrap();
+        assert_eq!(
+            tag,
+            ["orch.event.blob.v1".to_owned(), expected_hash.clone()]
+        );
+        assert_eq!((stored_at, stored_kind.as_str()), (at, kind));
+        let path = fx
+            .database
+            .parent()
+            .unwrap()
+            .join("blobs/sha256")
+            .join(&expected_hash[..2])
+            .join(&expected_hash[2..4])
+            .join(&expected_hash);
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(bytes.len(), maximum);
+        assert_eq!(format!("{:x}", Sha256::digest(&bytes)), expected_hash);
+        drop(bytes);
+        let order: Vec<i64> = conn
+            .prepare("SELECT seq FROM run_events WHERE run_id='boundary' ORDER BY seq")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(order, [1, 2]);
+        assert_eq!(producer.retained(), (0, 0, 0));
+        producer.close().await;
+    }
+    let fx = fixture();
+    let producer = fx.producer();
+    let mut poison = fx.batch("p", "plus-one", 1..=1).await;
+    let base = super::super::encode(&big_event(1, 0).event)
+        .unwrap()
+        .2
+        .len();
+    poison.events[0] = big_event(1, maximum + 1 - base);
+    assert_eq!(
+        super::super::encode(&poison.events[0].event)
+            .unwrap()
+            .2
+            .len(),
+        maximum + 1
+    );
+    let good = fx.batch("p", "beside", 1..=2).await;
+    let stall = fx.stall().await;
+    let poison = producer.submit(poison).unwrap();
+    let good = producer.submit(good).unwrap();
+    stall.end().await;
+    let failure = answered(poison).await.unwrap_err();
+    assert!(!failure.outcome_unknown);
+    assert_eq!(failure.not_stored, 1);
+    assert_eq!(answered(good).await.unwrap(), counts(2, 0));
+    assert!(fx.stored("p", "plus-one").await.is_empty());
+    assert_eq!(producer.retained(), (0, 0, 0));
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn encoded_unknown_commit_reconciles_escaped_ordered_numbers_and_accepted_nesting() {
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = armed.clone();
+    let mut once = true;
+    let fx = fixture_with(StorageOptions {
+        writer_commit_probe: Some(Box::new(move |tx| {
+            if !flag.load(Ordering::SeqCst) || !once {
+                return None;
+            }
+            once = false;
+            tx.execute_batch("COMMIT").unwrap();
+            Some(Err(sql(10)))
+        })),
+        ..StorageOptions::default()
+    });
+    let producer = fx.producer();
+    let mut batch = fx.batch("p", "exact-nested", 1..=2).await;
+    batch.events[0].event.timestamp = "2026-11-27T01:02:03.456-05:00".into();
+    let mut data = serde_json::json!({"z": "\n\t\"\\é", "a": [18446744073709551615u64, -0.0, 1.25e100], "m": {"b": 1, "a": 2}});
+    for _ in 0..160 {
+        data = serde_json::json!([data]);
+    }
+    batch.events[0].event.data = data;
+    let expected: Vec<_> = batch
+        .events
+        .iter()
+        .map(|e| super::super::encode(&e.event).unwrap())
+        .collect();
+    armed.store(true, Ordering::SeqCst);
+    assert_eq!(
+        answered(producer.submit(batch).unwrap()).await.unwrap(),
+        counts(2, 0)
+    );
+    assert_eq!(
+        fx.reports()[0].attempts,
+        1,
+        "lost acknowledgement reconciles without replay"
+    );
+    let conn = rusqlite::Connection::open(&fx.database).unwrap();
+    for (index, (at, kind, payload)) in expected.into_iter().enumerate() {
+        let stored: (i64, String, String) = conn
+            .query_row(
+                "SELECT at,type,payload FROM run_events WHERE run_id='exact-nested' AND seq=?1",
+                [(index + 1) as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(stored, (at, kind.to_owned(), payload));
+    }
+    assert_eq!(producer.retained(), (0, 0, 0));
+    producer.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encoded_budget_stays_charged_through_in_flight_ownership() {
+    let mut fx = fixture();
+    let batch = fx.batch("p", "charged", 1..=1).await;
+    let held = accounted_bytes(&batch);
+    let next = fx.batch("p", "another", 1..=1).await;
+    fx.options.byte_limit = held.max(accounted_bytes(&next));
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (release, blocked) = mpsc::sync_channel(1);
+    let blocked = Mutex::new(blocked);
+    fx.options.observer = Some(Arc::new(move |_| {
+        if let Some(entered) = entered.lock().unwrap().take() {
+            let _ = entered.send(());
+            blocked.lock().unwrap().recv_timeout(SAFETY).unwrap();
+        }
+    }));
+    let producer = fx.producer();
+    let submission = producer.submit(batch).unwrap();
+    tokio::time::timeout(SAFETY, observed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        producer.retained(),
+        (0, 0, held),
+        "completed plan still owns frozen bytes"
+    );
+    let Err(Rejected::Full(next)) = producer.submit(next) else {
+        panic!("in-flight ownership must consume the budget");
+    };
+    release.send(()).unwrap();
+    assert_eq!(answered(submission).await.unwrap(), counts(1, 0));
+    tokio::time::timeout(SAFETY, producer.flush())
+        .await
+        .unwrap();
+    assert_eq!(producer.retained(), (0, 0, 0));
+    assert_eq!(
+        answered(producer.submit(*next).unwrap()).await.unwrap(),
+        counts(1, 0)
     );
     producer.close().await;
 }

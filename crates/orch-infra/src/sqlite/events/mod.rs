@@ -33,6 +33,8 @@
 //! one exception is the producer (`producer`), which submits through the public
 //! retained-write API of `SqliteStorage` and is exported for the collector.
 
+pub(in crate::sqlite) mod encoded;
+
 use crate::blob::{BlobError, BlobHash, DiskBlobStore, Placement, placement};
 use orch_core::store::events::{AppendResult, EventGap, PruneResult, SequencedEvent};
 use orch_core::store::{Caller, Principal, StoreError};
@@ -110,6 +112,45 @@ pub(in crate::sqlite) fn append_with_blobs(
         }
         rows.push((row.seq as i64, encode(&row.event)?));
     }
+    append_rows(tx, caller, run, rows, disk)
+}
+
+pub(in crate::sqlite) fn append_encoded(
+    tx: &Transaction<'_>,
+    caller: &Caller,
+    run: &str,
+    lineage: &str,
+    epoch: u64,
+    batch: &[encoded::EncodedEvent],
+    disk: &DiskBlobStore,
+) -> Result<AppendResult> {
+    check_lease(tx, caller, run, lineage, epoch)?;
+    for row in batch {
+        if row.seq == 0 {
+            return Err(invalid("sequence numbers start at 1"));
+        }
+        if row.seq > MAX_STORED {
+            return Err(invalid("sequence number is too large to store"));
+        }
+    }
+    append_rows(
+        tx,
+        caller,
+        run,
+        batch
+            .iter()
+            .map(|row| (row.seq as i64, (row.at, row.kind, row.payload.as_ref()))),
+        Some(disk),
+    )
+}
+
+fn append_rows<P: AsRef<str>>(
+    tx: &Transaction<'_>,
+    caller: &Caller,
+    run: &str,
+    rows: impl IntoIterator<Item = (i64, (i64, &'static str, P))>,
+    disk: Option<&DiskBlobStore>,
+) -> Result<AppendResult> {
     // A row comes back only for an insert that happened, which is how a stored
     // row is told from a skipped one. (It also keeps this production code clear of
     // the `.execute(` scan of `orch-engine`'s `token_eco_preparation`, which
@@ -135,7 +176,7 @@ pub(in crate::sqlite) fn append_with_blobs(
             result.skipped += 1;
             continue;
         }
-        let payload = stored_payload(tx, &caller.project, payload, at, disk)?;
+        let payload = stored_payload(tx, &caller.project, payload.as_ref(), at, disk)?;
         if insert.exists(params![caller.project, run, seq, at, kind, payload])? {
             result.stored += 1;
         } else {
@@ -381,12 +422,12 @@ const BLOB_TAG: &str = "orch.event.blob.v1";
 fn stored_payload(
     tx: &Transaction<'_>,
     project: &str,
-    payload: String,
+    payload: &str,
     at: i64,
     disk: Option<&DiskBlobStore>,
 ) -> Result<String> {
     if placement(payload.as_bytes()) == Placement::Inline {
-        return Ok(payload);
+        return Ok(payload.to_owned());
     }
     let disk =
         disk.ok_or_else(|| EventsError::Corrupt("oversized event requires the blob store".into()))?;
@@ -493,7 +534,7 @@ fn unsigned(value: i64, what: &str) -> Result<u64> {
 mod tests;
 
 mod adapter;
-mod producer;
+pub(in crate::sqlite) mod producer;
 
 pub(super) use adapter::execution;
 pub use producer::{

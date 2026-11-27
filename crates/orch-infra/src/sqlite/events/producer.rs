@@ -48,18 +48,25 @@
 //! gaps, the counters at start and the stop record (R61, R63, R139), and pruning.
 //! Daemon wiring and activation are not part of this slice.
 
-use super::MAX_ROWS;
-use crate::blob::{INLINE_TEXT_MAX_BYTES, MAX_BLOB_BYTES};
+use super::{MAX_ROWS, encoded::EncodedEvent};
+#[cfg(test)]
+use crate::blob::INLINE_TEXT_MAX_BYTES;
+use crate::blob::MAX_BLOB_BYTES;
 use crate::sqlite::{RetainedWrite, SqliteStorage, WriteAccounting, WriteAttempt, WriteOutcome};
+#[cfg(test)]
+use orch_core::store::ReadSnapshot;
 use orch_core::store::events::{AppendResult, SequencedEvent};
-use orch_core::store::{Caller, Lane, Principal, ReadSnapshot, StoreError, UnitOfWork, WriteWork};
+use orch_core::store::{Caller, Lane, Principal, StoreError};
+#[cfg(test)]
 use orch_domain::RunEvent;
-use std::collections::{BTreeMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::{HashSet, VecDeque};
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, oneshot};
@@ -89,9 +96,11 @@ const QUEUE_LIMIT_BATCHES: usize = 4_096;
 const QUEUE_LIMIT_BYTES: usize = 4 * MAX_BLOB_BYTES as usize;
 /// What a waiting batch holds besides its strings and events: its entry in the
 /// queue, the slice of the plan built from it, and a reply channel.
-const BATCH_FIXED_BYTES: usize = size_of::<Pending>() + size_of::<Slice>() + 128;
+const BATCH_FIXED_BYTES: usize =
+    size_of::<Pending>() + 3 * size_of::<Slice>() + size_of::<Charge>() + 256;
 /// What a waiting event holds besides its encoded form: the event, and its cost.
-const EVENT_FIXED_BYTES: usize = size_of::<SequencedEvent>() + 1;
+const EVENT_FIXED_BYTES: usize =
+    size_of::<EncodedEvent>() + 1 + size_of::<Step>() + size_of::<EncodedExpected>() + 64;
 /// Reserve for the original caller/run allocations and their simultaneous
 /// plan, attempt, reconciliation and report copies. Clones have no more live
 /// bytes than the original capacities counted here.
@@ -221,16 +230,16 @@ struct Pending {
     run: String,
     lineage: String,
     epoch: u64,
-    events: Arc<[SequencedEvent]>,
+    events: Arc<[EncodedEvent]>,
     costs: Arc<[u8]>,
     /// What the batch holds, as `Measure` counted it; given back when it leaves.
-    accounted: usize,
     consumed: usize,
     /// A statement of this batch has committed. An empty batch is answered
     /// only after its lease check has committed.
     touched: bool,
     acc: AppendResult,
     reply: Option<oneshot::Sender<Answer>>,
+    charge: Option<Arc<Charge>>,
 }
 
 impl Pending {
@@ -249,6 +258,19 @@ impl Pending {
     }
     fn key(&self) -> (String, String) {
         (self.caller.project.clone(), self.run.clone())
+    }
+}
+
+struct Charge {
+    shared: Weak<Shared>,
+    bytes: usize,
+}
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.upgrade() {
+            shared.queue().bytes -= self.bytes;
+            shared.idle.notify_waiters();
+        }
     }
 }
 
@@ -359,7 +381,7 @@ impl EventProducer {
     /// sizes against what is still free (the walk stops at the first event that
     /// does not fit), and last the same limits again, because other submissions
     /// may have arrived while the events were measured.
-    pub fn submit(&self, mut batch: EventBatch) -> Result<Submission, Rejected> {
+    pub fn submit(&self, batch: EventBatch) -> Result<Submission, Rejected> {
         let options = &self.shared.options;
         let fixed = batch.fixed_bytes();
         let free = {
@@ -384,12 +406,6 @@ impl EventProducer {
         if let Err(refusal) = queue.admit(options, batch.events.len(), accounted) {
             return Err(rejected(batch, refusal));
         }
-        // Map does not expose its backing capacity. Rebuild only accepted
-        // objects from their live entries, so an emptied map cannot retain an
-        // uncharged reservation. Refused input has not been changed at all.
-        for sequenced in &mut batch.events {
-            compact_objects(&mut sequenced.event.data);
-        }
         let (reply, receiver) = oneshot::channel();
         queue.events += batch.events.len();
         queue.bytes += accounted;
@@ -399,9 +415,8 @@ impl EventProducer {
             run: batch.run,
             lineage: batch.lineage,
             epoch: batch.epoch,
-            events: Arc::from(batch.events),
+            events: measured.events,
             costs,
-            accounted,
             consumed: 0,
             touched: false,
             acc: AppendResult {
@@ -409,7 +424,12 @@ impl EventProducer {
                 skipped: 0,
             },
             reply: Some(reply),
+            charge: Some(Arc::new(Charge {
+                shared: Arc::downgrade(&self.shared),
+                bytes: accounted,
+            })),
         });
+        drop(batch.events);
         drop(queue);
         self.shared.work.notify_one();
         Ok(Submission(receiver))
@@ -533,81 +553,28 @@ impl EventBatch {
 /// What the events of a batch cost: the rows each changes, and their encoded bytes.
 struct Measure {
     costs: Arc<[u8]>,
+    events: Arc<[EncodedEvent]>,
     bytes: usize,
 }
 
 impl Measure {
-    /// `None` when the events encode to more than `free` bytes. The walk stops
-    /// at the first event that does not fit, so what a refused batch costs to
-    /// refuse is bounded by what was free, not by what it holds.
     fn of(events: &[SequencedEvent], free: usize) -> Option<Self> {
         let mut costs = Vec::with_capacity(events.len());
+        let mut encoded = Vec::with_capacity(events.len());
         let mut bytes = 0usize;
-        for sequenced in events {
-            let (rows, size) = row_cost(&sequenced.event, free - bytes)?;
-            bytes += size;
-            let free = free - bytes;
-            let timestamp = sequenced.event.timestamp.capacity();
-            let payload =
-                retained_value_bytes(&sequenced.event.data, free.checked_sub(timestamp)?)?;
-            bytes += timestamp + payload;
-            costs.push(rows);
+        for event in events {
+            #[cfg(test)]
+            ENCODED.with(|n| n.set(n.get() + 1));
+            let row = EncodedEvent::encode(event, free.checked_sub(bytes)?)?;
+            bytes = bytes.checked_add(row.payload.len())?;
+            costs.push(row.rows());
+            encoded.push(row);
         }
         Some(Self {
             costs: costs.into(),
+            events: encoded.into(),
             bytes,
         })
-    }
-}
-
-/// Owned payload allocations in addition to the inline `Value` already charged
-/// by its parent/event. Arrays charge their whole capacity before walking live
-/// elements. Object capacity is opaque in serde_json: accepted maps are rebuilt
-/// below, and this conservative per-entry reserve covers their entries, hash
-/// indices and growth slack. The explicit work list avoids recursion on caller
-/// supplied shapes; its length is bounded by the charged containers.
-fn retained_value_bytes(value: &serde_json::Value, limit: usize) -> Option<usize> {
-    use serde_json::Value;
-    const OBJECT_ENTRY_BYTES: usize = 8 * (size_of::<(String, Value)>() + 2 * size_of::<usize>());
-    let mut remaining = limit;
-    let mut pending = vec![value];
-    while let Some(value) = pending.pop() {
-        let bytes = match value {
-            Value::String(text) => text.capacity(),
-            Value::Array(items) => items.capacity().checked_mul(size_of::<Value>())?,
-            Value::Object(items) => items.len().checked_mul(OBJECT_ENTRY_BYTES)?,
-            _ => 0,
-        };
-        remaining = remaining.checked_sub(bytes)?;
-        match value {
-            Value::Array(items) => pending.extend(items),
-            Value::Object(items) => {
-                for (key, value) in items {
-                    remaining = remaining.checked_sub(key.capacity())?;
-                    pending.push(value);
-                }
-            }
-            _ => {}
-        }
-    }
-    Some(limit - remaining)
-}
-
-fn compact_objects(value: &mut serde_json::Value) {
-    use serde_json::Value;
-    let mut pending = vec![value];
-    while let Some(value) = pending.pop() {
-        match value {
-            Value::Object(items) => {
-                let old = std::mem::take(items);
-                let mut compact = serde_json::Map::with_capacity(old.len());
-                compact.extend(old);
-                *items = compact;
-                pending.extend(items.values_mut());
-            }
-            Value::Array(items) => pending.extend(items),
-            _ => {}
-        }
     }
 }
 
@@ -635,6 +602,7 @@ thread_local! {
 /// encoded size. This mirrors `stored_payload`; an event that cannot be encoded
 /// counts one row, and storage refuses it at its statement. `None` as soon as
 /// the encoded size passes `limit`.
+#[cfg(test)]
 fn row_cost(event: &RunEvent, limit: usize) -> Option<(u8, usize)> {
     struct Count {
         size: usize,
@@ -670,10 +638,11 @@ struct Slice {
     run: String,
     lineage: String,
     epoch: u64,
-    events: Arc<[SequencedEvent]>,
+    events: Arc<[EncodedEvent]>,
     costs: Arc<[u8]>,
     from: usize,
     to: usize,
+    charge: Option<Arc<Charge>>,
 }
 
 /// Immutable input of one logical transaction. Every attempt is built from it.
@@ -740,6 +709,7 @@ fn next_plan(queue: &Queue, id: u64, alone: bool) -> Option<Plan> {
                 costs: Arc::clone(&pending.costs),
                 from,
                 to,
+                charge: pending.charge.clone(),
             });
         }
         if to < pending.events.len() {
@@ -751,59 +721,69 @@ fn next_plan(queue: &Queue, id: u64, alone: bool) -> Option<Plan> {
 
 /// The callback of one attempt. Runs once, on the writer's thread, inside the
 /// transaction. Statements are cut between each other at the 20 ms of R27.
-fn build_work(plan: &Plan, now: Now, progress: Arc<Mutex<Progress>>) -> WriteWork {
+fn build_work(
+    plan: &Plan,
+    now: Now,
+    progress: Arc<Mutex<Progress>>,
+) -> crate::sqlite::storage::UnitWork {
     let slices = plan.slices.clone();
-    Box::new(move |unit: &mut dyn UnitOfWork| {
-        let started = now();
-        let mut done = Progress::default();
-        let mut first = true;
-        'slices: for (index, slice) in slices.iter().enumerate() {
-            let (events, costs) = (&slice.events, &slice.costs);
-            let mut at = slice.from;
-            // An empty batch still checks its lease: one statement over nothing.
-            let mut once = events.is_empty();
-            while at < slice.to || once {
-                if !first && now().saturating_duration_since(started) >= MAX_WORK {
-                    done.cut_by_time = true;
-                    break 'slices;
-                }
-                first = false;
-                once = false;
-                // An event with a blob is a statement of its own.
-                let mut end = at;
-                while end < slice.to && end - at < STEP_EVENTS {
-                    let heavy = costs[end] > 1;
-                    if heavy && end > at {
-                        break;
+    Box::new(
+        move |unit: &mut crate::sqlite::storage::view::Unit<'_, '_>| {
+            let started = now();
+            let mut done = Progress::default();
+            let mut first = true;
+            'slices: for (index, slice) in slices.iter().enumerate() {
+                let (events, costs) = (&slice.events, &slice.costs);
+                let mut at = slice.from;
+                // An empty batch still checks its lease: one statement over nothing.
+                let mut once = events.is_empty();
+                while at < slice.to || once {
+                    if !first && now().saturating_duration_since(started) >= MAX_WORK {
+                        done.cut_by_time = true;
+                        break 'slices;
                     }
-                    end += 1;
-                    if heavy {
-                        break;
+                    first = false;
+                    once = false;
+                    // An event with a blob is a statement of its own.
+                    let mut end = at;
+                    while end < slice.to && end - at < STEP_EVENTS {
+                        let heavy = costs[end] > 1;
+                        if heavy && end > at {
+                            break;
+                        }
+                        end += 1;
+                        if heavy {
+                            break;
+                        }
                     }
-                }
-                match unit.append_events(&slice.run, &slice.lineage, slice.epoch, &events[at..end])
-                {
-                    Ok(result) => done.steps.push(Step::Appended {
-                        slice: index,
-                        from: at,
-                        to: end,
-                        result,
-                    }),
-                    Err(error) if refusal(&error) => {
-                        done.steps.push(Step::Refused {
+                    match unit.append_encoded_events(
+                        &slice.run,
+                        &slice.lineage,
+                        slice.epoch,
+                        &events[at..end],
+                    ) {
+                        Ok(result) => done.steps.push(Step::Appended {
                             slice: index,
-                            error,
-                        });
-                        continue 'slices;
+                            from: at,
+                            to: end,
+                            result,
+                        }),
+                        Err(error) if refusal(&error) => {
+                            done.steps.push(Step::Refused {
+                                slice: index,
+                                error,
+                            });
+                            continue 'slices;
+                        }
+                        Err(error) => return Err(error),
                     }
-                    Err(error) => return Err(error),
+                    at = end;
                 }
-                at = end;
             }
-        }
-        *progress.lock().unwrap_or_else(PoisonError::into_inner) = done;
-        Ok(())
-    })
+            *progress.lock().unwrap_or_else(PoisonError::into_inner) = done;
+            Ok(())
+        },
+    )
 }
 
 enum Flow {
@@ -888,7 +868,7 @@ impl Drain {
                 Arc::clone(&self.shared.options.now),
                 Arc::clone(&progress),
             );
-            let attempt = match write.attempt(work).await {
+            let attempt = match write.attempt_unit(work).await {
                 Ok(attempt) => attempt,
                 Err(error) if self.admission_pressure(&error) => {
                     // Not admitted, so nothing ran; daemon-owned input is kept.
@@ -948,10 +928,7 @@ impl Drain {
         let mut pause = Duration::from_millis(20);
         for tries in 1..=RECONCILE_TRIES {
             let check = Arc::clone(&expected);
-            match write
-                .reconcile(move |snapshot| async move { rows_are_durable(snapshot, &check).await })
-                .await
-            {
+            match write.reconcile_encoded(check).await {
                 Ok(true) => return Reconciled::Committed,
                 Ok(false) if attempt.retry_code.is_some() => return Reconciled::Rebuild,
                 Ok(false) => {
@@ -1087,7 +1064,6 @@ impl Shared {
             let mut queue = self.queue();
             queue.closed = Some(error.to_string());
             queue.events = 0;
-            queue.bytes = 0;
             queue.busy = false;
             queue.in_flight.clear();
             queue.pending.drain(..).collect()
@@ -1116,11 +1092,11 @@ fn take(queue: &mut Queue, id: u64) -> Option<Pending> {
     let position = queue.pending.iter().position(|p| p.id == id)?;
     let pending = queue.pending.remove(position)?;
     queue.events -= pending.events.len() - pending.consumed;
-    queue.bytes -= pending.accounted;
     Some(pending)
 }
 
 /// What the callback appended in an unknown attempt, as the rows to look for.
+#[cfg(test)]
 pub(super) struct Expected {
     pub(super) run: String,
     pub(super) events: Arc<[SequencedEvent]>,
@@ -1128,7 +1104,15 @@ pub(super) struct Expected {
     pub(super) to: usize,
 }
 
-fn expected_rows(plan: &Plan, progress: &Arc<Mutex<Progress>>) -> Vec<Expected> {
+pub(in crate::sqlite) struct EncodedExpected {
+    pub run: String,
+    pub events: Arc<[EncodedEvent]>,
+    pub from: usize,
+    pub to: usize,
+    _charge: Option<Arc<Charge>>,
+}
+
+fn expected_rows(plan: &Plan, progress: &Arc<Mutex<Progress>>) -> Vec<EncodedExpected> {
     let done = progress.lock().unwrap_or_else(PoisonError::into_inner);
     done.steps
         .iter()
@@ -1139,11 +1123,12 @@ fn expected_rows(plan: &Plan, progress: &Arc<Mutex<Progress>>) -> Vec<Expected> 
                 from,
                 to,
                 result,
-            } if result.stored > 0 => Some(Expected {
+            } if result.stored > 0 => Some(EncodedExpected {
                 run: plan.slices[*slice].run.clone(),
                 events: Arc::clone(&plan.slices[*slice].events),
                 from: *from,
                 to: *to,
+                _charge: plan.slices[*slice].charge.clone(),
             }),
             _ => None,
         })
@@ -1153,6 +1138,7 @@ fn expected_rows(plan: &Plan, progress: &Arc<Mutex<Progress>>) -> Vec<Expected> 
 /// `true` when every expected row is stored with the expected bytes, `false`
 /// when none is. A transaction is atomic, so anything between is a divergence
 /// that the producer reports and does not resolve.
+#[cfg(test)]
 pub(super) async fn rows_are_durable(
     snapshot: Box<dyn ReadSnapshot>,
     expected: &[Expected],
@@ -1240,9 +1226,8 @@ mod tests {
             run: run.into(),
             lineage: "l".into(),
             epoch: 1,
-            events: Arc::from(events),
+            events: Measure::of(&events, usize::MAX).unwrap().events,
             costs,
-            accounted: 0,
             consumed: 0,
             touched: false,
             acc: AppendResult {
@@ -1250,6 +1235,7 @@ mod tests {
                 skipped: 0,
             },
             reply: None,
+            charge: None,
         }
     }
 
@@ -1270,6 +1256,40 @@ mod tests {
 
     fn small(n: u64) -> Vec<SequencedEvent> {
         (1..=n).map(|seq| event(seq, 8)).collect()
+    }
+
+    #[test]
+    fn metadata_reserves_eight_copies_and_only_1000_statement_names() {
+        let mut batch = batch_of(caller("project", "owner"), "run", "lineage", 0);
+        let empty = batch.fixed_bytes();
+        let capacity = batch.run.capacity();
+        batch.run.reserve_exact(4096);
+        assert_eq!(
+            batch.fixed_bytes() - empty,
+            8 * (batch.run.capacity() - capacity)
+        );
+        let empty = batch.fixed_bytes();
+        batch.events = small(1001);
+        assert_eq!(
+            batch.fixed_bytes() - empty,
+            1001 * EVENT_FIXED_BYTES + 1000 * batch.run.capacity()
+        );
+    }
+
+    #[test]
+    fn every_shape_retains_exactly_its_serialized_payload_without_value_allocations() {
+        let mut nested =
+            serde_json::json!({"z": "escape\n\"é", "a": [1, 18446744073709551615u64, -1.25]});
+        for _ in 0..160 {
+            nested = serde_json::json!([nested]);
+        }
+        let mut batch = batch_of(caller("p", "o"), "r", "l", 1);
+        batch.events[0].event.data = nested;
+        let expected = serde_json::to_string(&batch.events[0].event).unwrap();
+        let measured = Measure::of(&batch.events, expected.len()).unwrap();
+        assert_eq!(measured.bytes, expected.len());
+        assert_eq!(measured.events[0].payload.as_ref(), expected);
+        assert!(Measure::of(&batch.events, expected.len() - 1).is_none());
     }
 
     #[test]
@@ -1408,8 +1428,8 @@ mod tests {
         let one = Measure::of(&events[..1], usize::MAX).unwrap().bytes;
         let before = encoded_events();
         assert!(
-            one > 1000,
-            "owned allocations are charged beside the 1,000 encoded bytes"
+            one == 1000,
+            "frozen payloads retain exactly their encoded bytes"
         );
         assert!(Measure::of(&events, 5 * one).is_some_and(|m| m.bytes == 5 * one));
         assert_eq!(encoded_events() - before, 5);
