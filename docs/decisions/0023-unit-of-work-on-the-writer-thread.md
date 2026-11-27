@@ -95,8 +95,9 @@ Facts read from `main` at `075f2b124`:
    noncommit is withdrawn at its original deadline. It was independently reviewed (the code review with conditions), is not wired to the
    daemon and is not the T10 acceptance; the spec's "As built: the retained writer" lists what it
    does, the readings it builds and its one open question, and the plan's "Writer retry policy" gives the order and the vectors.
-   The first producer that rebuilds work is the SQLite event producer (commit `9b55edbf4` on that writer, integrated head
-   `07fecf1ed`; spec "As built: the event producer", plan "As built at `9b55edbf4`"). It submits through `RetainedWrite`, adds
+   The first producer that rebuilds work is the SQLite event producer (a development member of the draft train, on that
+   writer; spec "As built: the event producer", plan "As built: the event producer, first form" and "As built: the event
+   producer, encoded form"). It submits through `RetainedWrite`, adds
    no bound, trait or schema to this decision, is not wired to the daemon or a collector, and is not reviewed or accepted
    here.
 

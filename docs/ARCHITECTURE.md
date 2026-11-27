@@ -1296,9 +1296,10 @@ clients <── WriteReceipt::wait() ──────────────�
   are specific to the latter, and only the per-transaction accounting shows them). A leaf's cleanup unwind is
   outside all of this (record O).
 - **Event producer** (`sqlite/events/producer.rs`, exported from `orch_infra::sqlite`; spec "As built: the event producer",
-  plan "As built at `9b55edbf4`" and "As built at `4e80198f0`"; a development member of the integrated head `07fecf1ed`,
-  read at its later development head `4e80198f0` with the receipt-order correction `c33037e98`, which is the producer on the
-  draft train and not on `main`; not wired to the daemon or to a collector; the daemon still uses files).
+  plan "As built: the event producer, first form" and "As built: the event producer, encoded form"; a development member
+  of the draft train, read in its encoded form with the corrected order of receipts (spec bullet "When capacity comes
+  back"), which is the producer on the draft train and not on `main`; not wired to the daemon or to a collector; the daemon
+  still uses files).
   `EventProducer` is the first caller of `retained_write`, on the `Events` lane
   with no request deadline; while one of its writes has an episode open, the rule of the bullet above holds for it, so the
   worker runs no job of another lane until that write is answered. One task owns every numbered `EventBatch` until the writer has answered for it and has one

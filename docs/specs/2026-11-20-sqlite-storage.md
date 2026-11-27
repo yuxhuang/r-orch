@@ -246,8 +246,8 @@ refusal of a leaf may commit its unrelated work. It leaves one question open and
 cleanup (record O). It states nothing about the event producer, which was not built when this revision was written. No independent review had read this
 revision when it was written.
 
-The revision that carries this paragraph states, as built, the first event producer: the commit `9b55edbf4` on the writer
-of `2a7cb83e4`, in the integrated development head `07fecf1ed` ("As built: the event producer" under "When a transaction
+The revision that carries this paragraph states, as built, the first form of the event producer, a development commit on the
+writer that PR #412 landed as `53136a969` ("As built: the event producer" under "When a transaction
 fails"). It changes no rule of records O and P, no class, time or limit of R26, R27, R63 or R128, no trait, no schema and no
 other requirement. It is a development member, not wired to the daemon or to a collector, and it is not the T10 freeze or
 the acceptance of issue 127. No independent review had read this revision when it was written.
@@ -3013,7 +3013,7 @@ after three defects were found in it (the last bullet below lists them). What it
   the choice (1) above and was never a defect. The expiry of a settled token was not probed again: it has its permanent
   test.
 - *Not built here.* At `2a7cb83e4` the event producer (the coalescing of several runs, the cut at 1,000 rows or 20 ms with
-  the kept tail, the reconciliation of an unknown commit: vector WP9) was not built; it is built at `9b55edbf4`, below. Still
+  the kept tail, the reconciliation of an unknown commit: vector WP9) was not built; it is built in the section "As built: the event producer", below. Still
   not built: the final proofs of issue 127 and the other callers of record P. The deterministic admission fixtures of issue
   408, which the source of `2a7cb83e4` does not change, are in the integrated head `07fecf1ed`.
 
@@ -3074,10 +3074,10 @@ the retained write. It exists on the integrated development head `07fecf1ed` as 
 `2a7cb83e4`, which landed on `main` in PR #412 as `53136a969` (the producer did not: it is on the draft train only); it is
 read from the source and its tests on Linux, it is not wired to the daemon (which uses files) or to a
 collector, and it is not reviewed or accepted here: no T10 vector and no proof of issue 127 is accepted. It adds no trait, no
-schema and no authentication, and it changes no class, time or limit of R26, R27, R63 or R128. The plan's "As built at
-`9b55edbf4`" lists its tests and what the head's runs showed, including a whole `fast` run of that head that failed.
+schema and no authentication, and it changes no class, time or limit of R26, R27, R63 or R128. The plan's "As built: the event producer, first form" lists its tests and what the head's runs showed, including a
+whole `fast` run of that head that failed.
 The producer was changed after that commit. Its admission and its retained form are read below at the later development
-head `4e80198f0` (tree `6db7dc8eb`, on `c3d009ab9`, on `c51daaea9`; the plan's "As built at `4e80198f0`" has the tests
+head `4e80198f0` (tree `6db7dc8eb`, on `c3d009ab9`, on `c51daaea9`; the plan's "As built: the event producer, encoded form" has the tests
 and the runs), and the bullets that say so name it. One correction follows that head: `c33037e98` (tree `b8abd8e1b`)
 changes `producer.rs` and its tests only, and sends the answer of a batch after its bytes are returned ("When capacity
 comes back"); its `crates/` tree (`d2c1c4086`) is the `crates/` tree of the draft train at `60a989256`, which this revision
@@ -3200,7 +3200,7 @@ a development input like the first: it is not the T10 freeze and is not accepted
   `overloaded` at its deadline) as that section says, with no time bound.
 - *Reconcile.* After an unknown commit nothing is submitted until the database has answered: a snapshot of the bound caller
   reads each row that a step stored, by its sequence number, and compares its time, type and payload bytes with the frozen
-  encoding of the input (as built at `4e80198f0`; at `9b55edbf4` it paged through the sequence range and compared decoded
+  encoding of the input (as built in the encoded form; in the first form it paged through the sequence range and compared decoded
   events). A row whose payload is behind a blob reference is loaded through the blob store, which checks its size and hash,
   one row at a time, and no decoded value is rebuilt. All found: the commit happened.
   None found: a rebuild if the cause was retryable, and an answer of failure if not. Some found, a stored event that differs
@@ -5630,7 +5630,7 @@ lifetime of a reader's snapshot that answers no id and changes none of the answe
     reviewed (the code review with conditions), is not wired to the daemon and is not accepted for T10. As built, the suppression of claims
     holds all four lanes ("While one logical operation is retained" under "Writer lanes"); that is not a part of record P
     and not a ruling of the owner. A development implementation of item 2's event producer exists on the draft train, not
-    on `main` (first at `9b55edbf4`, then in the encoded form that "As built: the event producer" reads); it is not
+    on `main` (first in the form that the plan's "As built: the event producer, first form" reads, then in the encoded form that "As built: the event producer" reads); it is not
     wired, reviewed as a whole or accepted. The remaining collection and the other callers are not built.
 
 "As recommended" means, for O1 to O10, AP1 to AP13 and D1 to D8, the recommendation and its condition in
