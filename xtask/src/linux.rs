@@ -58,6 +58,7 @@ enum LinuxCommand {
 /// the Linux graph, and CI always runs it.
 const CI_STEPS: &[&str] = &[
     "test -s Cargo.lock && ! grep -qE '^name = \"(terminfo|termwiz)\"$' Cargo.lock",
+    "python3 scripts/ci/test_pr_merge_preflight.py",
     "cargo fmt --all --check",
     "cargo clippy --workspace --all-targets -- -D warnings",
     "cargo xtask crate-graph",
@@ -823,6 +824,10 @@ mod tests {
     /// a documentation change. It is a routing step of the workflow, not a check
     /// the container owes: `cargo xtask linux` always runs the whole suite.
     const DOCS_ONLY_BUILD: &str = "cargo build --workspace";
+    /// Live PR admission has no meaning in a local checkout. Its offline Git
+    /// fixtures still run in both lanes via CI_STEPS; only this exact command
+    /// is CI-only plumbing, not an exemption for arbitrary shell commands.
+    const PR_PREFLIGHT: &str = "bash scripts/ci/pr_merge_preflight.sh";
 
     fn assert_ci_mirror(ci: &str) {
         let script = container_script(&LinuxCommand::Ci).0;
@@ -843,6 +848,7 @@ mod tests {
                 || run.contains("apt-get")
                 || run.starts_with("chown -R ")
                 || run == DOCS_ONLY_BUILD
+                || run == PR_PREFLIGHT
                 || MIRROR_RUNNER_LINES.contains(&run)
             {
                 continue;
@@ -853,8 +859,8 @@ mod tests {
             );
             checked += 1;
         }
-        // fmt, clippy and crate-graph; the suite lines are runner-specific.
-        assert!(checked >= 3, "found only {checked} cargo steps in ci.yml");
+        // Shared fixtures, fmt, clippy and crate-graph; suites differ by runner.
+        assert!(checked >= 4, "found only {checked} shared checks in ci.yml");
         for command in &CI_STEPS[1..] {
             // The suite command is the one that differs by runner.
             if command.starts_with("cargo test ") {
@@ -899,6 +905,18 @@ mod tests {
             .or_else(|| failure.downcast_ref::<&str>().copied())
             .unwrap();
         assert!(message.contains("ci.yml runs `cargo xtask ci-only-regression`"));
+    }
+
+    #[test]
+    fn the_pr_preflight_exception_does_not_exempt_other_shell_commands() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let ci = std::fs::read_to_string(repo.join(".github/workflows/ci.yml")).unwrap();
+        let mutant = ci.replacen(PR_PREFLIGHT, "bash scripts/ci/unknown.sh", 1);
+        assert_ne!(mutant, ci);
+        let failure = std::panic::catch_unwind(|| assert_ci_mirror(&mutant))
+            .expect_err("unknown shell command escaped the mirror");
+        let message = failure.downcast_ref::<String>().unwrap();
+        assert!(message.contains("ci.yml runs `bash scripts/ci/unknown.sh`"));
     }
 
     #[test]
