@@ -245,7 +245,14 @@ struct Pending {
 impl Pending {
     fn finish(mut self, answer: Answer) {
         if let Some(reply) = self.reply.take() {
-            let _ = reply.send(answer);
+            if matches!(&answer, Err(failure) if failure.outcome_unknown) {
+                let _ = reply.send(answer);
+            } else if let Some(charge) = &self.charge {
+                *charge.answer.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some((reply, answer));
+            } else {
+                let _ = reply.send(answer);
+            }
         }
     }
     fn failure(&self, error: StoreError, outcome_unknown: bool) -> SubmitFailure {
@@ -264,12 +271,21 @@ impl Pending {
 struct Charge {
     shared: Weak<Shared>,
     bytes: usize,
+    answer: Mutex<Option<(oneshot::Sender<Answer>, Answer)>>,
 }
 impl Drop for Charge {
     fn drop(&mut self) {
         if let Some(shared) = self.shared.upgrade() {
             shared.queue().bytes -= self.bytes;
             shared.idle.notify_waiters();
+        }
+        if let Some((reply, answer)) = self
+            .answer
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = reply.send(answer);
         }
     }
 }
@@ -427,6 +443,7 @@ impl EventProducer {
             charge: Some(Arc::new(Charge {
                 shared: Arc::downgrade(&self.shared),
                 bytes: accounted,
+                answer: Mutex::new(None),
             })),
         });
         drop(batch.events);

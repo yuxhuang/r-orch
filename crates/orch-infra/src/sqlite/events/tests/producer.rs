@@ -2040,3 +2040,23 @@ async fn encoded_budget_stays_charged_through_in_flight_ownership() {
     );
     producer.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_answered_encoded_batch_has_already_returned_its_exact_budget() {
+    let mut fx = fixture();
+    let batch = fx.batch("p", "r", 1..=1).await;
+    fx.options.byte_limit = accounted_bytes(&batch);
+    let producer = fx.producer();
+    for _ in 0..1000 {
+        let result = producer
+            .submit(batch.clone())
+            .expect("a received receipt returns exact admission capacity");
+        answered(result).await.unwrap();
+        assert_eq!(
+            producer.retained(),
+            (0, 0, 0),
+            "receipt must follow the final owner and refund"
+        );
+    }
+    producer.close().await;
+}
