@@ -772,8 +772,10 @@ The cursor rules (spec R10, the `Cursor` row and the Task cursor exception of is
 `Send` part of a write, and the unit is only lent to it.
 
 **What it costs.** `dyn UnitOfWork` is no longer `Send`, so `&mut dyn UnitOfWork` is not `Send` either, and a consumer
-can never hand the unit it was lent to another thread. The reference types `Session` and `View` stay `Send` as concrete
-types; a callback does not see them.
+can never hand the unit it was lent to another thread. That is the one thing the compiler enforces about the borrowed
+view. Data borrowed from the unit, such as the `&Caller` that `caller()` returns, can cross threads, so rule 2 below is
+kept by review for it. The reference types `Session` and `View` stay `Send` as concrete types; a callback does not see
+them.
 
 **Rules for a callback.**
 

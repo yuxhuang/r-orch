@@ -52,8 +52,10 @@ Facts read from `main` at `075f2b124`:
    `overloaded` at its deadline, a failed writer) never invokes it.
 3. **A borrowed view stays on the thread that lent it.** The `&mut dyn UnitOfWork` of a callback, and anything
    borrowed from it, is used only on the thread running the callback, until the callback returns. It is not sent to
-   another thread, a spawned task or a scoped thread. The compiler enforces this: `dyn UnitOfWork` is no longer
-   `Send`, so a `&mut dyn UnitOfWork` is not.
+   another thread, a spawned task or a scoped thread. The compiler enforces one case of this: `dyn UnitOfWork` is no
+   longer `Send`, so the lent `&mut dyn UnitOfWork` cannot be moved into another thread (vector A3-W3 shows it for a
+   scoped `move` closure). It enforces nothing about other data: a `&Caller`, or a value that the callback captures, is
+   not thread-confined by this decision, and the rest of the rule is kept by review.
 4. **A callback depends on no Tokio runtime.** The SQLite adapter runs the writer (`Writer::run`, a blocking function) on
    a plain thread, so a callback there has no runtime context. A callback calls neither `Handle::current()` nor `block_on` nor anything else that needs a runtime. Sending a result
    on a `tokio::sync::oneshot` channel, as `StorageExt::transaction` does, needs none and stays allowed.
