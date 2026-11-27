@@ -115,6 +115,13 @@ impl RetainedWrite {
         &mut self,
         expected: Arc<Vec<super::super::events::producer::EncodedExpected>>,
     ) -> store::Result<bool> {
+        // Only the executor can commit: its hook forbids callback-side commits.
+        // If it never attempted COMMIT, an empty expected set or pre-existing
+        // duplicates cannot establish a successful commit of this attempt.
+        if !self.episode.commit_attempted() {
+            self.record_reconciled(false)?;
+            return Ok(false);
+        }
         self.reconcile_snapshot(move |snapshot| async move {
             snapshot.call(move |view| {
                 let (mut wanted, mut found) = (0, 0);
@@ -215,6 +222,14 @@ impl RetainedWrite {
         }
         let snapshot = self.storage.snapshot(self.caller.clone()).await?;
         let committed = check(snapshot).await?;
+        self.record_reconciled(committed)?;
+        Ok(committed)
+    }
+
+    fn record_reconciled(&mut self, committed: bool) -> store::Result<()> {
+        if self.pending.is_some() || !self.unknown {
+            return Err(backend("write has no settled unknown outcome"));
+        }
         self.unknown = false;
         if committed {
             self.storage.owner.shared.state.writer_committed();
@@ -227,11 +242,13 @@ impl RetainedWrite {
             },
             self.episode.snapshot().1,
         );
-        self.may_submit = !committed && self.episode.snapshot().1.is_some();
+        self.may_submit = !committed
+            && self.episode.snapshot().1.is_some()
+            && self.storage.owner.shared.state.failure().is_none();
         if !self.may_submit {
             self.episode.finish();
         }
-        Ok(committed)
+        Ok(())
     }
 }
 
@@ -263,6 +280,170 @@ mod tests {
             None,
         ))
     }
+    async fn incomplete_unknown_receipt(
+        write: &mut RetainedWrite,
+        calls: Arc<AtomicUsize>,
+        caught: bool,
+    ) -> WriteAttempt {
+        let state = write.storage.owner.shared.state.clone();
+        let receipt = write
+            .storage
+            .owner
+            .writer
+            .submit_episode(
+                super::super::super::Lane::Events,
+                write.episode.clone(),
+                move |tx| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    // Real rollback, deliberately absent hook evidence. The IOERR
+                    // is synthetic; this is not evidence of a disk failure.
+                    tx.execute_batch("ROLLBACK")?;
+                    let error = sql(rusqlite::ffi::SQLITE_IOERR);
+                    if caught {
+                        state.observe(FailureSource::Writer, &error);
+                        state.abort_transaction();
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                },
+                || {},
+            )
+            .unwrap();
+        write.may_submit = false;
+        write.pending = Some(tokio::task::spawn_blocking(move || receipt.wait()));
+        write.receive().await.unwrap()
+    }
+
+    async fn incomplete_unknown_ioerr_streak(separate_episodes: bool, caught: bool) {
+        let (_root, data) = crate::sqlite::test_data();
+        let storage = SqliteStorage::open(
+            Arc::new(data),
+            StorageOptions {
+                writer_setup: Some(Box::new(|connection| {
+                    connection.rollback_hook(None::<fn()>).unwrap();
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut write = storage.retained_write(owner(), store::Lane::Events, None);
+        let first = incomplete_unknown_receipt(&mut write, calls.clone(), caught).await;
+        assert_eq!(first.outcome, WriteOutcome::Unknown);
+        assert_eq!(first.retry_code, Some(RetryCode::Io));
+        assert!(
+            first
+                .result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("SQLite storage operation failed")
+        );
+        assert!(!first.retryable());
+        assert_eq!(first.accounting.rows, 0);
+        assert!(
+            storage.failure_state().failure().is_none(),
+            "one IOERR counted once"
+        );
+        assert!(storage.failure_state().claims_suppressed());
+        assert!(write.receive().await.is_err(), "one original receipt");
+        assert!(
+            write
+                .attempt(Box::new(|_| panic!("unknown replayed")))
+                .await
+                .is_err()
+        );
+        assert!(!write.reconcile_encoded(Arc::new(Vec::new())).await.unwrap());
+        assert_eq!(write.episode.snapshot().0, WriteOutcome::RolledBack);
+        assert!(
+            write.may_submit,
+            "confirmed noncommit permits producer rebuild"
+        );
+        if separate_episodes {
+            drop(write);
+            write = storage.retained_write(owner(), store::Lane::Events, None);
+        }
+        let second = incomplete_unknown_receipt(&mut write, calls.clone(), caught).await;
+        assert_eq!(second.outcome, WriteOutcome::Unknown);
+        assert_eq!(second.retry_code, Some(RetryCode::Io));
+        assert!(!second.retryable());
+        assert!(
+            second
+                .result
+                .as_ref()
+                .unwrap_err()
+                .to_string()
+                .contains("storage_unavailable")
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "each admitted callback ran once"
+        );
+        assert_eq!(
+            storage.failure_state().failure().unwrap().causes,
+            vec![(Role::Operation, FatalCause::ConsecutiveIoErrors)]
+        );
+        assert!(!write.reconcile_encoded(Arc::new(Vec::new())).await.unwrap());
+        assert_eq!(write.episode.snapshot().0, WriteOutcome::RolledBack);
+        assert!(!write.may_submit, "a fatal receipt never permits a rebuild");
+        assert!(
+            write
+                .attempt(Box::new(|_| panic!("fatal callback replayed")))
+                .await
+                .is_err()
+        );
+        drop(write);
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_known_empty_commit_breaks_the_incomplete_callback_ioerr_streak() {
+        let (_root, data) = crate::sqlite::test_data();
+        let storage = SqliteStorage::open(
+            Arc::new(data),
+            StorageOptions {
+                writer_setup: Some(Box::new(|connection| {
+                    connection.rollback_hook(None::<fn()>).unwrap();
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        for round in 0..2 {
+            let mut write = storage.retained_write(owner(), store::Lane::Events, None);
+            let failed = incomplete_unknown_receipt(&mut write, calls.clone(), false).await;
+            assert_eq!(failed.outcome, WriteOutcome::Unknown);
+            assert_eq!(failed.retry_code, Some(RetryCode::Io));
+            assert!(storage.failure_state().failure().is_none(), "round {round}");
+            assert!(!write.reconcile_encoded(Arc::new(Vec::new())).await.unwrap());
+            drop(write);
+            let mut empty = storage.retained_write(owner(), store::Lane::Events, None);
+            let committed = empty.attempt(Box::new(|_| Ok(()))).await.unwrap();
+            assert!(committed.result.is_ok());
+            assert_eq!(committed.outcome, WriteOutcome::Committed);
+            assert_eq!(committed.accounting.rows, 0);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn incomplete_unknown_ioerr_counts_once_and_the_next_attempt_latches() {
+        for caught in [false, true] {
+            incomplete_unknown_ioerr_streak(false, caught).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_unknown_ioerr_streak_survives_episode_turnover() {
+        for caught in [false, true] {
+            incomplete_unknown_ioerr_streak(true, caught).await;
+        }
+    }
+
     #[tokio::test]
     async fn native_observation_survives_port_conversion_and_spans_reconstructed_callbacks() {
         let (_root, data) = crate::sqlite::test_data();
