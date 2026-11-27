@@ -1794,3 +1794,6 @@ async fn an_idle_owned_snapshot_expires_and_releases_backlog_before_its_idle_tim
     drop(snapshot);
     storage.close().await.unwrap();
 }
+
+#[path = "operational_guard_tests.rs"]
+mod operational_guard_tests;
