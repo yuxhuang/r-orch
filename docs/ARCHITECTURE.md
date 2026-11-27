@@ -1285,8 +1285,8 @@ clients <── WriteReceipt::wait() ──────────────�
   not a ruling of the owner. A request that carries a deadline (`Storage::write`: 50 ms for `Claims`, 200 ms for `Entities`, 1 s for `Events`, 5 s
   for `Maintenance`) is answered `Overloaded` when the worker reaches it past that deadline, which can be well after it, and
   a queued claim is answered the same way, because the check does not depend on the lane;
-  no time bound is given (the spec's "While one logical operation is retained"; no permanent test covers the lanes other
-  than claims, issue 429). The worker retires an episode whose last outcome is a known noncommit at its original
+  no time bound is given (the spec's "While one logical operation is retained"; since PR #443 a permanent test covers the lanes other
+  than claims for an expired deadline and for none, issue 429; a finite future deadline is issue 445). The worker retires an episode whose last outcome is a known noncommit at its original
   deadline, between the producer's submissions; an unknown commit stays fenced until it is reconciled. A second
   `SQLITE_IOERR` in a row, counted by the writer across logical requests and ended by a known commit or another SQL
   failure, and sixty seconds from an episode's first failure without a known commit latch
