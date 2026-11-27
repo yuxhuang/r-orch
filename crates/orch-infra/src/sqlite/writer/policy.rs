@@ -38,8 +38,10 @@ pub enum WriteOutcome {
     Unknown,
 }
 
-/// Actual SQL changes and execution time for one indivisible transaction.
-/// COMMIT retries are part of this transaction, never another accounting event.
+/// Actual SQL changes and execution time for one physical transaction, its COMMIT
+/// included. It is over the bound when it changed more than 1,000 rows or worked
+/// longer than 20 ms, whether or not a producer could have divided it. COMMIT
+/// retries are part of this transaction, never another accounting event.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WriteAccounting {
     pub rows: u64,
