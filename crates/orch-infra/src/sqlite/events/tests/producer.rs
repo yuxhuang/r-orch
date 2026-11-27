@@ -727,6 +727,126 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn a_full_disk_is_retried_and_then_fails_the_writer() {
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let seen = attempts.clone();
+    let fx = fixture_with(StorageOptions {
+        writer_commit_probe: Some(Box::new(move |tx| {
+            let events: i64 = tx
+                .query_row("SELECT count(*) FROM run_events", [], |r| r.get(0))
+                .unwrap();
+            if events == 0 {
+                return None;
+            }
+            // Fail every reconstructed transaction, not just one callback or
+            // the policy object in isolation. The rows must roll back each time.
+            assert_eq!(events, 3);
+            seen.lock().unwrap().push(Instant::now());
+            Some(Err(sql(13)))
+        })),
+        ..StorageOptions::default()
+    });
+    let idle = fixture();
+    let producer = fx.producer();
+    let first = fx.batch("p", "a", 1..=3).await;
+    let second = fx.batch("p", "b", 1..=2).await;
+    let stall = fx.stall().await;
+    let first = producer.submit(first).unwrap();
+    in_flight(&producer).await;
+    let second = producer.submit(second).unwrap();
+    stall.end().await;
+
+    // Exercise the unmodified production sixty-second episode. This timeout is
+    // only a hang bound; there is no upper latency expectation or filled disk.
+    let failure = tokio::time::timeout(Duration::from_secs(120), first)
+        .await
+        .expect("FULL episode did not produce a terminal receipt")
+        .unwrap_err();
+    assert!(failure.error.to_string().contains("storage_unavailable"));
+    assert_eq!(failure.committed, counts(0, 0));
+    assert_eq!(failure.not_stored, 3);
+    assert!(!failure.outcome_unknown);
+    let queued = answered(second).await.unwrap_err();
+    assert!(queued.error.to_string().contains("storage_unavailable"));
+    assert_eq!((queued.committed, queued.not_stored), (counts(0, 0), 2));
+    assert!(!queued.outcome_unknown);
+    assert_eq!(
+        fx.storage.failure_state().failure().unwrap().causes,
+        vec![(
+            crate::sqlite::Role::Operation,
+            crate::sqlite::FatalCause::RetryWithoutCommit
+        )]
+    );
+    {
+        let attempts = attempts.lock().unwrap();
+        assert!(
+            attempts.len() >= 8,
+            "FULL must survive the exponential backoff"
+        );
+        assert!(attempts[0].elapsed() >= Duration::from_secs(60));
+    }
+    assert!(fx.reports().is_empty(), "no transaction committed");
+    for run in ["a", "b"] {
+        assert!(fx.stored("p", run).await.is_empty());
+    }
+    let later = fx
+        .storage
+        .write(
+            owner("p"),
+            Lane::Entities,
+            Box::new(|_| panic!("failed writer invoked a later mutation")),
+        )
+        .await;
+    assert!(
+        later
+            .unwrap_err()
+            .to_string()
+            .contains("storage_unavailable")
+    );
+
+    // This independent real writer stayed idle across the same full episode.
+    // Idle time alone must neither latch failure nor prevent a later commit.
+    assert!(idle.storage.failure_state().failure().is_none());
+    let control = idle.producer();
+    assert_eq!(
+        answered(
+            control
+                .submit(idle.batch("p", "idle", 1..=1).await)
+                .unwrap()
+        )
+        .await
+        .unwrap(),
+        counts(1, 0)
+    );
+    assert_eq!(idle.stored("p", "idle").await, vec![event(1)]);
+    assert!(idle.storage.failure_state().failure().is_none());
+    control.close().await;
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn a_closed_producer_returns_an_oversized_batch_as_closed() {
+    let mut fx = fixture();
+    fx.options.queue_limit = 1;
+    fx.options.observer = Some(Arc::new(|_| panic!("close intake after the known commit")));
+    let lead = fx.batch("p", "lead", 1..=1).await;
+    let batch = fx.batch("p", "run", 1..=2).await;
+    let expected = batch.clone();
+    let producer = fx.producer();
+    assert_eq!(
+        answered(producer.submit(lead).unwrap()).await.unwrap(),
+        counts(1, 0)
+    );
+    // On this current-thread runtime the observer unwinds and closes intake
+    // before the submitting task resumes from its delivered receipt.
+    match producer.submit(batch) {
+        Err(Rejected::Closed(batch, _)) => same_batch(&batch, &expected),
+        other => panic!("Closed must precede TooLarge: {other:?}"),
+    }
+    producer.close().await;
+}
+
+#[tokio::test]
 async fn a_stale_run_is_refused_alone_and_the_others_in_its_transaction_commit() {
     let fx = fixture();
     let producer = fx.producer();

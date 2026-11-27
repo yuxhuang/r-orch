@@ -503,6 +503,140 @@ mod tests {
         storage.close().await.unwrap();
     }
     #[tokio::test]
+    async fn every_nonclaim_lane_waits_for_retirement_and_keeps_its_original_deadline() {
+        for lane in [
+            store::Lane::Entities,
+            store::Lane::Events,
+            store::Lane::Maintenance,
+        ] {
+            for expired in [false, true] {
+                let (_root, data) = crate::sqlite::test_data();
+                let mut first = true;
+                let storage = SqliteStorage::open(
+                    Arc::new(data),
+                    StorageOptions {
+                        writer_commit_probe: Some(Box::new(move |_| {
+                            let fail = first;
+                            first = false;
+                            fail.then(|| {
+                                Err(rusqlite::Error::SqliteFailure(
+                                    rusqlite::ffi::Error::new(13),
+                                    None,
+                                ))
+                            })
+                        })),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let mut retained = storage.retained_write(owner(), store::Lane::Events, None);
+                let answer = retained
+                    .attempt(Box::new(|unit| {
+                        unit.create(team("rolled-back")).map(|_| ())
+                    }))
+                    .await
+                    .unwrap();
+                assert!(answer.retryable());
+                assert_eq!(answer.outcome, WriteOutcome::RolledBack);
+                let state = storage.failure_state();
+                assert!(state.claims_suppressed());
+
+                // An already-passed deadline is admitted into the real queue:
+                // it is the worker, after retirement, that must withdraw it.
+                let deadline = expired.then(|| Instant::now() - Duration::from_secs(1));
+                let mut queued = storage.retained_write(owner(), lane, deadline);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let seen = calls.clone();
+                let observed = state.clone();
+                let mut waiting = Box::pin(queued.attempt(Box::new(move |unit| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    assert!(
+                        !observed.claims_suppressed(),
+                        "{lane:?} overtook a retained retry"
+                    );
+                    unit.create(team("queued")).map(|_| ())
+                })));
+                assert!(futures::poll!(&mut waiting).is_pending());
+                let writer = storage.owner.writer.clone();
+                tokio::task::spawn_blocking(move || writer.wait_for_park_test())
+                    .await
+                    .unwrap();
+                assert!(
+                    futures::poll!(&mut waiting).is_pending(),
+                    "{lane:?} answered before retirement"
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert!(state.claims_suppressed());
+
+                // Dropping the known-noncommit producer retires its episode.
+                // No retry or new deadline is granted to the queued operation.
+                drop(retained);
+                let answer = tokio::time::timeout(Duration::from_secs(5), &mut waiting)
+                    .await
+                    .expect("retirement did not release queued work")
+                    .unwrap();
+                drop(waiting);
+                if expired {
+                    assert_eq!(answer.outcome, WriteOutcome::NotStarted);
+                    assert!(!answer.retryable());
+                    assert!(
+                        answer
+                            .result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("overloaded")
+                    );
+                    assert_eq!(calls.load(Ordering::SeqCst), 0);
+                    assert!(queued.receive().await.is_err(), "only one terminal receipt");
+                    assert!(
+                        queued
+                            .attempt(Box::new(|_| panic!("expired callback replayed")))
+                            .await
+                            .is_err()
+                    );
+                } else {
+                    assert_eq!(answer.outcome, WriteOutcome::Committed);
+                    assert!(answer.result.is_ok());
+                    assert_eq!(calls.load(Ordering::SeqCst), 1);
+                }
+                assert!(!state.claims_suppressed());
+                assert!(state.failure().is_none());
+                storage
+                    .transaction(owner(), store::Lane::Maintenance, |unit| {
+                        unit.create(team("after"))
+                    })
+                    .await
+                    .unwrap();
+                let snapshot = storage.read(owner()).await.unwrap();
+                assert!(
+                    snapshot
+                        .get(EntityKind::Team, "rolled-back")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(
+                    snapshot
+                        .get(EntityKind::Team, "queued")
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    !expired
+                );
+                assert!(
+                    snapshot
+                        .get(EntityKind::Team, "after")
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                drop(snapshot);
+                drop(queued);
+                storage.close().await.unwrap();
+            }
+        }
+    }
+    #[tokio::test]
     async fn caught_clean_leaf_refusal_may_commit_unrelated_work_despite_retry_class() {
         let (_root, data) = crate::sqlite::test_data();
         let inject = Arc::new(AtomicBool::new(false));
