@@ -65,7 +65,7 @@ jobs:
 
   changes:
     needs: preflight
-    if: ${{ !cancelled() && github.event_name != 'schedule' && (github.event_name != 'pull_request' || needs.preflight.result == 'success') }}
+    if: ${{ !cancelled() && github.event_name != 'schedule' && (github.event_name != 'pull_request' || (needs.preflight.result == 'success' && needs.preflight.outputs.merge != '')) }}
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_SELF_HOSTED_RUNNER || 'ubuntu-latest' }}
     container:
       image: docker.io/library/rust:1-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254
@@ -124,7 +124,7 @@ jobs:
 
   check:
     needs: [preflight, changes]
-    if: always() && (github.event_name != 'pull_request' || needs.preflight.result == 'success')
+    if: always()
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_SELF_HOSTED_RUNNER || 'ubuntu-latest' }}
     container:
       image: docker.io/library/rust:1-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254
@@ -140,11 +140,19 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           REF: ${{ github.ref }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          PREFLIGHT_MERGE: ${{ needs.preflight.outputs.merge }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           MODE: ${{ needs.changes.outputs.mode }}
         shell: bash
         run: |
           set -euo pipefail
+          if [[ "$EVENT" == pull_request ]]; then
+            if [[ "$PREFLIGHT_RESULT" != success || -z "$PREFLIGHT_MERGE" ]]; then
+              echo 'PR merge preflight failed or omitted its merge output' >&2
+              exit 1
+            fi
+          fi
           if [[ "$EVENT" == schedule ]]; then
             [[ "$CHANGES_RESULT" == skipped && -z "$MODE" ]] || exit 1
           else
@@ -212,7 +220,7 @@ jobs:
 
   test:
     needs: [preflight, changes]
-    if: ${{ !cancelled() && (github.event_name != 'pull_request' || needs.preflight.result == 'success') && github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all') }}
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.preflight.result == 'success' && needs.preflight.outputs.merge != '')) && github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all') }}
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.CI_SELF_HOSTED_RUNNER || 'ubuntu-latest' }}
     container:
       image: docker.io/library/rust:1-trixie@sha256:e84068000361bf3d4a5ba2b7647f62893528b1eb9f847d7a23b493f5ce8ea254

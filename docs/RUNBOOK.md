@@ -1720,7 +1720,7 @@ unsuccessful, 75 the lease was busy and nothing ran,
 | Exit 3, `advisories` is `ENV-LIMITED`: `cargo-deny not installed` | The advisories, licences, bans and sources check was not evaluated | `cargo install cargo-deny --locked`, then rerun. `ENV-LIMITED` is not a pass. |
 | `fast` selects `all` and you expected one crate | A `global`, `unknown` or `error` row in the printed reasons (shared input, unclassified path, unreadable base, empty change set) | Read the row; this is the fail-closed design, not a fault. Use `--base` for the right base. |
 | `REFUSED` with `marker:` and `target in use` / `an earlier use did not finish` | A target use marker is held or left by an unfinished use | Do not remove the marker, `target/` or run `cargo clean`. Inspect read-only with `lsof` on the marker; preserve the target and diagnostics for the owner. |
-| CI `preflight` fails with `PR merge preflight:` | The checked-out PR merge has stale/invalid parents, or the bounded live-ref lookup failed | Read expected/observed hashes in the preflight log. Wait for GitHub to publish a merge with the current base/head pair, then request a fresh PR run. Do not treat skipped downstream jobs as qualifying evidence. |
+| CI `preflight` fails with `PR merge preflight:` | The checked-out PR merge has stale/invalid parents, or the bounded live-ref lookup failed | Read expected/observed hashes in the preflight log. Wait for GitHub to publish a merge with the current base/head pair, then close and reopen the PR to create a fresh `pull_request` event (or push a new commit). Re-running jobs reuses the old `github.sha` and will refuse the same stale merge again. Do not treat skipped downstream jobs as qualifying evidence. |
 | CI `check` fails at `Require valid classification` (`invalid classification mode`) | The `changes` job did not produce `docs-only`, `packages` or `all` | Read the `changes` job log. Do not re-run it away; a missing or unresolvable base already selects `all`. |
 | A documentation-only PR shows `test` as skipped | By design: the `test` job's condition excludes `docs-only` | Nothing. A conditionally skipped job satisfies the required check; a skipped whole workflow would not. |
 
@@ -1782,9 +1782,13 @@ run `preflight`: its actual checkout must have exactly two ordered parents match
 the live target branch tip and upstream PR head ref. A failed or indeterminate
 lookup refuses the run before classification, caches or builds. The ref lookup
 has a 20-second deadline (five-second kill grace); the preflight job has a
-two-minute ceiling, excluding queue time. On success, classification and both
-required jobs check out the same verified merge SHA. `check` retains `always()`
-for classifier failures but cannot run after a failed PR preflight. On pushes and
+two-minute ceiling, excluding queue time. Checkout disables persisted credentials,
+so the live lookup depends on anonymous public-repository access; private access
+or throttling failures refuse qualification without retry. On success, classification
+and both required jobs check out the same verified merge SHA. `check` retains `always()`
+and fails its first admission step on a failed PR preflight or missing merge output,
+before checkout, caches or builds. The required `check` therefore reports failure;
+classification and the expensive test job skip. On pushes and
 schedules, preflight is intentionally skipped and existing lanes continue;
 only the schedule's skipped/empty classifier is exempt from classification.
 

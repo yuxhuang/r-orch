@@ -8,7 +8,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const CI: &str = include_str!("../../.github/workflows/ci.yml");
-const TEST_IF: &str = "${{ !cancelled() && (github.event_name != 'pull_request' || needs.preflight.result == 'success') && github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all') }}";
+const TEST_IF: &str = "${{ !cancelled() && (github.event_name != 'pull_request' || (needs.preflight.result == 'success' && needs.preflight.outputs.merge != '')) && github.event_name != 'schedule' && needs.changes.result == 'success' && (needs.changes.outputs.mode == 'packages' || needs.changes.outputs.mode == 'all') }}";
 const AMBIENT_IF: &str = "github.event_name == 'push' && github.ref == 'refs/heads/main'";
 /// The workspace's path inside a job container, on GitHub-hosted and
 /// self-hosted runners alike. The `github.workspace` context holds the host's
@@ -104,7 +104,7 @@ fn contract(ci: &str) {
     assert!(!preflight.contains("cargo "));
     let changes = job(ci, "changes");
     assert!(changes.contains("    needs: preflight\n"));
-    assert!(changes.contains("    if: ${{ !cancelled() && github.event_name != 'schedule' && (github.event_name != 'pull_request' || needs.preflight.result == 'success') }}\n"));
+    assert!(changes.contains("    if: ${{ !cancelled() && github.event_name != 'schedule' && (github.event_name != 'pull_request' || (needs.preflight.result == 'success' && needs.preflight.outputs.merge != '')) }}\n"));
     for name in ["changes", "check", "test"] {
         assert!(
             job(ci, name)
@@ -117,7 +117,7 @@ fn contract(ci: &str) {
     assert!(changes.contains("fetch-depth: 0"));
     assert!(changes.contains("--base \"$PR_BASE\" --format github"));
     assert!(changes.contains("printf 'mode=all\\n'"));
-    assert!(check.contains("    needs: [preflight, changes]\n    if: always() && (github.event_name != 'pull_request' || needs.preflight.result == 'success')\n"));
+    assert!(check.contains("    needs: [preflight, changes]\n    if: always()\n"));
     assert!(test.contains("    needs: [preflight, changes]\n"));
     assert!(check.contains("- name: Require valid classification\n"));
     assert!(check.contains("[[ \"$CHANGES_RESULT\" == success ]] || exit 1"));
@@ -465,6 +465,8 @@ fn classification_guard_executes_fail_closed_truth_table() {
                         &[
                             ("EVENT", event),
                             ("REF", reference),
+                            ("PREFLIGHT_RESULT", "success"),
+                            ("PREFLIGHT_MERGE", "verified-merge"),
                             ("CHANGES_RESULT", result),
                             ("MODE", mode)
                         ]
@@ -482,6 +484,8 @@ fn classification_guard_executes_fail_closed_truth_table() {
         &[
             ("EVENT", "pull_request"),
             ("REF", "refs/pull/1/merge"),
+            ("PREFLIGHT_RESULT", "success"),
+            ("PREFLIGHT_MERGE", "verified-merge"),
             ("CHANGES_RESULT", "failure"),
             ("MODE", "all")
         ]

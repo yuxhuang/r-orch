@@ -38,7 +38,7 @@ class MergePreflight(unittest.TestCase):
 
     def git(self, *args):
         return subprocess.check_output(['git', *args], cwd=self.repo,
-                                       env=self.env, text=True).strip()
+                                       env=self.env, input='', text=True).strip()
 
     def commit(self, *parents):
         tree = self.git('hash-object', '-t', 'tree', '--stdin')
@@ -151,7 +151,7 @@ class WorkflowConditions(unittest.TestCase):
 
     These local controls are not a substitute for GitHub execution receipts.
     """
-    def condition(self, job, event, preflight, changes='success', mode='all'):
+    def condition(self, job, event, preflight, changes='success', mode='all', merge='verified-merge'):
         workflow = (ROOT / '.github/workflows/ci.yml').read_text()
         # Stop at the next top-level job, not a job property.
         body = re.split(r'\n  (?=\S)', workflow.split(f'\n  {job}:\n', 1)[1])[0]
@@ -167,7 +167,8 @@ class WorkflowConditions(unittest.TestCase):
         scope = dict(
             github=SimpleNamespace(event_name=event, ref='refs/heads/main'),
             needs=SimpleNamespace(
-                preflight=SimpleNamespace(result=preflight),
+                preflight=SimpleNamespace(result=preflight,
+                                          outputs=SimpleNamespace(merge=merge)),
                 changes=SimpleNamespace(result=changes,
                                         outputs=SimpleNamespace(mode=mode))),
             always=lambda: True, cancelled=lambda: False)
@@ -175,14 +176,60 @@ class WorkflowConditions(unittest.TestCase):
         expression = re.sub(r'!(?!=)', ' not ', expression)
         return bool(eval(expression, {'__builtins__': {}}, scope))
 
-    def test_stale_or_indeterminate_blocks_all_expensive_jobs(self):
-        for result in ['failure', 'cancelled', 'skipped', '']:
-            for job in ['changes', 'check', 'test']:
-                with self.subTest(result=result, job=job):
-                    self.assertFalse(self.condition(job, 'pull_request', result))
+    def admission(self, event, preflight, changes='success', mode='all',
+                  merge='verified-merge'):
+        # Execute the actual first check step, with its actual Actions env wiring.
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        body = workflow.split('      - name: Require valid classification\n', 1)[1]
+        body = body.split('      - uses:', 1)[0]
+        values = {'github.event_name': event, 'github.ref': 'refs/heads/main',
+                  'needs.preflight.result': preflight,
+                  'needs.preflight.outputs.merge': merge,
+                  'needs.changes.result': changes, 'needs.changes.outputs.mode': mode}
+        env = dict(os.environ)
+        for name, expression in re.findall(r'^          (\w+): \$\{\{ (.*?) \}\}$', body, re.M):
+            env[name] = values[expression]
+        script = body.split('        run: |\n', 1)[1]
+        script = '\n'.join(line[10:] for line in script.splitlines())
+        return subprocess.run(['bash', '-c', script], env=env,
+                              capture_output=True, text=True, timeout=5).returncode
+
+    def test_stale_or_indeterminate_fails_required_check_before_costly_steps(self):
+        for result in ['failure', 'cancelled', 'skipped', '', 'success']:
+            for merge in ['', 'verified-merge']:
+                if result == 'success' and merge:
+                    continue
+                for changes in ['skipped', 'success', 'failure', '']:
+                    with self.subTest(result=result, merge=merge, changes=changes):
+                        self.assertTrue(self.condition('check', 'pull_request', result,
+                                                       changes=changes, merge=merge))
+                        self.assertNotEqual(self.admission('pull_request', result,
+                                                          changes=changes, merge=merge), 0)
+                        for job in ['changes', 'test']:
+                            self.assertFalse(self.condition(job, 'pull_request', result,
+                                                            changes=changes, merge=merge))
+        workflow = (ROOT / '.github/workflows/ci.yml').read_text()
+        check = workflow.split('\n  check:\n', 1)[1].split('\n  test:\n', 1)[0]
+        self.assertEqual(check.split('    steps:\n', 1)[1].splitlines()[0],
+                         '      - name: Require valid classification')
+        for job in ['changes', 'check', 'test']:
+            body = re.split(r'\n  (?=\S)', workflow.split(f'\n  {job}:\n', 1)[1])[0]
+            self.assertIn('preflight', re.search(r'^    needs: (.*)$', body, re.M)[1])
+
+    def test_failed_or_missing_classification_fails_check(self):
+        for changes, mode in [('failure', 'all'), ('skipped', ''), ('', ''),
+                              ('success', ''), ('success', 'unknown')]:
+            with self.subTest(changes=changes, mode=mode):
+                self.assertTrue(self.condition('check', 'pull_request', 'success',
+                                               changes=changes, mode=mode))
+                self.assertNotEqual(self.admission('pull_request', 'success',
+                                                  changes=changes, mode=mode), 0)
+                self.assertFalse(self.condition('test', 'pull_request', 'success',
+                                                changes=changes, mode=mode))
 
     def test_matching_pair_keeps_required_jobs(self):
         for mode in ['packages', 'all', 'docs-only']:
+            self.assertEqual(self.admission('pull_request', 'success', mode=mode), 0)
             for job in ['changes', 'check', 'test']:
                 with self.subTest(mode=mode, job=job):
                     self.assertEqual(self.condition(job, 'pull_request', 'success',
@@ -190,11 +237,14 @@ class WorkflowConditions(unittest.TestCase):
                                      job != 'test' or mode != 'docs-only')
 
     def test_push_keeps_all_jobs_despite_skipped_preflight(self):
+        self.assertEqual(self.admission('push', 'skipped', merge=''), 0)
         for job in ['changes', 'check', 'test', 'ambient']:
             with self.subTest(job=job):
                 self.assertTrue(self.condition(job, 'push', 'skipped'))
 
     def test_schedule_keeps_only_check(self):
+        self.assertEqual(self.admission('schedule', 'skipped', changes='skipped',
+                                        mode='', merge=''), 0)
         for job in ['changes', 'check', 'test', 'ambient']:
             with self.subTest(job=job):
                 self.assertEqual(self.condition(job, 'schedule', 'skipped',
