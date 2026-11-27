@@ -266,3 +266,127 @@ async fn a_latch_during_a_writer_callback_refuses_its_later_work_and_its_commit(
     drop(snapshot);
     storage.close().await.unwrap();
 }
+
+// Issue 448. Calls already admitted to a snapshot when its worker leaves it are
+// answered from the state of the incident, not from the bare fact that their job
+// was dropped. The first call holds the worker until the siblings are queued:
+// `join!` polls its futures in order, so each sibling is in the channel before
+// the last future opens the gate.
+const SIBLINGS: usize = 4;
+
+/// The first call (it runs `first` on the worker, once the gate is open) and the
+/// answers of `SIBLINGS` calls queued behind it; none of them may have run.
+async fn first_and_queued_siblings(
+    snapshot: &Snapshot,
+    first: impl FnOnce() -> Result<()> + Send + 'static,
+    ran: &Arc<AtomicUsize>,
+    before_open: impl FnOnce(),
+) -> (store::Result<()>, Vec<store::Result<()>>) {
+    let (open, gate) = std::sync::mpsc::channel::<()>();
+    let held = snapshot.call(move |_| {
+        gate.recv().expect("gate opened");
+        first()
+    });
+    let siblings = futures::future::join_all((0..SIBLINGS).map(|_| {
+        let ran = ran.clone();
+        snapshot.call(move |_| {
+            ran.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }));
+    let (held, siblings, ()) = tokio::join!(held, siblings, async {
+        before_open();
+        open.send(()).expect("worker waits at the gate");
+    });
+    (held, siblings)
+}
+
+#[tokio::test]
+async fn queued_siblings_of_a_fresh_fatal_read_all_answer_storage_unavailable() {
+    let (_temp, _data, storage) = seeded().await;
+    let snapshot = storage.snapshot(owner()).await.unwrap();
+    let ran = Arc::new(AtomicUsize::new(0));
+    let (held, siblings) =
+        first_and_queued_siblings(&snapshot, || Err(fatal_sql()), &ran, || {}).await;
+    assert!(unavailable(held), "the failing call itself");
+    assert_eq!(siblings.len(), SIBLINGS);
+    for (n, sibling) in siblings.into_iter().enumerate() {
+        assert!(unavailable(sibling), "sibling {n} answered something else");
+    }
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "no sibling ran on a retired view"
+    );
+    // A call made after the view ended is the ordinary later call of a retired snapshot.
+    let later = snapshot.call(|_| Ok(())).await.unwrap_err();
+    assert!(later.to_string().contains("snapshot_expired"), "{later}");
+    // A new snapshot starts after the observation and is served.
+    let next = storage.read(owner()).await.unwrap();
+    assert!(next.get(EntityKind::Team, "kept").await.unwrap().is_some());
+    drop((snapshot, next));
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn queued_siblings_answer_storage_unavailable_when_another_connection_made_the_observation() {
+    let (_temp, _data, storage) = seeded().await;
+    let snapshot = storage.snapshot(owner()).await.unwrap();
+    let ran = Arc::new(AtomicUsize::new(0));
+    let state = storage.failure_state();
+    // The checkpoint source, not this view, observes the damage while the first
+    // call runs; that call then fails for a logical reason, which a fresh fatal
+    // observation turns into the end of the snapshot.
+    let (held, siblings) = first_and_queued_siblings(
+        &snapshot,
+        || Err(SqliteError::Store(store::StoreError::InvalidCursor)),
+        &ran,
+        move || state.latch(FailureSource::Checkpoint, FatalCause::SqliteCorrupt),
+    )
+    .await;
+    assert!(unavailable(held));
+    assert!(siblings.into_iter().all(unavailable));
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    drop(snapshot);
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn queued_siblings_of_an_expired_snapshot_keep_answering_snapshot_expired() {
+    let (_temp, _data, storage) = seeded().await;
+    let snapshot = storage.snapshot(owner()).await.unwrap();
+    let ran = Arc::new(AtomicUsize::new(0));
+    let counted = storage.failure_state().fatal_observations();
+    let flag = snapshot.expired.clone();
+    // What the checkpoint's R127 interruption does to the one snapshot it ends.
+    let (held, siblings) = first_and_queued_siblings(
+        &snapshot,
+        || Ok(()),
+        &ran,
+        move || flag.store(true, Ordering::SeqCst),
+    )
+    .await;
+    for (n, answer) in std::iter::once(held).chain(siblings).enumerate() {
+        let error = answer.unwrap_err().to_string();
+        assert!(error.contains("snapshot_expired"), "call {n}: {error}");
+    }
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert_eq!(storage.failure_state().fatal_observations(), counted);
+    assert!(storage.failure_state().failure().is_none());
+    drop(snapshot);
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn queued_calls_of_a_snapshot_opened_after_a_latch_are_all_served() {
+    let (_temp, _data, storage) = seeded().await;
+    latch(&storage);
+    let snapshot = storage.snapshot(owner()).await.unwrap();
+    let ran = Arc::new(AtomicUsize::new(0));
+    let (held, siblings) = first_and_queued_siblings(&snapshot, || Ok(()), &ran, || {}).await;
+    held.unwrap();
+    assert!(siblings.into_iter().all(|answer| answer.is_ok()));
+    assert_eq!(ran.load(Ordering::SeqCst), SIBLINGS);
+    drop(snapshot);
+    storage.close().await.unwrap();
+}

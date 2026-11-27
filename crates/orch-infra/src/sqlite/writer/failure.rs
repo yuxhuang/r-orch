@@ -13,7 +13,10 @@
 //! What is fatal is decided here, by the structure of the error, and nowhere
 //! else. `classify` matches every `SqliteError` variant with no wildcard, so a
 //! new variant (the structured `TaskCorrupt` of R141, for one) cannot be added
-//! without a decision about its class. Task corruption and the structured
+//! without a decision about its class. `classify_sql` cannot do the same for
+//! `rusqlite::Error`, which is `#[non_exhaustive]`: a SQLite result code is
+//! decided by its code, and every other rusqlite error is the request's own
+//! answer (`Ordinary`). Task corruption and the structured
 //! corruption of an Agent, Team, Run, Context, Config, Template or Goal
 //! (`EntityCorrupt`, one variant for the seven families) are fatal;
 //! object access and publication failures of either (`TaskAccess`,
@@ -417,13 +420,19 @@ impl FailureState {
                 phase,
             });
     }
-    pub(super) fn retry_finished(&self, since: std::time::Instant) {
+    /// Remove the registration of this episode, and only this one. An episode
+    /// is identified by its `active` flag, never by the instant of its first
+    /// failure: two episodes can fail on the same clock reading (issue 448).
+    pub(super) fn retry_finished(&self, active: &Arc<AtomicBool>) {
         let mut starts = self
             .inner
             .retry_starts
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(i) = starts.iter().position(|start| start.since == since) {
+        if let Some(i) = starts
+            .iter()
+            .position(|start| Arc::ptr_eq(&start.active, active))
+        {
             starts.remove(i).active.store(false, Ordering::SeqCst);
         }
     }

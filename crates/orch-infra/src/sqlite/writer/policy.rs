@@ -1,4 +1,20 @@
 //! One logical write episode. Only the writer may record its SQL outcomes.
+//!
+//! An episode is identified by itself (its `active` flag), never by the clock
+//! reading of its first failure: episodes that first fail at the same instant
+//! register and end independently (issue 448).
+//!
+//! Supported producer cardinality (issue 448): **one retained producer** per
+//! writer, which is the event producer. The executor has a single continuation
+//! slot for the rebuild of a retained write, and its Events lane admits one
+//! queued entry. A second retained write whose rebuild finds the slot taken is
+//! refused `Overloaded` with its episode still live: it may resubmit once the
+//! worker has taken the first rebuild, and until it ends its registration keeps
+//! the writer's lanes held. That is retryable contention, not damage. It would
+//! become a restart-only failure only through the ordinary rule that an episode
+//! open for 60 s without a commit latches `RetryWithoutCommit`. Several
+//! concurrent retained producers are unsupported: a design that adds one gives
+//! each its own slot (or a bounded queue) and does not rely on this refusal.
 use super::{FailureSource, FailureState, FatalCause};
 use crate::sqlite::{Result, SqliteError};
 use rusqlite::ErrorCode;
@@ -66,13 +82,14 @@ struct Inner {
 }
 impl Drop for Inner {
     fn drop(&mut self) {
-        if let Some(since) = self
+        if self
             .progress
             .get_mut()
             .unwrap_or_else(PoisonError::into_inner)
             .since
+            .is_some()
         {
-            self.state.retry_finished(since);
+            self.state.retry_finished(&self.active);
         }
     }
 }
@@ -171,8 +188,8 @@ impl Episode {
             .progress
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(since) = p.since.take() {
-            self.inner.state.retry_finished(since);
+        if p.since.take().is_some() {
+            self.inner.state.retry_finished(&self.inner.active);
         }
     }
     fn check_policy(&self, now: Instant) -> Result<()> {
@@ -331,13 +348,15 @@ mod tests {
         let mut queue = super::super::Schedule::new(2);
         queue.push(super::super::Lane::Claims, now, 1).unwrap();
         episode.failed(RetryCode::Busy, now).unwrap();
-        assert!(queue.pop_allowed(!state.claims_suppressed()).is_none());
+        // The worker takes nothing from the queue while a retry is registered.
+        assert!(state.claims_suppressed());
         assert!(matches!(
             episode.check(now + Duration::from_millis(75)),
             Err(SqliteError::Overloaded)
         ));
         drop(episode);
-        assert_eq!(queue.pop_allowed(!state.claims_suppressed()), Some(1));
+        assert!(!state.claims_suppressed());
+        assert_eq!(queue.pop(), Some(1));
     }
     #[test]
     fn reader_and_artifact_sql_failures_cannot_contaminate_transaction_observation() {
@@ -443,5 +462,71 @@ mod tests {
             .failed(RetryCode::Io, now)
             .expect("a different SQL failure interrupts consecutive IOERRs");
         assert!(state.failure().is_none());
+    }
+    // Issue 448. A registration belongs to its episode, not to the clock reading
+    // of its first failure. The clock is controlled, so both episodes fail at
+    // exactly the same instant, and each order of ending is checked in turn. The
+    // oracle is separate for the two things that went wrong: the surviving
+    // episode's own flag (its continuation eligibility) and the global registry
+    // that suppresses claims, which stays nonempty after the first removal.
+    #[test]
+    fn episodes_that_first_fail_at_the_same_instant_end_independently() {
+        for finish_by_drop in [false, true] {
+            for earlier_ends_first in [false, true] {
+                let state = FailureState::new();
+                let now = Instant::now();
+                let earlier = Episode::new(state.clone(), None);
+                let later = Episode::new(state.clone(), None);
+                earlier.failed(RetryCode::Busy, now).unwrap();
+                later.failed(RetryCode::Busy, now).unwrap();
+                assert!(earlier.retrying() && later.retrying());
+                assert!(state.claims_suppressed());
+                let (ending, remaining) = if earlier_ends_first {
+                    (earlier, later)
+                } else {
+                    (later, earlier)
+                };
+                let case = format!("drop={finish_by_drop} earlier_first={earlier_ends_first}");
+                if finish_by_drop {
+                    drop(ending);
+                } else {
+                    ending.finish();
+                    assert!(!ending.retrying(), "{case}");
+                }
+                assert!(
+                    remaining.retrying(),
+                    "{case}: the other episode lost its own flag"
+                );
+                assert!(
+                    state.claims_suppressed(),
+                    "{case}: the registry is empty after the first removal"
+                );
+                remaining.finish();
+                assert!(!remaining.retrying(), "{case}");
+                assert!(!state.claims_suppressed(), "{case}");
+                assert!(state.failure().is_none(), "{case}");
+            }
+        }
+    }
+    #[test]
+    fn a_withdrawn_episode_leaves_the_same_instant_registration_of_another() {
+        let state = FailureState::new();
+        let now = Instant::now();
+        let bounded = Episode::new(state.clone(), Some(now + Duration::from_millis(100)));
+        let open = Episode::new(state.clone(), None);
+        // The unbounded episode is registered first, so a lookup by instant finds it.
+        open.failed(RetryCode::Busy, now).unwrap();
+        bounded.failed(RetryCode::Busy, now).unwrap();
+        bounded.outcome(WriteOutcome::RolledBack, Some(RetryCode::Busy));
+        state.check_retry_timeout(now + Duration::from_millis(100));
+        assert!(!bounded.retrying(), "expired known noncommit is withdrawn");
+        assert!(open.retrying() && state.claims_suppressed());
+        bounded.finish();
+        assert!(
+            open.retrying() && state.claims_suppressed(),
+            "ending a withdrawn episode removes nothing of another"
+        );
+        open.finish();
+        assert!(!state.claims_suppressed());
     }
 }
