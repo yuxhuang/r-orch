@@ -1337,6 +1337,46 @@ mod tests {
     }
 
     #[test]
+    fn empty_batch_metadata_covers_lease_and_refusal_steps() {
+        for n in [1usize, 257, 4096] {
+            let mut q = Queue::default();
+            let mut reserved = 0;
+            for id in 0..n {
+                let batch = batch_of(caller("p", "o"), "r", "l", 0);
+                reserved += batch.fixed_bytes();
+                q.pending
+                    .push_back(pending(id as u64, batch.caller, &batch.run, batch.events));
+            }
+            let plan = next_plan(&q, 1, false).unwrap();
+            let attempt_slices = plan.slices.clone();
+            let mut steps = Vec::new();
+            for i in 0..n {
+                steps.push(Step::Refused {
+                    slice: i,
+                    error: StoreError::StaleEpoch,
+                });
+            }
+            let actual = q.pending.capacity() * size_of::<Pending>()
+                + plan.slices.capacity() * size_of::<Slice>()
+                + attempt_slices.capacity() * size_of::<Slice>()
+                + steps.capacity() * size_of::<Step>();
+            assert!(
+                reserved >= actual,
+                "{n} empty batches reserve {reserved}, but their actual vector capacities hold {actual}"
+            );
+        }
+        assert!(
+            BATCH_FIXED_BYTES
+                >= 4 * size_of::<Pending>()
+                    + 8 * size_of::<Slice>()
+                    + size_of::<Charge>()
+                    + 8 * size_of::<Caller>()
+                    + 4 * size_of::<Step>(),
+            "the per-batch fixed overhead covers four empty/refused step slots independently of event count"
+        );
+    }
+
+    #[test]
     fn metadata_reserve_covers_simultaneous_vector_capacities() {
         let n = 257usize;
         let mut batch = batch_of(caller("p", "o"), "r", "l", 0);

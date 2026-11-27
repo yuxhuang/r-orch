@@ -2320,3 +2320,93 @@ fn encoded_input_stays_charged_when_runtime_cancels_a_running_callback() {
         .block_on(fx.storage.close())
         .unwrap();
 }
+
+#[test]
+fn encoded_input_stays_charged_while_cancelled_reconciliation_still_reads() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, blocked) = mpsc::sync_channel(1);
+    let hook = Mutex::new(Some((entered, blocked)));
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = armed.clone();
+    let mut once = true;
+    let fx = fixture_with(StorageOptions {
+        read_connections: 1,
+        unbounded_read_admission: true,
+        reader_setup: Some(Box::new(move |conn| {
+            let (entered, blocked) = hook.lock().unwrap().take().unwrap();
+            let mut entered = Some(entered);
+            conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+                if matches!(
+                    ctx.action,
+                    AuthAction::Read {
+                        table_name: "run_events",
+                        ..
+                    }
+                ) && let Some(entered) = entered.take()
+                {
+                    let _ = entered.send(());
+                    let _ = blocked.recv_timeout(SAFETY);
+                }
+                Authorization::Allow
+            }))
+            .unwrap();
+        })),
+        writer_commit_probe: Some(Box::new(move |tx| {
+            if !flag.load(Ordering::SeqCst) || !once {
+                return None;
+            }
+            once = false;
+            tx.execute_batch("COMMIT").unwrap();
+            Some(Err(sql(10)))
+        })),
+        ..StorageOptions::default()
+    });
+    let (producer, submission, held) = runtime.block_on(async {
+        let batch = fx.batch("p", "cancelled-reconciliation", 1..=1).await;
+        let held = accounted_bytes(&batch);
+        let producer = fx.producer();
+        armed.store(true, Ordering::SeqCst);
+        let submission = producer.submit(batch).unwrap();
+        tokio::time::timeout(SAFETY, observed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(producer.retained(), (1, 1, held));
+        (producer, submission, held)
+    });
+    runtime.shutdown_background();
+    let failure = futures::FutureExt::now_or_never(submission)
+        .expect("the unknown receipt must not wait for the selecting lookup")
+        .unwrap_err();
+    assert!(failure.outcome_unknown);
+    assert_eq!(
+        producer.retained(),
+        (0, 0, held),
+        "the real selecting read still owns its expected encoded bytes"
+    );
+    release.send(()).unwrap();
+    let deadline = Instant::now() + SAFETY;
+    while producer.retained().2 != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the selecting lookup did not release its byte charge"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        fx.reports().is_empty(),
+        "cancellation cannot invent a known commit"
+    );
+    drop(producer);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(fx.storage.close())
+        .unwrap();
+}
