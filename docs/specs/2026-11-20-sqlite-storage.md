@@ -2809,13 +2809,14 @@ that the adapter owns. Its two figures, 200 ms and 5 s, are starting values that
 256 MiB, so that a checkpoint can copy the frames it holds back. The idle release is another rule: it applies at any
 backlog, to a handle with no call in flight. It is no evidence that R127's interruption works and does none of the work of
 the checkpoint job (R126, R137, T15). A snapshot that is used at least every 5 s is never released as idle and meets R127
-alone.
+alone. The adapter's side of R127 is described in "As built: active readers and the passive checkpoint" below.
 
 *Error representation (open).* The names are promised: `overloaded` for an open that was not admitted in time,
 `snapshot_expired` after an idle release and `storage_unavailable` for a failed writer (R51, R98, R128). The port's
 `StoreError` has no variant for any of the three, and this spec does not yet say whether a read returns a typed variant
 (a change to `docs/TRAITS-FROZEN.md` that needs the contract decision of the R140 and T17 owner) or a message that is
-fixed and tested. The plan's "Reader snapshots on SQLite" lists the message texts that PR 385 returns today. The
+fixed and tested. The plan's "Reader snapshots on SQLite" lists the message texts that PR 385 returns today; R127's expiry returns the
+same `snapshot_expired` text at the port. The
 representation is decided and written here before activation (record N), and the code on the activation head must match it.
 
 **Checkpoints** (R126, R127). The writer never checkpoints in a commit: automatic checkpointing is off on
@@ -2843,7 +2844,8 @@ outcomes of a call and says which of them move the timer.
   pooled read older than 30 s is interrupted (`snapshot_expired`): a backup or an export that this stops
   is run again, and succeeds once the backlog has fallen. A snapshot handle with no call in flight is released by its
   own rule ("Reader snapshots on SQLite"), not by this one. A reader outside the daemon, such as a `sqlite3`
-  shell left inside a transaction, cannot be interrupted; the RUNBOOK names the cause.
+  shell left inside a transaction, cannot be interrupted; the RUNBOOK names the cause. The adapter's interruption is
+  built and its checkpoint job is not ("As built: active readers and the passive checkpoint").
 - **What is synced, and when.** With the write-ahead log and `synchronous = NORMAL` (B12), a commit is not
   synced: the log is synced before a checkpoint, and the database file when the checkpoint has copied its
   frames. The database stays consistent across a power loss, and the commits since the last sync can be
@@ -3044,13 +3046,63 @@ schema and no authentication, and it changes no class, time or limit of R26, R27
   must not turn into a gap row (R139). A writer that has latched a failure ends the producer the same way.
 - *Not built here.* The numbering of an event at its handover and the counters at start and stop (R61, R139), the collector's
   buffer and its gaps (R63), pruning, an export of the counter, and every caller in the daemon (T16's remaining work). R127's
-  age-and-backlog rule and the checkpoint job have no code. A reconciliation of a step that mixes duplicates that an
+  checkpoint job and its schedule have no code (its adapter-side rule is the next subsection). A reconciliation of a step that mixes duplicates that an
   earlier commit had stored with new rows has no test (a reading of the source that its review has been asked about, not a
   finding). The failures of its tests are injected through the writer's test-only commit probe; no real `SQLITE_FULL` or
   `SQLITE_IOERR` is provoked. The tests that R26 and R27 name in their rows exist under the module path
   `sqlite::events::tests::producer` and not `sqlite_writer`: `waiting_event_batches_share_one_transaction`,
   `bulk_work_is_cut_at_1000_rows` and `an_atomic_operation_over_the_bound_runs_whole_and_is_counted`; the other tests that
   R26's row names are not claimed here.
+
+**As built: active readers and the passive checkpoint (R127; development source `6706afcbc`, not a freeze).** This is a
+reading of `sqlite/read_pool/active.rs`, `read_pool.rs` and `storage/mod.rs` at that head, which is on `07fecf1ed`, and of
+the tests named below. It is a development input: no independent review of it, no hosted run and no daemon wiring is
+recorded here, and nothing is accepted by it. It changes no trait, no schema and no authorization, and it gives no
+credit to a first Task-authenticated call (issue 397).
+
+- *The call.* `ReadPool::checkpoint()` and the asynchronous `SqliteStorage::checkpoint()` (on a blocking task) run one
+  `wal_checkpoint_v2(PASSIVE)` on a connection of their own (`ConnectionRole::Checkpoint`): not the writer's, and not one
+  that a read holds. The call first refuses when the shared failure state has latched, so no checkpoint is called after
+  a fatal observation (R140); a failure of the call is reported to that state as `FailureSource::Checkpoint`. Its result
+  is a `CheckpointObservation`: the frames in the log, the frames copied, `backlog_bytes`, the age of the oldest
+  registered read and the number of reads it interrupted.
+- *The backlog is that call's own result.* It is (frames in the log minus frames copied) times the page size, read from
+  the counts that the call returns after it has copied what it could; a result of -1 (a database that is not in WAL
+  mode) gives zero. It is never the file's length: after a complete checkpoint a test leaves a `-wal` file longer than
+  256 MiB with a backlog of zero, and a read older than 30 s is not interrupted (R126, R127). The writer's commit callback
+  and its running count of the backlog (R126) are not kept by this adapter, and no rule here reads them.
+- *Both limits are strict and both are needed.* A read is interrupted only when the backlog is **over** 256 MiB and the
+  read is **older than** 30 s, counted from the registration of its transaction; for an owned snapshot that is when its
+  view was opened, not its last call. Exactly 256 MiB, or exactly 30 s, interrupts nothing, and so does either limit
+  alone. A read is interrupted once; a later call does not count it again.
+- *What an interruption does.* It sets the read's expiry flag and calls `sqlite3_interrupt` on the SQL that is
+  running. An interrupt has no effect between two statements, so a progress handler that checks the flag every 1,000
+  virtual-machine steps also stops SQL that begins after the flag is set. The read answers `snapshot_expired`: a typed
+  variant inside the adapter (`SqliteError::SnapshotExpired`, an ordinary result that latches nothing and does not move
+  the pool's transient streak) and, at the `Storage` port, the same message text in `StoreError::Backend` as the idle
+  release, so the error representation of "Reader snapshots on SQLite" is still open. The connection is discarded and
+  opened again on its next use. A callback that catches the raw interrupt error still cannot publish a value, because
+  the expiry answer wins. A raw error that the read has observed is classified first, so a fatal one is answered as
+  `storage_unavailable` (R140) and the expiry does not hide it.
+- *The same snapshot, and no other.* The flag belongs to one owned snapshot of `Storage::read`: its call in flight ends
+  with `snapshot_expired`, a later call on that handle answers it, and a snapshot opened afterwards is served. Once the
+  reader has gone, a later call of the checkpoint copies the frames that it had held back (each of the tests below ends on a
+  backlog of zero).
+- *Not built (T15 and later).* No timer, no 64 MiB size trigger, no 5-minute rule, no report of a backlog that stays
+  over 256 MiB for 5 minutes, no outcome of R137 (the call returns counts, not `copied_all`, `copied_part`,
+  `nothing_to_copy`, `held_back`, `busy` or `failed`), no `wal_bytes` or `wal_file_bytes` metric, no field of
+  `orch db status`, and the daemon never calls `checkpoint()`. A reader outside the daemon still cannot be interrupted.
+- *Tests.* The permanent tests of the rule are in the crate, and R127's row names `sqlite_pool.rs` tests that do not
+  exist: `read_pool::active::tests::exact_limits_do_not_expire_and_interruption_counts_once` (an injected clock: 30 s exactly with
+  one byte over, 256 MiB exactly with one nanosecond over, both over, and then a second call that interrupts nothing);
+  `read_pool::tests::active::actual_checkpoint_backlog_and_age_are_both_required_and_a_long_file_is_not_backlog`,
+  `::both_limits_interrupt_current_sql_and_caught_interrupt_cannot_publish_a_snapshot` and
+  `::sql_started_after_checkpoint_expiry_cannot_escape_the_progress_guard`; and
+  `storage::tests::active_checkpoint_expiry_interrupts_owned_sql_and_expires_that_same_snapshot` (the public snapshot, a
+  running recursive query, 258 MiB of real writes and its expiry, with a finite safety hook that fails the test if the
+  production interrupt does not come first). The tests make a read older by a test-only call
+  (`ActiveReads::age_for_test`); none of them waits 30 s, so none of them measures the 30 s on a clock. The counts that
+  passed are in the plan's "As built at `6706afcbc`".
 
 **A failed top-level rollback** (R128; the owner's ruling of 2026-11-24, record L). The writer rolls back the
 transaction of a request that ended in an error, and the transaction of a retryable failure before it tries again. If that

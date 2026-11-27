@@ -1354,6 +1354,23 @@ clients <── WriteReceipt::wait() ──────────────�
 - A failed read discards its connection, and the slot reopens on its next use. A connection returned inside an open
   transaction, including by a panic, is discarded the same way, so no reader inherits it. WAL readers do not block
   the writer.
+- **Active reads and the passive checkpoint (R127; `sqlite/read_pool/active.rs`, development source, not wired).** Every
+  read of the pool, and so every owned snapshot of `Storage::read`, registers its transaction with a start time, an
+  interrupt handle and an expiry flag. `ReadPool::checkpoint()`, and `SqliteStorage::checkpoint()`, which runs it on a
+  blocking task, refuse first with a latched failure state (R140), then open a connection of their own
+  (`ConnectionRole::Checkpoint`, never the writer's and never one held by a read), run one
+  `wal_checkpoint_v2(PASSIVE)` and take the backlog from its two frame counts: (frames in the log minus frames
+  copied) times the page size; a database that is not in WAL mode answers -1 and gives no backlog. When the backlog is
+  **over** 256 MiB, every registered read **older than** 30 s is flagged once, its running SQL is interrupted
+  (`sqlite3_interrupt`) and the read answers `snapshot_expired`. Exactly 256 MiB or exactly 30 s leaves a read alone,
+  and a long `-wal` file with a backlog of zero interrupts nothing. An interrupt has no effect between two statements,
+  so a progress handler (every 1,000 virtual-machine steps) also refuses SQL that starts after the flag is set. The
+  call returns a `CheckpointObservation` (frames in the log, frames copied, the backlog in bytes, the age of the oldest
+  registered read, and how many reads it interrupted). The expiry belongs to the one owned snapshot: its call in flight
+  ends, its later calls answer `snapshot_expired`, its connection is dropped and reopened on next use, and no other
+  snapshot is touched. A raw error that a read meets at the same time is classified first, so concurrent corruption is
+  answered as `storage_unavailable` and the expiry does not hide it. `snapshot_expired` is an ordinary result: it
+  latches nothing and does not move the transient streak of pool reads.
 
 **Limits of this slice** (follow-ups tracked in [issue 127](https://github.com/yuxhuang/r-orch/issues/127)):
 
@@ -1372,8 +1389,11 @@ clients <── WriteReceipt::wait() ──────────────�
   rows and elapsed time (the `COMMIT` included) of each transaction, and the producer that owns the input owns the cut, the kept tail and the merge. The
   event producer does this for run events (bullet "Event producer" above); pruning, expiry and the importer's chunks have
   no producer yet, and nothing calls the event producer from the daemon.
-- Nothing checkpoints the WAL while the executor runs: automatic checkpointing is off, and the checkpoint
-  connection, the backlog counters and the interruption of long reads (R126, R127, R137) are not built. Wiring this to the daemon waits for them.
+- Nothing schedules a checkpoint. Automatic checkpointing is off, and there is no timer, no 64 MiB size trigger, no
+  repeat while a backlog stays, no outcome record (R137), no commit-callback count of the backlog and no report of the
+  backlog or the file's length (R126, `wal_bytes`, `orch db status`). A checkpoint runs only when a caller calls
+  `checkpoint()` (the active-read bullet above); T15 owns the job that will, and the daemon does not call it. Wiring
+  the executor to the daemon waits for that job.
 - There is no query connection or authorizer for `orch db query` (R130) and no shutdown integration (R139).
 
 ---
