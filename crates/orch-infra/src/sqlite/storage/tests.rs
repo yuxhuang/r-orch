@@ -13,7 +13,7 @@ fn team(id: &str) -> Entity {
     Entity::Team(Box::new(serde_json::from_value(serde_json::json!({"id":id,"name":id,"status":"active","members":[],"task_pool":[],"lead_agent_id":"a","created_at":"opaque","updated_at":"opaque","config":{"auto_claim":false}})).unwrap()))
 }
 #[tokio::test]
-async fn owned_snapshot_pins_at_open_and_outlives_storage_handle() {
+async fn owned_snapshot_pins_at_open_and_stops_with_last_storage_handle() {
     let (_temp, data) = crate::sqlite::test_data();
     let storage = SqliteStorage::open(Arc::new(data), StorageOptions::default()).unwrap();
     let snapshot = storage.read(owner()).await.unwrap();
@@ -39,15 +39,7 @@ async fn owned_snapshot_pins_at_open_and_outlives_storage_handle() {
             .is_some()
     );
     drop(storage);
-    // A snapshot is independently owned; it keeps the owner/lock alive until
-    // explicit close or the final handle is dropped.
-    assert!(
-        snapshot
-            .get(EntityKind::Team, "later")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(snapshot.get(EntityKind::Team, "later").await.is_err());
 }
 #[tokio::test]
 async fn callback_panic_is_resumed_and_the_following_write_commits() {
@@ -261,5 +253,31 @@ async fn layout_order_and_leaf_pages_agree_for_every_non_task_shape() {
             assert_eq!(walked, all.items, "{filter:?} {sort:?}");
         }
     }
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_queued_snapshot_is_refused_at_admission_deadline() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            read_connections: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let held = storage.read(owner()).await.unwrap();
+    let refused = tokio::time::timeout(Duration::from_millis(500), storage.read(owner())).await;
+    assert!(
+        matches!(refused,Ok(Err(ref e)) if e.to_string().contains("overloaded")),
+        "queued read must answer overload before the holder's idle bound"
+    );
+    assert!(
+        held.get(EntityKind::Team, "missing")
+            .await
+            .unwrap()
+            .is_none()
+    );
     storage.close().await.unwrap();
 }

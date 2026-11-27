@@ -112,6 +112,15 @@ impl Drop for Owner {
 #[derive(Clone)]
 pub struct SqliteStorage {
     owner: Arc<Owner>,
+    _life: Arc<ClientLife>,
+}
+// Snapshot handles retain the reply state, not write admission. The last
+// Storage handle stops workers even when a client leaks a snapshot handle.
+struct ClientLife(Arc<Owner>);
+impl Drop for ClientLife {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
 }
 impl SqliteStorage {
     pub fn open(data: Arc<DataDir>, options: StorageOptions) -> Result<Self> {
@@ -195,15 +204,19 @@ impl SqliteStorage {
                 }
             })?;
         match ready.recv().map_err(|_| SqliteError::WriterClosed)? {
-            Ok((shared, writer, reads)) => Ok(Self {
-                owner: Arc::new(Owner {
+            Ok((shared, writer, reads)) => {
+                let owner = Arc::new(Owner {
                     shared,
                     writer,
                     reads,
                     stop,
                     thread: Mutex::new(Some(thread)),
-                }),
-            }),
+                });
+                Ok(Self {
+                    owner: owner.clone(),
+                    _life: Arc::new(ClientLife(owner)),
+                })
+            }
             Err(error) => {
                 let _ = thread.join();
                 Err(error)
@@ -378,9 +391,10 @@ impl Storage for SqliteStorage {
         port(self.owner.shared.available())?;
         let (commands, receiver) = mpsc::sync_channel(16);
         let (ready, answer) = oneshot::channel();
+        let deadline = Instant::now() + Duration::from_millis(200);
         let request = OpenRead {
             caller: caller.clone(),
-            deadline: Instant::now() + Duration::from_millis(200),
+            deadline,
             commands: receiver,
             ready,
         };
@@ -388,7 +402,10 @@ impl Storage for SqliteStorage {
             .reads
             .try_send(request)
             .map_err(|_| backend("SQLite read admission overloaded"))?;
-        port(answer.await.map_err(|_| backend("SQLite reader closed"))?)?;
+        let answer = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), answer)
+            .await
+            .map_err(|_| backend("overloaded"))?;
+        port(answer.map_err(|_| backend("SQLite reader closed"))?)?;
         Ok(Box::new(Snapshot {
             owner: self.owner.clone(),
             caller,
