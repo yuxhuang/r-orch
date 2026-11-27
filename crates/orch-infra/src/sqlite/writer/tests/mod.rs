@@ -1710,3 +1710,5 @@ fn a_known_commit_breaks_the_writer_ioerr_streak_between_requests() {
     failed.failed(RetryCode::Io, now).unwrap();
     assert!(state.failure().is_none());
 }
+
+mod retained_bounds;
