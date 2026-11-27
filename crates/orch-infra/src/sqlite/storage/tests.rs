@@ -120,7 +120,7 @@ async fn idle_snapshot_releases_the_only_reader_and_reports_expiry() {
 }
 
 #[tokio::test]
-async fn fatal_reader_observation_prevents_any_later_snapshot_value() {
+async fn fatal_reader_observation_discards_the_straddling_snapshot_only() {
     let (_temp, data) = crate::sqlite::test_data();
     let storage = SqliteStorage::open(Arc::new(data), StorageOptions::default()).unwrap();
     let snapshot = storage.read(owner()).await.unwrap();
@@ -139,7 +139,23 @@ async fn fatal_reader_observation_prevents_any_later_snapshot_value() {
         .failure_state()
         .observe(FailureSource::Reader, &error);
     assert!(snapshot.get(EntityKind::Team, "absent").await.is_err());
-    assert!(storage.read(owner()).await.is_err());
+    // A read requested after the observation is served (issue 389); writes are not.
+    let later = storage.read(owner()).await.unwrap();
+    assert!(
+        later
+            .get(EntityKind::Team, "absent")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        storage
+            .transaction(owner(), orch_core::store::Lane::Entities, |u| {
+                u.create(team("refused"))
+            })
+            .await
+            .is_err()
+    );
     storage.close().await.unwrap();
 }
 
