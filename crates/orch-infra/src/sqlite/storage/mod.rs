@@ -58,9 +58,16 @@ pub struct StorageOptions {
     pub(crate) completion_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     pub(crate) pin_now: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
+    // Fixtures testing corruption/cleanup opt out of incidental admission expiry.
+    #[cfg(test)]
+    pub(crate) unbounded_read_admission: bool,
+    #[cfg(test)]
+    pub(crate) write_admission: Option<WriteAdmission>,
     #[cfg(test)]
     pub(crate) write_observation_probe: Option<Arc<dyn Fn() -> Option<SqliteError> + Send + Sync>>,
 }
+#[cfg(test)]
+type WriteAdmission = Arc<dyn Fn(Instant, Option<Instant>) -> Option<Instant> + Send + Sync>;
 #[cfg(test)]
 type ReaderSetup = Box<dyn Fn(&mut rusqlite::Connection) + Send>;
 #[cfg(test)]
@@ -85,6 +92,10 @@ impl Default for StorageOptions {
             #[cfg(test)]
             pin_now: None,
             #[cfg(test)]
+            unbounded_read_admission: false,
+            #[cfg(test)]
+            write_admission: None,
+            #[cfg(test)]
             write_observation_probe: None,
         }
     }
@@ -102,6 +113,10 @@ struct Shared {
     completion_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     pin_now: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
+    #[cfg(test)]
+    unbounded_read_admission: bool,
+    #[cfg(test)]
+    write_admission: Option<WriteAdmission>,
     #[cfg(test)]
     write_observation_probe: Option<Arc<dyn Fn() -> Option<SqliteError> + Send + Sync>>,
 }
@@ -213,6 +228,10 @@ impl SqliteStorage {
                         completion_probe: options.completion_probe,
                         #[cfg(test)]
                         pin_now: options.pin_now,
+                        #[cfg(test)]
+                        unbounded_read_admission: options.unbounded_read_admission,
+                        #[cfg(test)]
+                        write_admission: options.write_admission,
                         #[cfg(test)]
                         write_observation_probe: options.write_observation_probe,
                     });
@@ -460,7 +479,10 @@ fn read_worker(
         if ready.is_closed() {
             continue;
         }
-        if Instant::now() >= deadline {
+        let expired = Instant::now() >= deadline;
+        #[cfg(test)]
+        let expired = expired && !shared.unbounded_read_admission;
+        if expired {
             let _ = ready.send(Err(SqliteError::Overloaded));
             continue;
         }
@@ -471,7 +493,10 @@ fn read_worker(
             let now = Instant::now();
             #[cfg(test)]
             let now = shared.pin_now.as_ref().map_or(now, |clock| clock());
-            if now >= deadline {
+            let expired = now >= deadline;
+            #[cfg(test)]
+            let expired = expired && !shared.unbounded_read_admission;
+            if expired {
                 return Err(SqliteError::Overloaded);
             }
             shared
@@ -543,8 +568,15 @@ impl Storage for SqliteStorage {
             .reads
             .try_send(request)
             .map_err(|_| backend("overloaded"))?;
+        #[cfg(not(test))]
         let answer =
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), answer).await;
+        #[cfg(test)]
+        let answer = if self.owner.shared.unbounded_read_admission {
+            Ok(answer.await)
+        } else {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), answer).await
+        };
         // Include queued admission and pinning in the request's original
         // baseline. ReadPool has classified any pin failure before this reply.
         port(self.owner.shared.refuse_fresh_fatal(observed))?;
@@ -559,15 +591,22 @@ impl Storage for SqliteStorage {
         }))
     }
     async fn write(&self, caller: Caller, lane: store::Lane, work: WriteWork) -> store::Result<()> {
+        let now = Instant::now();
         let deadline = Some(
-            Instant::now()
-                + match lane {
-                    store::Lane::Claims => Duration::from_millis(50),
-                    store::Lane::Entities => Duration::from_millis(200),
-                    store::Lane::Events => Duration::from_secs(1),
-                    store::Lane::Maintenance => Duration::from_secs(5),
-                },
+            now + match lane {
+                store::Lane::Claims => Duration::from_millis(50),
+                store::Lane::Entities => Duration::from_millis(200),
+                store::Lane::Events => Duration::from_secs(1),
+                store::Lane::Maintenance => Duration::from_secs(5),
+            },
         );
+        #[cfg(test)]
+        let deadline = self
+            .owner
+            .shared
+            .write_admission
+            .as_ref()
+            .map_or(deadline, |admit| admit(now, deadline));
         self.retained_write(caller, lane, deadline)
             .attempt(work)
             .await?

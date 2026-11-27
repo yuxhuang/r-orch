@@ -1,6 +1,16 @@
 use super::*;
 use orch_core::store::{Principal, Storage, StorageExt};
 
+// These fixtures prove latch/cleanup semantics, not wall-clock admission speed.
+// Queue, pool, real SQLite pin, Unit and original receipt paths stay unchanged.
+pub(super) fn without_admission_expiry() -> StorageOptions {
+    StorageOptions {
+        unbounded_read_admission: true,
+        write_admission: Some(Arc::new(|_, _| None)),
+        ..Default::default()
+    }
+}
+
 fn owner() -> Caller {
     Caller {
         project: "p".into(),
@@ -122,7 +132,7 @@ async fn idle_snapshot_releases_the_only_reader_and_reports_expiry() {
 #[tokio::test]
 async fn fatal_reader_observation_discards_the_straddling_snapshot_only() {
     let (_temp, data) = crate::sqlite::test_data();
-    let storage = SqliteStorage::open(Arc::new(data), StorageOptions::default()).unwrap();
+    let storage = SqliteStorage::open(Arc::new(data), without_admission_expiry()).unwrap();
     let snapshot = storage.read(owner()).await.unwrap();
     assert!(
         snapshot
@@ -751,7 +761,7 @@ async fn failed_cleanup_prevents_native_list_and_commit_even_when_callback_swall
     use orch_core::{store::ConfigEntry, test_support::make_task};
     let (_temp, data) = crate::sqlite::test_data();
     let data = Arc::new(data);
-    let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+    let storage = SqliteStorage::open(data.clone(), without_admission_expiry()).unwrap();
     storage
         .transaction(owner(), store::Lane::Entities, |u| {
             let mut task = make_task();
@@ -1091,7 +1101,7 @@ async fn failed_savepoint_cleanup_with_active_transaction_refuses_native_list() 
 async fn fatal_schema_damage_at_snapshot_open_reports_the_first_refusal() {
     let (_temp, data) = crate::sqlite::test_data();
     let data = Arc::new(data);
-    let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+    let storage = SqliteStorage::open(data.clone(), without_admission_expiry()).unwrap();
     // Corrupt only this synthetic live database after the factory opened it.
     // Changing the schema cookie forces the pool's next prepare to see damage.
     let corruptor = rusqlite::Connection::open(data.database_path()).unwrap();
@@ -1446,5 +1456,192 @@ async fn expiry_inside_pool_refuses_before_the_schema_pin() {
         0,
         "expired view must never pin"
     );
+    storage.close().await.unwrap();
+}
+
+// #408: observe the actual normal-port defaults before substituting a fixed
+// already-expired deadline. No sleep, larger budget or alternate executor.
+#[tokio::test]
+async fn normal_write_preserves_each_lane_budget_and_withdraws_before_invoking_work() {
+    use std::sync::atomic::AtomicUsize;
+    let (_temp, data) = crate::sqlite::test_data();
+    let budgets = Arc::new(Mutex::new(Vec::new()));
+    let seen = budgets.clone();
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            write_admission: Some(Arc::new(move |now, deadline| {
+                seen.lock()
+                    .unwrap()
+                    .push(deadline.expect("normal writes are bounded") - now);
+                Some(now - Duration::from_secs(1))
+            })),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    for lane in [
+        store::Lane::Claims,
+        store::Lane::Entities,
+        store::Lane::Events,
+        store::Lane::Maintenance,
+    ] {
+        let seen = calls.clone();
+        let error = storage
+            .write(
+                owner(),
+                lane,
+                Box::new(move |u| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    u.create(team("expired")).map(|_| ())
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("overloaded"),
+            "{lane:?}: {error}"
+        );
+    }
+    assert_eq!(
+        *budgets.lock().unwrap(),
+        [
+            Duration::from_millis(50),
+            Duration::from_millis(200),
+            Duration::from_secs(1),
+            Duration::from_secs(5)
+        ]
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn normal_write_without_incidental_fixture_expiry_commits_callback_once() {
+    use std::sync::atomic::AtomicUsize;
+    let (_temp, data) = crate::sqlite::test_data();
+    let data = Arc::new(data);
+    let storage = SqliteStorage::open(data.clone(), without_admission_expiry()).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let seen = calls.clone();
+    storage
+        .write(
+            owner(),
+            store::Lane::Entities,
+            Box::new(move |u| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                u.create(team("once")).map(|_| ())
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    storage.close().await.unwrap();
+    let reopened = SqliteStorage::open(data, without_admission_expiry()).unwrap();
+    let snapshot = reopened.read(owner()).await.unwrap();
+    assert_eq!(
+        snapshot
+            .get(EntityKind::Team, "once")
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        Revision::ONE
+    );
+    drop(snapshot);
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn unbounded_fixture_read_pins_despite_an_expired_queue_deadline_and_pin_clock() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            pin_now: Some(Arc::new(|| Instant::now() + Duration::from_secs(3600))),
+            ..without_admission_expiry()
+        },
+    )
+    .unwrap();
+    let (_commands, receiver) = mpsc::sync_channel(SNAPSHOT_CALL_CAPACITY);
+    let (ready, answer) = oneshot::channel();
+    storage
+        .owner
+        .reads
+        .try_send(OpenRead {
+            caller: owner(),
+            deadline: Instant::now() - Duration::from_secs(1),
+            commands: receiver,
+            ready,
+        })
+        .unwrap_or_else(|_| panic!("admit fixture read"));
+    answer.await.unwrap().unwrap();
+    // Exercise the normal Storage::read caller path too, not just OpenRead.
+    let snapshot = storage.read(owner()).await.unwrap();
+    assert!(
+        snapshot
+            .get(EntityKind::Team, "absent")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop((_commands, snapshot));
+    storage.close().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn fixture_read_waits_for_the_real_pin_after_the_normal_caller_timer_would_expire() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    let (_temp, data) = crate::sqlite::test_data();
+    let (started, pinning) = oneshot::channel();
+    let started = Arc::new(Mutex::new(Some(started)));
+    let (release, released) = mpsc::sync_channel(1);
+    let released = Arc::new(Mutex::new(released));
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            read_connections: 1,
+            reader_setup: Some(Box::new(move |connection| {
+                let started = started.clone();
+                let released = released.clone();
+                connection
+                    .authorizer(Some(move |ctx: AuthContext<'_>| {
+                        if matches!(ctx.action, AuthAction::Read { .. })
+                            && let Some(started) = started.lock().unwrap().take()
+                        {
+                            let _ = started.send(());
+                            // Liveness bound only. The test releases this real pin explicitly.
+                            let _ = released
+                                .lock()
+                                .unwrap()
+                                .recv_timeout(Duration::from_secs(10));
+                        }
+                        Authorization::Allow
+                    }))
+                    .unwrap();
+            })),
+            ..without_admission_expiry()
+        },
+    )
+    .unwrap();
+    let mut opening = Box::pin(storage.read(owner()));
+    assert!(futures::poll!(opening.as_mut()).is_pending());
+    pinning.await.unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(
+        futures::poll!(opening.as_mut()).is_pending(),
+        "fixture admission must await its original pin, not the production timer"
+    );
+    release.send(()).unwrap();
+    let snapshot = opening.await.unwrap();
+    assert!(
+        snapshot
+            .get(EntityKind::Team, "absent")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(snapshot);
     storage.close().await.unwrap();
 }
