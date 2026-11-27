@@ -781,7 +781,9 @@ them.
 
 1. It is an owned `Send + 'static` closure, invoked once on the writer when admitted, never replayed, and never
    invoked when the backend refuses admission. A retry by the writer of its own `BEGIN` or `COMMIT` does not invoke it
-   again (spec R128, record P); work that must be redone is a new request.
+   again (spec R128, record P); work that must be redone is a new request. The SQLite adapter's `RetainedWrite`
+   (`SqliteStorage::retained_write`, outside these traits) is how a producer that kept its input submits that new
+   request after a confirmed noncommit; `Storage::write` itself is one attempt and has no retry of the callback.
 2. The `&mut dyn UnitOfWork` it receives, and anything borrowed from it, is used on the thread that runs it, and not
    after it returns. No thread, task or scope receives it.
 3. Its body depends on no Tokio runtime: no `Handle::current()`, no `block_on`. `oneshot::Sender::send` needs none.
