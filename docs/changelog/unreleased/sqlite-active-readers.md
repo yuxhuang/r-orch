@@ -1,0 +1,3 @@
+### Fixed
+
+- Retire SQLite snapshots older than 30 seconds when a passive checkpoint reports more than 256 MiB of uncopied log frames, interrupt running SQL and return `snapshot_expired`. A large reused WAL file alone does not expire a reader. The adapter exposes the checkpoint observation for maintenance; daemon scheduling remains downstream.

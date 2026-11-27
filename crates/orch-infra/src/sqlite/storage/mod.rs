@@ -51,6 +51,8 @@ pub struct StorageOptions {
     #[cfg(test)]
     pub(crate) reader_setup: Option<ReaderSetup>,
     #[cfg(test)]
+    pub(crate) reader_progress: Option<Box<dyn FnMut() -> bool + Send>>,
+    #[cfg(test)]
     pub(crate) writer_setup: Option<WriterSetup>,
     #[cfg(test)]
     pub(crate) writer_commit_probe: Option<super::writer::CommitProbe>,
@@ -84,6 +86,8 @@ impl Default for StorageOptions {
             #[cfg(test)]
             reader_setup: None,
             #[cfg(test)]
+            reader_progress: None,
+            #[cfg(test)]
             writer_setup: None,
             #[cfg(test)]
             writer_commit_probe: None,
@@ -109,6 +113,7 @@ struct Shared {
     stopping: AtomicBool,
     interrupts: Mutex<Vec<Option<rusqlite::InterruptHandle>>>,
     idle: Duration,
+    active_reads: Arc<super::read_pool::ActiveReads>,
     #[cfg(test)]
     completion_probe: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
@@ -159,6 +164,8 @@ impl Shared {
 }
 struct Owner {
     shared: Arc<Shared>,
+    data: Mutex<Option<Arc<DataDir>>>,
+    sync: Synchronous,
     writer: WriterHandle,
     reads: mpsc::SyncSender<OpenRead>,
     stop: mpsc::SyncSender<()>,
@@ -167,6 +174,10 @@ struct Owner {
 impl Owner {
     fn stop(&self) {
         self.shared.stop();
+        self.data
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         self.writer.close();
         let _ = self.stop.try_send(());
     }
@@ -201,6 +212,8 @@ impl SqliteStorage {
         {
             return Err(SqliteError::InvalidCapacity);
         }
+        let owner_data = data.clone();
+        let owner_sync = options.synchronous;
         let (started, ready) = mpsc::sync_channel(1);
         let (stop, stopped) = mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
@@ -224,6 +237,7 @@ impl SqliteStorage {
                             (0..options.read_connections).map(|_| None).collect(),
                         ),
                         idle: options.snapshot_idle,
+                        active_reads: Arc::new(super::read_pool::ActiveReads::default()),
                         #[cfg(test)]
                         completion_probe: options.completion_probe,
                         #[cfg(test)]
@@ -235,15 +249,20 @@ impl SqliteStorage {
                         #[cfg(test)]
                         write_observation_probe: options.write_observation_probe,
                     });
-                    let pool = ReadPool::open_with_state(
+                    let mut pool = ReadPool::open_with_state(
                         &data,
                         options.synchronous,
                         options.read_connections,
                         state.clone(),
                     )?;
+                    pool.active = shared.active_reads.clone();
                     #[cfg(test)]
                     if let Some(setup) = options.reader_setup {
                         pool.configure_test_readers(setup);
+                    }
+                    #[cfg(test)]
+                    if let Some(probe) = options.reader_progress {
+                        pool.configure_progress_for_test(probe);
                     }
                     let (writer, handle) = Writer::open_with_state(
                         &data,
@@ -302,6 +321,8 @@ impl SqliteStorage {
         match ready.recv().map_err(|_| SqliteError::WriterClosed)? {
             Ok((shared, writer, reads)) => {
                 let owner = Arc::new(Owner {
+                    data: Mutex::new(Some(owner_data)),
+                    sync: owner_sync,
                     shared,
                     writer,
                     reads,
@@ -318,6 +339,27 @@ impl SqliteStorage {
                 Err(error)
             }
         }
+    }
+    /// One passive checkpoint on its own connection, followed by R127 reader
+    /// interruption from the actual backlog. T15 owns when this is scheduled.
+    pub async fn checkpoint(&self) -> Result<super::CheckpointObservation> {
+        self.owner.shared.available()?;
+        let owner = self.owner.clone();
+        tokio::task::spawn_blocking(move || {
+            owner.shared.available()?;
+            let data = owner
+                .data
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or(SqliteError::WriterClosed)?;
+            owner
+                .shared
+                .active_reads
+                .checkpoint(&data, owner.sync, &owner.shared.state)
+        })
+        .await
+        .map_err(|_| SqliteError::WriterClosed)?
     }
     pub fn failure_state(&self) -> FailureState {
         self.owner.shared.state.clone()
@@ -354,6 +396,7 @@ fn port<T>(result: Result<T>) -> store::Result<T> {
         SqliteError::Store(e) => e,
         SqliteError::StorageUnavailable(_) => backend("storage_unavailable"),
         SqliteError::Overloaded => backend("overloaded"),
+        SqliteError::SnapshotExpired => backend("snapshot_expired"),
         SqliteError::WriterClosed => backend("SQLite writer is closed"),
         _ => backend("SQLite storage operation failed"),
     })
@@ -368,12 +411,14 @@ const SNAPSHOT_CALL_CAPACITY: usize = 16;
 type RetiredReply = Box<dyn FnOnce() + Send>;
 type ReadJob = Box<dyn FnOnce(&ReadView<'_, '_>, &mut Option<RetiredReply>) -> Result<()> + Send>;
 struct OpenRead {
+    expired: Arc<AtomicBool>,
     caller: Caller,
     deadline: Instant,
     commands: mpsc::Receiver<ReadJob>,
     ready: oneshot::Sender<Result<()>>,
 }
 struct Snapshot {
+    expired: Arc<AtomicBool>,
     owner: Arc<Owner>,
     caller: Caller,
     commands: mpsc::SyncSender<ReadJob>,
@@ -387,6 +432,9 @@ impl Snapshot {
         f: impl FnOnce(&ReadView<'_, '_>) -> Result<T> + Send + 'static,
     ) -> store::Result<T> {
         port(self.owner.shared.readable())?;
+        if self.expired.load(Ordering::SeqCst) {
+            return port(Err(SqliteError::SnapshotExpired));
+        }
         // Bound queued/running jobs without blocking an async caller. Recheck
         // stop/fatal state after waiting: admission may have closed meanwhile.
         let capacity = self
@@ -398,6 +446,7 @@ impl Snapshot {
         port(self.owner.shared.readable())?;
         let (reply, answer) = oneshot::channel();
         let observed = self.observed;
+        let expired = self.expired.clone();
         let job: ReadJob = Box::new(move |view, retired_reply| {
             let _capacity = capacity;
             // Only the reader operation is contained. An adapter panic retires
@@ -412,6 +461,11 @@ impl Snapshot {
                         true,
                     ),
                 };
+            let result = if expired.load(Ordering::SeqCst) {
+                Err(SqliteError::SnapshotExpired)
+            } else {
+                result
+            };
             let result = result.and_then(|value| {
                 view.shared.refuse_fresh_fatal(observed)?;
                 Ok(value)
@@ -428,12 +482,15 @@ impl Snapshot {
                     Ok(())
                 }
                 Err(error) => {
+                    let snapshot_expired = matches!(error, SqliteError::SnapshotExpired);
                     let state = view.shared.state.clone();
                     // Answer only after ReadPool has classified the original
                     // error, retired the connection and updated its one streak.
                     *retired_reply = Some(Box::new(move || {
                         let message = if state.fatal_observations() != observed {
                             "storage_unavailable"
+                        } else if snapshot_expired {
+                            "snapshot_expired"
                         } else if panicked {
                             "SQLite reader operation panicked"
                         } else {
@@ -469,6 +526,7 @@ fn read_worker(
             Err(_) => break,
         };
         let OpenRead {
+            expired: snapshot_expired,
             caller,
             deadline,
             commands,
@@ -488,7 +546,7 @@ fn read_worker(
         }
         let mut ready = Some(ready);
         let mut retired_reply: Option<RetiredReply> = None;
-        let result = pool.read(deadline, |tx| {
+        let result = pool.read_tracked(deadline, snapshot_expired.clone(), |tx| {
             shared.readable()?;
             let now = Instant::now();
             #[cfg(test)]
@@ -520,6 +578,9 @@ fn read_worker(
             let view = ReadView::new(tx, &caller, shared);
             let mut idle = Instant::now();
             loop {
+                if snapshot_expired.load(Ordering::SeqCst) {
+                    return Err(SqliteError::SnapshotExpired);
+                }
                 if shared.stopping.load(Ordering::SeqCst) {
                     break;
                 }
@@ -558,7 +619,9 @@ impl Storage for SqliteStorage {
         let (commands, receiver) = mpsc::sync_channel(SNAPSHOT_CALL_CAPACITY);
         let (ready, answer) = oneshot::channel();
         let deadline = Instant::now() + Duration::from_millis(200);
+        let expired = Arc::new(AtomicBool::new(false));
         let request = OpenRead {
+            expired: expired.clone(),
             caller: caller.clone(),
             deadline,
             commands: receiver,
@@ -583,6 +646,7 @@ impl Storage for SqliteStorage {
         let answer = answer.map_err(|_| backend("overloaded"))?;
         port(answer.map_err(|_| backend("SQLite reader closed"))?)?;
         Ok(Box::new(Snapshot {
+            expired,
             owner: self.owner.clone(),
             caller,
             commands,

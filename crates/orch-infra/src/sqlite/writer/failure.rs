@@ -188,6 +188,7 @@ fn walk(error: &SqliteError, out: &mut Observation) {
         | Unrepresentable(_)
         | TransactionAborted
         | Overloaded
+        | SnapshotExpired
         | Store(_)
         | WriterClosed
         | CallbackPanicked(_)
