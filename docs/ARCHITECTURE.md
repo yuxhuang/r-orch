@@ -1239,8 +1239,8 @@ clients <── WriteReceipt::wait() ──────────────�
   the user `WriteWork` alone; `submit_contained` is `cfg(test)` and only tests call it. Two tests in
   `sqlite/storage/containment_tests.rs` show that a panic in the `Clock` read and one in the completion check after a
   successful callback reach the caller as an error, not as a resumed callback panic.
-  A leaf whose savepoint cleanup fails (the lease, intent, retry, message and native Context/Config/Template/Goal leaves) does not return an error that a
-  callback could catch and commit past. It unwinds with a typed `CleanupUnwind`, which `contain` reports to the failure
+  In the lease, intent, retry, message and native Context/Config/Template/Goal leaves, a savepoint cleanup failure
+  does not return an error that a callback could catch and commit past. It unwinds with a typed `CleanupUnwind`, which `contain` reports to the failure
   state, so that `SQLITE_CORRUPT` or `SQLITE_NOTADB` latches although the outer rollback would succeed, and then raises
   again. `run` ends as for any other panic under `submit`. The operation's cause and the cleanup's are observed
   separately (spec record O): the receipts return `StorageUnavailable` when either is fatal and so latched, and
