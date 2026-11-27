@@ -97,7 +97,7 @@ const QUEUE_LIMIT_BYTES: usize = 4 * MAX_BLOB_BYTES as usize;
 /// What a waiting batch holds besides its strings and events: its entry in the
 /// queue, the slice of the plan built from it, and a reply channel.
 const BATCH_FIXED_BYTES: usize =
-    size_of::<Pending>() + 3 * size_of::<Slice>() + size_of::<Charge>() + 256;
+    4 * size_of::<Pending>() + 3 * size_of::<Slice>() + size_of::<Charge>() + 256;
 /// What a waiting event holds besides its encoded form: the event, and its cost.
 const EVENT_FIXED_BYTES: usize =
     size_of::<EncodedEvent>() + 1 + size_of::<Step>() + size_of::<EncodedExpected>() + 64;
@@ -1066,7 +1066,9 @@ impl Shared {
             queue.events = 0;
             queue.busy = false;
             queue.in_flight.clear();
-            queue.pending.drain(..).collect()
+            let drained = queue.pending.drain(..).collect();
+            queue.pending.shrink_to_fit();
+            drained
         };
         for pending in drained {
             let failure = pending.failure(copy_error(error), doubtful.contains(&pending.id));
@@ -1092,6 +1094,7 @@ fn take(queue: &mut Queue, id: u64) -> Option<Pending> {
     let position = queue.pending.iter().position(|p| p.id == id)?;
     let pending = queue.pending.remove(position)?;
     queue.events -= pending.events.len() - pending.consumed;
+    queue.pending.shrink_to_fit();
     Some(pending)
 }
 
