@@ -1,5 +1,46 @@
 # Tiered verification checks
 
+## PR414 current-merge resolver and classification base — 2026-11-27 (draft; #405)
+
+A pull-request run can receive an event merge (`GITHUB_SHA`) that GitHub has since
+replaced because the target branch moved. This amendment records the contract of
+the `preflight` job built by draft PR 414 (head `ca534eda0a4d2f40b664c589f1bf3f1947798ff8`).
+It changes no required check name, no tier rule and no part of the gate; PRs
+only. Closes #405 and nothing else; the review findings that PR 414 leaves open
+are #415 and #416.
+
+| Requirement | Contract |
+|---|---|
+| P1: one bounded resolution | `scripts/ci/pr_merge_preflight.sh` runs once per event, before classification, caches or builds, under one hard deadline of at most 120 seconds (default 120; a non-numeric value or one above 120 is refused). The deadline covers every API call, `ls-remote`, fetch and wait, and kills the process group. |
+| P2: live identity | Through the GitHub API it requires that the live PR has the event's number, is open, belongs to the event repository, targets the event's base branch and has the event's head SHA. A difference is a refusal that needs a fresh event, not a retry. |
+| P3: live pair | `ls-remote` reads the target branch tip, the PR head ref and the advertised PR merge ref. The head ref must equal the event head. |
+| P4: ordered parents | A merge qualifies only if it has exactly two parents, in this order: the current target tip, then the event head. If the event merge matches, no fetch is made (fast path). Otherwise the advertised merge is fetched by SHA at depth 2, never by the moving ref, and checked the same way. |
+| P5: stale or missing merge | While the advertised merge is stale or unpublished, it polls inside the same deadline. Expiry is a refusal. |
+| P6: recheck before output | Identity and refs are read again after a fetch and before output, on the fast path as well. The loop publishes only a pair that is still current. |
+| P7: outputs | Exactly two outputs, `merge` (the verified merge SHA) and `base` (its first parent), written in one step immediately before exit 0. The log shows the observed and expected hashes and the verified tree. A killed or refused run publishes nothing. |
+| P8: fail closed | Any failed, malformed, duplicated or indeterminate lookup, fetch or parse refuses. Partial output does not rescue a failed call. No refusal is retried inside the job. |
+| P9: credentials | Only the one live-PR API request carries the token, and the preflight job alone holds `contents: read` and `pull-requests: read`. Git reads are anonymous and checkout keeps `persist-credentials: false`. No write token, no PR reopen loop and no automatic workflow event. |
+| C1: one merge for all jobs | `changes`, `check` and `test` check out `needs.preflight.outputs.merge` on pull requests. |
+| C2: classification base | The classifier's `PR_BASE` is the verified first parent (`needs.preflight.outputs.base`), not `github.event.pull_request.base.sha`. With that SHA as first parent of `HEAD`, the merge base is the base, so the classified diff is the PR's own. Selection is otherwise unchanged (docs-only skips `test`; a missing or unresolvable base selects everything). |
+| C3: missing outputs | `changes` and `test` run only if `preflight` succeeded and both outputs are non-empty. `check` keeps `if: always()` and fails in its first step, before checkout, caches or builds, if `preflight` did not succeed or either output is empty. |
+| C4: other events | Pushes to `main` and the weekly schedule skip `preflight` and keep today's lanes (push runs everything, the schedule runs `check` alone). |
+| Q1: point-in-time | Preflight is not the qualification. Before recommending or merging, the executed merge's ordered parents must be the then-current target tip and the reviewed head, its tree must equal the expected squash tree, `mergeStateStatus` must be `CLEAN` and the closing references must match the description. |
+
+Recovery is operator procedure, kept in the
+[RUNBOOK](../RUNBOOK.md#recovering-from-a-refused-preflight): a lookup failure
+or delayed publication is recovered by re-running all jobs of the same run; a
+changed head or target needs a fresh `pull_request` event (a pushed commit, or
+close and reopen), which for a changed head also needs delta review and fresh CI.
+Only the target moving keeps the head review.
+
+Not proven at this head: the hosted run 45949276424 took the fast path, so the
+stale-merge branch has local fixture coverage only (P4–P6; recording a hosted
+recovery is #416). Open follow-ups, none part of this amendment: polling rate
+and transient lookup failures (#415: one second between reads, two API requests
+a second measured on a stale merge, and one failed lookup refuses), and negative
+fixtures for the open-state and repository terms plus an exact permissions
+assertion (#416).
+
 ## PR3 implementation clarification — 2026-11-17
 
 The approved [PR3 supplement](2026-11-17-pr3-ci.md) implements R6/R7 and prepares

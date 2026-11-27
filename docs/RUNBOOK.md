@@ -1720,7 +1720,7 @@ unsuccessful, 75 the lease was busy and nothing ran,
 | Exit 3, `advisories` is `ENV-LIMITED`: `cargo-deny not installed` | The advisories, licences, bans and sources check was not evaluated | `cargo install cargo-deny --locked`, then rerun. `ENV-LIMITED` is not a pass. |
 | `fast` selects `all` and you expected one crate | A `global`, `unknown` or `error` row in the printed reasons (shared input, unclassified path, unreadable base, empty change set) | Read the row; this is the fail-closed design, not a fault. Use `--base` for the right base. |
 | `REFUSED` with `marker:` and `target in use` / `an earlier use did not finish` | A target use marker is held or left by an unfinished use | Do not remove the marker, `target/` or run `cargo clean`. Inspect read-only with `lsof` on the marker; preserve the target and diagnostics for the owner. |
-| CI `preflight` fails with `PR merge preflight:` | Live PR identity/target/head changed, lookup/fetch failed, or no current merge was published within the total deadline | Read expected/observed hashes and the final error in the preflight log. A changed head or target requires a fresh `pull_request` event. For delayed publication, wait for the current pair and retry; the resolver can replace a stale event merge within its bounded window. Do not treat skipped downstream jobs as qualifying evidence. |
+| CI `preflight` fails with `PR merge preflight:` | One of three causes: a lookup or fetch failed, GitHub published no current merge within the 120-second deadline, or the live PR no longer matches the event (changed head, target, repository, number or state) | Read the first `::error::PR merge preflight:` line (the closing `resolution failed or total deadline expired` line also follows every inner refusal and does not name the cause). Follow [Recovering from a refused preflight](#recovering-from-a-refused-preflight). Do not treat skipped downstream jobs as qualifying evidence. |
 | CI `check` fails at `Require valid classification` (`invalid classification mode`) | The `changes` job did not produce `docs-only`, `packages` or `all` | Read the `changes` job log. Do not re-run it away; a missing or unresolvable base already selects `all`. |
 | A documentation-only PR shows `test` as skipped | By design: the `test` job's condition excludes `docs-only` | Nothing. A conditionally skipped job satisfies the required check; a skipped whole workflow would not. |
 
@@ -1810,6 +1810,54 @@ executed merge's ordered parents against the then-current base tip and reviewed
 PR head, and its tree against the expected squash tree. Movement after preflight
 invalidates that pair's qualification. Docker Linux checks
 remain ordinary/probed-platform checks, never equivalent to the hosted fold.
+
+#### Recovering from a refused preflight
+
+Which recovery applies depends on the first `::error::PR merge preflight:` line.
+Rerunning reuses the original event: the same `GITHUB_SHA` (the stale event merge)
+and the same event head and target. That is enough when only the merge is
+missing or stale, and never enough when the PR itself changed.
+
+| What the log shows | Cause | Recovery |
+|---|---|---|
+| `live PR lookup failed`, `live ref lookup failed; expected pair indeterminate`, `live ref missing; expected pair indeterminate`, `candidate fetch failed`, `malformed live ref`, `duplicate live base`/`head`/`merge` | **Lookup failure.** An API, `ls-remote` or fetch call failed or answered nonsense. Nothing was verified, and no partial answer is used. | **Re-run all jobs** of the same workflow run. The re-resolution starts from scratch. If the same line comes back, read the log for throttling or access errors before trying again. |
+| `awaiting publication of current ordered pair` repeated, then `resolution failed or total deadline expired (status=…)` | **Delayed publication.** The live pair is readable, but `refs/pull/<n>/merge` stayed unpublished or stale (first parent is not the current target tip) for the whole 120 seconds. | Wait, then **re-run all jobs**; the resolver picks up the merge GitHub has published by then. If a second run after several minutes expires the same way, obtain a fresh event (next row). |
+| `live PR identity, target or head differs from event; fresh event required`, `live head differs from event; fresh event required` | **Changed head or target** (also a closed PR, another repository or another number). Rerunning compares against the same event again and refuses again. | Obtain a **fresh `pull_request` event**: push a commit, or close and reopen the PR. The workflow lists no `types:`, so GitHub's defaults (`opened`, `synchronize`, `reopened`) apply: retargeting a PR (`edited`) starts no run. A pushed commit is a changed head and needs delta review and fresh CI. Reopening keeps the head, so the reviewed head and its review stand. Qualify only the newest run for the current head: a push cancels the superseded run. |
+
+Re-run **all** jobs, not only the failed ones. GitHub keeps the outputs of jobs
+that are not re-run from the earlier attempt, so re-running only a failed `test`
+or `check` job would reuse the earlier `preflight` merge and base. A
+re-run of the failed `preflight` job also re-runs `changes`, `check` and `test`
+that depend on it.
+
+##### Verify the current parent and tree
+
+A green `check` and `test` qualify the merge they checked out, not the PR head
+alone. Before recommending the head or merging, compare that merge with the
+state of `main` now, from the run's `preflight` log line
+`verified merge=<sha> tree=<tree> base=<sha> head=<sha>`:
+
+```sh
+git fetch --no-tags origin main
+git rev-parse origin/main                           # current target tip
+git fetch --no-tags origin <merge-sha>              # the tested merge, by SHA
+git show -s --format='merge=%H parents=[%P] tree=%T' <merge-sha>
+git merge-tree --write-tree origin/main <reviewed-head-sha>   # expected squash tree
+```
+
+Require that:
+
+1. the merge has exactly two parents, in this order: the current `origin/main`
+   tip, then the reviewed head;
+2. its tree equals the `git merge-tree` tree (the squash result);
+3. `mergeStateStatus` is `CLEAN` and `closingIssuesReferences` lists the issues
+   the description says it closes.
+
+| Observation | Meaning | Action |
+|---|---|---|
+| First parent is an older `main` commit, head unchanged | **Only the target moved** after preflight. The head review stands. | Re-run all jobs (a resolver run picks the new pair once GitHub publishes it, or expires as delayed publication) and compare again. |
+| First parent is current, tree differs from `merge-tree` | The merge is not the squash of the reviewed head | Do not qualify. Investigate before any rerun. |
+| Second parent is not the reviewed head | **Changed head.** The CI result belongs to another head. | Delta review and fresh CI on the new head. |
 
 Both existing required checks remain until the owner applies the independently
 reviewed split. After transition, the monitor requires the latest correct PR
