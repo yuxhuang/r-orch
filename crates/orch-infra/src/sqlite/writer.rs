@@ -639,6 +639,10 @@ impl WriterHandle {
     /// savepoint cleanup failed is not contained: it is reported to the failure
     /// state (a fatal cause latches) and raised again, and the worker ends as it
     /// does for any panic outside the callback.
+    ///
+    /// Supply only the caller's callback here, never adapter setup, a setup
+    /// clock read or completion checks. Storage instead uses the SQLite-private
+    /// `contain` inside its `submit` job around the user `WriteWork` alone.
     pub fn submit_contained<T, F>(
         &self,
         lane: Lane,

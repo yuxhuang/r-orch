@@ -85,7 +85,10 @@ impl fmt::Debug for CallbackPanic {
 /// is observed through `state` (a fatal cause latches) and raised again.
 /// Storage uses this only around user `WriteWork`; adapter setup and completion
 /// must remain outside the catch.
-pub(in crate::sqlite) fn contain<T>(state: &FailureState, callback: impl FnOnce() -> Result<T>) -> Result<T> {
+pub(in crate::sqlite) fn contain<T>(
+    state: &FailureState,
+    callback: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     match catch_unwind(AssertUnwindSafe(callback)) {
         Ok(result) => result,
         Err(payload) => match payload.downcast::<CleanupUnwind>() {
