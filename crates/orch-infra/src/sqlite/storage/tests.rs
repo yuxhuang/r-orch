@@ -1297,3 +1297,39 @@ async fn a_known_commit_keeps_its_receipt_when_a_later_connection_latches() {
     );
     assert!(matches!(later, Err(ref e) if e.to_string().contains("storage_unavailable")));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_snapshot_fanout_waits_for_the_production_capacity() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(Arc::new(data), StorageOptions::default()).unwrap();
+    storage
+        .transaction(owner(), store::Lane::Entities, |unit| {
+            for i in 0..200 {
+                unit.create(team(&format!("t{i:03}")))?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let mut failures = Vec::new();
+    for round in 0..5 {
+        let snapshot: Arc<dyn ReadSnapshot> = Arc::from(storage.read(owner()).await.unwrap());
+        let calls = (0..40).map(|_| {
+            let snapshot = snapshot.clone();
+            tokio::spawn(
+                async move { snapshot.list(&Filter::Teams, &PageRequest::default()).await },
+            )
+        });
+        for result in futures::future::join_all(calls).await {
+            match result.unwrap() {
+                Ok(page) => assert_eq!(page.items.len(), 100),
+                Err(error) => failures.push((round, error.to_string())),
+            }
+        }
+    }
+    storage.close().await.unwrap();
+    assert!(
+        failures.is_empty(),
+        "public snapshot calls were refused: {failures:?}"
+    );
+}
