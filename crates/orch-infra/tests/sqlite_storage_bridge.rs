@@ -248,7 +248,7 @@ fn failing_families() -> [Failing; 3] {
             entity: || agent("doomed", "doomed"),
             retires_writer: false,
         },
-        // The task writer keeps its own savepoint and poison.
+        // The task writer unwinds on failed savepoint cleanup (#477).
         Failing {
             name: "task (task writer)",
             trigger: "CREATE TRIGGER end_it BEFORE INSERT ON tasks WHEN NEW.id='doomed' \

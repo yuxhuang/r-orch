@@ -883,6 +883,53 @@ fn caught_task_move_hydration_failure_preserves_rows_and_counter() {
     .unwrap();
 }
 
+// Catch directly so containment's abort guard cannot mask a missing router poison flag.
+#[test]
+fn directly_swallowed_task_move_cleanup_unwind_preserves_router_poison() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    let (_temp, data) = crate::sqlite::test_data();
+    setup(&data);
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    conn.for_migration()
+        .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Savepoint {
+                savepoint_name: "entity_task_move",
+                operation: TransactionOperation::Release | TransactionOperation::Rollback,
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    let caller = owner("p");
+    let state = FailureState::new();
+    let mut unit = EntityWrite::new(&tx, &caller, &disk, state.clone(), 0);
+    for family in FAMILIES {
+        unit.create(payload(family, "kept", "before")).unwrap();
+    }
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unit.move_to_end(Family::Task, "kept", Revision::ONE)
+    }))
+    .err()
+    .expect("cleanup must unwind")
+    .downcast::<crate::sqlite::writer::contain::CleanupUnwind>()
+    .expect("typed cleanup unwind");
+    assert!(matches!(
+        unwind.error(),
+        SqliteError::OperationRollback { .. }
+    ));
+    assert!(!tx.is_autocommit());
+    assert!(state.failure().is_none());
+    assert!(state.transaction_must_abort().is_none());
+    assert!(matches!(
+        unit.ensure_committable(),
+        Err(SqliteError::TransactionAborted)
+    ));
+    assert_mutations_refused(&mut unit);
+    drop(unit);
+    tx.rollback().unwrap();
+}
+
 #[test]
 fn task_move_cleanup_poison_refuses_all_reads_and_mutations() {
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
