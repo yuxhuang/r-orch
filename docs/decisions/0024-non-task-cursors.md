@@ -9,9 +9,9 @@
 - Amends: the `Cursor` contract of [0017](0017-sqlite-storage.md) decision 3 and the cursor text of
   [0020](0020-storage-consumer-contracts.md), for the families other than Task only. It changes no accepted decision's
   wording and supersedes no ADR. Task keeps its cursor and the issue 277 exception of R10.
-- Scope of the decision: the contract and its vectors. As built, three private slices are on `main` (PR #376, the inline
-  arm; PR #377, the key-taking entry of the three leaves; and PR #383, the table of retained entries and entries by
-  lookup). Nothing is wired into the running daemon, and no vector has run end to end.
+- Scope of the decision: the contract and its vectors. As built, two private slices are on `main` (PR #376, the inline
+  arm, and PR #377, the key-taking entry of the three leaves). The retained and lookup arms are not built, nothing is
+  wired into the running daemon, and no vector has run end to end.
 
 ## Context
 
@@ -102,7 +102,7 @@
   record-taking `select` and its refusal stay in the leaves until the page PR retires their use. The leaf half of
   P-F1, P-F2, Q8 and N3b is tested there; N3a and every integrated vector remain the page PR's (issue 370).
 - The `Cursor` text of the port, R10 and the vectors are in the spec. The page PR names every vector as a test and
-  executes the mutants. The wording is on `main` (PR #369); public paging waits for the page PR (plan step 5), which wires the
-  encoder, the table and the leaves.
+  executes the mutants. The wording is on `main` (PR #369); public paging waits for the table of retained entries and the
+  page PR (plan steps 4 and 5).
 - The inline capacities are derived from the Task token's constants. The encoder (PR #376) confirms all nine rows of the
   spec's table, and the table needed no correction.
