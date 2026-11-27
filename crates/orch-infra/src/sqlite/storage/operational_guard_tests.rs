@@ -23,17 +23,20 @@ async fn caught_cctg_cleanup_failure_refuses_operational_read_on_active_unit() {
     let mut unit = Unit::new(&tx, &caller, &storage.owner.shared);
     // An absent attention item is a successful read before poisoning.
     assert!(unit.get_attention(1).unwrap().is_none());
-    // cctg currently returns OperationRollback through the public port;
-    // unlike message cleanup, this path does not raise CleanupUnwind.
-    // Deny RELEASE and the ensuing ROLLBACK TO, leaving the outer transaction
-    // active. No private poison flag or synthetic failure state is injected.
-    assert!(
-        unit.create(Entity::Config(ConfigEntry {
-            key: "must-rollback".into(),
-            value: "synthetic".into(),
-        }))
-        .is_err()
-    );
+    // Direct-Unit characterization only: contain observes the typed leaf
+    // unwind before this test catches it to inspect refusal on the same Unit.
+    // Production Storage::write lets it escape and retires the writer.
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::sqlite::writer::contain::contain(&storage.failure_state(), || {
+            let _ = unit.create(Entity::Config(ConfigEntry {
+                key: "must-rollback".into(),
+                value: "synthetic".into(),
+            }));
+            Ok(())
+        })
+    }))
+    .unwrap_err();
+    assert!(unwind.is::<crate::sqlite::writer::contain::CleanupUnwind>());
     assert!(!tx.is_autocommit(), "autocommit must not explain refusal");
     assert!(storage.failure_state().transaction_must_abort().is_some());
     assert!(storage.failure_state().failure().is_none());

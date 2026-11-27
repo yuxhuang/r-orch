@@ -358,6 +358,7 @@ enum CrashCause {
     Adapter,
     OperationCorrupt,
     CleanupNotAdb,
+    OrdinaryCleanup,
 }
 
 #[tokio::test]
@@ -379,7 +380,35 @@ async fn ordinary_operation_with_fatal_cleanup_closes_both_receipts_and_reopens_
     combined_crash_case(CrashCause::CleanupNotAdb).await;
 }
 
+#[tokio::test]
+async fn cctg_ordinary_cleanup_retires_writer_and_closes_both_receipts() {
+    cctg_crash_case(CrashCause::OrdinaryCleanup).await;
+}
+#[tokio::test]
+async fn cctg_fatal_operation_latches_before_retiring_writer() {
+    cctg_crash_case(CrashCause::OperationCorrupt).await;
+}
+#[tokio::test]
+async fn cctg_fatal_cleanup_latches_before_retiring_writer() {
+    cctg_crash_case(CrashCause::CleanupNotAdb).await;
+}
+#[tokio::test]
+async fn cctg_caller_panic_preserves_payload_and_serves_queued_work() {
+    cctg_crash_case(CrashCause::Callback).await;
+}
 async fn combined_crash_case(cause: CrashCause) {
+    crash_case(cause, false).await;
+}
+async fn cctg_crash_case(cause: CrashCause) {
+    crash_case(cause, true).await;
+}
+fn config(key: &str) -> Entity {
+    Entity::Config(orch_core::store::ConfigEntry {
+        key: key.into(),
+        value: "synthetic".into(),
+    })
+}
+async fn crash_case(cause: CrashCause, cctg: bool) {
     use super::super::{FatalCause, Role};
     use orch_core::store::intents::IntentPayload;
     use std::io::{Read, Seek, SeekFrom, Write};
@@ -399,8 +428,8 @@ async fn combined_crash_case(cause: CrashCause) {
             .unwrap();
         let page: i64 = conn
             .query_row(
-                "SELECT rootpage FROM sqlite_master WHERE name='intents'",
-                [],
+                "SELECT rootpage FROM sqlite_master WHERE name=?1",
+                [if cctg { "project_config" } else { "intents" }],
                 |r| r.get(0),
             )
             .unwrap();
@@ -443,13 +472,24 @@ async fn combined_crash_case(cause: CrashCause) {
             writer_setup: Some(Box::new(move |conn| {
                 conn.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
                     AuthAction::Savepoint {
-                        savepoint_name: "orch_intent",
+                        savepoint_name,
                         operation: TransactionOperation::Rollback,
-                    } if matches!(cause, CrashCause::OperationCorrupt) => Authorization::Deny,
+                    } if savepoint_name == if cctg { "cctg_entity" } else { "orch_intent" }
+                        && matches!(cause, CrashCause::OperationCorrupt) =>
+                    {
+                        Authorization::Deny
+                    }
                     AuthAction::Savepoint {
-                        savepoint_name: "orch_message",
+                        savepoint_name,
                         operation: TransactionOperation::Release | TransactionOperation::Rollback,
-                    } if matches!(cause, CrashCause::CleanupNotAdb) => Authorization::Deny,
+                    } if savepoint_name == if cctg { "cctg_entity" } else { "orch_message" }
+                        && matches!(
+                            cause,
+                            CrashCause::CleanupNotAdb | CrashCause::OrdinaryCleanup
+                        ) =>
+                    {
+                        Authorization::Deny
+                    }
                     _ => Authorization::Allow,
                 }))
                 .unwrap();
@@ -474,10 +514,16 @@ async fn combined_crash_case(cause: CrashCause) {
                         .expect("parent releases callback");
                     match cause {
                         CrashCause::Callback => {
+                            if cctg {
+                                unit.create(config("partial-config"))?;
+                            }
                             std::panic::panic_any(String::from("combined callback payload"))
                         }
                         CrashCause::Adapter => {
                             finished.store(true, Ordering::SeqCst);
+                        }
+                        CrashCause::OperationCorrupt if cctg => {
+                            let _ = unit.create(config("must-rollback"));
                         }
                         CrashCause::OperationCorrupt => {
                             let _ = unit.add_intent(
@@ -487,8 +533,12 @@ async fn combined_crash_case(cause: CrashCause) {
                                 0,
                             );
                         }
-                        CrashCause::CleanupNotAdb => {
-                            let _ = unit.create(message());
+                        CrashCause::CleanupNotAdb | CrashCause::OrdinaryCleanup => {
+                            let _ = unit.create(if cctg {
+                                config("must-rollback")
+                            } else {
+                                message()
+                            });
                         }
                     }
                     Ok(())
@@ -565,6 +615,7 @@ async fn combined_crash_case(cause: CrashCause) {
         storage.failure_state().failure().map(|f| f.causes.clone()),
         fatal.map(|f| vec![f])
     );
+    assert!(!storage.failure_state().claims_suppressed());
     let close = storage.close().await;
     assert_eq!(close.is_ok(), matches!(cause, CrashCause::Callback));
     // This repair restores only the deliberately damaged page-header byte. It
@@ -605,6 +656,15 @@ async fn combined_crash_case(cause: CrashCause) {
             .unwrap()
             .is_empty()
     );
+    for key in ["partial-config", "must-rollback"] {
+        assert!(
+            snapshot
+                .get(EntityKind::Config, key)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
     drop(snapshot);
     let recovery = reopened
         .transaction(owner(), store::Lane::Entities, |u| {
@@ -623,4 +683,55 @@ async fn combined_crash_case(cause: CrashCause) {
         Some(recovery)
     );
     reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cctg_successful_cleanup_returns_error_and_keeps_writer_usable() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            writer_setup: Some(Box::new(|conn| {
+                let first_release = AtomicBool::new(true);
+                conn.authorizer(Some(move |ctx: AuthContext<'_>| match ctx.action {
+                    AuthAction::Savepoint {
+                        savepoint_name: "cctg_entity",
+                        operation: TransactionOperation::Release,
+                    } if first_release.swap(false, Ordering::SeqCst) => Authorization::Deny,
+                    _ => Authorization::Allow,
+                }))
+                .unwrap();
+            })),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    storage
+        .transaction(owner(), store::Lane::Entities, |unit| {
+            unit.create(team("before"))?;
+            assert!(unit.create(config("reject")).is_err());
+            unit.create(config("before"))?;
+            unit.create(config("after"))
+        })
+        .await
+        .unwrap();
+    storage
+        .transaction(owner(), store::Lane::Entities, |unit| {
+            unit.create(config("following"))
+        })
+        .await
+        .unwrap();
+    let read = storage.read(owner()).await.unwrap();
+    for key in ["before", "after", "following"] {
+        assert!(read.get(EntityKind::Config, key).await.unwrap().is_some());
+    }
+    assert!(
+        read.get(EntityKind::Config, "reject")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(storage.failure_state().failure().is_none());
+    drop(read);
+    storage.close().await.unwrap();
 }
