@@ -690,7 +690,8 @@ mod tests {
             store::Lane::Events,
             store::Lane::Maintenance,
         ] {
-            for expired in [false, true] {
+            for deadline_kind in ["absent", "future", "expired"] {
+                let expired = deadline_kind == "expired";
                 let (_root, data) = crate::sqlite::test_data();
                 let mut first = true;
                 let storage = SqliteStorage::open(
@@ -724,7 +725,11 @@ mod tests {
 
                 // An already-passed deadline is admitted into the real queue:
                 // it is the worker, after retirement, that must withdraw it.
-                let deadline = expired.then(|| Instant::now() - Duration::from_secs(1));
+                let deadline = match deadline_kind {
+                    "expired" => Some(Instant::now() - Duration::from_secs(1)),
+                    "future" => Some(Instant::now() + Duration::from_secs(3600)),
+                    _ => None,
+                };
                 let mut queued = storage.retained_write(owner(), lane, deadline);
                 let calls = Arc::new(AtomicUsize::new(0));
                 let seen = calls.clone();
@@ -776,12 +781,27 @@ mod tests {
                             .is_err()
                     );
                 } else {
-                    assert_eq!(answer.outcome, WriteOutcome::Committed);
+                    assert_eq!(
+                        answer.outcome,
+                        WriteOutcome::Committed,
+                        "{lane:?} {deadline_kind} request must commit after retirement"
+                    );
                     assert!(answer.result.is_ok());
                     assert_eq!(calls.load(Ordering::SeqCst), 1);
                 }
                 assert!(!state.claims_suppressed());
                 assert!(state.failure().is_none());
+                let snapshot = storage.read(owner()).await.unwrap();
+                assert_eq!(
+                    snapshot
+                        .get(EntityKind::Team, "queued")
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    !expired,
+                    "{lane:?} {deadline_kind} durability before trailing transaction"
+                );
+                drop(snapshot);
                 storage
                     .transaction(owner(), store::Lane::Maintenance, |unit| {
                         unit.create(team("after"))
@@ -812,6 +832,7 @@ mod tests {
                         .is_some()
                 );
                 drop(snapshot);
+                assert_eq!(calls.load(Ordering::SeqCst), usize::from(!expired));
                 drop(queued);
                 storage.close().await.unwrap();
             }

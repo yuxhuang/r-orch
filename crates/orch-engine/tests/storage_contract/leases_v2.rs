@@ -201,6 +201,63 @@ pub async fn a_claim_rolls_back_with_its_unit_of_work(fixture: Fixture) {
     );
 }
 
+pub async fn agent_lookup_sees_own_claim_and_keeps_only_committed_leases_after_rollback(
+    fixture: Fixture,
+) {
+    let s = fixture.storage.clone();
+    let committed = granted(claim(s.as_ref(), P, new("t1", "a1", "r1"), 10).await);
+    let expected = committed.clone();
+    let failed = s
+        .transaction(owner(P), Lane::Claims, move |u| {
+            let pending = granted(u.claim_lease(&new("t2", "a2", "r2"), 20)?);
+            assert_eq!(u.get_agent_lease("a2")?, Some(pending));
+            assert_eq!(u.get_agent_lease("a1")?, Some(expected));
+            assert_eq!(u.get_agent_lease("t2")?, None, "lookup uses the agent id");
+            Err::<(), _>(StoreError::StaleEpoch)
+        })
+        .await;
+    assert!(matches!(failed, Err(StoreError::StaleEpoch)));
+    let snap = s.read(owner(P)).await.unwrap();
+    assert_eq!(snap.read_agent_lease("a2").await.unwrap(), None);
+    assert_eq!(
+        snap.read_agent_lease("a1").await.unwrap(),
+        Some(committed.clone())
+    );
+    s.transaction(owner(P), Lane::Claims, move |u| {
+        assert_eq!(u.get_agent_lease("a2")?, None);
+        assert_eq!(u.get_agent_lease("a1")?, Some(committed));
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
+pub async fn lease_list_sees_every_own_claim_and_keeps_only_committed_leases_after_rollback(
+    fixture: Fixture,
+) {
+    let s = fixture.storage.clone();
+    let committed = granted(claim(s.as_ref(), P, new("t1", "a1", "r1"), 10).await);
+    // A project-scoped list must not return a neighboring project's lease.
+    claim(s.as_ref(), "other", new("t0", "a0", "r0"), 10).await;
+    let expected = committed.clone();
+    let failed = s
+        .transaction(owner(P), Lane::Claims, move |u| {
+            let second = granted(u.claim_lease(&new("t2", "a2", "r2"), 20)?);
+            let third = granted(u.claim_lease(&new("t3", "a3", "r3"), 30)?);
+            assert_eq!(u.list_leases()?, vec![expected, second, third]);
+            Err::<(), _>(StoreError::StaleEpoch)
+        })
+        .await;
+    assert!(matches!(failed, Err(StoreError::StaleEpoch)));
+    assert_eq!(all(s.as_ref(), P).await, vec![committed.clone()]);
+    s.transaction(owner(P), Lane::Claims, move |u| {
+        assert_eq!(u.list_leases()?, vec![committed]);
+        Ok(())
+    })
+    .await
+    .unwrap();
+}
+
 pub async fn release_and_renew_roll_back_with_their_unit_of_work(fixture: Fixture) {
     let s = fixture.storage.clone();
     let l = granted(claim(s.as_ref(), P, new("t1", "a1", "r1"), 0).await);
@@ -523,6 +580,8 @@ macro_rules! lease_suite {
             case!(a_refused_claim_uses_no_epoch);
             case!(one_of_many_concurrent_claims_wins);
             case!(a_claim_rolls_back_with_its_unit_of_work);
+            case!(agent_lookup_sees_own_claim_and_keeps_only_committed_leases_after_rollback);
+            case!(lease_list_sees_every_own_claim_and_keeps_only_committed_leases_after_rollback);
             case!(release_and_renew_roll_back_with_their_unit_of_work);
             case!(renew_moves_the_deadline_from_the_callers_clock);
             case!(a_lease_past_its_deadline_is_renewable_until_someone_ends_it);

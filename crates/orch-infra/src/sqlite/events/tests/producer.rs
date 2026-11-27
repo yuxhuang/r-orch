@@ -5,7 +5,9 @@
 //! the producer under test is the production one. No outcome depends on a sleep:
 //! the stalls are released by the test, the clock of the 20 ms cut is injected,
 //! and the one pause (the write lock held for 300 ms) only widens the window in
-//! which a wrongly early commit would show.
+//! which a wrongly early commit would show. The FULL exhaustion test also waits
+//! through the real sixty-second production retry episode; its watchdog is only
+//! a hang guard, not a latency target.
 
 use super::super::producer::{
     EventBatch, EventProducer, EventProducerOptions, Expected, Rejected, Submission, SubmitFailure,
