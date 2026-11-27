@@ -148,6 +148,14 @@ reviewed or merged.
   activation and T27 release. Report the verdict and findings directly to the lead, who uses them to decide
   milestone acceptance. File a GitHub issue for each finding that will remain open at the gate.
   Do not schedule a deep review per train or batch.
+- The lead keeps an open `[issue N]` fix task for every blocking or high issue. When a slot opens, dispatch
+  ready fixes for the current critical path in priority order: blocking first, then high, then routine work.
+- Each fix task names the code, prerequisite PRs and decisions it needs. When a draft PR supplies the code,
+  develop against its frozen commit now and land the fix with or immediately after its prerequisite.
+- Every approval hold on a blocking or high fix names the exact event that releases it. The supervisor checks
+  for that event and releases the hold when it occurs.
+- Keep later-milestone fixes in their assigned milestones. Reassess them when the critical path moves and
+  start them when their milestone becomes the critical path.
 
 ### Independent PRs, stacks and trains
 
