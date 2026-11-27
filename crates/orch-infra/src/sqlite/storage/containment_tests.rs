@@ -259,3 +259,62 @@ async fn adapter_setup_panic_is_outside_the_user_callback_catch() {
     assert!(storage.failure_state().failure().is_none());
     assert!(closed.is_err());
 }
+
+#[tokio::test]
+async fn adapter_completion_panic_is_outside_the_user_callback_catch() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let data = Arc::new(data);
+    let finished = Arc::new(AtomicBool::new(false));
+    let probe = finished.clone();
+    let storage = SqliteStorage::open(
+        data.clone(),
+        StorageOptions {
+            completion_probe: Some(Arc::new(move || {
+                assert!(
+                    !probe.load(Ordering::SeqCst),
+                    "synthetic adapter completion panic"
+                );
+            })),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let first = storage.clone();
+    let outcome = tokio::spawn(async move {
+        first
+            .transaction(owner(), store::Lane::Entities, move |unit| {
+                unit.create(team("partial"))?;
+                finished.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+    })
+    .await;
+    let closed = storage.close().await;
+    assert!(
+        outcome
+            .expect("adapter completion panic must not resume as a caller panic")
+            .is_err()
+    );
+    assert!(storage.failure_state().failure().is_none());
+    assert!(closed.is_err());
+    let reopened = SqliteStorage::open(data, StorageOptions::default()).unwrap();
+    assert!(
+        reopened
+            .read(owner())
+            .await
+            .unwrap()
+            .list(&Filter::Teams, &PageRequest::default())
+            .await
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    reopened
+        .transaction(owner(), store::Lane::Entities, |unit| {
+            unit.create(team("following"))
+        })
+        .await
+        .unwrap();
+    reopened.close().await.unwrap();
+}

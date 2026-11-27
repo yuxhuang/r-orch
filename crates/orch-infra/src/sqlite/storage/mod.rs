@@ -50,6 +50,8 @@ pub struct StorageOptions {
     pub(crate) reader_setup: Option<ReaderSetup>,
     #[cfg(test)]
     pub(crate) writer_setup: Option<WriterSetup>,
+    #[cfg(test)]
+    pub(crate) completion_probe: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 #[cfg(test)]
 type ReaderSetup = Box<dyn Fn(&mut rusqlite::Connection) + Send>;
@@ -68,6 +70,8 @@ impl Default for StorageOptions {
             reader_setup: None,
             #[cfg(test)]
             writer_setup: None,
+            #[cfg(test)]
+            completion_probe: None,
         }
     }
 }
@@ -80,6 +84,8 @@ struct Shared {
     stopping: AtomicBool,
     interrupts: Mutex<Vec<Option<rusqlite::InterruptHandle>>>,
     idle: Duration,
+    #[cfg(test)]
+    completion_probe: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 impl Shared {
     fn stop(&self) {
@@ -185,6 +191,8 @@ impl SqliteStorage {
                             (0..options.read_connections).map(|_| None).collect(),
                         ),
                         idle: options.snapshot_idle,
+                        #[cfg(test)]
+                        completion_probe: options.completion_probe,
                     });
                     let pool = ReadPool::open_with_state(
                         &data,

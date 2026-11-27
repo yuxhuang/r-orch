@@ -132,6 +132,10 @@ impl<'a, 'conn> Unit<'a, 'conn> {
         public_result(&self.shared.state, port(result))
     }
     pub(super) fn ensure_committable(&self) -> Result<()> {
+        #[cfg(test)]
+        if let Some(probe) = &self.shared.completion_probe {
+            probe();
+        }
         self.router.ensure_committable()?;
         self.native.ensure_committable().map_err(Into::into)
     }
