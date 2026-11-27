@@ -93,8 +93,11 @@ impl<'a, 'conn> EntityRead<'a, 'conn> {
         self.caller
     }
 
+    /// A latched state (R128) refuses a callback on the writer connection: its work can
+    /// never commit. A pooled snapshot read is not refused for a latch that was set
+    /// before it: it fails only for a fatal observation that happens during the
+    /// snapshot, which `ReadPool::read` and the owned snapshot discard (R140; issue 389).
     fn active(&self) -> Result<()> {
-        self.state.ensure_available()?;
         if self.source == FailureSource::Writer
             && let Some(error) = self.state.transaction_must_abort()
         {
@@ -383,3 +386,6 @@ mod tests;
 mod contain_tests;
 #[cfg(test)]
 mod operational_tests;
+
+#[cfg(test)]
+mod prior_latch_tests;

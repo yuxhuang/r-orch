@@ -303,6 +303,7 @@ async fn worker_snapshot(storage: &SqliteStorage) -> Snapshot {
         caller: owner(),
         commands,
         capacity: Arc::new(Semaphore::new(16)),
+        observed: storage.failure_state().fatal_observations(),
     }
 }
 

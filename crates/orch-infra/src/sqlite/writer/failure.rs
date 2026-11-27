@@ -6,7 +6,9 @@
 //! produced and before it is converted to a public error. The first fatal
 //! observation latches the state until the process restarts: the writer then
 //! refuses every mutation, no claim is granted, and a checkpoint is not called
-//! (`ensure_available` is the one gate for all three).
+//! (`ensure_available` is the one gate for all three). A read is not behind it: a
+//! pooled snapshot read is served after a latch and refused only for a fatal
+//! observation made during that read (R128 and R140; issue 389).
 //!
 //! What is fatal is decided here, by the structure of the error, and nowhere
 //! else. `classify` matches every `SqliteError` variant with no wildcard, so a
@@ -305,7 +307,8 @@ impl FailureState {
         self.inner.fatal_observations.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// The gate for a mutation, a claim and a checkpoint: refuses once latched.
+    /// The gate for a mutation, a claim and a checkpoint: refuses once latched. Not the
+    /// gate of a pooled read, which fails only for a fatal observation during it.
     pub fn ensure_available(&self) -> Result<()> {
         match self.failure() {
             Some(failure) => Err(SqliteError::StorageUnavailable(failure)),

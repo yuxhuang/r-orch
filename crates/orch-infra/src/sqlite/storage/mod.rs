@@ -4,6 +4,8 @@ mod page;
 mod page_tests;
 mod ports;
 #[cfg(test)]
+mod prior_latch_tests;
+#[cfg(test)]
 mod tests;
 mod view;
 
@@ -78,12 +80,27 @@ impl Shared {
             handle.interrupt();
         }
     }
+    /// Admission of a write: refused once the state is latched (R128) or closing.
     fn available(&self) -> Result<()> {
         self.state.ensure_available()?;
+        self.readable()
+    }
+    /// Admission of a snapshot or of a call on one. A latch set before it does not
+    /// refuse a read (R128 lists mutations, claims and checkpoints; issue 389).
+    fn readable(&self) -> Result<()> {
         if self.stopping.load(Ordering::SeqCst) {
             Err(SqliteError::WriterClosed)
         } else {
             Ok(())
+        }
+    }
+    /// A fatal observation since `since`, on any connection, may mean that what the
+    /// snapshot reads is damaged, as for `ReadPool::read`: refuse its value.
+    fn refuse_fresh_fatal(&self, since: u64) -> Result<()> {
+        if self.state.fatal_observations() == since {
+            Ok(())
+        } else {
+            self.state.ensure_available()
         }
     }
 }
@@ -281,13 +298,15 @@ struct Snapshot {
     caller: Caller,
     commands: mpsc::SyncSender<ReadJob>,
     capacity: Arc<Semaphore>,
+    /// `FailureState::fatal_observations` before the snapshot was requested.
+    observed: u64,
 }
 impl Snapshot {
     async fn call<T: Send + 'static>(
         &self,
         f: impl FnOnce(&ReadView<'_, '_>) -> Result<T> + Send + 'static,
     ) -> store::Result<T> {
-        port(self.owner.shared.available())?;
+        port(self.owner.shared.readable())?;
         // Bound queued/running jobs without blocking an async caller. Recheck
         // stop/fatal state after waiting: admission may have closed meanwhile.
         let capacity = self
@@ -296,8 +315,9 @@ impl Snapshot {
             .acquire_owned()
             .await
             .map_err(|_| backend("snapshot_expired"))?;
-        port(self.owner.shared.available())?;
+        port(self.owner.shared.readable())?;
         let (reply, answer) = oneshot::channel();
+        let observed = self.observed;
         let job: ReadJob = Box::new(move |view| {
             let _capacity = capacity;
             // Only the reader operation is contained. An adapter panic retires
@@ -311,24 +331,23 @@ impl Snapshot {
                     )));
                 }
             };
-            let result = result.and_then(|value| {
-                view.shared.state.ensure_available()?;
-                Ok(value)
-            });
+            if let Err(refusal) = view.shared.refuse_fresh_fatal(observed) {
+                let _ = reply.send(Err(backend("storage_unavailable")));
+                // Keep the operation's own raw error for ReadPool even when the
+                // public answer must be the fresh-fatal refusal.
+                return match result { Err(error) => Err(error), Ok(_) => Err(refusal) };
+            }
             match result {
                 Ok(value) => {
                     let _ = reply.send(Ok(value));
                     Ok(())
                 }
                 Err(SqliteError::Store(error)) => {
-                    let _ = reply.send(public_result(&view.shared.state, Err(error)));
+                    let _ = reply.send(Err(error));
                     Ok(())
                 }
                 Err(error) => {
-                    let _ = reply.send(public_result(
-                        &view.shared.state,
-                        Err(backend("SQLite storage operation failed")),
-                    ));
+                    let _ = reply.send(Err(backend("SQLite storage operation failed")));
                     Err(error)
                 }
             }
@@ -373,7 +392,7 @@ fn read_worker(
         }
         let mut ready = Some(ready);
         let result = pool.read(deadline, |tx| {
-            shared.available()?;
+            shared.readable()?;
             if Instant::now() >= deadline {
                 return Err(SqliteError::Overloaded);
             }
@@ -401,7 +420,6 @@ fn read_worker(
                 if shared.stopping.load(Ordering::SeqCst) {
                     break;
                 }
-                shared.state.ensure_available()?;
                 let remaining = shared.idle.saturating_sub(idle.elapsed());
                 if remaining.is_zero() {
                     break;
@@ -429,7 +447,8 @@ fn read_worker(
 #[async_trait]
 impl Storage for SqliteStorage {
     async fn read(&self, caller: Caller) -> store::Result<Box<dyn ReadSnapshot>> {
-        port(self.owner.shared.available())?;
+        port(self.owner.shared.readable())?;
+        let observed = self.owner.shared.state.fatal_observations();
         let (commands, receiver) = mpsc::sync_channel(16);
         let (ready, answer) = oneshot::channel();
         let deadline = Instant::now() + Duration::from_millis(200);
@@ -452,6 +471,7 @@ impl Storage for SqliteStorage {
             caller,
             commands,
             capacity: Arc::new(Semaphore::new(16)),
+            observed,
         }))
     }
     async fn write(&self, caller: Caller, lane: store::Lane, work: WriteWork) -> store::Result<()> {

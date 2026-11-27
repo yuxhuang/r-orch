@@ -82,7 +82,6 @@ impl<'a, 'conn> ReadView<'a, 'conn> {
         }
     }
     pub(super) fn list(&self, f: &Filter, p: &PageRequest) -> Result<Page<Record>> {
-        self.shared.state.ensure_available()?;
         if matches!(f, Filter::Tasks { .. }) {
             self.router
                 .task_page(&self.shared.task_cursors, self.shared.clock.now_ms(), f, p)
