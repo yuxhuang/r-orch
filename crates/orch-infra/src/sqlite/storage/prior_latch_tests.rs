@@ -160,10 +160,10 @@ async fn a_read_that_finds_damage_after_a_prior_latch_returns_no_value_and_is_co
     let counted = state.fatal_observations();
     let snapshot = storage.read(owner()).await.unwrap();
     // Served until the read itself meets the damage: no value, and not a refusal
-    // for the prior latch (the error is the operation's own).
+    // for the prior latch: this refusal is for the freshly observed damage.
     let damaged = snapshot.get(EntityKind::Team, "kept").await;
     assert!(
-        matches!(&damaged, Err(e) if !e.to_string().contains("storage_unavailable")),
+        matches!(&damaged, Err(e) if e.to_string().contains("storage_unavailable")),
         "{damaged:?}"
     );
     assert!(

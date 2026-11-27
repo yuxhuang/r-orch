@@ -47,7 +47,7 @@ fn route(entity: Entity) -> RoutedEntity {
 
 pub(super) struct ReadView<'a, 'conn> {
     pub(super) router: EntityRead<'a, 'conn>,
-    tx: &'a Transaction<'conn>,
+    pub(super) tx: &'a Transaction<'conn>,
     caller: &'a Caller,
     pub(super) shared: &'a Shared,
 }

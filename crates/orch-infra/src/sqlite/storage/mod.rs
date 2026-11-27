@@ -44,7 +44,11 @@ pub struct StorageOptions {
     pub writer_capacity: usize,
     pub snapshot_idle: Duration,
     pub clock: Arc<dyn Clock>,
+    #[cfg(test)]
+    pub(crate) reader_setup: Option<ReaderSetup>,
 }
+#[cfg(test)]
+type ReaderSetup = Box<dyn Fn(&mut rusqlite::Connection) + Send>;
 impl Default for StorageOptions {
     fn default() -> Self {
         Self {
@@ -54,6 +58,8 @@ impl Default for StorageOptions {
             writer_capacity: 64,
             snapshot_idle: Duration::from_secs(5),
             clock: Arc::new(crate::clock::SystemClock),
+            #[cfg(test)]
+            reader_setup: None,
         }
     }
 }
@@ -178,6 +184,10 @@ impl SqliteStorage {
                         options.read_connections,
                         state.clone(),
                     )?;
+                    #[cfg(test)]
+                    if let Some(setup) = options.reader_setup {
+                        pool.configure_test_readers(setup);
+                    }
                     let (writer, handle) = Writer::open_with_state(
                         &data,
                         options.synchronous,
@@ -286,7 +296,8 @@ fn public_result<T>(state: &FailureState, result: store::Result<T>) -> store::Re
     port(state.ensure_available())?;
     result
 }
-type ReadJob = Box<dyn FnOnce(&ReadView<'_, '_>) -> Result<()> + Send>;
+type RetiredReply = Box<dyn FnOnce() + Send>;
+type ReadJob = Box<dyn FnOnce(&ReadView<'_, '_>, &mut Option<RetiredReply>) -> Result<()> + Send>;
 struct OpenRead {
     caller: Caller,
     deadline: Instant,
@@ -318,36 +329,49 @@ impl Snapshot {
         port(self.owner.shared.readable())?;
         let (reply, answer) = oneshot::channel();
         let observed = self.observed;
-        let job: ReadJob = Box::new(move |view| {
+        let job: ReadJob = Box::new(move |view, retired_reply| {
             let _capacity = capacity;
             // Only the reader operation is contained. An adapter panic retires
             // this view, but is not evidence of database corruption (R140).
-            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(view))) {
-                Ok(result) => view.observed(result),
-                Err(_) => {
-                    let _ = reply.send(Err(backend("SQLite reader operation panicked")));
-                    return Err(SqliteError::Store(backend(
-                        "SQLite reader operation panicked",
-                    )));
-                }
-            };
-            if let Err(refusal) = view.shared.refuse_fresh_fatal(observed) {
-                let _ = reply.send(Err(backend("storage_unavailable")));
-                // Keep the operation's own raw error for ReadPool even when the
-                // public answer must be the fresh-fatal refusal.
-                return match result { Err(error) => Err(error), Ok(_) => Err(refusal) };
-            }
+            let (result, panicked) =
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(view))) {
+                    Ok(result) => (view.observed(result), false),
+                    Err(_) => (
+                        Err(SqliteError::Store(backend(
+                            "SQLite reader operation panicked",
+                        ))),
+                        true,
+                    ),
+                };
+            let result = result.and_then(|value| {
+                view.shared.refuse_fresh_fatal(observed)?;
+                Ok(value)
+            });
             match result {
                 Ok(value) => {
                     let _ = reply.send(Ok(value));
                     Ok(())
                 }
-                Err(SqliteError::Store(error)) => {
+                Err(SqliteError::Store(error))
+                    if !panicked && view.shared.refuse_fresh_fatal(observed).is_ok() =>
+                {
                     let _ = reply.send(Err(error));
                     Ok(())
                 }
                 Err(error) => {
-                    let _ = reply.send(Err(backend("SQLite storage operation failed")));
+                    let state = view.shared.state.clone();
+                    // Answer only after ReadPool has classified the original
+                    // error, retired the connection and updated its one streak.
+                    *retired_reply = Some(Box::new(move || {
+                        let message = if state.fatal_observations() != observed {
+                            "storage_unavailable"
+                        } else if panicked {
+                            "SQLite reader operation panicked"
+                        } else {
+                            "SQLite storage operation failed"
+                        };
+                        let _ = reply.send(Err(backend(message)));
+                    }));
                     Err(error)
                 }
             }
@@ -391,6 +415,7 @@ fn read_worker(
             continue;
         }
         let mut ready = Some(ready);
+        let mut retired_reply: Option<RetiredReply> = None;
         let result = pool.read(deadline, |tx| {
             shared.readable()?;
             if Instant::now() >= deadline {
@@ -426,7 +451,7 @@ fn read_worker(
                 }
                 match commands.recv_timeout(remaining.min(Duration::from_millis(50))) {
                     Ok(job) => {
-                        job(&view)?;
+                        job(&view, &mut retired_reply)?;
                         idle = Instant::now();
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -439,6 +464,9 @@ fn read_worker(
             .interrupts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)[index] = None;
+        if let Some(reply) = retired_reply {
+            reply();
+        }
         if let Some(ready) = ready {
             let _ = ready.send(result);
         }

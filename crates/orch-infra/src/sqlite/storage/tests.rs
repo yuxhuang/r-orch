@@ -303,23 +303,31 @@ async fn a_queued_snapshot_is_refused_at_admission_deadline() {
 async fn worker_snapshot(storage: &SqliteStorage) -> Snapshot {
     let (commands, receiver) = mpsc::sync_channel(16);
     let (ready, answer) = oneshot::channel();
-    storage
-        .owner
-        .reads
-        .try_send(OpenRead {
-            caller: owner(),
-            deadline: Instant::now() + Duration::from_secs(2),
-            commands: receiver,
-            ready,
-        })
-        .unwrap_or_else(|_| panic!("test admission"));
+    let observed = storage.failure_state().fatal_observations();
+    let mut request = OpenRead {
+        caller: owner(),
+        deadline: Instant::now() + Duration::from_secs(2),
+        commands: receiver,
+        ready,
+    };
+    loop {
+        match storage.owner.reads.try_send(request) {
+            Ok(()) => break,
+            Err(mpsc::TrySendError::Full(queued)) => {
+                assert!(Instant::now() < queued.deadline, "test admission deadline");
+                request = queued;
+                tokio::task::yield_now().await;
+            }
+            Err(_) => panic!("test reader closed"),
+        }
+    }
     answer.await.unwrap().unwrap();
     Snapshot {
         owner: storage.owner.clone(),
         caller: owner(),
         commands,
         capacity: Arc::new(Semaphore::new(16)),
-        observed: storage.failure_state().fatal_observations(),
+        observed,
     }
 }
 
@@ -344,7 +352,7 @@ async fn reader_operation_panic_retires_view_without_losing_worker() {
         "{error}"
     );
     assert!(snapshot.get(EntityKind::Team, "absent").await.is_err());
-    let next = storage.read(owner()).await.unwrap();
+    let next = worker_snapshot(&storage).await;
     assert!(
         next.get(EntityKind::Team, "absent")
             .await
@@ -440,5 +448,590 @@ async fn fatal_observation_during_successful_read_prevents_reply() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("storage_unavailable"), "{error}");
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn ordinary_sql_error_retires_connection_and_counts_once() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            read_connections: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let snapshot = worker_snapshot(&storage).await;
+    snapshot
+        .call(|v| {
+            v.tx.execute_batch("PRAGMA cache_size=1234")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let result = snapshot
+        .call::<()>(|_| {
+            Err(SqliteError::Sql(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                None,
+            )))
+        })
+        .await;
+    assert!(result.is_err());
+    assert_eq!(storage.failure_state().pool_failure_streak(), 1);
+    let next = worker_snapshot(&storage).await;
+    let size = next
+        .call(|v| {
+            Ok(v.tx.query_row("PRAGMA cache_size", [], |r| r.get::<_, i64>(0))?)
+        })
+        .await
+        .unwrap();
+    assert_ne!(size, 1234, "failed connection must be reopened");
+    assert_eq!(
+        storage.failure_state().pool_failure_streak(),
+        1,
+        "an open snapshot is not a finished pool read"
+    );
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_cursor_keeps_snapshot_and_failure_streak() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(Arc::new(data), StorageOptions::default()).unwrap();
+    let snapshot = storage.read(owner()).await.unwrap();
+    let result = snapshot
+        .list(
+            &Filter::Teams,
+            &PageRequest {
+                cursor: Some(store::Cursor::new("malformed".into()).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await;
+    assert!(matches!(result, Err(StoreError::InvalidCursor)));
+    assert!(
+        snapshot
+            .get(EntityKind::Config, "absent")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(storage.failure_state().pool_failure_streak(), 0);
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_and_expired_opens_do_not_retire_a_healthy_connection() {
+    for cancelled in [true, false] {
+        let (_temp, data) = crate::sqlite::test_data();
+        let storage = SqliteStorage::open(
+            Arc::new(data),
+            StorageOptions {
+                read_connections: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let held = worker_snapshot(&storage).await;
+        held.call(|v| {
+            v.tx.execute_batch("PRAGMA cache_size=1234")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let (_commands, receiver) = mpsc::sync_channel(16);
+        let (ready, answer) = oneshot::channel();
+        let deadline = if cancelled {
+            Instant::now() + Duration::from_secs(5)
+        } else {
+            Instant::now()
+        };
+        storage
+            .owner
+            .reads
+            .try_send(OpenRead {
+                caller: owner(),
+                deadline,
+                commands: receiver,
+                ready,
+            })
+            .unwrap_or_else(|_| panic!("stale admission"));
+        if cancelled {
+            drop(answer);
+        } else {
+            drop(held);
+            assert!(matches!(
+                answer.await.unwrap(),
+                Err(SqliteError::Overloaded)
+            ));
+            let next = worker_snapshot(&storage).await;
+            let size = next
+                .call(|v| {
+                    Ok(v.tx.query_row("PRAGMA cache_size", [], |r| r.get::<_, i64>(0))?)
+                })
+                .await
+                .unwrap();
+            assert_eq!(size, 1234, "expired open must skip the pool");
+            storage.close().await.unwrap();
+            continue;
+        }
+        drop(held);
+        let next = worker_snapshot(&storage).await;
+        let size = next
+            .call(|v| {
+                Ok(v.tx.query_row("PRAGMA cache_size", [], |r| r.get::<_, i64>(0))?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(size, 1234, "cancelled open must skip the pool");
+        storage.close().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn close_stops_idle_snapshot_independently_of_its_long_idle_bound() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            snapshot_idle: Duration::from_secs(60),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let snapshot = storage.read(owner()).await.unwrap();
+    let close = storage.clone();
+    let mut closing = tokio::spawn(async move { close.close().await });
+    let stopped = tokio::time::timeout(Duration::from_secs(1), &mut closing).await;
+    // Also let a mutated worker exit on channel disconnection before asserting.
+    drop(snapshot);
+    match stopped {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(_) => {
+            closing.await.unwrap().unwrap();
+            panic!("close waited for idle expiry");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn close_interrupts_a_statement_that_is_already_running() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let (entered, running) = oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            read_connections: 1,
+            reader_setup: Some(Box::new(move |conn| {
+                let mut entered = entered.lock().unwrap().take();
+                let mut fallback = None;
+                conn.progress_handler(
+                    1000,
+                    Some(move || {
+                        if let Some(entered) = entered.take() {
+                            fallback = Some(Instant::now() + Duration::from_secs(4));
+                            let _ = entered.send(());
+                        }
+                        // A broken interrupt mutant still exits and cleans up.
+                        fallback.is_some_and(|deadline| Instant::now() >= deadline)
+                    }),
+                )
+                .unwrap();
+            })),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let snapshot = worker_snapshot(&storage).await;
+    let query = tokio::spawn(async move {
+        snapshot.call(move |v| {
+            v.tx.query_row("WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<1000000000) SELECT sum(x) FROM n", [], |r| r.get::<_, i64>(0)).map_err(Into::into)
+        }).await
+    });
+    running.await.unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(1), storage.close()).await;
+    let result = query.await.unwrap();
+    storage.close().await.unwrap();
+    assert!(result.is_err(), "close must interrupt SQL");
+    stopped
+        .expect("close must not wait for the statement fallback")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn dropping_an_in_flight_snapshot_returns_its_connection_without_a_transaction() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            read_connections: 1,
+            snapshot_idle: Duration::from_secs(60),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let snapshot = worker_snapshot(&storage).await;
+    let (release, blocked) = mpsc::sync_channel(1);
+    let (entered, running) = oneshot::channel();
+    let call = tokio::spawn(async move {
+        snapshot
+            .call(move |_| {
+                let _ = entered.send(());
+                blocked.recv().unwrap();
+                Ok(())
+            })
+            .await
+    });
+    running.await.unwrap();
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    let next = worker_snapshot(&storage).await;
+    // A write after cancelled delivery must be visible in a new snapshot.
+    drop(next);
+    storage
+        .transaction(owner(), store::Lane::Entities, |u| {
+            u.create(team("after-cancel"))
+        })
+        .await
+        .unwrap();
+    let next = storage.read(owner()).await.unwrap();
+    assert!(
+        next.get(EntityKind::Team, "after-cancel")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_cleanup_prevents_native_list_and_commit_even_when_callback_swallows_it() {
+    use orch_core::{store::ConfigEntry, test_support::make_task};
+    let (_temp, data) = crate::sqlite::test_data();
+    let data = Arc::new(data);
+    let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+    storage
+        .transaction(owner(), store::Lane::Entities, |u| {
+            let mut task = make_task();
+            task.created_at = "2025-01-01T00:00:00.000Z".into();
+            task.updated_at = task.created_at.clone();
+            u.create(Entity::Task(Box::new(task)))?;
+            u.create(Entity::Config(ConfigEntry {
+                key: "kept".into(),
+                value: "v".into(),
+            }))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    super::super::open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap().execute_batch(
+        "CREATE TRIGGER abort_move BEFORE UPDATE ON tasks BEGIN SELECT RAISE(ROLLBACK, 'synthetic cleanup failure'); END"
+    ).unwrap();
+    let refused = Arc::new(AtomicBool::new(false));
+    let seen = refused.clone();
+    let result = storage
+        .write(
+            owner(),
+            store::Lane::Entities,
+            Box::new(move |u| {
+                u.create(team("must-rollback"))?;
+                assert!(
+                    u.move_to_end(EntityKind::Task, "tsk_test1", Revision::ONE)
+                        .is_err()
+                );
+                seen.store(
+                    u.list(&Filter::Config, &PageRequest::default()).is_err(),
+                    Ordering::SeqCst,
+                );
+                Ok(())
+            }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "executor must reject the swallowed cleanup failure"
+    );
+    assert!(
+        refused.load(Ordering::SeqCst),
+        "native page must refuse an aborted unit"
+    );
+    assert!(storage.failure_state().failure().is_none());
+    storage
+        .transaction(owner(), store::Lane::Entities, |u| {
+            u.create(team("following"))
+        })
+        .await
+        .unwrap();
+    let snapshot = storage.read(owner()).await.unwrap();
+    assert!(
+        snapshot
+            .get(EntityKind::Team, "must-rollback")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        snapshot
+            .get(EntityKind::Team, "following")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn invalid_non_task_limit_precedes_malformed_cursor() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(Arc::new(data), StorageOptions::default()).unwrap();
+    let snapshot = storage.read(owner()).await.unwrap();
+    for limit in [0, 1001] {
+        let result = snapshot
+            .list(
+                &Filter::Teams,
+                &PageRequest {
+                    limit,
+                    cursor: Some(store::Cursor::new("malformed".into()).unwrap()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(StoreError::InvalidPage(_))),
+            "{result:?}"
+        );
+    }
+    storage.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn close_drains_admitted_write_and_releases_lock_with_live_snapshot() {
+    use crate::data_dir::{DataDir, Holder, LockKind};
+    let (temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(Arc::new(data), StorageOptions::default()).unwrap();
+    let snapshot = storage.read(owner()).await.unwrap();
+    let (release, blocked) = mpsc::sync_channel(1);
+    let (entered, running) = oneshot::channel();
+    let writer = storage.clone();
+    let writing = tokio::spawn(async move {
+        writer
+            .write(
+                owner(),
+                store::Lane::Entities,
+                Box::new(move |u| {
+                    u.create(team("admitted"))?;
+                    let _ = entered.send(());
+                    blocked.recv().unwrap();
+                    Ok(())
+                }),
+            )
+            .await
+    });
+    running.await.unwrap();
+    let close = storage.clone();
+    let closing = tokio::spawn(async move { close.close().await });
+    tokio::task::yield_now().await;
+    release.send(()).unwrap();
+    writing.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(1), closing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(snapshot.get(EntityKind::Team, "admitted").await.is_err());
+    let second = DataDir::acquire(
+        &temp.path().join("data"),
+        &Holder {
+            kind: LockKind::Daemon,
+            pid: std::process::id(),
+            started_at: "synthetic".into(),
+            binary_version: "test".into(),
+            executable: "/synthetic/orch".into(),
+        },
+    )
+    .unwrap();
+    let conn = open_connection(&second, ConnectionRole::Reader, Synchronous::Normal).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM teams WHERE project_id='p' AND id='admitted'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn cancelled_open_never_enters_pool_or_resets_its_failure_streak() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            read_connections: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let failed = worker_snapshot(&storage).await;
+    assert!(
+        failed
+            .call::<()>(|_| Err(SqliteError::Sql(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                None,
+            ))))
+            .await
+            .is_err()
+    );
+    assert_eq!(storage.failure_state().pool_failure_streak(), 1);
+    let (_commands, commands) = mpsc::sync_channel(16);
+    let (ready, answer) = oneshot::channel();
+    drop(answer);
+    storage
+        .owner
+        .reads
+        .try_send(OpenRead {
+            caller: owner(),
+            deadline: Instant::now() + Duration::from_secs(2),
+            commands,
+            ready,
+        })
+        .unwrap_or_else(|_| panic!("cancelled test admission"));
+    let next = worker_snapshot(&storage).await;
+    assert_eq!(
+        storage.failure_state().pool_failure_streak(),
+        1,
+        "cancelled open must never count as a successful pool read"
+    );
+    assert!(
+        next.get(EntityKind::Team, "absent")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    storage.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn last_storage_drop_releases_lock_while_snapshot_metadata_remains() {
+    use crate::data_dir::{DataDir, Holder, LockKind};
+    let (temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            snapshot_idle: Duration::from_secs(60),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let snapshot = storage.read(owner()).await.unwrap();
+    drop(storage);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(second) = DataDir::acquire(
+                &temp.path().join("data"),
+                &Holder {
+                    kind: LockKind::Daemon,
+                    pid: std::process::id(),
+                    started_at: "synthetic".into(),
+                    binary_version: "test".into(),
+                    executable: "/synthetic/orch".into(),
+                },
+            ) {
+                drop(second);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("last storage client must stop owner and release lock");
+    assert!(snapshot.get(EntityKind::Team, "absent").await.is_err());
+}
+
+#[tokio::test]
+async fn first_fatal_writer_read_replies_unavailable_and_rolls_back() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let data = Arc::new(data);
+    let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+    storage
+        .transaction(owner(), store::Lane::Entities, |u| {
+            u.create(team("damaged"))
+        })
+        .await
+        .unwrap();
+    open_connection(&data, ConnectionRole::Writer, Synchronous::Normal)
+        .unwrap()
+        .execute(
+            "DELETE FROM entity_details WHERE project_id='p' AND family='team'",
+            [],
+        )
+        .unwrap();
+    let result = storage
+        .write(
+            owner(),
+            store::Lane::Entities,
+            Box::new(|u| u.get(EntityKind::Team, "damaged").map(|_| ())),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(ref e) if e.to_string().contains("storage_unavailable")),
+        "{result:?}"
+    );
+    assert_eq!(
+        storage.failure_state().failure().unwrap().source,
+        FailureSource::Writer
+    );
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_savepoint_cleanup_with_active_transaction_refuses_native_list() {
+    use orch_core::store::{ConfigEntry, UnitOfWork};
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    let (_temp, data) = crate::sqlite::test_data();
+    let data = Arc::new(data);
+    let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+    let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    conn.for_migration()
+        .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Savepoint {
+                savepoint_name: "entity_task_move",
+                operation: TransactionOperation::Release | TransactionOperation::Rollback,
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    let caller = owner();
+    let mut unit = Unit::new(&tx, &caller, &storage.owner.shared);
+    let mut task = orch_core::test_support::make_task();
+    task.created_at = "2025-01-01T00:00:00.000Z".into();
+    task.updated_at = task.created_at.clone();
+    unit.create(Entity::Task(Box::new(task))).unwrap();
+    unit.create(Entity::Config(ConfigEntry {
+        key: "kept".into(),
+        value: "v".into(),
+    }))
+    .unwrap();
+    assert!(
+        unit.move_to_end(EntityKind::Task, "tsk_test1", Revision::ONE)
+            .is_err()
+    );
+    assert!(
+        !tx.is_autocommit(),
+        "exercise the active-transaction guard, not the leaf's autocommit guard"
+    );
+    assert!(storage.failure_state().transaction_must_abort().is_some());
+    assert!(
+        unit.list(&Filter::Config, &PageRequest::default()).is_err(),
+        "page bridge must refuse a poisoned unit even with the transaction open"
+    );
+    drop(unit);
+    tx.rollback().unwrap();
+    drop(conn);
     storage.close().await.unwrap();
 }
