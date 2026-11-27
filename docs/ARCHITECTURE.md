@@ -1242,8 +1242,9 @@ clients <── WriteReceipt::wait() ──────────────�
   A leaf whose savepoint cleanup fails (the lease, intent, retry and message leaves) does not return an error that a
   callback could catch and commit past. It unwinds with a typed `CleanupUnwind`, which `contain` reports to the failure
   state, so that `SQLITE_CORRUPT` or `SQLITE_NOTADB` latches although the outer rollback would succeed, and then raises
-  again. `run` ends as for any other panic under `submit`. The receipts return `StorageUnavailable` when a cause is
-  latched and `WriterClosed` when none is. A failed outer rollback after a callback panic keeps the payload, which the
+  again. `run` ends as for any other panic under `submit`. The operation's cause and the cleanup's are observed
+  separately (spec record O): the receipts return `StorageUnavailable` when either is fatal and so latched, and
+  `WriterClosed`, with nothing latched, when both are ordinary. A failed outer rollback after a callback panic keeps the payload, which the
   caller can still reach with `SqliteError::callback_panic()`. A callback is trusted not to swallow an unwind itself.
 - **Queue.** `capacity` bounds the number of waiting transactions, not their bytes. A full queue, and a second
   waiting `Events` transaction, return `Overloaded` at once; the producer keeps its batch. Nothing coalesces
