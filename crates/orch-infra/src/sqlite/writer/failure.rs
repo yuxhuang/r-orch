@@ -14,7 +14,8 @@
 //! else. `classify` matches every `SqliteError` variant with no wildcard, so a
 //! new variant (the structured `TaskCorrupt` of R141, for one) cannot be added
 //! without a decision about its class. Task corruption and the structured
-//! corruption of a Context, Config, Template or Goal (`EntityCorrupt`) are fatal;
+//! corruption of an Agent, Team, Run, Context, Config, Template or Goal
+//! (`EntityCorrupt`, one variant for the seven families) are fatal;
 //! object access and publication failures of either (`TaskAccess`,
 //! `TaskPublication`, `EntityAccess`, `EntityPublication`) alone prove nothing
 //! about the live database.
@@ -170,8 +171,8 @@ fn walk(error: &SqliteError, out: &mut Observation) {
         TaskCorrupt { .. } | EntityCorrupt { .. } => Class::Fatal(FatalCause::LogicalCorruption),
         // The error that a latched state answers with: already latched.
         StorageUnavailable(_) => Class::Ordinary,
-        // R140 names SQLITE_CORRUPT, SQLITE_NOTADB and `TaskCorrupt` as fatal.
-        // The stored-data errors below are not among them.
+        // R140 names SQLITE_CORRUPT, SQLITE_NOTADB, `TaskCorrupt` and `EntityCorrupt`
+        // (the arm above) as fatal. The stored-data errors below are not among them.
         EventCorrupt(_)
         | IntentCorrupt(_)
         | LeaseCorrupt(_)
@@ -482,21 +483,243 @@ mod tests {
         }
     }
 
+    const LIVE_NON_WRITERS: [FailureSource; 3] = [
+        FailureSource::Reader,
+        FailureSource::Checkpoint,
+        FailureSource::Tool,
+    ];
+
+    /// A nonfatal failed savepoint rollback: neither side is fatal, so no latch can
+    /// make `transaction_must_abort` answer for the abort bit.
+    fn nonfatal_operation_rollback() -> SqliteError {
+        SqliteError::OperationRollback {
+            operation: Box::new(SqliteError::Overloaded),
+            rollback: sqlite_failure(rusqlite::ffi::SQLITE_BUSY),
+        }
+    }
+
+    fn sqlite_failure(code: i32) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None)
+    }
+
+    fn abort_bit(state: &FailureState) -> bool {
+        state.inner.transaction_aborted.load(Ordering::SeqCst)
+    }
+
     #[test]
-    fn only_a_writer_observation_aborts_the_enclosing_transaction() {
+    fn only_the_writer_observes_into_the_abort_bit_even_when_nothing_is_latched() {
+        // Positive control: the writer's nonfatal failed rollback sets the bit and
+        // latches nothing, so the bit alone is what forbids the commit.
         let writer = FailureState::new();
         writer.begin_transaction();
-        writer.observe(FailureSource::Writer, &entity_corrupt());
-        // `ensure_available` already fails once latched; the abort flag is its own bit.
-        assert!(writer.inner.transaction_aborted.load(Ordering::SeqCst));
+        let observation = writer.observe(FailureSource::Writer, &nonfatal_operation_rollback());
+        assert!(observation.savepoint_rollback_failed());
+        assert!(!observation.is_fatal());
+        assert_eq!(writer.failure(), None);
+        assert!(abort_bit(&writer));
         assert!(matches!(
             writer.transaction_must_abort(),
-            Some(SqliteError::StorageUnavailable(_))
+            Some(SqliteError::TransactionAborted)
         ));
 
-        let reader = FailureState::new();
-        reader.observe(FailureSource::Reader, &entity_corrupt());
-        assert!(!reader.inner.transaction_aborted.load(Ordering::SeqCst));
+        // Every other source, with a fresh state each: the bit stays clear.
+        for source in LIVE_NON_WRITERS
+            .into_iter()
+            .chain([FailureSource::Artifact])
+        {
+            let state = FailureState::new();
+            state.begin_transaction();
+            let observation = state.observe(source, &nonfatal_operation_rollback());
+            assert!(observation.savepoint_rollback_failed(), "{source}");
+            assert_eq!(state.failure(), None, "{source}");
+            assert!(!abort_bit(&state), "{source} must not set the abort bit");
+            assert!(state.transaction_must_abort().is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_fatal_observation_sets_the_abort_bit_for_the_writer_alone() {
+        let state = FailureState::new();
+        state.begin_transaction();
+        state.observe(FailureSource::Writer, &entity_corrupt());
+        assert!(abort_bit(&state));
+
+        // A latched non-writer is refused by `ensure_available`, but the bit itself
+        // is the writer's, so a later transaction that clears it is not poisoned twice.
+        for source in LIVE_NON_WRITERS {
+            let state = FailureState::new();
+            state.begin_transaction();
+            state.observe(source, &entity_corrupt());
+            assert!(state.failure().is_some(), "{source} latches");
+            assert!(!abort_bit(&state), "{source} must not set the abort bit");
+        }
+    }
+
+    #[test]
+    fn a_named_latch_sets_the_abort_bit_for_the_writer_alone() {
+        let writer = FailureState::new();
+        writer.begin_transaction();
+        writer.latch(FailureSource::Writer, FatalCause::LogicalCorruption);
+        assert!(abort_bit(&writer));
+
+        for source in LIVE_NON_WRITERS {
+            let state = FailureState::new();
+            state.begin_transaction();
+            state.latch(source, FatalCause::SqliteCorrupt);
+            let failure = state
+                .failure()
+                .unwrap_or_else(|| panic!("{source} latched"));
+            assert_eq!(failure.source, source);
+            assert!(!abort_bit(&state), "{source} must not set the abort bit");
+        }
+
+        let artifact = FailureState::new();
+        artifact.begin_transaction();
+        artifact.latch(FailureSource::Artifact, FatalCause::SqliteCorrupt);
+        assert_eq!(artifact.failure(), None);
+        assert!(!abort_bit(&artifact));
+    }
+
+    #[test]
+    fn begin_transaction_clears_only_the_abort_bit_and_not_the_latch() {
+        let state = FailureState::new();
+        state.observe(FailureSource::Writer, &nonfatal_operation_rollback());
+        assert!(abort_bit(&state));
+        state.begin_transaction();
+        assert!(!abort_bit(&state));
+        assert!(state.transaction_must_abort().is_none());
+
+        state.observe(FailureSource::Writer, &entity_corrupt());
+        state.begin_transaction();
+        assert!(!abort_bit(&state));
+        assert!(matches!(
+            state.transaction_must_abort(),
+            Some(SqliteError::StorageUnavailable(_))
+        ));
+    }
+
+    #[test]
+    fn sqlite_result_codes_classify_by_primary_code_with_extended_codes_included() {
+        use rusqlite::ffi::*;
+        let fatal_corrupt = Class::Fatal(FatalCause::SqliteCorrupt);
+        let fatal_notadb = Class::Fatal(FatalCause::SqliteNotADatabase);
+        let table = [
+            ("SQLITE_CORRUPT", SQLITE_CORRUPT, fatal_corrupt),
+            ("SQLITE_CORRUPT_VTAB", SQLITE_CORRUPT_VTAB, fatal_corrupt),
+            ("SQLITE_CORRUPT_INDEX", SQLITE_CORRUPT_INDEX, fatal_corrupt),
+            ("SQLITE_NOTADB", SQLITE_NOTADB, fatal_notadb),
+            ("SQLITE_CONSTRAINT", SQLITE_CONSTRAINT, Class::Ordinary),
+            (
+                "SQLITE_CONSTRAINT_UNIQUE",
+                SQLITE_CONSTRAINT_UNIQUE,
+                Class::Ordinary,
+            ),
+            (
+                "SQLITE_CONSTRAINT_FOREIGNKEY",
+                SQLITE_CONSTRAINT_FOREIGNKEY,
+                Class::Ordinary,
+            ),
+            ("SQLITE_FULL", SQLITE_FULL, Class::Transient),
+            ("SQLITE_IOERR", SQLITE_IOERR, Class::Transient),
+            ("SQLITE_IOERR_READ", SQLITE_IOERR_READ, Class::Transient),
+            ("SQLITE_NOMEM", SQLITE_NOMEM, Class::Transient),
+            ("SQLITE_BUSY", SQLITE_BUSY, Class::Transient),
+            ("SQLITE_LOCKED", SQLITE_LOCKED, Class::Transient),
+            ("SQLITE_READONLY", SQLITE_READONLY, Class::Transient),
+            ("SQLITE_CANTOPEN", SQLITE_CANTOPEN, Class::Transient),
+            ("SQLITE_ERROR", SQLITE_ERROR, Class::Transient),
+        ];
+        for (name, code, class) in table {
+            let error = SqliteError::Sql(sqlite_failure(code));
+            assert_eq!(classify(&error).leaves(), operation(class), "{name}");
+            // The same result is a rollback's: classified on its own side.
+            let nested = SqliteError::OperationRollback {
+                operation: Box::new(SqliteError::Overloaded),
+                rollback: sqlite_failure(code),
+            };
+            assert_eq!(
+                classify(&nested).leaves(),
+                [(Role::Operation, Class::Ordinary), (Role::Rollback, class)],
+                "{name} as a rollback"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_sqlite_failure_of_the_driver_is_the_requests_own_answer() {
+        for error in [
+            rusqlite::Error::QueryReturnedNoRows,
+            rusqlite::Error::InvalidQuery,
+            rusqlite::Error::InvalidParameterCount(1, 2),
+        ] {
+            let label = format!("{error:?}");
+            assert_eq!(
+                classify(&SqliteError::Sql(error)).leaves(),
+                operation(Class::Ordinary),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_class_latches_from_each_live_source_by_its_class_alone() {
+        use rusqlite::ffi::*;
+        let live = [
+            FailureSource::Writer,
+            FailureSource::Reader,
+            FailureSource::Checkpoint,
+            FailureSource::Tool,
+        ];
+        let cases: [(&str, i32, Option<FatalCause>); 6] = [
+            ("CORRUPT", SQLITE_CORRUPT, Some(FatalCause::SqliteCorrupt)),
+            (
+                "NOTADB",
+                SQLITE_NOTADB,
+                Some(FatalCause::SqliteNotADatabase),
+            ),
+            ("FULL", SQLITE_FULL, None),
+            ("IOERR", SQLITE_IOERR, None),
+            ("NOMEM", SQLITE_NOMEM, None),
+            ("CONSTRAINT", SQLITE_CONSTRAINT, None),
+        ];
+        for (name, code, cause) in cases {
+            for source in live {
+                let state = FailureState::new();
+                state.observe(source, &SqliteError::Sql(sqlite_failure(code)));
+                match cause {
+                    Some(cause) => {
+                        let failure = state
+                            .failure()
+                            .unwrap_or_else(|| panic!("{name} from {source} latches"));
+                        assert_eq!(failure.source, source, "{name}");
+                        assert_eq!(failure.causes, [(Role::Operation, cause)], "{name}");
+                    }
+                    None => assert_eq!(state.failure(), None, "{name} from {source}"),
+                }
+            }
+            // An external artifact is classified and reported to its caller, never latched.
+            let artifact = FailureState::new();
+            let observation = artifact.observe(
+                FailureSource::Artifact,
+                &SqliteError::Sql(sqlite_failure(code)),
+            );
+            assert_eq!(observation.is_fatal(), cause.is_some(), "{name}");
+            assert_eq!(artifact.failure(), None, "{name} from artifact");
+        }
+    }
+
+    #[test]
+    fn the_first_fatal_observation_keeps_its_source_and_a_later_one_only_counts() {
+        let state = FailureState::new();
+        state.observe(FailureSource::Reader, &entity_corrupt());
+        let first = state.failure().expect("latched");
+        state.observe(
+            FailureSource::Writer,
+            &SqliteError::Sql(sqlite_failure(rusqlite::ffi::SQLITE_NOTADB)),
+        );
+        assert_eq!(state.failure(), Some(first.clone()));
+        assert_eq!(first.source, FailureSource::Reader);
+        assert_eq!(state.fatal_observations(), 2);
     }
 
     #[test]
@@ -549,6 +772,27 @@ mod tests {
         assert_eq!(state.pool_failure_streak(), before);
         state.pool_read_finished(None);
         assert_eq!(state.pool_failure_streak(), 0);
+        assert!(!state.pool_degraded());
+    }
+
+    #[test]
+    fn a_pooled_read_is_reported_degraded_at_exactly_three_failures_in_a_row() {
+        let state = FailureState::new();
+        let failed = SqliteError::Sql(sqlite_failure(rusqlite::ffi::SQLITE_IOERR));
+        for streak in 1..3 {
+            state.pool_read_finished(Some(&failed));
+            assert_eq!(state.pool_failure_streak(), streak);
+            assert!(!state.pool_degraded(), "{streak} in a row is not reported");
+        }
+        state.pool_read_finished(Some(&failed));
+        assert_eq!(state.pool_failure_streak(), 3);
+        assert!(state.pool_degraded(), "the third in a row is reported");
+        // A request's own refusal neither counts nor resets the streak.
+        state.pool_read_finished(Some(&SqliteError::Sql(sqlite_failure(
+            rusqlite::ffi::SQLITE_CONSTRAINT,
+        ))));
+        assert_eq!(state.pool_failure_streak(), 3);
+        state.pool_read_finished(None);
         assert!(!state.pool_degraded());
     }
 
