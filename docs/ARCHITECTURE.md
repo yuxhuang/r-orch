@@ -1313,7 +1313,8 @@ clients <── WriteReceipt::wait() ──────────────�
 **Limits of this slice** (follow-ups tracked in [issue 127](https://github.com/yuxhuang/r-orch/issues/127)):
 
 - No retry and no replay: a SQL error goes to its receipt. The retry of R128's retryable class and its 60 s and
-  second-`IOERR` fatal rules are not built; the shared failure state, the classification of R128 and R140 and the
+  second-`IOERR` fatal rules are not built; the owner approved the policy on 2026-11-27 (spec record P, plan "Writer retry
+  policy"), and the writer will retry only its own `BEGIN` and `COMMIT`, never a callback; the shared failure state, the classification of R128 and R140 and the
   `StorageUnavailable` answer of a latched writer are (`sqlite/writer/failure.rs`).
 - A closure must not issue `COMMIT`, `BEGIN` or `SAVEPOINT`, or any side effect outside the database. The executor
   does not detect it; a manual `COMMIT` can persist rows although the wrapper then reports an error. Side effects
