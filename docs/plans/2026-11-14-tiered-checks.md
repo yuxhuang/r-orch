@@ -1,5 +1,49 @@
 # Tiered verification checks — plan
 
+## PR414 current-merge resolver — 2026-11-27 (draft; #405)
+
+Records what draft PR 414 (head `ca534eda0a4d2f40b664c589f1bf3f1947798ff8`,
+base `22e1ff29b9281c16bb0c5fc22326372a8a827d78`, one commit, five files) built,
+against the [PR414 amendment in the spec](../specs/2026-11-14-tiered-checks.md).
+The tiers, the folded suite and the required check names are untouched.
+
+| Step | Change | Check |
+|---|---|---|
+| 1 | `scripts/ci/pr_merge_preflight.sh` becomes a resolver under one `timeout --signal=KILL` re-exec of at most 120 seconds. It validates live identity through the API, reads the target tip, head ref and advertised merge ref, uses the event merge when it already has the ordered pair, and otherwise fetches the advertised merge by SHA at depth 2 and polls within the deadline. Spec P1–P8. | `python3 -I scripts/ci/test_pr_merge_preflight.py`: 38 passed on the reviewed head (real Git remotes and shallow clones: delayed publication, base/head/target motion, hung fetch and `ls-remote`, failed lookups, parent mismatch, missing outputs, push and schedule) |
+| 2 | `.github/workflows/ci.yml`: `preflight` gets `pull-requests: read` beside `contents: read`, a five-minute ceiling and a second output `base`; `PR_HEAD_SHA` and the token enter its step environment. `changes`, `check` and `test` require both outputs and check out the same merge SHA. `PR_BASE` becomes the verified first parent. Spec P9, C1–C4. | `cargo test --locked -p xtask --test ci_workflow`: 11 passed, including the fail-closed classification truth table that runs the real `check` admission step |
+| 3 | `docs/RUNBOOK.md`: the `preflight` troubleshooting row, the paragraph on the preflight and the recovery and current-parent/tree procedure. Spec Q1. | Read against the script: every first error line in the recovery table is a string the script prints |
+
+### Recovery contract (as written in the RUNBOOK)
+
+| Situation | Recovery |
+|---|---|
+| Lookup failure (API, `ls-remote` or fetch failed; malformed or duplicate ref) | Re-run all jobs of the same run |
+| Delayed publication (deadline expired while the merge was stale or unpublished) | Wait, re-run all jobs; if it expires again after several minutes, obtain a fresh event |
+| Changed head, target, repository, number or state (`fresh event required`) | A rerun cannot succeed. Push a commit (changed head: delta review and fresh CI) or close and reopen the PR (same head). Retargeting alone starts no run |
+
+Re-run **all** jobs, because GitHub keeps the outputs of jobs that are not re-run
+from the earlier attempt: re-running only a failed `test` would reuse the earlier
+preflight's merge and base.
+
+### Qualification of a landing (verification, not a CI step)
+
+1. Read the run's `verified merge=… tree=… base=… head=…` line, or `git show`
+   the tested merge fetched by SHA.
+2. First parent equals the current `origin/main`; second parent equals the
+   reviewed head; tree equals `git merge-tree --write-tree origin/main <head>`.
+3. `mergeStateStatus` is `CLEAN`; `closingIssuesReferences` equals the issues the
+   description closes (PR 414: `#405` only).
+4. Only `main` moved: keep the head review and rerun CI on the new merge. A
+   changed head: delta review and fresh CI.
+
+At the head above, current `main` was `7a2fb42e955f2d07dbd06fa5c344c0f022fde005`
+and `git merge-tree --write-tree` gave tree `3d749e820bd75002d5a87602a13ee046a2dad298`.
+Run 45949276424 tested merge `b9a9d2f88f69ecd534757390bdc04babd1aab0a6` on the
+older parent `22e1ff29`, tree `8aaae2c0a88a93fcfe9b9940991704128b3013c6`; it does
+not qualify against the newer `main`. Hosted recovery through the stale branch is
+not yet recorded (#416), and the polling rate and transient-failure handling are
+#415.
+
 ## PR4 nextest adoption — 2026-11-24 (divergence from this plan)
 
 The owner reversed the deferral of 2026-11-17 and adopted cargo-nextest, pinned

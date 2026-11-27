@@ -545,4 +545,267 @@ mod tests {
         drop(write);
         storage.close().await.unwrap();
     }
+    #[tokio::test]
+    async fn reconciled_commit_clears_shared_ioerr_streak_before_the_next_request() {
+        let (_root, data) = crate::sqlite::test_data();
+        let mut commits = 0;
+        let storage = SqliteStorage::open(
+            Arc::new(data),
+            StorageOptions {
+                writer_commit_probe: Some(Box::new(move |tx| {
+                    commits += 1;
+                    if commits == 1 {
+                        tx.execute_batch("COMMIT").unwrap();
+                    }
+                    Some(Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(10),
+                        None,
+                    )))
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let mut first = storage.retained_write(owner(), store::Lane::Events, None);
+        let answer = first
+            .attempt(Box::new(move |unit| {
+                count.fetch_add(1, Ordering::SeqCst);
+                unit.create(team("reconciled")).map(|_| ())
+            }))
+            .await
+            .unwrap();
+        assert_eq!(answer.outcome, WriteOutcome::Unknown);
+        assert!(!answer.retryable());
+        assert!(first.receive().await.is_err(), "one terminal receipt");
+        assert!(
+            first
+                .reconcile(|snapshot| async move {
+                    Ok(snapshot
+                        .get(EntityKind::Team, "reconciled")
+                        .await?
+                        .is_some())
+                })
+                .await
+                .unwrap()
+        );
+        assert_eq!(first.episode.snapshot().0, WriteOutcome::Committed);
+        assert!(!storage.failure_state().claims_suppressed());
+        assert!(
+            first
+                .attempt(Box::new(|_| panic!("known commit replayed")))
+                .await
+                .is_err()
+        );
+        let mut second = storage.retained_write(owner(), store::Lane::Entities, None);
+        let count = calls.clone();
+        let answer = second
+            .attempt(Box::new(move |unit| {
+                count.fetch_add(1, Ordering::SeqCst);
+                unit.create(team("rolled-back")).map(|_| ())
+            }))
+            .await
+            .unwrap();
+        assert_eq!(answer.outcome, WriteOutcome::RolledBack);
+        assert_eq!(answer.retry_code, Some(RetryCode::Io));
+        assert!(
+            answer.retryable(),
+            "reconciliation must end the prior IOERR streak"
+        );
+        assert!(storage.failure_state().failure().is_none());
+        assert!(second.receive().await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            storage
+                .read(owner())
+                .await
+                .unwrap()
+                .get(EntityKind::Team, "rolled-back")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(second);
+        drop(first);
+        storage.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn authoritative_absence_releases_an_unknown_token_after_its_original_deadline() {
+        let (_root, data) = crate::sqlite::test_data();
+        let mut once = true;
+        let storage = SqliteStorage::open(
+            Arc::new(data),
+            StorageOptions {
+                writer_commit_probe: Some(Box::new(move |tx| {
+                    if !once {
+                        return None;
+                    }
+                    once = false;
+                    // The empty transaction really commits, but its acknowledgement
+                    // is lost. The durable operation identity is authoritatively absent.
+                    tx.execute_batch("COMMIT").unwrap();
+                    Some(Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(10),
+                        None,
+                    )))
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let deadline = Instant::now() - Duration::from_secs(1);
+        let mut write = storage.retained_write(owner(), store::Lane::Events, Some(deadline));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let receipt = storage.owner.writer.submit_at_test_time(
+            write.episode.clone(),
+            deadline - Duration::from_secs(1),
+            move |tx| {
+                count.fetch_add(1, Ordering::SeqCst);
+                assert!(!tx.is_autocommit());
+                Ok(())
+            },
+        );
+        // Seed only admission with a synthetic clock; consume the actual worker
+        // receipt through the retained Storage boundary, exactly as attempt does.
+        write.may_submit = false;
+        write.pending = Some(tokio::task::spawn_blocking(move || receipt.wait()));
+        let answer = write.receive().await.unwrap();
+        assert_eq!(answer.outcome, WriteOutcome::Unknown);
+        assert!(!answer.retryable());
+        assert!(write.receive().await.is_err(), "one terminal receipt");
+        assert!(
+            write
+                .attempt(Box::new(|_| panic!("unknown replayed")))
+                .await
+                .is_err()
+        );
+
+        // Queue a sentinel, then use a second fixture continuation as a worker
+        // barrier. run() has necessarily checked expiry after the unknown answer
+        // and before this barrier; it must keep the ordinary queue fenced.
+        let ran = Arc::new(AtomicBool::new(false));
+        let seen = ran.clone();
+        let mut queued = storage.retained_write(owner(), store::Lane::Maintenance, None);
+        let mut waiting = Box::pin(queued.attempt(Box::new(move |unit| {
+            seen.store(true, Ordering::SeqCst);
+            unit.create(team("after-absence")).map(|_| ())
+        })));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        let barrier = storage.owner.writer.submit_at_test_time(
+            Episode::new(storage.owner.shared.state.clone(), None),
+            Instant::now(),
+            |_| {
+                Err::<(), _>(SqliteError::Store(StoreError::InvalidEvents(
+                    "barrier".into(),
+                )))
+            },
+        );
+        assert!(
+            tokio::task::spawn_blocking(move || barrier.wait())
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            storage.failure_state().claims_suppressed(),
+            "unknown remains fenced past deadline"
+        );
+        assert!(!ran.load(Ordering::SeqCst));
+        assert!(
+            !write
+                .reconcile(|snapshot| async move {
+                    Ok(snapshot
+                        .get(EntityKind::Team, "absent-operation")
+                        .await?
+                        .is_some())
+                })
+                .await
+                .unwrap()
+        );
+        assert_eq!(write.episode.snapshot().0, WriteOutcome::RolledBack);
+        // No producer resubmission or Drop: the idle worker must now observe
+        // reconcile(false)'s phase and retire this live expired registration.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), &mut waiting)
+                .await
+                .expect("worker did not retire reconciled token")
+                .unwrap()
+                .result
+                .is_ok()
+        );
+        drop(waiting);
+        assert!(!storage.failure_state().claims_suppressed());
+        let answer = write
+            .attempt(Box::new(|_| panic!("original deadline renewed")))
+            .await
+            .unwrap();
+        assert_eq!(answer.outcome, WriteOutcome::NotStarted);
+        assert!(!answer.retryable());
+        assert!(answer.result.is_err());
+        assert!(write.receive().await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(write);
+        drop(queued);
+        assert!(
+            !storage.failure_state().claims_suppressed(),
+            "Drop after retirement is idempotent"
+        );
+        storage.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn dropping_a_live_unknown_token_releases_queued_work_without_replay() {
+        let (_root, data) = crate::sqlite::test_data();
+        let mut once = true;
+        let storage = SqliteStorage::open(
+            Arc::new(data),
+            StorageOptions {
+                writer_commit_probe: Some(Box::new(move |tx| {
+                    if !once {
+                        return None;
+                    }
+                    once = false;
+                    tx.execute_batch("COMMIT").unwrap();
+                    Some(Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(10),
+                        None,
+                    )))
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let mut write = storage.retained_write(owner(), store::Lane::Events, None);
+        let answer = write
+            .attempt(Box::new(move |unit| {
+                count.fetch_add(1, Ordering::SeqCst);
+                unit.create(team("drop-control")).map(|_| ())
+            }))
+            .await
+            .unwrap();
+        assert_eq!(answer.outcome, WriteOutcome::Unknown);
+        assert!(write.receive().await.is_err());
+        assert!(storage.failure_state().claims_suppressed());
+        let mut queued = storage.retained_write(owner(), store::Lane::Maintenance, None);
+        let mut waiting =
+            Box::pin(queued.attempt(Box::new(|unit| unit.create(team("after-drop")).map(|_| ()))));
+        assert!(futures::poll!(&mut waiting).is_pending());
+        drop(write);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), &mut waiting)
+                .await
+                .expect("Drop did not release worker")
+                .unwrap()
+                .result
+                .is_ok()
+        );
+        drop(waiting);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!storage.failure_state().claims_suppressed());
+        drop(queued);
+        storage.close().await.unwrap();
+    }
 }
