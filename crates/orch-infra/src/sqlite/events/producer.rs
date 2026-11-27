@@ -439,6 +439,12 @@ pub struct EventProducer {
 }
 
 impl EventProducer {
+    /// Lets receipt-order tests block the real capacity refund.
+    #[cfg(test)]
+    pub(super) fn hold_queue(&self) -> impl Drop + '_ {
+        self.shared.queue()
+    }
+
     pub fn new(storage: SqliteStorage, options: EventProducerOptions) -> Self {
         let shared = Arc::new(Shared {
             queue: Mutex::new(Queue::default()),
