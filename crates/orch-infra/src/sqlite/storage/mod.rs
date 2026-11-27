@@ -1,4 +1,6 @@
 //! Owned SQLite storage composition. The daemon continues using files until T24.
+#[cfg(test)]
+mod containment_tests;
 mod page;
 #[cfg(test)]
 mod page_tests;
@@ -46,9 +48,13 @@ pub struct StorageOptions {
     pub clock: Arc<dyn Clock>,
     #[cfg(test)]
     pub(crate) reader_setup: Option<ReaderSetup>,
+    #[cfg(test)]
+    pub(crate) writer_setup: Option<WriterSetup>,
 }
 #[cfg(test)]
 type ReaderSetup = Box<dyn Fn(&mut rusqlite::Connection) + Send>;
+#[cfg(test)]
+type WriterSetup = Box<dyn FnOnce(&mut rusqlite::Connection) + Send>;
 impl Default for StorageOptions {
     fn default() -> Self {
         Self {
@@ -60,6 +66,8 @@ impl Default for StorageOptions {
             clock: Arc::new(crate::clock::SystemClock),
             #[cfg(test)]
             reader_setup: None,
+            #[cfg(test)]
+            writer_setup: None,
         }
     }
 }
@@ -194,6 +202,14 @@ impl SqliteStorage {
                         options.writer_capacity,
                         state,
                     )?;
+                    #[cfg(test)]
+                    let writer = {
+                        let mut writer = writer;
+                        if let Some(setup) = options.writer_setup {
+                            setup(writer.connection_for_test());
+                        }
+                        writer
+                    };
                     let (reads, requests) = mpsc::sync_channel(options.read_connections);
                     let requests = Mutex::new(requests);
                     std::thread::scope(|scope| {
@@ -296,6 +312,7 @@ fn public_result<T>(state: &FailureState, result: store::Result<T>) -> store::Re
     port(state.ensure_available())?;
     result
 }
+const SNAPSHOT_CALL_CAPACITY: usize = 16;
 type RetiredReply = Box<dyn FnOnce() + Send>;
 type ReadJob = Box<dyn FnOnce(&ReadView<'_, '_>, &mut Option<RetiredReply>) -> Result<()> + Send>;
 struct OpenRead {
@@ -477,7 +494,7 @@ impl Storage for SqliteStorage {
     async fn read(&self, caller: Caller) -> store::Result<Box<dyn ReadSnapshot>> {
         port(self.owner.shared.readable())?;
         let observed = self.owner.shared.state.fatal_observations();
-        let (commands, receiver) = mpsc::sync_channel(16);
+        let (commands, receiver) = mpsc::sync_channel(SNAPSHOT_CALL_CAPACITY);
         let (ready, answer) = oneshot::channel();
         let deadline = Instant::now() + Duration::from_millis(200);
         let request = OpenRead {
@@ -490,23 +507,24 @@ impl Storage for SqliteStorage {
             .reads
             .try_send(request)
             .map_err(|_| backend("overloaded"))?;
-        let answer = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), answer)
-            .await
-            .map_err(|_| backend("overloaded"))?;
+        let answer =
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), answer).await;
+        // Include queued admission and pinning in the request's original
+        // baseline. ReadPool has classified any pin failure before this reply.
+        port(self.owner.shared.refuse_fresh_fatal(observed))?;
+        let answer = answer.map_err(|_| backend("overloaded"))?;
         port(answer.map_err(|_| backend("SQLite reader closed"))?)?;
         Ok(Box::new(Snapshot {
             owner: self.owner.clone(),
             caller,
             commands,
-            capacity: Arc::new(Semaphore::new(16)),
+            capacity: Arc::new(Semaphore::new(SNAPSHOT_CALL_CAPACITY)),
             observed,
         }))
     }
     async fn write(&self, caller: Caller, lane: store::Lane, work: WriteWork) -> store::Result<()> {
         port(self.owner.shared.available())?;
         let shared = self.owner.shared.clone();
-        let panic = Arc::new(Mutex::new(None));
-        let callback_panic = panic.clone();
         let lane = match lane {
             store::Lane::Claims => super::Lane::Claims,
             store::Lane::Entities => super::Lane::Entities,
@@ -524,25 +542,24 @@ impl Storage for SqliteStorage {
             Some(Instant::now() + budget),
             move |tx| {
                 let mut unit = Unit::new(tx, &caller, &shared);
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&mut unit))) {
-                    Ok(Ok(())) => unit.ensure_committable(),
-                    Ok(Err(error)) => Err(SqliteError::Store(error)),
-                    Err(payload) => {
-                        *callback_panic
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload);
-                        Err(SqliteError::TransactionAborted)
-                    }
-                }
+                // The approved catch contains only the user's invocation.
+                // Unit construction/Clock and completion remain adapter code.
+                super::writer::contain::contain(&shared.state, || {
+                    work(&mut unit).map_err(SqliteError::Store)
+                })?;
+                unit.ensure_committable()
             },
         ))?;
         let result = tokio::task::spawn_blocking(move || receipt.wait())
             .await
             .map_err(|_| backend("SQLite receipt worker failed"))?;
-        if let Some(payload) = panic
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        // A failed outer rollback may wrap the callback error. Recover its
+        // original payload before any public conversion or latch refusal.
+        if let Some(payload) = result
+            .as_ref()
+            .err()
+            .and_then(SqliteError::callback_panic)
+            .and_then(|panic| panic.take())
         {
             std::panic::resume_unwind(payload);
         }
