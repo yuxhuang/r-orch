@@ -2667,6 +2667,7 @@ async fn incomplete_callback_ioerr_recovery(hide_rollback: bool, failures: u64) 
     }));
     let fx = fixture_with(options);
     let batch = fx.batch("p", "ioerr", 1..=3).await;
+    let rejected_after_failure = batch.clone();
     let producer = fx.producer();
     armed.store(true, Ordering::SeqCst);
     let answer = answered(producer.submit(batch).unwrap()).await;
@@ -2702,6 +2703,15 @@ async fn incomplete_callback_ioerr_recovery(hide_rollback: bool, failures: u64) 
     );
     producer.flush().await;
     assert_eq!(producer.retained(), (0, 0, 0));
+    if failures == 2 {
+        assert!(
+            matches!(
+                producer.submit(rejected_after_failure),
+                Err(Rejected::Closed(..))
+            ),
+            "the fatal noncommit must close intake immediately"
+        );
+    }
     producer.close().await;
 }
 
