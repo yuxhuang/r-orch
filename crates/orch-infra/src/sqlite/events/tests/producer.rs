@@ -2410,3 +2410,101 @@ fn encoded_input_stays_charged_while_cancelled_reconciliation_still_reads() {
         .block_on(fx.storage.close())
         .unwrap();
 }
+
+// Regression: #436 / RM2. Sending a known answer before taking the queue
+// mutex must be observable even when an uncontended refund would be very fast.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn known_success_receipt_waits_for_blocked_capacity_refund() {
+    let mut fx = fixture();
+    let batch = fx.batch("p", "blocked-refund", 1..=1).await;
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let entered = Mutex::new(Some(entered));
+    let (release, blocked) = mpsc::sync_channel(1);
+    let blocked = Mutex::new(blocked);
+    fx.options.observer = Some(Arc::new(move |_| {
+        entered.lock().unwrap().take().unwrap().send(()).unwrap();
+        blocked.lock().unwrap().recv_timeout(SAFETY).unwrap();
+    }));
+    let producer = Arc::new(fx.producer());
+    let submission = producer.submit(batch).unwrap();
+    tokio::time::timeout(SAFETY, observed)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Own the sync guard on a blocking thread, never across an async await.
+    // The observer cannot finish until this thread holds the real queue lock.
+    let holder = Arc::clone(&producer);
+    let (locked, held) = tokio::sync::oneshot::channel();
+    let (unlock, unlock_rx) = mpsc::sync_channel(1);
+    let lock_task = tokio::task::spawn_blocking(move || {
+        let guard = holder.hold_queue();
+        locked.send(()).unwrap();
+        unlock_rx.recv_timeout(SAFETY).unwrap();
+        drop(guard);
+    });
+    tokio::time::timeout(SAFETY, held).await.unwrap().unwrap();
+    release.send(()).unwrap();
+    tokio::pin!(submission);
+    // A bounded negative observation: a send-before-refund mutant can answer
+    // during this interval; the correct implementation cannot acquire the lock.
+    let early = tokio::time::timeout(Duration::from_millis(500), &mut submission).await;
+    // Release and join before asserting, including when the mutant answers early.
+    unlock.send(()).unwrap();
+    lock_task.await.unwrap();
+    assert!(
+        early.is_err(),
+        "known receipt arrived while its refund was blocked"
+    );
+    assert_eq!(
+        tokio::time::timeout(SAFETY, &mut submission)
+            .await
+            .unwrap()
+            .unwrap(),
+        counts(1, 0)
+    );
+    assert_eq!(producer.retained(), (0, 0, 0));
+    Arc::try_unwrap(producer)
+        .unwrap_or_else(|_| panic!("the queue holder still owns the producer"))
+        .close()
+        .await;
+}
+
+// Regression: #436 / RM4. A current-thread runtime hides an early failure
+// answer by finishing the producer's refund before it polls the caller again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn known_invalid_sequence_receipt_returns_exact_capacity() {
+    let mut fx = fixture();
+    let mut batch = fx.batch("p", "invalid-refund", 1..=2).await;
+    batch.events[1].seq = 0;
+    fx.options.byte_limit = accounted_bytes(&batch);
+    let producer = fx.producer();
+    for round in 0..1000 {
+        // No yield, flush or retry between the last known answer and this
+        // exact-capacity refill: Full is a receipt-order contract violation.
+        let submission = producer.submit(batch.clone()).unwrap_or_else(|error| {
+            panic!("round {round}: known receipt did not return exact capacity: {error:?}")
+        });
+        let failure = answered(submission).await.unwrap_err();
+        assert!(
+            matches!(failure.error, StoreError::InvalidEvents(_)),
+            "{failure:?}"
+        );
+        assert_eq!(
+            (
+                failure.committed,
+                failure.not_stored,
+                failure.outcome_unknown
+            ),
+            (counts(0, 0), 2, false),
+            "round {round}: invalid sequence must have a known refusal"
+        );
+        assert_eq!(
+            producer.retained(),
+            (0, 0, 0),
+            "round {round}: known receipt preceded refund"
+        );
+    }
+    assert!(fx.stored("p", "invalid-refund").await.is_empty());
+    producer.close().await;
+}
