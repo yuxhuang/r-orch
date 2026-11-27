@@ -1333,3 +1333,118 @@ async fn public_snapshot_fanout_waits_for_the_production_capacity() {
         "public snapshot calls were refused: {failures:?}"
     );
 }
+
+#[tokio::test]
+async fn logical_refusal_after_fresh_fatal_retires_the_snapshot() {
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(Arc::new(data), StorageOptions::default()).unwrap();
+    let snapshot = worker_snapshot(&storage).await;
+    let state = storage.failure_state();
+    let before = state.fatal_observations();
+    let error = snapshot
+        .call::<()>(move |_| {
+            // Preserve a real structured observation before the logical Store error.
+            state.observe(FailureSource::Checkpoint, &corrupt_error());
+            Err(SqliteError::Store(StoreError::InvalidCursor))
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("storage_unavailable"), "{error}");
+    assert!(storage.failure_state().fatal_observations() > before);
+    assert_eq!(
+        storage.failure_state().failure().unwrap().source,
+        FailureSource::Checkpoint
+    );
+    let later = snapshot.call(|_| Ok(())).await.unwrap_err();
+    assert!(later.to_string().contains("snapshot_expired"), "{later}");
+    storage.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stopped_snapshot_is_refused_after_waiting_for_a_permit() {
+    use std::sync::atomic::AtomicUsize;
+    let (_temp, data) = crate::sqlite::test_data();
+    let storage = SqliteStorage::open(Arc::new(data), StorageOptions::default()).unwrap();
+    let snapshot = worker_snapshot(&storage).await;
+    let held = snapshot
+        .capacity
+        .clone()
+        .acquire_many_owned(SNAPSHOT_CALL_CAPACITY as u32)
+        .await
+        .unwrap();
+    let ran = Arc::new(AtomicUsize::new(0));
+    let seen = ran.clone();
+    let mut call = Box::pin(snapshot.call(move |_| {
+        seen.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }));
+    std::future::poll_fn(|cx| {
+        assert!(
+            call.as_mut().poll(cx).is_pending(),
+            "must wait for capacity"
+        );
+        std::task::Poll::Ready(())
+    })
+    .await;
+    storage.owner.shared.stop();
+    drop(held);
+    let error = call.await.unwrap_err();
+    assert!(
+        error.to_string().contains("SQLite writer is closed"),
+        "must refuse before enqueue: {error}"
+    );
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn expiry_inside_pool_refuses_before_the_schema_pin() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::sync::atomic::AtomicUsize;
+    let (_temp, data) = crate::sqlite::test_data();
+    let pins = Arc::new(AtomicUsize::new(0));
+    let seen = pins.clone();
+    let storage = SqliteStorage::open(
+        Arc::new(data),
+        StorageOptions {
+            read_connections: 1,
+            // Advance only the final pin-time check. The queued open remains live.
+            pin_now: Some(Arc::new(|| Instant::now() + Duration::from_secs(7200))),
+            reader_setup: Some(Box::new(move |connection| {
+                let seen = seen.clone();
+                connection
+                    .authorizer(Some(move |ctx: AuthContext<'_>| {
+                        if matches!(ctx.action, AuthAction::Read { .. }) {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Authorization::Allow
+                    }))
+                    .unwrap();
+            })),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (_commands, receiver) = mpsc::sync_channel(SNAPSHOT_CALL_CAPACITY);
+    let (ready, answer) = oneshot::channel();
+    storage
+        .owner
+        .reads
+        .try_send(OpenRead {
+            caller: owner(),
+            deadline: Instant::now() + Duration::from_secs(3600),
+            commands: receiver,
+            ready,
+        })
+        .unwrap_or_else(|_| panic!("live admission"));
+    assert!(matches!(
+        answer.await.unwrap(),
+        Err(SqliteError::Overloaded)
+    ));
+    assert_eq!(
+        pins.load(Ordering::SeqCst),
+        0,
+        "expired view must never pin"
+    );
+    storage.close().await.unwrap();
+}
