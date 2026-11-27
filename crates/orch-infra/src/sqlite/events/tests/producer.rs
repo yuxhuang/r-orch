@@ -239,7 +239,11 @@ async fn waiting_event_batches_share_one_transaction() {
     );
     assert_eq!(reports[1].events, 12);
     assert_eq!(reports[1].accounting.rows, 12);
-    assert!(!reports[1].accounting.over_bound);
+    assert_eq!(
+        reports[1].accounting.over_bound,
+        reports[1].accounting.work > Duration::from_millis(20),
+        "the signed accounting includes actual COMMIT time, even for a small planned transaction"
+    );
     assert_eq!(
         fx.stored("p", "run-1").await,
         (1..=6).map(event).collect::<Vec<_>>()
