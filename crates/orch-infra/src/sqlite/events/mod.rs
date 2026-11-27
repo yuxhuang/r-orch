@@ -29,7 +29,9 @@
 //! Sequence numbers and gap ranges must fit a SQLite integer, so one above
 //! `i64::MAX` is refused as invalid, and a read after such a number is empty.
 //!
-//! Registered for normal builds, but not wired into `Storage` or the daemon.
+//! Registered for normal builds, but not wired into `Storage` or the daemon. The
+//! one exception is the producer (`producer`), which submits through the public
+//! retained-write API of `SqliteStorage` and is exported for the collector.
 
 use crate::blob::{BlobError, BlobHash, DiskBlobStore, Placement, placement};
 use orch_core::store::events::{AppendResult, EventGap, PruneResult, SequencedEvent};
@@ -491,5 +493,10 @@ fn unsigned(value: i64, what: &str) -> Result<u64> {
 mod tests;
 
 mod adapter;
+mod producer;
 
 pub(super) use adapter::execution;
+pub use producer::{
+    EventBatch, EventProducer, EventProducerOptions, Rejected, Submission, SubmitFailure,
+    TransactionReport,
+};
