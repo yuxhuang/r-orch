@@ -855,12 +855,12 @@ change (R49):
 [ADR 0024](../decisions/0024-non-task-cursors.md)). A list of Agent, Team, Run, Message (`Messages` and
 `PendingMessages`), Context, Config, Template or Goal returns a cursor that resumes from the last row's *original
 ordering tuple* and never from the row's state at resume time. Task keeps its own cursor and its issue 277 exception,
-unchanged, and nothing below applies to it. What is written here is the contract. As built, two private slices are on
-`main` and wired to nothing: the inline arm (PR #376, `78846fed8`) and the key-taking entry of the three leaves
-(PR #377, `110002d86`). The table of retained entries and entries by lookup, the binding of a cursor in a page, the
-unfiltered identity scan with its tuple comparison, and the wire into `Storage` do not exist, so no vector has run
-end to end and no SQLite list returns a cursor of these eight families (issue 370; plan "Non-Task cursors", steps 4
-and 5). The test-only file reference and the memory fake already issue cursors for these families.
+unchanged, and nothing below applies to it. What is written here is the contract. As built, three private slices are on
+`main` and wired to nothing: the inline arm (PR #376, `78846fed8`), the key-taking entry of the three leaves
+(PR #377, `110002d86`) and the table of retained entries and entries by lookup, with the unfiltered identity scan and
+its tuple comparison (PR #383). The binding of a cursor in a page and the wire into `Storage` do not exist, so no
+vector has run end to end and no SQLite list returns a cursor of these eight families (issue 370; plan
+"Non-Task cursors", step 5). The test-only file reference and the memory fake already issue cursors for these families.
 
 The owner's words, as the lead recorded them. The answer to the two decisions of the lead's eighth escalation of this
 goal was "d1 approve; d2 - p / all new refusals and 64KiB rule are acceptable" (D2 approves option P for the eight
@@ -924,8 +924,8 @@ owner's live copy and nothing beyond this wording.
   `a_tuple_at_the_capacity_is_inline_and_one_byte_more_is_not` shows, for each of them, that a tuple at the capacity
   (with one-byte and multi-byte characters) is inline and encodes to a token of exactly 512 characters, and that one
   byte more is not inline and would encode to 514 characters, which `Cursor::new` refuses. These tests run at the
-  encoder's own interface; the retained and lookup halves of the boundary vectors need the table of step 4. The table
-  decides the arm.
+  encoder's own interface; the retained and lookup halves of the boundary vectors need the table of step 4 (PR #383), which
+  is built and tested at its own interface, not through a page. The table decides the arm.
 - *What the adapter holds.* The retained entries and the entries by lookup are one table in the adapter's memory. It is
   never written to the database: a list is a read, and a durable entry would turn every long-anchor page into a write
   through the single writer, so a failed writer (R128) would stop reads. An entry records the tuple or its digests, the
@@ -952,8 +952,10 @@ owner's live copy and nothing beyond this wording.
   cannot name a different anchor in a new one. The token is not secret and has no MAC, as for Task: a guessed or edited
   handle that names a live entry of the same binding and sort can only start its holder's own walk at another valid
   position within their own project, filter and sort, and shows no row that a walk from the start does not. As built
-  (PR #376), the encoder issues and resumes the inline token only (version 1). Versions 2 and 3 are reserved for the
-  retained token and the token by lookup and are refused until step 4 reads them. `resume_inline` refuses a token of more
+  (PR #376), the encoder issues and resumes the inline token only (version 1). As built (PR #383), the table issues and
+  resumes versions 2 and 3, the retained token and the token by lookup: 34 raw bytes (version, sort, binding of 16,
+  nonce of 8, handle of 8) and no expiry field, and `resume` checks the length, version, sort, binding and nonce
+  before it reads the table. `resume_inline` refuses a token of more
   than 512 characters before it decodes anything, because a `Cursor` built by deserialization has not been through
   `Cursor::new`, and `issue_inline` refuses a tuple that the request's layout does not admit, because a tuple does not
   remember its layout and one of another layout would otherwise resume as another identity.
@@ -1013,7 +1015,7 @@ owner's live copy and nothing beyond this wording.
 - *Key-taking leaves, as built* (PR #377, `110002d86`; three leaves, crate-private, no `Storage` caller). Each leaf
   defines an `OrderKey`, the original ordering tuple ending with the identity, one shape per ordering; the leaf's
   `key_of(&Record)` (`NativeSelection` and `MessageSelection`) returns the tuple that a page ending on that row records,
-  and that is what the encoder and the table of step 4 will call at issue time. Texts are `Cow<str>` compared as UTF-8
+  and that is what the encoder and the table of step 4 will call at issue time (nothing calls it yet). Texts are `Cow<str>` compared as UTF-8
   bytes, never by characters or locale; integers are `u64` (`attempt` is `u32`).
 
   | Leaf | Shape (the selection that takes it) | Components, in order |
@@ -1050,9 +1052,8 @@ owner's live copy and nothing beyond this wording.
     another shape than the selection's is `InvalidCursor`, decided before any row is read. `key_of`'s identity shape is
     not a family check: it returns the identity of any record, so the caller must already have bound the family (the
     token's digest does that), and `Some(key)` is not evidence that a row is of the requested family.
-  - *Left to the page PR and the table.* Using the encoder's inline token (PR #376, built) in a page and binding it to
-    the validated request, the retained and lookup table, the identity scan and tuple comparison of the lookup arm,
-    authorization of the caller and the derivation of the project from it before any row access, and a bridge from the
+  - *Left to the page PR.* Using the encoder's inline token (PR #376, built) and the table (PR #383, built) in a page and
+    binding them to the validated request, authorization of the caller and the derivation of the project from it before any row access, and a bridge from the
     encoder's `Layout`, `Tuple` and `Component` to each leaf's `OrderKey`. `Layout::compare` of the encoder and each
     leaf's own `cmp_key` are separate implementations of one order. Each is pinned to a hand-written expected order,
     but no test in the tree runs one against the other (a reviewer's local probe agreed on 271,068 pairs and was not
@@ -1090,8 +1091,10 @@ As built, no vector is signed off. PR #376 tests the inline arm at the encoder's
 the inline half of P-B1, I-T1 to I-T4, Q7′, P-S2, P-X2 and C3 for the inline kind, and P-X3. PR #377 tests the leaf
 half of P-F1 and N3b (`cctg`), of P-F2 (`agent_team_run`) and of Q8 (`retry_message::message`): a resume after the
 original tuple, with the anchor out of the filter, in the selecting view. N3a is a comparison of the lookup arm and is
-not tested at all. Each of these vectors, N3a included, stays an obligation of the integrated page PR once the encoder
-and the table of step 4 are wired (issue 370); the record of a vector passing is that PR's receipt.
+not tested at all. PR #383 tests the table at its own interface, with real SQLite identity quartets and a synthetic
+hydrator, and no page; which vectors it covers is that PR's receipt. Each of these vectors, N3a included, stays an
+obligation of the integrated page PR once the encoder and the table of step 4 are wired (issue 370); the record of a
+vector passing is that PR's receipt.
 
 | Vector | Input | Must |
 |---|---|---|
