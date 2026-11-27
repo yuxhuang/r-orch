@@ -132,12 +132,16 @@ reviewed or merged.
 - Each PR gets one independent code review. Add a security review only for untrusted input, file paths,
   authorisation, importer, restore or process spawning. Skip separate per-PR resilience reviews, fact-checks,
   review boards and CI-log verifier tasks.
-- Require green Linux `check` and `test` on the actual merge (`test` may skip for a CI-classified docs-only PR),
-  a `CLEAN` merge state and a short lead recommendation naming the head, base and merge tree.
-- If `main` moves and the unchanged head still merges cleanly, rerun only CI on the new merge. Review the delta
-  when the head changes. Use batch trains for independent PRs. Once #381 lands, CI fails fast on stale merge parents.
-- The supervising session checks each squash and watches the push to `main`. Skip separate landing and
-  terminal-main verifier tasks.
+- Require successful Linux `check` and `test` on the actual merge. Only a CI-classified docs-only PR may skip
+  `test`. The tested merge's first parent must equal the current `origin/main` tip and its tree must equal the
+  expected squash tree. Require a `CLEAN` merge state, applicable closing references and a short lead
+  recommendation naming the PR head, base and merge tree.
+- Whenever `main` advances, run fresh CI on the new merge. An unchanged PR head keeps its review. Review the
+  delta when the head changes. Independent PRs may still use batch trains.
+- The supervising session checks each squash and watches every push to `main`. Once the per-PR requirements
+  hold, the owner may merge while a main push run is still in progress.
+- **Stop on red.** If any job in any main push run fails, stop further merges until the failure is fixed or,
+  for a flaky failure, the supervising session's rerun passes. Skip separate landing and terminal-main verifier tasks.
 - **Rolling deep review.** Review each subsystem’s changes on `main` since its last deep review after about
   10 merged PRs or 10,000 changed lines. A rolling review never blocks a merge. Its only output is GitHub
   issues. File each finding in `yuxhuang/r-orch` and follow `issue-triage-process.md`. Triage assigns priority
@@ -160,7 +164,7 @@ reviewed or merged.
 ### Independent PRs, stacks and trains
 
 - **Base on `main`.** Branch every PR from current `main`. Independent PRs stay independent and are qualified
-  together in a *train*: an ordered batch checked as one combined merge on a draft branch from green `main`, which
+  together in a *train*: an ordered batch checked as one combined merge on a draft branch from current `main`, which
   the owner then merges member by member, in that order. The draft is closed unmerged once `main` has the
   recorded tree.
 - **Stack only for code.** Base a PR on another open PR only when the upper change needs the lower PR's code. Say
