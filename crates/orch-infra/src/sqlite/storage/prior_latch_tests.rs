@@ -36,7 +36,8 @@ fn latch(storage: &SqliteStorage) {
 async fn seeded() -> (tempfile::TempDir, Arc<DataDir>, SqliteStorage) {
     let (temp, data) = crate::sqlite::test_data();
     let data = Arc::new(data);
-    let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+    let storage =
+        SqliteStorage::open(data.clone(), super::tests::without_admission_expiry()).unwrap();
     storage
         .transaction(owner(), Lane::Entities, |u| {
             u.create(team("kept"))?;
