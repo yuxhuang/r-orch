@@ -3068,6 +3068,92 @@ owner, and it is not a latency guarantee.
   `Schedule::pop_allowed(false)`, a gate that skips claims alone and lets the other lanes through, which the worker does
   not use: it shows the episode's suppression flag and not the worker's queue rule.
 
+**One retained producer per writer (issue 448, issue 461 item 5, issue 456; the contract that T16 follows before it wires
+the event producer).** This is read from the source and its tests, not a ruling of the owner, and it is a contract of the
+adapter that a design must change explicitly. It was read on Linux at `77376bc6c` (`main`, after #442) and at `fd81eacc3`,
+the frozen head of the draft PR #459 (tree `b97ab7722`, on `5b382b296`). `writer.rs`, `storage/retained.rs` and
+`events/producer.rs` are byte-identical at the two (`git diff` of the three paths is empty), so every rule below that
+names them holds on `main` today. PR #459 changes `writer/policy.rs` (the module header that states the cardinality, and
+the identity of an episode by its own flag instead of the time of its first failure), `writer/failure.rs` and
+`storage/mod.rs` (the reply of a queued sibling after a fresh fatal read), and tests. Where a sentence below needs #459
+it says so. Nothing here is wired to the daemon, which uses files until T24.
+
+- *Cardinality.* One retained producer per writer, and it is the event producer. `EventProducer::drive`
+  (`events/producer.rs`) opens one `retained_write(.., Lane::Events, None)` per logical transaction and runs one
+  transaction at a time. T16 wires one `EventProducer` for each `SqliteStorage`. The type does not enforce it:
+  `EventProducer::new(storage, options)` can be called twice on one storage, and two producers would be two retained
+  producers. The wiring, not the type, holds the rule until T16 adds a construction that cannot be doubled (the plan's
+  "One retained producer per writer"). `Storage::write` makes a `RetainedWrite` of its own and submits it once, and the
+  event adapter's `write`, `write_async` and `prune` submit one `Writer::submit` job; none of them rebuilds, so none of
+  them is a producer. A design with a second producer (a second owner of a retained write that rebuilds after a
+  rollback) is a new design: it gives each producer its own slot or a bounded queue, and says what R26's one waiting event
+  transaction, the sixty seconds of R128 and the claim suppression mean for two open episodes.
+- *Why one.* The executor has two single-place structures that a retained rebuild uses. `State::continuation` is an
+  `Option<Job>`: the retained operation's own next submission waits there, ahead of the queue, for the worker. And
+  `Schedule::admits` refuses an `Events` request while any `Events` entry is queued (R26: at most one waiting event
+  transaction), and refuses any request while the queue holds `capacity` entries.
+- *What a refusal is, and when `prepare` runs.* `WriterHandle::submit_episode` runs in this order: `ensure_available`
+  (a latched writer is refused here with its latch); `Episode::prepare()`; a second `ensure_available` and the
+  `accepting` check under the queue lock (`WriterClosed`); then, for an episode that is registered as retrying, the
+  continuation slot (`Overloaded` when it holds a job, otherwise the job is stored there and runs next), or, for any
+  other episode, `Schedule::admits` (`Overloaded` when it fails, otherwise the job is queued). A refusal creates no receipt,
+  runs no callback, latches nothing and leaves the registration of the episode (its `since`, its `active` flag, its
+  backoff delay and its deadline) as it was. `prepare` has already run: it sets the episode's outcome and its registered
+  phase to `NotStarted`, its code to none, its accounting to zero and `commit_attempted` to false. A refused submission
+  therefore is not "nothing happened" for these four fields.
+- *Retry eligibility.* `RetainedWrite::attempt_unit` answers a refusal with the error and no `WriteAttempt`, so
+  `retryable()` is not consulted: the rule of `retryable()` (a confirmed `RolledBack` or `NotStarted` outcome with a retryable
+  code and a nonterminal answer) applies only to an attempt that ran. After `Overloaded` at admission the token keeps
+  `may_submit` when it has no deadline or its deadline is still ahead, and the episode stays registered; a refusal that
+  leaves the deadline passed, or any other error, finishes the episode. The word is not one thing: `overloaded` at
+  admission leaves the token usable, and `overloaded` in a receipt (the deadline passed while the job was queued) is a
+  terminal answer of an attempt that the writer withdrew and will never commit. The producer tells them apart by where
+  the answer comes from: its `attempt_unit` error arm sees only admission errors (and a latch), and treats `overloaded`
+  with no failure latched as pressure: it waits 25 ms, doubling to 250 ms, and submits the same input again, with no limit
+  on the count (`ADMISSION_WAIT`, `ADMISSION_WAIT_MAX`). What bounds the wait is the episode: a registered episode that
+  gets no commit for sixty seconds latches `RetryWithoutCommit`, which only a restart ends; an episode that was never
+  registered (its first submission was refused at the lane) has no bound of its own, and has taken nothing from anyone.
+  The producer's deadline is `None`, so `check_retry_timeout` never withdraws its episode; a retained write that is given a
+  deadline is withdrawn at it once its last outcome is a known noncommit, and a refusal after `prepare` leaves that outcome
+  `NotStarted`.
+- *The occupied slot, measured.* At `fd81eacc3` a throwaway test (not kept; the plan's "One retained producer per writer"
+  lists it) registered an episode that had a 200 ms deadline, a COMMIT reached and an unknown outcome, and a second
+  registered episode in the slot. Before a reconciliation the unknown episode is fenced: `check_retry_timeout` after the
+  deadline kept it registered. After the outcome was set to `RolledBack`, as `reconcile(false)` does, a resubmission was
+  refused `Overloaded`; the episode's snapshot then read `(NotStarted, None, zero accounting)`, `commit_attempted` was false and
+  it was still registered; after the deadline it was withdrawn and the other episode kept the claims suppressed. The
+  permanent test `a_second_retained_rebuild_is_refused_until_the_continuation_slot_is_taken` (`sqlite::writer::tests`, added by
+  #459) shows the refusal and the resubmission at the writer, with two episodes that fail at one instant. The review of #459
+  found it a characterization of the one-slot behaviour and not the regression test of the identity fix, which two tests of
+  `writer::policy::tests` pin (the PR's description says the same). The reuse of a `RetainedWrite` token
+  after such a refusal is still untested at the token. The first-submission refusal at the lane is tested through the producer
+  (`an_admission_the_writer_refuses_is_kept_and_committed_later`).
+- *The uncertain COMMIT boundary (issue 456; issue 461 item 5).* An unknown COMMIT is fenced by three things that
+  stand together: the attempt's outcome is `Unknown`, which `rebuild` excludes, so `may_submit` is false and the token's
+  `unknown` is set; `attempt_unit` refuses a new submission with "write requires its prior receipt or outcome
+  reconciliation" before `submit_episode` is called; and the registered phase `Unknown` stops `check_retry_timeout` from
+  withdrawing the episode at its deadline. Only `reconcile` or `reconcile_encoded` ends it: `true` is a known commit and
+  finishes the episode; `false` records `RolledBack` and sets `may_submit` when the original code was retryable and no
+  failure is latched. So `prepare` never runs over an unreconciled `Unknown`, and a refusal after `prepare` cannot turn an
+  uncertain COMMIT into a known noncommit. The statement of issue 461 item 5, that a refused resubmission of a
+  retained episode "whose earlier COMMIT outcome was unknown" is no longer retryable contention because the episode may
+  be withdrawn at its deadline, is true only after a reconciliation has established absence: the outcome was then already a
+  known noncommit, `prepare` only restates it as `NotStarted`, and the deadline rule applies as to any known noncommit (the
+  probe above is that case). `commit_attempted` is per attempt: the executor sets it when it issues COMMIT, `prepare`
+  clears it for every submission, and `reconcile_encoded` reads it to refuse a reading of a callback that never reached COMMIT
+  (an empty expected set or rows that were already there) as a commit. It answers false without reading the database in
+  that case. Two things are not as safe as that sounds. First, no permanent test pins the reset: at `fd81eacc3`, with the line
+  `p.commit_attempted = false;` removed from `prepare`, the 136 tests of `sqlite::writer`, `sqlite::storage::retained` and
+  `sqlite::events::tests::producer` still pass, which is the survivor that issue 456 reports as M2; its tests, and those
+  of the closure of intake after two uncertain commits (M6, M7), are the fix of issue 456, not on `main`. Second, the generic
+  `RetainedWrite::reconcile` has no `commit_attempted` guard; only `reconcile_encoded` has (issue 456 N1). The event
+  producer uses the guarded one, and a first production caller of the generic one must add the guard or an equivalent
+  enforced precondition before it ships.
+- *Not covered by this contract.* A queued sibling of a pinned read snapshot (issue 448 C) is a reader matter and is
+  in #459 and the spec's "Reader snapshots on SQLite". The three writer cleanups that #459 split off (issue 457) change no
+  contract here. Issue 461 items 1, 2 and 4 (a test of the fresh-fatal baseline, a softened comment, the vestigial queue in a
+  test) are test and comment work that follows #459 and changes no sentence above.
+
 **As built: the event producer (issue 127, T16's first slice, record P item 2; a development input, not the T10 freeze).**
 `EventProducer` (`crates/orch-infra/src/sqlite/events/producer.rs`, exported from `orch_infra::sqlite`) is the first caller of
 the retained write. It exists on the integrated development head `07fecf1ed` as the commit `9b55edbf4` on the writer of
@@ -3193,7 +3279,8 @@ a development input like the first: it is not the T10 freeze and is not accepted
   budget in either case, and an episode is bounded by the sixty seconds and the latches of R128. After a confirmed noncommit
   with a retryable cause it builds the same transaction again from the retained input as a new request of the same episode.
   An `overloaded` that the writer's queue gives at admission ran nothing, and the submission is tried again after 25 ms,
-  doubling to 250 ms, without a limit. Another failure while the writer has not failed answers one batch: a coalesced
+  doubling to 250 ms, without a limit ("One retained producer per writer", above, says what that refusal is, what bounds it
+  and why the producer is the only retained producer). Another failure while the writer has not failed answers one batch: a coalesced
   transaction is planned again with its first batch alone. The producer's write is one logical operation of the writer, so
   while it has an episode open the rule of "While one logical operation is retained" holds for it: the worker takes no job
   of another lane except the producer's own next submission, and a request of another lane waits (or is answered
