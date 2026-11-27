@@ -855,8 +855,12 @@ change (R49):
 [ADR 0024](../decisions/0024-non-task-cursors.md)). A list of Agent, Team, Run, Message (`Messages` and
 `PendingMessages`), Context, Config, Template or Goal returns a cursor that resumes from the last row's *original
 ordering tuple* and never from the row's state at resume time. Task keeps its own cursor and its issue 277 exception,
-unchanged, and nothing below applies to it. What is written here is the contract; no code implements it yet and no
-vector below has run.
+unchanged, and nothing below applies to it. What is written here is the contract. As built, two private slices are on
+`main` and wired to nothing: the inline arm (PR #376, `78846fed8`) and the key-taking entry of the three leaves
+(PR #377, `110002d86`). The table of retained entries and entries by lookup, the binding of a cursor in a page, the
+unfiltered identity scan with its tuple comparison, and the wire into `Storage` do not exist, so no vector has run
+end to end and no SQLite list returns a cursor of these eight families (issue 370; plan "Non-Task cursors", steps 4
+and 5). The test-only file reference and the memory fake already issue cursors for these families.
 
 The owner's words, as the lead recorded them. The answer to the two decisions of the lead's eighth escalation of this
 goal was "d1 approve; d2 - p / all new refusals and 64KiB rule are acceptable" (D2 approves option P for the eight
@@ -913,9 +917,15 @@ owner's live copy and nothing beyond this wording.
   | Goals, `created_at` | `created_at`, `position`, identity | 221 |
   | Messages, default | `created_at`, `position`, identity | 221 |
 
-  The figures are derived from the Task token's constants (`HEADER`, `MAX_RAW`) and have not been checked against an
-  encoding, because no encoder exists. The change that lands the encoder confirms or corrects this table in the same
-  PR. The table decides the arm, and the boundary vectors test it.
+  The figures follow from the Task token's constants (`HEADER` 26, `MAX_RAW` 256): 256 − 26 − 8*k* − *t*. As built,
+  the encoder (`crates/orch-infra/src/sqlite/non_task_cursor`, PR #376, `78846fed8`) confirms all nine rows and the
+  table needed no correction. The test `the_capacity_table_of_the_spec_is_what_the_layouts_derive` compares 24 list
+  and sort rows (every sort `id` and each other order the table names) with `Layout::inline_capacity`, and
+  `a_tuple_at_the_capacity_is_inline_and_one_byte_more_is_not` shows, for each of them, that a tuple at the capacity
+  (with one-byte and multi-byte characters) is inline and encodes to a token of exactly 512 characters, and that one
+  byte more is not inline and would encode to 514 characters, which `Cursor::new` refuses. These tests run at the
+  encoder's own interface; the retained and lookup halves of the boundary vectors need the table of step 4. The table
+  decides the arm.
 - *What the adapter holds.* The retained entries and the entries by lookup are one table in the adapter's memory. It is
   never written to the database: a list is a read, and a durable entry would turn every long-anchor page into a write
   through the single writer, so a failed writer (R128) would stop reads. An entry records the tuple or its digests, the
@@ -941,7 +951,12 @@ owner's live copy and nothing beyond this wording.
   does for Task). The nonce is random and made when the adapter is built, so a handle from an earlier process
   cannot name a different anchor in a new one. The token is not secret and has no MAC, as for Task: a guessed or edited
   handle that names a live entry of the same binding and sort can only start its holder's own walk at another valid
-  position within their own project, filter and sort, and shows no row that a walk from the start does not.
+  position within their own project, filter and sort, and shows no row that a walk from the start does not. As built
+  (PR #376), the encoder issues and resumes the inline token only (version 1). Versions 2 and 3 are reserved for the
+  retained token and the token by lookup and are refused until step 4 reads them. `resume_inline` refuses a token of more
+  than 512 characters before it decodes anything, because a `Cursor` built by deserialization has not been through
+  `Cursor::new`, and `issue_inline` refuses a tuple that the request's layout does not admit, because a tuple does not
+  remember its layout and one of another layout would otherwise resume as another identity.
 - *Generation.* The daemon takes a new generation at every start (R41) and a restore takes another (R77). Every
   non-Task cursor therefore ends at a restart, an inline one through its binding and a retained one through the nonce and
   the table. A cursor ends at a restart for Task too, so this is not a new behaviour.
@@ -987,11 +1002,63 @@ owner's live copy and nothing beyond this wording.
 - *Resume from a key, never from a record.* A leaf takes the tuple as the position, compares the candidates with it by
   the leaf's own order, and does no check of the anchor against the filter. The family, the filter and the sort stay
   bound by the token's digest, which replaces the leaf's family check. The composition never passes a stored,
-  synthetic or looked-up record as the anchor; in the lookup arm it takes the tuple from the verified row. As built,
-  the three leaves (`sqlite::agent_team_run`, `sqlite::cctg` and `sqlite::retry_message::message`) take an anchor
-  record and answer `InvalidCursor` for one that the filter refuses. That refusal is withdrawn (pending: the page PR adds
-  a key-taking entry to each leaf), because an anchor that has left the filter alone refuses nothing. The memory
-  and the file reference already resume from a stored key and never read the anchor's row.
+  synthetic or looked-up record as the anchor; in the lookup arm it takes the tuple from the verified row. The
+  memory and the file reference already resume from a stored key and never read the anchor's row. As built (PR #377,
+  `110002d86`), each of the three leaves (`sqlite::agent_team_run`, `sqlite::cctg` and
+  `sqlite::retry_message::message`) has a second page entry, `select_after(query, after, limit)`, that takes the tuple
+  and does not check the anchor against the filter. Its refusal is withdrawn there, because an anchor that has left the
+  filter alone refuses nothing. The record-taking `select` stays, still answers `InvalidCursor` for an anchor that the
+  filter refuses or that is of another family, and now compares through the same code as `select_after`, so the two
+  entries cannot disagree; the page PR retires its use. Nothing calls `select_after` outside the leaves' tests.
+- *Key-taking leaves, as built* (PR #377, `110002d86`; three leaves, crate-private, no `Storage` caller). Each leaf
+  defines an `OrderKey`, the original ordering tuple ending with the identity, one shape per ordering; the leaf's
+  `key_of(&Record)` (`NativeSelection` and `MessageSelection`) returns the tuple that a page ending on that row records,
+  and that is what the encoder and the table of step 4 will call at issue time. Texts are `Cow<str>` compared as UTF-8
+  bytes, never by characters or locale; integers are `u64` (`attempt` is `u32`).
+
+  | Leaf | Shape (the selection that takes it) | Components, in order |
+  |---|---|---|
+  | `agent_team_run` | `Id` (sort `id` of Agent, Team or Run) | identity |
+  | | `AgentPosition` (Agents, default) | `position`, identity |
+  | | `AgentName` (Agents, `name`) | `name`, `position`, identity |
+  | | `TeamCreated` (Teams, default) | `created_at`, identity |
+  | | `TeamName` (Teams, `name`) | `name`, identity |
+  | | `RunStarted` (Runs, no task in the filter, default) | `started_at` (descending), identity |
+  | | `RunAttempt` (Runs, filter names a task, default or `attempt`) | `attempt` (descending), identity |
+  | `cctg` | `Id` (Context, Config, Template in every order; Goal by `id`) | identity |
+  | | `GoalDefault` (Goals, default) | status rank, `updated_at` (an `Option`, newest first, an absent one after every text), `position`, identity |
+  | | `GoalCreated` (Goals, `created_at`) | `created_at`, `position`, identity |
+  | `retry_message::message` | `Id` (sort `id`) | identity |
+  | | `Default` (Messages and `PendingMessages`, default) | `created_at`, `position`, identity |
+
+  - *The tuple names a place, not a row.* The first row returned is the first of the selecting view that sorts strictly
+    after the tuple on the original bytes. The row the tuple came from may be deleted, changed, recreated or may no
+    longer match the filter (a goal achieved under `--status active`, a pending message delivered, a run whose agent
+    changed) and nothing is refused for that; a changed row is returned at its new place if that is after the tuple.
+    Rows whose values did not change are neither skipped nor repeated. Ties (equal `created_at`, `name`, `started_at`,
+    `attempt` or `updated_at`) are decided by the later components, position and then identity, as in the reference.
+  - *Same view.* Hydration and filtering happen in the view the caller passes, a pooled read snapshot or the caller's own
+    writer transaction, as for `select`. `total` counts the rows that match now, before the cursor, as for `select`.
+    The limit is 1 to 1,000.
+  - *What a page reads.* Agent, Team, Run, Context, Config, Template and Goal hydrate every row of the family, each
+    through the usual checks, so one damaged row anywhere fails the page, including a row that sorts before the tuple.
+    Messages hydrate the candidates of the narrowing query only: `PendingMessages` rows with status `pending`, and rows
+    of the recipient for a recipient filter. A damaged message outside that narrowing is not read. The narrowing is a
+    superset and the hydrated original bytes decide, as for `select`; it is not the identity scan of the lookup arm,
+    which must be unfiltered.
+  - *Refusals.* An unsupported family or sort is `InvalidPage`, and the limit is checked before the tuple. A tuple of
+    another shape than the selection's is `InvalidCursor`, decided before any row is read. `key_of`'s identity shape is
+    not a family check: it returns the identity of any record, so the caller must already have bound the family (the
+    token's digest does that), and `Some(key)` is not evidence that a row is of the requested family.
+  - *Left to the page PR and the table.* Using the encoder's inline token (PR #376, built) in a page and binding it to
+    the validated request, the retained and lookup table, the identity scan and tuple comparison of the lookup arm,
+    authorization of the caller and the derivation of the project from it before any row access, and a bridge from the
+    encoder's `Layout`, `Tuple` and `Component` to each leaf's `OrderKey`. `Layout::compare` of the encoder and each
+    leaf's own `cmp_key` are separate implementations of one order. Each is pinned to a hand-written expected order,
+    but no test in the tree runs one against the other (a reviewer's local probe agreed on 271,068 pairs and was not
+    merged), so the page PR keeps an all-shapes equivalence test or unifies them (issue 378). The encoder's module doc
+    (`non_task_cursor/mod.rs`) calls `Layout::compare` "the one definition" of "after the anchor" for the leaves, which
+    is not what is built until then.
 - *The refusals.* A cursor of these eight families is refused, as `InvalidCursor`, only when it is: malformed, or
   bound to another project, generation, family, filter or sort, or to another adapter instance (the nonce); expired by
   the rules of "Time"; no longer held (evicted, or the adapter was stopped and built again); or in the arm by lookup
@@ -1018,6 +1085,13 @@ for all eight families. The references keep every bookmark for ever and neither 
 eviction, nonce and lookup rows are SQLite-only, as the Task long-ID tests are. The ids are those of the design review
 that proposed them. Its first draft's vectors C5 and C6 are replaced by P-L1, P-L2, P-T1, P-T3 and I-T1 to I-T4, and its
 C9 (a resume at the anchor's current row) is withdrawn. A result is a receipt of the PR that carries the test.
+
+As built, no vector is signed off. PR #376 tests the inline arm at the encoder's own interface, with no page: C7 and
+the inline half of P-B1, I-T1 to I-T4, Q7′, P-S2, P-X2 and C3 for the inline kind, and P-X3. PR #377 tests the leaf
+half of P-F1 and N3b (`cctg`), of P-F2 (`agent_team_run`) and of Q8 (`retry_message::message`): a resume after the
+original tuple, with the anchor out of the filter, in the selecting view. N3a is a comparison of the lookup arm and is
+not tested at all. Each of these vectors, N3a included, stays an obligation of the integrated page PR once the encoder
+and the table of step 4 are wired (issue 370); the record of a vector passing is that PR's receipt.
 
 | Vector | Input | Must |
 |---|---|---|
@@ -2202,9 +2276,10 @@ default order itself.
   rollback", so one corrupt row fails the whole page and no partial page is returned), applies the filter, sorts by the
   total order of the table above on the original UTF-8 bytes in Rust, continues after the saved anchor and then limits.
   The page limit is 1 to 1,000. An anchor that is an entity of another one of the four families, or one that the filter
-  refuses, is `InvalidCursor` (pending: the refusal for a filter is withdrawn by "Cursors of the eight families other than
-  Task", which resumes from the anchor's ordering tuple and never from a record, and the page PR adds a key-taking entry
-  to the driver); an anchor that is not an entity of these four families at all is `Unrepresentable`, and a
+  refuses, is `InvalidCursor` for the record-taking `select`, which stays. The refusal is withdrawn for a resume by key,
+  as "Cursors of the eight families other than Task" requires, and the driver now has that entry, `select_after`
+  (PR #377), which takes the ordering tuple and uses no record; the page PR retires its use of `select`. An anchor that is
+  not an entity of these four families at all is `Unrepresentable`, and a
   sort the family lacks (`created_at` on any family but Goal) is `InvalidPage`. The digest of an indirect key finds its
   row and decides no order. An exact lookup by an indirect key checks that the hydrated identity hashes to the stored digest and form, and then returns the record only if its identifier is exactly the bytes asked for: the digest locates a candidate and the requested bytes decide, so a different identifier that shares the locator is not found (`a_lookup_returns_only_the_identifier_that_was_asked_for`; the two are equal unless two texts share one SHA-256). This settles "Open in this section", item 1, for these
   four families by a method that costs one hydration of the family per page; it is correct for the rare large text
