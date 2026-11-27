@@ -910,8 +910,7 @@ fn directly_swallowed_task_move_cleanup_unwind_preserves_router_poison() {
     let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         unit.move_to_end(Family::Task, "kept", Revision::ONE)
     }))
-    .err()
-    .expect("cleanup must unwind")
+    .expect_err("cleanup must unwind")
     .downcast::<crate::sqlite::writer::contain::CleanupUnwind>()
     .expect("typed cleanup unwind");
     assert!(matches!(
