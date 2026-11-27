@@ -58,3 +58,14 @@ retries_v2::retry_suite!(
 mod attention_v2;
 attention_v2::attention_suite!(memory_attention_v2, crate::v2_operations::memory_backend);
 attention_v2::attention_suite!(file_attention_v2, crate::v2_file::operations_backend);
+
+#[path = "storage_contract/v2_sqlite.rs"]
+mod v2_sqlite;
+v2::entity_suite!(sqlite_v2, crate::v2_sqlite::backend);
+events_v2::event_suite!(sqlite_events_v2, crate::v2_sqlite::events_backend);
+v2_operations::operational_suite!(sqlite_operations_v2, crate::v2_sqlite::operations_backend);
+leases_v2::lease_suite!(sqlite_leases_v2, crate::v2_sqlite::operations_backend);
+intents_v2::intent_suite!(sqlite_intents_v2, crate::v2_sqlite::operations_backend);
+request_keys_v2::request_key_suite!(sqlite_request_keys_v2, crate::v2_sqlite::operations_backend);
+retries_v2::retry_suite!(sqlite_retries_v2, crate::v2_sqlite::operations_backend);
+attention_v2::attention_suite!(sqlite_attention_v2, crate::v2_sqlite::operations_backend);

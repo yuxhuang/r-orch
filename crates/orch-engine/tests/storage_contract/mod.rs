@@ -33,6 +33,7 @@ pub const STAMP: &str = "2025-01-01T00:00:00.000Z";
 pub fn task(id: &str) -> Task {
     Task {
         id: id.into(),
+        created_at: STAMP.into(),
         updated_at: STAMP.into(),
         ..make_task()
     }

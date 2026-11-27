@@ -246,3 +246,4 @@ mod non_task_cursor;
     reason = "Storage composition is being qualified before activation"
 )]
 mod storage;
+pub use storage::{SqliteStorage, StorageOptions};
