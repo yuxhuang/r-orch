@@ -1688,3 +1688,25 @@ fn unsafe_commit_failure_is_rolled_back_and_never_replays_callback() {
     );
     assert!(state.failure().is_none());
 }
+
+#[test]
+fn a_known_commit_breaks_the_writer_ioerr_streak_between_requests() {
+    let (_root, data) = test_data();
+    let mut connection =
+        open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    let gate = Gate::install(&mut connection).unwrap();
+    let state = FailureState::new();
+    let now = Instant::now();
+    {
+        let failed = Episode::new(state.clone(), None);
+        failed.failed(RetryCode::Io, now).unwrap();
+    }
+    execute(&mut connection, &gate, &state, None, Instant::now, |tx| {
+        tx.execute_batch("CREATE TABLE ioerr_commit_break(id INTEGER PRIMARY KEY) STRICT")?;
+        Ok(())
+    })
+    .unwrap();
+    let failed = Episode::new(state.clone(), None);
+    failed.failed(RetryCode::Io, now).unwrap();
+    assert!(state.failure().is_none());
+}

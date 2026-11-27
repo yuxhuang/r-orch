@@ -312,7 +312,8 @@ fn execute_episode<T>(
         }
     };
     let must_abort = state.transaction_must_abort().or_else(|| {
-        (gate.rolled_back.load(Ordering::SeqCst) || state.writer_retry().is_some())
+        gate.rolled_back
+            .load(Ordering::SeqCst)
             .then_some(SqliteError::TransactionAborted)
     });
     if let Some(error) = must_abort {
@@ -338,6 +339,7 @@ fn execute_episode<T>(
         match committed {
             Ok(()) => {
                 episode.outcome(WriteOutcome::Committed, None);
+                state.writer_committed();
                 episode.finish();
                 return Ok(value);
             }

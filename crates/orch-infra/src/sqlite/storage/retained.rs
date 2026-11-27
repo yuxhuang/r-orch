@@ -167,6 +167,17 @@ impl RetainedWrite {
         let snapshot = self.storage.read(self.caller.clone()).await?;
         let committed = check(snapshot).await?;
         self.unknown = false;
+        if committed {
+            self.storage.owner.shared.state.writer_committed();
+        }
+        self.episode.outcome(
+            if committed {
+                WriteOutcome::Committed
+            } else {
+                WriteOutcome::RolledBack
+            },
+            self.episode.snapshot().1,
+        );
         self.may_submit = !committed && self.episode.snapshot().1.is_some();
         if !self.may_submit {
             self.episode.finish();
@@ -440,6 +451,98 @@ mod tests {
         assert!(claimed.load(Ordering::SeqCst));
         drop(claim);
         drop(retained);
+        storage.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn caught_clean_leaf_refusal_may_commit_unrelated_work_despite_retry_class() {
+        let (_root, data) = crate::sqlite::test_data();
+        let inject = Arc::new(AtomicBool::new(false));
+        let injected = inject.clone();
+        let storage = SqliteStorage::open(
+            Arc::new(data),
+            StorageOptions {
+                write_observation_probe: Some(Arc::new(move || {
+                    injected.swap(false, Ordering::SeqCst).then(|| sql(13))
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        storage
+            .transaction(owner(), store::Lane::Events, |unit| {
+                unit.create(team("existing"))
+            })
+            .await
+            .unwrap();
+        inject.store(true, Ordering::SeqCst);
+        let mut write = storage.retained_write(owner(), store::Lane::Events, None);
+        let answer = write
+            .attempt(Box::new(|unit| {
+                // The real duplicate operation is cleanly refused/rolled back by
+                // its leaf; inject FULL only at Unit's source-observation seam.
+                assert!(unit.create(team("existing")).is_err());
+                unit.create(team("unrelated")).map(|_| ())
+            }))
+            .await
+            .unwrap();
+        assert!(
+            answer.result.is_ok(),
+            "a caught nonfatal clean leaf refusal is not callback-wide abort"
+        );
+        assert_eq!(answer.outcome, WriteOutcome::Committed);
+        assert!(!storage.failure_state().claims_suppressed());
+        assert!(
+            storage
+                .read(owner())
+                .await
+                .unwrap()
+                .get(EntityKind::Team, "unrelated")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        drop(write);
+        storage.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn a_callback_logical_error_is_not_retried_for_an_earlier_caught_storage_error() {
+        let (_root, data) = crate::sqlite::test_data();
+        let inject = Arc::new(AtomicBool::new(false));
+        let injected = inject.clone();
+        let storage = SqliteStorage::open(
+            Arc::new(data),
+            StorageOptions {
+                write_observation_probe: Some(Arc::new(move || {
+                    injected.swap(false, Ordering::SeqCst).then(|| sql(13))
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        storage
+            .transaction(owner(), store::Lane::Events, |unit| {
+                unit.create(team("existing"))
+            })
+            .await
+            .unwrap();
+        inject.store(true, Ordering::SeqCst);
+        let mut write = storage.retained_write(owner(), store::Lane::Events, None);
+        let answer = write
+            .attempt(Box::new(|unit| {
+                assert!(unit.create(team("existing")).is_err());
+                Err(StoreError::InvalidEvents(
+                    "synthetic logical refusal".into(),
+                ))
+            }))
+            .await
+            .unwrap();
+        assert!(matches!(&answer.result, Err(StoreError::InvalidEvents(_))));
+        assert!(
+            !answer.retryable(),
+            "a caught earlier backend result cannot reclassify a logical callback refusal"
+        );
+        assert!(!storage.failure_state().claims_suppressed());
+        drop(write);
         storage.close().await.unwrap();
     }
 }

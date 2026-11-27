@@ -2,6 +2,7 @@
 use super::{FailureSource, FailureState, FatalCause};
 use crate::sqlite::{Result, SqliteError};
 use rusqlite::ErrorCode;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -23,12 +24,6 @@ impl RetryCode {
             ErrorCode::DatabaseLocked => Some(Self::Locked),
             ErrorCode::DiskFull => Some(Self::Full),
             ErrorCode::SystemIoFailure => Some(Self::Io),
-            _ => None,
-        }
-    }
-    pub(super) fn error(error: &SqliteError) -> Option<Self> {
-        match error {
-            SqliteError::Sql(error) => Self::sql(error),
             _ => None,
         }
     }
@@ -55,7 +50,6 @@ pub struct WriteAccounting {
 struct Progress {
     since: Option<Instant>,
     delay: Duration,
-    ioerr: bool,
     outcome: WriteOutcome,
     code: Option<RetryCode>,
     accounting: WriteAccounting,
@@ -64,6 +58,8 @@ struct Progress {
 struct Inner {
     state: FailureState,
     progress: Mutex<Progress>,
+    active: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
@@ -87,10 +83,11 @@ impl Episode {
         Self {
             inner: Arc::new(Inner {
                 state,
+                active: Arc::new(AtomicBool::new(false)),
+                phase: Arc::new(AtomicU8::new(WriteOutcome::NotStarted as u8)),
                 progress: Mutex::new(Progress {
                     since: None,
                     delay: Duration::from_millis(50),
-                    ioerr: false,
                     outcome: WriteOutcome::NotStarted,
                     code: None,
                     accounting: WriteAccounting::default(),
@@ -101,12 +98,7 @@ impl Episode {
         }
     }
     pub(super) fn retrying(&self) -> bool {
-        self.inner
-            .progress
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .since
-            .is_some()
+        self.inner.active.load(Ordering::SeqCst)
     }
     pub(super) fn prepare(&self) {
         let mut p = self
@@ -115,6 +107,9 @@ impl Episode {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         p.outcome = WriteOutcome::NotStarted;
+        self.inner
+            .phase
+            .store(WriteOutcome::NotStarted as u8, Ordering::SeqCst);
         p.code = None;
         p.accounting = WriteAccounting::default();
     }
@@ -126,13 +121,14 @@ impl Episode {
             .unwrap_or_else(PoisonError::into_inner);
         (p.outcome, p.code, p.accounting)
     }
-    pub(super) fn outcome(&self, outcome: WriteOutcome, code: Option<RetryCode>) {
+    pub(in crate::sqlite) fn outcome(&self, outcome: WriteOutcome, code: Option<RetryCode>) {
         let mut p = self
             .inner
             .progress
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         p.outcome = outcome;
+        self.inner.phase.store(outcome as u8, Ordering::SeqCst);
         p.code = code;
     }
     pub(super) fn accounting(&self, rows: u64, work: Duration) {
@@ -159,7 +155,6 @@ impl Episode {
         if let Some(since) = p.since.take() {
             self.inner.state.retry_finished(since);
         }
-        p.ioerr = false;
     }
     fn check_policy(&self, now: Instant) -> Result<()> {
         self.inner.state.ensure_available()?;
@@ -168,8 +163,10 @@ impl Episode {
             .progress
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if p.since
-            .is_some_and(|since| now.saturating_duration_since(since) >= Duration::from_secs(60))
+        if self.inner.active.load(Ordering::SeqCst)
+            && p.since.is_some_and(|since| {
+                now.saturating_duration_since(since) >= Duration::from_secs(60)
+            })
         {
             self.inner
                 .state
@@ -195,14 +192,18 @@ impl Episode {
         p.code = Some(code);
         if p.since.is_none() {
             p.since = Some(now);
-            self.inner.state.retry_started(now);
+            self.inner.state.retry_started(
+                now,
+                self.deadline,
+                self.inner.active.clone(),
+                self.inner.phase.clone(),
+            );
         }
-        if code == RetryCode::Io && p.ioerr {
+        if self.inner.state.retry_failure(code) {
             self.inner
                 .state
                 .latch(FailureSource::Writer, FatalCause::ConsecutiveIoErrors);
         }
-        p.ioerr = code == RetryCode::Io;
         let delay = p.delay;
         p.delay = (delay * 2).min(Duration::from_secs(2));
         p.pending_delay = Some(delay);
@@ -334,5 +335,94 @@ mod tests {
         assert_eq!(state.writer_retry(), Some(RetryCode::Io));
         state.begin_transaction();
         assert_eq!(state.writer_retry(), None);
+    }
+    #[test]
+    fn expired_known_noncommit_releases_claims_between_producer_submissions() {
+        let state = FailureState::new();
+        let now = Instant::now();
+        let episode = Episode::new(state.clone(), Some(now + Duration::from_millis(200)));
+        episode.outcome(WriteOutcome::RolledBack, Some(RetryCode::Full));
+        episode.failed(RetryCode::Full, now).unwrap();
+        state.check_retry_timeout(now + Duration::from_millis(199));
+        assert!(state.claims_suppressed());
+        state.check_retry_timeout(now + Duration::from_millis(200));
+        assert!(
+            !state.claims_suppressed(),
+            "known-noncommit withdrawal must release the queue without another submission"
+        );
+        assert!(state.failure().is_none());
+        assert!(matches!(
+            episode.check(now + Duration::from_millis(200)),
+            Err(SqliteError::Overloaded)
+        ));
+        assert!(matches!(
+            episode.check(now + Duration::from_secs(61)),
+            Err(SqliteError::Overloaded)
+        ));
+        assert!(
+            state.failure().is_none(),
+            "a withdrawn episode does not become a sixty-second failure later"
+        );
+        drop(episode);
+        assert!(
+            !state.claims_suppressed(),
+            "expiry followed by Drop must not decrement twice"
+        );
+    }
+    #[test]
+    fn unknown_commit_remains_fenced_past_the_original_deadline() {
+        let state = FailureState::new();
+        let now = Instant::now();
+        let episode = Episode::new(state.clone(), Some(now + Duration::from_millis(200)));
+        episode.outcome(WriteOutcome::Unknown, Some(RetryCode::Io));
+        episode.failed(RetryCode::Io, now).unwrap();
+        state.check_retry_timeout(now + Duration::from_millis(201));
+        assert!(
+            state.claims_suppressed(),
+            "uncertainty is not an overloaded/noncommit receipt"
+        );
+        assert!(state.failure().is_none());
+        episode.finish();
+        assert!(!state.claims_suppressed());
+    }
+    #[test]
+    fn consecutive_io_errors_of_separate_logical_requests_still_latch() {
+        let state = FailureState::new();
+        let now = Instant::now();
+        {
+            let first = Episode::new(state.clone(), None);
+            first.failed(RetryCode::Io, now).unwrap();
+        }
+        assert!(!state.claims_suppressed());
+        let second = Episode::new(state.clone(), None);
+        assert!(
+            second.failed(RetryCode::Io, now).is_err(),
+            "ending a logical request cannot reset the writer IOERR streak"
+        );
+        assert_eq!(
+            state.failure().unwrap().causes[0].1,
+            FatalCause::ConsecutiveIoErrors
+        );
+    }
+    #[test]
+    fn a_different_sql_failure_breaks_the_consecutive_ioerr_streak() {
+        let state = FailureState::new();
+        let now = Instant::now();
+        {
+            let first = Episode::new(state.clone(), None);
+            first.failed(RetryCode::Io, now).unwrap();
+        }
+        state.observe(
+            FailureSource::Writer,
+            &SqliteError::Sql(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(19),
+                None,
+            )),
+        );
+        let second = Episode::new(state.clone(), None);
+        second
+            .failed(RetryCode::Io, now)
+            .expect("a different SQL failure interrupts consecutive IOERRs");
+        assert!(state.failure().is_none());
     }
 }

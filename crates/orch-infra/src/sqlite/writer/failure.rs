@@ -26,7 +26,7 @@
 use crate::sqlite::{Result, SqliteError};
 use rusqlite::ErrorCode;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// Which connection saw the result (R140). Only `Artifact` is not live.
@@ -248,9 +248,16 @@ struct Inner {
     transaction_aborted: AtomicBool,
     pool_failure_streak: AtomicU32,
     writer_retry: Mutex<Option<super::policy::RetryCode>>,
-    retrying: AtomicU64,
-    retry_starts: Mutex<Vec<std::time::Instant>>,
+    retry_starts: Mutex<Vec<RetryRegistration>>,
+    consecutive_ioerr: AtomicBool,
     over_bound: AtomicU64,
+}
+
+struct RetryRegistration {
+    since: std::time::Instant,
+    deadline: Option<std::time::Instant>,
+    active: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
 }
 
 /// Shared by the writer, the read pool and every other live connection. Clone
@@ -281,18 +288,34 @@ impl FailureState {
         if source == FailureSource::Artifact {
             return observation;
         }
-        if source == FailureSource::Writer
-            && let Some(code) = super::policy::RetryCode::error(error)
-        {
-            let mut retry = self
-                .inner
-                .writer_retry
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            // A source error can be observed again by an outer adapter.
-            // Keep one transaction observation, with I/O failure precedence.
-            if retry.is_none() || code == super::policy::RetryCode::Io {
-                *retry = Some(code);
+        if source == FailureSource::Writer {
+            match error {
+                SqliteError::Sql(error) => {
+                    let code = super::policy::RetryCode::sql(error);
+                    *self
+                        .inner
+                        .writer_retry
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = code;
+                    if code.is_none() && matches!(error, rusqlite::Error::SqliteFailure(_, _)) {
+                        self.inner.consecutive_ioerr.store(false, Ordering::SeqCst);
+                    }
+                }
+                // Preserve the source observation through Unit's lossy port
+                // conversion and through the callback-wide abort guard. A
+                // cleanup unwind is classified by record O, never retried.
+                SqliteError::Store(orch_core::store::StoreError::Backend(_))
+                | SqliteError::TransactionAborted
+                | SqliteError::OperationRollback { .. } => {}
+                // A new logical refusal, non-retryable backend cause or caller
+                // panic is its own answer, not the earlier caught SQL failure.
+                _ => {
+                    *self
+                        .inner
+                        .writer_retry
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner) = None
+                }
             }
         }
         let causes = observation.fatal_causes();
@@ -374,13 +397,24 @@ impl FailureState {
         }
     }
 
-    pub(super) fn retry_started(&self, now: std::time::Instant) {
+    pub(super) fn retry_started(
+        &self,
+        since: std::time::Instant,
+        deadline: Option<std::time::Instant>,
+        active: Arc<AtomicBool>,
+        phase: Arc<AtomicU8>,
+    ) {
+        active.store(true, Ordering::SeqCst);
         self.inner
             .retry_starts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(now);
-        self.inner.retrying.fetch_add(1, Ordering::SeqCst);
+            .push(RetryRegistration {
+                since,
+                deadline,
+                active,
+                phase,
+            });
     }
     pub(super) fn retry_finished(&self, since: std::time::Instant) {
         let mut starts = self
@@ -388,27 +422,54 @@ impl FailureState {
             .retry_starts
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(i) = starts.iter().position(|start| *start == since) {
-            starts.remove(i);
+        if let Some(i) = starts.iter().position(|start| start.since == since) {
+            starts.remove(i).active.store(false, Ordering::SeqCst);
         }
-        self.inner.retrying.fetch_sub(1, Ordering::SeqCst);
     }
     pub(super) fn check_retry_timeout(&self, now: std::time::Instant) {
-        let expired = self
+        let mut starts = self
             .inner
             .retry_starts
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .any(|start| {
-                now.saturating_duration_since(*start) >= std::time::Duration::from_secs(60)
-            });
-        if expired && self.failure().is_none() {
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut timed_out = false;
+        starts.retain(|entry| {
+            // A known noncommit can be withdrawn without another producer
+            // submission. An unknown COMMIT stays fenced until reconciled.
+            if entry.deadline.is_some_and(|deadline| now >= deadline)
+                && entry.phase.load(Ordering::SeqCst) != super::policy::WriteOutcome::Unknown as u8
+            {
+                entry.active.store(false, Ordering::SeqCst);
+                return false;
+            }
+            timed_out |=
+                now.saturating_duration_since(entry.since) >= std::time::Duration::from_secs(60);
+            true
+        });
+        drop(starts);
+        if timed_out && self.failure().is_none() {
             self.latch(FailureSource::Writer, FatalCause::RetryWithoutCommit);
         }
     }
     pub(in crate::sqlite) fn claims_suppressed(&self) -> bool {
-        self.inner.retrying.load(Ordering::SeqCst) != 0
+        !self
+            .inner
+            .retry_starts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+    }
+    /// Count the executor's terminal SQL failure once, after raw observations
+    /// have been deduplicated within its transaction. Logical request turnover
+    /// is not a successful commit and cannot erase a preceding I/O failure.
+    pub(super) fn retry_failure(&self, code: super::policy::RetryCode) -> bool {
+        self.inner
+            .consecutive_ioerr
+            .swap(code == super::policy::RetryCode::Io, Ordering::SeqCst)
+            && code == super::policy::RetryCode::Io
+    }
+    pub(in crate::sqlite) fn writer_committed(&self) {
+        self.inner.consecutive_ioerr.store(false, Ordering::SeqCst);
     }
     pub(super) fn count_over_bound(&self) {
         self.inner.over_bound.fetch_add(1, Ordering::SeqCst);
