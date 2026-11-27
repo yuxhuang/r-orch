@@ -1,8 +1,10 @@
 //! The shared intent scenarios of the storage contract (`intents_v2.rs`: three
 //! intents, rollback, signed retention edges, a caught refusal) run through the
-//! real `Writer` and `ReadPool`, so that registering the SQLite adapter in the
-//! conformance suite meets a leaf already proven on the same sequences. The
-//! numbers below are those of the shared cases; keep them equal.
+//! real `Writer` and `ReadPool`. These component fixtures cover the same intent
+//! refusals; the registered public SQLite conformance case additionally creates
+//! and reads a Task marker to prove that unrelated work commits. This leaf-only
+//! fixture has no Task adapter and leaves that composition assertion to the
+//! shared suite (`an_error_caught_inside_the_callback_changes_nothing`).
 use super::*;
 use crate::sqlite::{
     ConnectionRole, Lane, ReadPool, Synchronous, Writer, WriterHandle, migrations, open_connection,
@@ -289,6 +291,14 @@ fn caught_refusals_in_a_committing_callback_change_nothing() {
                     .add_intent(&IntentPayload::BlobDelete { hash: "x".into() }, 1)
                     .map(drop),
                 intents.add_intent(&stop("r-without-lease"), 1).map(drop),
+                intents
+                    .add_intent(
+                        &IntentPayload::ProcessStart {
+                            run: "r-without-lease".into(),
+                        },
+                        1,
+                    )
+                    .map(drop),
                 intents.finish_intent(0, 1).map(drop),
                 intents.finish_intent(99, 1).map(drop),
                 intents.delete_finished_intents(1, 0).map(drop),
@@ -299,7 +309,7 @@ fn caught_refusals_in_a_committing_callback_change_nothing() {
             Ok((intents.add_intent(&stop("r1"), 2)?, refused))
         })
         .unwrap();
-        assert_eq!(refusals, 8);
+        assert_eq!(refusals, 9);
         // No refusal, including the stale token above, spent an id.
         assert_eq!(probe.id, 1);
         read(pool, |intents| {

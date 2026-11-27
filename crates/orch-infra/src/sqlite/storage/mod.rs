@@ -52,6 +52,8 @@ pub struct StorageOptions {
     pub(crate) writer_setup: Option<WriterSetup>,
     #[cfg(test)]
     pub(crate) completion_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    pub(crate) pin_now: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
 }
 #[cfg(test)]
 type ReaderSetup = Box<dyn Fn(&mut rusqlite::Connection) + Send>;
@@ -72,6 +74,8 @@ impl Default for StorageOptions {
             writer_setup: None,
             #[cfg(test)]
             completion_probe: None,
+            #[cfg(test)]
+            pin_now: None,
         }
     }
 }
@@ -86,6 +90,8 @@ struct Shared {
     idle: Duration,
     #[cfg(test)]
     completion_probe: Option<Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(test)]
+    pin_now: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
 }
 impl Shared {
     fn stop(&self) {
@@ -193,6 +199,8 @@ impl SqliteStorage {
                         idle: options.snapshot_idle,
                         #[cfg(test)]
                         completion_probe: options.completion_probe,
+                        #[cfg(test)]
+                        pin_now: options.pin_now,
                     });
                     let pool = ReadPool::open_with_state(
                         &data,
@@ -443,7 +451,10 @@ fn read_worker(
         let mut retired_reply: Option<RetiredReply> = None;
         let result = pool.read(deadline, |tx| {
             shared.readable()?;
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            #[cfg(test)]
+            let now = shared.pin_now.as_ref().map_or(now, |clock| clock());
+            if now >= deadline {
                 return Err(SqliteError::Overloaded);
             }
             shared
