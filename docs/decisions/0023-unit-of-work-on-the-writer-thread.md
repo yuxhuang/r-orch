@@ -86,8 +86,14 @@ Facts read from `main` at `075f2b124`:
    producer that kept its input, after a definitive noncommit, and an unknown commit outcome is reconciled before it submits
    again. A leaf's savepoint cleanup that fails with a transient (non-fatal) result is not retried either: it is the nonfatal
    pair of decision 5, so the worker ends, the requests are answered `WriterClosed` and nothing is latched (spec
-   "Amendment 3", "A transient cleanup", issue 410). This is the owner's approval of the writer's retry policy (spec R128, record P). It is not built yet, and the
-   plan's "Writer retry policy" gives its order and its vectors.
+   "Amendment 3", "A transient cleanup", issue 410). This is the owner's approval of the writer's retry policy (spec R128, record P). A development implementation exists on
+   PR 411's writer member (source `2a7cb83e4`): it retries `BEGIN` and a `BUSY` `COMMIT` on the same transaction, runs
+   each callback at most once, and adds the SQLite-only `RetainedWrite` for a producer that rebuilds work after a
+   confirmed noncommit, so that the frozen traits and the seven bounds of this decision are unchanged. While one logical
+   operation is retained the writer runs no other queued job (a built choice) until its outcome is known or a known
+   noncommit is withdrawn at its original deadline. It is not
+   reviewed, not wired to the daemon and not the T10 acceptance; the spec's "As built: the retained writer" lists what it
+   does, the readings it builds and its one open question, and the plan's "Writer retry policy" gives the order and the vectors.
 
 ## Consequences
 
