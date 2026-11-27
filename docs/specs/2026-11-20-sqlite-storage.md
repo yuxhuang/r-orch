@@ -4960,6 +4960,14 @@ lifetime of a reader's snapshot that answers no id and changes none of the answe
     proves nothing: A3-W7 to A3-W10 and issue 149's cases are pending, and the PR that carries the code keeps its
     independent review, its successful Linux check and test on the exact head, a CLEAN merge state and the lead's
     recommendation. The owner alone merges.
+  - *Held: the case of a failed leaf cleanup with no fatal cause.* This record, "Amendment 3" and the vector A3-W7
+    describe what the source does: such an unwind is observed, ends the worker and answers `WriterClosed`, and latches
+    nothing, because `FatalCause` has no variant for a failed savepoint cleanup. The wording of the owner's answer as
+    recorded, that a typed `CleanupUnwind` "latches as fatal", can also be read as saying that every such unwind
+    latches and is answered `storage_unavailable`. That reading would add a fatal cause and change record L, and
+    nothing here does either. Which reading is the contract is not ruled; the independent review of the lower PR holds
+    it open, and the PR's qualification waits for the ruling. Until then this spec, the ADR and the architecture
+    document describe the source's behaviour, and a ruling for the other reading changes them and A3-W7 together.
   - *Second question, the reader's snapshot (the lead's "O4 wording", from the composition adjudication of 2026-11-26).*
     The answer as recorded: "Approve as proposed". The wording, with its numbers as starting values that no measurement
     backs: one pinned snapshot per task and no unrelated await while holding it; a 200 ms admission budget for an open,
