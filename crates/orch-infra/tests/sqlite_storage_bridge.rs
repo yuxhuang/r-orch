@@ -11,9 +11,9 @@
 //! What each leaf proves alone stays with its leaf: the two native guards in
 //! `agent_team_run` (poison with a transaction open, a fresh helper on an ended
 //! transaction) and the typed-cause cases of `sqlite_writer_policy`. The tests
-//! here prove the composition: the whole `UnitOfWork` refuses once any helper in
-//! it has lost its savepoint, the outer commit is refused even when the callback
-//! caught every error, and nothing the request did is durable.
+//! here prove the composition: returned cleanup failures poison the whole unit,
+//! while native cctg cleanup failure unwinds and retires the writer. Neither path
+//! commits the failed request, including when the callback intended to return Ok.
 use orch_core::storage::ContextEntry;
 use orch_core::store::{
     Caller, ConfigEntry, Entity, EntityKind, Filter, Lane, PageRequest, Principal, Record,
@@ -236,6 +236,7 @@ struct Failing {
     name: &'static str,
     trigger: &'static str,
     entity: fn() -> Entity,
+    retires_writer: bool,
 }
 fn failing_families() -> [Failing; 3] {
     [
@@ -245,6 +246,7 @@ fn failing_families() -> [Failing; 3] {
             trigger: "CREATE TRIGGER end_it BEFORE INSERT ON agents WHEN NEW.id='doomed' \
                       BEGIN SELECT RAISE(ROLLBACK,'synthetic SQLite rollback'); END",
             entity: || agent("doomed", "doomed"),
+            retires_writer: false,
         },
         // The task writer keeps its own savepoint and poison.
         Failing {
@@ -252,6 +254,7 @@ fn failing_families() -> [Failing; 3] {
             trigger: "CREATE TRIGGER end_it BEFORE INSERT ON tasks WHEN NEW.id='doomed' \
                       BEGIN SELECT RAISE(ROLLBACK,'synthetic SQLite rollback'); END",
             entity: || task("doomed"),
+            retires_writer: false,
         },
         // Context, config, template and goal are a separate helper in the unit.
         Failing {
@@ -259,18 +262,19 @@ fn failing_families() -> [Failing; 3] {
             trigger: "CREATE TRIGGER end_it BEFORE INSERT ON project_config WHEN NEW.key='doomed' \
                       BEGIN SELECT RAISE(ROLLBACK,'synthetic SQLite rollback'); END",
             entity: || config("doomed"),
+            retires_writer: true,
         },
     ]
 }
 
 /// R128: SQLite ended the transaction under the unit, so its savepoint cannot be
-/// rolled back and the unit may never commit, even when the callback catches every
-/// error and returns `Ok`. Covers the composed poison, the ended-transaction guard,
-/// the executor's commit refusal and a usable writer afterwards, for each helper.
+/// rolled back and the unit may never commit. The cctg leaf unwinds and retires
+/// the writer (#462); the other helpers still return errors and refuse the rest
+/// of the unit. Neither path commits partial work; a reopened writer is usable.
 #[tokio::test]
 async fn a_caught_rollback_failure_refuses_the_rest_of_the_unit_and_commits_nothing() {
     for failing in failing_families() {
-        let env = Env::new();
+        let mut env = Env::new();
         env.sql(failing.trigger);
         let keep = env
             .commit(|unit| unit.create(agent("keep", "original")))
@@ -312,10 +316,18 @@ async fn a_caught_rollback_failure_refuses_the_rest_of_the_unit_and_commits_noth
                 seen.fetch_add(1, Ordering::SeqCst);
             })
             .await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "{}", failing.name);
-        // The request is answered as aborted: not as a fatal storage failure.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            usize::from(!failing.retires_writer),
+            "{}",
+            failing.name
+        );
         let error = outcome.expect_err(failing.name);
-        assert_eq!(backend_text(&error), FAILED, "{}", failing.name);
+        if failing.retires_writer {
+            assert!(backend_text(&error).contains("SQLite writer is closed"));
+        } else {
+            assert_eq!(backend_text(&error), FAILED, "{}", failing.name);
+        }
         assert!(
             env.storage.failure_state().failure().is_none(),
             "{}: a rollback failure with ordinary causes does not latch",
@@ -340,8 +352,19 @@ async fn a_caught_rollback_failure_refuses_the_rest_of_the_unit_and_commits_noth
             assert_eq!(env.count(table), expected, "{}: {table}", failing.name);
         }
 
-        // The abort belongs to that one request: the next transaction commits.
         env.sql("DROP TRIGGER end_it");
+        if failing.retires_writer {
+            let later = env
+                .storage
+                .transaction(owner(), Lane::Entities, |unit| unit.create(team("refused")))
+                .await
+                .unwrap_err();
+            assert!(backend_text(&later).contains("SQLite writer is closed"));
+            assert!(env.storage.close().await.is_err());
+            env.storage = SqliteStorage::open(env.data.clone(), StorageOptions::default()).unwrap();
+        }
+        // A returned abort leaves the worker usable; typed cleanup requires a
+        // reopened worker before a new transaction can commit.
         env.commit(|unit| unit.create(team("fresh"))).await;
         assert!(env.get(EntityKind::Team, "fresh").await.is_some());
         assert!(env.get(EntityKind::Team, "before").await.is_none());
