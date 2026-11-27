@@ -132,14 +132,18 @@ reviewed or merged.
 - Each PR gets one independent code review. Add a security review only for untrusted input, file paths,
   authorisation, importer, restore or process spawning. Skip separate per-PR resilience reviews, fact-checks,
   review boards and CI-log verifier tasks.
+- For the SQLite storage goal, the lead keeps a PR in draft until review findings have dispositions.
+  Marking it ready signals that it belongs to the goal and should merge. The supervisor verifies from each
+  required review task’s verdict and dispositions that the review passed with nothing blocking.
 - Require successful Linux `check` and `test` on the actual merge. Only a CI-classified docs-only PR may skip
-  `test`. The tested merge's first parent must equal the current `origin/main` tip and its tree must equal the
-  expected squash tree. Require a `CLEAN` merge state, applicable closing references and a short lead
-  recommendation naming the PR head, base and merge tree.
-- Whenever `main` advances, run fresh CI on the new merge. An unchanged PR head keeps its review. Review the
-  delta when the head changes. Independent PRs may still use batch trains.
-- The supervising session checks each squash and watches every push to `main`. Once the per-PR requirements
-  hold, the owner may merge while a main push run is still in progress.
+  `test`. The tested merge’s first parent must equal the current `origin/main` tip and its tree must equal the
+  expected squash tree. Require `mergeStateStatus` to be `CLEAN` and `closingIssuesReferences` to match
+  the issues the PR description says it closes.
+- When only `main` moves, retain the head review and rerun CI on the new merge. A changed PR head needs
+  delta review and fresh CI. State the landing order for PRs that should land together in a train.
+- The supervisor merges each ready goal PR once these checks and the stop-on-red rule hold. Ready status
+  supplies the lead’s signal without a separate recommendation or sign-off after a base move. The supervisor
+  checks each squash and watches every push to `main`. A pending main push run may overlap the next merge.
 - **Stop on red.** If any job in any main push run fails, stop further merges until the failure is fixed or,
   for a flaky failure, the supervising session's rerun passes. Skip separate landing and terminal-main verifier tasks.
 - **Rolling deep review.** Review each subsystem’s changes on `main` since its last deep review after about
@@ -165,20 +169,21 @@ reviewed or merged.
 
 - **Base on `main`.** Branch every PR from current `main`. Independent PRs stay independent and are qualified
   together in a *train*: an ordered batch checked as one combined merge on a draft branch from current `main`, which
-  the owner then merges member by member, in that order. The draft is closed unmerged once `main` has the
+  the designated merger then merges member by member, in that order. The draft is closed unmerged once `main` has the
   recorded tree.
 - **Stack only for code.** Base a PR on another open PR only when the upper change needs the lower PR's code. Say
   so in both PR bodies (`Depends on #N`). The whole stack enters one train, bottom to top (#171 then #175, #186
   then #208). If any member is held, the whole stack waits.
 - **A changed head restarts the gate.** A new head (a push or a rebase) needs a delta review, fresh CI at that
-  head and a renewed lead recommendation. Evidence for the old head does not carry over.
+  head. Evidence for the old head does not carry over.
 - **One writer for shared documents.** Within a wave of parallel work, one documentation writer owns the shared
   specs, plans, ADRs and this file; builders own disjoint implementation paths, named in each task's scope. A
   builder who needs a shared document changed asks the writer instead of editing it.
 - **Release notes never conflict.** A PR adds a changelog fragment, not a line in `CHANGELOG.md` (see
   "Changelog fragments").
 
-**Merge policy.** The human owner merges by default. The owner may standing-delegate categories to the
+**Merge policy.** The supervisor merges ready SQLite storage goal PRs under the rules above, including process
+changes for that goal. Outside that goal, the human owner merges by default. The owner may standing-delegate categories to the
 orchestrator; current delegation: docs-only, test-only, and CHANGELOG/plan-status PRs, once required checks are
 green. The exception is a change to the process itself (`AGENTS.md`, `docs/decisions/`, and the `docs/specs/` or
 `docs/plans/` README and TEMPLATE files), which the owner merges. Everything else waits for the owner. Changes to
