@@ -262,6 +262,10 @@ async fn layout_order_and_leaf_pages_agree_for_every_non_task_shape() {
             let mut walked = Vec::new();
             loop {
                 let one = snapshot.list(&filter, &request).await.unwrap();
+                assert!(
+                    walked.len() + one.items.len() <= all.items.len(),
+                    "cursor did not advance: {filter:?} {sort:?}"
+                );
                 walked.extend(one.items);
                 let Some(cursor) = one.next_cursor else { break };
                 request.cursor = Some(cursor);
