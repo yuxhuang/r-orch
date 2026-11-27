@@ -12,7 +12,7 @@
 //! `agent_team_run` (poison with a transaction open, a fresh helper on an ended
 //! transaction) and the typed-cause cases of `sqlite_writer_policy`. The tests
 //! here prove the composition: returned cleanup failures poison the whole unit,
-//! while Agent/Team/Run cleanup failure unwinds and retires the writer. Neither path
+//! while Agent/Team/Run and native cctg cleanup failures unwind and retire the writer. Neither path
 //! commits the failed request, including when the callback intended to return Ok.
 use orch_core::storage::ContextEntry;
 use orch_core::store::{
@@ -262,14 +262,14 @@ fn failing_families() -> [Failing; 3] {
             trigger: "CREATE TRIGGER end_it BEFORE INSERT ON project_config WHEN NEW.key='doomed' \
                       BEGIN SELECT RAISE(ROLLBACK,'synthetic SQLite rollback'); END",
             entity: || config("doomed"),
-            retires_writer: false,
+            retires_writer: true,
         },
     ]
 }
 
 /// R128: SQLite ended the transaction under the unit, so its savepoint cannot be
-/// rolled back and the unit may never commit. The Agent/Team/Run leaf unwinds and
-/// retires the writer (#468); the other helpers still return errors and refuse the rest
+/// rolled back and the unit may never commit. The Agent/Team/Run and cctg leaves
+/// unwind and retire the writer (#468 and #462); Task returns errors and refuses the rest
 /// of the unit. Neither path commits partial work; a reopened writer is usable.
 #[tokio::test]
 async fn a_caught_rollback_failure_refuses_the_rest_of_the_unit_and_commits_nothing() {
