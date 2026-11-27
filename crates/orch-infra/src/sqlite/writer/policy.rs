@@ -55,6 +55,7 @@ struct Progress {
     outcome: WriteOutcome,
     code: Option<RetryCode>,
     accounting: WriteAccounting,
+    commit_attempted: bool,
     pending_delay: Option<Duration>,
 }
 struct Inner {
@@ -93,6 +94,7 @@ impl Episode {
                     outcome: WriteOutcome::NotStarted,
                     code: None,
                     accounting: WriteAccounting::default(),
+                    commit_attempted: false,
                     pending_delay: None,
                 }),
             }),
@@ -114,6 +116,21 @@ impl Episode {
             .store(WriteOutcome::NotStarted as u8, Ordering::SeqCst);
         p.code = None;
         p.accounting = WriteAccounting::default();
+        p.commit_attempted = false;
+    }
+    pub(super) fn mark_commit_attempted(&self) {
+        self.inner
+            .progress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .commit_attempted = true;
+    }
+    pub(in crate::sqlite) fn commit_attempted(&self) -> bool {
+        self.inner
+            .progress
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .commit_attempted
     }
     pub(in crate::sqlite) fn snapshot(&self) -> (WriteOutcome, Option<RetryCode>, WriteAccounting) {
         let p = self

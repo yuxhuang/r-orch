@@ -5,7 +5,9 @@
 //! the producer under test is the production one. No outcome depends on a sleep:
 //! the stalls are released by the test, the clock of the 20 ms cut is injected,
 //! and the one pause (the write lock held for 300 ms) only widens the window in
-//! which a wrongly early commit would show.
+//! which a wrongly early commit would show. The FULL exhaustion test also waits
+//! through the real sixty-second production retry episode; its watchdog is only
+//! a hang guard, not a latency target.
 
 use super::super::producer::{
     EventBatch, EventProducer, EventProducerOptions, Expected, Rejected, Submission, SubmitFailure,
@@ -733,6 +735,126 @@ impl Fixture {
             events: vec![event(9)],
         }
     }
+}
+
+#[tokio::test]
+async fn a_full_disk_is_retried_and_then_fails_the_writer() {
+    let attempts = Arc::new(Mutex::new(Vec::new()));
+    let seen = attempts.clone();
+    let fx = fixture_with(StorageOptions {
+        writer_commit_probe: Some(Box::new(move |tx| {
+            let events: i64 = tx
+                .query_row("SELECT count(*) FROM run_events", [], |r| r.get(0))
+                .unwrap();
+            if events == 0 {
+                return None;
+            }
+            // Fail every reconstructed transaction, not just one callback or
+            // the policy object in isolation. The rows must roll back each time.
+            assert_eq!(events, 3);
+            seen.lock().unwrap().push(Instant::now());
+            Some(Err(sql(13)))
+        })),
+        ..StorageOptions::default()
+    });
+    let idle = fixture();
+    let producer = fx.producer();
+    let first = fx.batch("p", "a", 1..=3).await;
+    let second = fx.batch("p", "b", 1..=2).await;
+    let stall = fx.stall().await;
+    let first = producer.submit(first).unwrap();
+    in_flight(&producer).await;
+    let second = producer.submit(second).unwrap();
+    stall.end().await;
+
+    // Exercise the unmodified production sixty-second episode. This timeout is
+    // only a hang bound; there is no upper latency expectation or filled disk.
+    let failure = tokio::time::timeout(Duration::from_secs(120), first)
+        .await
+        .expect("FULL episode did not produce a terminal receipt")
+        .unwrap_err();
+    assert!(failure.error.to_string().contains("storage_unavailable"));
+    assert_eq!(failure.committed, counts(0, 0));
+    assert_eq!(failure.not_stored, 3);
+    assert!(!failure.outcome_unknown);
+    let queued = answered(second).await.unwrap_err();
+    assert!(queued.error.to_string().contains("storage_unavailable"));
+    assert_eq!((queued.committed, queued.not_stored), (counts(0, 0), 2));
+    assert!(!queued.outcome_unknown);
+    assert_eq!(
+        fx.storage.failure_state().failure().unwrap().causes,
+        vec![(
+            crate::sqlite::Role::Operation,
+            crate::sqlite::FatalCause::RetryWithoutCommit
+        )]
+    );
+    {
+        let attempts = attempts.lock().unwrap();
+        assert!(
+            attempts.len() >= 8,
+            "FULL must survive the exponential backoff"
+        );
+        assert!(attempts[0].elapsed() >= Duration::from_secs(60));
+    }
+    assert!(fx.reports().is_empty(), "no transaction committed");
+    for run in ["a", "b"] {
+        assert!(fx.stored("p", run).await.is_empty());
+    }
+    let later = fx
+        .storage
+        .write(
+            owner("p"),
+            Lane::Entities,
+            Box::new(|_| panic!("failed writer invoked a later mutation")),
+        )
+        .await;
+    assert!(
+        later
+            .unwrap_err()
+            .to_string()
+            .contains("storage_unavailable")
+    );
+
+    // This independent real writer stayed idle across the same full episode.
+    // Idle time alone must neither latch failure nor prevent a later commit.
+    assert!(idle.storage.failure_state().failure().is_none());
+    let control = idle.producer();
+    assert_eq!(
+        answered(
+            control
+                .submit(idle.batch("p", "idle", 1..=1).await)
+                .unwrap()
+        )
+        .await
+        .unwrap(),
+        counts(1, 0)
+    );
+    assert_eq!(idle.stored("p", "idle").await, vec![event(1)]);
+    assert!(idle.storage.failure_state().failure().is_none());
+    control.close().await;
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn a_closed_producer_returns_an_oversized_batch_as_closed() {
+    let mut fx = fixture();
+    fx.options.queue_limit = 1;
+    fx.options.observer = Some(Arc::new(|_| panic!("close intake after the known commit")));
+    let lead = fx.batch("p", "lead", 1..=1).await;
+    let batch = fx.batch("p", "run", 1..=2).await;
+    let expected = batch.clone();
+    let producer = fx.producer();
+    assert_eq!(
+        answered(producer.submit(lead).unwrap()).await.unwrap(),
+        counts(1, 0)
+    );
+    // On this current-thread runtime the observer unwinds and closes intake
+    // before the submitting task resumes from its delivered receipt.
+    match producer.submit(batch) {
+        Err(Rejected::Closed(batch, _)) => same_batch(&batch, &expected),
+        other => panic!("Closed must precede TooLarge: {other:?}"),
+    }
+    producer.close().await;
 }
 
 #[tokio::test]
@@ -2437,4 +2559,203 @@ fn encoded_input_stays_charged_while_cancelled_reconciliation_still_reads() {
         .unwrap()
         .block_on(fx.storage.close())
         .unwrap();
+}
+
+/// A real SQLite rollback with its evidence deliberately hidden from the writer.
+/// This simulates Unknown reachability; it does not claim SQLite loses its hook.
+fn incomplete_callback_options(hide_rollback: bool) -> StorageOptions {
+    StorageOptions {
+        writer_setup: Some(Box::new(move |connection| {
+            if hide_rollback {
+                connection.rollback_hook(None::<fn()>).unwrap();
+            }
+            // Fixture DDL uses its own connection: the production writer's
+            // commit hook continues to forbid callback-side commits.
+            rusqlite::Connection::open(connection.path().unwrap())
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER fail_event BEFORE INSERT ON run_events
+                 BEGIN SELECT RAISE(ROLLBACK, 'incomplete-event-callback'); END;",
+                )
+                .unwrap();
+        })),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn incomplete_unknown_callback_preserves_its_failure_and_releases_every_charge() {
+    let fx = fixture_with(incomplete_callback_options(true));
+    let batch = fx.batch("p", "incomplete", 1..=3).await;
+    let producer = fx.producer();
+    let bytes = accounted_bytes(&batch);
+    let submission = producer.submit(batch).unwrap();
+    assert_eq!(producer.retained(), (1, 3, bytes));
+    let failure = answered(submission).await.unwrap_err();
+    assert!(
+        failure
+            .error
+            .to_string()
+            .contains("SQLite storage operation failed"),
+        "{failure:?}"
+    );
+    assert_eq!(failure.committed, counts(0, 0));
+    assert_eq!(failure.not_stored, 3);
+    assert!(!failure.outcome_unknown);
+    producer.flush().await;
+    assert_eq!(producer.retained(), (0, 0, 0));
+    assert!(fx.reports().is_empty(), "no false commit report");
+    assert!(fx.stored("p", "incomplete").await.is_empty());
+    assert!(fx.storage.failure_state().failure().is_none());
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn incomplete_known_callback_preserves_its_failure_without_a_false_commit() {
+    let fx = fixture_with(incomplete_callback_options(false));
+    let producer = fx.producer();
+    let failure = answered(
+        producer
+            .submit(fx.batch("p", "known", 1..=3).await)
+            .unwrap(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        failure
+            .error
+            .to_string()
+            .contains("SQLite storage operation failed")
+    );
+    assert_eq!((failure.committed, failure.not_stored), (counts(0, 0), 3));
+    assert!(!failure.outcome_unknown);
+    producer.flush().await;
+    assert_eq!(producer.retained(), (0, 0, 0));
+    assert!(fx.reports().is_empty());
+    assert!(fx.stored("p", "known").await.is_empty());
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn successful_empty_and_duplicate_only_callbacks_still_commit() {
+    let fx = fixture();
+    let batch = fx.batch("p", "duplicates", 1..=3).await;
+    let duplicate = batch.clone();
+    let empty = fx.empty_batch("p", "empty").await;
+    let producer = fx.producer();
+    assert_eq!(
+        answered(producer.submit(batch).unwrap()).await.unwrap(),
+        counts(3, 0)
+    );
+    assert_eq!(
+        answered(producer.submit(duplicate).unwrap()).await.unwrap(),
+        counts(0, 3)
+    );
+    assert_eq!(
+        answered(producer.submit(empty).unwrap()).await.unwrap(),
+        counts(0, 0)
+    );
+    producer.flush().await;
+    assert_eq!(producer.retained(), (0, 0, 0));
+    assert_eq!(fx.reports().len(), 3);
+    assert_eq!(fx.reports()[1].accounting.rows, 0);
+    assert_eq!(fx.reports()[2].accounting.rows, 0);
+    assert_eq!(fx.stored("p", "duplicates").await.len(), 3);
+    assert!(fx.stored("p", "empty").await.is_empty());
+    producer.close().await;
+}
+
+async fn incomplete_callback_ioerr_recovery(hide_rollback: bool, failures: u64) {
+    use std::sync::atomic::AtomicBool;
+    let armed = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicU64::new(0));
+    let path = Arc::new(Mutex::new(None));
+    let mut options = incomplete_callback_options(hide_rollback);
+    let setup = options.writer_setup.take().unwrap();
+    let database = path.clone();
+    options.writer_setup = Some(Box::new(move |connection| {
+        *database.lock().unwrap() = Some(connection.path().unwrap().to_owned());
+        setup(connection);
+    }));
+    let active = armed.clone();
+    let seen = calls.clone();
+    options.write_observation_probe = Some(Arc::new(move || {
+        if !active.load(Ordering::SeqCst) {
+            return None;
+        }
+        let call = seen.fetch_add(1, Ordering::SeqCst);
+        if call == 0 {
+            // The trigger's real ROLLBACK already released the writer lock.
+            // Remove it so the next attempt has no intervening SQLite error
+            // that could legitimately break the consecutive IOERR streak.
+            rusqlite::Connection::open(path.lock().unwrap().as_ref().unwrap())
+                .unwrap()
+                .execute_batch("DROP TRIGGER fail_event")
+                .unwrap();
+        }
+        (call < failures).then(|| crate::sqlite::SqliteError::Sql(sql(10)))
+    }));
+    let fx = fixture_with(options);
+    let batch = fx.batch("p", "ioerr", 1..=3).await;
+    let rejected_after_failure = batch.clone();
+    let producer = fx.producer();
+    armed.store(true, Ordering::SeqCst);
+    let answer = answered(producer.submit(batch).unwrap()).await;
+    if failures == 1 {
+        assert_eq!(answer.unwrap(), counts(3, 0));
+        assert_eq!(fx.reports().len(), 1, "no report for the failed callback");
+        assert_eq!(fx.reports()[0].attempts, 2);
+        assert_eq!(fx.reports()[0].accounting.rows, 3);
+        assert_eq!(fx.stored("p", "ioerr").await.len(), 3);
+        assert!(
+            fx.storage.failure_state().failure().is_none(),
+            "one IOERR counted once"
+        );
+    } else {
+        let failure = answer.unwrap_err();
+        assert!(failure.error.to_string().contains("storage_unavailable"));
+        assert_eq!((failure.committed, failure.not_stored), (counts(0, 0), 3));
+        assert!(!failure.outcome_unknown);
+        assert!(fx.reports().is_empty(), "neither failed callback committed");
+        assert!(fx.stored("p", "ioerr").await.is_empty());
+        assert_eq!(
+            fx.storage.failure_state().failure().unwrap().causes,
+            vec![(
+                crate::sqlite::Role::Operation,
+                crate::sqlite::FatalCause::ConsecutiveIoErrors
+            )]
+        );
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "two fresh callbacks, no replay"
+    );
+    producer.flush().await;
+    assert_eq!(producer.retained(), (0, 0, 0));
+    if failures == 2 {
+        assert!(
+            matches!(
+                producer.submit(rejected_after_failure),
+                Err(Rejected::Closed(..))
+            ),
+            "the fatal noncommit must close intake immediately"
+        );
+    }
+    producer.close().await;
+}
+
+#[tokio::test]
+async fn incomplete_unknown_callback_rebuilds_only_after_noncommit_and_accounts_ioerr_once() {
+    incomplete_callback_ioerr_recovery(true, 1).await;
+}
+
+#[tokio::test]
+async fn incomplete_unknown_callback_keeps_the_streak_until_the_second_ioerr_latches() {
+    incomplete_callback_ioerr_recovery(true, 2).await;
+}
+
+#[tokio::test]
+async fn incomplete_known_callback_keeps_the_streak_until_the_second_ioerr_latches() {
+    incomplete_callback_ioerr_recovery(false, 2).await;
 }

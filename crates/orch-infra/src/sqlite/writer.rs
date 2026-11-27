@@ -299,14 +299,17 @@ fn execute_episode<T>(
             let error = finish_abandoned(connection, gate, state, episode, transaction, error);
             // A failed callback is never replayed. Only a producer retaining its
             // input may reconstruct after this confirmed rollback.
-            if episode.snapshot().0 == WriteOutcome::RolledBack
-                && let Some(code) = state.writer_retry()
-            {
+            if let Some(code) = state.writer_retry() {
+                // Count the failed physical attempt even without rollback-hook
+                // evidence. Reconciliation settles durability, never recounts
+                // the SQL failure. Unknown work takes its delay only on rebuild.
                 let delay = episode.failed(code, now())?;
-                let waiting = Instant::now();
-                let paused = episode.pause(delay, now, wait);
-                accounting.waiting += waiting.elapsed();
-                paused?;
+                if episode.snapshot().0 == WriteOutcome::RolledBack {
+                    let waiting = Instant::now();
+                    let paused = episode.pause(delay, now, wait);
+                    accounting.waiting += waiting.elapsed();
+                    paused?;
+                }
             }
             return Err(error);
         }
@@ -318,19 +321,20 @@ fn execute_episode<T>(
     });
     if let Some(error) = must_abort {
         let error = finish_abandoned(connection, gate, state, episode, transaction, error);
-        if episode.snapshot().0 == WriteOutcome::RolledBack
-            && let Some(code) = state.writer_retry()
-        {
+        if let Some(code) = state.writer_retry() {
             let delay = episode.failed(code, now())?;
-            let waiting = Instant::now();
-            let paused = episode.pause(delay, now, wait);
-            accounting.waiting += waiting.elapsed();
-            paused?;
+            if episode.snapshot().0 == WriteOutcome::RolledBack {
+                let waiting = Instant::now();
+                let paused = episode.pause(delay, now, wait);
+                accounting.waiting += waiting.elapsed();
+                paused?;
+            }
         }
         return Err(error);
     }
     transaction.set_drop_behavior(DropBehavior::Ignore);
     loop {
+        episode.mark_commit_attempted();
         gate.committing.store(true, Ordering::SeqCst);
         // Do not consume Transaction: a documented BUSY keeps exactly this
         // transaction active (sqlite.org/lang_transaction.html section 2.3).
@@ -477,6 +481,8 @@ fn abandon(
 type Job = Box<dyn FnOnce(&mut ConnectionHandle<'_>, &Gate) + Send>;
 
 struct State {
+    #[cfg(test)]
+    park_generation: u64,
     accepting: bool,
     queue: Schedule<Job>,
     // A retained logical operation still owns the executor's in-progress slot
@@ -582,6 +588,8 @@ impl<'a> Writer<'a> {
         let gate = Gate::install(&mut connection)?;
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
+                #[cfg(test)]
+                park_generation: 0,
                 accepting: true,
                 queue: Schedule::new(capacity),
                 continuation: None,
@@ -637,6 +645,11 @@ impl<'a> Writer<'a> {
                         // No running SQL remains: a retained producer can no
                         // longer submit. Close queued receipts on worker drop.
                         break None;
+                    }
+                    #[cfg(test)]
+                    {
+                        state.park_generation += 1;
+                        self.shared.available.notify_all();
                     }
                     state = self
                         .shared
