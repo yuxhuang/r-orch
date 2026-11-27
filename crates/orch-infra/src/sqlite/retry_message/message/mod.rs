@@ -11,7 +11,7 @@
 //! snapshot, before they are filtered, ordered, counted or cut.
 //!
 //! The helpers borrow the caller's connection or writer transaction, never
-//! commit it, and are not the Send-bound `UnitOfWork` facade. No clock is read:
+//! commit it, and are not the borrowed `UnitOfWork` facade. No clock is read:
 //! the time a blob registration is stamped is supplied by the caller, and so is
 //! `now` of `Filter::PendingMessages`.
 use std::borrow::Cow;

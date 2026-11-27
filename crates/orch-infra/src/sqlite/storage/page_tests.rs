@@ -51,3 +51,52 @@ fn team_pages_resume_original_tuple_with_count_and_cross_sort_refusal() {
         ))
     ));
 }
+
+#[test]
+fn config_and_template_stored_rows_resume_strictly_after_the_first_page() {
+    use orch_core::store::{ConfigEntry, TemplateEntry};
+    let (_temp, data) = crate::sqlite::test_data();
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrations::migrate(&data, &mut conn).unwrap();
+    let tx = conn.transaction().unwrap();
+    let mut sql = crate::sqlite::cctg::NativeSql::new(&tx, &disk, "p", None, 0);
+    for id in ["a", "b", "c"] {
+        sql.create(Entity::Config(ConfigEntry {
+            key: id.into(),
+            value: "stored".into(),
+        }))
+        .unwrap();
+        sql.create(Entity::Template(TemplateEntry {
+            name: id.into(),
+            body: "stored".into(),
+        }))
+        .unwrap();
+    }
+    let cursors = NonTaskCursors::new("g");
+    for f in [Filter::Config, Filter::Templates] {
+        let request = PageRequest {
+            limit: 1,
+            cursor: None,
+            sort: Sort::Default,
+            with_count: true,
+        };
+        let first = page::page(&tx, &disk, "p", &cursors, 0, &f, &request).unwrap();
+        assert_eq!(first.items[0].entity.id(), "a");
+        let second = page::page(
+            &tx,
+            &disk,
+            "p",
+            &cursors,
+            0,
+            &f,
+            &PageRequest {
+                cursor: first.next_cursor,
+                ..request
+            },
+        )
+        .unwrap();
+        assert_eq!(second.items[0].entity.id(), "b", "{f:?}");
+        assert_eq!(second.total, Some(3));
+    }
+}

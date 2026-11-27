@@ -124,6 +124,36 @@ pub trait ReadSnapshot:
 ///
 /// Errors leave that operation unchanged. Returning an error from `work`
 /// discards every operation, including positions and revision increments.
+///
+/// An owned callback can be sent to the writer, but the mutable unit it receives
+/// cannot be moved to a scoped thread (A3-W3):
+///
+/// ```compile_fail,E0277
+/// use orch_core::store::WriteWork;
+///
+/// let _work: WriteWork = Box::new(|unit| {
+///     std::thread::scope(|scope| {
+///         scope.spawn(move || {
+///             let _ = unit.caller();
+///         });
+///     });
+///     Ok(())
+/// });
+/// ```
+///
+/// The same callback can use its unit on the calling thread, including inside
+/// the scope:
+///
+/// ```
+/// use orch_core::store::WriteWork;
+///
+/// let _work: WriteWork = Box::new(|unit| {
+///     std::thread::scope(|_scope| {
+///         let _ = unit.caller();
+///     });
+///     Ok(())
+/// });
+/// ```
 pub trait UnitOfWork:
     attention::AttentionWrite
     + events::EventWrite

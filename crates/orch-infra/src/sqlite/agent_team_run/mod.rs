@@ -2023,6 +2023,45 @@ mod tests {
             Err(NativeError::Aborted)
         ));
         assert!(tx.is_autocommit());
+
+        // Keep the transaction-ended guard false so only poison can refuse this write.
+        tx.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(!tx.is_autocommit());
+        let result = sql.create(Entity::Team(Box::new(team())));
+        let rows: i64 = tx
+            .query_row("SELECT COUNT(*) FROM teams", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            matches!(result, Err(NativeError::Aborted)) && rows == 0,
+            "poisoned helper must refuse without writing: result={result:?}, rows={rows}"
+        );
+    }
+
+    #[test]
+    fn native_unpoisoned_helper_after_transaction_end_refuses_mutation_without_rows() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let disk = DiskBlobStore::open(data.root()).unwrap();
+        let mut conn = native_conn();
+        let tx = conn.transaction().unwrap();
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        sql.create(Entity::Agent(Box::new(agent()))).unwrap();
+
+        // The fresh helper after rollback has never observed a failing operation.
+        tx.execute_batch("ROLLBACK").unwrap();
+        assert!(tx.is_autocommit());
+        let mut sql = NativeSql::new(&tx, &disk, "p", 123);
+        let result = sql.create(Entity::Team(Box::new(team())));
+        let rows: i64 = tx
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM teams)+(SELECT COUNT(*) FROM agents)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            matches!(result, Err(NativeError::Aborted)) && rows == 0,
+            "ended transaction must refuse without writing: result={result:?}, rows={rows}"
+        );
     }
 
     #[test]

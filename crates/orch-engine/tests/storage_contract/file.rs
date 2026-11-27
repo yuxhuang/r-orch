@@ -98,6 +98,7 @@ async fn every_kind_corpus_loads_each_store_and_project_prompt_template() {
             .unwrap(),
         Some(Task {
             status: TaskStatus::Done,
+            created_at: "2025-01-01T00:00:00Z".into(),
             assignee: Some("agt_b".into()),
             goal_id: Some("goal_b".into()),
             ..contract::task("tsk_b")

@@ -2,7 +2,7 @@
 //! port, with whole diagnostics stored by R97.
 //!
 //! The helpers borrow the caller's connection or writer transaction, never
-//! commit it, and are not the Send-bound `UnitOfWork` facade: the combined
+//! commit it, and are not the borrowed `UnitOfWork` facade: the combined
 //! adapter binds the authenticated caller and the failure state around them.
 //! No clock is read; deadlines and the time a blob registration is stamped are
 //! supplied by the caller. Message and attempt mappings are not here: they need

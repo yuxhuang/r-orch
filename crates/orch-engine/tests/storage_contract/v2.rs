@@ -508,6 +508,9 @@ macro_rules! entity_suite {
             case!(run_attempt_pages_keep_snapshot_and_bind_every_query_field);
             case!(run_attempt_sort_refuses_every_unscoped_or_other_family_filter);
 
+            case!(runs_of_one_task_with_attempts_2_10_10_list_numerically_descending_with_binary_id_ties);
+            case!(filters_pages_and_cursors_agree_with_the_reference_for_all_three_families);
+
             case!(settings_and_templates_are_keyed_rows_listed_by_their_exact_key);
             case!(settings_and_templates_belong_to_their_project);
             case!(a_failed_unit_of_work_keeps_no_setting_or_template_row_or_position);
@@ -551,3 +554,22 @@ pub use consumers::{
     run_attempt_pages_keep_snapshot_and_bind_every_query_field,
     run_attempt_sort_refuses_every_unscoped_or_other_family_filter,
 };
+
+#[path = "v2_r142_public.rs"]
+mod r142_public;
+
+pub async fn runs_of_one_task_with_attempts_2_10_10_list_numerically_descending_with_binary_id_ties(
+    b: Backend,
+) {
+    r142_public::runs_of_one_task_with_attempts_2_10_10_list_numerically_descending_with_binary_id_ties(
+        b.storage.as_ref(),
+    )
+    .await;
+}
+
+pub async fn filters_pages_and_cursors_agree_with_the_reference_for_all_three_families(b: Backend) {
+    r142_public::filters_pages_and_cursors_agree_with_the_reference_for_all_three_families(
+        b.storage.as_ref(),
+    )
+    .await;
+}

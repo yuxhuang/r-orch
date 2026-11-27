@@ -196,6 +196,8 @@ pub async fn transaction_reads_see_own_intent_completion_and_roll_back(fixture: 
         assert_eq!(snap.read_intent(id).await.unwrap(), None);
     }
     assert!(snap.read_pending_intents(0, 3).await.unwrap().is_empty());
+    // The ids rolled back with the rows: nothing was spent.
+    assert_eq!(add_ok(s.as_ref(), P, blob(HASH), 50).await.id, 1);
 }
 
 pub async fn finish_and_deletion_roll_back_with_their_unit_of_work(fixture: Fixture) {
@@ -617,6 +619,61 @@ pub async fn completed_intents_are_kept_for_exactly_the_retention(fixture: Fixtu
     assert!(read(s.as_ref(), P, 1).await.is_none());
 }
 
+pub async fn retention_never_underflows_below_the_signed_minimum(fixture: Fixture) {
+    // One policy for every backend: a row is old enough when
+    // `done_at <= now - DONE_RETENTION_MS`, and when that subtraction would pass
+    // i64::MIN nothing is old enough. Saturating instead would delete the row
+    // finished at i64::MIN for every clock below i64::MIN + the retention.
+    let s = fixture.storage.clone();
+    let first = i64::MIN + DONE_RETENTION_MS;
+    add_ok(s.as_ref(), P, blob(HASH), i64::MIN).await;
+    add_ok(s.as_ref(), P, blob(HASH), i64::MIN).await;
+    add_ok(s.as_ref(), P, blob(HASH), i64::MIN).await;
+    finish(s.as_ref(), P, 1, i64::MIN).await.unwrap();
+    finish(s.as_ref(), P, 2, i64::MIN + 1).await.unwrap();
+    assert_eq!(
+        read(s.as_ref(), P, 1).await.unwrap().done_at,
+        Some(i64::MIN)
+    );
+    for now in [i64::MIN, i64::MIN + 1, first - 1] {
+        assert_eq!(delete_finished(s.as_ref(), P, now, 10).await.unwrap(), 0);
+        assert!(read(s.as_ref(), P, 1).await.is_some(), "now {now}");
+    }
+    // Exactly seven days after the minimum, only the row done at the minimum.
+    assert_eq!(delete_finished(s.as_ref(), P, first, 10).await.unwrap(), 1);
+    assert!(read(s.as_ref(), P, 1).await.is_none());
+    assert!(read(s.as_ref(), P, 2).await.is_some());
+    assert_eq!(
+        delete_finished(s.as_ref(), P, first + 1, 10).await.unwrap(),
+        1
+    );
+    // The pending row, also created at the minimum, stays however late it is.
+    assert_eq!(
+        delete_finished(s.as_ref(), P, i64::MAX, 10).await.unwrap(),
+        0
+    );
+    assert_eq!(pending(s.as_ref(), P).await.len(), 1);
+    // The top of the range is exact too: nothing finished at i64::MAX is old.
+    finish(s.as_ref(), P, 3, i64::MAX).await.unwrap();
+    assert_eq!(
+        delete_finished(s.as_ref(), P, i64::MAX, 10).await.unwrap(),
+        0
+    );
+    assert!(read(s.as_ref(), P, 3).await.is_some());
+}
+
+pub async fn ids_past_the_signed_range_read_as_absent(fixture: Fixture) {
+    let s = fixture.storage.clone();
+    add_ok(s.as_ref(), P, blob(HASH), 1).await;
+    for id in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+        assert!(read(s.as_ref(), P, id).await.is_none(), "{id}");
+        let snap = s.read(owner(P)).await.unwrap();
+        assert!(snap.read_pending_intents(id, 1).await.unwrap().is_empty());
+        assert!(is_invalid(finish(s.as_ref(), P, id, 2).await), "{id}");
+    }
+    assert_eq!(pending(s.as_ref(), P).await.len(), 1);
+}
+
 pub async fn a_pending_intent_is_never_deleted_by_retention(fixture: Fixture) {
     let s = fixture.storage.clone();
     add_ok(s.as_ref(), P, blob(HASH), 0).await;
@@ -753,6 +810,8 @@ macro_rules! intent_suite {
             case!(a_restore_ends_the_right_to_stop_but_keeps_what_was_written);
             case!(payloads_hold_ids_and_hashes_never_paths);
             case!(completed_intents_are_kept_for_exactly_the_retention);
+            case!(retention_never_underflows_below_the_signed_minimum);
+            case!(ids_past_the_signed_range_read_as_absent);
             case!(a_pending_intent_is_never_deleted_by_retention);
             case!(retention_deletes_the_oldest_ids_first_within_its_bound);
             case!(retention_over_the_bound_takes_several_calls);

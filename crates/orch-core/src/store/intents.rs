@@ -23,8 +23,11 @@
 //! dispatcher decides who may call. What they enforce is the lease boundary
 //! (R132). `process.start` and `process.stop` name the run of a lease that
 //! exists in the unit of work, under the current lineage, and a task principal
-//! may name only its own run and only with its own token; otherwise the call is
-//! refused with [`StoreError::StaleEpoch`], as a lease-bound call is. A restore
+//! may name only its own run, and only with the task, run, lineage and epoch of
+//! that lease (the lease's own fencing token, not an API credential); otherwise
+//! the call is refused with [`StoreError::StaleEpoch`], as a lease-bound call
+//! is. The lease is looked up in the unit of work, so it sees the lease
+//! changes the same unit made earlier and none that rolled back. A restore
 //! ends every lease, so it ends the right to add either; rows already written
 //! stay. The lease is read when the intent is added, so a cancel adds the stop
 //! intent before it releases the lease, in the same unit of work (R37).
@@ -36,7 +39,12 @@
 //! judge; this port has no generation and keeps the rows as they were written.
 //!
 //! Retention: a finished intent is kept [`DONE_RETENTION_MS`] and then deleted
-//! by [`IntentWrite::delete_finished_intents`], at most 1,000 rows a call.
+//! by [`IntentWrite::delete_finished_intents`], at most 1,000 rows a call. A
+//! row is old enough when `done_at <= now_ms - DONE_RETENTION_MS`, computed
+//! without saturating. When that subtraction would pass `i64::MIN`, no stored
+//! time is old enough and nothing is deleted, so a row finished at `i64::MIN`
+//! is kept until `now_ms` is exactly `i64::MIN + DONE_RETENTION_MS`. Every
+//! backend follows this one rule.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -207,7 +215,9 @@ pub trait IntentWrite {
     fn finish_intent(&mut self, id: u64, now_ms: i64) -> Result<FinishOutcome>;
     /// Deletes finished intents whose `done_at` is at least [`DONE_RETENTION_MS`]
     /// before `now_ms`, lowest id first, at most `max_rows` (1..=1,000), and
-    /// returns how many. Pending intents are never deleted.
+    /// returns how many. Pending intents are never deleted. If `now_ms` is
+    /// below `i64::MIN + DONE_RETENTION_MS` nothing is old enough: the call
+    /// deletes nothing and does not saturate.
     fn delete_finished_intents(&mut self, now_ms: i64, max_rows: usize) -> Result<usize>;
     fn get_intent(&self, id: u64) -> Result<Option<Intent>>;
     fn list_pending_intents(&self, after: u64, limit: usize) -> Result<Vec<Intent>>;

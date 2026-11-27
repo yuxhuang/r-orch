@@ -160,6 +160,16 @@ impl SqliteStorage {
                     let (reads, requests) = mpsc::sync_channel(options.read_connections);
                     let requests = Mutex::new(requests);
                     std::thread::scope(|scope| {
+                        // A construction unwind must stop already spawned workers
+                        // before the scope waits to join them.
+                        struct StopWorkers<'a>(&'a Shared, &'a WriterHandle);
+                        impl Drop for StopWorkers<'_> {
+                            fn drop(&mut self) {
+                                self.0.stop();
+                                self.1.close();
+                            }
+                        }
+                        let _stop = StopWorkers(&shared, &handle);
                         scope.spawn(move || writer.run());
                         for index in 0..options.read_connections {
                             let shared = shared.clone();
@@ -207,18 +217,22 @@ impl SqliteStorage {
     /// worker off the runtime. Safe even when other handles still exist.
     pub async fn close(&self) -> store::Result<()> {
         self.owner.stop();
-        let thread = self
-            .owner
-            .thread
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(thread) = thread {
-            tokio::task::spawn_blocking(move || thread.join())
-                .await
-                .map_err(|_| backend("SQLite close worker failed"))?
-                .map_err(|_| backend("SQLite worker panicked"))?;
-        }
+        let owner = self.owner.clone();
+        tokio::task::spawn_blocking(move || {
+            // Serialize concurrent close callers until the join completes.
+            let mut slot = owner
+                .thread
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(thread) = slot.take() {
+                thread
+                    .join()
+                    .map_err(|_| backend("SQLite worker panicked"))?;
+            }
+            Ok::<(), StoreError>(())
+        })
+        .await
+        .map_err(|_| backend("SQLite close worker failed"))??;
         Ok(())
     }
 }
@@ -228,6 +242,9 @@ fn backend(message: &str) -> StoreError {
 fn port<T>(result: Result<T>) -> store::Result<T> {
     result.map_err(|e| match e {
         SqliteError::Store(e) => e,
+        SqliteError::StorageUnavailable(_) => backend("storage_unavailable"),
+        SqliteError::Overloaded => backend("overloaded"),
+        SqliteError::WriterClosed => backend("SQLite writer is closed"),
         _ => backend("SQLite storage operation failed"),
     })
 }
@@ -330,6 +347,7 @@ fn read_worker(
                 if shared.stopping.load(Ordering::SeqCst) {
                     break;
                 }
+                shared.state.ensure_available()?;
                 let remaining = shared.idle.saturating_sub(idle.elapsed());
                 if remaining.is_zero() {
                     break;

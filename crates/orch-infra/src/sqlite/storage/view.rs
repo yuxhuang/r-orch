@@ -23,14 +23,18 @@ fn native_family(kind: EntityKind) -> cctg::Family {
         _ => cctg::Family::Goal,
     }
 }
-fn payload(entity: Entity) -> std::result::Result<Payload, Entity> {
-    Ok(match entity {
+enum RoutedEntity {
+    Router(Payload),
+    Native(Entity),
+}
+fn route(entity: Entity) -> RoutedEntity {
+    RoutedEntity::Router(match entity {
         Entity::Task(v) => Payload::Task(v),
         Entity::Agent(v) => Payload::Agent(v),
         Entity::Team(v) => Payload::Team(v),
         Entity::Run(v) => Payload::Run(v),
         Entity::Message(v) => Payload::Message(v),
-        other => return Err(other),
+        other => return RoutedEntity::Native(other),
     })
 }
 
@@ -164,18 +168,18 @@ impl store::UnitOfWork for Unit<'_, '_> {
     fn create(&mut self, entity: Entity) -> store::Result<Record> {
         let result = self
             .ensure_committable()
-            .and_then(|()| match payload(entity) {
-                Ok(p) => self.router.create(p),
-                Err(e) => self.native.create(e).map_err(Into::into),
+            .and_then(|()| match route(entity) {
+                RoutedEntity::Router(p) => self.router.create(p),
+                RoutedEntity::Native(e) => self.native.create(e).map_err(Into::into),
             });
         self.observed(result)
     }
     fn update(&mut self, entity: Entity, expected: Revision) -> store::Result<Record> {
         let result = self
             .ensure_committable()
-            .and_then(|()| match payload(entity) {
-                Ok(p) => self.router.update(p, expected),
-                Err(e) => self.native.update(e, expected).map_err(Into::into),
+            .and_then(|()| match route(entity) {
+                RoutedEntity::Router(p) => self.router.update(p, expected),
+                RoutedEntity::Native(e) => self.native.update(e, expected).map_err(Into::into),
             });
         self.observed(result)
     }
