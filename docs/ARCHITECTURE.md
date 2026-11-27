@@ -1248,20 +1248,45 @@ clients <── WriteReceipt::wait() ──────────────�
   caller can still reach with `SqliteError::callback_panic()`. A callback is trusted not to swallow an unwind itself.
 - **Queue.** `capacity` bounds the number of waiting transactions, not their bytes. A full queue, and a second
   waiting `Events` transaction, return `Overloaded` at once; the producer keeps its batch. Nothing coalesces
-  events yet.
+  events yet. A retained write that is rebuilt in an open episode takes the writer's one in-progress slot and does not
+  wait in the queue.
 - **Order.** `Lane` is `Claims`, `Entities`, `Events` or `Maintenance`. The worker takes the oldest waiting
-  `Claims` job first. Otherwise it takes the job with the earliest deadline, which is its arrival plus the lane's
+  `Claims` job first (but see "Retry and retained writes": while a retained write's episode is open the worker runs no queued job). Otherwise it takes the job with the earliest deadline, which is its arrival plus the lane's
   wait budget (entities 200 ms, events 1 s, maintenance 5 s), and the earlier arrival wins a tie. The budgets are
   priorities, not timeouts and not measured results (ADR 0017 decision 9).
-- **Request deadline.** `submit` takes an optional `Instant`. The worker checks it twice: just before `BEGIN`, and
-  again once `BEGIN IMMEDIATE` has obtained the write reservation. A request found expired at either check returns
-  `Overloaded` before its closure runs. At the second check the transaction is dropped, which rolls it back and
-  releases the reservation, so a request that expired while it waited for another connection's write lock never
+- **Request deadline.** `submit` takes an optional `Instant`. The worker checks it before each `BEGIN` attempt, once
+  `BEGIN IMMEDIATE` has obtained the write reservation, and between the pieces of a backoff wait. A request found
+  expired at any check returns `Overloaded` before its closure runs. After `BEGIN` the transaction is rolled back and
+  the reservation released, so a request that expired while it waited for another connection's write lock never
   commits (spec R128). The deadline is an admission check, not an interrupt. It does not shorten the busy wait
   inside `BEGIN IMMEDIATE`, which runs for up to the 5 s busy timeout whatever the deadline, and it does not stop a
   closure or a `COMMIT` that has started: both can finish after the deadline. A `BEGIN` that is still busy at the
-  timeout returns its SQL error to the receipt, not `Overloaded`, even when the deadline has passed. Classifying
-  that failure belongs to the retry work (R128, issue 127).
+  timeout is classified: when the deadline has passed the receipt is `Overloaded` and the closure has not run (a probe
+  with a 100 ms deadline and a 300 ms busy timeout was answered after 301 ms), and otherwise the `BEGIN` is tried
+  again (next bullet). A queued request is checked only when the worker reaches it.
+- **Retry and retained writes** (spec R128, record P; a development input at `2a7cb83e4`, not wired to the daemon).
+  The writer retries what it issues itself and never a closure. A failed `BEGIN IMMEDIATE` with a primary result of
+  `SQLITE_BUSY`, `SQLITE_LOCKED`, `SQLITE_FULL` or `SQLITE_IOERR` keeps the request, waits 50 ms doubling to 2 s on
+  the writer's thread, and tries again within the original deadline; the closure runs once. A `COMMIT` that fails with
+  `SQLITE_BUSY` while the same transaction is still active is issued again on it. Any other `COMMIT` failure is
+  observed, rolled back and judged by record L, and the outcome is `RolledBack` or `Unknown`; the connection being in
+  autocommit mode afterwards proves no noncommit. A closure that returns an error that carries a retryable-class
+  result, observed at the writer's source before the unit converted it, is rolled back and is not run again; a closure
+  that catches a clean nonfatal refusal of a leaf and returns success commits its unrelated work, and a logical refusal
+  it returns later is its own answer. The SQLite-only `RetainedWrite`
+  (`sqlite/storage/retained.rs`; `SqliteStorage::retained_write`) lets a producer that kept its input submit a new
+  closure after a confirmed noncommit and reconcile an unknown commit with a new snapshot of the bound caller;
+  `Storage::write` is one attempt of its own. One episode (`sqlite/writer/policy.rs`) spans a logical request, holds
+  its deadline and backoff, and while it is open the worker runs no queued job but the retained continuation, so claims
+  and every other lane wait: one logical operation owns the writer until its outcome is known (a built choice of the
+  source, stated in the spec). The worker retires an episode whose last outcome is a known noncommit at its original
+  deadline, between the producer's submissions; an unknown commit stays fenced until it is reconciled. A second
+  `SQLITE_IOERR` in a row, counted by the writer across logical requests and ended by a known commit or another SQL
+  failure, and sixty seconds from an episode's first failure without a known commit latch
+  `FatalCause::ConsecutiveIoErrors` and `FatalCause::RetryWithoutCommit`; the worker checks the sixty seconds every 50 ms. For each physical transaction
+  the writer counts the SQL changes and the execution time without its own waits, rollback included, and
+  `FailureState::writer_txn_over_bound_total()` rises once for more than 1,000 rows or 20 ms. A leaf's cleanup unwind is
+  outside all of this (record O).
 - **Receipts.** `wait` blocks and returns the closure's result. Dropping a receipt does not cancel the work: an
   accepted transaction still commits. Do not call `wait` on an async runtime thread. The internal event adapter
   (`sqlite/events/adapter.rs`) adapts it for event writes and prunes: `write_async` and `prune_async` queue the
@@ -1312,16 +1337,20 @@ clients <── WriteReceipt::wait() ──────────────�
 
 **Limits of this slice** (follow-ups tracked in [issue 127](https://github.com/yuxhuang/r-orch/issues/127)):
 
-- No retry and no replay: a SQL error goes to its receipt. The retry of R128's retryable class and its 60 s and
-  second-`IOERR` fatal rules are not built; the shared failure state, the classification of R128 and R140 and the
-  `StorageUnavailable` answer of a latched writer are (`sqlite/writer/failure.rs`).
+- No replay of a closure. The writer retries only its own `BEGIN` and a `SQLITE_BUSY` `COMMIT` on the same transaction;
+  every other SQL error goes to its receipt, after the policy's classification and its cleanup. The owner approved the
+  policy on 2026-11-27 (spec record P, plan "Writer retry policy"); the development implementation is the bullet "Retry
+  and retained writes" above, with the one open question that the spec lists, and no producer that rebuilds work exists yet.
+  The shared failure state, the classification of R128 and R140 and the `StorageUnavailable` answer of a latched writer
+  are in `sqlite/writer/failure.rs`.
 - A closure must not issue `COMMIT`, `BEGIN` or `SAVEPOINT`, or any side effect outside the database. The executor
   does not detect it; a manual `COMMIT` can persist rows although the wrapper then reports an error. Side effects
   belong in `intents` rows (ADR 0017 decision 10), which do not exist yet.
 - Claims always go first, so a steady stream of claims can delay every other lane. Bounded claim production is
   not implemented.
 - Nothing cuts bulk work to 1,000 rows or 20 ms, and nothing merges the event batches of several runs into one
-  transaction (ADR 0017 decision 9).
+  transaction (ADR 0017 decision 9): the writer only counts the actual rows and time of each transaction, and the event
+  producer (issue 127) owns the cut, the kept tail and the merge.
 - Nothing checkpoints the WAL while the executor runs: automatic checkpointing is off, and the checkpoint
   connection, the backlog counters and the interruption of long reads (R126, R127, R137) are not built. Wiring this to the daemon waits for them.
 - There is no query connection or authorizer for `orch db query` (R130) and no shutdown integration (R139).

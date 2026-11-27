@@ -134,6 +134,7 @@ pub use writer::contain::CallbackPanic;
 pub use writer::failure::{
     Class, Failure, FailureSource, FailureState, FatalCause, Observation, Role, classify,
 };
+pub use writer::policy::{RetryCode, WriteAccounting, WriteOutcome};
 pub use writer::{Lane, WriteReceipt, Writer, WriterHandle};
 
 #[cfg(test)]
@@ -246,4 +247,4 @@ mod non_task_cursor;
     reason = "Storage composition is being qualified before activation"
 )]
 mod storage;
-pub use storage::{SqliteStorage, StorageOptions};
+pub use storage::{RetainedWrite, SqliteStorage, StorageOptions, WriteAttempt};

@@ -2,6 +2,7 @@
 
 - Status: accepted. The owner approved the change on 2026-11-26 (record M of the storage spec's "Owner's answers");
   it takes effect when the owner merges the PR that carries it.
+  Decision 7 records the owner's ruling of 2026-11-27 on the writer's retry policy (record P).
 - Date: 2026-11-26
 - Spec: [SQLite storage for release 1.1](../specs/2026-11-20-sqlite-storage.md) ("Amendment 3: the unit of work
   stays on the writer's thread" under "Storage port v2"); plan:
@@ -76,6 +77,23 @@ Facts read from `main` at `075f2b124`:
    A3-W2, A3-W3 and A3-W6 of the spec, and A3-W7 to A3-W10 for the scope of the catch and the typed unwind in
    decision 5 (the plan's steps 2 and 2a say which PR shows which). The workspace compile check of the seven-bound
    diff (A3-W1) is a condition of the PR that carries this record.
+
+7. **A retry on the writer never replays a callback (record P, 2026-11-27).** The writer retries what it issues itself:
+   a failed `BEGIN IMMEDIATE` keeps the admitted request with its original deadline, and a failed `COMMIT` is tried again
+   on the same active transaction only where SQLite documents that retry as safe, otherwise the transaction is rolled back.
+   The callback of an admitted request is invoked at most once. A storage fault inside the callback's own body is surfaced,
+   classified, after the cleanup, and is not retried by the writer; work that must be redone is rebuilt as a new request by a
+   producer that kept its input, after a definitive noncommit, and an unknown commit outcome is reconciled before it submits
+   again. A leaf's savepoint cleanup that fails with a transient (non-fatal) result is not retried either: it is the nonfatal
+   pair of decision 5, so the worker ends, the requests are answered `WriterClosed` and nothing is latched (spec
+   "Amendment 3", "A transient cleanup", issue 410). This is the owner's approval of the writer's retry policy (spec R128, record P). A development implementation exists on
+   PR 411's writer member (source `2a7cb83e4`): it retries `BEGIN` and a `BUSY` `COMMIT` on the same transaction, runs
+   each callback at most once, and adds the SQLite-only `RetainedWrite` for a producer that rebuilds work after a
+   confirmed noncommit, so that the frozen traits and the seven bounds of this decision are unchanged. While one logical
+   operation is retained the writer runs no other queued job (a built choice) until its outcome is known or a known
+   noncommit is withdrawn at its original deadline. It is not
+   reviewed, not wired to the daemon and not the T10 acceptance; the spec's "As built: the retained writer" lists what it
+   does, the readings it builds and its one open question, and the plan's "Writer retry policy" gives the order and the vectors.
 
 ## Consequences
 
