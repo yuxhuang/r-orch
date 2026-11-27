@@ -213,3 +213,8 @@ debug = 0
 
 [profile.test]
 debug = 0
+
+# The physical storage corpus repeatedly hashes real 64–128 MiB values. Keep
+# every boundary case while avoiding SHA-256's unoptimized per-block overhead.
+[profile.test.package."sha2:0.10.9"]
+opt-level = 3
