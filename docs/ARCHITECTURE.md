@@ -1269,7 +1269,10 @@ clients <── WriteReceipt::wait() ──────────────�
     the transaction's end. If the transaction has ended when the closure returns, the request answers
     `TransactionAborted` and commits nothing, even when the closure then issued `BEGIN IMMEDIATE` and wrote more: a
     `BEGIN` inside the open transaction is an SQLite error (SQLite does not nest transactions), and one after it ended
-    opens a transaction that the executor never commits.
+    opens a transaction that the executor never commits. This is the answer for a closure that returned success. A
+    closure that returned an error keeps that error as the answer (`execute_episode` classifies it, rolls back and
+    returns it), and a latched failure state is checked first, so a latched writer answers `StorageUnavailable` and not
+    `TransactionAborted`.
   - A closure may open savepoints of its own, and the leaves do. Writes under a released savepoint commit with the
     request; `ROLLBACK TO` undoes only its own writes; a statement that fails alone leaves the transaction open.
   - A closure that returns success after it reported a fatal cause or a failed savepoint rollback to the shared failure
@@ -1290,19 +1293,23 @@ clients <── WriteReceipt::wait() ──────────────�
   waiting `Events` transaction, return `Overloaded` at once; the producer keeps its batch. The writer itself coalesces
   nothing: the event producer below does. A retained write that is rebuilt in an open episode takes the writer's one in-progress slot and does not
   wait in the queue.
-- **Order.** `Lane` (`orch_infra::sqlite::Lane`) is `Claims`, `Entities`, `Events` or `Maintenance`. The port has a second
-  enum with the same four names, `orch_core::store::Lane`, which is what a `Storage::write` or `retained_write` caller
-  names. The adapters convert it one for one into the writer's before they submit, in a `match` with no default arm
-  (`writer_lane` in `sqlite/leases/adapter.rs`; the same four arms in `RetainedWrite::attempt_unit`,
-  `sqlite/storage/retained.rs`), so a lane added to the port does not compile until it is mapped. The lease adapter's own
-  submissions do not take a lane from a caller: a lease change submitted on its own (claim, renewal, release) is a
-  `Claims` job (`LEASE_LANE`), and a lease release that is one step of a larger change, such as a finish, must be an
-  `Entities` job (`COMPOSED_RELEASE_LANE`, which only tests use so far) and not a second submission (tests in `sqlite/leases/contract_tests.rs`,
-  among them `port_lanes_map_one_to_one_onto_writer_lanes`). The daemon's `orch_daemon::coordinator::Lane` (`Ordinary`,
-  `Control`, `Internal`) is a third, unrelated enum for its operation boundary (§2.1 G2). The worker takes the oldest waiting
-  `Claims` job first (but see "Retry and retained writes": while a retained write's episode is open the worker runs no queued job). Otherwise it takes the job with the earliest deadline, which is its arrival plus the lane's
-  wait budget (entities 200 ms, events 1 s, maintenance 5 s), and the earlier arrival wins a tie. The budgets are
-  priorities, not timeouts and not measured results (ADR 0017 decision 9).
+- **Order.** `Lane` (`orch_infra::sqlite::Lane`) is `Claims`, `Entities`, `Events` or `Maintenance`. The port has a
+  second enum with the same four names, `orch_core::store::Lane`, which is what a `Storage::write` or `retained_write`
+  caller names. The caller's lane becomes the writer's in `RetainedWrite::attempt_unit`
+  (`sqlite/storage/retained.rs`), in a `match` with no default arm, so a lane added to the port does not compile until
+  it is mapped there. `SqliteStorage::write` matches the port lane a second time, on its own, to choose the admission
+  deadline of the request (50 ms, 200 ms, 1 s and 5 s; "Request deadline" below). The lease adapter takes no lane from
+  a caller. Its helper `writer_lane` (`sqlite/leases/adapter.rs`) is a third one-for-one `match` over the same four
+  lanes, and it only defines two constants: `LEASE_LANE`, the lane of a lease change submitted on its own (claim,
+  renewal, release), which is `Claims`; and `COMPOSED_RELEASE_LANE`, the lane of a lease release that is one step of a
+  larger change such as a finish, which must be an `Entities` job and not a second submission (only tests use it so
+  far; tests in `sqlite/leases/contract_tests.rs`, among them `port_lanes_map_one_to_one_onto_writer_lanes`). The
+  daemon's `orch_daemon::coordinator::Lane` (`Ordinary`, `Control`, `Internal`) is a third, unrelated enum for its
+  operation boundary (§2.1 G2). The worker takes the oldest waiting `Claims` job first (but see "Retry and retained
+  writes": while a retained write's episode is open the worker runs no queued job). Otherwise it takes the job with the
+  earliest deadline, which is its arrival plus the lane's wait budget (entities 200 ms, events 1 s, maintenance 5 s),
+  and the earlier arrival wins a tie. The budgets are priorities, not timeouts and not measured results (ADR 0017
+  decision 9).
 - **Request deadline.** `submit` takes an optional `Instant`. The worker checks it before each `BEGIN` attempt, once
   `BEGIN IMMEDIATE` has obtained the write reservation, and between the pieces of a backoff wait. A request found
   expired at any check returns `Overloaded` before its closure runs. After `BEGIN` the transaction is rolled back and
@@ -1433,7 +1440,7 @@ clients <── WriteReceipt::wait() ──────────────�
 - A failed read discards its connection, and the slot reopens on its next use. A connection returned inside an open
   transaction, including by a panic, is discarded the same way, so no reader inherits it. WAL readers do not block
   the writer.
-- **Active reads and the passive checkpoint (R127; `sqlite/read_pool/active.rs`, development source, not wired).** Every
+- **Active reads and the passive checkpoint (R127; `sqlite/read_pool/active.rs`, landed in PR #424 as `e087144be`, not wired to the daemon).** Every
   read of the pool, and so every owned snapshot of `Storage::read`, registers its transaction with a start time, an
   interrupt handle and an expiry flag. `ReadPool::checkpoint()`, and `SqliteStorage::checkpoint()`, which runs it on a
   blocking task, refuse first with a latched failure state (R140), then open a connection of their own
@@ -1465,9 +1472,11 @@ clients <── WriteReceipt::wait() ──────────────�
   with no effect of their own), but nothing performs a pending intent after the commit yet: the performer is plan T13.
   Transaction control is no longer on this list: a closure's `COMMIT`, `ROLLBACK` or `BEGIN` cannot make a row durable
   ("Atomicity of a request" above), and a savepoint of its own is allowed. What stays with the caller is the trust the
-  guard rests on. The executor classifies only what reaches it: the closure's returned error, the typed cleanup unwind of
-  a leaf, and what the closure reports with `FailureState::observe`. A closure that catches an SQLite error and returns
-  success without reporting it is not classified, and a closure is trusted not to swallow an unwind of its own
+  guard rests on. The executor classifies what reaches it from the closure: the closure's returned
+  error, the typed cleanup unwind of a leaf, and what the closure reports with `FailureState::observe`. Those are the
+  closure-side inputs, and a closure that catches an SQLite error and returns success without reporting it is not
+  classified. The executor also classifies the results of its own transaction control (`BEGIN`, `COMMIT` and the
+  rollback), which no closure can hide. A closure is trusted not to swallow an unwind of its own
   (`writer/contain.rs`).
 - Claims always go first, so a steady stream of claims can delay every other lane. Bounded claim production is
   not implemented.
