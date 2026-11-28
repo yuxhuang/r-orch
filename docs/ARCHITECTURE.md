@@ -1285,8 +1285,8 @@ clients <── WriteReceipt::wait() ──────────────�
   not a ruling of the owner. A request that carries a deadline (`Storage::write`: 50 ms for `Claims`, 200 ms for `Entities`, 1 s for `Events`, 5 s
   for `Maintenance`) is answered `Overloaded` when the worker reaches it past that deadline, which can be well after it, and
   a queued claim is answered the same way, because the check does not depend on the lane;
-  no time bound is given (the spec's "While one logical operation is retained"; since PR #443 a permanent test covers the lanes other
-  than claims for an expired deadline and for none, issue 429; a finite future deadline is issue 445). The worker retires an episode whose last outcome is a known noncommit at its original
+  no time bound is given (the spec's "While one logical operation is retained"; since PR #443 (issue 429) and PR #455 (issue 445) a permanent test covers the lanes other
+  than claims for an expired deadline, for none and for a finite one that is still in the future (3,600 s in the test); no test advances a clock across the original deadline). The worker retires an episode whose last outcome is a known noncommit at its original
   deadline, between the producer's submissions; an unknown commit stays fenced until it is reconciled. A second
   `SQLITE_IOERR` in a row, counted by the writer across logical requests and ended by a known commit or another SQL
   failure, and sixty seconds from an episode's first failure without a known commit latch
@@ -1298,9 +1298,9 @@ clients <── WriteReceipt::wait() ──────────────�
   are specific to the latter, and only the per-transaction accounting shows them). A leaf's cleanup unwind is
   outside all of this (record O).
 - **Event producer** (`sqlite/events/producer.rs`, exported from `orch_infra::sqlite`; spec "As built: the event producer",
-  plan "As built: the event producer, first form" and "As built: the event producer, encoded form"; a development member
-  of the draft train, read in its encoded form with the corrected order of receipts (spec bullet "When capacity comes
-  back"), which is the producer on the draft train and not on `main`; not wired to the daemon or to a collector; the daemon
+  plan "As built: the event producer, first form" and "As built: the event producer, encoded form"; landed in
+  PRs #420, #425 and #427, read in its encoded form with the corrected order of receipts (spec bullet "When capacity comes
+  back"); it is on `main` and no code of the daemon, the engine or the CLI calls it: not wired to the daemon or to a collector; the daemon
   still uses files).
   `EventProducer` is the first caller of `retained_write`, on the `Events` lane
   with no request deadline; while one of its writes has an episode open, the rule of the bullet above holds for it, so the
@@ -1408,7 +1408,7 @@ clients <── WriteReceipt::wait() ──────────────�
 - No replay of a closure. The writer retries only its own `BEGIN` (after `SQLITE_BUSY`, `SQLITE_LOCKED`, `SQLITE_FULL` or `SQLITE_IOERR`) and a `SQLITE_BUSY` `COMMIT` on the same transaction;
   every other SQL error goes to its receipt, after the policy's classification and its cleanup. The owner approved the
   policy on 2026-11-27 (spec record P, plan "Writer retry policy"); the implementation landed in PR #412 as `53136a969` and is the
-  bullet "Retry and retained writes" above, with the one open question that the spec lists, and one producer that rebuilds work, the event producer below ("Event producer"), which is a development member and not wired.
+  bullet "Retry and retained writes" above, with the one open question that the spec lists, and one producer that rebuilds work, the event producer below ("Event producer"), which is on `main` (PRs #420, #425 and #427) and is not wired to the daemon.
   The shared failure state, the classification of R128 and R140 and the `StorageUnavailable` answer of a latched writer
   are in `sqlite/writer/failure.rs`.
 - A closure must not issue `COMMIT`, `BEGIN` or `SAVEPOINT`, or any side effect outside the database. The executor
