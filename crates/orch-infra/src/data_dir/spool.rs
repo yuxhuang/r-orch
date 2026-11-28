@@ -13,7 +13,8 @@
 //! power-loss proof. Temporary files left by a killed publisher are blob scratch.
 use super::confined::{ConfinedDir, ConfinedError, FileAccess};
 use crate::blob::{BlobHash, INLINE_TEXT_MAX_BYTES};
-use orch_domain::{RunStatus, TokenUsage};
+use orch_core::RunUsage;
+use orch_domain::RunStatus;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
@@ -35,8 +36,48 @@ pub struct FinishRecord {
     pub status: RunStatus,
     pub finished_at: String,
     pub result: Option<FinishResult>,
-    pub usage: Option<TokenUsage>,
+    pub usage: Option<FinishUsage>,
     pub last_event_number: Option<u64>,
+}
+
+/// Serializable R86/R87 observation. Unlike legacy TokenUsage this preserves
+/// unreported counts as null, and retains the model and cached CLI version.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FinishUsage {
+    pub tokens_input: Option<i64>,
+    pub tokens_output: Option<i64>,
+    pub tokens_reasoning: Option<i64>,
+    pub tokens_cache_read: Option<i64>,
+    pub tokens_cache_write: Option<i64>,
+    pub model: Option<String>,
+    pub adapter_version: Option<String>,
+}
+impl From<RunUsage> for FinishUsage {
+    fn from(usage: RunUsage) -> Self {
+        Self {
+            tokens_input: usage.tokens_input,
+            tokens_output: usage.tokens_output,
+            tokens_reasoning: usage.tokens_reasoning,
+            tokens_cache_read: usage.tokens_cache_read,
+            tokens_cache_write: usage.tokens_cache_write,
+            model: usage.model,
+            adapter_version: usage.adapter_version,
+        }
+    }
+}
+impl From<FinishUsage> for RunUsage {
+    fn from(usage: FinishUsage) -> Self {
+        Self {
+            tokens_input: usage.tokens_input,
+            tokens_output: usage.tokens_output,
+            tokens_reasoning: usage.tokens_reasoning,
+            tokens_cache_read: usage.tokens_cache_read,
+            tokens_cache_write: usage.tokens_cache_write,
+            model: usage.model,
+            adapter_version: usage.adapter_version,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

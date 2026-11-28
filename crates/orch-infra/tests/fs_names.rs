@@ -1,5 +1,5 @@
 //! R101/R129 producer tests. Runtime transactions remain the engine's responsibility.
-use orch_domain::{RunStatus, TokenUsage};
+use orch_domain::RunStatus;
 use orch_infra::data_dir::{
     confined::ConfinedDir,
     spool::{FinishRecord, FinishResult, FinishSpool, ReplayDisposition, finish_file_name},
@@ -72,12 +72,16 @@ fn record(project: &str, run: &str) -> FinishRecord {
         status: RunStatus::Succeeded,
         finished_at: "2026-11-28T00:00:00Z".into(),
         result: Some(FinishResult::Inline("synthetic result".into())),
-        usage: Some(TokenUsage {
-            input: 2,
-            output: 3,
-            total: 5,
-            ..Default::default()
-        }),
+        usage: Some(
+            orch_core::RunUsage {
+                tokens_input: Some(2),
+                tokens_output: Some(3),
+                model: Some("synthetic-model".into()),
+                adapter_version: Some("synthetic-cli 1".into()),
+                ..Default::default()
+            }
+            .into(),
+        ),
         last_event_number: Some(17),
     }
 }
@@ -293,15 +297,23 @@ fn inline_results_are_bounded_by_bytes_and_large_results_use_published_blob_refe
         bytes: 65537,
     });
     assert!(spool.write(&finish).is_err());
-    // Blob publication is the caller's responsibility; the spool never opens this hash.
+    // Publish the large result first, as the runtime caller must do.
+    let blobs = orch_infra::blob::DiskBlobStore::open(&data).unwrap();
+    let payload = vec![b'x'; 65537];
+    let hash = blobs.put(&payload).unwrap();
     finish.result = Some(FinishResult::Blob {
-        hash: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+        hash: hash.to_string(),
         bytes: 65537,
     });
     spool.write(&finish).unwrap();
     spool
         .replay(|found| {
             assert_eq!(found, &finish);
+            let Some(FinishResult::Blob { hash, bytes }) = &found.result else {
+                panic!("blob reference lost")
+            };
+            assert_eq!(*bytes, 65537);
+            assert_eq!(blobs.get(&hash.parse().unwrap()).unwrap(), payload);
             Ok::<_, std::io::Error>(ReplayDisposition::Committed)
         })
         .unwrap();
@@ -514,4 +526,40 @@ async fn a4_finish_ids_survive_sqlite_port_reopen() {
     let storage = SqliteStorage::open(data, StorageOptions::default()).unwrap();
     read_vectors(&storage).await;
     storage.close().await.unwrap();
+}
+
+#[test]
+fn replay_preserves_null_and_zero_usage_model_and_cli_version() {
+    let (_temp, data) = fixture();
+    let spool = FinishSpool::open(&data).unwrap();
+    let observed = orch_core::RunUsage {
+        tokens_input: None,
+        tokens_output: Some(0),
+        tokens_reasoning: Some(7),
+        tokens_cache_read: None,
+        tokens_cache_write: Some(i64::MAX),
+        model: Some("synthetic-model".into()),
+        adapter_version: Some("synthetic-cli 1".into()),
+    };
+    let mut finish = record("project", "run");
+    finish.usage = Some(observed.clone().into());
+    spool.write(&finish).unwrap();
+    spool
+        .replay(|found| {
+            let persisted = found.usage.as_ref().unwrap();
+            assert_eq!(persisted.tokens_input, None);
+            assert_eq!(persisted.tokens_output, Some(0));
+            assert_eq!(persisted.tokens_reasoning, Some(7));
+            assert_eq!(persisted.tokens_cache_read, None);
+            assert_eq!(persisted.tokens_cache_write, Some(i64::MAX));
+            assert_eq!(persisted.model.as_deref(), Some("synthetic-model"));
+            assert_eq!(
+                persisted.adapter_version.as_deref(),
+                Some("synthetic-cli 1")
+            );
+            let restored: orch_core::RunUsage = found.usage.clone().unwrap().into();
+            assert_eq!(restored, observed);
+            Ok::<_, std::io::Error>(ReplayDisposition::Committed)
+        })
+        .unwrap();
 }
