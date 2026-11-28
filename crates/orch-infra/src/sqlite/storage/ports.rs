@@ -347,3 +347,110 @@ impl orch_core::store::retries::stream::RetryTextRead for Snapshot {
         result
     }
 }
+
+#[cfg(test)]
+mod retry_stream_io_tests {
+    use super::*;
+    use orch_core::store::retries::stream::Result;
+    use orch_core::store::retries::stream::*;
+    use orch_core::store::{Lane, Principal, StorageExt};
+    use tokio_util::sync::CancellationToken;
+    struct Sink {
+        fail: bool,
+    }
+    impl RetryTextSink for Sink {
+        fn begin(&mut self, _: RetryTextRow<'_>, _: &RetryStreamAdmission) -> Result<()> {
+            Ok(())
+        }
+        fn write(&mut self, _: &[u8], _: &RetryStreamAdmission) -> Result<()> {
+            if self.fail {
+                Err(RetryStreamError::Store(StoreError::Backend(
+                    orch_core::Error::Io {
+                        context: "synthetic sink failure".into(),
+                        path: None,
+                        source: std::io::ErrorKind::PermissionDenied.into(),
+                    },
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[tokio::test]
+    async fn object_io_retires_the_snapshot_but_sink_io_is_only_its_own_error() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let storage = super::super::SqliteStorage::open(
+            std::sync::Arc::new(data),
+            super::super::tests::without_admission_expiry(),
+        )
+        .unwrap();
+        let caller = Caller {
+            project: "p".into(),
+            principal: Principal::Owner {
+                identity: "synthetic".into(),
+            },
+        };
+        storage
+            .transaction(caller.clone(), Lane::Entities, |u| {
+                u.put_retry(&Retry {
+                    task: "a".into(),
+                    attempt: 1,
+                    due_at: 1,
+                    error: "x".repeat(65_537),
+                })
+            })
+            .await
+            .unwrap();
+        let snapshot = storage.snapshot(caller.clone()).await.unwrap();
+        storage.owner.shared.disk.fail_next_stream_read();
+        assert!(matches!(
+            snapshot
+                .read_retry_text(
+                    None,
+                    1,
+                    Box::new(Sink { fail: false }),
+                    CancellationToken::new()
+                )
+                .await,
+            Err(RetryStreamError::Store(_))
+        ));
+        // The fault is one-shot; a swallowed native IO would leave this same
+        // snapshot live and incorrectly make this call succeed.
+        assert!(matches!(
+            snapshot
+                .read_retry_text(
+                    None,
+                    1,
+                    Box::new(Sink { fail: false }),
+                    CancellationToken::new()
+                )
+                .await,
+            Err(RetryStreamError::Store(_))
+        ));
+        let snapshot = storage.snapshot(caller).await.unwrap();
+        assert!(matches!(
+            snapshot
+                .read_retry_text(
+                    None,
+                    1,
+                    Box::new(Sink { fail: true }),
+                    CancellationToken::new()
+                )
+                .await,
+            Err(RetryStreamError::Store(_))
+        ));
+        // A sink's own file failure must not retire a healthy database reader.
+        snapshot
+            .read_retry_text(
+                None,
+                1,
+                Box::new(Sink { fail: false }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(storage.owner.shared.retry_admission.used_bytes(), 0);
+        drop(snapshot);
+        storage.close().await.unwrap();
+    }
+}

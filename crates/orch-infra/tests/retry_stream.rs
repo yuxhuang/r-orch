@@ -416,7 +416,7 @@ async fn all_adapters_hold_actual_worker_memory_after_future_drop_and_cancel_wit
             let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let calls = callbacks.clone();
             let (entered, waiting) = tokio::sync::oneshot::channel();
-            let task = tokio::spawn(async move {
+            let mut task = Some(tokio::spawn(async move {
                 worker
                     .read_retry_text(
                         None,
@@ -430,13 +430,18 @@ async fn all_adapters_hold_actual_worker_memory_after_future_drop_and_cancel_wit
                         cancellation,
                     )
                     .await
-            });
+            }));
             let admission = tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
                 .await
                 .unwrap()
                 .unwrap();
             if drop_waiter {
-                task.abort();
+                let waiter = task.take().unwrap();
+                waiter.abort();
+                // abort requests cancellation; awaiting the join proves the
+                // future and its child-token drop guard have actually dropped.
+                assert!(waiter.await.unwrap_err().is_cancelled());
+                assert!(!token.is_cancelled());
             } else {
                 token.cancel();
             }
@@ -453,12 +458,9 @@ async fn all_adapters_hold_actual_worker_memory_after_future_drop_and_cancel_wit
                 *lock.lock().unwrap() = true;
                 condition.notify_all();
             }
-            if drop_waiter {
-                assert!(task.await.unwrap_err().is_cancelled());
-                assert!(!token.is_cancelled());
-            } else {
+            if let Some(waiter) = task {
                 assert!(matches!(
-                    task.await.unwrap(),
+                    waiter.await.unwrap(),
                     Err(RetryStreamError::Cancelled)
                 ));
             }

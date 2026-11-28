@@ -50,6 +50,8 @@ pub struct DiskBlobStore {
     sha256: ConfinedDir,
     tmp: ConfinedDir,
     hooks: Box<dyn Hooks>,
+    #[cfg(test)]
+    fail_stream_read: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for DiskBlobStore {
@@ -85,7 +87,19 @@ impl DiskBlobStore {
         let tmp = blobs.ensure_dir("tmp")?;
         blobs.sync()?;
         data_root.sync()?;
-        Ok(Self { sha256, tmp, hooks })
+        Ok(Self {
+            sha256,
+            tmp,
+            hooks,
+            #[cfg(test)]
+            fail_stream_read: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_stream_read(&self) {
+        self.fail_stream_read
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Stores the bytes and returns their hash; a blob already stored, and intact, is not written again.
@@ -267,6 +281,89 @@ impl BlobStreamHasher for StreamHasher {
     }
 }
 
+impl DiskBlobStore {
+    /// Preserve native disk-I/O origin privately. Consumer callback failures
+    /// bypass this observation; the public blob/stream error stays unchanged.
+    pub(crate) fn read_windowed_observed(
+        &self,
+        hash: &BlobHash,
+        window: &mut [u8],
+        cancel: &CancellationToken,
+        consume: &mut dyn FnMut(&[u8]) -> StreamResult<()>,
+        observed: &mut Option<io::ErrorKind>,
+    ) -> StreamResult<()> {
+        let mut access = |error: BlobError| {
+            match &error {
+                BlobError::Io(e) | BlobError::Confined(ConfinedError::Io(e))
+                    if e.kind() != io::ErrorKind::NotFound =>
+                {
+                    *observed = Some(e.kind());
+                }
+                _ => {}
+            }
+            stream_access(error)
+        };
+
+        if cancel.is_cancelled() {
+            return Err(RetryStreamError::Cancelled);
+        }
+        #[cfg(test)]
+        if self
+            .fail_stream_read
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(access(BlobError::Io(
+                io::ErrorKind::PermissionDenied.into(),
+            )));
+        }
+        if window.is_empty() || window.len() > RETRY_STREAM_WINDOW_BYTES {
+            return Err(RetryStreamError::Resource);
+        }
+        let (ab, cd, name) = names(hash);
+        let mut file = self
+            .shard(&ab, &cd)
+            .and_then(|dir| dir.open_file(&name, FileAccess::Read))
+            .map_err(|e| access(missing(hash, e)))?;
+        let length = file.metadata().map_err(|e| access(e.into()))?.len();
+        if length > MAX_BLOB_BYTES {
+            return Err(RetryStreamError::Corrupt);
+        }
+        let mut digest = Sha256::new();
+        let mut seen = 0u64;
+        loop {
+            if cancel.is_cancelled() {
+                return Err(RetryStreamError::Cancelled);
+            }
+            let n = match file.read(window) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(access(e.into())),
+            };
+            if n == 0 {
+                break;
+            }
+            seen = seen
+                .checked_add(n as u64)
+                .ok_or(RetryStreamError::Resource)?;
+            if seen > length {
+                return Err(RetryStreamError::Corrupt);
+            }
+            digest.update(&window[..n]);
+            if cancel.is_cancelled() {
+                return Err(RetryStreamError::Cancelled);
+            }
+            consume(&window[..n])?;
+        }
+        if seen != length || BlobHash::from_digest(digest.finalize().into()) != *hash {
+            return Err(RetryStreamError::Corrupt);
+        }
+        if cancel.is_cancelled() {
+            return Err(RetryStreamError::Cancelled);
+        }
+        Ok(())
+    }
+}
+
 impl orch_core::store::blob::BlobStore for DiskBlobStore {
     type Hash = BlobHash;
     type Error = BlobError;
@@ -298,54 +395,7 @@ impl orch_core::store::blob::BlobStore for DiskBlobStore {
         cancel: &CancellationToken,
         consume: &mut dyn FnMut(&[u8]) -> StreamResult<()>,
     ) -> StreamResult<()> {
-        if cancel.is_cancelled() {
-            return Err(RetryStreamError::Cancelled);
-        }
-        if window.is_empty() || window.len() > RETRY_STREAM_WINDOW_BYTES {
-            return Err(RetryStreamError::Resource);
-        }
-        let (ab, cd, name) = names(hash);
-        let mut file = self
-            .shard(&ab, &cd)
-            .and_then(|dir| dir.open_file(&name, FileAccess::Read))
-            .map_err(|e| stream_access(missing(hash, e)))?;
-        let length = file.metadata().map_err(|e| stream_access(e.into()))?.len();
-        if length > MAX_BLOB_BYTES {
-            return Err(RetryStreamError::Corrupt);
-        }
-        let mut digest = Sha256::new();
-        let mut seen = 0u64;
-        loop {
-            if cancel.is_cancelled() {
-                return Err(RetryStreamError::Cancelled);
-            }
-            let n = match file.read(window) {
-                Ok(n) => n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(stream_access(e.into())),
-            };
-            if n == 0 {
-                break;
-            }
-            seen = seen
-                .checked_add(n as u64)
-                .ok_or(RetryStreamError::Resource)?;
-            if seen > length {
-                return Err(RetryStreamError::Corrupt);
-            }
-            digest.update(&window[..n]);
-            if cancel.is_cancelled() {
-                return Err(RetryStreamError::Cancelled);
-            }
-            consume(&window[..n])?;
-        }
-        if seen != length || BlobHash::from_digest(digest.finalize().into()) != *hash {
-            return Err(RetryStreamError::Corrupt);
-        }
-        if cancel.is_cancelled() {
-            return Err(RetryStreamError::Cancelled);
-        }
-        Ok(())
+        self.read_windowed_observed(hash, window, cancel, consume, &mut None)
     }
     fn with_stream_hasher(
         &self,

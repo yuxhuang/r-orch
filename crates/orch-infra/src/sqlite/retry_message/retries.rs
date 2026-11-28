@@ -541,6 +541,54 @@ impl From<RetryStreamError> for BoundedRetryError {
         Self::Public(e)
     }
 }
+// Observation belongs to one selected operation, never a process-global slot.
+// Only the disk adapter can record origin; a sink may return the same public
+// backend class and must not retire the database snapshot.
+struct ObservedRetryDisk<'a> {
+    disk: &'a DiskBlobStore,
+    io: std::sync::Mutex<Option<std::io::ErrorKind>>,
+}
+impl orch_core::store::blob::BlobStore for ObservedRetryDisk<'_> {
+    type Hash = crate::blob::BlobHash;
+    type Error = crate::blob::BlobError;
+    fn put(&self, bytes: &[u8]) -> std::result::Result<Self::Hash, Self::Error> {
+        self.disk.put(bytes)
+    }
+    fn get(&self, hash: &Self::Hash) -> std::result::Result<Vec<u8>, Self::Error> {
+        self.disk.get(hash)
+    }
+    fn remove(&self, hash: &Self::Hash) -> std::result::Result<bool, Self::Error> {
+        self.disk.remove(hash)
+    }
+    fn read_windowed(
+        &self,
+        hash: &Self::Hash,
+        window: &mut [u8],
+        cancel: &CancellationToken,
+        consume: &mut dyn FnMut(&[u8]) -> orch_core::store::retries::stream::Result<()>,
+    ) -> orch_core::store::retries::stream::Result<()> {
+        let mut native_io = None;
+        let result =
+            self.disk
+                .read_windowed_observed(hash, window, cancel, consume, &mut native_io);
+        if let Some(kind) = native_io {
+            *self
+                .io
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(kind);
+        }
+        result
+    }
+    fn with_stream_hasher(
+        &self,
+        work: &mut dyn FnMut(
+            &mut dyn orch_core::store::blob::BlobStreamHasher,
+        ) -> orch_core::store::retries::stream::Result<()>,
+    ) -> orch_core::store::retries::stream::Result<()> {
+        self.disk.with_stream_hasher(work)
+    }
+}
+
 struct AdmittedRetry {
     task: String,
     attempt: u32,
@@ -708,15 +756,30 @@ pub(in crate::sqlite) fn bounded_retry_page(
                     consume(part)?;
                 }
             }
-            Stored::Blob(blob) => verify_retry_objects(
-                disk,
-                &blob.sha256,
-                blob.chunks.iter().map(|c| (c.sha256.as_str(), c.size)),
-                blob.bytes,
-                window.as_mut_slice(),
-                cancel,
-                &mut consume,
-            )?,
+            Stored::Blob(blob) => {
+                let objects = ObservedRetryDisk {
+                    disk,
+                    io: std::sync::Mutex::new(None),
+                };
+                let result = verify_retry_objects(
+                    &objects,
+                    &blob.sha256,
+                    blob.chunks.iter().map(|c| (c.sha256.as_str(), c.size)),
+                    blob.bytes,
+                    window.as_mut_slice(),
+                    cancel,
+                    &mut consume,
+                );
+                if let Some(kind) = objects
+                    .io
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    return Err(SqliteError::Io(kind.into()).into());
+                }
+                result?;
+            }
         }
     }
     check_cancel(cancel)?;
