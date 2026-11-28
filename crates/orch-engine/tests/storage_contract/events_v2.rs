@@ -430,6 +430,23 @@ pub async fn repeated_gap_is_idempotent_and_conflict_changes_nothing(storage: Ar
         })
         .await
         .unwrap();
+    // Each distinct identity must retain its own gap, not merely accept the write.
+    for (project, run, dropped) in [("other", "run", 9), ("p", "another", 8)] {
+        assert_eq!(
+            storage
+                .read(caller(project))
+                .await
+                .unwrap()
+                .read_event_gaps(run)
+                .await
+                .unwrap(),
+            vec![EventGap {
+                after_seq: 5,
+                dropped,
+            }],
+            "gap readback for project {project}, run {run}",
+        );
+    }
     assert_eq!(
         storage
             .read(caller("p"))
