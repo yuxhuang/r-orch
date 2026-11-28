@@ -2,6 +2,13 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+// This fixture has no config.yml. Frozen preflight defaults contribute 18
+// settings: project (2), agent (7), task (2), scheduling (4), prompt (1),
+// peer (2), including optional nulls. The run cap replaces its scheduling key;
+// the inert legacy.config row adds one, and the fixture has one template.
+const DEFAULT_CONFIG_ROWS: usize = 19;
+const FIXTURE_ROWS: usize = DEFAULT_CONFIG_ROWS + 1;
+
 fn run(root: &Path, args: &[&str]) -> Output {
     run_at_home(root, args, &root.join("data"))
 }
@@ -73,7 +80,7 @@ fn native_template_import_and_resume_are_explicitly_unfinished() {
         let output = run(root.path(), args);
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value["imported"], 1);
+        assert_eq!(value["imported"], FIXTURE_ROWS);
         assert_eq!(value["unfinished"], true);
         assert!(!root.path().join("source/.orch-project").exists());
         assert_eq!(
@@ -314,7 +321,7 @@ fn missing_data_home_parents_are_created_only_after_preflight() {
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(home.is_dir());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["imported"], 1);
+    assert_eq!(value["imported"], FIXTURE_ROWS);
 }
 
 fn database(root: &Path) -> std::path::PathBuf {
@@ -371,10 +378,15 @@ fn native_command_resume_checks_all_retained_hashes_before_admitting_new_rows() 
         first["templates"],
         serde_json::json!([["z", "synthetic body", 1, 1]])
     );
-    assert_eq!(first["manifest"].as_array().unwrap().len(), 1);
-    assert_eq!(first["manifest"][0][0], "template");
-    assert_eq!(first["manifest"][0][1], "z");
-    assert_eq!(first["manifest"][0][2].as_str().unwrap().len(), 64);
+    let manifest = first["manifest"].as_array().unwrap();
+    assert_eq!(manifest.len(), FIXTURE_ROWS);
+    assert_eq!(
+        manifest.iter().filter(|row| row[0] == "config").count(),
+        DEFAULT_CONFIG_ROWS
+    );
+    let template = manifest.iter().find(|row| row[0] == "template").unwrap();
+    assert_eq!(template[1], "z");
+    assert_eq!(template[2].as_str().unwrap().len(), 64);
     let progress: serde_json::Value =
         serde_json::from_str(first["progress"][0][1].as_str().unwrap()).unwrap();
     assert_eq!(progress["status"], "unfinished");
@@ -398,7 +410,10 @@ fn native_command_resume_checks_all_retained_hashes_before_admitting_new_rows() 
     assert_eq!(run(root.path(), &["--resume"]).status.code(), Some(1));
     let restored = logical(root.path());
     assert_eq!(restored["templates"].as_array().unwrap().len(), 2);
-    assert_eq!(restored["manifest"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        restored["manifest"].as_array().unwrap().len(),
+        FIXTURE_ROWS + 1
+    );
     assert_eq!(restored["templates"][0], first["templates"][0]);
     assert!(!root.path().join("source/.orch-project").exists());
 }
@@ -576,7 +591,7 @@ sys.stdin.readline();c.rollback();c.close()"#,
     assert!(!root.path().join("source/.orch-project").exists());
     let rows = logical(root.path());
     assert_eq!(rows["templates"].as_array().unwrap().len(), 1);
-    assert_eq!(rows["manifest"].as_array().unwrap().len(), 1);
+    assert_eq!(rows["manifest"].as_array().unwrap().len(), FIXTURE_ROWS);
 }
 
 #[test]
@@ -671,7 +686,7 @@ fn existing_destination_with_an_aliased_parent_resumes_on_the_native_writer() {
             .unwrap();
         assert_eq!(output.status.code(), Some(1), "{output:?}");
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(value["imported"], 1, "{value}");
+        assert_eq!(value["imported"], FIXTURE_ROWS, "{value}");
         assert_eq!(value["unfinished"], true);
     }
     let output = python(root.path()).args(["-c", "import sqlite3,sys,json; c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); print(json.dumps([c.execute('SELECT count(*),min(revision),max(revision) FROM templates').fetchone(),c.execute('SELECT count(*) FROM import_manifest').fetchone()])); c.close()"])
@@ -679,7 +694,7 @@ fn existing_destination_with_an_aliased_parent_resumes_on_the_native_writer() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
-        serde_json::json!([[1, 1, 1], [1]])
+        serde_json::json!([[1, 1, 1], [FIXTURE_ROWS]])
     );
 }
 
