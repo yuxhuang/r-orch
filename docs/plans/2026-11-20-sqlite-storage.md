@@ -258,7 +258,8 @@ the file reference as a dev-only dependency. The name alignment for R7, R117
 and the caller part of R132, the frozen-trait record and the pending-message,
 run-order and retry-text decisions belong to issue 109 and are in "T8 consumer
 contracts (issue 109)" below; this name reconciliation changes none of them. Full
-T8 acceptance still requires the accepted operational integration and issue
+T8 acceptance is recorded, with its scope and the R56 limit, under "Full T8" in "T10 acceptance record"
+below; before that record it required the accepted operational integration and issue
 109's consumer dispositions. macOS is tracked in After 2.0 under the owner's
 Linux-only direction through 2.0.
 
@@ -1619,8 +1620,9 @@ This subsection records what the acceptance of T10 rests on. It is read from `ma
 from the hosted runs it names and from the Linux runs of its first table. It accepts the SQLite storage adapter and
 nothing around it. The adapter is on `main` and unwired, the daemon still uses files, and this text activates, wires,
 merges or releases nothing: T12, the importer and every later consumer keep their own gates, and the tables below say
-which proofs stay with them. The "T10 verification selections" above end by saying that a passing selection is not the
-T10 acceptance; this is the record they point to.
+which proofs stay with them. It also records the disposition of full T8 on the same tree ("Full T8" below). The "T10
+verification selections" above end by saying that a passing selection is not the T10 acceptance; this is the record they
+point to.
 
 **What this change closes.** The description of the pull request that adds this subsection carries five standalone
 closing lines, for issues 166, 167, 286, 379 and 409, and none for another issue. Each is backed by its own paragraph
@@ -1635,14 +1637,18 @@ packages #503, #504, #505, #507, #508, #509, #514 and #515. Each of those PRs ha
 with conditions"; the conditions that concern this record are carried below. `main` is still `550fa43ad`: its push run
 46135776569 passed `check`, `test` and `ambient` on the first attempt.
 
-**Runs for this record.** Linux, a fresh checkout of `550fa43ad`, `cargo test --locked --offline`, first run of each, no
-failure and no retry. Counts were not copied from an earlier record.
+**Runs for this record.** Linux, a fresh checkout of `550fa43ad`, first run of each, no failure and no retry. Counts were
+not copied from an earlier record. The author's runs used `cargo test --offline`; only the single-test selections and the
+physical R142 runs also passed `--locked`. The `sqlite_migrations` and `compile_fail` runs have no recorded command line.
+The independent review then ran the whole-target and batch selections of the table below with `cargo test --locked
+--offline` (every run exited 0 and the counts matched), which shows that `Cargo.lock` needed no change; it did not rerun
+the `compile_fail` doctest.
 
 | Run | Result at `550fa43ad` |
 |---|---|
 | `-p orch-engine --test storage_conformance` (the whole target) | 481 passed, 0 failed |
 | `-p orch-engine --test storage_conformance -- sqlite_` (the eight registrations) | 135 passed, 0 failed, 0 ignored |
-| Each suite on memory, file and SQLite | identical on all three: `v2` 30, attention 14, events 8, intents 26, leases 20, operations 4, request keys 12, retries 21 (SQLite 135). The reference-only rows are `queued_memory_v2` 30, `blob_memory_retries_v2` 21 and `file_backend` 17 |
+| Each suite on memory, file and SQLite | identical on all three: `v2` 30, attention 14, events 8, intents 26, leases 20, operations 4, request keys 12, retries 21 (SQLite 135). The reference-only rows are `queued_memory_v2` 30, `blob_memory_retries_v2` 21 and `file_backend` 17; eight further tests belong to two fixture groups, seven in `file::` and one in `v2_writer`, so the 481 are 405 (3 × 135) + 68 + 8 |
 | `-p orch-infra --lib -- sqlite::writer::` / `sqlite::read_pool::` / `sqlite::storage::` | 71 / 13 / 97 passed, 0 failed, 0 ignored |
 | `-p orch-infra --test` `sqlite_connection` / `sqlite_writer_policy` / `sqlite_public_writer` | 8 / 23 / 11 passed |
 | `-p orch-infra --test` `sqlite_crash` / `sqlite_storage_crash` | 3 passed, 1 ignored / 5 passed, 1 ignored (the private child process of each) |
@@ -1672,7 +1678,8 @@ of the push run above are the gate, and these runs are the author's own reading 
 
 **Issue 286.** The two single-guard runs of the whole review were made at `24c40bcf4`, and the native source changed
 afterwards (#475) and so did the bridge tests (#467, #475, #480, #490, #499), so they were run again on `550fa43ad`.
-With `self.poisoned || self.tx.is_autocommit()` in `NativeSql::ensure_committable` as it is, the 58 native tests pass.
+With `self.poisoned || self.tx.is_autocommit()` in `NativeSql::ensure_committable` as it is, the 58 native tests
+(`cargo test -p orch-infra --lib native_`) pass.
 Without the poison term, `native_rollback_failure_retains_both_errors_and_poison_blocks_later_writes` fails (a late team
 row is written; 56 passed, 2 failed, the other failure being `native_selection_refuses_poisoned_helper`) and the
 ended-transaction test passes. Without the ended-transaction term,
@@ -1737,10 +1744,47 @@ eight later commits are #504 to #515). Each row is a pass or carries an owner's 
 residual work name T12, T13, T15, T16, T17, T22, T23 and T24. The issue was closed and reopened on 2026-11-23, and the
 owner closes it by hand. No line of this change or of its description may close it.
 
+**Full T8.** The T8 acceptance is positive on `550fa43ad` (tree `214c8a372`), for the storage port, the SQLite adapter's
+obligations from the T8 consumer contracts (issue 109), and the memory and file references. The evidence is an independent
+audit of ten rows made on that tree with its own runs; the T8 milestone has no open issue (#109, #130, #204, #216 and #228
+are closed). The earlier hold on full T8 asked for the shared conformance and the first consumer on the composed SQLite
+adapter; the composition (#385) and the qualified whole (#427) are that consumer, and both are on `main`.
+
+| Row | What shows it | Result |
+|---|---|---|
+| Registration | `storage_conformance` registers eight SQLite suites; the whole target is 481 passed, 0 failed, 0 ignored (135 on SQLite, as in the table above); memory, file and SQLite have the same count for each shared suite | pass |
+| #130 crosswalk | each of the 17 bare filters (R8 to R15, R97) lists exactly its expected registrations, SQLite included | pass |
+| Pending messages | status, the exact recipient and the byte-wise expiry run on the four entity registrations, including the 1,100-row filter-before-count case; the SQL narrows by status and recipient, and Rust compares the hydrated expiry bytes. Changing `>=` to `>` fails the SQLite case and passes restored | pass |
+| `Sort::Attempt` | numeric descending, id bytes ascending, per task only; the index and the numeric-attempt tests pass | pass |
+| Whole retry text | inline up to 65,536 bytes, one object up to 64 MiB, ordered chunks above; a later-chunk failure leaves no row and no registration; the SQLite retry tests pass (67 with `sqlite::retry_message`) | pass |
+| Physical R97 and faults | the retry fault tests, the message damage tests and the other seven families of `r142_physical` (22 passed, debug profile) | pass |
+| Due retries after a restore | a 2,501-row restore, then a due read at `i64::MAX` returns the first 1,000 rows through its own statement. Ordering ties by `task_id DESC` in that statement alone fails this test while the shared complete walk still passes; restored, it passes | pass |
+| Request-key ties | equal expiry is ordered by the full scope | pass |
+| List order | positions, `move_to_end` and no reuse of a position, on SQLite | pass |
+| References | 346 reference cases inside the 481; the historical pin held 332 | pass |
+
+Three wording limits are accepted. (1) The due-statement test is a private component test and its restore is a database
+copy; the shared lineage restore on SQLite proves only the complete walk, so two tests together carry the claim and no
+single test does both through the port. (2) The plan's earlier text for the pending-message statement says
+`expires_at IS NULL OR expires_at >= ?now`; as built the expiry is compared in Rust on the hydrated bytes after an SQL
+superset on status and recipient, which is the same byte comparison. (3) No single test combines a prior row, a failure on a
+later chunk and a caught commit; the parts are each proved.
+
+**The limit of the T8 acceptance, R56.** Agent rotation is not credited to T8. The only rotation conformance case is the 1.0
+file-backend `equal_score_selections_rotate_after_run_lifecycle_saves`; the file R56 names,
+`crates/orch-engine/tests/order_conformance.rs`, does not exist on `550fa43ad`. Under port v2 rotation is the scheduler's
+ordinal over positions, which T14 builds and proves on both backends (`::tied_agents_rotate`,
+`::dispatch_order_matches_1_0`). T8 grants no proof of runtime rotation. It also grants none of a crash between
+publication and commit, an interruption inside `COMMIT`, a power loss, the blob sweep, a file-copy backup or restore (T23),
+the 1.0 import (T21), or any runtime caller (T12, T14). The audit made two single-line mutations (the due-statement
+tie order and the pending-message expiry comparison), each restored, and the R142 physical tests ran in the debug profile:
+this is no mutation matrix.
+
 **Carried, not closed by this change.** Each stays open on its issue; none blocks the acceptance.
 
 | Issue | Carried by | Released by |
 |---|---|---|
+| Process kill through `Storage` for events, leases and request keys (the residual of the T10 acceptance named under "T10 verification selections") | T27's crash gate | one named test per family that kills a process through `Storage`, or a recorded reason for it; no such kill test exists for any of the three |
 | #439 (medium) | T16's first event producer, or the correction in draft PR #437 | a deterministic real-producer check that catches the known-error receipt before the capacity refund (the existing test caught it in 80 of 100 mutant runs) |
 | #449 (medium) | T15, T16, T19 and T21 by the issue's item list; T12 and T23 cite it | each item's own trigger |
 | #461 (medium) | test engineer with the writer's builder | item 1 (a prior latch, then genuine expiry still answers `snapshot_expired`; no test pins it) at the next snapshot-expiry change or before T24 wires the read pool |
@@ -1755,14 +1799,17 @@ owner closes it by hand. No line of this change or of its description may close 
 | #203, #223 | T17 (`commit_seq`); T13 and T24 | their own issue text |
 | #99, #126, #209, #252, #265, #273, #308, #322, #391, #457, #498 | T12, T13, T15, T16, T17, T18, T19, T21 to T24 and T26, as the adjudication of the whole review assigned them | each at its own milestone |
 | #392, #397 | After 1.1 | the performance ruling; the Task-principal provenance |
-| #104 (high) | T21 (importer proofs), T23 (restore witness), T24 (startup and closure) | T10's own part holds: `sqlite/connection.rs` is unchanged since #173 (`67e358bf8`), its `compile_fail` doctest blocks extracting a raw connection, and the three mismatched-root migration tests pass |
+| #104 (high) | T21 (importer proofs), T23 (restore witness), T24 (startup and closure) | T10's own part holds: `sqlite/connection.rs` is unchanged since #173 (`67e358bf8`), its `compile_fail` doctest blocks extracting a raw connection, and the two mismatched-root migration tests and the matching-root control (`sqlite_migrations`) pass |
 | #229, #283, #360, #378, #384, #402, #407, #408, #418, #419, #474 | the owner's process | closure is supported by the reviews but no PR has closed them: each needs a closure or a recorded decision to leave it open |
 
-**Limits that stay.** No proof of an interruption inside `COMMIT` or of a power loss. The production reachability of the
+**Limits that stay.** No proof of an interruption inside `COMMIT` or of a power loss, and no process kill through `Storage`
+for events, leases or request keys (the crash gate of T27 carries it, as the Carried table says). The production reachability of the
 #447 precondition (a missing rollback hook with autocommit restored) is not shown: only a fixture that hides the hook
 reaches it. #461's first item is untested: no test covers queued siblings on a genuine expiry after a prior latch, and
 the tests that kill a mutant of `Snapshot::dropped` are #448's, not #461's. The cause of #512 is unknown; the privileged
-run of #511 has never been made. The first Task-authenticated production call is issue 397.
+run of #511 has never been made. The first Task-authenticated production call is issue 397. The observation-only discriminator of issue 367 was not shown
+again on the test that #480 rewrote (`deliberately_swallowed_router_cleanup_unwind_arms_real_writer_guard`): it has no new
+result, and the earlier discriminator and the broader control of #480 stand as recorded.
 
 ## Status
 
@@ -1771,7 +1818,7 @@ run of #511 has never been made. The first Task-authenticated production call is
 | T1 | first-review text (`f5637805`) implemented in PR 1, `fast` on macOS, and merged to `main` by the owner on 2026-11-21; this corrected text, with the review corrections and the owner's answers, implemented in a follow-up PR that is pending its reviews and the owner's merge. The spec is not approved by either. Since then: the corrected text (`34b3b4d`) reached `main` on 2026-11-22 (UTC) through that follow-up PR, and the deferral of 2026-11-21 (the spec's record I) is implemented in a further documentation PR that is pending its review and its merge. This revision changes no document's status (`draft`, `proposed`) |
 | T4 | dropped as an entry step by the owner on 2026-11-21. The first run of 2026-11-20 is recorded in [issue 98](https://github.com/yuxhuang/r-orch/issues/98) and is not delivered to `main` |
 | T4b | deferred by the owner on 2026-11-21; not run |
-| T10, first slice (writer and read pool) | implemented as an unwired foundation in PR 122 (`b67dbfa44`, merged 2026-11-22), with its module tests; the follow-ups of issue 127 are open. When this row was written the rest of T10 was pending behind T8b and T8c ("T10 split"). The deadline recheck and the bounded writer tests landed in PR 154 (`8afcbe02`, 2026-11-22). Status on 2026-11-28, read from `git log` of `main` at `23ffdc838` and not a result of this plan: the rest of the writer side is on `main` as well, still unwired and not yet accepted for T10 at that date (the daemon uses files): the bounded writer test cleanup (PR 169, `eb79206d3`), the executor's hooks (PR 188, `9a68f1498`) and the shared failure state (PR 249, `8d79976df`), the lease adapter (PRs 211, 232 and 245), the composed `Storage` adapter (PR 385, `964e1144a`), the retained writer (PR 412, `53136a969`) and the event producer (PRs 420 and 427). Issue 127 and the T10 acceptance stayed open at that date; the acceptance is recorded in "T10 acceptance record" above, and issue 127 stays open for the owner to close |
+| T10, first slice (writer and read pool) | implemented as an unwired foundation in PR 122 (`b67dbfa44`, merged 2026-11-22), with its module tests; the follow-ups of issue 127 are open. When this row was written the rest of T10 was pending behind T8b and T8c ("T10 split"). The deadline recheck and the bounded writer tests landed in PR 154 (`8afcbe02`, 2026-11-22). Status on 2026-11-28, read from `git log` of `main` at `23ffdc838` and not a result of this plan: the rest of the writer side is on `main` as well, still unwired and not yet accepted for T10 at that date (the daemon uses files): the bounded writer test cleanup (PR 169, `eb79206d3`), the executor's hooks (PR 188, `9a68f1498`) and the shared failure state (PR 249, `8d79976df`), the lease adapter (PRs 211, 232 and 245), the composed `Storage` adapter (PR 385, `964e1144a`), the retained writer (PR 412, `53136a969`) and the event producer (PRs 420 and 427). Issue 127 and the T10 acceptance stayed open at that date; the storage acceptance and the scoped full-T8 disposition are recorded in "T10 acceptance record" above, and issue 127 stays open for the owner to close |
 | Linux-only scope (the spec's record K) | recorded on 2026-11-23 by one documentation PR that is pending its review and the owner's merge: the spec, this plan, ADR 0017, the lease prototype's spec, the spec TEMPLATE, ARCHITECTURE §13 and AGENTS.md carry it. Nothing was verified on a platform: no code and no CI changed. The first independent review blocked its first head on three points: the Linux sleep/wake check of R42 (issue 110) was withdrawn with the macOS one, R16, R88 and R136 still named macOS, and the branch conflicted with `main`. The text was corrected for them and re-synchronised with `main` keeping the rows of both sides; the corrected text awaits a second review |
 | T10, internal lease adapter (issue 127 N1 to N4) | The damaged-epoch error, the lane mapping and the optional request deadline are merged (#211, #232) and their tests pass on Linux at `af0d43acd` (38 module tests). The spec's "Lease adapter contracts" records them. Unwired: only the module's tests call the adapter, and the daemon uses files. This documentation landed as PR 245 (`65b82036d`, 2026-11-23), and PR 385 registered the shared lease suite on SQLite (`sqlite_leases_v2`, 20 cases). Pending behind it, as of 2026-11-28: T12's start and finish transactions, T13's cancel, pause and permanent-failure transactions, T15's lease expiry, T22's `orch db verify` and the R128 and R140 classification. Issue 127 is not closed |
 | T10, internal goal adapter | Goal reads, creates, updates, deletes and explicit moves use the executor. Module tests cover transactions, snapshots, reopen and file-reference behavior for supported inputs. Public conformance still requires timestamp and counter compatibility, imported position high-water marks, and text/blob handling. PR 318 (open, draft, on PR 317; kept as history, its repaired content carried by the combined PR 338, which is not merged yet) rewrites the adapter as a thin wrapper over the native driver of the four families (step 4 of "T10 entity format"): the staged helper `entity.rs` and its tests are removed, both timestamps are kept as their original strings, and the module's 15 tests cover the lifecycle against the file reference and a reopen, original timestamps, snapshots, rollback and its poisoning, counters, a drifted projection, a zero stored and a zero surviving position, an unsupported detail format, and a caught failure inside a move and inside a delete. On its first head `730b72c4e` the module had 10 tests, which passed; the five last named are registered in the source of `e45545321` (branch `feature/sqlite-goal-adapter-repaired-public`) and the module's 15 tests passed in the integrator's Linux run on a private head whose code is byte-identical to that source (counts in the row below). What it still lacks is listed in the row below. |
