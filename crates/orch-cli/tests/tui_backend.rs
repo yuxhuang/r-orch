@@ -1276,55 +1276,170 @@ async fn a_refresh_reads_the_daemons_current_state_every_time() {
 
 // ── no daemon (goal row 3; spec R4–R6) ───────────────────────────────────
 
-/// The daemon going away under an open dashboard ends the session: the next
-/// call fails, the loss latch holds the frozen message, and the draw loop's
-/// stop flag is up so `tui::command` can show the no-daemon screen. Nothing
-/// is retried and nothing is started.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_daemon_going_away_ends_the_session_with_the_frozen_message() {
+/// A test-only transport gate. Handshake/bootstrap still reach the real
+/// synthetic daemon; closing one lane cannot accidentally close another.
+struct LossGate {
+    close: Option<tokio::sync::oneshot::Sender<()>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl LossGate {
+    async fn disconnect(&mut self) {
+        self.close.take().expect("close once").send(()).unwrap();
+        (&mut self.task).await.expect("transport closed");
+    }
+}
+
+impl Drop for LossGate {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Launch opens the observation lane first, then the foreground request lane.
+/// Later background sessions use the ordinary connector without a gate.
+fn gated_loss_connector(
+    daemon: &TestDaemon,
+) -> (
+    orch_cli::tui::Connector,
+    tokio::sync::mpsc::UnboundedReceiver<LossGate>,
+) {
+    let config = daemon.client_config();
+    let opened = std::sync::atomic::AtomicUsize::new(0);
+    let (gates, receive) = tokio::sync::mpsc::unbounded_channel();
+    let connector = orch_cli::tui::Connector::new(daemon.root().to_path_buf(), false, move || {
+        let gated = opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2;
+        let config = config.clone();
+        let gates = gates.clone();
+        Box::pin(async move {
+            if !gated {
+                return orch_client::Client::connect(&config).await;
+            }
+            let project = config.project().expect("synthetic project");
+            let mut server = tokio::net::UnixStream::connect(config.socket.as_ref().unwrap())
+                .await
+                .expect("synthetic daemon socket");
+            let (client, mut relay) = tokio::io::duplex(65536);
+            let (close, closed) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                tokio::select! {
+                    _ = closed => {}
+                    result = tokio::io::copy_bidirectional(&mut relay, &mut server) => {
+                        result.expect("relay synthetic daemon traffic");
+                    }
+                }
+            });
+            gates
+                .send(LossGate {
+                    close: Some(close),
+                    task,
+                })
+                .unwrap_or_else(|_| panic!("loss gate receiver dropped before launch"));
+            orch_client::Client::from_stream(project, client, config.caller, config.mode).await
+        })
+    });
+    (connector, receive)
+}
+
+/// Exercise both interleavings explicitly. A request on a closed lane may
+/// fail before the observation pump sees EOF; neither error may overwrite
+/// the first frozen diagnostic. No daemon shutdown timing decides the result.
+async fn check_session_loss_order(observation_first: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let temp = project_tree().await;
     let daemon = TestDaemon::start_default(temp.path()).await;
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (connector, mut gates) = gated_loss_connector(&daemon);
+    let stop = Arc::new(AtomicBool::new(false));
     let backend = DaemonBackend::launch(
-        daemon.connector(),
+        connector,
         "9.9.9",
         daemon.root().to_path_buf(),
         Arc::clone(&stop),
     )
     .await
     .expect("launch");
-    let root = daemon.root().display().to_string();
+    let mut observation = gates.recv().await.expect("observation gate");
+    let mut request = gates.recv().await.expect("request gate");
     let loss = backend.session_loss();
-    daemon.shutdown().await;
+    let root = daemon.root().display().to_string();
+
+    if observation_first {
+        observation.disconnect().await;
+        // Wait for the pump to record EOF before attempting a foreground call.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !stop.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("observation pump recorded loss without a foreground call");
+    } else {
+        request.disconnect().await;
+    }
 
     let (backend, refreshed) = on_draw_thread(backend, |backend| backend.refresh_tasks()).await;
-    let refreshed = refreshed.expect_err("a call after the daemon stopped succeeded");
-    eprintln!("after stop: {refreshed}");
-    // The feed notices too, even with no call in flight.
-    for _ in 0..300 {
-        if stop.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(
-        stop.load(std::sync::atomic::Ordering::SeqCst),
-        "the draw loop was not stopped"
+    assert_eq!(
+        refreshed.unwrap_err(),
+        "the orch daemon is no longer reachable"
     );
+    assert!(stop.load(Ordering::SeqCst), "the draw loop was not stopped");
     let message = loss.failure().expect("the loss is recorded");
-    assert!(
-        message.starts_with(&format!("  ✕ No orch daemon is running for {root} (")),
-        "{message}"
-    );
-    assert!(
-        message.ends_with("Start it with: orch daemon start"),
-        "{message}"
-    );
+    let expected = if observation_first {
+        format!(
+            "  ✕ No orch daemon is running for {root} (connection lost)\n    Start it with: orch daemon start"
+        )
+    } else {
+        format!(
+            "  ✕ Cannot confirm the orch request outcome for {root} (request outcome unknown)\n    the request may have been applied; inspect state before retrying."
+        )
+    };
+    assert_eq!(message, expected);
 
-    // Every later call fails fast without touching a socket.
+    // Deliver the other loss afterwards: the first text must stay frozen.
+    if observation_first {
+        request.disconnect().await;
+    } else {
+        observation.disconnect().await;
+    }
     let (_backend, later) = on_draw_thread(backend, |backend| backend.refresh_goals()).await;
     assert_eq!(later.unwrap_err(), "the orch daemon is no longer reachable");
-    drop(temp);
+    assert_eq!(loss.failure().as_deref(), Some(message.as_str()));
+    daemon.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_daemon_going_away_ends_the_session_with_the_frozen_message() {
+    check_session_loss_order(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_lost_before_the_observation_freezes_the_unknown_outcome_warning() {
+    check_session_loss_order(false).await;
+}
+
+/// The pump can record after the foreground call returns. Exercise the latch
+/// synchronously too, so this assertion cannot pass by outrunning that task.
+#[test]
+fn session_loss_keeps_the_first_failure_in_both_orders() {
+    use orch_cli::tui::backend::SessionLoss;
+    use orch_proto::error::NoDaemonDetail;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let render =
+        |detail| orch_client::NoDaemon::no_daemon("synthetic-project", detail).render(false);
+    let observation = render(NoDaemonDetail::ConnectionLost);
+    let request = render(NoDaemonDetail::RequestOutcomeUnknown);
+    for (first, second) in [(&observation, &request), (&request, &observation)] {
+        let stop = Arc::new(AtomicBool::new(false));
+        let loss = SessionLoss::new(Arc::clone(&stop));
+        assert_eq!(loss.failure(), None);
+        assert!(!stop.load(Ordering::SeqCst));
+        loss.record(first.clone());
+        assert!(stop.load(Ordering::SeqCst));
+        loss.record(second.clone());
+        assert_eq!(loss.failure().as_ref(), Some(first));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
