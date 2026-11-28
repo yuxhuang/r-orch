@@ -1523,10 +1523,11 @@ fn a_failed_step_leaves_the_old_row_and_references_readable_even_when_caught() {
     }
     // A failure that ends the whole transaction poisons it for later work.
     tx.execute_batch("CREATE TRIGGER abort BEFORE INSERT ON project_config WHEN NEW.key='fatal' BEGIN SELECT RAISE(ROLLBACK,'synthetic'); END").unwrap();
-    assert!(matches!(
-        db.create(cfg("fatal", "x")),
-        Err(NativeError::Rollback { .. })
-    ));
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.create(cfg("fatal", "x"))
+    }))
+    .unwrap_err();
+    assert!(unwind.is::<crate::sqlite::writer::contain::CleanupUnwind>());
     assert!(matches!(
         db.create(cfg("after", "x")),
         Err(NativeError::Aborted)

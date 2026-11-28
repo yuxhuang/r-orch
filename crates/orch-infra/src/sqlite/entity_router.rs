@@ -54,13 +54,6 @@ pub(super) fn native(error: NativeError) -> SqliteError {
         NativeError::Encoding => SqliteError::Unrepresentable("entity encoding".into()),
         NativeError::ClaimedIdentity => SqliteError::Unrepresentable("claimed run identity".into()),
         NativeError::Aborted => SqliteError::TransactionAborted,
-        NativeError::Rollback {
-            operation,
-            rollback,
-        } => SqliteError::OperationRollback {
-            operation: Box::new(native(*operation)),
-            rollback,
-        },
     }
 }
 
@@ -329,10 +322,7 @@ impl<'a, 'conn> EntityWrite<'a, 'conn> {
                 Ok(()) => Err(operation),
                 Err(rollback) => {
                     self.poisoned = true;
-                    Err(SqliteError::OperationRollback {
-                        operation: Box::new(operation),
-                        rollback,
-                    })
+                    crate::sqlite::writer::contain::cleanup_failed(operation, rollback)
                 }
             },
         };
@@ -382,6 +372,8 @@ mod operational;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod adapter_failure_tests;
 #[cfg(test)]
 mod contain_tests;
 #[cfg(test)]

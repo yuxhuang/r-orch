@@ -315,6 +315,51 @@ mod tests {
         write.receive().await.unwrap()
     }
 
+    #[tokio::test]
+    async fn refused_commit_does_not_mark_the_next_callback_only_failure_as_committed() {
+        let (_root, data) = crate::sqlite::test_data();
+        let mut first = true;
+        let storage = SqliteStorage::open(
+            Arc::new(data),
+            StorageOptions {
+                // Hide rollback evidence to exercise the defensive Unknown path.
+                // ROLLBACK below is real SQLite; FULL and IOERR are injected.
+                writer_setup: Some(Box::new(|connection| {
+                    connection.rollback_hook(None::<fn()>).unwrap();
+                })),
+                writer_commit_probe: Some(Box::new(move |_| {
+                    if first {
+                        first = false;
+                        // Executor reached COMMIT, but this probe refuses it
+                        // while the transaction remains open for real rollback.
+                        return Some(Err(rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+                            None,
+                        )));
+                    }
+                    None
+                })),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut write = storage.retained_write(owner(), store::Lane::Events, None);
+        let first = write.attempt(Box::new(|_| Ok(()))).await.unwrap();
+        assert_eq!(first.outcome, WriteOutcome::RolledBack);
+        assert_eq!(first.retry_code, Some(RetryCode::Full));
+        assert!(first.retryable());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let second = incomplete_unknown_receipt(&mut write, calls.clone(), false).await;
+        assert_eq!(second.outcome, WriteOutcome::Unknown);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !write.reconcile_encoded(Arc::new(Vec::new())).await.unwrap(),
+            "the second attempt never reached COMMIT; the first attempt's flag must not leak"
+        );
+        drop(write);
+        storage.close().await.unwrap();
+    }
+
     async fn incomplete_unknown_ioerr_streak(separate_episodes: bool, caught: bool) {
         let (_root, data) = crate::sqlite::test_data();
         let storage = SqliteStorage::open(
@@ -690,7 +735,8 @@ mod tests {
             store::Lane::Events,
             store::Lane::Maintenance,
         ] {
-            for expired in [false, true] {
+            for deadline_kind in ["absent", "future", "expired"] {
+                let expired = deadline_kind == "expired";
                 let (_root, data) = crate::sqlite::test_data();
                 let mut first = true;
                 let storage = SqliteStorage::open(
@@ -724,7 +770,11 @@ mod tests {
 
                 // An already-passed deadline is admitted into the real queue:
                 // it is the worker, after retirement, that must withdraw it.
-                let deadline = expired.then(|| Instant::now() - Duration::from_secs(1));
+                let deadline = match deadline_kind {
+                    "expired" => Some(Instant::now() - Duration::from_secs(1)),
+                    "future" => Some(Instant::now() + Duration::from_secs(3600)),
+                    _ => None,
+                };
                 let mut queued = storage.retained_write(owner(), lane, deadline);
                 let calls = Arc::new(AtomicUsize::new(0));
                 let seen = calls.clone();
@@ -776,12 +826,27 @@ mod tests {
                             .is_err()
                     );
                 } else {
-                    assert_eq!(answer.outcome, WriteOutcome::Committed);
+                    assert_eq!(
+                        answer.outcome,
+                        WriteOutcome::Committed,
+                        "{lane:?} {deadline_kind} request must commit after retirement"
+                    );
                     assert!(answer.result.is_ok());
                     assert_eq!(calls.load(Ordering::SeqCst), 1);
                 }
                 assert!(!state.claims_suppressed());
                 assert!(state.failure().is_none());
+                let snapshot = storage.read(owner()).await.unwrap();
+                assert_eq!(
+                    snapshot
+                        .get(EntityKind::Team, "queued")
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    !expired,
+                    "{lane:?} {deadline_kind} durability before trailing transaction"
+                );
+                drop(snapshot);
                 storage
                     .transaction(owner(), store::Lane::Maintenance, |unit| {
                         unit.create(team("after"))
@@ -812,6 +877,7 @@ mod tests {
                         .is_some()
                 );
                 drop(snapshot);
+                assert_eq!(calls.load(Ordering::SeqCst), usize::from(!expired));
                 drop(queued);
                 storage.close().await.unwrap();
             }

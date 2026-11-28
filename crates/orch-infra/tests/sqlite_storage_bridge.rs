@@ -11,9 +11,9 @@
 //! What each leaf proves alone stays with its leaf: the two native guards in
 //! `agent_team_run` (poison with a transaction open, a fresh helper on an ended
 //! transaction) and the typed-cause cases of `sqlite_writer_policy`. The tests
-//! here prove the composition: the whole `UnitOfWork` refuses once any helper in
-//! it has lost its savepoint, the outer commit is refused even when the callback
-//! caught every error, and nothing the request did is durable.
+//! here prove the composition: returned cleanup failures poison the whole unit,
+//! while Task, Agent/Team/Run and native cctg cleanup failures unwind and retire the writer. Neither path
+//! commits the failed request, including when the callback intended to return Ok.
 use orch_core::storage::ContextEntry;
 use orch_core::store::{
     Caller, ConfigEntry, Entity, EntityKind, Filter, Lane, PageRequest, Principal, Record,
@@ -236,6 +236,7 @@ struct Failing {
     name: &'static str,
     trigger: &'static str,
     entity: fn() -> Entity,
+    retires_writer: bool,
 }
 fn failing_families() -> [Failing; 3] {
     [
@@ -245,13 +246,15 @@ fn failing_families() -> [Failing; 3] {
             trigger: "CREATE TRIGGER end_it BEFORE INSERT ON agents WHEN NEW.id='doomed' \
                       BEGIN SELECT RAISE(ROLLBACK,'synthetic SQLite rollback'); END",
             entity: || agent("doomed", "doomed"),
+            retires_writer: true,
         },
-        // The task writer keeps its own savepoint and poison.
+        // The task writer unwinds on failed savepoint cleanup (#477).
         Failing {
             name: "task (task writer)",
             trigger: "CREATE TRIGGER end_it BEFORE INSERT ON tasks WHEN NEW.id='doomed' \
                       BEGIN SELECT RAISE(ROLLBACK,'synthetic SQLite rollback'); END",
             entity: || task("doomed"),
+            retires_writer: true,
         },
         // Context, config, template and goal are a separate helper in the unit.
         Failing {
@@ -259,18 +262,19 @@ fn failing_families() -> [Failing; 3] {
             trigger: "CREATE TRIGGER end_it BEFORE INSERT ON project_config WHEN NEW.key='doomed' \
                       BEGIN SELECT RAISE(ROLLBACK,'synthetic SQLite rollback'); END",
             entity: || config("doomed"),
+            retires_writer: true,
         },
     ]
 }
 
 /// R128: SQLite ended the transaction under the unit, so its savepoint cannot be
-/// rolled back and the unit may never commit, even when the callback catches every
-/// error and returns `Ok`. Covers the composed poison, the ended-transaction guard,
-/// the executor's commit refusal and a usable writer afterwards, for each helper.
+/// rolled back and the unit may never commit. Task, Agent/Team/Run and cctg leaves
+/// unwind and retire the writer (#477, #468 and #462). No path commits partial work;
+/// a reopened writer is usable.
 #[tokio::test]
 async fn a_caught_rollback_failure_refuses_the_rest_of_the_unit_and_commits_nothing() {
     for failing in failing_families() {
-        let env = Env::new();
+        let mut env = Env::new();
         env.sql(failing.trigger);
         let keep = env
             .commit(|unit| unit.create(agent("keep", "original")))
@@ -312,10 +316,18 @@ async fn a_caught_rollback_failure_refuses_the_rest_of_the_unit_and_commits_noth
                 seen.fetch_add(1, Ordering::SeqCst);
             })
             .await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "{}", failing.name);
-        // The request is answered as aborted: not as a fatal storage failure.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            usize::from(!failing.retires_writer),
+            "{}",
+            failing.name
+        );
         let error = outcome.expect_err(failing.name);
-        assert_eq!(backend_text(&error), FAILED, "{}", failing.name);
+        if failing.retires_writer {
+            assert!(backend_text(&error).contains("SQLite writer is closed"));
+        } else {
+            assert_eq!(backend_text(&error), FAILED, "{}", failing.name);
+        }
         assert!(
             env.storage.failure_state().failure().is_none(),
             "{}: a rollback failure with ordinary causes does not latch",
@@ -340,8 +352,19 @@ async fn a_caught_rollback_failure_refuses_the_rest_of_the_unit_and_commits_noth
             assert_eq!(env.count(table), expected, "{}: {table}", failing.name);
         }
 
-        // The abort belongs to that one request: the next transaction commits.
         env.sql("DROP TRIGGER end_it");
+        if failing.retires_writer {
+            let later = env
+                .storage
+                .transaction(owner(), Lane::Entities, |unit| unit.create(team("refused")))
+                .await
+                .unwrap_err();
+            assert!(backend_text(&later).contains("SQLite writer is closed"));
+            assert!(env.storage.close().await.is_err());
+            env.storage = SqliteStorage::open(env.data.clone(), StorageOptions::default()).unwrap();
+        }
+        // A returned abort leaves the worker usable; typed cleanup requires a
+        // reopened worker before a new transaction can commit.
         env.commit(|unit| unit.create(team("fresh"))).await;
         assert!(env.get(EntityKind::Team, "fresh").await.is_some());
         assert!(env.get(EntityKind::Team, "before").await.is_none());
@@ -427,30 +450,32 @@ async fn caught_live_corruption_latches_the_writer_and_prevents_the_outer_commit
 /// R140: the operation's cause and the rollback's cause stay apart in what the
 /// failure state keeps, and each decides the outcome by its own class. An ordinary
 /// operation cause with a rollback that failed because SQLite ended the transaction
-/// aborts only that request. A fatal operation cause latches with exactly that
-/// cause under the operation role. (A fatal cause on the rollback side needs
+/// retires the native writer without latching. A fatal operation cause latches
+/// with exactly that cause under the operation role. (A fatal cause on the rollback side needs
 /// `SQLITE_CORRUPT` from a savepoint rollback, which no callback can provoke; the
 /// synthetic cases of `sqlite_writer_policy` keep it.)
 #[tokio::test]
 async fn the_operation_cause_and_the_rollback_cause_keep_their_own_class() {
-    let env = Env::new();
+    let mut env = Env::new();
     env.commit(|unit| unit.create(agent("a", "original"))).await;
     env.sql(
         "CREATE TRIGGER end_it BEFORE INSERT ON teams WHEN NEW.id='doomed' \
          BEGIN SELECT RAISE(ROLLBACK,'synthetic SQLite rollback'); END",
     );
 
-    // Ordinary operation cause (a trigger refusal) and a rollback that fails
-    // because SQLite already ended the transaction: aborted, not fatal.
+    // Ordinary operation and cleanup causes retire this native writer without
+    // latching. The typed unwind skips the callback's returned-error handling.
     let outcome = env
         .try_commit(|unit| {
             let error = unit.create(team("doomed")).unwrap_err();
             assert_eq!(backend_text(&error), FAILED);
         })
         .await;
-    assert_eq!(backend_text(&outcome.unwrap_err()), FAILED);
+    assert!(backend_text(&outcome.unwrap_err()).contains("SQLite writer is closed"));
     assert!(env.storage.failure_state().failure().is_none());
     assert_eq!(env.count("teams"), 0);
+    assert!(env.storage.close().await.is_err());
+    env.storage = SqliteStorage::open(env.data.clone(), StorageOptions::default()).unwrap();
 
     // A fatal operation cause with the savepoint intact: the read runs, proves
     // the stored agent corrupt and the writer latches that cause as the
@@ -469,4 +494,246 @@ async fn the_operation_cause_and_the_rollback_cause_keep_their_own_class() {
         [(Role::Operation, FatalCause::LogicalCorruption)]
     );
     env.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue 127 (R140; PR 202 review I2): a statement that really fails in each
+// adapter, through the public `Storage`, reaches the shared failure state with
+// its SQLite code. The database is damaged on disk with the adapter closed, so
+// the first statement that reads the table answers SQLITE_CORRUPT.
+// ---------------------------------------------------------------------------
+
+use orch_core::store::events::SequencedEvent;
+use orch_core::store::leases::{ClaimOutcome, NewLease};
+use orch_core::store::request_keys::RequestScope;
+
+fn sequenced(seq: u64) -> SequencedEvent {
+    SequencedEvent {
+        seq,
+        event: orch_domain::RunEvent {
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            event_type: orch_domain::RunEventType::AgentOutput,
+            data: json!({ "seq": seq }),
+        },
+    }
+}
+
+fn key_hash() -> String {
+    "a".repeat(64)
+}
+
+fn key_scope(key: &str) -> RequestScope {
+    RequestScope::of(&owner(), key).unwrap()
+}
+
+/// Overwrite the first byte of the root page of `table`: not a valid b-tree page.
+fn damage(data: &DataDir, table: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+    let conn = open_connection(data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let root: i64 = conn
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name=?1",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let size: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap();
+    let path = conn.path().unwrap().to_owned();
+    drop(conn);
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(((root - 1) * size) as u64))
+        .unwrap();
+    file.write_all(&[0xFF]).unwrap();
+    file.sync_all().unwrap();
+}
+
+/// A storage over a database that holds one lease, two events, a gap, a request
+/// key and a goal, with `table` damaged and the adapter reopened over it.
+async fn damaged(table: &str) -> Env {
+    let env = Env::new();
+    env.commit(|unit| {
+        let ClaimOutcome::Granted(lease) = unit.claim_lease(
+            &NewLease {
+                task: "t".into(),
+                agent: "a".into(),
+                run: "r".into(),
+            },
+            0,
+        )?
+        else {
+            panic!("the seed lease is granted")
+        };
+        unit.append_events(
+            "r",
+            &lease.lineage,
+            lease.epoch,
+            &[sequenced(1), sequenced(2)],
+        )?;
+        unit.record_event_gap("r", 2, 1)?;
+        unit.store_request_key(
+            &key_scope("0123456789abcdef"),
+            "task.update",
+            &key_hash(),
+            "r",
+            0,
+        )?;
+        unit.create(goal("seed"))?;
+        Ok(())
+    })
+    .await;
+    let Env {
+        _root,
+        data,
+        storage,
+    } = env;
+    storage.close().await.unwrap();
+    damage(&data, table);
+    let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+    Env {
+        _root,
+        data,
+        storage,
+    }
+}
+
+type WriteOp = fn(&mut dyn UnitOfWork) -> orch_core::store::Result<()>;
+
+#[tokio::test]
+async fn a_real_corrupt_statement_of_each_adapter_latches_the_public_writer_with_its_cause() {
+    let ops: [(&str, &str, WriteOp); 8] = [
+        ("request key check", "request_keys", |u| {
+            u.check_request_key(
+                &key_scope("fedcba9876543210"),
+                "task.update",
+                &key_hash(),
+                0,
+            )
+            .map(drop)
+        }),
+        ("request key store", "request_keys", |u| {
+            u.store_request_key(
+                &key_scope("fedcba9876543210"),
+                "task.update",
+                &key_hash(),
+                "x",
+                0,
+            )
+        }),
+        ("lease claim", "leases", |u| {
+            u.claim_lease(
+                &NewLease {
+                    task: "t2".into(),
+                    agent: "a2".into(),
+                    run: "r2".into(),
+                },
+                0,
+            )
+            .map(drop)
+        }),
+        ("lease get", "leases", |u| u.get_lease("t").map(drop)),
+        ("event append", "run_events", |u| {
+            let lease = u.get_lease("t")?.expect("the seed lease");
+            u.append_events("r", &lease.lineage, lease.epoch, &[sequenced(3)])
+                .map(drop)
+        }),
+        ("event prune", "run_events", |u| {
+            u.prune_events("r", 10).map(drop)
+        }),
+        ("event gap", "run_event_gaps", |u| {
+            u.record_event_gap("r", 3, 1)
+        }),
+        ("goal create", "goals", |u| {
+            u.create(goal("fresh")).map(drop)
+        }),
+    ];
+    for (name, table, op) in ops {
+        let env = damaged(table).await;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let slot = seen.clone();
+        let outcome = env
+            .storage
+            .write(
+                owner(),
+                Lane::Entities,
+                Box::new(move |unit| {
+                    *slot.lock().unwrap() = Some(op(unit));
+                    // Caught, and the callback goes on to succeed.
+                    Ok(())
+                }),
+            )
+            .await;
+        let caught = seen.lock().unwrap().take().unwrap();
+        assert_eq!(
+            backend_text(&caught.expect_err(name)),
+            UNAVAILABLE,
+            "{name}: the first fatal observation answers unavailable"
+        );
+        assert_eq!(backend_text(&outcome.unwrap_err()), UNAVAILABLE, "{name}");
+        let failure = env.storage.failure_state().failure().expect(name);
+        assert_eq!(failure.source, FailureSource::Writer, "{name}");
+        assert_eq!(
+            failure.causes,
+            [(Role::Operation, FatalCause::SqliteCorrupt)],
+            "{name}"
+        );
+        let later = env.try_commit(|_| ()).await;
+        assert_eq!(backend_text(&later.unwrap_err()), UNAVAILABLE, "{name}");
+        // Issue 389: a new healthy read is allowed after the incident.
+        let healthy = env.storage.read(owner()).await.unwrap();
+        assert!(
+            healthy
+                .get(EntityKind::Agent, "absent")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(healthy);
+        env.close().await;
+    }
+}
+
+#[tokio::test]
+async fn a_real_corrupt_statement_of_each_pooled_read_latches_the_public_storage_as_the_readers() {
+    for (name, table) in [
+        ("lease", "leases"),
+        ("events", "run_events"),
+        ("event gaps", "run_event_gaps"),
+        ("goal", "goals"),
+    ] {
+        let env = damaged(table).await;
+        let snapshot = env.storage.read(owner()).await.unwrap();
+        let error = match name {
+            "lease" => snapshot.read_lease("t").await.map(drop),
+            "events" => snapshot.read_events("r", 0, 10).await.map(drop),
+            "event gaps" => snapshot.read_event_gaps("r").await.map(drop),
+            _ => snapshot.get(EntityKind::Goal, "seed").await.map(drop),
+        }
+        .expect_err(name);
+        assert_eq!(backend_text(&error), UNAVAILABLE, "{name}");
+        drop(snapshot);
+        let failure = env.storage.failure_state().failure().expect(name);
+        assert_eq!(failure.source, FailureSource::Reader, "{name}");
+        assert_eq!(
+            failure.causes,
+            [(Role::Operation, FatalCause::SqliteCorrupt)],
+            "{name}"
+        );
+        let later = env.try_commit(|_| ()).await;
+        assert_eq!(backend_text(&later.unwrap_err()), UNAVAILABLE, "{name}");
+        // Issue 389: a new healthy read is allowed after the incident.
+        let healthy = env.storage.read(owner()).await.unwrap();
+        assert!(
+            healthy
+                .get(EntityKind::Agent, "absent")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(healthy);
+        env.close().await;
+    }
 }

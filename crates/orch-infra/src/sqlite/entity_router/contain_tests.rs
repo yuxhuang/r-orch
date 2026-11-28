@@ -9,6 +9,7 @@
 //! so the order is fixed without timing and an unwinding worker is caught here.
 use super::tests::{owner, payload, setup};
 use super::*;
+use crate::sqlite::corrupt_root_page;
 use crate::sqlite::writer::contain::CleanupUnwind;
 use crate::sqlite::writer::failure::{FatalCause, Role};
 use crate::sqlite::{
@@ -141,32 +142,6 @@ fn lose_the_savepoint(tx: &Transaction<'_>, table: &str) {
          BEGIN SELECT RAISE(ROLLBACK, 'synthetic fault'); END"
     ))
     .unwrap();
-}
-
-/// Damage the root page of `table` in the database file, with no connection open:
-/// the first statement that reads it answers `SQLITE_CORRUPT`. Synthetic data only.
-fn corrupt_root_page(data: &crate::data_dir::DataDir, table: &str) {
-    use std::io::{Seek, SeekFrom, Write};
-    let conn = open_connection(data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-        .unwrap();
-    let root: i64 = conn
-        .query_row(
-            "SELECT rootpage FROM sqlite_master WHERE name=?1",
-            [table],
-            |r| r.get(0),
-        )
-        .unwrap();
-    let size: i64 = conn
-        .query_row("PRAGMA page_size", [], |r| r.get(0))
-        .unwrap();
-    let path = conn.path().unwrap().to_owned();
-    drop(conn);
-    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-    file.seek(SeekFrom::Start(((root - 1) * size) as u64))
-        .unwrap();
-    file.write_all(&[0xFF]).unwrap();
-    file.sync_all().unwrap();
 }
 
 /// `Writer::run` on this thread, its unwind caught. A writer that wrongly survives

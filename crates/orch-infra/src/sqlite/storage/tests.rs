@@ -756,7 +756,7 @@ async fn dropping_an_in_flight_snapshot_returns_its_connection_without_a_transac
 }
 
 #[tokio::test]
-async fn failed_cleanup_prevents_native_list_and_commit_even_when_callback_swallows_it() {
+async fn failed_task_cleanup_unwinds_before_native_list_and_retires_writer() {
     use orch_core::{store::ConfigEntry, test_support::make_task};
     let (_temp, data) = crate::sqlite::test_data();
     let data = Arc::new(data);
@@ -803,10 +803,26 @@ async fn failed_cleanup_prevents_native_list_and_commit_even_when_callback_swall
         "executor must reject the swallowed cleanup failure"
     );
     assert!(
-        refused.load(Ordering::SeqCst),
-        "native page must refuse an aborted unit"
+        !refused.load(Ordering::SeqCst),
+        "cleanup unwind must escape before the native page call"
     );
     assert!(storage.failure_state().failure().is_none());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("SQLite writer is closed")
+    );
+    assert!(
+        storage
+            .transaction::<(), _>(owner(), store::Lane::Entities, |_| panic!(
+                "closed callback ran"
+            ))
+            .await
+            .is_err()
+    );
+    assert!(storage.close().await.is_err());
+    let storage = SqliteStorage::open(data, without_admission_expiry()).unwrap();
     storage
         .transaction(owner(), store::Lane::Entities, |u| {
             u.create(team("following"))
@@ -1078,10 +1094,15 @@ async fn failed_savepoint_cleanup_with_active_transaction_refuses_native_list() 
         value: "v".into(),
     }))
     .unwrap();
-    assert!(
-        unit.move_to_end(EntityKind::Task, "tsk_test1", Revision::ONE)
-            .is_err()
-    );
+    // Deliberately swallow the typed unwind only to inspect the defensive guards.
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::sqlite::writer::contain::contain(&storage.failure_state(), || {
+            let _ = unit.move_to_end(EntityKind::Task, "tsk_test1", Revision::ONE);
+            Ok(())
+        })
+    }))
+    .unwrap_err();
+    assert!(unwind.is::<crate::sqlite::writer::contain::CleanupUnwind>());
     assert!(
         !tx.is_autocommit(),
         "exercise the active-transaction guard, not the leaf's autocommit guard"
@@ -1794,3 +1815,6 @@ async fn an_idle_owned_snapshot_expires_and_releases_backlog_before_its_idle_tim
     drop(snapshot);
     storage.close().await.unwrap();
 }
+
+#[path = "operational_guard_tests.rs"]
+mod operational_guard_tests;

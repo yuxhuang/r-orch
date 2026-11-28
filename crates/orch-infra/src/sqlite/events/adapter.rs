@@ -16,10 +16,15 @@ pub(in crate::sqlite) fn execution(error: EventsError) -> SqliteError {
     }
 }
 
+/// What a caller of the adapter is told of a failure that is not a refusal.
+fn backend_text(error: &SqliteError) -> StoreError {
+    StoreError::Backend(orch_core::Error::other(format!("SQLite events: {error}")))
+}
+
 fn port(error: SqliteError) -> StoreError {
     match error {
         SqliteError::Store(error) => error,
-        other => StoreError::Backend(orch_core::Error::other(format!("SQLite events: {other}"))),
+        other => backend_text(&other),
     }
 }
 
@@ -202,6 +207,7 @@ impl EventAdapter<'_, '_> {
                     tx,
                     caller: &self.caller,
                     blobs: self.blobs,
+                    state: self.readers.failure_state(),
                 })
                 .map_err(SqliteError::Store)
             })
@@ -228,8 +234,7 @@ impl EventBatch<'_> {
             Err(EventsError::Store(error)) => Err(error),
             Err(error) => {
                 let error = execution(error);
-                let refusal =
-                    StoreError::Backend(orch_core::Error::other(format!("SQLite events: {error}")));
+                let refusal = backend_text(&error);
                 self.failed = Some(error);
                 Err(refusal)
             }
@@ -280,38 +285,292 @@ pub(super) struct EventSnapshot<'a> {
     tx: &'a Transaction<'a>,
     caller: &'a Caller,
     blobs: &'a DiskBlobStore,
+    state: &'a crate::sqlite::FailureState,
 }
 
 impl EventSnapshot<'_> {
+    /// Observe every structured failure before the port converts it to text.
+    /// A caught ordinary failure must not hide a later fatal one in this snapshot.
+    fn result<T>(&self, result: Result<T>) -> orch_core::store::Result<T> {
+        result.map_err(|error| {
+            let error = execution(error);
+            self.state
+                .observe(crate::sqlite::FailureSource::Reader, &error);
+            port(error)
+        })
+    }
+
     pub(super) fn events(
         &self,
         run: &str,
         after: u64,
         limit: usize,
     ) -> orch_core::store::Result<Vec<SequencedEvent>> {
-        read_with_blobs(
+        self.result(read_with_blobs(
             self.tx,
             &self.caller.project,
             run,
             after,
             limit,
             Some(self.blobs),
-        )
-        .map_err(execution)
-        .map_err(port)
+        ))
     }
     pub(super) fn tail(
         &self,
         run: &str,
         count: usize,
     ) -> orch_core::store::Result<Vec<SequencedEvent>> {
-        tail_with_blobs(self.tx, &self.caller.project, run, count, Some(self.blobs))
-            .map_err(execution)
-            .map_err(port)
+        self.result(tail_with_blobs(
+            self.tx,
+            &self.caller.project,
+            run,
+            count,
+            Some(self.blobs),
+        ))
     }
     pub(super) fn gaps(&self, run: &str) -> orch_core::store::Result<Vec<EventGap>> {
-        read_event_gaps(self.tx, &self.caller.project, run)
-            .map_err(execution)
-            .map_err(port)
+        self.result(read_event_gaps(self.tx, &self.caller.project, run))
+    }
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    use super::*;
+    use crate::sqlite::{
+        ConnectionRole, FailureSource, FatalCause, Role, Synchronous, Writer, migrations,
+        open_connection,
+    };
+    use orch_core::store::Principal;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    fn event(seq: u64) -> SequencedEvent {
+        SequencedEvent {
+            seq,
+            event: orch_domain::RunEvent {
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                event_type: orch_domain::RunEventType::AgentOutput,
+                data: serde_json::json!({"seq": seq}),
+            },
+        }
+    }
+
+    // Every connection is closed before damage, and only a fresh synthetic DB is touched.
+    fn damaged(table: &str, test: impl FnOnce(EventAdapter<'_, '_>, &AtomicUsize)) {
+        damaged_with(table, |_| {}, test);
+    }
+
+    fn damaged_with(
+        table: &str,
+        prepare: impl FnOnce(&Connection),
+        test: impl FnOnce(EventAdapter<'_, '_>, &AtomicUsize),
+    ) {
+        let (_temp, data) = crate::sqlite::test_data();
+        let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        migrations::migrate(&data, &mut conn).unwrap();
+        let caller = Caller {
+            project: "p".into(),
+            principal: Principal::Owner {
+                identity: "synthetic".into(),
+            },
+        };
+        let tx = conn.transaction().unwrap();
+        let lease = crate::sqlite::leases::claim_lease(
+            &tx,
+            &caller,
+            &orch_core::store::leases::NewLease {
+                task: "t".into(),
+                agent: "a".into(),
+                run: "r".into(),
+            },
+            0,
+        )
+        .unwrap();
+        let orch_core::store::leases::ClaimOutcome::Granted(lease) = lease else {
+            panic!("seed lease")
+        };
+        append_events(
+            &tx,
+            &caller,
+            "r",
+            &lease.lineage,
+            lease.epoch,
+            &[event(1), event(2)],
+        )
+        .unwrap();
+        record_event_gap(&tx, "p", "r", 2, 1).unwrap();
+        tx.commit().unwrap();
+        prepare(&conn);
+        drop(conn);
+        crate::sqlite::corrupt_root_page(&data, table);
+        let blobs = Arc::new(DiskBlobStore::open(data.root()).unwrap());
+        let (mut writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+        let commits = Arc::new(AtomicUsize::new(0));
+        let count = commits.clone();
+        writer.set_commit_probe(Box::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            None
+        }));
+        let pool = ReadPool::open_with_state(&data, Synchronous::Normal, 1, handle.failure_state())
+            .unwrap();
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || writer.run());
+            struct Close<'a>(&'a WriterHandle);
+            impl Drop for Close<'_> {
+                fn drop(&mut self) {
+                    self.0.close();
+                }
+            }
+            let close = Close(&handle);
+            test(
+                EventAdapter {
+                    writer: &handle,
+                    readers: &pool,
+                    caller,
+                    blobs: &blobs,
+                },
+                &commits,
+            );
+            drop(close);
+            worker.join().unwrap();
+        });
+    }
+
+    fn latched(adapter: &EventAdapter<'_, '_>, source: FailureSource) {
+        let failure = adapter
+            .writer
+            .failure_state()
+            .failure()
+            .expect("SQLite category must survive public text conversion");
+        assert_eq!(failure.source, source);
+        assert_eq!(
+            failure.causes,
+            [(Role::Operation, FatalCause::SqliteCorrupt)]
+        );
+        assert!(matches!(
+            adapter
+                .writer
+                .submit(crate::sqlite::Lane::Entities, None, |_| Ok(())),
+            Err(SqliteError::StorageUnavailable(_))
+        ));
+        // A prior latch still permits healthy reads under the signed issue 389 policy.
+        adapter
+            .snapshot(Instant::now() + Duration::from_secs(10), |_| Ok(()))
+            .unwrap();
+    }
+
+    #[test]
+    fn real_corrupt_snapshot_statements_retain_reader_category_even_when_caught() {
+        for (name, table) in [
+            ("events", "run_events"),
+            ("tail", "run_events"),
+            ("gaps", "run_event_gaps"),
+        ] {
+            for caught in [false, true] {
+                damaged(table, |adapter, commits| {
+                    let answer =
+                        adapter.snapshot(Instant::now() + Duration::from_secs(10), |read| {
+                            let result = match name {
+                                "events" => read.events("r", 0, 10).map(drop),
+                                "tail" => read.tail("r", 10).map(drop),
+                                _ => read.gaps("r").map(drop),
+                            };
+                            assert!(
+                                matches!(&result, Err(StoreError::Backend(_))),
+                                "{name}: {result:?}"
+                            );
+                            if caught { Ok(()) } else { result }
+                        });
+                    assert!(answer.is_err(), "{name}, caught {caught}: {answer:?}");
+                    latched(&adapter, FailureSource::Reader);
+                    assert_eq!(commits.load(Ordering::SeqCst), 0);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn a_caught_ordinary_event_format_error_allows_a_successful_snapshot() {
+        damaged_with(
+            "run_event_gaps",
+            |conn| {
+                conn.execute("UPDATE run_events SET payload='invalid json'", [])
+                    .unwrap();
+            },
+            |adapter, _| {
+                let value = adapter.snapshot(Instant::now() + Duration::from_secs(10), |read| {
+                    assert!(read.events("r", 0, 10).is_err());
+                    Ok(7)
+                });
+                assert_eq!(value.unwrap(), 7);
+                assert!(adapter.writer.failure_state().failure().is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn a_caught_ordinary_event_error_cannot_hide_later_real_sqlite_corruption() {
+        damaged_with(
+            "run_event_gaps",
+            |conn| {
+                conn.execute("UPDATE run_events SET payload='invalid json'", [])
+                    .unwrap();
+            },
+            |adapter, commits| {
+                let answer = adapter.snapshot(Instant::now() + Duration::from_secs(10), |read| {
+                    // Stored event-format corruption remains ordinary under issue 313.
+                    assert!(read.events("r", 0, 10).is_err());
+                    assert!(adapter.writer.failure_state().failure().is_none());
+                    // This second statement encounters actual SQLite page damage.
+                    assert!(read.gaps("r").is_err());
+                    Ok(())
+                });
+                assert!(answer.is_err());
+                latched(&adapter, FailureSource::Reader);
+                assert_eq!(commits.load(Ordering::SeqCst), 0);
+            },
+        );
+    }
+
+    #[test]
+    fn real_corrupt_batch_and_prune_statements_retain_writer_category() {
+        for (name, table) in [
+            ("append", "run_events"),
+            ("gap", "run_event_gaps"),
+            ("prune", "run_events"),
+        ] {
+            damaged(table, |adapter, commits| {
+                let answer = if name == "prune" {
+                    adapter.prune("r".into(), 10).map(drop)
+                } else {
+                    adapter.write(None, move |batch| {
+                        let result = if name == "gap" {
+                            batch.gap("r", 3, 1)
+                        } else {
+                            // Read the intact lease through the real transaction to use its fence.
+                            let lease =
+                                crate::sqlite::leases::get_lease(batch.tx, batch.caller, "t")
+                                    .unwrap()
+                                    .unwrap();
+                            batch
+                                .append("r", &lease.lineage, lease.epoch, &[event(3)])
+                                .map(drop)
+                        };
+                        assert!(matches!(result, Err(StoreError::Backend(_))));
+                        Ok(())
+                    })
+                };
+                assert!(
+                    matches!(answer, Err(StoreError::Backend(_))),
+                    "{name}: {answer:?}"
+                );
+                latched(&adapter, FailureSource::Writer);
+                assert_eq!(
+                    commits.load(Ordering::SeqCst),
+                    0,
+                    "{name}: no COMMIT attempt"
+                );
+            });
+        }
     }
 }

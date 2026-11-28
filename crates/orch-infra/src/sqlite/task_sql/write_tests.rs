@@ -474,13 +474,13 @@ fn failed_rollback_preserves_both_causes_and_forbids_commit_after_catch() {
     let mut writer = TaskWrite::new(sql(&tx, &disk, "p"), &caller);
     writer.create(task("t")).unwrap();
     tx.execute_batch("CREATE TEMP TRIGGER fail_rollback BEFORE DELETE ON task_details BEGIN SELECT RAISE(ROLLBACK,'injected'); END;").unwrap();
-    let error = writer.delete("t", Revision::ONE).unwrap_err();
-    match error {
+    let unwind = cleanup_unwind(|| writer.delete("t", Revision::ONE));
+    match unwind.error() {
         SqliteError::OperationRollback {
             operation,
             rollback,
         } => {
-            assert!(matches!(*operation, SqliteError::Sql(_)));
+            assert!(matches!(**operation, SqliteError::Sql(_)));
             assert!(matches!(rollback, rusqlite::Error::SqliteFailure(..)));
         }
         other => panic!("both causes required: {other:?}"),
@@ -763,9 +763,10 @@ fn failed_savepoint_rollback_poison_refuses_with_outer_transaction_still_active(
     let mut writer = TaskWrite::new(sql(&tx, &disk, "p"), &caller);
     writer.create(task("t")).unwrap();
     tx.execute_batch("CREATE TEMP TRIGGER fail_delete BEFORE DELETE ON task_details BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    let unwind = cleanup_unwind(|| writer.delete("t", Revision::ONE));
     assert!(matches!(
-        writer.delete("t", Revision::ONE),
-        Err(SqliteError::OperationRollback { .. })
+        unwind.error(),
+        SqliteError::OperationRollback { .. }
     ));
     assert!(!tx.is_autocommit());
     assert!(matches!(
@@ -838,4 +839,16 @@ fn damaged_position_names_requested_task_and_preserves_bounded_codec_check() {
     assert!(
         matches!(sql(&tx, &disk, "p").get("t"), Err(SqliteError::TaskCorrupt { task, check: "detail length or hash", locator: "detail" }) if task == "t")
     );
+}
+
+// Only direct guard tests swallow the adapter unwind. Production containment re-raises it.
+pub(super) fn cleanup_unwind<T>(
+    work: impl FnOnce() -> Result<T>,
+) -> Box<crate::sqlite::writer::contain::CleanupUnwind> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Err(payload) => payload
+            .downcast::<crate::sqlite::writer::contain::CleanupUnwind>()
+            .expect("typed cleanup unwind"),
+        Ok(_) => panic!("cleanup returned to the callback"),
+    }
 }

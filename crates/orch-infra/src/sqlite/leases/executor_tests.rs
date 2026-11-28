@@ -673,3 +673,122 @@ fn statement_level_failure_in_a_composed_lease_job_is_rolled_back_by_the_executo
         assert_eq!(lease_state(readers), (vec![], 0, 0));
     });
 }
+
+// F1 / PR156 I1: these callbacks catch the actual SQLite error and continue.
+// Returning early with `?` cannot detect a later autocommit leak.
+fn caught_rollback_case(case: &'static str) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let (_temp, data) = test_data();
+    {
+        let conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        conn.execute_batch(include_str!("../schema.sql")).unwrap();
+        if case == "read" {
+            conn.execute_batch("ALTER TABLE task_epochs RENAME TO task_epochs_gone")
+                .unwrap();
+        }
+        conn.execute_batch("CREATE TABLE rollback_tripwire(id INTEGER);
+            CREATE TRIGGER end_foreign BEFORE INSERT ON rollback_tripwire BEGIN SELECT RAISE(ROLLBACK,'foreign rollback'); END;
+            CREATE TRIGGER end_renew BEFORE UPDATE ON leases BEGIN SELECT RAISE(ROLLBACK,'renew rollback'); END;
+            CREATE TRIGGER end_release BEFORE DELETE ON leases BEGIN SELECT RAISE(ROLLBACK,'release rollback'); END;").unwrap();
+    }
+    let attempted = Arc::new(AtomicBool::new(false));
+    let later = Arc::clone(&attempted);
+    let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(move || writer.run());
+        struct Close<'a>(&'a WriterHandle);
+        impl Drop for Close<'_> {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+        let _close = Close(&handle);
+        let receipt = handle.submit(Lane::Claims, None, move |tx| {
+            tx.execute("INSERT INTO daemon_config(key,value,revision) VALUES('outer','x',1)", [])?;
+            if matches!(case, "renew" | "release") {
+                let lease = grant(tx, &owner("p"), new("t", "a", "r"), 0);
+                let failed = if case == "renew" {
+                    renew_lease(tx, &owner("p"), "t", &lease.lineage, lease.epoch, 9)
+                } else {
+                    release_lease(tx, &owner("p"), "t", &lease.lineage, lease.epoch)
+                };
+                assert!(matches!(failed, Err(LeaseError::Sql(ref e)) if e.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::ConstraintViolation)));
+                assert!(tx.is_autocommit(), "the fault must end the transaction");
+            } else {
+                let error = tx.execute("INSERT INTO rollback_tripwire VALUES(1)", []).unwrap_err();
+                assert_eq!(error.sqlite_error_code(), Some(rusqlite::ffi::ErrorCode::ConstraintViolation));
+                assert!(tx.is_autocommit());
+                if case == "read" {
+                    assert!(matches!(claim_lease(tx, &owner("p"), &new("t", "a", "r"), 0), Err(LeaseError::Sql(ref e)) if e.to_string().contains("task_epochs")));
+                } else {
+                    // In autocommit SAVEPOINT starts a transaction; RELEASE would
+                    // commit the lease and epoch without the executor's gate.
+                    let before = tx.total_changes();
+                    let result = claim_lease(tx, &owner("p"), &new("t", "a", "r"), 0);
+                    assert!(matches!(result, Err(LeaseError::Sql(ref e)) if e.sqlite_error().is_some_and(|e| e.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_COMMITHOOK)));
+                    assert_eq!(tx.total_changes() - before, 2, "both claim writes must reach RELEASE");
+                }
+            }
+            later.store(true, Ordering::SeqCst);
+            let _caught = tx.execute("INSERT INTO daemon_config(key,value,revision) VALUES('later','x',1)", []);
+            Ok(())
+        }).unwrap().wait();
+        handle.close();
+        let joined = worker.join();
+        joined.unwrap();
+        assert!(
+            matches!(receipt, Err(crate::sqlite::SqliteError::TransactionAborted)),
+            "{receipt:?}"
+        );
+    });
+    assert!(attempted.load(Ordering::SeqCst));
+    // Fresh connection after worker exit, not a pre-existing reader snapshot.
+    let conn = open_connection(&data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
+    let epochs = if case == "read" {
+        "task_epochs_gone"
+    } else {
+        "task_epochs"
+    };
+    let state = (
+        conn.query_row("SELECT count(*) FROM leases", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        conn.query_row(&format!("SELECT count(*) FROM {epochs}"), [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap(),
+        conn.query_row(
+            "SELECT count(*) FROM daemon_config WHERE key IN ('outer','later')",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap(),
+    );
+    assert_eq!(
+        state,
+        (0, 0, 0),
+        "{case}: receipt and durable state disagree"
+    );
+}
+
+#[test]
+fn caught_renew_whole_transaction_rollback_blocks_an_attempted_later_write() {
+    caught_rollback_case("renew");
+}
+
+#[test]
+fn caught_release_whole_transaction_rollback_blocks_an_attempted_later_write() {
+    caught_rollback_case("release");
+}
+
+#[test]
+fn caught_claim_read_error_after_a_lost_transaction_blocks_an_attempted_later_write() {
+    caught_rollback_case("read");
+}
+
+#[test]
+fn claim_after_a_swallowed_foreign_rollback_cannot_commit_on_savepoint_release() {
+    caught_rollback_case("claim");
+}

@@ -5,7 +5,9 @@
 //! the producer under test is the production one. No outcome depends on a sleep:
 //! the stalls are released by the test, the clock of the 20 ms cut is injected,
 //! and the one pause (the write lock held for 300 ms) only widens the window in
-//! which a wrongly early commit would show.
+//! which a wrongly early commit would show. The FULL exhaustion test also waits
+//! through the real sixty-second production retry episode; its watchdog is only
+//! a hang guard, not a latency target.
 
 use super::super::producer::{
     EventBatch, EventProducer, EventProducerOptions, Expected, Rejected, Submission, SubmitFailure,
@@ -179,15 +181,24 @@ fn sql(code: i32) -> rusqlite::Error {
 }
 
 /// Waits until the producer has taken its first transaction, so that the next
-/// batches wait in the producer and not in it.
+/// batches wait in the producer and not in it. A yield count cannot bound how
+/// long another runtime worker takes to run on a loaded host. Observe the state
+/// instead, with half the stall's watchdog left for assertions and release.
+/// This is only a deadlock watchdog; no production deadline or clock changes.
 async fn in_flight(producer: &EventProducer) {
-    for _ in 0..10_000 {
-        if producer.waiting().1 {
-            return;
+    tokio::time::timeout(SAFETY / 2, async {
+        while !producer.waiting().1 {
+            tokio::task::yield_now().await;
         }
-        tokio::task::yield_now().await;
-    }
-    panic!("the producer never took a transaction");
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the producer never took a transaction: waiting={:?}, retained={:?}",
+            producer.waiting(),
+            producer.retained()
+        )
+    });
 }
 
 #[tokio::test]
@@ -1882,15 +1893,16 @@ async fn concurrent_submissions_never_exceed_the_byte_limit() {
             .map(|b| {
                 let (p, bar) = (Arc::clone(&producer), Arc::clone(&barrier));
                 std::thread::spawn(move || {
+                    let expected = b.clone();
                     bar.wait();
-                    p.submit(b).is_ok()
+                    (expected, p.submit(b))
                 })
             })
             .collect();
-        let ok = handles
-            .into_iter()
-            .map(|h| h.join().unwrap())
-            .filter(|x| *x)
+        let candidates: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok = candidates
+            .iter()
+            .filter(|(_, answer)| answer.is_ok())
             .count();
         let (_, _, bytes) = producer.retained();
         assert!(
@@ -1903,7 +1915,25 @@ async fn concurrent_submissions_never_exceed_the_byte_limit() {
             "round {round}: PROBE-D exactly one candidate fits ({ok})"
         );
         stall.end().await;
-        answered(lead).await.unwrap();
+        assert_eq!(answered(lead).await.unwrap(), counts(1, 0));
+        for (expected, answer) in candidates {
+            match answer {
+                Ok(submission) => {
+                    assert_eq!(answered(submission).await.unwrap(), counts(1, 0));
+                    assert_eq!(fx.stored("p", &expected.run).await, expected.events);
+                }
+                Err(Rejected::Full(returned)) => {
+                    same_batch(&returned, &expected);
+                    assert!(fx.stored("p", &expected.run).await.is_empty());
+                }
+                Err(other) => panic!("round {round}: unexpected refusal: {other:?}"),
+            }
+        }
+        assert_eq!(producer.retained(), (0, 0, 0));
+        Arc::try_unwrap(producer)
+            .unwrap_or_else(|_| panic!("all submitters have joined"))
+            .close()
+            .await;
     }
 }
 
@@ -2728,4 +2758,53 @@ async fn incomplete_unknown_callback_keeps_the_streak_until_the_second_ioerr_lat
 #[tokio::test]
 async fn incomplete_known_callback_keeps_the_streak_until_the_second_ioerr_latches() {
     incomplete_callback_ioerr_recovery(false, 2).await;
+}
+
+#[tokio::test]
+async fn two_uncertain_commits_reconciled_absent_report_storage_unavailable_and_close_intake() {
+    let commits = Arc::new(AtomicU64::new(0));
+    let seen = commits.clone();
+    let fx = fixture_with(StorageOptions {
+        writer_commit_probe: Some(Box::new(move |tx| {
+            let rows: i64 = tx
+                .query_row("SELECT count(*) FROM run_events", [], |row| row.get(0))
+                .unwrap();
+            if rows == 0 {
+                return None;
+            }
+            seen.fetch_add(1, Ordering::SeqCst);
+            // Real SQLite DELETE and COMMIT, followed by an injected IOERR.
+            // Each uncertain receipt reconciles against real, absent rows;
+            // this does not simulate a physical disk failure.
+            tx.execute_batch("DELETE FROM run_events; COMMIT").unwrap();
+            Some(Err(sql(rusqlite::ffi::SQLITE_IOERR)))
+        })),
+        ..Default::default()
+    });
+    let producer = fx.producer();
+    let first = fx.batch("p", "uncertain", 1..=3).await;
+    let next = fx.batch("p", "next", 1..=1).await;
+    let failure = answered(producer.submit(first).unwrap()).await.unwrap_err();
+    assert!(
+        failure.error.to_string().contains("storage_unavailable"),
+        "{failure:?}"
+    );
+    assert_eq!((failure.committed, failure.not_stored), (counts(0, 0), 3));
+    assert!(!failure.outcome_unknown);
+    assert_eq!(commits.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fx.storage.failure_state().failure().unwrap().causes,
+        vec![(
+            crate::sqlite::Role::Operation,
+            crate::sqlite::FatalCause::ConsecutiveIoErrors,
+        )]
+    );
+    assert!(
+        matches!(producer.submit(next), Err(Rejected::Closed(..))),
+        "fatal reconciled absence must close intake before answering"
+    );
+    assert!(fx.reports().is_empty(), "no false committed report");
+    assert!(fx.stored("p", "uncertain").await.is_empty());
+    assert_eq!(producer.retained(), (0, 0, 0));
+    producer.close().await;
 }

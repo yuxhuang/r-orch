@@ -1,0 +1,1 @@
+Fixed the inactive SQLite Context, Config, Template and Goal writer to retire its connection after failed savepoint cleanup, closing active and queued requests instead of allowing the callback to catch the cleanup failure.

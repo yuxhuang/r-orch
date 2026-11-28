@@ -1,0 +1,1 @@
+SQLite retires the writer when either Task savepoint cannot be cleaned up. Active and queued writes fail without committing partial work; fatal causes remain classified separately, and reopening permits fresh work.

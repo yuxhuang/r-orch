@@ -1197,3 +1197,70 @@ fn message_native_quartets_enforce_r97_bytes_presence_and_identity_forms() {
         2
     );
 }
+
+#[test]
+fn active_agent_uniqueness_is_enforced_by_the_database_within_each_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data(&tmp);
+    let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    migrate(&dir, &mut conn).unwrap();
+    let insert = |project: &str, task: &str, state: &str| {
+        conn.execute(
+            "INSERT INTO leases(project_id,task_id,run_id,agent_id,worker_id,epoch,lineage,state,granted_at,renewed_at,expires_at) VALUES(?1,?2,?2,'a1','w',1,'lineage',?3,0,0,120000)",
+            rusqlite::params![project, task, state],
+        )
+    };
+    insert("p", "t1", "active").unwrap();
+    insert("q", "t2", "active").unwrap();
+    insert("p", "t3", "offered").unwrap();
+    let error = insert("p", "t4", "active").unwrap_err();
+    assert_eq!(
+        error.sqlite_error().unwrap().extended_code,
+        rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+    );
+}
+
+#[test]
+fn migration_refuses_extra_missing_and_gapped_ledger_rows_without_repairing_them() {
+    use orch_infra::sqlite::{SqliteError, migrations::SCHEMA_VERSION};
+    for damage in [
+        format!(
+            "INSERT INTO schema_migrations(version,applied_at) VALUES({},0)",
+            SCHEMA_VERSION + 1
+        ),
+        format!("DELETE FROM schema_migrations WHERE version={SCHEMA_VERSION}"),
+        "DELETE FROM schema_migrations WHERE version=2".into(),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = data(&tmp);
+        let mut conn = open_connection(&dir, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+        migrate(&dir, &mut conn).unwrap();
+        conn.execute(&damage, []).unwrap();
+        let ledger = || {
+            conn.prepare("SELECT version FROM schema_migrations ORDER BY version")
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        let before = ledger();
+        assert!(
+            matches!(migrate(&dir, &mut conn), Err(SqliteError::Migration(message)) if message == "schema_migrations disagrees with user_version"),
+            "{damage}"
+        );
+        let after: Vec<i64> = conn
+            .prepare("SELECT version FROM schema_migrations ORDER BY version")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(after, before, "{damage}");
+        assert_eq!(
+            conn.pragma_query_value::<i64, _>(None, "user_version", |row| row.get(0))
+                .unwrap(),
+            SCHEMA_VERSION as i64
+        );
+    }
+}

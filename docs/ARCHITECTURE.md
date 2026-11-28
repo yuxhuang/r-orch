@@ -447,8 +447,8 @@ All three names are the same program:
 | Crate | Modules |
 |---|---|
 | `orch-domain` | `task`, `agent`, `run`, `goal`, `team`, `message`, `state`, `config`, `global_config`, `events`, `error`, `transitions`, `scope`, `model_tiers`, `shop` (agent-shop + org-shop + default-agents) |
-| `orch-core` | `storage` (v1 traits), `store::{entity, page, events, leases, retries, intents, request_keys, attention, blob, fake}` (additive v2 entity, paging, event, lease, retry, intent, request-key, attention and blob-store port, and the memory reference), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
-| `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock, v2}`, `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models`, `blob::{DiskBlobStore, BlobReferences}` |
+| `orch-core` | `storage` (v1 traits), `store::{entity, page, events, leases, retries, intents, request_keys, attention, blob, fake}` (additive v2 entity, paging, event, lease, retry, intent, request-key, attention and blob-store port, and the memory reference `fake`, built only with the `test-support` feature; `store::Lane` is the port's lane, not the SQLite writer's, §6.6), `adapter` (`Adapter`, `AgentEvent`, `ExecuteParams`, `Registry`), `usage` (`RunUsage`, `RunUsageObserver`), `process` (`ProcessManager`), `workspace` (`WorkspaceManager`), `template` (`TemplateEngine`), `skills` (`SkillLoader`), `clock` (`Clock`), `ids` (`IdGenerator`) |
+| `orch-infra` | `storage::{paths, fs_utils, index, task, agent, run, state, config, global_config, context, message, goal, team, cached, lock, v2}` (`v2` is the file reference `FileStorage` of the v2 port, for the conformance suite only; its submodules are `events`, `leases`, `retries`, `intents`, `request_keys`, `attention`, `order` and `text`), `adapters::{claude, codex, cursor, opencode, pi, grok, antigravity, shell, util, buffer, registry}`, `process`, `workspace::{manager, merge}`, `template`, `skills`, `clipboard`, `models`, `data_dir::{confined, paths, backup}` (`DataDir`, the exclusive data-directory lock, and `ConfinedDir`, the descriptor-confined file access), `blob::{DiskBlobStore, BlobReferences}` (the blob-store adapter, with `BlobHash` and `placement`; `BlobReferences` links task attachments only), `sqlite::{connection, migrations, writer, read_pool, events, leases, intents, attention, request_keys, retry_message, storage, ...}` (the SQLite connection, migrations, writer, read pool and the adapters of the v2 port; `sqlite::Lane` is the writer's lane, §6.6; the daemon does not use it before T24) |
 | `orch-engine` | `events` (bus), `task_service`, `agent_service`, `run_service`, `goal_service`, `team_service`, `message_service`, `agent_factory`, `review_runner`, `doctor_service`, `orchestrator`, `container` |
 | `orch-cli` | `commands::{agent, config, context, daemon, goal, init, msg, org, org_template, remote, rpc, run, status, task, team}`, `doctor`, `logs`, `tui` (`DaemonBackend`), `update`, `web`, `routing`, `tree`, `output` (human rendering and the `--json`/`--yaml` `StructuredFormat`), `context`, `document_input` (bounded JSON/YAML input and `apply_mutation` for `update`/`patch`), `editor`, `shop_picker`, `update_check`, `serve::logger`, `mcp::{server, registry, mode, identity, projections, resources, system, tools::{task, goal, msg, context, agent, team, logs, config, remote}}` (the `orch mcp` stdio server, §3.3.1) |
 | `orch-tui` | **`backend`** (the `TuiBackend` trait + an in-crate `FakeBackend` — the crate's only seam to the engine, §3.1), `app`, `state`, `views::{goals, tasks, agents, logs}`, `widgets::*`, `command_bar`, `wizard`, `theme`, `keys` |
@@ -535,12 +535,22 @@ maintenance timer, SQLite mapping or CLI caller is activated by this port.
 The additive `orch_core::store::blob::BlobStore` port is synchronous and names
 bytes by a parsed content hash. Its inactive `orch_infra::blob::DiskBlobStore`
 implementation uses `data_dir::confined::ConfinedDir` for every file operation.
-`BlobReferences` publishes the bytes before registering `blobs` and linking a
-run prompt or task attachment inside a savepoint of the caller's SQLite writer
-transaction; it does not commit the outer transaction. Reads validate the hash,
-registered size and storage location. A rollback may leave unreferenced bytes.
-Async consumers must keep this blocking I/O off their executor. Neither the
-adapter nor these reference helpers change the active file-backed runtime.
+`BlobReferences` publishes the bytes before registering `blobs` and
+linking a task attachment (`store_attachment`) inside a savepoint of the
+transaction the caller passes; it does not commit the outer transaction. That
+savepoint comes from `Transaction::savepoint`, which needs `&mut Transaction`,
+and the writer lends its callbacks `&Transaction`, so only tests call
+`store_attachment` today and no writer callback can. `load_attachment` validates
+the hash, registered size and storage location. Its independent run-prompt
+writer and reader no longer exist (two `compile_fail` doctests in
+`blob/references.rs` pin that): the run prompt belongs to the native
+Agent/Team/Run path in `sqlite/agent_team_run`, which keeps the prompt's chunk
+references, whole-content hash and revision together with the run row. An event
+payload over the inline limit takes its own path in `sqlite/events`, which
+publishes the bytes and registers the `blobs` row in the writer's transaction. A
+rollback may leave unreferenced bytes. Async consumers must keep this blocking
+I/O off their executor. Neither the adapter nor these reference helpers change
+the active file-backed runtime.
 
 ### 3.3.1 `orch mcp` (`orch-cli::mcp`)
 
@@ -1227,8 +1237,8 @@ clients <── WriteReceipt::wait() ──────────────�
 - **Connection.** The writer connection has WAL, the configured `synchronous` level, foreign keys, a 5 s busy
   timeout, `BEGIN IMMEDIATE` transactions, and automatic checkpointing off (`sqlite/connection.rs`).
 - **Transaction.** The closure receives a borrowed `rusqlite::Transaction` and returns `sqlite::Result<T>`. An
-  error from the closure rolls the transaction back, a commit error is returned the same way, and the worker
-  takes the next job. A panic in a closure submitted with `submit` rolls back, ends `run` and drops the `Writer`,
+  error from the closure rolls the transaction back and the worker takes the next job; a `COMMIT` that fails is
+  judged as the "Retry and retained writes" bullet says. A panic in a closure submitted with `submit` rolls back, ends `run` and drops the `Writer`,
   which closes admission and drops every queued job. Their receipts then return `WriterClosed`, or
   `StorageUnavailable` when a fatal cause was latched.
   `submit_contained` is the entry for a callback that must not end the writer (spec Amendment 3, issue 379). It wraps
@@ -1239,18 +1249,57 @@ clients <── WriteReceipt::wait() ──────────────�
   the user `WriteWork` alone; `submit_contained` is `cfg(test)` and only tests call it. Two tests in
   `sqlite/storage/containment_tests.rs` show that a panic in the `Clock` read and one in the completion check after a
   successful callback reach the caller as an error, not as a resumed callback panic.
-  A leaf whose savepoint cleanup fails (the lease, intent, retry and message leaves) does not return an error that a
-  callback could catch and commit past. It unwinds with a typed `CleanupUnwind`, which `contain` reports to the failure
+  In the lease, intent, retry, message, Agent/Team/Run, Task (both `task_entity` and the outer
+  `entity_task_move`) and native Context/Config/Template/Goal leaves, a savepoint cleanup failure
+  does not return an error that a callback could catch and commit past. It unwinds with a typed `CleanupUnwind`, which `contain` reports to the failure
   state, so that `SQLITE_CORRUPT` or `SQLITE_NOTADB` latches although the outer rollback would succeed, and then raises
   again. `run` ends as for any other panic under `submit`. The operation's cause and the cleanup's are observed
   separately (spec record O): the receipts return `StorageUnavailable` when either is fatal and so latched, and
   `WriterClosed`, with nothing latched, when both are ordinary. A failed outer rollback after a callback panic keeps the payload, which the
   caller can still reach with `SqliteError::callback_panic()`. A callback is trusted not to swallow an unwind itself.
+- **Atomicity of a request** (issue 127, PR #188; `Gate` in `writer.rs`). The closure holds the transaction itself, so
+  the writer connection carries a commit hook and a rollback hook, and only the executor's own `COMMIT` can make a
+  request durable. A closure's own transaction control cannot persist a row:
+  - The commit hook is armed only around the executor's `COMMIT` and turns every other commit into a rollback. A
+    closure's `COMMIT` fails with an SQL error and keeps nothing; once SQLite has ended the transaction (a full disk,
+    an I/O error, `RAISE(ROLLBACK)`), a later statement that runs alone in autocommit mode is refused the same way, so
+    a closure that swallows the failure and writes on makes nothing durable.
+  - The rollback hook records that the transaction was rolled back since the request began: a closure's `ROLLBACK`, one
+    that SQLite made, or the rollback of a vetoed commit. `ROLLBACK TO` does not run it, so a savepoint's rollback is not
+    the transaction's end. If the transaction has ended when the closure returns, the request answers
+    `TransactionAborted` and commits nothing, even when the closure then issued `BEGIN IMMEDIATE` and wrote more: a
+    `BEGIN` inside the open transaction is an SQLite error (SQLite does not nest transactions), and one after it ended
+    opens a transaction that the executor never commits.
+  - A closure may open savepoints of its own, and the leaves do. Writes under a released savepoint commit with the
+    request; `ROLLBACK TO` undoes only its own writes; a statement that fails alone leaves the transaction open.
+  - A closure that returns success after it reported a fatal cause or a failed savepoint rollback to the shared failure
+    state (`FailureState::observe`), or after a leaf asked for the callback-wide abort, is rolled back and answers
+    `TransactionAborted`, or `StorageUnavailable` once a cause has latched; it is never committed, whether or not either
+    cause is fatal.
+  - An explicit top-level rollback that fails and leaves the connection inside a transaction latches
+    `FatalCause::RollbackLeftTransactionOpen` before the request is answered. Queued and later requests answer
+    `StorageUnavailable`, and the worker ends by a panic, which drops the connection and releases the write lock.
+
+  Tests (`cargo test -p orch-infra --lib sqlite::writer::` and `--test sqlite_writer_policy`; 62 and 23 passed on `main`
+  `56ecd762e`): `a_callback_cannot_commit_or_restart_the_transaction_behind_the_executor`,
+  `a_sqlite_rollback_in_the_body_leaves_no_later_write_durable`,
+  `savepoints_and_their_rollbacks_inside_a_request_still_commit`,
+  `a_failed_top_level_rollback_that_leaves_the_transaction_open_fails_the_writer` and
+  `a_failed_savepoint_rollback_forbids_the_enclosing_commit_even_when_neither_cause_is_fatal`.
 - **Queue.** `capacity` bounds the number of waiting transactions, not their bytes. A full queue, and a second
   waiting `Events` transaction, return `Overloaded` at once; the producer keeps its batch. The writer itself coalesces
   nothing: the event producer below does. A retained write that is rebuilt in an open episode takes the writer's one in-progress slot and does not
   wait in the queue.
-- **Order.** `Lane` is `Claims`, `Entities`, `Events` or `Maintenance`. The worker takes the oldest waiting
+- **Order.** `Lane` (`orch_infra::sqlite::Lane`) is `Claims`, `Entities`, `Events` or `Maintenance`. The port has a second
+  enum with the same four names, `orch_core::store::Lane`, which is what a `Storage::write` or `retained_write` caller
+  names. The adapters convert it one for one into the writer's before they submit, in a `match` with no default arm
+  (`writer_lane` in `sqlite/leases/adapter.rs`; the same four arms in `RetainedWrite::attempt_unit`,
+  `sqlite/storage/retained.rs`), so a lane added to the port does not compile until it is mapped. The lease adapter's own
+  submissions do not take a lane from a caller: a lease change submitted on its own (claim, renewal, release) is a
+  `Claims` job (`LEASE_LANE`), and a lease release that is one step of a larger change, such as a finish, must be an
+  `Entities` job (`COMPOSED_RELEASE_LANE`, which only tests use so far) and not a second submission (tests in `sqlite/leases/contract_tests.rs`,
+  among them `port_lanes_map_one_to_one_onto_writer_lanes`). The daemon's `orch_daemon::coordinator::Lane` (`Ordinary`,
+  `Control`, `Internal`) is a third, unrelated enum for its operation boundary (§2.1 G2). The worker takes the oldest waiting
   `Claims` job first (but see "Retry and retained writes": while a retained write's episode is open the worker runs no queued job). Otherwise it takes the job with the earliest deadline, which is its arrival plus the lane's
   wait budget (entities 200 ms, events 1 s, maintenance 5 s), and the earlier arrival wins a tie. The budgets are
   priorities, not timeouts and not measured results (ADR 0017 decision 9).
@@ -1281,10 +1330,11 @@ clients <── WriteReceipt::wait() ──────────────�
   takes a queued job only while `FailureState::claims_suppressed()` is false (the name is narrower than the use: it is true
   while any episode is open), so `Claims`, `Entities`, `Events` and `Maintenance` all wait, and one logical operation owns
   the writer until its outcome is known. R128 requires only that no claim is granted; the rest is how the source is built,
-  not a ruling of the owner. A request that carries a deadline (`Storage::write`: 200 ms, 1 s or 5 s for the three lanes
-  that are not claims) is answered `Overloaded` when the worker reaches it past that deadline, which can be well after it;
-  no time bound is given (the spec's "While one logical operation is retained"; no permanent test covers the lanes other
-  than claims, issue 429). The worker retires an episode whose last outcome is a known noncommit at its original
+  not a ruling of the owner. A request that carries a deadline (`Storage::write`: 50 ms for `Claims`, 200 ms for `Entities`, 1 s for `Events`, 5 s
+  for `Maintenance`) is answered `Overloaded` when the worker reaches it past that deadline, which can be well after it, and
+  a queued claim is answered the same way, because the check does not depend on the lane;
+  no time bound is given (the spec's "While one logical operation is retained"; since PR #443 (issue 429) and PR #455 (issue 445) a permanent test covers the lanes other
+  than claims for an expired deadline, for none and for a finite one that is still in the future (3,600 s in the test); no test advances a clock across the original deadline). The worker retires an episode whose last outcome is a known noncommit at its original
   deadline, between the producer's submissions; an unknown commit stays fenced until it is reconciled. A second
   `SQLITE_IOERR` in a row, counted by the writer across logical requests and ended by a known commit or another SQL
   failure, and sixty seconds from an episode's first failure without a known commit latch
@@ -1296,9 +1346,9 @@ clients <── WriteReceipt::wait() ──────────────�
   are specific to the latter, and only the per-transaction accounting shows them). A leaf's cleanup unwind is
   outside all of this (record O).
 - **Event producer** (`sqlite/events/producer.rs`, exported from `orch_infra::sqlite`; spec "As built: the event producer",
-  plan "As built: the event producer, first form" and "As built: the event producer, encoded form"; a development member
-  of the draft train, read in its encoded form with the corrected order of receipts (spec bullet "When capacity comes
-  back"), which is the producer on the draft train and not on `main`; not wired to the daemon or to a collector; the daemon
+  plan "As built: the event producer, first form" and "As built: the event producer, encoded form"; landed in
+  PRs #420, #425 and #427, read in its encoded form with the corrected order of receipts (spec bullet "When capacity comes
+  back"); it is on `main` and no code of the daemon, the engine or the CLI calls it: not wired to the daemon or to a collector; the daemon
   still uses files).
   `EventProducer` is the first caller of `retained_write`, on the `Events` lane
   with no request deadline; while one of its writes has an episode open, the rule of the bullet above holds for it, so the
@@ -1362,8 +1412,8 @@ clients <── WriteReceipt::wait() ──────────────�
     caller is told only that the wait failed.
   - *Withdrawn requests keep their queue slot* until the writer reaches them. During a long stall, repeated
     timed-out retries can fill the bounded queue and make every lane, claims included, refuse new work. Back off
-    between retries until the writer drains them; removing a withdrawn entry on the writer side needs `writer.rs`
-    and waits for PR 188.
+    between retries until the writer drains them; removing a withdrawn entry on the writer side needs a change in
+    `writer.rs`, which PR 188 did not make (it landed, and no code removes a withdrawn entry from the queue).
   - *Dropping the runtime blocks* until the writer has reached every parked wait (700 ms in one probe with the
     writer stalled for that long). Shutdown must drain the writer before the runtime is dropped, or use
     `Runtime::shutdown_timeout`.
@@ -1403,15 +1453,22 @@ clients <── WriteReceipt::wait() ──────────────�
 
 **Limits of this slice** (follow-ups tracked in [issue 127](https://github.com/yuxhuang/r-orch/issues/127)):
 
-- No replay of a closure. The writer retries only its own `BEGIN` and a `SQLITE_BUSY` `COMMIT` on the same transaction;
+- No replay of a closure. The writer retries only its own `BEGIN` (after `SQLITE_BUSY`, `SQLITE_LOCKED`, `SQLITE_FULL` or `SQLITE_IOERR`) and a `SQLITE_BUSY` `COMMIT` on the same transaction;
   every other SQL error goes to its receipt, after the policy's classification and its cleanup. The owner approved the
-  policy on 2026-11-27 (spec record P, plan "Writer retry policy"); the development implementation is the bullet "Retry
-  and retained writes" above, with the one open question that the spec lists, and one producer that rebuilds work, the event producer below ("Event producer"), which is a development member and not wired.
+  policy on 2026-11-27 (spec record P, plan "Writer retry policy"); the implementation landed in PR #412 as `53136a969` and is the
+  bullet "Retry and retained writes" above, with the one open question that the spec lists, and one producer that rebuilds work, the event producer below ("Event producer"), which is on `main` (PRs #420, #425 and #427) and is not wired to the daemon.
   The shared failure state, the classification of R128 and R140 and the `StorageUnavailable` answer of a latched writer
   are in `sqlite/writer/failure.rs`.
-- A closure must not issue `COMMIT`, `BEGIN` or `SAVEPOINT`, or any side effect outside the database. The executor
-  does not detect it; a manual `COMMIT` can persist rows although the wrapper then reports an error. Side effects
-  belong in `intents` rows (ADR 0017 decision 10), which do not exist yet.
+- A closure must not have a side effect outside the database (a file, a process, a message). The executor cannot detect
+  one and cannot undo it when the request rolls back or is refused. Such effects belong in `intents` rows (ADR 0017
+  decision 10). The rows exist (the `intents` table, and `sqlite/intents.rs` writes them in the caller's transaction,
+  with no effect of their own), but nothing performs a pending intent after the commit yet: the performer is plan T13.
+  Transaction control is no longer on this list: a closure's `COMMIT`, `ROLLBACK` or `BEGIN` cannot make a row durable
+  ("Atomicity of a request" above), and a savepoint of its own is allowed. What stays with the caller is the trust the
+  guard rests on. The executor classifies only what reaches it: the closure's returned error, the typed cleanup unwind of
+  a leaf, and what the closure reports with `FailureState::observe`. A closure that catches an SQLite error and returns
+  success without reporting it is not classified, and a closure is trusted not to swallow an unwind of its own
+  (`writer/contain.rs`).
 - Claims always go first, so a steady stream of claims can delay every other lane. Bounded claim production is
   not implemented.
 - The writer cuts no bulk work to 1,000 rows or 20 ms and merges nothing (ADR 0017 decision 9): it only counts the actual

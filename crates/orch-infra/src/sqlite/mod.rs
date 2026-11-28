@@ -161,6 +161,33 @@ fn test_data() -> (tempfile::TempDir, crate::data_dir::DataDir) {
     (temp, data)
 }
 
+#[cfg(test)]
+/// Damage the root page of `table` in the database file, with no connection open:
+/// the first statement that reads it answers `SQLITE_CORRUPT`. Synthetic data only.
+pub(in crate::sqlite) fn corrupt_root_page(data: &crate::data_dir::DataDir, table: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+    let conn = open_connection(data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let root: i64 = conn
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name=?1",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let size: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap();
+    let path = conn.path().unwrap().to_owned();
+    drop(conn);
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(((root - 1) * size) as u64))
+        .unwrap();
+    file.write_all(&[0xFF]).unwrap();
+    file.sync_all().unwrap();
+}
+
 #[allow(
     dead_code,
     reason = "internal goal persistence slice; full Storage and safety policy are not wired yet"
