@@ -248,7 +248,15 @@ pub(super) fn run_on(
     orch: &ConfinedDir,
     options: &Options,
     probe: &dyn ProcessProbe,
-) -> Result<(Report, Vec<super::TemplateSource>), PreflightError> {
+) -> Result<
+    (
+        Report,
+        Vec<super::TemplateSource>,
+        Vec<super::NativeSource>,
+        super::ConfigSource,
+    ),
+    PreflightError,
+> {
     // The guarded legacy YAML reader parks its parse on a blocking thread and awaits it.
     // This thread is itself a worker of the caller's blocking pool, so a pool of one would
     // wait for itself. The decode therefore runs on a runtime of its own, whose blocking
@@ -266,12 +274,17 @@ pub(super) fn run_on(
         auto_agent: false,
         inherited_agent_policy: false,
         templates: Vec::new(),
+        native: Vec::new(),
+        config: super::ConfigSource::default(),
     };
     if let Some(plan) = check.plan(orch)? {
         check.examine(orch, plan)?;
     }
     check.report.counts.entries = check.listed;
-    Ok((check.report, check.templates))
+    check
+        .native
+        .sort_by_key(|input| (input.store, input.position));
+    Ok((check.report, check.templates, check.native, check.config))
 }
 
 pub(super) struct Check<'a> {
@@ -281,6 +294,8 @@ pub(super) struct Check<'a> {
     pub(super) report: Report,
     listed: u64,
     templates: Vec<super::TemplateSource>,
+    native: Vec<super::NativeSource>,
+    config: super::ConfigSource,
     /// One fold key for each task id of the listing (R117): fold key to the id.
     tasks: BTreeMap<Vec<u8>, Vec<u8>>,
     auto_agent: bool,
@@ -694,7 +709,20 @@ impl Check<'_> {
                     let value = self.document(store, &level.dir, name, stem, &path)?;
                     if let Some(index) = &mut index {
                         match value {
-                            Some(value) => self.index_file(store.dir(), index, stem, &value),
+                            Some(value) => {
+                                if let Some(position) =
+                                    self.index_file(store.dir(), index, stem, &value)
+                                {
+                                    self.native.push(super::NativeSource {
+                                        store: store.dir(),
+                                        name: name.to_owned(),
+                                        id: String::from_utf8(stem.to_vec())
+                                            .expect("validated stem"),
+                                        hash: value.1,
+                                        position,
+                                    });
+                                }
+                            }
                             None => self.index_invalid_file(index, stem),
                         }
                     }
@@ -832,7 +860,10 @@ impl Check<'_> {
             Store::Runs => counts.runs += 1,
             Store::Templates => {}
         }
-        Ok(Some(DocumentContent(value)))
+        Ok(Some(DocumentContent(
+            value,
+            format!("{:x}", Sha256::digest(&bytes)),
+        )))
     }
 
     fn config(&mut self, orch: &ConfinedDir, present: bool) -> Result<(), PreflightError> {
@@ -844,6 +875,7 @@ impl Check<'_> {
             let Some(bytes) = self.read(file, Limits::YAML.bytes, path)? else {
                 return Ok(());
             };
+            self.config.hash = Some(format!("{:x}", Sha256::digest(&bytes)));
             let value = match self
                 .runtime
                 .block_on(decode_yaml::<serde_yaml_ng::Value>(&bytes, Limits::YAML))
@@ -888,13 +920,15 @@ impl Check<'_> {
         }
         self.config_unknown_notes(path, &unknown, "");
         let merged = orch_domain::deep_merge(&defaults, &value);
-        let config = match serde_json::from_value::<orch_domain::OrchestratorConfig>(merged) {
+        let config = match serde_json::from_value::<orch_domain::OrchestratorConfig>(merged.clone())
+        {
             Ok(config) => config,
             Err(e) => {
                 self.refusal(path, Refusal::invalid("type", e));
                 return Ok(());
             }
         };
+        self.config.rows = compatibility::native_config(&merged, &defaults, &unknown);
         self.report.run_cap = Some(config.scheduling.max_concurrent_agents as u64);
         if value.pointer("/scheduling/max_concurrent_agents").is_none() {
             self.note(

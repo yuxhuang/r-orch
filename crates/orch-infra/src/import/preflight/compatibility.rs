@@ -140,9 +140,9 @@ impl Check<'_> {
         plan: &mut IndexPlan,
         stem: &[u8],
         value: &DocumentContent,
-    ) {
+    ) -> Option<u64> {
         if plan.stopped {
-            return;
+            return None;
         }
         let id = std::str::from_utf8(stem).expect("validated ASCII stem");
         let path = format!("{store}/_index.json");
@@ -177,6 +177,7 @@ impl Check<'_> {
             plan.order.pop_last();
             plan.omitted += 1;
         }
+        Some(position)
     }
 
     pub(super) fn finish_index(&mut self, store: &'static str, plan: IndexPlan) {
@@ -222,6 +223,56 @@ impl Check<'_> {
             }
         }
     }
+}
+
+/// Only schema-named keys leave the inert legacy object. Values stay JSON text.
+/// Candidate row representation is deliberately independent of the runtime defaults.
+pub(super) fn native_config(
+    value: &Value,
+    schema: &Value,
+    unknown: &Value,
+) -> Vec<orch_core::store::ConfigEntry> {
+    use orch_core::store::ConfigEntry;
+    fn leaves(value: &Value, schema: &Value, path: &str, rows: &mut Vec<ConfigEntry>) {
+        if let (Some(map), Some(expected)) = (value.as_object(), schema.as_object()) {
+            for (key, child_schema) in expected {
+                if let Some(child) = map.get(key) {
+                    let path = if path.is_empty() {
+                        key.clone()
+                    } else {
+                        format!("{path}.{key}")
+                    };
+                    let prompt_schema = serde_json::json!({"template":null,"system_template":null,"user_template":null});
+                    leaves(
+                        child,
+                        if path == "prompt" && child.is_object() {
+                            &prompt_schema
+                        } else {
+                            child_schema
+                        },
+                        &path,
+                        rows,
+                    );
+                }
+            }
+        } else {
+            rows.push(ConfigEntry {
+                key: if path == "scheduling.max_concurrent_agents" {
+                    "run_cap".into()
+                } else {
+                    path.into()
+                },
+                value: value.to_string(),
+            });
+        }
+    }
+    let mut rows = Vec::new();
+    leaves(value, schema, "", &mut rows);
+    rows.push(ConfigEntry {
+        key: "legacy.config".into(),
+        value: unknown.to_string(),
+    });
+    rows
 }
 
 /// Frozen 1.0 defaults (fb6a1e1), independent of later product defaults. Optional
@@ -309,6 +360,8 @@ mod tests {
                 auto_agent: false,
                 inherited_agent_policy: false,
                 templates: Vec::new(),
+                native: Vec::new(),
+                config: crate::import::preflight::ConfigSource::default(),
             };
             let fault = Fault {
                 bytes: br#"[{"id":"b"}]"#,
