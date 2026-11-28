@@ -364,3 +364,98 @@ fn an_existing_registration_that_disagrees_refuses_the_write() {
     assert!(rig.reader("p").read_retry("t").unwrap().is_none());
     let _ = &mut rig;
 }
+
+// Catches interleaving parse/reconstruct: later structural damage must win over
+// an earlier access failure, independently of the ordering of the two rows.
+#[test]
+fn mixed_rows_validate_all_metadata_before_opening_any_object() {
+    let mut rig = rig();
+    rig.put("p", &retry("object", 1, 10, &text_of(BIG)));
+    insert(&rig, "damaged", 0, 20, Some(r#"{"v":1,"inline":"ok"}"#));
+    let unreadable = Faulty {
+        inner: &rig.blobs,
+        puts_allowed: Cell::new(usize::MAX),
+        corrupt_reads: false,
+        unreadable: true,
+    };
+    let reader = RetryReader::with_objects(&rig.conn, "p", &unreadable);
+    assert!(matches!(
+        reader.read_retry("object"),
+        Err(SqliteError::Io(_))
+    ));
+    for due in [20, 0] {
+        rig.conn
+            .execute(
+                "UPDATE retry_queue SET due_at=?1 WHERE task_id='damaged'",
+                [due],
+            )
+            .unwrap();
+        is_corrupt(reader.read_due_retries(20, 2), "attempt");
+        is_corrupt(reader.read_retries(None, 2), "attempt");
+    }
+}
+
+// Catches a registration lookup by hash alone: a healthy shared disk object and
+// another project's matching registration do not repair this project's row.
+#[test]
+fn another_projects_registration_cannot_authorize_retry_reads() {
+    let mut rig = rig();
+    let value = retry("t", 1, 10, &text_of(BIG));
+    rig.put("p", &value);
+    rig.put("other", &value);
+    rig.conn
+        .execute("DELETE FROM blobs WHERE project_id='p'", [])
+        .unwrap();
+    assert_eq!(rig.reader("other").read_retry("t").unwrap(), Some(value));
+    let reader = rig.reader("p");
+    is_corrupt(reader.read_retry("t"), "blob registration");
+    is_corrupt(reader.read_due_retries(10, 2), "blob registration");
+    is_corrupt(reader.read_retries(None, 2), "blob registration");
+    is_corrupt(reader.named_objects(), "blob registration");
+}
+
+// Invalid UTF-8 TEXT distinguishes the SQL projection from the parser's same
+// size error: conversion to Rust String fails if the SQL guard is removed.
+#[test]
+fn sql_size_guard_excludes_oversized_text_before_rust_conversion() {
+    let rig = rig();
+    insert(&rig, "t", 1, 10, Some(""));
+    let reader = rig.reader("p");
+    let after = RetryCursor {
+        due_at: 0,
+        task: "a".into(),
+    };
+    for size in [
+        super::super::text::MAX_STORED_BYTES,
+        super::super::text::MAX_STORED_BYTES + 1,
+    ] {
+        rig.conn
+            .execute(
+                "UPDATE retry_queue SET error=CAST(x'80' || zeroblob(?1) AS TEXT)",
+                [size as i64 - 1],
+            )
+            .unwrap();
+        if size == super::super::text::MAX_STORED_BYTES {
+            // At the admitted boundary the invalid byte reaches row conversion.
+            assert!(matches!(reader.read_retry("t"), Err(SqliteError::Sql(_))));
+            assert!(matches!(
+                reader.read_due_retries(10, 1),
+                Err(SqliteError::Sql(_))
+            ));
+            assert!(matches!(
+                reader.read_retries(None, 1),
+                Err(SqliteError::Sql(_))
+            ));
+            assert!(matches!(
+                reader.read_retries(Some(&after), 1),
+                Err(SqliteError::Sql(_))
+            ));
+        } else {
+            is_corrupt(reader.read_retry("t"), "document size");
+            is_corrupt(reader.read_due_retries(10, 1), "document size");
+            is_corrupt(reader.read_retries(None, 1), "document size");
+            is_corrupt(reader.read_retries(Some(&after), 1), "document size");
+            is_corrupt(reader.named_objects(), "document size");
+        }
+    }
+}
