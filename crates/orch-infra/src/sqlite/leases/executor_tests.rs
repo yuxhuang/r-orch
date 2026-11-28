@@ -699,6 +699,13 @@ fn caught_rollback_case(case: &'static str) {
     let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
     std::thread::scope(|scope| {
         let worker = scope.spawn(move || writer.run());
+        struct Close<'a>(&'a WriterHandle);
+        impl Drop for Close<'_> {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+        let _close = Close(&handle);
         let receipt = handle.submit(Lane::Claims, None, move |tx| {
             tx.execute("INSERT INTO daemon_config(key,value,revision) VALUES('outer','x',1)", [])?;
             if matches!(case, "renew" | "release") {

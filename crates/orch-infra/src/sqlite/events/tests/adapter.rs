@@ -692,7 +692,12 @@ fn caught_event_whole_transaction_rollback_refuses_later_work_and_reopens_empty(
     // F7 is a separate filesystem outcome: publication precedes the SQL row.
     // No sweep/retention acceptance is implied by this orphan characterization.
     let reopened_blobs = DiskBlobStore::open(reopened.root()).unwrap();
-    assert_eq!(reopened_blobs.get(&hash).unwrap(), bytes);
+    assert_eq!(
+        reopened_blobs
+            .get(&hash)
+            .expect("F7: unswept publication remains until the T15 orphan sweep"),
+        bytes
+    );
 }
 
 #[test]
@@ -719,7 +724,10 @@ fn caught_raw_event_rollback_blocks_an_attempted_later_entity_write() {
             );
             Ok(())
         });
-        assert!(receipt.is_err());
+        assert!(
+            matches!(receipt, Err(SqliteError::TransactionAborted)),
+            "{receipt:?}"
+        );
     });
     drop(data);
     let reopened = acquire(&fx.path);
