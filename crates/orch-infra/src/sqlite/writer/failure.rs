@@ -488,7 +488,7 @@ impl FailureState {
     pub fn writer_txn_over_bound_total(&self) -> u64 {
         self.inner.over_bound.load(Ordering::SeqCst)
     }
-    pub(super) fn writer_retry(&self) -> Option<super::policy::RetryCode> {
+    pub(in crate::sqlite) fn writer_retry(&self) -> Option<super::policy::RetryCode> {
         *self
             .inner
             .writer_retry
