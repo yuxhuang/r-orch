@@ -467,6 +467,9 @@ async fn cursor_is_bound_to_project_filter_and_sort_for_all_eight_non_task_famil
                     status: Some(GoalStatus::Active),
                 },
                 Filter::Agents => Filter::Teams,
+                Filter::Context => Filter::Config,
+                Filter::Config => Filter::Templates,
+                Filter::Templates => Filter::Context,
                 _ => Filter::Agents,
             };
             for (project, filter, sort) in [
@@ -921,7 +924,8 @@ async fn i_t4_inline_forged_expiry_obeys_the_future_claim_bound() {
     .await;
     let cursor = token(&page(&s, &Filter::Teams, Sort::Id, None, 1).await, "01");
     for (extra, accepted) in [(0, true), (1, false)] {
-        // ADR 0024 specifies the unauthenticated hex format and expiry bytes.
+        // The spec defines the unauthenticated hex format and expiry bytes;
+        // ADR 0024 gives the accepted bounds.
         let mut raw = cursor.as_str().to_owned();
         let expiry = (NOW + 86_400_000 + 300_000 + extra)
             .to_be_bytes()
@@ -1354,7 +1358,8 @@ async fn p_l2_public_byte_and_lookup_count_bounds_evict_exactly_the_oldest() {
         for _ in 0..bound {
             cursors.push(token(&page(&s, &filter, sort, None, 1).await, arm));
         }
-        // Resume every entry: use must neither refresh age nor create a charge.
+        // Resume every entry before the extra issue; all must remain usable.
+        // The P-L1 test separately detects refresh-on-use.
         for cursor in &cursors {
             assert_eq!(
                 page(&s, &filter, sort, Some(cursor.clone()), 10)
