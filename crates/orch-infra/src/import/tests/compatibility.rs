@@ -247,9 +247,9 @@ fn json_depth_clamp_remains_64_when_the_requested_limit_is_higher() {
     );
 }
 
-// C-V5. The event pass counts documents, and its scanner emits nothing for a stream
-// whose only content is a tab at the start of a line. 1.0's scanner rejects it, and a
-// file that does not scan is never a stream of no document.
+// C-V5. The scanner emits stream-start and stream-end, but no document-start,
+// for tab-only input. 1.0 rejects it; the bounded reader must classify it as
+// syntax rather than a stream of no document.
 #[tokio::test]
 async fn a_config_that_does_not_scan_stops_before_its_documents_are_counted() {
     for input in [
