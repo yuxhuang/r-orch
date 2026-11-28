@@ -523,6 +523,13 @@ mod classifier_tests {
                     assert!(adapter.writer.failure_state().failure().is_none());
                     // This second statement encounters actual SQLite page damage.
                     assert!(read.gaps("r").is_err());
+                    // Observe before COMMIT can independently detect the damaged page.
+                    let failure = adapter.writer.failure_state().failure().unwrap();
+                    assert_eq!(failure.source, FailureSource::Reader);
+                    assert_eq!(
+                        failure.causes,
+                        [(Role::Operation, FatalCause::SqliteCorrupt)]
+                    );
                     Ok(())
                 });
                 assert!(answer.is_err());
@@ -530,6 +537,30 @@ mod classifier_tests {
                 assert_eq!(commits.load(Ordering::SeqCst), 0);
             },
         );
+    }
+
+    #[test]
+    fn a_caught_typed_event_refusal_cannot_hide_later_real_sqlite_corruption() {
+        damaged("run_event_gaps", |adapter, commits| {
+            let state = adapter.writer.failure_state();
+            let answer = adapter.write(None, move |batch| {
+                let lease = crate::sqlite::leases::get_lease(batch.tx, batch.caller, "t")
+                    .unwrap()
+                    .unwrap();
+                // The intact lease rejects this fence before any damaged page is read.
+                assert!(matches!(
+                    batch.append("r", &lease.lineage, lease.epoch + 1, &[]),
+                    Err(StoreError::StaleEpoch)
+                ));
+                assert!(state.failure().is_none());
+                // A caught refusal must leave the batch able to observe a SQL failure.
+                assert!(matches!(batch.gap("r", 3, 1), Err(StoreError::Backend(_))));
+                Ok(())
+            });
+            assert!(matches!(answer, Err(StoreError::Backend(_))));
+            latched(&adapter, FailureSource::Writer);
+            assert_eq!(commits.load(Ordering::SeqCst), 0, "no COMMIT attempt");
+        });
     }
 
     #[test]
