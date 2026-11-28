@@ -72,6 +72,13 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
         "cfg(test) scripted/real process fake",
     ),
     (
+        "orch-engine/src/orchestrator/claim_v2/tests/sqlite.rs",
+        1,
+        "cfg(test) self-test executable selects the exact interrupted_reservation_child test; \
+         env_clear and private fixture paths isolate it; a 30-second output wait and \
+         kill-on-drop bound cleanup",
+    ),
+    (
         "orch-engine/src/orchestrator/tests/resilience.rs",
         1,
         "cfg(test) process existence assertion",
