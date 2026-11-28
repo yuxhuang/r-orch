@@ -48,18 +48,31 @@ fn run(root: &Path, args: &[&str], exit: i32) -> Value {
     value
 }
 
-// Same observer contract as import_offline: observe file bytes with O_NOATIME;
-// complete directory listing before recording metadata. Source access times are
-// excluded, since ordinary source reads may advance them. Destination metadata
-// includes access time. Never repair a timestamp to make a check pass.
+// Same observer contract as import_offline: observe file bytes and enumerate
+// directory descriptors with O_NOATIME. Source access times are excluded, since
+// ordinary source reads may advance them. Destination metadata includes access
+// time. Never repair a timestamp to make a check pass.
 type Snapshot = BTreeMap<PathBuf, (Vec<u8>, Vec<i128>)>;
 fn snapshot(root: &Path, source: bool) -> Snapshot {
     fn walk(base: &Path, path: &Path, source: bool, out: &mut Snapshot) {
         let mut bytes = Vec::new();
         let kind = fs::symlink_metadata(path).unwrap().file_type();
         if kind.is_dir() {
-            for entry in fs::read_dir(path).unwrap() {
-                walk(base, &entry.unwrap().path(), source, out);
+            use std::os::unix::ffi::OsStrExt;
+            let fd = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_NOATIME | nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY)
+                .open(path)
+                .unwrap();
+            // Enumerate this open description itself: reopening the path (or
+            // /proc/self/fd) would lose O_NOATIME on the directory reader.
+            let mut dir = nix::dir::Dir::from_fd(fd.into()).unwrap();
+            for entry in dir.iter() {
+                let entry = entry.unwrap();
+                let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+                if name != "." && name != ".." {
+                    walk(base, &path.join(name), source, out);
+                }
             }
         } else if kind.is_file() {
             fs::OpenOptions::new()
@@ -98,6 +111,43 @@ fn snapshot(root: &Path, source: bool) -> Snapshot {
         walk(root, root, source, &mut out);
     }
     out
+}
+
+#[test]
+fn repeated_snapshots_preserve_stale_directory_access_time() {
+    use std::time::{Duration, SystemTime};
+
+    let root = tempfile::tempdir().unwrap();
+    let nested = root.path().join("nested");
+    fs::create_dir(&nested).unwrap();
+    fs::write(nested.join("payload"), [0, 255, 1, 2]).unwrap();
+    std::os::unix::fs::symlink("nested", root.path().join("link")).unwrap();
+    let stale = SystemTime::UNIX_EPOCH + Duration::new(946684800, 123456789);
+    for path in [root.path(), nested.as_path()] {
+        fs::File::open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_accessed(stale))
+            .unwrap();
+    }
+    let before: Vec<_> = [root.path(), nested.as_path()]
+        .map(|path| fs::symlink_metadata(path).unwrap())
+        .iter()
+        .map(|m| (m.atime(), m.atime_nsec()))
+        .collect();
+    assert_eq!(before, vec![(946684800, 123456789); 2]);
+    let first = snapshot(root.path(), false);
+    for _ in 0..3 {
+        assert_eq!(snapshot(root.path(), false), first);
+        let after: Vec<_> = [root.path(), nested.as_path()]
+            .map(|path| fs::symlink_metadata(path).unwrap())
+            .iter()
+            .map(|m| (m.atime(), m.atime_nsec()))
+            .collect();
+        assert_eq!(
+            after, before,
+            "observer must preserve even the first stale atime"
+        );
+    }
 }
 
 fn refusal_parity(root: &Path, existing: bool) -> Value {
