@@ -9,10 +9,11 @@
 - Amends: the `Cursor` contract of [0017](0017-sqlite-storage.md) decision 3 and the cursor text of
   [0020](0020-storage-consumer-contracts.md), for the families other than Task only. It changes no accepted decision's
   wording and supersedes no ADR. Task keeps its cursor and the issue 277 exception of R10.
-- Scope of the decision: the contract and its vectors. As built, three private slices are on `main` (PR #376, the inline
-  arm; PR #377, the key-taking entry of the three leaves; and PR #383, the table of retained entries and entries by
-  lookup). Nothing is wired into the running daemon. The composition (draft PR 385) wires the three into `Storage` on
-  SQLite (`sqlite/storage/page.rs`); no vector is signed off through it (plan step 5).
+- Scope of the decision: the contract and its vectors. As built, three slices are on `main` (PR #376, the inline arm; PR
+  #377, the key-taking entry of the three leaves; and PR #383, the table of retained entries and entries by lookup), and
+  PR #385 wired them into `Storage` on SQLite (`sqlite/storage/page.rs`). Nothing is wired into the running daemon. PR #504
+  tests seven vectors and the two shared cases through `Storage`; the table of vectors as a whole is not signed off (plan
+  step 5).
 
 ## Context
 
@@ -101,9 +102,11 @@
   can list (release 1.3), one caller's walks can evict another's, and a per-principal limit is open.
 - The three leaves gain a key-taking entry, `select_after`, that does no filter check on the anchor (PR #377). The
   record-taking `select` and its refusal stay in the leaves until the page PR retires their use. The leaf half of
-  P-F1, P-F2, Q8 and N3b is tested there; N3a and every integrated vector remain the page PR's (issue 370).
-- The `Cursor` text of the port, R10 and the vectors are in the spec. The page PR names every vector as a test and
-  executes the mutants. The wording is on `main` (PR #369). Public paging reaches `main` with the composition (PR 385);
-  its named vectors, mutants and the physical corpus (plan step 5) are not claimed.
+  P-F1, P-F2, Q8 and N3b is tested there; N3a is a comparison of the lookup arm, and the integrated vectors were tested
+  through `Storage` afterwards by PR #504 (issue 370).
+- The `Cursor` text of the port, R10 and the vectors are in the spec. The page PR was to name every vector as a
+  test and execute the mutants. The wording is on `main` (PR #369). Public paging reached `main` with the composition
+  (PR #385); PR #504 names seven vectors and the two shared cases through `Storage` and ran the mutants, and the other
+  vectors and the physical corpus (plan step 5) are not claimed.
 - The inline capacities are derived from the Task token's constants. The encoder (PR #376) confirms all nine rows of the
   spec's table, and the table needed no correction.
