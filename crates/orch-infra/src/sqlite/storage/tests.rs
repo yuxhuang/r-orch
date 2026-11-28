@@ -1280,6 +1280,124 @@ async fn native_page_bridge_observes_fatal_damage_before_pool_cleanup() {
     native_fatal_read_is_observed_before_pool_cleanup(true).await;
 }
 
+// R140 / issue 127: pool cleanup must not be the first observer of an actual
+// SQLITE_CORRUPT returned by either native ReadView dispatch path.
+async fn native_real_corruption_is_observed_before_pool_cleanup(bridge: bool) {
+    use super::super::{FatalCause, Role};
+    use std::io::{Seek, SeekFrom, Write};
+
+    let (_temp, data) = crate::sqlite::test_data();
+    let data = Arc::new(data);
+    let seed = SqliteStorage::open(data.clone(), without_admission_expiry()).unwrap();
+    seed.transaction(owner(), store::Lane::Entities, |unit| {
+        unit.create(Entity::Config(store::ConfigEntry {
+            key: "damaged".into(),
+            value: "v".into(),
+        }))
+    })
+    .await
+    .unwrap();
+    seed.close().await.unwrap();
+
+    // All adapter connections are closed before changing this private fixture.
+    let conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let root: i64 = conn
+        .query_row(
+            "SELECT rootpage FROM sqlite_schema WHERE name='project_config'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let size: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap();
+    drop(conn);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(data.database_path())
+        .unwrap();
+    file.seek(SeekFrom::Start(((root - 1) * size) as u64))
+        .unwrap();
+    file.write_all(&[0xff]).unwrap(); // Invalid b-tree page type.
+    file.sync_all().unwrap();
+    drop(file);
+
+    let (entered, rolling_back) = oneshot::channel();
+    let (release, blocked) = mpsc::sync_channel(1);
+    let hook = Mutex::new(Some((entered, blocked)));
+    let storage = SqliteStorage::open(
+        data,
+        StorageOptions {
+            read_connections: 1,
+            reader_setup: Some(Box::new(move |conn| {
+                let (entered, blocked) = hook.lock().unwrap().take().unwrap();
+                let mut gate = Some((entered, blocked));
+                conn.rollback_hook(Some(move || {
+                    if let Some((entered, blocked)) = gate.take() {
+                        let _ = entered.send(());
+                        // Disconnect on test unwind releases the hook too. The bound
+                        // only prevents a broken harness from hanging the test suite.
+                        let _ = blocked.recv_timeout(Duration::from_secs(10));
+                    }
+                }))
+                .unwrap();
+            })),
+            ..without_admission_expiry()
+        },
+    )
+    .unwrap();
+    // Declare after storage so unwinding disconnects the gate before dropping
+    // the storage owner, whose shutdown joins the reader thread.
+    let release = release;
+    let snapshot = storage.read(owner()).await.unwrap();
+    let reading = tokio::spawn(async move {
+        if bridge {
+            snapshot
+                .list(&Filter::Config, &PageRequest::default())
+                .await
+                .map(|_| ())
+        } else {
+            snapshot
+                .get(EntityKind::Config, "damaged")
+                .await
+                .map(|_| ())
+        }
+    });
+    let cleanup = tokio::time::timeout(Duration::from_secs(5), rolling_back).await;
+    // Capture now; ReadPool will observe the same error after rollback. Checking
+    // only after releasing this gate would let M7a (ReadView observe off) survive.
+    let before_cleanup = storage.failure_state().failure();
+    let reply_pending = !reading.is_finished();
+    let _ = release.send(());
+    let read = reading.await.unwrap();
+    storage.close().await.unwrap();
+
+    cleanup.expect("reader must reach rollback").unwrap();
+    assert!(reply_pending, "the reply must still await pool cleanup");
+    let failure = before_cleanup.expect("ReadView must observe before pool cleanup");
+    assert_eq!(failure.source, FailureSource::Reader);
+    assert_eq!(
+        failure.causes,
+        [(Role::Operation, FatalCause::SqliteCorrupt)]
+    );
+    assert!(
+        matches!(read, Err(ref e) if e.to_string().contains("storage_unavailable")),
+        "{read:?}"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_get_observes_real_corruption_before_pool_cleanup() {
+    native_real_corruption_is_observed_before_pool_cleanup(false).await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn native_page_bridge_observes_real_corruption_before_pool_cleanup() {
+    native_real_corruption_is_observed_before_pool_cleanup(true).await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn a_known_commit_keeps_its_receipt_when_a_later_connection_latches() {
     let (_temp, data) = crate::sqlite::test_data();
