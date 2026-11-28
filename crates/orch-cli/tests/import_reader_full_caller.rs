@@ -1,6 +1,9 @@
 //! Issue 146: reviewed reader vectors extended to persisted native rows.
 //! Synthetic inputs only. The candidate remains unfinished; this does not prove
 //! state/events/attachments, policy activation, R66, R121 or R125 acceptance.
+//! Retained-payload validation-loop isolation belongs to the infra unit test
+//! `prewrite_validation_detects_native_drift_and_never_creates_unseen_rows`;
+//! this file checks observable refusal and couples its EIO fault to read count.
 #![cfg(target_os = "linux")]
 
 use serde_json::{Value, json};
@@ -570,6 +573,11 @@ fn auto_policy_requires_owner_confirmation_before_either_mode_can_write() {
                 .unwrap()
                 .contains("owner confirmation")
         );
+        assert_eq!(
+            notes(&result["preflight"], "preapproval_confirmation").count(),
+            1
+        );
+        assert_eq!(result["preflight"]["refusals"]["listed"], json!([]));
         assert_eq!(result["imported"], 0);
         assert_eq!(result["unfinished"], false);
         assert!(!root.path().join("data").exists());
