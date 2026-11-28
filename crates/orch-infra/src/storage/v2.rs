@@ -125,6 +125,7 @@ struct Cursors {
 pub struct FileStorage {
     root: PathBuf,
     retry_blobs: Option<Arc<text::RetryBlobStore>>,
+    retry_admission: orch_core::store::retries::stream::RetryStreamAdmission,
     writer: Arc<AsyncMutex<()>>,
     cursors: Arc<Mutex<Cursors>>,
 }
@@ -134,6 +135,7 @@ impl FileStorage {
         Self {
             root: root.into(),
             retry_blobs: None,
+            retry_admission: Default::default(),
             writer: Arc::default(),
             cursors: Arc::default(),
         }
@@ -326,8 +328,10 @@ impl Storage for FileStorage {
         let root = self.root.clone();
         let cursors = self.cursors.clone();
         let retry_blobs = self.retry_blobs.clone();
+        let retry_admission = self.retry_admission.clone();
         let session = blocking(move || {
             Ok(Session {
+                retry_admission,
                 retry_text: text::RetryText {
                     dir: dir.clone(),
                     store: retry_blobs,
@@ -348,12 +352,14 @@ impl Storage for FileStorage {
         let root = self.root.clone();
         let cursors = self.cursors.clone();
         let retry_blobs = self.retry_blobs.clone();
+        let retry_admission = self.retry_admission.clone();
         // The guard moves into the blocking work: a caller that stops waiting
         // does not release the gate while the work still runs.
         let gate = self.writer.clone().lock_owned().await;
         blocking(move || {
             let _gate = gate;
             let mut session = Session {
+                retry_admission,
                 retry_text: text::RetryText {
                     dir: dir.clone(),
                     store: retry_blobs,
@@ -377,6 +383,7 @@ impl Storage for FileStorage {
 /// One project as of one moment: a read's private snapshot, or a write's working
 /// copy, which is dropped unless the work returned `Ok`.
 struct Session {
+    retry_admission: orch_core::store::retries::stream::RetryStreamAdmission,
     retry_text: text::RetryText,
     caller: Caller,
     /// The daemon's lineage as of this session's start.
@@ -869,6 +876,60 @@ impl AttentionWrite for Session {
         let count = self.project.attention.expire(cutoff, limit)?;
         self.dirty |= count > 0;
         Ok(count)
+    }
+}
+
+#[async_trait]
+impl orch_core::store::retries::stream::RetryTextRead for Session {
+    async fn read_retry_text(
+        &self,
+        after: Option<&RetryCursor>,
+        limit: usize,
+        mut sink: Box<dyn orch_core::store::retries::stream::RetryTextSink>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> orch_core::store::retries::stream::Result<orch_core::store::retries::stream::RetryTextPage>
+    {
+        use orch_core::store::retries::stream::*;
+        let cancel = cancellation.child_token();
+        let _guard = cancel.clone().drop_guard();
+        check_cancel(&cancel)?;
+        let admission = self.retry_admission.clone();
+        let permit = admission.reserve(
+            1024usize
+                .checked_add(after.map_or(0, |c| c.task.len()))
+                .and_then(|n| n.checked_add(self.retry_text.dir.as_os_str().len()))
+                .ok_or(RetryStreamError::Resource)?,
+        )?;
+        let after = after
+            .map(|c| {
+                Ok::<_, RetryStreamError>(RetryCursor {
+                    task: copy_text(&c.task)?,
+                    due_at: c.due_at,
+                })
+            })
+            .transpose()?;
+        let retries = self.project.retries.clone();
+        let text = self.retry_text.clone();
+        let worker_cancel = cancel.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            retries.stream_page(
+                &text,
+                after.as_ref(),
+                limit,
+                &admission,
+                sink.as_mut(),
+                &worker_cancel,
+            )
+        })
+        .await
+        .map_err(|_| {
+            RetryStreamError::Store(StoreError::Backend(Error::other(
+                "retry stream worker failed",
+            )))
+        })?;
+        check_cancel(&cancel)?;
+        result
     }
 }
 

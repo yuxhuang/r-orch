@@ -119,21 +119,33 @@ impl<'a> RetryReader<'a> {
         after: Option<&RetryCursor>,
         limit: usize,
     ) -> Result<RetryPage> {
+        let (rows, more) = self.selected_retries(after, limit)?;
+        let rows = self.hydrate(rows)?;
+        let next = rows.last().filter(|_| more).map(RetryCursor::after);
+        Ok(RetryPage { rows, next })
+    }
+
+    fn selected_retries(
+        &self,
+        after: Option<&RetryCursor>,
+        limit: usize,
+    ) -> Result<(Vec<Raw>, bool)> {
         check_limit(limit)?;
         if let Some(cursor) = after {
             cursor.validate()?;
         }
         // One more row than the page tells whether a row follows it.
         let fetch = limit as i64 + 1;
-        let mut rows = match after {
-            None => self.select(
+        let (rows, more) = match after {
+            None => self.select_stream_page(
                 &format!(
                     "SELECT {COLUMNS} FROM retry_queue INDEXED BY retries_due WHERE project_id=?1
                      ORDER BY due_at,task_id LIMIT ?3"
                 ),
                 params![self.project, text::MAX_STORED_BYTES as i64, fetch],
+                limit,
             )?,
-            Some(cursor) => self.select(
+            Some(cursor) => self.select_stream_page(
                 &format!(
                     "SELECT {COLUMNS} FROM retry_queue INDEXED BY retries_due
                      WHERE project_id=?1 AND due_at >= ?3 AND (due_at > ?3 OR task_id > ?4)
@@ -146,13 +158,49 @@ impl<'a> RetryReader<'a> {
                     cursor.task,
                     fetch
                 ],
+                limit,
             )?,
         };
-        let more = rows.len() > limit;
-        rows.truncate(limit);
-        let rows = self.hydrate(rows)?;
-        let next = rows.last().filter(|_| more).map(RetryCursor::after);
-        Ok(RetryPage { rows, next })
+        Ok((rows, more))
+    }
+
+    /// Select and validate only the returned rows, with checked logical-byte
+    /// accounting before any object is opened. The enclosing snapshot must
+    /// remain alive through streaming. Retained as a test oracle for the
+    /// original selection leaf; the admitted production path is below.
+    #[cfg(test)]
+    pub(in crate::sqlite) fn preflight_stream_retries(
+        &self,
+        after: Option<&RetryCursor>,
+        limit: usize,
+    ) -> Result<RetryStreamPage> {
+        let (rows, more) = self.selected_retries(after, limit)?;
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(rows.len())
+            .map_err(|_| stream_resource())?;
+        let mut bytes = 0u64;
+        for row in rows {
+            let (attempt, stored) = self.parse(&row)?;
+            let length = match &stored {
+                Stored::Inline(text) => text.len() as u64,
+                Stored::Blob(blob) => blob.bytes,
+            };
+            bytes = text::checked_page_bytes(bytes, length).map_err(|_| stream_resource())?;
+            prepared.push((row, attempt, stored));
+        }
+        let next = prepared
+            .last()
+            .filter(|_| more)
+            .map(|(row, _, _)| RetryCursor {
+                task: row.task.clone(),
+                due_at: row.due_at,
+            });
+        Ok(RetryStreamPage {
+            rows: prepared,
+            bytes,
+            next,
+        })
     }
 
     /// Every object the project's retry rows name, by task and position. Damage
@@ -184,6 +232,29 @@ impl<'a> RetryReader<'a> {
         Ok(statement
             .query_map(args, raw)?
             .collect::<rusqlite::Result<_>>()?)
+    }
+
+    // The lookahead row is used only for existence. Do not decode any of its
+    // fields: even a malformed native column beyond the page is unselected.
+    fn select_stream_page(
+        &self,
+        sql: &str,
+        args: impl rusqlite::Params,
+        limit: usize,
+    ) -> Result<(Vec<Raw>, bool)> {
+        let mut statement = self.conn.prepare_cached(sql)?;
+        let mut query = statement.query(args)?;
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(limit)
+            .map_err(|_| stream_resource())?;
+        while let Some(row) = query.next()? {
+            if selected.len() == limit {
+                return Ok((selected, true));
+            }
+            selected.push(raw(row)?);
+        }
+        Ok((selected, false))
     }
 
     /// The structural checks of one row: its native columns and its document.
@@ -398,5 +469,375 @@ impl<'a, 'conn> Retries<'a, 'conn> {
     pub(in crate::sqlite) fn named_objects(&self) -> Result<Vec<NamedObject>> {
         self.active()?;
         self.reader().named_objects()
+    }
+}
+
+fn stream_resource() -> SqliteError {
+    SqliteError::Io(std::io::ErrorKind::OutOfMemory.into())
+}
+
+/// Selected rows from one caller-owned snapshot. No cursor is released until
+/// all selected text has passed final verification. All output is provisional
+/// until this method succeeds; a sink must discard it on any error.
+#[cfg(test)]
+pub(in crate::sqlite) struct RetryStreamPage {
+    rows: Vec<(Raw, u32, Stored)>,
+    bytes: u64,
+    next: Option<RetryCursor>,
+}
+
+#[cfg(test)]
+impl RetryStreamPage {
+    pub(in crate::sqlite) fn declared_bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub(in crate::sqlite) fn stream(
+        self,
+        mut read: impl FnMut(
+            &crate::blob::BlobHash,
+            &mut dyn FnMut(&[u8]) -> std::result::Result<(), text::StreamError>,
+        ) -> std::result::Result<(), text::StreamError>,
+        mut begin: impl FnMut(&str, u32, i64) -> std::result::Result<(), text::StreamError>,
+        mut consume: impl FnMut(&[u8]) -> std::result::Result<(), text::StreamError>,
+    ) -> std::result::Result<Option<RetryCursor>, text::StreamError> {
+        for (row, attempt, stored) in self.rows {
+            begin(&row.task, attempt, row.due_at)?;
+            match stored {
+                Stored::Inline(value) => {
+                    for part in value.as_bytes().chunks(64 * 1024) {
+                        consume(part)?;
+                    }
+                }
+                Stored::Blob(blob) => text::verify_stream(&blob, &mut read, &mut consume)?,
+            }
+        }
+        Ok(self.next)
+    }
+}
+
+use orch_core::store::retries::stream::{
+    RETRY_STREAM_WINDOW_BYTES, RetryStreamAdmission, RetryStreamError, RetryStreamPermit,
+    RetryTextPage, RetryTextRow, RetryTextSink, check_cancel, copy_text, verify_retry_objects,
+};
+use tokio_util::sync::CancellationToken;
+
+pub(in crate::sqlite) enum BoundedRetryError {
+    Sql(SqliteError),
+    Public(RetryStreamError),
+}
+impl From<SqliteError> for BoundedRetryError {
+    fn from(e: SqliteError) -> Self {
+        Self::Sql(e)
+    }
+}
+impl From<rusqlite::Error> for BoundedRetryError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Sql(e.into())
+    }
+}
+impl From<RetryStreamError> for BoundedRetryError {
+    fn from(e: RetryStreamError) -> Self {
+        Self::Public(e)
+    }
+}
+// Observation belongs to one selected operation, never a process-global slot.
+// Only the disk adapter can record origin; a sink may return the same public
+// backend class and must not retire the database snapshot.
+struct ObservedRetryDisk<'a> {
+    disk: &'a DiskBlobStore,
+    io: std::sync::Mutex<Option<std::io::ErrorKind>>,
+}
+impl orch_core::store::blob::BlobStore for ObservedRetryDisk<'_> {
+    type Hash = crate::blob::BlobHash;
+    type Error = crate::blob::BlobError;
+    fn put(&self, bytes: &[u8]) -> std::result::Result<Self::Hash, Self::Error> {
+        self.disk.put(bytes)
+    }
+    fn get(&self, hash: &Self::Hash) -> std::result::Result<Vec<u8>, Self::Error> {
+        self.disk.get(hash)
+    }
+    fn remove(&self, hash: &Self::Hash) -> std::result::Result<bool, Self::Error> {
+        self.disk.remove(hash)
+    }
+    fn read_windowed(
+        &self,
+        hash: &Self::Hash,
+        window: &mut [u8],
+        cancel: &CancellationToken,
+        consume: &mut dyn FnMut(&[u8]) -> orch_core::store::retries::stream::Result<()>,
+    ) -> orch_core::store::retries::stream::Result<()> {
+        let mut native_io = None;
+        let result =
+            self.disk
+                .read_windowed_observed(hash, window, cancel, consume, &mut native_io);
+        if let Some(kind) = native_io {
+            *self
+                .io
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(kind);
+        }
+        result
+    }
+    fn with_stream_hasher(
+        &self,
+        work: &mut dyn FnMut(
+            &mut dyn orch_core::store::blob::BlobStreamHasher,
+        ) -> orch_core::store::retries::stream::Result<()>,
+    ) -> orch_core::store::retries::stream::Result<()> {
+        self.disk.with_stream_hasher(work)
+    }
+}
+
+struct AdmittedRetry {
+    task: String,
+    attempt: u32,
+    due: i64,
+    stored: Stored,
+    bytes: u64,
+    _permit: RetryStreamPermit,
+}
+
+/// No selected Rust metadata or JSON is materialized before admission. SQLite
+/// owns its existing page/cache allocations; those are outside this counter.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one snapshot operation binds selection, admission, cancellation and provisional sink"
+)]
+pub(in crate::sqlite) fn bounded_retry_page(
+    conn: &Connection,
+    project: &str,
+    disk: &DiskBlobStore,
+    after: Option<&RetryCursor>,
+    limit: usize,
+    admission: &RetryStreamAdmission,
+    sink: &mut dyn RetryTextSink,
+    cancel: &CancellationToken,
+) -> std::result::Result<RetryTextPage, BoundedRetryError> {
+    check_limit(limit).map_err(RetryStreamError::Store)?;
+    if let Some(cursor) = after {
+        cursor.validate().map_err(RetryStreamError::Store)?;
+    }
+    check_cancel(cancel)?;
+    let _rows = admission.reserve(
+        limit
+            .checked_mul(std::mem::size_of::<AdmittedRetry>())
+            .ok_or(RetryStreamError::Resource)?,
+    )?;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(limit)
+        .map_err(|_| RetryStreamError::Resource)?;
+    let sql = if after.is_some() {
+        "SELECT task_id,attempt,due_at,error FROM retry_queue INDEXED BY retries_due
+         WHERE project_id=?1 AND due_at>=?2 AND (due_at>?2 OR task_id>?3)
+         ORDER BY due_at,task_id LIMIT ?4"
+    } else {
+        "SELECT task_id,attempt,due_at,error FROM retry_queue INDEXED BY retries_due
+         WHERE project_id=?1 AND ?2 IS NULL AND ?3 IS NULL
+         ORDER BY due_at,task_id LIMIT ?4"
+    };
+    let mut statement = conn.prepare_cached(sql)?;
+    let mut query = statement.query(params![
+        project,
+        after.map(|c| c.due_at),
+        after.map(|c| c.task.as_str()),
+        limit as i64 + 1
+    ])?;
+    let mut bytes = 0u64;
+    let mut more = false;
+    while let Some(row) = query.next()? {
+        if rows.len() == limit {
+            more = true;
+            break;
+        }
+        check_cancel(cancel)?;
+        let task = row
+            .get_ref(0)?
+            .as_str()
+            .map_err(|_| RetryStreamError::Corrupt)?;
+        let document = row
+            .get_ref(3)?
+            .as_str()
+            .map_err(|_| RetryStreamError::Corrupt)?;
+        if document.len() > text::MAX_STORED_BYTES || task.is_empty() {
+            return Err(RetryStreamError::Corrupt.into());
+        }
+        // Covers decoded strings, amortized chunk capacity, current field keys
+        // and the task key. The decoder never copies the encoded document.
+        let capacity = document
+            .len()
+            .checked_mul(8)
+            .and_then(|n| n.checked_add(task.len()))
+            .and_then(|n| n.checked_add(4096))
+            .ok_or(RetryStreamError::Resource)?;
+        let permit = admission.reserve(capacity)?;
+        let task = copy_text(task)?;
+        let attempt = u32::try_from(row.get::<_, i64>(1)?)
+            .ok()
+            .filter(|v| *v >= 1)
+            .ok_or(RetryStreamError::Corrupt)?;
+        let due = row.get::<_, i64>(2)?;
+        if due < 0 {
+            return Err(RetryStreamError::Corrupt.into());
+        }
+        let stored = text::parse_stream(document)?;
+        let length = match &stored {
+            Stored::Inline(text) => text.len() as u64,
+            Stored::Blob(blob) => {
+                // Do not allocate a BTreeMap of registrations. Repeated
+                // occurrences are checked against the same pinned transaction.
+                let mut registration = conn.prepare_cached(
+                    "SELECT size,storage_location FROM blobs WHERE project_id=?1 AND sha256=?2",
+                )?;
+                for chunk in &blob.chunks {
+                    let found = registration
+                        .query_row(params![project, chunk.sha256], |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get_ref(1)?.as_str().is_ok_and(|s| s == "disk"),
+                            ))
+                        })
+                        .optional()?;
+                    if !found.is_some_and(|(size, disk)| {
+                        disk && u64::try_from(size).ok() == Some(chunk.size)
+                    }) {
+                        return Err(RetryStreamError::Corrupt.into());
+                    }
+                }
+                blob.bytes
+            }
+        };
+        bytes = bytes
+            .checked_add(length)
+            .ok_or(RetryStreamError::Resource)?;
+        rows.push(AdmittedRetry {
+            task,
+            attempt,
+            due,
+            stored,
+            bytes: length,
+            _permit: permit,
+        });
+    }
+    drop(query);
+    drop(statement);
+    let _cursor = admission.reserve(rows.last().map_or(0, |r| r.task.len()))?;
+    let next = if more {
+        rows.last()
+            .map(|r| {
+                Ok::<_, RetryStreamError>(RetryCursor {
+                    task: copy_text(&r.task)?,
+                    due_at: r.due,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let mut window = admission.buffer(RETRY_STREAM_WINDOW_BYTES)?;
+    for row in &rows {
+        check_cancel(cancel)?;
+        sink.begin(
+            RetryTextRow {
+                task: &row.task,
+                attempt: row.attempt,
+                due_at: row.due,
+                bytes: row.bytes,
+            },
+            admission,
+        )?;
+        let mut consume = |part: &[u8]| {
+            check_cancel(cancel)?;
+            sink.write(part, admission)
+        };
+        match &row.stored {
+            Stored::Inline(text) => {
+                for part in text.as_bytes().chunks(RETRY_STREAM_WINDOW_BYTES) {
+                    consume(part)?;
+                }
+            }
+            Stored::Blob(blob) => {
+                let objects = ObservedRetryDisk {
+                    disk,
+                    io: std::sync::Mutex::new(None),
+                };
+                let result = verify_retry_objects(
+                    &objects,
+                    &blob.sha256,
+                    blob.chunks.iter().map(|c| (c.sha256.as_str(), c.size)),
+                    blob.bytes,
+                    window.as_mut_slice(),
+                    cancel,
+                    &mut consume,
+                );
+                if let Some(kind) = objects
+                    .io
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    return Err(SqliteError::Io(kind.into()).into());
+                }
+                result?;
+            }
+        }
+    }
+    check_cancel(cancel)?;
+    Ok(RetryTextPage {
+        rows: rows.len(),
+        bytes,
+        next,
+    })
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use crate::sqlite::retry_message::tests::{retry, rig};
+
+    #[test]
+    fn streaming_preflight_selects_ordered_rows_without_resolving_lookahead() {
+        let mut rig = rig();
+        rig.put("p", &retry("b", 2, 1, "second"));
+        rig.put("p", &retry("a", 1, 1, "first"));
+        rig.put("p", &retry("z", 1, 2, "later"));
+        rig.conn
+            .execute(
+                "UPDATE retry_queue SET error='damaged' WHERE task_id='z'",
+                [],
+            )
+            .unwrap();
+        let plan = rig.reader("p").preflight_stream_retries(None, 2).unwrap();
+        assert_eq!(plan.declared_bytes(), 11);
+        let mut tasks = Vec::new();
+        let mut bytes = Vec::new();
+        let next = plan
+            .stream(
+                |_, _| panic!("inline rows open no objects"),
+                |task, attempt, deadline| {
+                    tasks.push((task.to_owned(), attempt, deadline));
+                    Ok(())
+                },
+                |part| {
+                    bytes.extend_from_slice(part);
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(tasks, [("a".to_owned(), 1, 1), ("b".to_owned(), 2, 1)]);
+        assert_eq!(bytes, b"firstsecond");
+        assert_eq!(
+            next,
+            RetryCursor {
+                task: "b".into(),
+                due_at: 1
+            }
+        );
+        assert!(
+            rig.reader("p")
+                .preflight_stream_retries(Some(&next), 2)
+                .is_err()
+        );
     }
 }

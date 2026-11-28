@@ -189,3 +189,157 @@ impl RetryText {
         }
     }
 }
+
+use orch_core::store::retries::stream::{
+    self, RetryStreamAdmission, RetryStreamError, RetryStreamPermit, check_cancel,
+    verify_retry_objects,
+};
+use tokio_util::sync::CancellationToken;
+
+pub(super) struct RetryTextPlan<'a> {
+    stored: &'a StoredText,
+    objects: Vec<(BlobHash, u64)>,
+    bytes: u64,
+    _permit: RetryStreamPermit,
+}
+impl RetryTextPlan<'_> {
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+impl RetryText {
+    fn stream_store<T>(
+        &self,
+        work: impl FnOnce(&RetryBlobStore) -> stream::Result<T>,
+    ) -> stream::Result<T> {
+        match &self.store {
+            Some(store) => work(store.as_ref()),
+            None => work(
+                &blobs(&self.dir)
+                    .map_err(|_| RetryStreamError::Store(backend("cannot open retry objects")))?,
+            ),
+        }
+    }
+    pub(super) fn preflight<'a>(
+        &self,
+        stored: &'a StoredText,
+        admission: &RetryStreamAdmission,
+        cancel: &CancellationToken,
+    ) -> stream::Result<RetryTextPlan<'a>> {
+        check_cancel(cancel)?;
+        let count = match stored {
+            StoredText::Inline(_) => 0,
+            StoredText::Blob { .. } => 1,
+            StoredText::Chunked { chunks, .. } => chunks.len(),
+        };
+        let permit = admission.reserve(
+            count
+                .checked_mul(std::mem::size_of::<(BlobHash, u64)>())
+                .ok_or(RetryStreamError::Resource)?,
+        )?;
+        let mut objects = Vec::new();
+        objects
+            .try_reserve_exact(count)
+            .map_err(|_| RetryStreamError::Resource)?;
+        let bytes = match stored {
+            StoredText::Inline(text) => {
+                if text.len() > INLINE_TEXT_MAX_BYTES {
+                    return Err(RetryStreamError::Corrupt);
+                }
+                text.len() as u64
+            }
+            StoredText::Blob { sha256 } | StoredText::Chunked { sha256, .. } => {
+                sha256
+                    .parse::<BlobHash>()
+                    .map_err(|_| RetryStreamError::Corrupt)?;
+                if count == 0 {
+                    return Err(RetryStreamError::Corrupt);
+                }
+                // Syntax/structure of every selected reference precedes metadata access.
+                match stored {
+                    StoredText::Blob { sha256 } => {
+                        objects.push((sha256.parse().map_err(|_| RetryStreamError::Corrupt)?, 0))
+                    }
+                    StoredText::Chunked { chunks, .. } => {
+                        for name in chunks {
+                            objects.push((name.parse().map_err(|_| RetryStreamError::Corrupt)?, 0));
+                        }
+                    }
+                    _ => return Err(RetryStreamError::Corrupt),
+                }
+                self.stream_store(|store| {
+                    let mut bytes = 0u64;
+                    for (ordinal, (hash, length)) in objects.iter_mut().enumerate() {
+                        check_cancel(cancel)?;
+                        *length = store.stream_len(hash)?;
+                        if *length == 0
+                            || *length > MAX_BLOB_BYTES
+                            || (ordinal + 1 < count && *length != MAX_BLOB_BYTES)
+                        {
+                            return Err(RetryStreamError::Corrupt);
+                        }
+                        bytes = bytes
+                            .checked_add(*length)
+                            .ok_or(RetryStreamError::Resource)?;
+                    }
+                    if bytes <= INLINE_TEXT_MAX_BYTES as u64
+                        || (matches!(stored, StoredText::Chunked { .. }) && bytes <= MAX_BLOB_BYTES)
+                    {
+                        return Err(RetryStreamError::Corrupt);
+                    }
+                    Ok(bytes)
+                })?
+            }
+        };
+        Ok(RetryTextPlan {
+            stored,
+            objects,
+            bytes,
+            _permit: permit,
+        })
+    }
+    pub(super) fn stream(
+        &self,
+        plan: &RetryTextPlan<'_>,
+        window: &mut [u8],
+        cancel: &CancellationToken,
+        consume: &mut dyn FnMut(&[u8]) -> stream::Result<()>,
+    ) -> stream::Result<()> {
+        match plan.stored {
+            StoredText::Inline(text) => {
+                for part in text.as_bytes().chunks(stream::RETRY_STREAM_WINDOW_BYTES) {
+                    check_cancel(cancel)?;
+                    consume(part)?;
+                }
+                Ok(())
+            }
+            StoredText::Blob { sha256 } | StoredText::Chunked { sha256, .. } => {
+                // Keep names borrowed from the snapshot rather than allocating strings.
+                self.stream_store(|store| match plan.stored {
+                    StoredText::Blob { sha256 } => verify_retry_objects(
+                        store,
+                        sha256,
+                        std::iter::once((sha256.as_str(), plan.bytes)),
+                        plan.bytes,
+                        window,
+                        cancel,
+                        consume,
+                    ),
+                    StoredText::Chunked { chunks, .. } => verify_retry_objects(
+                        store,
+                        sha256,
+                        chunks
+                            .iter()
+                            .map(String::as_str)
+                            .zip(plan.objects.iter().map(|(_, length)| *length)),
+                        plan.bytes,
+                        window,
+                        cancel,
+                        consume,
+                    ),
+                    _ => Err(RetryStreamError::Corrupt),
+                })
+            }
+        }
+    }
+}

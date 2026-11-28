@@ -288,3 +288,169 @@ impl RetryWrite for Unit<'_, '_> {
         self.observed(result)
     }
 }
+
+#[async_trait]
+impl orch_core::store::retries::stream::RetryTextRead for Snapshot {
+    async fn read_retry_text(
+        &self,
+        after: Option<&RetryCursor>,
+        limit: usize,
+        mut sink: Box<dyn orch_core::store::retries::stream::RetryTextSink>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> orch_core::store::retries::stream::Result<orch_core::store::retries::stream::RetryTextPage>
+    {
+        use crate::sqlite::retry_message::{BoundedRetryError, bounded_retry_page};
+        use orch_core::store::retries::stream::*;
+        let cancel = cancellation.child_token();
+        let _guard = cancel.clone().drop_guard();
+        check_cancel(&cancel)?;
+        let admission = self.owner.shared.retry_admission.clone();
+        let permit = admission.reserve(
+            1024usize
+                .checked_add(self.caller.project.len())
+                .and_then(|n| n.checked_add(after.map_or(0, |c| c.task.len())))
+                .ok_or(RetryStreamError::Resource)?,
+        )?;
+        let project = copy_text(&self.caller.project)?;
+        let after = after
+            .map(|c| {
+                Ok::<_, RetryStreamError>(RetryCursor {
+                    task: copy_text(&c.task)?,
+                    due_at: c.due_at,
+                })
+            })
+            .transpose()?;
+        let owner = self.owner.clone();
+        let worker_cancel = cancel.clone();
+        let result = self
+            .call(move |view| {
+                let _owner = owner;
+                let _permit = permit;
+                match bounded_retry_page(
+                    view.tx,
+                    &project,
+                    &view.shared.disk,
+                    after.as_ref(),
+                    limit,
+                    &admission,
+                    sink.as_mut(),
+                    &worker_cancel,
+                ) {
+                    Ok(page) => Ok(Ok(page)),
+                    Err(BoundedRetryError::Public(error)) => Ok(Err(error)),
+                    Err(BoundedRetryError::Sql(error)) => Err(error),
+                }
+            })
+            .await
+            .map_err(RetryStreamError::Store)?;
+        check_cancel(&cancel)?;
+        result
+    }
+}
+
+#[cfg(test)]
+mod retry_stream_io_tests {
+    use super::*;
+    use orch_core::store::retries::stream::Result;
+    use orch_core::store::retries::stream::*;
+    use orch_core::store::{Lane, Principal, StorageExt};
+    use tokio_util::sync::CancellationToken;
+    struct Sink {
+        fail: bool,
+    }
+    impl RetryTextSink for Sink {
+        fn begin(&mut self, _: RetryTextRow<'_>, _: &RetryStreamAdmission) -> Result<()> {
+            Ok(())
+        }
+        fn write(&mut self, _: &[u8], _: &RetryStreamAdmission) -> Result<()> {
+            if self.fail {
+                Err(RetryStreamError::Store(StoreError::Backend(
+                    orch_core::Error::Io {
+                        context: "synthetic sink failure".into(),
+                        path: None,
+                        source: std::io::ErrorKind::PermissionDenied.into(),
+                    },
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[tokio::test]
+    async fn object_io_retires_the_snapshot_but_sink_io_is_only_its_own_error() {
+        let (_temp, data) = crate::sqlite::test_data();
+        let storage = super::super::SqliteStorage::open(
+            std::sync::Arc::new(data),
+            super::super::tests::without_admission_expiry(),
+        )
+        .unwrap();
+        let caller = Caller {
+            project: "p".into(),
+            principal: Principal::Owner {
+                identity: "synthetic".into(),
+            },
+        };
+        storage
+            .transaction(caller.clone(), Lane::Entities, |u| {
+                u.put_retry(&Retry {
+                    task: "a".into(),
+                    attempt: 1,
+                    due_at: 1,
+                    error: "x".repeat(65_537),
+                })
+            })
+            .await
+            .unwrap();
+        let snapshot = storage.snapshot(caller.clone()).await.unwrap();
+        storage.owner.shared.disk.fail_next_stream_read();
+        assert!(matches!(
+            snapshot
+                .read_retry_text(
+                    None,
+                    1,
+                    Box::new(Sink { fail: false }),
+                    CancellationToken::new()
+                )
+                .await,
+            Err(RetryStreamError::Store(_))
+        ));
+        // The fault is one-shot; a swallowed native IO would leave this same
+        // snapshot live and incorrectly make this call succeed.
+        assert!(matches!(
+            snapshot
+                .read_retry_text(
+                    None,
+                    1,
+                    Box::new(Sink { fail: false }),
+                    CancellationToken::new()
+                )
+                .await,
+            Err(RetryStreamError::Store(_))
+        ));
+        let snapshot = storage.snapshot(caller).await.unwrap();
+        assert!(matches!(
+            snapshot
+                .read_retry_text(
+                    None,
+                    1,
+                    Box::new(Sink { fail: true }),
+                    CancellationToken::new()
+                )
+                .await,
+            Err(RetryStreamError::Store(_))
+        ));
+        // A sink's own file failure must not retire a healthy database reader.
+        snapshot
+            .read_retry_text(
+                None,
+                1,
+                Box::new(Sink { fail: false }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(storage.owner.shared.retry_admission.used_bytes(), 0);
+        drop(snapshot);
+        storage.close().await.unwrap();
+    }
+}

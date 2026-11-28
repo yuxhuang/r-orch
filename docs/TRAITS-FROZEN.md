@@ -199,7 +199,7 @@ trait StorageExt: Storage {
 }
 
 // One committed state for every read through it, repeated page reads included.
-trait ReadSnapshot: AttentionRead + EventRead + IntentRead + LeaseRead + RetryRead + Send + Sync {
+trait ReadSnapshot: RetryTextRead + AttentionRead + EventRead + IntentRead + LeaseRead + RetryRead + Send + Sync {
     fn caller(&self) -> &Caller;
     async fn get(&self, kind: EntityKind, id: &str) -> Result<Option<Record>>;
     async fn list(&self, filter: &Filter, page: &PageRequest) -> Result<Page<Record>>;
@@ -265,6 +265,7 @@ trait BlobStore: Send + Sync {
     fn get(&self, hash: &Self::Hash) -> Result<Vec<u8>, Self::Error>;     // verifies the hash; missing or corrupt is an error
     fn remove(&self, hash: &Self::Hash) -> Result<bool, Self::Error>;     // idempotent; the caller proves no reference remains
 }
+// Three provided methods and `BlobStreamHasher` were added for the bounded retry read: see "Added for the bounded retry read".
 ```
 
 The sorts each family offers are the spec's table: tasks `Position`, `Priority`, `CreatedAt`, `UpdatedAt`; goals
@@ -272,7 +273,7 @@ The sorts each family offers are the spec's table: tasks `Position`, `Priority`,
 a backend refuses any other combination as `InvalidPage`. A cursor is opaque, holds no snapshot, and is bound to its project, filter and sort.
 
 ```rust
-// store::retries (RetryRead on ReadSnapshot, RetryWrite on UnitOfWork)
+// store::retries (RetryRead and RetryTextRead on ReadSnapshot, RetryWrite on UnitOfWork)
 pub const MAX_DUE_RETRIES: usize = 1_000;
 pub const MAX_RETRY_ERROR_BYTES: usize = 64 * 1024;       // 65,536: the inline threshold, not a limit on the text
 pub struct Retry { pub task: String, pub attempt: u32 /* >= 1 */, pub due_at: i64 /* UTC ms, >= 0 */, pub error: String }
@@ -528,6 +529,150 @@ pub enum Sort { /* ..., */ Attempt }                       // serde "attempt"
   `{"sha256": H, "chunks": [...]}` above 67,108,864 bytes (hashes are 64 lower-case hex digits, and chunks are cut at
   67,108,864 bytes); a stored mapping with any other field is refused when the document loads. No public type carries it, so this record has no new type to list; the types that hold it are
   private to each adapter, and T10 may choose another encoding that holds the same facts.
+
+#### Added for the bounded retry read (ADR 0020 decision 9)
+
+One trait, one supertrait edge, one error enum, one constant and a small set of types and helpers in
+`orch_core::store::retries::stream` (a public module of `store::retries`), plus one trait and three defaulted methods
+in `orch_core::store::blob`. They are additive: no earlier method signature changes, `RetryRead` keeps the six reads
+listed above, and nothing is removed. One edge is not additive for an implementor of `ReadSnapshot`: it now has
+`RetryTextRead` as a supertrait, so every implementation must provide the stream (the memory fake, the file reference
+and SQLite do). The `test-support` fakes are not part of the contract and are not listed, except the two
+`test-support` methods named below. Signatures read at commit `bdf99d96c` (tree `9c41bb6f`), which carries the three adapters
+and the SQLite disk-fault observation described under "Errors on a stored object"; none of the signatures below differs from the
+earlier integration commit `b85df7a1a`, because the repair added crate-private items only.
+
+```rust
+// store::retries::stream
+pub const RETRY_STREAM_WINDOW_BYTES: usize = 65_536;         // the most bytes one sink callback receives
+
+#[derive(Debug, thiserror::Error)]
+pub enum RetryStreamError {                                   // every message is content-free
+    Resource,                                                 // admission or allocation refused; never damage
+    Cancelled,
+    Corrupt,                                                  // stored text failed verification
+    Store(StoreError),                                        // #[error(transparent)] #[from]; any ordinary store failure
+}
+pub type Result<T> = std::result::Result<T, RetryStreamError>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct RetryTextRow<'a> { pub task: &'a str, pub attempt: u32, pub due_at: i64, pub bytes: u64 }  // bytes = logical UTF-8 length
+pub trait RetryTextSink: Send + 'static {                     // called on the adapter's blocking boundary only
+    fn begin(&mut self, row: RetryTextRow<'_>, admission: &RetryStreamAdmission) -> Result<()>;
+    fn write(&mut self, bytes: &[u8], admission: &RetryStreamAdmission) -> Result<()>;   // <= RETRY_STREAM_WINDOW_BYTES; may split a UTF-8 character
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryTextPage { pub rows: usize, pub bytes: u64, pub next: Option<RetryCursor> }  // returned only after everything verified
+#[async_trait]
+pub trait RetryTextRead: Send + Sync {
+    async fn read_retry_text(&self, after: Option<&RetryCursor>, limit: usize,
+                             sink: Box<dyn RetryTextSink>, cancellation: CancellationToken) -> Result<RetryTextPage>;
+}
+
+#[derive(Clone)] pub struct RetryStreamAdmission(/* private */);   // clones share one counter
+impl RetryStreamAdmission {
+    pub fn new(bytes: usize) -> Self;
+    pub fn reserve(&self, bytes: usize) -> Result<RetryStreamPermit>;     // checked; refusal is Resource and leaves no charge
+    pub fn buffer(&self, bytes: usize) -> Result<RetryStreamBuffer>;      // fallible allocation; charges the Vec's real capacity
+    #[cfg(any(test, feature = "test-support"))] pub fn used_bytes(&self) -> usize;            // fixture introspection
+    #[cfg(any(test, feature = "test-support"))] pub fn fail_next_buffer_allocation(&self);    // the next `buffer` returns Resource
+}
+impl Default for RetryStreamAdmission { /* new(64 * 1024 * 1024) = 67,108,864 bytes */ }
+pub struct RetryStreamPermit(/* private */);                  // not Clone; releases its bytes once, on drop
+pub struct RetryStreamBuffer(/* private */);                  // fixed length; holds its charge until dropped
+impl RetryStreamBuffer { pub fn as_mut_slice(&mut self) -> &mut [u8]; }
+
+// Helpers the three adapters share (public so each adapter crate can call them)
+pub fn copy_text(value: &str) -> Result<String>;              // fallible copy; the caller has charged its capacity
+pub fn check_cancel(token: &CancellationToken) -> Result<()>; // Cancelled when the token has fired
+pub struct RetryStreamSelection<'a> { pub keys: Vec<(&'a str, i64)>, pub more: bool, /* private permit */ }
+pub fn select_retry_keys<'a>(rows: impl Iterator<Item = (&'a str, i64)>, after: Option<&RetryCursor>, limit: usize,
+        admission: &RetryStreamAdmission, cancel: &CancellationToken) -> Result<RetryStreamSelection<'a>>;
+#[derive(Default)] pub struct RetryStreamUtf8 { /* four carried bytes */ }
+impl RetryStreamUtf8 { pub fn feed(&mut self, bytes: &[u8]) -> Result<()>; pub fn finish(&self) -> Result<()>; }
+pub fn verify_retry_objects<'a, B: BlobStore + ?Sized>(store: &B, whole: &str,
+        objects: impl Iterator<Item = (&'a str, u64)> + Clone, expected: u64, window: &mut [u8],
+        cancel: &CancellationToken, consume: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>;
+
+// store (ReadSnapshot gains one supertrait; the order below is the declaration order)
+pub trait ReadSnapshot: retries::stream::RetryTextRead + AttentionRead + EventRead + IntentRead + LeaseRead
+    + RetryRead + Send + Sync { .. }
+
+// store::blob (additive: three provided methods and one trait; `put`, `get`, `remove` and `Hash`/`Error` are unchanged)
+pub trait BlobStreamHasher { fn update(&mut self, bytes: &[u8]); fn matches(&self, expected: &str) -> bool; }
+pub trait BlobStore: Send + Sync {
+    // ... Hash, Error, put, get, remove as listed in section 2 ...
+    fn stream_len(&self, hash: &Self::Hash) -> retries::stream::Result<u64> { /* unsupported */ }
+    fn read_windowed(&self, hash: &Self::Hash, window: &mut [u8], cancel: &CancellationToken,
+                     consume: &mut dyn FnMut(&[u8]) -> retries::stream::Result<()>) -> retries::stream::Result<()> { /* unsupported */ }
+    fn with_stream_hasher(&self, work: &mut dyn FnMut(&mut dyn BlobStreamHasher) -> retries::stream::Result<()>)
+        -> retries::stream::Result<()> { /* unsupported */ }
+}
+```
+
+- **Selection.** `read_retry_text(after, limit, ..)` selects the rows, the order and the cursor that
+  `RetryRead::read_retries(after, limit)` selects from the same snapshot: earliest deadline first, ties by task id as
+  UTF-8 bytes, `limit` in 1..=1,000, `next` exactly when a row follows. A row it does not select is not read; the row
+  that decides `next` is looked at only far enough to know that it exists.
+- **Provisional output.** `begin` and `write` receive bytes that are provisional until the call returns
+  `Ok(RetryTextPage)`, including bytes of rows before one that fails. On any `Err`, on cancellation and on a dropped
+  future the caller discards every byte of the page and keeps its cursor. There is no end-of-row callback and none is
+  needed: `begin` carries the row's declared length (`RetryTextRow::bytes`), and the page result is provisional as a
+  whole. `rows` is the number of rows delivered, `bytes` the checked sum of their logical lengths and `next` the page's
+  next cursor.
+- **Bytes, not `str`.** A window can end inside a UTF-8 character. The adapter validates UTF-8 across windows and
+  objects; the sink must not assume a window is valid text.
+- **Admission.** Each adapter owns one `RetryStreamAdmission` and keeps it across snapshots and concurrent reads;
+  a call cannot supply its own. Each adapter creates it with `Default`, so the capacity of the counter is 64 MiB
+  (67,108,864 bytes) per adapter instance, shared by every read on it; no setting changes it, and it is a bound on live
+  working memory, never on the length of a text. It charges the live windows, selected-row metadata and the bytes a sink
+  retains, and the adapter passes the same counter to both callbacks; a sink that retains bytes allocates them with
+  `buffer`, or holds a `reserve` permit for as long as it holds the bytes. `buffer` charges the capacity the allocator
+  returned, which can exceed the request. The counter does not cover allocator bookkeeping, what the database or the
+  existing snapshots already hold, or the control allocations of a call, and the `Arc` of `new` is not allocated
+  fallibly. It is a count of charged payload bytes, not process memory (RSS).
+- **Cancellation.** The adapter derives a child token of `cancellation`, holds its drop guard for the whole await,
+  checks it before every read, before every callback and before it returns success, and keeps the snapshot and the
+  admission charged until its worker has exited. A latched sink error is never turned into success.
+- **Blob capability and refusal.** The three `BlobStore` methods have provided bodies that return
+  `RetryStreamError::Store(StoreError::Backend(..))` whose message is `blob store does not support bounded streaming`.
+  A store that implements only `put`, `get` and `remove` therefore compiles unchanged and refuses the stream; the stream
+  never falls back to the whole `get`. `stream_len` must not fetch payload. `read_windowed` fills the caller's admitted
+  window (1 to 65,536 bytes), checks cancellation before every read, before every callback and before it returns, and
+  verifies the object's hash and length at its end. `with_stream_hasher` lends stack-owned incremental state for the
+  whole-value hash, so no boxed hasher and no whole-value buffer is allocated. `orch_infra::blob::DiskBlobStore`
+  implements all three; the memory fake in its disk-backed form calls whichever store it was given, so with a `DiskBlobStore`
+it reads through that one.
+- **Errors on a stored object.** With `DiskBlobStore`, a selected object that is missing, is a symbolic link, is not a
+  regular file, has the wrong length or has the wrong hash is `Corrupt`; any other I/O error on it is
+  `Store(Backend)` whose text is the constant `retry object access failed`. Neither carries a path, a hash or text.
+  That is the disk helper's own error, and the file reference and the disk-backed fake return it as it is. On SQLite the
+  same I/O error is also an observation of the snapshot's reader, and the reply the caller sees differs (no signature
+  changes):
+  - *A native I/O fault on a stored object* (any I/O kind except `NotFound`, which is `Corrupt`, raised while the bounded
+    read opens the object, asks for its length or reads a window) is raised to the snapshot as a SQLite I/O error. The
+    snapshot classifies it with the failure policy of the legacy retry reads (an ordinary, transient class that latches
+    nothing), retires that snapshot's reader connection and answers the call with `Store(Backend)` whose text is the
+    snapshot's ordinary retired-reader text, `SQLite storage operation failed`; if a fatal observation was made since the
+    snapshot was requested the text is `storage_unavailable` instead. The disk helper's text above is replaced, not
+    passed on. A later call on that snapshot is refused with `Store(Backend)` text `snapshot_expired`, the text of a snapshot
+    whose worker has left. A snapshot taken after the fault clears reads the page.
+  - *A sink's own error* is returned to the caller as the sink made it, including a `Store(Backend)` of the same class as
+    a disk fault. It does not retire the snapshot, and the next read on that snapshot succeeds.
+  - The origin is recorded privately and only at the disk operation, for one selected row's operation; the public error
+    alone cannot tell the two apart. Cancellation, `Resource`, the `Corrupt` cases and interrupted-read retries are not
+    observed and do not retire the snapshot.
+  The test that shows reader retirement, recovery on a fresh snapshot and reuse after a sink error asserts the class of
+  each error (`Store`) and the sequence of outcomes; the literal texts above are established by the source and by a one-off
+  probe recorded in the plan's "Bounded retry text read", not by an assertion of that test.
+- **Compatibility.** The whole-value reads of `RetryRead` and `RetryWrite` keep their signatures, orders and errors. The
+  trait does not change what is stored: a row is the version-1 document and the chunk mapping of ADR 0020 decision 4.
+  No format, schema or setting changes.
+
+Implemented by: `orch_core::store::fake::FakeStorage` (the logical form and the form with a retry blob store), the
+`orch_infra::storage::v2::FileStorage` reference and `orch_infra::sqlite::SqliteStorage`, each on its `ReadSnapshot`
+type. No production caller exists; the plan's "Bounded retry text read" records what evidence exists and what releases
+the first read.
 
 ## 3. `orch_core::adapter`
 
@@ -835,7 +980,7 @@ pub trait AttentionWrite  { .. }   // likewise EventWrite, IntentWrite, LeaseWri
 
 **Not changed.** `WriteWork` (`Box<dyn FnOnce(&mut dyn UnitOfWork) -> Result<()> + Send + 'static>`), `Storage: Send + Sync`,
 `StorageExt` (`T: Send + 'static`, `F: … + Send + 'static`), `ReadSnapshot: … + Send + Sync` and every read trait
-(`AttentionRead`, `EventRead`, `IntentRead`, `LeaseRead`, `RetryRead`: `Send + Sync`). No method of any trait changes.
+(`AttentionRead`, `EventRead`, `IntentRead`, `LeaseRead`, `RetryRead`, `RetryTextRead`: `Send + Sync`). No method of any trait changes.
 The cursor rules (spec R10, the `Cursor` row and the Task cursor exception of issue 277) are not touched.
 
 **Why.** The SQLite adapter's unit of work borrows the writer's open transaction, which cannot be `Send` (`rusqlite`'s

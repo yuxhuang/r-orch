@@ -472,7 +472,7 @@ family and its filters; `PageRequest` bounds each list and selects a supported
 sort. `store::fake::FakeStorage`, behind `test-support`, serializes in-memory
 writers and retains immutable read views. Its cursor registry holds query
 bindings and sort keys, not snapshots, and lives only as long as that fake.
-`ReadSnapshot` also extends `AttentionRead`, `EventRead`, `IntentRead`, `LeaseRead` and `RetryRead`; `UnitOfWork`
+`ReadSnapshot` also extends `RetryTextRead`, `AttentionRead`, `EventRead`, `IntentRead`, `LeaseRead` and `RetryRead`; `UnitOfWork`
 extends `AttentionWrite`, `EventWrite`, `IntentWrite`, `LeaseWrite`, `RequestKeyWrite` and `RetryWrite`
 ([TRAITS-FROZEN](TRAITS-FROZEN.md) records each signature). Event batches keep the first
 payload for each sequence and report stored/skipped counts; range/tail reads are

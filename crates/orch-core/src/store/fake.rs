@@ -768,6 +768,50 @@ impl AttentionWrite for View {
 #[cfg(test)]
 mod tests;
 
+#[async_trait]
+impl retries::stream::RetryTextRead for View {
+    async fn read_retry_text(
+        &self,
+        after: Option<&retries::RetryCursor>,
+        limit: usize,
+        mut sink: Box<dyn retries::stream::RetryTextSink>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> retries::stream::Result<retries::stream::RetryTextPage> {
+        use retries::stream::*;
+        let cancel = cancellation.child_token();
+        let _guard = cancel.clone().drop_guard();
+        check_cancel(&cancel)?;
+        let state = self.project.retries.clone();
+        let admission = state.admission();
+        let permit = admission.reserve(
+            1024usize
+                .checked_add(after.map_or(0, |c| c.task.len()))
+                .ok_or(RetryStreamError::Resource)?,
+        )?;
+        let after = after
+            .map(|c| {
+                Ok::<_, RetryStreamError>(retries::RetryCursor {
+                    task: copy_text(&c.task)?,
+                    due_at: c.due_at,
+                })
+            })
+            .transpose()?;
+        let worker_cancel = cancel.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            state.stream_page(after.as_ref(), limit, sink.as_mut(), &worker_cancel)
+        })
+        .await
+        .map_err(|_| {
+            RetryStreamError::Store(StoreError::Backend(crate::Error::other(
+                "retry stream worker failed",
+            )))
+        })?;
+        check_cancel(&cancel)?;
+        result
+    }
+}
+
 #[cfg(test)]
 mod permanent_input_tests {
     use super::*;

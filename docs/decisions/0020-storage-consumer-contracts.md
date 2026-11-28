@@ -9,10 +9,14 @@
 - Amends: nothing in [0017](0017-sqlite-storage.md). It adds to the port that decision 3 defines, applies decisions 7
   and 11 to the retry row, and is the ADR that `docs/TRAITS-FROZEN.md` requires for its record of the landed v2
   port. It supersedes no accepted ADR.
+- Amended: decision 8 (28 November 2026) adds the permanent input refusal of issue 441, and decision 9 (2026-11-28)
+  adds a bounded, verified streaming read of a retry's whole text for its first production consumer (T12). Decisions 1
+  to 7 stand as written; decision 9 adds a port trait and a supertrait edge and changes no signature of decisions 1 to 4.
 - Scope of the decision: contracts, and the memory and file references that meet them. The change that carries this
   ADR implements decisions 1 to 4 in `orch-core`, the memory fake and the file reference and registers the shared
-  tests on both (decision 6 names them). Nothing here is wired into the running daemon, and no SQLite adapter carries
-  these contracts yet.
+  tests on both (decision 6 names them). Nothing here is wired into the running daemon. When it was written no SQLite
+  adapter carried these contracts; the spec records that the shared retry scenarios have run on SQLite since #385
+  (`sqlite_retries_v2`), and the daemon still uses the file backend.
 
 ## Context
 
@@ -215,6 +219,107 @@ reference conformance reconciliation (#196) landed and #130 closed:
      Linux tests across the three adapters for the same valid boundary and refused inputs, content-free errors,
      rollback and a separately classified backend fault have been run on it. The plan's "Permanent input refusal
      (issue 441)" lists them.
+9. **The private retry read is a bounded, verified stream.** This is the lead's T12 first-use decision of
+   2026-11-28. It keeps decision 3's promise (the whole text of a valid stored retry is recoverable, also after its
+   run is gone) for the first production consumer, a diagnostic read, without a whole-text allocation and without a
+   new logical-size ceiling. It adds one trait to `orch_core::store::retries::stream` and makes it a supertrait of
+   `ReadSnapshot`; it changes no method signature. `read_retry`, `read_due_retries`, `read_retries`, `get_retry`,
+   `due_retries` and `list_retries` keep their contract and their whole-value results, and a caller that accepts a whole
+   `String` keeps using them. The memory fake (logical and disk-backed forms), the file reference and SQLite implement
+   it; no daemon path calls it.
+   - *The trait.* `RetryTextRead::read_retry_text(after, limit, sink, cancellation)` selects exactly the rows, the
+     order and the next cursor that `RetryRead::read_retries(after, limit)` selects from the same snapshot, and
+     delivers each row's text to a caller-supplied `RetryTextSink` in windows of at most 65,536 bytes
+     (`RETRY_STREAM_WINDOW_BYTES`) instead of returning it. A window is a byte slice, not a `str`: a UTF-8 character
+     may span two windows and two objects. Every byte and every chunk occurrence is delivered, in order, so identical
+     chunks are delivered once per position. The sink's callbacks are synchronous, so a slow sink applies
+     backpressure across rows. A row that the call does not select is not read, damaged or not, as in decision 3.
+   - *Before any payload is read.* Every selected row is checked before the first byte reaches the sink, and the
+     lengths are summed for the page with checked arithmetic (an overflow is `Resource`). Stored metadata that is not
+     valid is damage (`Corrupt`). SQLite compares each chunk's declared size with the registered blob of the same
+     snapshot and charges the encoded document before it decodes it (see admission). The disk-backed memory fake checks
+     the chunk sizes it recorded when it wrote the row. The file reference stores no object length in a text (a
+     single object records its hash, and a split text records the whole-value hash and the ordered chunk hashes), so
+     it reads one from the object: after it has validated the syntax and structure of every selected reference, it
+     opens each selected object through the confined directory, which refuses a symbolic link and a file that is not
+     regular, and takes the length from the open descriptor (`BlobStore::stream_len`, metadata only). It reads no
+     payload, hashing included, until the whole selected page has passed, so a page whose last reference fails reads
+     nothing. Every adapter counts every occurrence of a repeated chunk and keeps the lengths for the verification,
+     charged to the counter. This adds no stored field and no format.
+   - *Verification.* While streaming, the adapter reopens each object by the same confined route, rechecks its type and
+     its length against the length it kept (the declared size on SQLite), reads to the end of the object, and checks the object's hash, the whole
+     value's hash and length, and the UTF-8 of the joined bytes incrementally across windows and objects (an invalid
+     sequence, or a character cut at the end of the value, is damage). An object replaced between the preflight and the
+     read, including by one of the same length, fails on the hash or on the length. Success needs the last of these
+     checks. The sink's `begin` and `write` receive **provisional** bytes, including for rows before one that later
+     fails. Only a returned `RetryTextPage` (the row count, the summed logical bytes and the next cursor) authorizes the
+     consumer to publish its output or to advance its cursor. On any failure, a cancellation or a dropped future the
+     consumer discards every provisional byte of the page and the cursor stays where it was. A consumer never collects
+     the stream into an unbounded string and never acts on a prefix that was not verified.
+   - *Admission, not a ceiling.* A request's logical length is never a reason to refuse. Each adapter owns one
+     `RetryStreamAdmission`, a checked shared byte counter that it keeps across snapshots and concurrent reads, queued
+     work included, and charges for the working memory that is live (a window, the selected rows' metadata, the bytes a
+     sink retains). Its capacity is `RetryStreamAdmission::default()`, 64 MiB (67,108,864 bytes) per adapter instance,
+     and no setting changes it. It hands the counter to both sink callbacks, so a sink that must hold bytes charges the
+     same counter, and a caller cannot replace it. Allocation is fallible (`try_reserve_exact`). A charge or an
+     allocation that fails is `RetryStreamError::Resource`, and no page completes. A permit is released exactly once,
+     when the work that holds it exits, also after the requesting future was dropped. SQLite reserves, for each selected
+     row, eight times the encoded document, plus the task key and 4,096 bytes, before it decodes the document, so a
+     decoder's strings, chunk capacity and field keys are inside the charge before they are allocated. The counter
+     covers payload and selection metadata: not allocator bookkeeping, not process memory, not the database, the
+     existing snapshots or the control allocations of a call; the `Arc` of `new` is not allocated fallibly. On the
+     synthetic page of five 2 MiB retries (10 MiB in all) that the public matrix reads, the highest charge a sink saw
+     in its callbacks was 66,710 bytes on the memory fake in both forms, 67,245 on the file reference and 96,157 on
+     SQLite. Those are charged bytes sampled at the callbacks, not measurements of resident memory. The allocation proof injects a refusal at the buffer
+     allocation boundary of the counter (`fail_next_buffer_allocation`, `test-support` only): it shows that a refused
+     buffer is `Resource` and releases its charge, and it does not simulate the process or the global allocator running
+     out of memory.
+   - *Cancellation.* The adapter derives a child of the caller's `CancellationToken` and holds its drop guard across the
+     await, so dropping the future cancels its worker and cancelling one read never cancels another. The worker
+     checks the token before each read, before each sink callback and before it returns success. The snapshot outlives
+     the blocking work, and the worker's admission stays charged until the worker has actually exited. A test fills
+     the adapter's counter from inside a blocked sink callback, then drops the future (or fires the token), and shows
+     that the counter stays full, that a second read on the same adapter is refused with `Resource`, and that the
+     counter returns to zero only after the callback has returned.
+   - *Errors.* `RetryStreamError` has four content-free variants: `Resource` (admission or allocation, never damage),
+     `Cancelled`, `Corrupt` (persisted data that fails verification) and `Store`
+     (any ordinary `StoreError`, so the classifications of decision 3 and of #441 survive). A selected object that is
+     missing, is not a regular file, has the wrong length or the wrong hash is `Corrupt`; an input or output fault on
+     an object that is present is `Store(Backend)`. The disk helper's own text for it is the constant
+     `retry object access failed`, which the file reference and the disk-backed fake return as it is; the SQLite reply is
+     given under *A disk fault on SQLite*. A sink's error is latched: an implementation never returns success after a
+     callback failed, and stops calling the sink once it sees cancellation.
+   - *A disk fault on SQLite.* The snapshot's failure policy already retires a reader whose legacy retry read met a native
+     I/O error on a stored object, so the stream does the same, or one disk fault would leave a snapshot usable through
+     one public entry point and retired through the other. The public `Store(Backend)` error alone cannot say where it
+     came from, because a sink can return the same class. The origin is therefore kept privately at the disk operation
+     (the open, the length lookup and each window read of `DiskBlobStore`'s bounded read, for one selected row's
+     objects) and forwarded to the SQLite adapter as an I/O error of the outer call. Only an I/O error of any kind but
+     `NotFound` is forwarded (`NotFound` stays `Corrupt`); the missing, wrong-length and wrong-hash classifications,
+     cancellation, `Resource`, the retry of an interrupted read and a sink's error are unchanged. The outer snapshot
+     classifies the error as transient (it latches nothing), retires the reader connection and replies `Store(Backend)`
+     with the snapshot's ordinary retired-reader text, `SQLite storage operation failed`, or `storage_unavailable` when
+     a fatal observation was made since the snapshot was requested. The disk helper's inner text is replaced by it. A
+     later call on the retired snapshot answers `snapshot_expired`; a snapshot taken after the fault clears reads the page.
+     A sink's own error, even one of the same `Store(Backend)` class, is returned as the sink made it and retires
+     nothing: the next read on that snapshot succeeds. No signature, stored form or setting changes; the observation is
+     crate-private.
+   - *The blob port.* `BlobStore` gains three provided methods (`stream_len`, `read_windowed`, `with_stream_hasher`) and
+     the trait `BlobStreamHasher`, so a store written against the earlier port compiles unchanged. A store that does not
+     implement them refuses the stream with `Store(Backend)` and a constant text, and the stream never falls back to
+     the whole `get`. The hasher is lent to a closure on the stack, so no boxed hasher is allocated. `DiskBlobStore`
+     implements all three.
+   - *What stays as it was.* No stored format, schema or setting changes. The 4 MiB serialized-manifest limit on the
+     SQLite write side, and the error a write over it returns, are not changed here: that disposition is the
+     controller's, under open issue [#546](https://github.com/yuxhuang/r-orch/issues/546), and the cap is no logical
+     length ceiling and no reason to map a write refusal to this read's `Resource`.
+   - *Owners and release.* A storage-port builder owns the trait and the three adapters; the T12 owner owns the first
+     consumer and its bounded sink. This decision releases no production read. A read is released when the accepted
+     trait and adapter commit is part of the consumer's candidate, the consuming call has passed the independent code
+     review and the security review that its surface requires (the security reasoning and evidence stay private), the
+     private Linux evidence that the plan's "Bounded retry text read" lists is recorded against that commit, with
+     its actual limits, and the controller has the proofs of the two deferred fixtures named there ([#511](https://github.com/yuxhuang/r-orch/issues/511),
+     [#512](https://github.com/yuxhuang/r-orch/issues/512)). The other #449 items keep their own triggers.
 
 ## Alternatives considered
 
@@ -257,6 +362,29 @@ reference conformance reconciliation (#196) landed and #130 closed:
 - **Close the claimed-Run case in this change by adding claim metadata to the references.** The port has no durable
   claim allocation, so the metadata would be invented outside the claim path that T12 owns. Rejected: the case is held
   with T12's lifecycle task and issue 441 stays open for it.
+- **Collect the text with the whole-value reads, or cap it for the diagnostic.** The whole-value reads allocate the
+  whole text (and a page can hold 1,000 of them), and a cap is decision 3's option B again. Rejected for decision 9's
+  stream, which keeps the promise and adds no ceiling.
+- **Hand the sink a verified prefix as it arrives.** A hash can be checked only after the last byte, so a prefix is
+  never known to be the stored text. Rejected: bytes are provisional until the page returns.
+- **Let the caller supply the admission budget.** A caller could size a private budget per call and bypass the
+  adapter's concurrent limit. Rejected: the adapter owns one budget across snapshots and reads.
+- **Raise or remove the 64 KiB window, or read objects whole.** A whole-object read is the 64 MiB allocation that the
+  stream exists to avoid. Rejected for a fixed window.
+- **Store an object length in the file reference's text, or hash every object during the preflight.** The first
+  changes the stored format; the second reads every payload twice and delivers nothing to a page that fails late.
+  Rejected: the length comes from the open descriptor, and no payload is read before the page has passed.
+- **Add an end-of-row callback.** The row's declared length arrives with `begin`, and the whole page is provisional,
+  so a sink has nothing to learn from an end marker that it cannot also learn from the next `begin` or the returned
+  page. Rejected: not needed.
+- **Classify a disk fault from the public error.** The stream's `Store(Backend)` for an unreadable object and a sink's
+  own `Store(Backend)` are the same class, so a mapping at the snapshot would retire a healthy reader for a failing sink,
+  or leave a faulted one live. Rejected for a private observation at the disk operation, forwarded only from there.
+- **Leave the stream's disk fault unobserved and defer the repair.** The legacy retry read already retires the snapshot on
+  the same fault, so the two public entry points would disagree about one disk. Rejected by the controller's ruling of
+  2026-11-28 before the final freeze.
+- **Map a refused serialized-manifest write to `Resource`.** `Resource` is this read's statement about its own live
+  memory; the write-side 4 MiB cap is a different contract, left to issue #546.
 
 ## Consequences
 
@@ -281,6 +409,25 @@ reference conformance reconciliation (#196) landed and #130 closed:
 - T21 can import any 1.0 retry error whole. T12 must call `get_retry` before `put_retry` to keep 1.0's first-wins
   enqueue (the shared round-trip scenario models two enqueue calls with that guard and does not test a production
   caller), and T14 must keep dispatching in candidate order and not due-row order.
+- A consumer of decision 9's stream has three things to do that the whole-value reads did not ask of it: hold its output
+  as provisional until `read_retry_text` returns, discard it on every error including `Cancelled`, and treat `Resource`
+  as a statement about this call's memory and never about the stored text (`Corrupt` is the statement about the text).
+  The stream has no end-of-row callback: a row ends where the next `begin` is called or the page returns. Its
+  cursor is the returned page's `next`, valid only on success. Which consumer policy follows each error is T12's.
+- On SQLite a disk fault during the stream ends that snapshot, as it does for the whole-value reads. A consumer that
+  sees `Store(Backend)` from `read_retry_text` can retry on a fresh snapshot, and must not read a different cause from
+  the text: the texts above are diagnostics, and the same class also carries a sink's own error, which retires nothing.
+  How the first consumer reacts is T12's.
+- The stream is a port contract with three implementations and a public three-adapter test matrix (four registrations:
+  the memory fake in its logical and disk-backed forms, the file reference and SQLite). The plan's "Bounded retry text
+  read" lists the tests and the commands that select them. No daemon path calls it, so the evidence is synthetic and
+  says nothing about a real diagnostic; the proofs of [#511](https://github.com/yuxhuang/r-orch/issues/511) (an
+  unreadable object as an ordinary and as a privileged user) and [#512](https://github.com/yuxhuang/r-orch/issues/512)
+  (snapshot admission after a large write) are deferred for this unused producer only and are owed before a runtime
+  integration is accepted.
+- Every implementor of `ReadSnapshot` must now implement `RetryTextRead`, and a `BlobStore` that implements only the
+  three original methods refuses the stream. The first is a source change for any out-of-tree storage adapter; the
+  second needs none.
 - The chunk path is reference-port behaviour. This decision supplies no measurement above 64 MiB and no runtime
   evidence for any consumer, and it grants no publication or merge authority. The proof it requires is in the
   plan's "T8 consumer contracts (issue 109)".

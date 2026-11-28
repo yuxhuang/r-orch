@@ -9,9 +9,23 @@ use crate::store::blob::BlobStore;
 
 use super::*;
 
+use super::stream::{
+    self, RETRY_STREAM_WINDOW_BYTES, RetryStreamAdmission, RetryStreamError, RetryTextPage,
+    RetryTextRow, RetryTextSink, check_cancel, copy_text, select_retry_keys, verify_retry_objects,
+};
+use tokio_util::sync::CancellationToken;
+
 trait RetryBlobs: Send + Sync {
     fn publish(&self, bytes: &[u8]) -> Result<Backing>;
     fn resolve(&self, backing: &Backing) -> Result<Vec<u8>>;
+    fn preflight(&self, backing: &Backing) -> stream::Result<()>;
+    fn stream(
+        &self,
+        backing: &Backing,
+        window: &mut [u8],
+        cancel: &CancellationToken,
+        consume: &mut dyn FnMut(&[u8]) -> stream::Result<()>,
+    ) -> stream::Result<()>;
 }
 
 struct Blobs<B: BlobStore> {
@@ -24,6 +38,8 @@ struct Blobs<B: BlobStore> {
 struct Backing {
     hash: String,
     chunks: Vec<String>,
+    sizes: Vec<u64>,
+    bytes: u64,
 }
 
 fn backend(error: impl std::fmt::Display) -> StoreError {
@@ -35,17 +51,69 @@ fn backend(error: impl std::fmt::Display) -> StoreError {
 impl<B: BlobStore> RetryBlobs for Blobs<B> {
     fn publish(&self, bytes: &[u8]) -> Result<Backing> {
         let mut chunks = Vec::new();
+        let mut sizes = Vec::new();
         for chunk in bytes.chunks(self.chunk_bytes) {
             let hash = self.store.put(chunk).map_err(backend)?;
             if self.store.get(&hash).map_err(backend)? != chunk {
                 return Err(backend("published bytes differ"));
             }
             chunks.push(hash.to_string());
+            sizes.push(chunk.len() as u64);
         }
         Ok(Backing {
             hash: (self.hash)(bytes).to_string(),
             chunks,
+            sizes,
+            bytes: bytes.len() as u64,
         })
+    }
+
+    fn preflight(&self, backing: &Backing) -> stream::Result<()> {
+        backing
+            .hash
+            .parse::<B::Hash>()
+            .map_err(|_| RetryStreamError::Corrupt)?;
+        if backing.chunks.is_empty() || backing.chunks.len() != backing.sizes.len() {
+            return Err(RetryStreamError::Corrupt);
+        }
+        let mut total = 0u64;
+        for (ordinal, (name, size)) in backing.chunks.iter().zip(&backing.sizes).enumerate() {
+            name.parse::<B::Hash>()
+                .map_err(|_| RetryStreamError::Corrupt)?;
+            if *size == 0
+                || *size > self.chunk_bytes as u64
+                || (ordinal + 1 < backing.chunks.len() && *size != self.chunk_bytes as u64)
+            {
+                return Err(RetryStreamError::Corrupt);
+            }
+            total = total.checked_add(*size).ok_or(RetryStreamError::Resource)?;
+        }
+        if total != backing.bytes || total <= MAX_RETRY_ERROR_BYTES as u64 {
+            return Err(RetryStreamError::Corrupt);
+        }
+        Ok(())
+    }
+
+    fn stream(
+        &self,
+        backing: &Backing,
+        window: &mut [u8],
+        cancel: &CancellationToken,
+        consume: &mut dyn FnMut(&[u8]) -> stream::Result<()>,
+    ) -> stream::Result<()> {
+        verify_retry_objects(
+            &self.store,
+            &backing.hash,
+            backing
+                .chunks
+                .iter()
+                .map(String::as_str)
+                .zip(backing.sizes.iter().copied()),
+            backing.bytes,
+            window,
+            cancel,
+            consume,
+        )
     }
 
     fn resolve(&self, backing: &Backing) -> Result<Vec<u8>> {
@@ -72,7 +140,8 @@ struct Row {
 #[derive(Clone, Default)]
 pub struct RetryState {
     /// By task id: one row per task.
-    rows: BTreeMap<String, Row>,
+    rows: Arc<BTreeMap<String, Row>>,
+    admission: RetryStreamAdmission,
     blobs: Option<Arc<dyn RetryBlobs>>,
 }
 
@@ -121,14 +190,14 @@ impl RetryState {
             && let Some(blobs) = &self.blobs
         {
             row.backing = Some(blobs.publish(retry.error.as_bytes())?);
-            row.retry.error.clear();
+            row.retry.error = String::new();
         }
-        self.rows.insert(retry.task.clone(), row);
+        Arc::make_mut(&mut self.rows).insert(retry.task.clone(), row);
         Ok(())
     }
 
     pub fn delete(&mut self, task: &str) -> bool {
-        self.rows.remove(task).is_some()
+        Arc::make_mut(&mut self.rows).remove(task).is_some()
     }
 
     pub fn get(&self, task: &str) -> Result<Option<Retry>> {
@@ -175,6 +244,110 @@ impl RetryState {
     }
 }
 
+impl RetryState {
+    pub fn admission(&self) -> RetryStreamAdmission {
+        self.admission.clone()
+    }
+
+    pub fn stream_page(
+        &self,
+        after: Option<&RetryCursor>,
+        limit: usize,
+        sink: &mut dyn RetryTextSink,
+        cancel: &CancellationToken,
+    ) -> stream::Result<RetryTextPage> {
+        let admission = &self.admission;
+        let selected = select_retry_keys(
+            self.rows
+                .values()
+                .map(|r| (r.retry.task.as_str(), r.retry.due_at)),
+            after,
+            limit,
+            admission,
+            cancel,
+        )?;
+        let mut bytes = 0u64;
+        for (task, _) in &selected.keys {
+            let row = &self.rows[*task];
+            row.retry
+                .validate()
+                .map_err(|_| RetryStreamError::Corrupt)?;
+            let length = match &row.backing {
+                None => row.retry.error.len() as u64,
+                Some(backing) => {
+                    self.blobs
+                        .as_ref()
+                        .ok_or(RetryStreamError::Corrupt)?
+                        .preflight(backing)?;
+                    if backing.chunks.is_empty() || backing.chunks.len() != backing.sizes.len() {
+                        return Err(RetryStreamError::Corrupt);
+                    }
+                    let sum = backing.sizes.iter().try_fold(0u64, |a, b| {
+                        a.checked_add(*b).ok_or(RetryStreamError::Resource)
+                    })?;
+                    if sum != backing.bytes {
+                        return Err(RetryStreamError::Corrupt);
+                    }
+                    backing.bytes
+                }
+            };
+            bytes = bytes
+                .checked_add(length)
+                .ok_or(RetryStreamError::Resource)?;
+        }
+        let mut window = admission.buffer(RETRY_STREAM_WINDOW_BYTES)?;
+        let mut next = None;
+        let _cursor = admission.reserve(selected.keys.last().map_or(0, |(task, _)| task.len()))?;
+        for (task, due) in &selected.keys {
+            check_cancel(cancel)?;
+            let row = &self.rows[*task];
+            let length = row
+                .backing
+                .as_ref()
+                .map_or(row.retry.error.len() as u64, |b| b.bytes);
+            sink.begin(
+                RetryTextRow {
+                    task,
+                    attempt: row.retry.attempt,
+                    due_at: *due,
+                    bytes: length,
+                },
+                admission,
+            )?;
+            let mut consume = |part: &[u8]| {
+                check_cancel(cancel)?;
+                sink.write(part, admission)
+            };
+            match &row.backing {
+                None => {
+                    for part in row.retry.error.as_bytes().chunks(RETRY_STREAM_WINDOW_BYTES) {
+                        consume(part)?;
+                    }
+                }
+                Some(backing) => self
+                    .blobs
+                    .as_ref()
+                    .ok_or(RetryStreamError::Corrupt)?
+                    .stream(backing, window.as_mut_slice(), cancel, &mut consume)?,
+            }
+        }
+        if selected.more
+            && let Some((task, due)) = selected.keys.last()
+        {
+            next = Some(RetryCursor {
+                task: copy_text(task)?,
+                due_at: *due,
+            });
+        }
+        check_cancel(cancel)?;
+        Ok(RetryTextPage {
+            rows: selected.keys.len(),
+            bytes,
+            next,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,8 +383,7 @@ mod tests {
         };
         state.put(&row).unwrap();
         assert_eq!(state.get("t").unwrap(), Some(row));
-        state
-            .rows
+        Arc::make_mut(&mut state.rows)
             .get_mut("t")
             .unwrap()
             .backing

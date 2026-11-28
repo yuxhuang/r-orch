@@ -14,6 +14,7 @@ pub(super) mod message;
 mod retries;
 mod text;
 
+pub(super) use retries::{BoundedRetryError, bounded_retry_page};
 #[allow(
     unused_imports,
     reason = "internal retry mapping awaits the combined T10 Storage adapter"
