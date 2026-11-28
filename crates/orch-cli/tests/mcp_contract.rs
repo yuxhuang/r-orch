@@ -196,7 +196,10 @@ const DISPOSITION: &[(&str, Disposition)] = &[
         "init",
         Excluded("bootstraps a project; MCP requires an existing one"),
     ),
-    ("import", Excluded("offline import is restricted to the owner")),
+    (
+        "import",
+        Excluded("offline import is restricted to the owner"),
+    ),
     ("update", Excluded("host software management")),
 ];
 

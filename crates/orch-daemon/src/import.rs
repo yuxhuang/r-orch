@@ -101,9 +101,9 @@ fn future_destination(path: &Path) -> std::io::Result<PathBuf> {
     loop {
         match std::fs::symlink_metadata(anchor) {
             Ok(metadata) => {
-                // Following an unsafe final entry can itself advance its atime.
-                // Refuse it before canonicalization, including an alias above a
-                // missing destination, without touching the link's metadata.
+                // Reject a final symlink before canonicalization touches it.
+                // Looking up a missing descendant can already traverse an
+                // ancestor symlink and advance that ancestor's atime.
                 if metadata.file_type().is_symlink() {
                     return Err(std::io::Error::other("destination alias refused"));
                 }

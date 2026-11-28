@@ -4903,12 +4903,16 @@ the target, and "Not yet built" lists what is missing.
   home; otherwise `<data home>/<default name of the canonical source>`. The data home is `ORCH_DATA_HOME`, else
   `$HOME/.orchestry/daemons`. The destination must be outside the source: it is compared after the deepest
   existing part of its path is resolved, so an alias above a missing destination counts. A destination whose
-  deepest existing entry is itself a symbolic link is refused (exit 2) before it is resolved, so the link's
-  metadata, its read time included, is not touched. The data home must always be absolute, as must
-  `ORCH_DATA_DIR`. The data home is used only to find or create the default destination: when `ORCH_DATA_DIR`
-  selects the destination, the command neither creates nor otherwise touches the data home, wherever it points,
-  even inside the source. A project record that is present but invalid refuses (exit 2) and is never read as
-  "no record".
+  deepest existing entry is itself a symbolic link is refused (exit 2) before that entry is resolved. When the
+  entry is the destination itself, dangling or not, the link's metadata, its read time included, is not
+  touched. When the destination is absent and the entry is a link above it, finding that the destination is
+  absent has already followed the link, so the link's read time may advance (on Linux, as the mount's
+  access-time options allow). The refusal still writes no byte, in the source or at any destination, and
+  creates nothing. An existing destination below an aliased ancestor is not refused for the alias: it resumes
+  as any existing destination does. The data home must always be absolute, as must `ORCH_DATA_DIR`. The data
+  home is used only to find or create the default destination: when `ORCH_DATA_DIR` selects the destination,
+  the command neither creates nor otherwise touches the data home, wherever it points, even inside the
+  source. A project record that is present but invalid refuses (exit 2) and is never read as "no record".
 - Output: `--json` prints one object, `{"preflight": <report>, "imported": n, "unfinished": bool,
   "procedural_exclusion": bool, "detail": "...", "exit_code": n}`. Without `--json` the command prints
   `detail` (escaped, because source names are untrusted terminal text) and then the same object. The report
@@ -4917,7 +4921,7 @@ the target, and "Not yet built" lists what is missing.
 | Exit | When | What was written |
 |---|---|---|
 | 0 | `--dry-run`, and the source check found no refusal and no confirmation. The destination's database is not opened, so this says nothing about it (see "Dry run is source-only") | Nothing, anywhere |
-| 2 | A known stop before any write, with `unfinished: false`: the check refuses or asks for a confirmation, a non-UTF-8 template stem or body (rule `utf8`), a template over 65,536 bytes (rule `bytes`), a listener on a daemon socket, a destination inside the source or whose deepest existing entry is a symbolic link, an existing destination without `--resume`, an existing destination the guard refuses (held, unsafe, or lacking `orch.lock`: see "Interrupted destination"), a missing parent of an explicit destination, a source with no template, cancellation before writing, a held or unsafe source lock, and a destination setup that failed before its first successful `mkdir` or holder publication | Nothing at the destination or in the source |
+| 2 | A known stop before any write, with `unfinished: false`: the check refuses or asks for a confirmation, a non-UTF-8 template stem or body (rule `utf8`), a template over 65,536 bytes (rule `bytes`), a listener on a daemon socket, a destination inside the source or whose deepest existing entry is a symbolic link, an existing destination without `--resume` (writing run only), an existing destination the guard refuses (held, unsafe, or lacking `orch.lock`: see "Interrupted destination"), a missing parent of an explicit destination (writing run only), a source with no template, cancellation before writing, a held or unsafe source lock, and a destination setup that failed before its first successful `mkdir` or holder publication | Nothing at the destination or in the source |
 | 1 | A run that wrote, or that cannot show it did not: `unfinished` is `true`. Setup records the first successful `mkdir` (a data-home ancestor or the destination) or holder publication, so a setup failure after one of them is exit 1; so is a setup or worker task that failed with an unknown outcome (`offline import worker failed; write outcome unknown`, `destination setup failed; write outcome unknown`); every later stop, successful or not, is exit 1 too | Templates, their manifest rows and the progress record (below), plus any directory the run created and the holder it published on `orch.lock` |
 
 - Order, which is the reason a refusal leaves nothing behind: (1) resolve the canonical source and the
@@ -4982,8 +4986,8 @@ the target, and "Not yet built" lists what is missing.
 - The source is never written, and the command creates nothing it does not use: the tests compare bytes,
   inodes, modes and write times before and after a dry run, an import, a resume and each refusal (access times of
   the source are excluded because reading it advances them), and show that an explicit destination leaves an
-  unused data home inside the source uncreated. A refused destination that is a symbolic link keeps even its own
-  access time.
+  unused data home inside the source uncreated. A refused destination that is itself a symbolic link keeps even
+  its own access time; a link above an absent destination is not covered by that test (see "Destination").
 
 Not yet built, so that no reader takes this slice for the importer of R64 to R70, R99 and R112: every family
 but templates (tasks, agents, goals, teams, messages, context, runs, run events, attachments, `config.yml`
