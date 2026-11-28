@@ -282,6 +282,16 @@ decision 8). It changes no stored data, schema, protocol, requirement row, curso
 consumer. It does not claim parity for the identity of a claimed Run, which stays held with T12, and issue 441 stays
 open for it. No independent review had read this revision when it was written.
 
+The revision that carries this paragraph records the lead's T12 first-use decision of 2026-11-28 on the private retry
+read and changes nothing else. It adds one port trait, a bounded and verified stream of a retry's whole text, to the
+whole-retry-text contract ("Whole retry text" under "Storage port v2", "Bounded read of a retry's text";
+[ADR 0020](../decisions/0020-storage-consumer-contracts.md) decision 9), makes it a supertrait of `ReadSnapshot`, and adds
+three provided methods and one trait to `BlobStore`. The memory fake, the file reference and SQLite implement it. It
+changes no signature of the whole-value reads, no stored data, no schema, no requirement row, no cursor text and no
+read bound, and it adds no logical size ceiling and no setting; each adapter's working-memory counter has a default
+capacity of 64 MiB. It releases no production read: the first one waits for the trigger that the plan's "Bounded retry
+text read" states. No independent review had read this revision when it was written.
+
 ## Source
 
 Verbatim excerpts of the owner's request as recorded in the goal "orch 2.0 phase 1: SQLite storage (release
@@ -1423,6 +1433,47 @@ nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or
   publish each object and read it back before they stage the row, so a failed publication leaves the staged row untouched, and objects left by a
   rolled-back unit or a replaced row are unreferenced until the blob store's sweep.
 
+  *Bounded read of a retry's text* (T12 first-use decision of 2026-11-28; ADR 0020 decision 9 has the detail and the
+  reasons). The whole-value reads above allocate the whole text, and a page may hold 1,000 of them. The first
+  production consumer, a diagnostic read, therefore uses an additional trait, `RetryTextRead::read_retry_text`
+  (`orch_core::store::retries::stream`; the signatures are in `docs/TRAITS-FROZEN.md`), that delivers the same rows
+  to a sink in windows of at most 65,536 bytes. All three adapters implement it, and `ReadSnapshot` requires it. R97's promise is unchanged: the whole text of a valid stored retry is
+  recovered, also when its run is gone, and no logical-size ceiling is added. The whole-value reads keep their contract.
+  The adapter shall:
+  1. select exactly the rows, order and cursor of `read_retries(after, limit)` from the same snapshot, and read nothing
+     of a row it does not select;
+  2. before it delivers any byte, check every selected row and sum the page's lengths with checked arithmetic (an
+     overflow is `Resource`). SQLite checks each chunk's declared size against the registered blob of the same
+     snapshot, and charges the encoded document before it decodes it. The disk-backed fake checks the sizes it recorded.
+     The file reference, whose text records no object length, validates the syntax and structure of every selected
+     reference first and then reads each selected object's length from the confined open descriptor (a symbolic link or a
+     file that is not regular is refused) with no payload read, hashing included, so that a page whose last reference
+     fails reads no payload at all;
+  3. deliver every byte and every chunk occurrence, in stored order, through the sink's synchronous callbacks, so that
+     a slow sink applies backpressure across rows, and hold no more than a bounded window of a text at a time;
+  4. charge all live working memory (windows, selected-row metadata, what a sink retains) to one admission counter
+     that the adapter owns and keeps across snapshots and concurrent reads, allocate fallibly, and return `Resource`
+     when a charge or an allocation fails, with no page completed. A text's logical length is never itself a reason
+     to refuse. SQLite charges eight times a selected row's encoded document, plus its task key and 4,096 bytes, before
+     it decodes the document;
+  5. verify each object's hash and length, the whole-value hash and length, and the UTF-8 of the whole value
+     incrementally across windows and objects, and treat the output as provisional until the last of these has passed.
+     A missing, short, long, reordered or damaged selected object, an object that is not a regular file, or an invalid
+     or truncated UTF-8 sequence, fails the call with `Corrupt` (an I/O fault on a present object is `Store`); an
+     object replaced between the preflight and the read, also by one of the same length, fails the same way; success is the returned `RetryTextPage`, and only then may the consumer publish its output or advance its
+     cursor. After any failure the consumer discards the page's provisional bytes and keeps its cursor;
+  6. hold the snapshot and the charge until its blocking work has exited, cancel that work when the future is dropped or
+     the caller's token fires, never cancel another read, and never return success after a cancellation or a sink
+     error.
+
+  The consumer shall not collect the stream into an unbounded string and shall not act on a prefix that was not
+  verified. `Resource`, `Cancelled`, `Corrupt` and ordinary store errors are distinct results; the consumer's policy for
+  each is T12's. Each adapter's counter has the default capacity of 64 MiB (67,108,864 bytes); the contract adds no
+  setting, and the counter is not a limit on the length of a text. What the contract and its tests cover is
+  stated in the plan's "Bounded retry text read": that section lists the evidence that is required before a first
+  production read, the tests that exist, and what is still owed. The security reasoning behind the requirements, and the evidence
+  for them, are kept private.
+
   Tests required on both references, with the test that carries each item. The first three rows are scenarios of the
   conformance suite's `retry_suite` (21 scenarios), registered as `memory_retries_v2` (logical fake),
   `blob_memory_retries_v2` (disk-backed fake) and `file_retries_v2`, so 3 registrations each when this was written (`sqlite_retries_v2` runs the same scenarios since #385, so 4 for the 21 scenarios of the suite). The next ten rows are in
@@ -1463,6 +1514,7 @@ nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or
 - **Owners.** This change implements the three on the memory fake and the file reference and registers the shared
   tests on both. T10 owns the SQLite representation and the adapter registration. T12 owns the finish and
   enqueue caller (get, then put, in one unit of work), the retry row written with the status and the lease release,
+  the first consumer of the bounded text read and its sink (a storage-port builder owns the trait and its three adapters),
   and lease-bound finish and restart fencing (R36, R132). T13 owns generations, recovery and the Linux
   sleep and wake check (R41, R42). T14 owns `retry_pending` gating and candidate-order dispatch. T21 owns the
   legacy mapping of an unparsable deadline to due, counted in the dry run, and the whole 1.0 error (R97). T23 owns
