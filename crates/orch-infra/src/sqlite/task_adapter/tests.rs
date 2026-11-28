@@ -1269,7 +1269,11 @@ fn from_fallback_pins_each_sorts_prefix_edge_and_multibyte_tails() {
                 })
                 .unwrap();
                 let first = fx.list(&filter(), &request(sort, 1)).unwrap();
-                assert_eq!(Fixture::ids(&first), [anchor.clone()], "{sort:?} {case}");
+                assert_eq!(
+                    Fixture::ids(&first),
+                    std::slice::from_ref(&anchor),
+                    "{sort:?} {case}"
+                );
                 let token = first.next_cursor.unwrap();
                 assert_eq!(fallback_kind(&token, sort), kind, "{sort:?} {case}");
                 delete_rows(fx, &[&anchor]);
