@@ -2,6 +2,7 @@
 pub mod backup;
 pub mod confined;
 pub mod paths;
+pub mod spool;
 
 use confined::{ConfinedDir, ConfinedError, FileAccess};
 use nix::fcntl::{Flock, FlockArg};
