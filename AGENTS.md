@@ -149,6 +149,13 @@ reviewed or merged.
   and watches every push to `main`. A pending main push run may overlap the next merge.
 - **Stop on red.** If any job in any main push run fails, stop further merges until the failure is fixed or,
   for a flaky failure, the supervising session's rerun passes. Skip separate landing and terminal-main verifier tasks.
+- **Recorded flaky tests (2026-11-28).** The supervisor may continue merging after a red push to
+  `main` if the log shows the test run finished, every failure is a test named in an r-orch issue labelled
+  `flaky-test`, and each failing test is outside the code changed in that push. Rerun the failed job once
+  and name each failing test and its issue in the next merge checkpoint. If a test was unrecorded when it
+  failed, or the same recorded test fails twice in a row on one head, apply the stop-on-red rule above.
+  File each new flake in a `flaky-test` issue naming the test. A PR’s own red test still requires a green
+  rerun before merge. Never use `--admin` to bypass branch protection.
 - **Rolling deep review.** Review each subsystem’s changes on `main` since its last deep review after about
   10 merged PRs or 10,000 changed lines. A rolling review never blocks a merge. Its only output is GitHub
   issues. File each finding in `yuxhuang/r-orch` and follow `issue-triage-process.md`. Triage assigns priority
@@ -352,7 +359,7 @@ A reviewer states what was checked and what was not, as in Roles.
 #### What gates a merge (status: Q1 approved policy; live rules unchanged)
 
 - **Approved policy.** One green Linux execution at the PR's final head is the CI evidence a merge needs. A failed run
-  is kept and diagnosed, never re-run until it passes; a flaky test is fixed or named, not retried. This replaces the
+  is kept and diagnosed. For reruns, follow the stop-on-red and recorded-flake rules above. This replaces the
   earlier rule of three complete green CI executions per PR, which the repository records for the daemon-owned-state
   goal in [its spec](docs/specs/2026-11-09-daemon-owned-state.md) and [plan](docs/plans/2026-11-09-daemon-owned-state.md); both
   already carry the owner's amendment of 2026-11-13 that one green execution is enough. Independent review remains.
@@ -599,13 +606,6 @@ and a walking skeleton comes before a second revision. The rules are in
 - **"Done" means evidence.** A task is done when a commit exists on its branch and its verify command passed
   there, both stated in the PR or handoff. Status in a tracker is not evidence. A lead releases dependent tasks
   only after checking that evidence.
-- **Recorded flaky tests (28 November 2026).** The supervisor may continue merging after a red push to
-  `main` if the log shows the test run finished, every failure is a test named in an r-orch issue labelled
-  `flaky-test`, and each failing test is outside the code touched by the change. Rerun the failed job once
-  and name each failing test and its issue in the next merge checkpoint. If a test was unrecorded when it
-  failed, or the same recorded test fails twice in a row on one head, apply the stop-on-red rule above.
-  File each new flake in a `flaky-test` issue naming the test. A PR’s own red test still requires a green
-  rerun before merge. Never use `--admin` to bypass branch protection.
 - **Reviewers write the verdict skeleton first** (scope, what will be checked), then fill it in, so an
   interrupted review still leaves a report. A diff over about 800 lines is reviewed in slices.
 - **Checkpoints change something.** A lead checkpoint must produce or change a deliverable (code, test, doc) or
