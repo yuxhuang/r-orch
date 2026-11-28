@@ -4,6 +4,8 @@ use orch_core::store::retries::Retry;
 use orch_domain::{AgentStatus, Task};
 use orch_infra::storage::v2::FileStorage;
 
+mod sqlite;
+
 fn caller() -> Caller {
     Caller {
         principal: orch_core::store::Principal::Owner {
@@ -27,15 +29,19 @@ fn request() -> ClaimRequest {
 fn task(id: &str) -> Task {
     serde_json::from_value(serde_json::json!({
         "id": id, "title": "Synthetic claim", "description": "", "status": "todo",
-        "priority": 2, "labels": [], "depends_on": [], "created_at": "old",
-        "updated_at": "old", "attempts": 0, "max_attempts": 3
+        "priority": 2, "labels": [], "depends_on": [], "created_at": "1970-01-01T00:00:00.000Z",
+        "updated_at": "1970-01-01T00:00:00.000Z", "attempts": 0, "max_attempts": 3
     }))
     .expect("synthetic task")
 }
 
 async fn seed(storage: &dyn Storage) {
+    seed_for(storage, caller()).await;
+}
+
+async fn seed_for(storage: &dyn Storage, caller: Caller) {
     storage
-        .transaction(caller(), Lane::Entities, |unit| {
+        .transaction(caller, Lane::Entities, |unit| {
             for id in ["task-selected", "task-other"] {
                 unit.create(Entity::Task(Box::new(task(id))))?;
             }
@@ -90,7 +96,7 @@ async fn success(storage: &dyn Storage) {
     assert_eq!(task_data.status, TaskStatus::InProgress);
     assert_eq!(task_data.attempts, 1);
     assert_eq!(task_data.updated_at, "1970-01-01T00:00:01.234Z");
-    assert_eq!(task_data.created_at, "old");
+    assert_eq!(task_data.created_at, "1970-01-01T00:00:00.000Z");
     assert_eq!(task_data.assignee.as_deref(), Some(lease.agent.as_str()));
     assert_eq!(task.revision.get(), 2);
     let Entity::Run(run_data) = &run.entity else {
@@ -477,8 +483,8 @@ fn old_run() -> Run {
         agent_id: "agent-selected".into(),
         attempt: 3,
         status: RunStatus::Failed,
-        started_at: "old".into(),
-        finished_at: Some("old".into()),
+        started_at: "1970-01-01T00:00:00.000Z".into(),
+        finished_at: Some("1970-01-01T00:00:00.000Z".into()),
         workspace_path: String::new(),
         prompt: String::new(),
         pid: None,
@@ -544,7 +550,7 @@ async fn rerun_success(storage: &dyn Storage, status: TaskStatus, attempts: u32)
     );
     assert_eq!(task_data.max_attempts, 3);
     assert_eq!(task_data.updated_at, "1970-01-01T00:00:01.234Z");
-    assert_eq!(task_data.created_at, "old");
+    assert_eq!(task_data.created_at, "1970-01-01T00:00:00.000Z");
     assert_eq!(task_data.feedback.as_deref(), Some("synthetic feedback"));
     assert_eq!(task_data.assignee.as_deref(), Some("agent-selected"));
     assert_eq!(task.revision, revision.next().unwrap());
@@ -980,7 +986,7 @@ async fn due_success(storage: &dyn Storage) {
         "the budget is kept and one more is spent, not reset"
     );
     assert_eq!(task_data.updated_at, "1970-01-01T00:00:01.234Z");
-    assert_eq!(task_data.created_at, "old");
+    assert_eq!(task_data.created_at, "1970-01-01T00:00:00.000Z");
     assert_eq!(task_data.feedback.as_deref(), Some("synthetic feedback"));
     assert_eq!(task_data.assignee.as_deref(), Some("agent-selected"));
     assert_eq!(task.revision, revision.next().unwrap());
@@ -1539,4 +1545,183 @@ async fn concurrent_due_retries_have_one_winner_and_spend_one_attempt_in_memory(
 async fn concurrent_due_retries_have_one_winner_and_spend_one_attempt_on_files() {
     let root = tempfile::tempdir().unwrap();
     due_race(&FileStorage::new(root.path())).await;
+}
+
+// A lease must win over an idle agent record, and the next selection can
+// still progress. This exercises reservations, not the runtime scheduler.
+async fn leased_idle_candidate(storage: &dyn Storage) {
+    seed(storage).await;
+    let ClaimResult::Reserved { lease: first, .. } =
+        claim(storage, caller(), request()).await.unwrap()
+    else {
+        panic!("first claim")
+    };
+    let mut next = request();
+    next.task_id = "task-other".into();
+    next.run_id = "run-other".into();
+    let before = state(storage).await;
+    assert_eq!(
+        claim(storage, caller(), next.clone()).await.unwrap(),
+        ClaimResult::Refused(Refusal::Held(first.clone()))
+    );
+    assert_eq!(state(storage).await, before);
+    next.agent_id = "agent-other".into();
+    let ClaimResult::Reserved { lease: second, .. } = claim(storage, caller(), next).await.unwrap()
+    else {
+        panic!("next idle candidate must remain available")
+    };
+    assert_eq!(second.agent, "agent-other");
+    assert_eq!(second.task, "task-other");
+    assert_eq!(second.epoch, 1);
+    let after = state(storage).await;
+    assert_eq!(after.1.len(), 2);
+    assert!(after.1.contains(&first));
+    assert!(after.1.contains(&second));
+}
+
+async fn distinct_agent_contention(storage: &dyn Storage, mode: Mode) {
+    let revision = match mode {
+        Mode::Dispatch => {
+            seed(storage).await;
+            Revision::ONE
+        }
+        Mode::ExplicitRerun => seed_terminal(storage, TaskStatus::Failed, 3).await,
+        Mode::DueRetry => seed_retrying(storage, 2, DUE).await,
+    };
+    let left = rerun_request(revision);
+    let mut right = left.clone();
+    right.agent_id = "agent-other".into();
+    right.run_id = "run-other".into();
+    let reserve_one =
+        |req| storage.transaction(caller(), Lane::Claims, move |u| reserve(u, req, mode));
+    let (a, b) = tokio::join!(reserve_one(left), reserve_one(right));
+    let outcomes = [a, b];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|r| matches!(r, Ok(ClaimResult::Reserved { .. })))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|r| matches!(
+                r,
+                Err(StoreError::StaleRevision {
+                    kind: EntityKind::Task,
+                    ..
+                })
+            ))
+            .count(),
+        1
+    );
+    let winner = outcomes
+        .into_iter()
+        .find_map(|r| match r {
+            Ok(ClaimResult::Reserved { task, run, lease }) => Some((task, run, lease)),
+            _ => None,
+        })
+        .unwrap();
+    let after = state(storage).await;
+    assert_eq!(after.1, vec![winner.2.clone()]);
+    assert_eq!(
+        after
+            .0
+            .iter()
+            .filter(|r| matches!(r.entity, Entity::Run(_)))
+            .count(),
+        1
+    );
+    assert!(after.0.contains(&winner.0));
+    assert!(after.0.contains(&winner.1));
+    let Entity::Task(task) = winner.0.entity else {
+        panic!("task")
+    };
+    assert_eq!(task.assignee.as_deref(), Some(winner.2.agent.as_str()));
+    assert_eq!(task.attempts, if mode == Mode::DueRetry { 3 } else { 1 });
+}
+
+async fn project_and_caller(storage: &dyn Storage) {
+    seed(storage).await;
+    let before = retry_state(storage).await;
+    let other = Caller {
+        project: "other-project".into(),
+        principal: orch_core::store::Principal::Task {
+            identity: "synthetic-task-principal".into(),
+            task: "task-selected".into(),
+            run: "run-selected".into(),
+            lineage: "synthetic-lineage".into(),
+            epoch: 19,
+        },
+    };
+    let view = storage.read(other.clone()).await.unwrap();
+    assert_eq!(view.caller(), &other);
+    assert!(
+        view.get(EntityKind::Task, "task-selected")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(view);
+    for mode in [Mode::Dispatch, Mode::ExplicitRerun, Mode::DueRetry] {
+        let expected = other.clone();
+        let result = storage
+            .transaction(other.clone(), Lane::Claims, move |u| {
+                assert_eq!(u.caller(), &expected);
+                reserve(u, request(), mode)
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(StoreError::StaleRevision { actual: None, .. })
+        ));
+        assert_eq!(retry_state(storage).await, before);
+    }
+    // The port carries authority, while the dispatcher authorizes operations.
+    // Identical IDs in another project must not observe or claim this lease.
+    seed_for(storage, other.clone()).await;
+    let ClaimResult::Reserved { lease, .. } = claim(storage, other, request()).await.unwrap()
+    else {
+        panic!("other project claim")
+    };
+    assert_eq!(lease.epoch, 1);
+    assert_eq!(retry_state(storage).await, before);
+    let ClaimResult::Reserved { lease, .. } = claim(storage, caller(), request()).await.unwrap()
+    else {
+        panic!("original project claim")
+    };
+    assert_eq!(lease.epoch, 1);
+}
+
+#[tokio::test]
+async fn a_leased_idle_candidate_does_not_prevent_the_next_reservation_in_memory() {
+    leased_idle_candidate(&FakeStorage::default()).await;
+}
+#[tokio::test]
+async fn a_leased_idle_candidate_does_not_prevent_the_next_reservation_on_files() {
+    let root = tempfile::tempdir().unwrap();
+    leased_idle_candidate(&FileStorage::new(root.path())).await;
+}
+#[tokio::test]
+async fn distinct_agents_contending_for_one_task_have_one_winner_in_memory() {
+    for mode in [Mode::Dispatch, Mode::ExplicitRerun, Mode::DueRetry] {
+        distinct_agent_contention(&FakeStorage::default(), mode).await;
+    }
+}
+#[tokio::test]
+async fn distinct_agents_contending_for_one_task_have_one_winner_on_files() {
+    for mode in [Mode::Dispatch, Mode::ExplicitRerun, Mode::DueRetry] {
+        let root = tempfile::tempdir().unwrap();
+        distinct_agent_contention(&FileStorage::new(root.path()), mode).await;
+    }
+}
+#[tokio::test]
+async fn reservations_preserve_caller_and_isolate_projects_in_memory() {
+    project_and_caller(&FakeStorage::default()).await;
+}
+#[tokio::test]
+async fn reservations_preserve_caller_and_isolate_projects_on_files() {
+    let root = tempfile::tempdir().unwrap();
+    project_and_caller(&FileStorage::new(root.path())).await;
 }
