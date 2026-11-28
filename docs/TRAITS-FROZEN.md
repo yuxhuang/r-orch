@@ -390,6 +390,7 @@ pub enum StoreError {
     InvalidPage(String),  InvalidCursor,  StaleEpoch,  InvalidEvents(String),  InvalidIntent(String),
     InvalidRetry(String), InvalidRequestKey(String),  InvalidAttention(String),
     StaleAttentionRevision { id: u64, expected: Revision, actual: Option<Revision> },
+    Unrepresentable,                          // issue 441: a unit variant, no payload (see "Added for issue 441")
     CounterExhausted,  Backend(orch_core::Error),
 }
 ```
@@ -407,6 +408,76 @@ It adds no signature. A stored row's epoch is at most `i64::MAX`, the ceiling `R
 rows in the same change. A row denies an unknown field and the collection that holds the rows ignores one. A negative
 `now_ms` is refused on `check_request_key` as on `store_request_key`. The tie order of rows with an equal expiry in
 `delete_expired_request_keys` is not observable through the port; T10 proves it on SQLite under issue 127.
+
+#### Added for issue 441 (ADR 0020 decision 8)
+
+One error variant and two inherent methods, all in `orch_core::store`. They are additive: no earlier signature
+changes and nothing is removed. `StoreError` is not `#[non_exhaustive]`, so a consumer that matches it with no wildcard
+arm must add the variant. The `test-support` fakes are not part of the contract and are not listed. The change lands
+on the memory and file references and on SQLite's public converters; nothing is wired into the daemon, and no caller
+in the engine matches the variant yet.
+
+```rust
+// store (store.rs)
+impl Caller { pub fn validate_context_provenance(&self) -> Result<()>; }   // Err(StoreError::Unrepresentable)
+// store::entity
+impl Entity { pub fn validate_storage_input(&self) -> Result<()>; }        // Err(StoreError::Unrepresentable)
+// StoreError::Unrepresentable            #[error("input cannot be represented by storage")]
+```
+
+- **The variant.** `StoreError::Unrepresentable` has no field. Its `Display` is exactly `input cannot be represented by
+  storage`, its `Debug` is exactly `Unrepresentable`, and `std::error::Error::source` is `None`: it holds no input, no
+  field name, no bound and no backend text. It says that the caller's value is outside the storage contract, so
+  retrying the same value cannot succeed. A consumer matches the variant, never the message, does not reschedule that
+  input, and does not infer permanence from `Backend` text or from any other variant.
+- **What `Entity::validate_storage_input` refuses.** Only a `Task`; every other kind returns `Ok`.
+  - `id`, `assignee` (when present), `goal_id` (when present), `created_at` and `updated_at` are at most 65,536 UTF-8
+    bytes each. The unit is bytes: 32,768 two-byte characters are exactly at the bound. An empty value is valid.
+  - `created_at` and `updated_at` must also be the canonical form `YYYY-MM-DDTHH:MM:SS.sssZ` (24 bytes, UTC, three
+    fraction digits), from `0000-01-01T00:00:00.000Z` to `9999-12-30T22:00:00.999Z` inclusive. A string is accepted
+    only if the core clock codec parses it and formats the instant back to the same bytes, so second precision, an
+    offset, an expanded year, a month 13, a day that does not exist (`2026-02-30`), the next millisecond
+    (`9999-12-30T22:00:01.000Z`) and `9999-12-31T23:59:59.999Z` are refused, and `2024-02-29T00:00:00.000Z` is accepted.
+  - `title`, `description`, `feedback` and every other field have no new bound: text over 65,536 bytes still round
+    trips (goal decision 7, R97).
+- **What `Caller::validate_context_provenance` refuses.** The identity of an `Owner`, a `Worker` or a `Task` principal,
+  and the `run` of a `Task` principal, over 65,536 UTF-8 bytes. The `task`, `lineage` and `epoch` of a `Task` principal
+  are not persisted as Context provenance and are not checked. The check runs on `create` of a `Context` entity only.
+  `update` never consults the caller for it, so an update keeps the persisted provenance as stored, whoever makes it
+  and however long that caller's identity is. This check validates a value that is about to be stored; it grants no
+  authority and does not replace the dispatcher's authorization (R132).
+- **Where the memory and file references apply them.** `create` runs `validate_storage_input` for every kind, then
+  `validate_context_provenance` for a Context, after the `AlreadyExists` and `IdAlias` checks and before the position is
+  taken. `update` runs `validate_storage_input` after the stale-revision check and before the revision is advanced.
+  `delete` and `move_to_end` take no entity and have no new refusal.
+- **A refusal changes nothing.** The row, its revision and its position are as they were, and a refused `create` takes
+  no position: the next `create` gets the position after the last stored one. Inside a unit of work the callback sees
+  the error and may catch it; the refused operation wrote nothing, and other work in that unit commits as usual. When
+  the callback returns the error, the whole unit rolls back, as for any other error.
+- **SQLite.** Both public converters, `port` in `sqlite/storage/mod.rs` and `port` in `sqlite/entity_router.rs`, map
+  `SqliteError::Unrepresentable(_)` to `StoreError::Unrepresentable` and drop its text. The mapping runs after the
+  failure state has observed the native error, and that classifier treats `Unrepresentable` as an ordinary class
+  that latches nothing (`sqlite/writer/failure.rs`), so a refusal does not retire the writer. Every other arm is as it
+  was: a `SqliteError::Store` passes through, and any other native error becomes `StoreError::Backend` with a fixed
+  message. **The mapping is wider than the reference adapters' checks:** it covers every native `Unrepresentable`,
+  which also arises for entity encodings of the other families, for a message outside the schema's bounds on write, for
+  a retry diagnostic whose stored document is over its bound (issue 546), for cursor shapes, and for the identity of a
+  claimed Run (held, below). Parity of the three adapters is stated and tested for the Task and Context rules above and
+  for nothing else.
+- **Faults and damaged data stay distinct.** A fault of the backend is `Backend(orch_core::Error)`: an I/O failure of
+  the file reference is `Backend(Error::Io)`, a statement failure on SQLite is `Backend` with the message `SQLite storage
+  operation failed` and latches nothing, and a retry of the same call after the fault clears succeeds. Persisted data
+  that does not decode is not an input refusal: the file reference answers `Backend(Error::Serde)` and leaves the
+  document unchanged, and SQLite's stored-data damage is the fatal logical-corruption cause that fails the writer and
+  answers `Backend` with the message `storage_unavailable`.
+- **Not part of this record.** The identity of a claimed Run is not covered: a Run update that changes `task_id` or
+  `agent_id` of a persisted claim is refused by SQLite's native guard (`Unrepresentable`, "claimed run identity") and by
+  neither reference, so the three adapters differ there. That parity belongs to T12's claim-allocation task
+  (decision of 28 November 2026) and is not claimed here. Which refusal wins when more than one applies is not part of
+  the contract, except that all three answer `AlreadyExists` and `IdAlias` before a representability refusal on `create`
+  and a stale revision before it on `update`; on `update` of a row at the revision ceiling SQLite answers the exhausted
+  counter first and the references the refusal (issue 545). The bound constants are duplicated between
+  `orch-core` and the SQLite codec (issue 544).
 
 #### Added for issue 109 (ADR 0020)
 

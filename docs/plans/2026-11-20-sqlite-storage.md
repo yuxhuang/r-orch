@@ -295,6 +295,80 @@ own them. They stay a residual of the T10 acceptance and are carried by the cras
 `Storage` for each of the three families or record why it does not. A passing selection above is a result of that selection;
 it is not the T10 acceptance, which is recorded in "T10 acceptance record" below.
 
+### Permanent input refusal (issue 441)
+
+[ADR 0020](../decisions/0020-storage-consumer-contracts.md) decision 8 records the decision, the spec's "Permanent input
+refusal (issue 441)" (under "Storage port v2") states the contract, and `docs/TRAITS-FROZEN.md` ("Added for issue 441")
+records the signatures. T12's first Task write and retry classification need a caller input that can never be stored to
+be told from a fault that may clear. `main` at `7800f65a7` has no such variant: SQLite answered a refused Task or Context
+with `StoreError::Backend` and a fixed message, and the memory and file references accepted the same input. The change
+that carries this section adds `StoreError::Unrepresentable`, makes the three adapters refuse the same Task keys, Task
+times and Context provenance, and maps SQLite's native refusal after its failure observation. It adds no schema, no
+stored data, no signature beyond the variant and two validators, and no caller; no daemon path uses it. A test result is
+a receipt of the PR that carries the change, not a statement of this plan.
+
+**What exists.** Read at the code commit `deb18c4cb` (tree `361ed8e8b`), which is `aea90b200` plus two restored test
+strings, on `f4e3bde1e`, on `7800f65a7`.
+
+| Piece | Where | State |
+|---|---|---|
+| `StoreError::Unrepresentable`, `Caller::validate_context_provenance` | `crates/orch-core/src/store.rs` | Written; `store::entity::permanent_input_tests::context_provenance_bounds_only_persisted_identity_and_run` |
+| `Entity::validate_storage_input` (Task keys and canonical times) | `crates/orch-core/src/store/entity.rs` | Written; `store::entity::permanent_input_tests::task_keys_and_canonical_timestamps_have_exact_boundaries` |
+| The memory fake's `create` and `update` | `crates/orch-core/src/store/fake.rs` | Written; `store::fake::permanent_input_tests::permanent_input_refusal_preserves_operations_and_transaction` |
+| The file reference's `create` and `update` | `crates/orch-infra/src/storage/v2.rs` | Written; `storage::v2::permanent_input_tests` (2: the same scenario, and a backend fault that is `Backend`) |
+| SQLite's two public converters | `crates/orch-infra/src/sqlite/storage/mod.rs`, `crates/orch-infra/src/sqlite/entity_router.rs` | One arm each, after the failure observation. Mapping the entity router alone left 48 passed and 18 failed: the composed `Storage` calls the second converter through `Unit::observed` |
+| The public matrix on the three adapters | `crates/orch-infra/tests/permanent_input.rs` | Written: 66 tests |
+| Fixtures the new rule invalidated | `crates/orch-core/src/test_support/factories.rs`, `crates/orch-engine/src/orchestrator/claim_v2/tests.rs`, `crates/orch-infra/src/sqlite/task_page/tests.rs` | Migrated; deliberately invalid inputs stay invalid |
+| The claimed-Run lifecycle proof on three adapters | T12's claim-allocation lifecycle task | **Held, not built** (below) |
+
+**Commands that select what exists, and the counts to expect** (Linux, a private checkout, the default Cargo target;
+a selection that matches zero tests, or ignores one, fails the check):
+
+| Command | Expect |
+|---|---|
+| `cargo test -p orch-infra --test permanent_input` | 66 passed, 0 failed |
+| the same with `-- memory::`, `-- file::`, `-- sqlite::` | 20 each |
+| the same with `-- file_` and `-- sqlite_` | 3 each (the single tests: reopen, backend fault, damaged data) |
+| `cargo test -p orch-core --features test-support --lib -- permanent_input_tests` | 3 passed |
+| `cargo test -p orch-infra --lib -- permanent_input_tests` | 2 passed |
+| `cargo test -p orch-infra --lib -- mixed_timestamp_precision_is_a_documented_incompatible_representation` | 1 passed |
+| `cargo test -p orch-engine --lib claim_v2` | 42 passed (0 before the fixture migration) |
+
+The 66 are the 20 scenarios of the spec's table on each of the memory fake, the file reference and SQLite, and six single
+tests. The Context scenarios use an Owner, a Worker and a Task principal, a Task principal once for its identity and once
+for its run, and on SQLite read the four native `set_by_*` columns before and after an update.
+
+**Earlier results that stay on record** (the builder's receipt; not re-run by the writer of this section): the first
+matrix on the first head passed 44 and failed 16, the converter-only repair passed 48 and failed 18, the claim fixtures
+passed 0 and failed 42 before their migration, an unbounded libtest run of the `storage::` library selection failed 163
+with `TooManyOpenFiles` at a soft limit of 1,024 files and passed (471, 1 ignored) with `--test-threads=4`, and the first
+scoped Clippy run reported `type_complexity` in a test helper before a named alias fixed it. The matrix count of 66 is
+provisional until the final freeze of the change's head.
+
+**Held: the identity of a claimed Run** (the lead's decision of 28 November 2026, option A). The change proves the
+ordinary public-port refusal and claims no parity for a claimed Run: SQLite's native guard refuses a changed `task_id` or
+`agent_id` on a Run with a stored claim tuple, and the references have no such guard and no durable claim allocation to
+build one from. T12's claim-allocation lifecycle task may develop an inactive candidate, and before the first path that
+relies on a claimed Run's identity is enabled it shows, on the memory fake, the file reference and SQLite, the typed
+refusal, the unchanged Run, revision and claim identity, and the valid same-identity update, varying `task_id` and
+`agent_id` separately with a current revision, during the claim and after the lease is released, with a reopen for the
+persistent stores and an ordinary unclaimed Run as the control. If durable allocation needs new storage paths, a scoped
+producer decision comes first. The native guard is unchanged, and issue 441 stays open: the change refers to it and
+does not close it.
+
+**Release of the first use.** T12's first Task write, and any retry classification that depends on this variant, are
+released when the controller records all of: a reviewed, accepted producer commit that is part of the consumer's base;
+the matrix above and its three-adapter assertions (the same valid boundary and refused inputs, content-free errors,
+rollback and a separately classified backend fault) run on that commit; the dispositions of an independent code review
+and a static security review of the completed head (the earlier reviews' verdicts on `f4e3bde1e` stay on record and accept nothing of the completed head); and the
+development-fast results and the current-`main` hosted Linux `check` and `test` on the actual merge, with a `CLEAN`
+merge state. Nothing in this section releases them. The claimed-Run proof above is a separate hold.
+
+**Follow-ups kept with their issues (none is a contract waiver):** #544, the 65,536 and canonical-time bounds are written
+in `orch-core` and in the SQLite codec and only the shared tests keep them equal; #545, which refusal wins on `update` of a
+row at the revision ceiling; #546, the stored document bound of a retry diagnostic on SQLite against R97's whole-text
+promise and the references. The security reasoning behind the bounds and the evidence for them stay private.
+
 ### T8 consumer contracts (issue 109)
 
 [ADR 0020](../decisions/0020-storage-consumer-contracts.md) records the decisions, and the spec's "T8 consumer-contract
@@ -1794,7 +1868,7 @@ this is no mutation matrix.
 | #511 (low) | the next change to the retry fixture | `t10_retry_reads.rs` sets file mode `0o000` and expects a refusal, so as root the read succeeds and the test fails (it never passes falsely): run it as an ordinary user and as a privileged one |
 | #512 (medium, flaky) | the next retry-conformance change, or a recurrence | one hosted `overloaded` on the first snapshot after the 1,200-row write, before any retention assertion; the cause is unknown and the same-head rerun passed. Keep the row-retention assertions and the production admission deadline |
 | #390 (open) | the next change to `non_task_cursor/tests.rs` | its comment that describes the Run sort as `name` |
-| #441, #465 | T12 before its first Task write or retry classification; T16 before the first production caller of the generic `reconcile` | typed content-free refusal with backend parity; the guard of issue 465 |
+| #441, #465 | #441: T12 before its first Task write or retry classification (the ordinary public input is the change of "Permanent input refusal (issue 441)"; the identity of a claimed Run stays open with T12's claim-allocation lifecycle task). #465: T16 before the first production caller of the generic `reconcile` | #441: the release event of that section (an accepted producer commit in the consumer's base, the three-adapter public matrix on it, and the review and merge dispositions), and for the claimed Run the lifecycle proof on all three adapters before first use. #465: the guard of issue 465 |
 | #436 (draft #437), #422 | T16's wiring or the next writer accounting change | the success-path refund guard and the known-error boundaries |
 | #203, #223 | T17 (`commit_seq`); T13 and T24 | their own issue text |
 | #99, #126, #209, #252, #265, #273, #308, #322, #391, #457, #498 | T12, T13, T15, T16, T17, T18, T19, T21 to T24 and T26, as the adjudication of the whole review assigned them | each at its own milestone |
@@ -1835,6 +1909,7 @@ result, and the earlier discriminator and the broader control of #480 stand as r
 | T10 and T16, one retained producer per writer (issues 448, 456, 461 and 465) | Written as a contract in the spec's "One retained producer per writer" and in this plan's subsection of that name, from `main` at `77376bc6c` and from PR #459 at `fd81eacc3`, and read again on `main` at `23ffdc838` after #459 (`930d32585`), #466 (`4d415afb9`), #486 and #488: one retained producer (the event producer), refusal at a taken continuation slot or a queued `Events` entry as `Overloaded` after `Episode::prepare`, the token's retry eligibility after it, and the uncertain-COMMIT boundary of issue 461 item 5 checked against the code and one throwaway test. T16's acceptance carries six obligations, and obligation 6's tests of issue 456 are on `main`. Held, not changed by this text: the first caller of the generic `reconcile` (issue 465, open), the rest of issue 461, the T10 acceptance and every wiring. Whether the daemon wires the producer once per writer is not shown by any code yet: `EventProducer::new` has no production caller |
 | T10, active readers (R127) and the physical R142 corpus (development member `6706afcbc`) | One commit on `07fecf1ed`, not part of PR 385 when read and not wired (it landed on `main` as PR #424, `e087144be`, and the daemon does not call it): the adapter side of R127 (one passive checkpoint on its own connection, the backlog from its frame counts, interruption of a read that is older than 30 s while the backlog is over 256 MiB, `snapshot_expired` for that one owned snapshot) and the physical R142 corpus as `cfg(test)` code on the borrowed entity driver and the shared failure state. Development runs on Linux: `sqlite::read_pool::` 11 passed, `sqlite::storage::` 57 passed, 0 failed (the plan's "As built at `6706afcbc`" has the tests; the 22 physical tests passed in the same development run). Not done: the checkpoint job and its schedule (T15), a whole `fast` run, a hosted run, an independent review, the corpus's whole current qualification, the freeze and the acceptance; nothing is activated |
 | T10 acceptance (storage only) | Recorded in "T10 acceptance record" above, from `main` at `550fa43ad` (tree `214c8a372`) and the hosted push run 46135776569, which passed `check`, `test` and `ambient`. The whole review of PR #427's landing (`24c40bcf4`) and the delta review of the 32 commits after it each passed with conditions; the records of the Linux runs, of issues 166, 167, 286, 379 and 409 (the five closing lines of the pull request that carries it), of issue 127 (the owner closes it by hand) and of what stays open are in that subsection. Nothing is wired or activated, and T12, the importer and every later consumer keep their gates |
+| T8 and T10, permanent input refusal (issue 441) | Contract written by this documentation (ADR 0020 decision 8, the spec's "Permanent input refusal (issue 441)", `docs/TRAITS-FROZEN.md`, the plan's section of that name) for a code candidate whose head is `deb18c4cb` (five commits on `7800f65a7`; draft PR pending). Linux, read from that head: the public matrix `permanent_input` passed 66 of 66 (provisional until the final freeze), the private unit tests and the fixture selections of the plan's section passed with the counts it gives. Pending: development `fast` on the completed head, the independent code and static security delta reviews, the hosted Linux `check` and `test` on the actual merge, and the lead's recommendation. The identity of a claimed Run is held with T12 and issue 441 stays open. Nothing is wired into the daemon, no consumer is released, and no acceptance of T12's first use follows |
 | T2 to T27, except T4 and T4b | pending, as this table stood before 2026-11-21; this revision brings no other row up to date |
 
 ### Train 14: size of the replacement for PR 324 and PR 326

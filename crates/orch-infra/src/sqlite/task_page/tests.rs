@@ -872,29 +872,29 @@ async fn mixed_timestamp_precision_is_a_documented_incompatible_representation()
     a.created_at = "2026-01-01T00:00:00Z".into();
     let mut b = task("b", TaskStatus::Todo, 0, 0, None);
     b.created_at = "2026-01-01T00:00:00.001Z".into();
-    for t in [a, b] {
-        let position = save(&file, "p", t.clone()).await;
+    // The reference now enforces the same canonical-only input contract.
+    // Keep the invalid fixture: integer projection would lose its raw order.
+    let invalid = a.clone();
+    let error = file
+        .write(
+            owner("p"),
+            Lane::Entities,
+            Box::new(move |u| {
+                u.create(Entity::Task(Box::new(invalid)))?;
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, StoreError::Unrepresentable));
+    assert!(b.created_at < a.created_at);
+    for (t, position) in [(a, 1), (b, 2)] {
         insert(&db, "p", &t, position);
     }
     let req = request(Sort::CreatedAt, 100);
     let tx = db.transaction().unwrap();
     let got = query(&tx, "p", &filter(), &req, None).unwrap();
-    let expected = file
-        .read(owner("p"))
-        .await
-        .unwrap()
-        .list(&filter(), &req)
-        .await
-        .unwrap();
     assert_eq!(got.ids, ["a", "b"]);
-    assert_eq!(
-        expected
-            .items
-            .iter()
-            .map(|r| r.entity.id())
-            .collect::<Vec<_>>(),
-        ["b", "a"]
-    );
     // Offset and sub-millisecond strings also lose raw lexical information.
     let left = "2026-01-01T00:30:00+01:00";
     let right = "2025-12-31T23:45:00Z";

@@ -178,6 +178,43 @@ reference conformance reconciliation (#196) landed and #130 closed:
    the shared suites. T12 owns the finish and enqueue caller and lease-bound finish, T14 the dispatch order, T21
    the legacy import (a whole 1.0 error, rebuilt into chunks when it needs them), and T23 the backup, restore and
    export round trip of every reachable chunk. Each consumer keeps the obligations listed in the plan.
+8. **A caller value that storage cannot represent is a permanent, payload-free refusal (issue 441).** This is the
+   lead's T12 first-use decision of 28 November 2026, and the lead's disposition of the same day (option A) for what
+   issue 441 covers now. T12's first Task write and retry classification need to tell a caller input that can never be
+   stored from a fault that may clear, and on SQLite the two were both `Backend` with a fixed message.
+   - *The variant.* Add `StoreError::Unrepresentable`, a unit variant. Its text is constant, it has no source, and it
+     carries no input, field name, bound or backend text. It says that retrying the same value cannot succeed.
+   - *The contract it enforces now (ordinary entity input).* The memory fake, the file reference
+     and SQLite refuse the same Task values and the same Context provenance and accept the same boundary values. A `Task`'s `id`, `assignee`, `goal_id`, `created_at` and `updated_at` are at
+     most 65,536 UTF-8 bytes, and its two times are the canonical `YYYY-MM-DDTHH:MM:SS.sssZ` from
+     `0000-01-01T00:00:00.000Z` to `9999-12-30T22:00:00.999Z`, inclusive (the spec's "Task format v1 (SQLite)",
+     "Time", and "Staged SQLite goal timestamp and position limits"). A Context `create` refuses a caller whose identity,
+     or whose Task run, is over 65,536 UTF-8 bytes, because both are stored as provenance; an `update` preserves the
+     stored provenance and never reads the caller's. The references validate in `create` and `update`; SQLite already
+     refused these values natively.
+   - *Nothing changes when it refuses.* The row, revision and position are as before, no position is consumed, and a
+     caught refusal leaves the rest of the unit of work intact; a returned one rolls the unit back.
+   - *Mapping on SQLite.* Both public converters map the native `SqliteError::Unrepresentable` to the variant after
+     the failure state has observed it, and drop its text. It is an ordinary class that latches nothing. Every other
+     arm keeps its classification.
+   - *Faults and damaged data stay apart.* A transient backend fault stays `Backend` and a retry after it clears
+     succeeds; persisted data that fails to decode stays a decode error on the file reference and the fatal
+     logical-corruption cause on SQLite. None of them is an input refusal.
+   - *What the consumer does.* It matches the variant exhaustively, does not reschedule that input, and never infers
+     permanence from the text of an error or from `Backend`. This decision adds no consumer and releases none.
+   - *What is held.* The identity of a claimed Run is not covered. SQLite's native guard binds `task_id` and `agent_id`
+     of a Run update to a persisted claim tuple and answers the same native refusal, which the converters now map; the
+     two references have no such guard, ordinary entity creation produces no claim tuple, the port exposes no durable
+     claim allocation, and the references remove a released lease, so the presence of a lease cannot tell them that a
+     Run was claimed. The guard stays as it is and no reference metadata is added. T12's claim-allocation lifecycle
+     task owns the case and must show, before the first path that relies on a claimed Run's identity is enabled, the
+     same typed refusal and the same valid same-identity update on all three adapters (spec and plan). Issue 441 stays
+     open for it, and the change that carries this decision refers to it and does not close it.
+   - *Release.* The first T12 Task write or retry classification that depends on this variant is released when the
+     controller records a reviewed, accepted producer commit that is part of the consumer's base, and the public-port
+     Linux tests across the three adapters for the same valid boundary and refused inputs, content-free errors,
+     rollback and a separately classified backend fault have been run on it. The plan's "Permanent input refusal
+     (issue 441)" lists them.
 
 ## Alternatives considered
 
@@ -206,6 +243,20 @@ reference conformance reconciliation (#196) landed and #130 closed:
 - **Keep refusing text over 64 KiB.** That fails a finish whose agent printed a long error, and fails the import of
   a 1.0 queue entry that 1.0 accepted. It leaves R97 unmet.
 - **Truncate.** Forbidden by R97 and by the decision of 2026-11-23.
+- **Leave SQLite's refusal a generic `Backend` error and let the consumer read the text.** The text is fixed and
+  names no cause, so the consumer could not tell an input that fails every time from a fault that clears, and it would
+  have to match a message to decide. Rejected for decision 8's typed variant.
+- **Carry the field, the bound or the value in the variant.** It would put a caller's text into a log or a diagnostic
+  (R101) and invite a consumer to branch on it. Rejected for a unit variant with a constant message.
+- **Map the refusal on SQLite only.** The memory fake and the file reference would accept a Task that SQLite refuses,
+  so a test could pass on a reference with an input that no real backend stores. Rejected: the references validate
+  the same values, and the shared public tests run on all three.
+- **Widen SQLite to accept what the references accepted.** A second-precision or offset time would sort differently as
+  a native integer than as text, which the spec's "Task format v1 (SQLite)", "Time" rules out, and a key over 65,536
+  bytes cannot be kept out of its native projection. Rejected: the format keeps its canonical form and bounds.
+- **Close the claimed-Run case in this change by adding claim metadata to the references.** The port has no durable
+  claim allocation, so the metadata would be invented outside the claim path that T12 owns. Rejected: the case is held
+  with T12's lifecycle task and issue 441 stays open for it.
 
 ## Consequences
 
@@ -247,3 +298,24 @@ reference conformance reconciliation (#196) landed and #130 closed:
   document ignores an unknown field and a row denies one; the persisted check needs the one-hour TTL, so a change of
   `KEY_TTL_MS` migrates or reconciles earlier rows in the same change; and the tie order of rows with an equal expiry
   is a SQLite proof owned by T10 under issue 127. None of these adds a public type or a signature.
+- `StoreError` gains a variant and is not `#[non_exhaustive]`, so a consumer that matches it without a wildcard arm
+  must handle `Unrepresentable`. The memory fake and the file reference now refuse a `Task` whose times are not the
+  canonical millisecond form, so a test that builds one through them uses canonical times: the shared factory's
+  timestamp is `2025-01-01T00:00:00.000Z` for that reason, and the `claim_v2` test helper and one SQLite ordering test
+  were adapted with it. The mixed-precision SQLite test keeps its deliberately invalid second-precision string, and
+  asserts that the reference port refuses it before it shows the native ordering difference. A Run's opaque timestamps
+  are not Task times and were not migrated.
+- SQLite's variant is wider than the shared rule. Every native `SqliteError::Unrepresentable` that reaches a public
+  converter becomes the public variant: also an entity encoding of another family, a message outside the schema's
+  bounds on write, a retry diagnostic whose stored document is over its bound, a cursor shape, and the identity of a
+  claimed Run (held above). The memory and file references do not enforce those, and the shared tests prove parity for
+  the Task and Context rules only. Whether the retry diagnostic document bound needs a refusal on the references, or a
+  disposition of its own that keeps R97's whole-text promise, is issue 546.
+- Three follow-ups are filed and are not part of this contract: the bound constants are written twice, in `orch-core`
+  and in the SQLite codec, with the shared tests as the only guard against drift (issue 544); which refusal wins on
+  `update` at a row on the revision ceiling differs between SQLite and the references (issue 545); and the retry
+  diagnostic document bound (issue 546).
+- Nothing here activates a consumer. The reference tests are the Linux public matrix `permanent_input` of `orch-infra`
+  (20 scenarios on each of the three adapters, three file-only and three SQLite-only fault and reopen tests: 66), the
+  private unit tests of `orch-core` and the file reference, and the migrated fixtures. This ADR records the names and
+  counts that are expected, and a result is a receipt of the PR that carries the change.
