@@ -54,13 +54,6 @@ pub(super) fn native(error: NativeError) -> SqliteError {
         NativeError::Encoding => SqliteError::Unrepresentable("entity encoding".into()),
         NativeError::ClaimedIdentity => SqliteError::Unrepresentable("claimed run identity".into()),
         NativeError::Aborted => SqliteError::TransactionAborted,
-        NativeError::Rollback {
-            operation,
-            rollback,
-        } => SqliteError::OperationRollback {
-            operation: Box::new(native(*operation)),
-            rollback,
-        },
     }
 }
 

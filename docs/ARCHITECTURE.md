@@ -1239,7 +1239,7 @@ clients <── WriteReceipt::wait() ──────────────�
   the user `WriteWork` alone; `submit_contained` is `cfg(test)` and only tests call it. Two tests in
   `sqlite/storage/containment_tests.rs` show that a panic in the `Clock` read and one in the completion check after a
   successful callback reach the caller as an error, not as a resumed callback panic.
-  In the lease, intent, retry, message, Task (both `task_entity` and the outer
+  In the lease, intent, retry, message, Agent/Team/Run, Task (both `task_entity` and the outer
   `entity_task_move`) and native Context/Config/Template/Goal leaves, a savepoint cleanup failure
   does not return an error that a callback could catch and commit past. It unwinds with a typed `CleanupUnwind`, which `contain` reports to the failure
   state, so that `SQLITE_CORRUPT` or `SQLITE_NOTADB` latches although the outer rollback would succeed, and then raises

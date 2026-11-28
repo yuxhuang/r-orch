@@ -2759,3 +2759,52 @@ async fn incomplete_unknown_callback_keeps_the_streak_until_the_second_ioerr_lat
 async fn incomplete_known_callback_keeps_the_streak_until_the_second_ioerr_latches() {
     incomplete_callback_ioerr_recovery(false, 2).await;
 }
+
+#[tokio::test]
+async fn two_uncertain_commits_reconciled_absent_report_storage_unavailable_and_close_intake() {
+    let commits = Arc::new(AtomicU64::new(0));
+    let seen = commits.clone();
+    let fx = fixture_with(StorageOptions {
+        writer_commit_probe: Some(Box::new(move |tx| {
+            let rows: i64 = tx
+                .query_row("SELECT count(*) FROM run_events", [], |row| row.get(0))
+                .unwrap();
+            if rows == 0 {
+                return None;
+            }
+            seen.fetch_add(1, Ordering::SeqCst);
+            // Real SQLite DELETE and COMMIT, followed by an injected IOERR.
+            // Each uncertain receipt reconciles against real, absent rows;
+            // this does not simulate a physical disk failure.
+            tx.execute_batch("DELETE FROM run_events; COMMIT").unwrap();
+            Some(Err(sql(rusqlite::ffi::SQLITE_IOERR)))
+        })),
+        ..Default::default()
+    });
+    let producer = fx.producer();
+    let first = fx.batch("p", "uncertain", 1..=3).await;
+    let next = fx.batch("p", "next", 1..=1).await;
+    let failure = answered(producer.submit(first).unwrap()).await.unwrap_err();
+    assert!(
+        failure.error.to_string().contains("storage_unavailable"),
+        "{failure:?}"
+    );
+    assert_eq!((failure.committed, failure.not_stored), (counts(0, 0), 3));
+    assert!(!failure.outcome_unknown);
+    assert_eq!(commits.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        fx.storage.failure_state().failure().unwrap().causes,
+        vec![(
+            crate::sqlite::Role::Operation,
+            crate::sqlite::FatalCause::ConsecutiveIoErrors,
+        )]
+    );
+    assert!(
+        matches!(producer.submit(next), Err(Rejected::Closed(..))),
+        "fatal reconciled absence must close intake before answering"
+    );
+    assert!(fx.reports().is_empty(), "no false committed report");
+    assert!(fx.stored("p", "uncertain").await.is_empty());
+    assert_eq!(producer.retained(), (0, 0, 0));
+    producer.close().await;
+}

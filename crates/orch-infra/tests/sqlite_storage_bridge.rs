@@ -12,7 +12,7 @@
 //! `agent_team_run` (poison with a transaction open, a fresh helper on an ended
 //! transaction) and the typed-cause cases of `sqlite_writer_policy`. The tests
 //! here prove the composition: returned cleanup failures poison the whole unit,
-//! while Task and native cctg cleanup failures unwind and retire the writer. Neither path
+//! while Task, Agent/Team/Run and native cctg cleanup failures unwind and retire the writer. Neither path
 //! commits the failed request, including when the callback intended to return Ok.
 use orch_core::storage::ContextEntry;
 use orch_core::store::{
@@ -246,7 +246,7 @@ fn failing_families() -> [Failing; 3] {
             trigger: "CREATE TRIGGER end_it BEFORE INSERT ON agents WHEN NEW.id='doomed' \
                       BEGIN SELECT RAISE(ROLLBACK,'synthetic SQLite rollback'); END",
             entity: || agent("doomed", "doomed"),
-            retires_writer: false,
+            retires_writer: true,
         },
         // The task writer unwinds on failed savepoint cleanup (#477).
         Failing {
@@ -268,9 +268,9 @@ fn failing_families() -> [Failing; 3] {
 }
 
 /// R128: SQLite ended the transaction under the unit, so its savepoint cannot be
-/// rolled back and the unit may never commit. The Task and cctg leaves unwind and retire
-/// the writer (#477, #462); the native helper still returns errors and refuses the rest
-/// of the unit. Neither path commits partial work; a reopened writer is usable.
+/// rolled back and the unit may never commit. Task, Agent/Team/Run and cctg leaves
+/// unwind and retire the writer (#477, #468 and #462). No path commits partial work;
+/// a reopened writer is usable.
 #[tokio::test]
 async fn a_caught_rollback_failure_refuses_the_rest_of_the_unit_and_commits_nothing() {
     for failing in failing_families() {
@@ -450,30 +450,32 @@ async fn caught_live_corruption_latches_the_writer_and_prevents_the_outer_commit
 /// R140: the operation's cause and the rollback's cause stay apart in what the
 /// failure state keeps, and each decides the outcome by its own class. An ordinary
 /// operation cause with a rollback that failed because SQLite ended the transaction
-/// aborts only that request. A fatal operation cause latches with exactly that
-/// cause under the operation role. (A fatal cause on the rollback side needs
+/// retires the native writer without latching. A fatal operation cause latches
+/// with exactly that cause under the operation role. (A fatal cause on the rollback side needs
 /// `SQLITE_CORRUPT` from a savepoint rollback, which no callback can provoke; the
 /// synthetic cases of `sqlite_writer_policy` keep it.)
 #[tokio::test]
 async fn the_operation_cause_and_the_rollback_cause_keep_their_own_class() {
-    let env = Env::new();
+    let mut env = Env::new();
     env.commit(|unit| unit.create(agent("a", "original"))).await;
     env.sql(
         "CREATE TRIGGER end_it BEFORE INSERT ON teams WHEN NEW.id='doomed' \
          BEGIN SELECT RAISE(ROLLBACK,'synthetic SQLite rollback'); END",
     );
 
-    // Ordinary operation cause (a trigger refusal) and a rollback that fails
-    // because SQLite already ended the transaction: aborted, not fatal.
+    // Ordinary operation and cleanup causes retire this native writer without
+    // latching. The typed unwind skips the callback's returned-error handling.
     let outcome = env
         .try_commit(|unit| {
             let error = unit.create(team("doomed")).unwrap_err();
             assert_eq!(backend_text(&error), FAILED);
         })
         .await;
-    assert_eq!(backend_text(&outcome.unwrap_err()), FAILED);
+    assert!(backend_text(&outcome.unwrap_err()).contains("SQLite writer is closed"));
     assert!(env.storage.failure_state().failure().is_none());
     assert_eq!(env.count("teams"), 0);
+    assert!(env.storage.close().await.is_err());
+    env.storage = SqliteStorage::open(env.data.clone(), StorageOptions::default()).unwrap();
 
     // A fatal operation cause with the savepoint intact: the read runs, proves
     // the stored agent corrupt and the writer latches that cause as the

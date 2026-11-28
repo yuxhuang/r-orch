@@ -2010,9 +2010,18 @@ mod tests {
         let mut sql = NativeSql::new(&tx, &disk, "p", 123);
         sql.create(Entity::Agent(Box::new(agent()))).unwrap();
         tx.execute_batch("CREATE TEMP TRIGGER abort_transaction BEFORE INSERT ON entity_blob_refs BEGIN SELECT RAISE(ROLLBACK,'injected'); END").unwrap();
-        let error = sql.create(Entity::Run(Box::new(run()))).unwrap_err();
+        // Tests alone catch the typed cleanup unwind to inspect the helper's
+        // defensive poison. Production containment re-raises it to retire the writer.
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sql.create(Entity::Run(Box::new(run())))
+        }))
+        .unwrap_err()
+        .downcast::<crate::sqlite::writer::contain::CleanupUnwind>()
+        .expect("typed cleanup unwind");
         assert!(
-            matches!(error,NativeError::Rollback {operation,rollback:rusqlite::Error::SqliteFailure(..)} if matches!(*operation,NativeError::Sql(rusqlite::Error::SqliteFailure(..))))
+            matches!(unwind.error(), crate::sqlite::SqliteError::OperationRollback {
+            operation, rollback: rusqlite::Error::SqliteFailure(..)
+        } if matches!(**operation, crate::sqlite::SqliteError::Sql(rusqlite::Error::SqliteFailure(..))))
         );
         assert!(matches!(
             sql.ensure_committable(),
@@ -2372,11 +2381,6 @@ pub(super) enum NativeError {
     ClaimedIdentity,
     #[error("native transaction cannot commit after failed rollback")]
     Aborted,
-    #[error("operation failed: {operation}; rollback failed: {rollback}")]
-    Rollback {
-        operation: Box<NativeError>,
-        rollback: rusqlite::Error,
-    },
 }
 
 impl Family {
@@ -2911,10 +2915,10 @@ impl<'a, 'conn> NativeSql<'a, 'conn> {
                 Ok(()) => Err(operation),
                 Err(rollback) => {
                     self.poisoned = true;
-                    Err(NativeError::Rollback {
-                        operation: Box::new(operation),
+                    crate::sqlite::writer::contain::cleanup_failed(
+                        crate::sqlite::entity_router::native(operation),
                         rollback,
-                    })
+                    )
                 }
             },
         }
