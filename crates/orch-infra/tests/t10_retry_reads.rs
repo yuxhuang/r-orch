@@ -129,7 +129,7 @@ async fn composed_mixed_retry_pages_refuse_partial_results() {
                 .join(&hash[2..4])
                 .join(&hash);
             let permissions = std::fs::metadata(&path).unwrap().permissions();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0)).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
             let snapshot = env.storage.read(owner("p")).await.unwrap();
             let access = snapshot.read_retry("object").await;
             assert!(
