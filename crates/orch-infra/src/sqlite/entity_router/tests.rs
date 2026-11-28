@@ -480,8 +480,26 @@ fn message_blob_registration_uses_the_supplied_signed_clock() {
     });
 }
 
+// Only direct characterization fixtures swallow this unwind, after containment
+// has observed it. Public Storage::write must let it escape and retire the worker.
+fn inspect_native_cleanup<T>(state: &FailureState, work: impl FnOnce() -> Result<T>) {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::sqlite::writer::contain::contain(state, work)
+    }));
+    let Err(payload) = payload else {
+        panic!("cleanup must unwind")
+    };
+    let unwind = payload
+        .downcast::<crate::sqlite::writer::contain::CleanupUnwind>()
+        .expect("typed cleanup unwind");
+    assert!(matches!(
+        unwind.error(),
+        SqliteError::OperationRollback { .. }
+    ));
+}
+
 #[test]
-fn caught_failed_native_cleanup_aborts_all_families_and_next_transaction_succeeds() {
+fn deliberately_swallowed_native_cleanup_still_arms_all_guards() {
     scenario(|data, handle, disk| {
         submit(handle, |tx| {
             tx.execute_batch("CREATE TRIGGER abort_agent BEFORE INSERT ON agents WHEN NEW.id='fatal' BEGIN SELECT RAISE(ROLLBACK, 'synthetic'); END")?;
@@ -493,13 +511,9 @@ fn caught_failed_native_cleanup_aborts_all_families_and_next_transaction_succeed
             let caller = owner("p");
             let mut unit = EntityWrite::new(tx, &caller, &blobs, state.clone(), 0);
             unit.create(payload(Family::Task, "earlier", "before failure"))?;
-            let error = unit
-                .create(payload(Family::Agent, "fatal", "agent"))
-                .unwrap_err();
-            assert!(
-                matches!(&error, SqliteError::OperationRollback { operation, .. } if matches!(**operation, SqliteError::Sql(_)))
-            );
-            assert!(crate::sqlite::classify(&error).savepoint_rollback_failed());
+            inspect_native_cleanup(&state, || {
+                unit.create(payload(Family::Agent, "fatal", "agent"))
+            });
             for family in FAMILIES {
                 assert!(matches!(
                     unit.create(payload(family, "after", "after failure")),
@@ -578,10 +592,9 @@ fn failed_cleanup_with_active_transaction_also_refuses_reads_and_task_pages() {
     unit.create(payload(Family::Task, "kept", "before failure"))
         .unwrap();
     tx.execute_batch("CREATE TEMP TRIGGER fail_agent BEFORE INSERT ON agents BEGIN SELECT RAISE(ABORT,'injected'); END").unwrap();
-    assert!(matches!(
-        unit.create(payload(Family::Agent, "broken", "agent")),
-        Err(SqliteError::OperationRollback { .. })
-    ));
+    inspect_native_cleanup(&state, || {
+        unit.create(payload(Family::Agent, "broken", "agent"))
+    });
     assert!(!tx.is_autocommit());
     assert!(state.failure().is_none());
     for family in FAMILIES {
@@ -633,10 +646,17 @@ fn assert_poisoned_mutations(trigger: &str, poison: Payload) {
         unit.create(payload(family, "kept", "before")).unwrap();
     }
     tx.execute_batch(trigger).unwrap();
-    assert!(matches!(
-        unit.create(poison),
-        Err(SqliteError::OperationRollback { .. })
-    ));
+    if matches!(
+        &poison,
+        Payload::Agent(_) | Payload::Team(_) | Payload::Run(_)
+    ) {
+        inspect_native_cleanup(&state, || unit.create(poison));
+    } else {
+        assert!(matches!(
+            unit.create(poison),
+            Err(SqliteError::OperationRollback { .. })
+        ));
+    }
     assert!(!tx.is_autocommit());
     assert_mutations_refused(&mut unit);
     drop(unit);

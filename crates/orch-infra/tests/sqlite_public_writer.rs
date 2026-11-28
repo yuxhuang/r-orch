@@ -348,22 +348,38 @@ async fn no_statement_is_durable_when_sqlite_ends_the_transaction_and_the_callba
             Ok(())
         })
         .await;
+    let error = result.unwrap_err();
     assert!(
-        result.is_err(),
-        "a caught failed cleanup cannot acknowledge commit"
+        error.to_string().contains("SQLite writer is closed"),
+        "{error}"
     );
     assert!(
         f.storage.failure_state().failure().is_none(),
-        "ordinary rollback is not fatal corruption"
+        "ordinary cleanup failure retires the worker without latching"
     );
-    // An independent successful receipt also proves the healthy writer survives.
-    f.storage
+    let later = f
+        .storage
+        .fixture_transaction(owner(), Lane::Entities, |u| {
+            u.create(team("refused-later")).map(|_| ())
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        later.to_string().contains("SQLite writer is closed"),
+        "{later}"
+    );
+    assert!(f.storage.close().await.is_err());
+    let reopened = SqliteStorage::open(f.data.clone(), StorageOptions::default()).unwrap();
+    assert!(
+        f.team_ids().is_empty(),
+        "nothing before or after cleanup was committed"
+    );
+    reopened
         .fixture_transaction(owner(), Lane::Entities, |u| {
             u.create(team("following")).map(|_| ())
         })
         .await
         .unwrap();
-    let reopened = f.reopen().await;
     assert_eq!(f.team_ids(), ["following"]);
     reopened.close().await.unwrap();
 }
