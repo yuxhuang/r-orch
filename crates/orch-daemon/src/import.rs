@@ -309,14 +309,14 @@ async fn execute(request: ImportRequest, cancel: Arc<AtomicBool>) -> ImportOutco
         result.detail = "cancelled before writing".into();
         return result;
     }
-    if prepared.report.preapproval_requires_confirmation {
-        result.detail =
-            "owner confirmation of preapproval is required; this candidate cannot enable it".into();
-        return result;
-    }
     if request.dry_run {
         result.exit_code = 0;
         result.detail = "dry run; no import batches admitted".into();
+        return result;
+    }
+    if prepared.report.preapproval_requires_confirmation {
+        result.detail =
+            "owner confirmation of preapproval is required; this candidate cannot enable it".into();
         return result;
     }
     if existing.is_some() && !request.resume {
