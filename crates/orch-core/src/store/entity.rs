@@ -95,10 +95,13 @@ impl Entity {
             }
             for text in [&task.created_at, &task.updated_at] {
                 // Reuse the core clock codec: round-trip equality rejects rolled
-                // dates and alternate spellings; 24 bytes bounds years to 0000..9999.
+                // dates and alternate spellings. The Task format keeps the staged
+                // SQLite range, whose upper bound precedes the end of year 9999.
                 let valid = text.len() == 24
-                    && crate::clock::epoch_ms_from_iso(text)
-                        .is_some_and(|ms| crate::clock::iso_from_epoch_ms(ms) == *text);
+                    && crate::clock::epoch_ms_from_iso(text).is_some_and(|ms| {
+                        (-62_167_219_200_000..=253_402_207_200_999).contains(&ms)
+                            && crate::clock::iso_from_epoch_ms(ms) == *text
+                    });
                 if !valid {
                     return Err(super::StoreError::Unrepresentable);
                 }
@@ -175,7 +178,7 @@ mod permanent_input_tests {
         }
         for time in [
             "0000-01-01T00:00:00.000Z",
-            "9999-12-31T23:59:59.999Z",
+            "9999-12-30T22:00:00.999Z",
             "2024-02-29T00:00:00.000Z",
         ] {
             task.created_at = time.into();
@@ -184,6 +187,8 @@ mod permanent_input_tests {
                 .unwrap();
         }
         for time in [
+            "9999-12-30T22:00:01.000Z",
+            "9999-12-31T23:59:59.999Z",
             "2026-02-30T00:00:00.000Z",
             "2026-01-01T00:00:00Z",
             "2026-01-01T00:00:00.000+00:00",

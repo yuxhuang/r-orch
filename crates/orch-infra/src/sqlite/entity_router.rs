@@ -361,6 +361,7 @@ impl<'a, 'conn> EntityWrite<'a, 'conn> {
 fn port<T>(result: Result<T>) -> orch_core::store::Result<T> {
     result.map_err(|error| match error {
         SqliteError::Store(refusal) => refusal,
+        SqliteError::Unrepresentable(_) => orch_core::store::StoreError::Unrepresentable,
         _ => orch_core::store::StoreError::Backend(orch_core::Error::other(
             "SQLite storage operation failed",
         )),

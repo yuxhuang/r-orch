@@ -395,6 +395,7 @@ fn backend(message: &str) -> StoreError {
 fn port<T>(result: Result<T>) -> store::Result<T> {
     result.map_err(|e| match e {
         SqliteError::Store(e) => e,
+        SqliteError::Unrepresentable(_) => StoreError::Unrepresentable,
         SqliteError::StorageUnavailable(_) => backend("storage_unavailable"),
         SqliteError::Overloaded => backend("overloaded"),
         SqliteError::SnapshotExpired => backend("snapshot_expired"),
