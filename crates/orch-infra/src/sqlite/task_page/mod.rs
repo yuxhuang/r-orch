@@ -230,6 +230,7 @@ pub(crate) fn find_id_with_prefix(
     }
     args.push(Value::Integer(byte_len as i64));
     sql.push_str(&format!(" AND length(CAST(id AS BLOB)) = ?{}", args.len()));
+    sql.push_str(" ORDER BY id");
     let mut statement = tx.prepare(&sql)?;
     let mut rows = statement.query(params_from_iter(&args))?;
     while let Some(row) = rows.next()? {
