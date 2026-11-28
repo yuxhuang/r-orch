@@ -52,7 +52,7 @@ pub enum SqliteError {
         operation: Box<SqliteError>,
         rollback: rusqlite::Error,
     },
-    #[error("goal transaction cannot commit after a failed operation rollback")]
+    #[error("transaction cannot commit after a failed operation rollback")]
     TransactionAborted,
     #[error("storage admission deadline or queue bound reached")]
     Overloaded,

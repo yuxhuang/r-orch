@@ -444,6 +444,10 @@ fn transaction_abort_cannot_be_caught_and_followed_by_a_new_intent() {
         intents.get_intent(1),
         Err(SqliteError::TransactionAborted)
     ));
+    assert!(matches!(
+        intents.list_pending_intents(0, 1),
+        Err(SqliteError::TransactionAborted)
+    ));
     assert_eq!(
         tx.query_row("SELECT count(*) FROM intents", [], |r| r.get::<_, i64>(0))
             .unwrap(),
@@ -553,4 +557,136 @@ fn read_pool_keeps_pending_snapshot_across_writer_completion_and_retention() {
         })
         .unwrap();
     });
+}
+
+#[test]
+fn valid_padded_payloads_over_the_stored_bound_are_redacted_on_both_reads() {
+    let mut conn = database();
+    let tx = conn.transaction().unwrap();
+    let who = caller("p");
+    let mut intents = Intents::new(&tx, &who);
+    let payload = remove("synthetic-secret");
+    intents.add_intent(&payload, 0).unwrap();
+    let text = serde_json::to_string(&payload).unwrap();
+    // Exact boundary remains readable; one extra JSON whitespace byte does not.
+    for bytes in [256, 257] {
+        let padded = format!("{text:bytes$}");
+        assert_eq!(
+            serde_json::from_str::<IntentPayload>(&padded).unwrap(),
+            payload
+        );
+        tx.execute("UPDATE intents SET payload=?1", [&padded])
+            .unwrap();
+        for result in [
+            intents.get_intent(1).map(|_| ()),
+            intents.list_pending_intents(0, 1).map(|_| ()),
+        ] {
+            if bytes == 256 {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(
+                    error,
+                    SqliteError::IntentCorrupt("invalid id or payload size")
+                ));
+                assert!(!error.to_string().contains("synthetic-secret"));
+                assert!(!format!("{error:?}").contains("synthetic-secret"));
+            }
+        }
+    }
+}
+
+#[test]
+fn ambiguous_run_leases_refuse_both_process_intents_without_spending_an_id() {
+    let mut conn = database();
+    let tx = conn.transaction().unwrap();
+    let who = caller("p");
+    claim(&tx, &who);
+    // Normal claims refuse a reused run. Inject the damaged two-lease state
+    // directly so this test reaches the intent helper's ambiguity guard.
+    tx.execute_batch("INSERT INTO leases(project_id,task_id,run_id,agent_id,worker_id,epoch,lineage,state,granted_at,renewed_at,expires_at) SELECT project_id,'second',run_id,'b',worker_id,epoch,lineage,state,granted_at,renewed_at,expires_at FROM leases WHERE task_id='t'").unwrap();
+    let mut intents = Intents::new(&tx, &who);
+    for payload in [
+        IntentPayload::ProcessStart { run: "r".into() },
+        IntentPayload::ProcessStop { run: "r".into() },
+    ] {
+        assert!(matches!(
+            intents.add_intent(&payload, 0),
+            Err(SqliteError::Store(StoreError::StaleEpoch))
+        ));
+    }
+    assert!(intents.list_pending_intents(0, 10).unwrap().is_empty());
+    assert_eq!(intents.add_intent(&remove("t"), 1).unwrap().id, 1);
+    tx.commit().unwrap();
+}
+
+#[test]
+fn nonpositive_stored_ids_refuse_allocation_without_changing_rows_or_counter() {
+    for id in [0, -1] {
+        let mut conn = database();
+        let tx = conn.transaction().unwrap();
+        let who = caller("p");
+        let mut intents = Intents::new(&tx, &who);
+        intents.add_intent(&remove("t"), 0).unwrap();
+        tx.execute("UPDATE intents SET id=?1", [id]).unwrap();
+        assert!(matches!(
+            intents.add_intent(&remove("second"), 1),
+            Err(SqliteError::IntentCorrupt("nonpositive stored id"))
+        ));
+        assert_eq!(
+            tx.query_row("SELECT id FROM intents", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            id
+        );
+        assert_eq!(
+            tx.query_row(
+                "SELECT value FROM counters WHERE project_id='p' AND name='intent'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        tx.commit().unwrap();
+    }
+}
+
+#[test]
+fn missing_lineage_refuses_process_intents_with_the_sql_error_and_no_writes() {
+    let mut conn = database();
+    let tx = conn.transaction().unwrap();
+    let who = caller("p");
+    claim(&tx, &who);
+    tx.execute("DELETE FROM daemon_config WHERE key='lineage'", [])
+        .unwrap();
+    let mut intents = Intents::new(&tx, &who);
+    for payload in [
+        IntentPayload::ProcessStart { run: "r".into() },
+        IntentPayload::ProcessStop { run: "r".into() },
+    ] {
+        assert!(matches!(
+            intents.add_intent(&payload, 0),
+            Err(SqliteError::Sql(rusqlite::Error::QueryReturnedNoRows))
+        ));
+    }
+    assert!(intents.list_pending_intents(0, 10).unwrap().is_empty());
+    assert_eq!(
+        tx.query_row(
+            "SELECT count(*) FROM counters WHERE project_id='p' AND name='intent'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(intents.add_intent(&remove("t"), 1).unwrap().id, 1);
+    tx.commit().unwrap();
+}
+
+#[test]
+fn aborted_transaction_diagnostic_applies_to_every_transaction_family() {
+    assert_eq!(
+        SqliteError::TransactionAborted.to_string(),
+        "transaction cannot commit after a failed operation rollback"
+    );
 }

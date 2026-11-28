@@ -759,12 +759,23 @@ pub async fn another_project_sees_no_intent_and_changes_none(fixture: Fixture) {
     assert_eq!(mine.len(), 2);
     assert!(mine.iter().all(|i| i.done_at.is_none()));
     assert_eq!(mine[0].payload, blob(HASH));
-    // A process intent needs a lease of the caller's own project.
+    // The shared task ID has different runs in the two projects.
+    claim(s.as_ref(), P, new("t1", "a1", "r2")).await;
     claim(s.as_ref(), "other", new("t1", "a1", "r1")).await;
-    assert!(matches!(
-        add(s.as_ref(), P, stop("r1"), 1).await,
-        Err(StoreError::StaleEpoch)
-    ));
+    // Catch the refusal and commit, so a counter accidentally spent by a
+    // refused operation cannot hide behind the outer transaction rollback.
+    s.transaction(owner(P), Lane::Entities, |u| {
+        assert!(matches!(
+            u.add_intent(&stop("r1"), 1),
+            Err(StoreError::StaleEpoch)
+        ));
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(add_ok(s.as_ref(), P, remove("t1"), 2).await.id, 3);
+    assert_eq!(pending(s.as_ref(), P).await.len(), 3);
+    assert_eq!(add_ok(s.as_ref(), P, stop("r2"), 3).await.id, 4);
 }
 
 pub async fn concurrent_writers_get_distinct_gapless_ids(fixture: Fixture) {
