@@ -616,21 +616,20 @@ fn a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body() {
     // Two pre-BEGIN reads would both acquire it and leave the deadline unexpired.
     let observer = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
     observer.busy_timeout(Duration::ZERO).unwrap();
-    let reads = std::cell::Cell::new(0);
-    let clock = || {
-        reads.set(reads.get() + 1);
-        match observer.execute_batch("BEGIN IMMEDIATE") {
-            Ok(()) => {
-                observer.execute_batch("ROLLBACK").unwrap();
-                limit - Duration::from_secs(1)
-            }
-            Err(error) => {
-                assert_eq!(
-                    error.sqlite_error_code(),
-                    Some(rusqlite::ErrorCode::DatabaseBusy)
-                );
-                limit
-            }
+    let held = std::cell::RefCell::new(Vec::new());
+    let clock = || match observer.execute_batch("BEGIN IMMEDIATE") {
+        Ok(()) => {
+            held.borrow_mut().push(false);
+            observer.execute_batch("ROLLBACK").unwrap();
+            limit - Duration::from_secs(1)
+        }
+        Err(error) => {
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            held.borrow_mut().push(true);
+            limit
         }
     };
     let ran = std::cell::Cell::new(false);
@@ -642,7 +641,11 @@ fn a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body() {
         Ok(())
     });
     assert!(matches!(outcome, Err(SqliteError::Overloaded)));
-    assert_eq!(reads.get(), 2, "deadline read before and after BEGIN");
+    assert_eq!(
+        *held.borrow(),
+        [false, true],
+        "reservation before and after BEGIN"
+    );
     assert!(
         !ran.get(),
         "the body must not run after the recheck refuses it"
