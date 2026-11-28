@@ -62,7 +62,11 @@ impl ConfinedDir {
     pub fn open(root: &Path) -> Result<Self> {
         let fd = open(
             root,
-            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            OFlag::O_RDONLY
+                | OFlag::O_NONBLOCK
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC
+                | OFlag::O_NOCTTY,
             Mode::empty(),
         )
         .map_err(|e| error(root.as_os_str(), e))?;
@@ -92,7 +96,11 @@ impl ConfinedDir {
         let fd = openat(
             &self.file,
             name,
-            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            OFlag::O_RDONLY
+                | OFlag::O_NONBLOCK
+                | OFlag::O_NOFOLLOW
+                | OFlag::O_CLOEXEC
+                | OFlag::O_NOCTTY,
             Mode::empty(),
         )
         .map_err(|e| error(name, e))?;
@@ -155,7 +163,7 @@ impl ConfinedDir {
         let fd = openat(
             &self.file,
             name,
-            mode | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK,
+            mode | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC | OFlag::O_NONBLOCK | OFlag::O_NOCTTY,
             Mode::empty(),
         )
         .map_err(|e| error(name, e))?;
