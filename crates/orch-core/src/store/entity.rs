@@ -75,6 +75,38 @@ pub enum Entity {
 }
 
 impl Entity {
+    /// Refuse caller values outside the shared entity representation contract.
+    /// This checks input only; persisted-data decoding has a distinct error path.
+    pub fn validate_storage_input(&self) -> super::Result<()> {
+        if let Self::Task(task) = self {
+            for key in [
+                Some(task.id.as_str()),
+                task.assignee.as_deref(),
+                task.goal_id.as_deref(),
+                Some(task.created_at.as_str()),
+                Some(task.updated_at.as_str()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if key.len() > 65_536 {
+                    return Err(super::StoreError::Unrepresentable);
+                }
+            }
+            for text in [&task.created_at, &task.updated_at] {
+                // Reuse the core clock codec: round-trip equality rejects rolled
+                // dates and alternate spellings; 24 bytes bounds years to 0000..9999.
+                let valid = text.len() == 24
+                    && crate::clock::epoch_ms_from_iso(text)
+                        .is_some_and(|ms| crate::clock::iso_from_epoch_ms(ms) == *text);
+                if !valid {
+                    return Err(super::StoreError::Unrepresentable);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn kind(&self) -> EntityKind {
         match self {
             Self::Task(_) => EntityKind::Task,
@@ -111,4 +143,96 @@ pub struct Record {
     pub entity: Entity,
     pub revision: Revision,
     pub position: u64,
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod permanent_input_tests {
+    use super::*;
+    use crate::store::{Caller, Principal, StoreError};
+    use crate::test_support::make_task;
+
+    #[test]
+    fn task_keys_and_canonical_timestamps_have_exact_boundaries() {
+        let mut task = make_task();
+        task.created_at = "2026-01-01T00:00:00.000Z".into();
+        task.updated_at = task.created_at.clone();
+        task.id = "é".repeat(32768);
+        task.assignee = Some("a".repeat(65536));
+        task.goal_id = Some("g".repeat(65536));
+        let valid = Entity::Task(Box::new(task.clone()));
+        valid.validate_storage_input().unwrap();
+        for field in ["id", "assignee", "goal"] {
+            let mut refused = task.clone();
+            match field {
+                "id" => refused.id.push('a'),
+                "assignee" => refused.assignee.as_mut().unwrap().push('a'),
+                _ => refused.goal_id.as_mut().unwrap().push('a'),
+            }
+            assert!(matches!(
+                Entity::Task(Box::new(refused)).validate_storage_input(),
+                Err(StoreError::Unrepresentable)
+            ));
+        }
+        for time in [
+            "0000-01-01T00:00:00.000Z",
+            "9999-12-31T23:59:59.999Z",
+            "2024-02-29T00:00:00.000Z",
+        ] {
+            task.created_at = time.into();
+            Entity::Task(Box::new(task.clone()))
+                .validate_storage_input()
+                .unwrap();
+        }
+        for time in [
+            "2026-02-30T00:00:00.000Z",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00.000+00:00",
+            "+002026-01-01T00:00:00.000Z",
+            "secret",
+        ] {
+            task.created_at = time.into();
+            let error = Entity::Task(Box::new(task.clone()))
+                .validate_storage_input()
+                .unwrap_err();
+            assert!(matches!(error, StoreError::Unrepresentable));
+            assert_eq!(error.to_string(), "input cannot be represented by storage");
+            assert_eq!(format!("{error:?}"), "Unrepresentable");
+        }
+    }
+
+    #[test]
+    fn context_provenance_bounds_only_persisted_identity_and_run() {
+        let mut caller = Caller {
+            project: "p".into(),
+            principal: Principal::Task {
+                identity: "i".repeat(65536),
+                task: "t".repeat(65537),
+                run: "r".repeat(65536),
+                lineage: "l".into(),
+                epoch: 1,
+            },
+        };
+        caller.validate_context_provenance().unwrap();
+        if let Principal::Task { run, .. } = &mut caller.principal {
+            run.push('r');
+        }
+        assert!(matches!(
+            caller.validate_context_provenance(),
+            Err(StoreError::Unrepresentable)
+        ));
+        for principal in [
+            Principal::Owner {
+                identity: "i".repeat(65537),
+            },
+            Principal::Worker {
+                identity: "i".repeat(65537),
+            },
+        ] {
+            caller.principal = principal;
+            assert!(matches!(
+                caller.validate_context_provenance(),
+                Err(StoreError::Unrepresentable)
+            ));
+        }
+    }
 }
