@@ -322,10 +322,7 @@ impl<'a, 'conn> EntityWrite<'a, 'conn> {
                 Ok(()) => Err(operation),
                 Err(rollback) => {
                     self.poisoned = true;
-                    Err(SqliteError::OperationRollback {
-                        operation: Box::new(operation),
-                        rollback,
-                    })
+                    crate::sqlite::writer::contain::cleanup_failed(operation, rollback)
                 }
             },
         };

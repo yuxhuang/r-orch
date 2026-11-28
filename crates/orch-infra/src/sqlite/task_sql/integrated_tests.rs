@@ -441,7 +441,7 @@ fn transient_real_object_access_can_be_caught_then_writer_recovers() {
 }
 
 #[test]
-fn caught_task_savepoint_rollback_failure_aborts_outer_request_without_latching() {
+fn deliberately_swallowed_task_cleanup_unwind_still_refuses_commit() {
     scenario(|data, handle, state, disk| {
         seed(handle, disk, state, false);
         let disk2 = disk.clone();
@@ -452,9 +452,10 @@ fn caught_task_savepoint_rollback_failure_aborts_outer_request_without_latching(
                 TaskWrite::new(sql(tx, &disk2, &state2, FailureSource::Writer), &caller);
             write.create(task("before"))?;
             tx.execute_batch("CREATE TEMP TRIGGER end_outer BEFORE DELETE ON task_details BEGIN SELECT RAISE(ROLLBACK,'injected'); END;")?;
+            let unwind = super::write_tests::cleanup_unwind(|| write.delete("a", Revision::ONE));
             assert!(matches!(
-                write.delete("a", Revision::ONE),
-                Err(SqliteError::OperationRollback { .. })
+                unwind.error(),
+                SqliteError::OperationRollback { .. }
             ));
             assert!(tx.is_autocommit());
             assert!(matches!(

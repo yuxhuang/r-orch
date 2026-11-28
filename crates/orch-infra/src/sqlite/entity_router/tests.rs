@@ -646,7 +646,13 @@ fn assert_poisoned_mutations(trigger: &str, poison: Payload) {
         unit.create(payload(family, "kept", "before")).unwrap();
     }
     tx.execute_batch(trigger).unwrap();
-    if matches!(
+    if matches!(poison, Payload::Task(_)) {
+        let unwind = task_cleanup_unwind(&state, || unit.create(poison));
+        assert!(matches!(
+            unwind.error(),
+            SqliteError::OperationRollback { .. }
+        ));
+    } else if matches!(
         &poison,
         Payload::Agent(_) | Payload::Team(_) | Payload::Run(_)
     ) {
@@ -895,6 +901,52 @@ fn caught_task_move_hydration_failure_preserves_rows_and_counter() {
     .unwrap();
 }
 
+// Catch directly so containment's abort guard cannot mask a missing router poison flag.
+#[test]
+fn directly_swallowed_task_move_cleanup_unwind_preserves_router_poison() {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
+    let (_temp, data) = crate::sqlite::test_data();
+    setup(&data);
+    let disk = DiskBlobStore::open(data.root()).unwrap();
+    let mut conn = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    conn.for_migration()
+        .authorizer(Some(|ctx: AuthContext<'_>| match ctx.action {
+            AuthAction::Savepoint {
+                savepoint_name: "entity_task_move",
+                operation: TransactionOperation::Release | TransactionOperation::Rollback,
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }))
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    let caller = owner("p");
+    let state = FailureState::new();
+    let mut unit = EntityWrite::new(&tx, &caller, &disk, state.clone(), 0);
+    for family in FAMILIES {
+        unit.create(payload(family, "kept", "before")).unwrap();
+    }
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        unit.move_to_end(Family::Task, "kept", Revision::ONE)
+    }))
+    .expect_err("cleanup must unwind")
+    .downcast::<crate::sqlite::writer::contain::CleanupUnwind>()
+    .expect("typed cleanup unwind");
+    assert!(matches!(
+        unwind.error(),
+        SqliteError::OperationRollback { .. }
+    ));
+    assert!(!tx.is_autocommit());
+    assert!(state.failure().is_none());
+    assert!(state.transaction_must_abort().is_none());
+    assert!(matches!(
+        unit.ensure_committable(),
+        Err(SqliteError::TransactionAborted)
+    ));
+    assert_mutations_refused(&mut unit);
+    drop(unit);
+    tx.rollback().unwrap();
+}
+
 #[test]
 fn task_move_cleanup_poison_refuses_all_reads_and_mutations() {
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
@@ -918,11 +970,14 @@ fn task_move_cleanup_poison_refuses_all_reads_and_mutations() {
     for family in FAMILIES {
         unit.create(payload(family, "kept", "before")).unwrap();
     }
-    let error = unit
-        .move_to_end(Family::Task, "kept", Revision::ONE)
-        .unwrap_err();
-    assert!(matches!(error, SqliteError::OperationRollback { .. }));
-    assert!(crate::sqlite::writer::failure::classify(&error).savepoint_rollback_failed());
+    let unwind = task_cleanup_unwind(&state, || {
+        unit.move_to_end(Family::Task, "kept", Revision::ONE)
+    });
+    assert!(matches!(
+        unwind.error(),
+        SqliteError::OperationRollback { .. }
+    ));
+    assert!(crate::sqlite::writer::failure::classify(unwind.error()).savepoint_rollback_failed());
     assert!(!tx.is_autocommit());
     assert!(state.failure().is_none());
     assert!(
@@ -969,10 +1024,10 @@ fn task_move_cleanup_poison_refuses_all_reads_and_mutations() {
     tx.rollback().unwrap();
 }
 
-// #367: the callback catches the error, so only observation can arm the
-// executor's abort guard before it considers committing an apparently Ok job.
+// #367: deliberately swallow the typed unwind in this guard-only test.
+// Containment must observe it before the executor sees an apparently Ok job.
 #[test]
-fn caught_router_cleanup_failure_arms_real_writer_before_public_conversion() {
+fn deliberately_swallowed_router_cleanup_unwind_arms_real_writer_guard() {
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization, TransactionOperation};
     // Fail only the router's savepoint cleanup. The Task leaf succeeds, and
     // the transaction stays open, so its guards cannot mask a missing observer.
@@ -996,10 +1051,13 @@ fn caught_router_cleanup_failure_arms_real_writer_before_public_conversion() {
                 let caller = owner("p");
                 let mut unit = EntityWrite::new(tx, &caller, &blobs, state.clone(), 0);
                 unit.create(payload(Family::Task, "t", "before"))?;
-                let error = unit
-                    .move_to_end(Family::Task, "t", Revision::ONE)
-                    .unwrap_err();
-                assert!(matches!(error, SqliteError::OperationRollback { .. }));
+                let unwind = task_cleanup_unwind(&state, || {
+                    unit.move_to_end(Family::Task, "t", Revision::ONE)
+                });
+                assert!(matches!(
+                    unwind.error(),
+                    SqliteError::OperationRollback { .. }
+                ));
                 assert!(
                     !tx.is_autocommit(),
                     "router failure must leave an active transaction"
@@ -1029,4 +1087,19 @@ fn caught_router_cleanup_failure_arms_real_writer_before_public_conversion() {
             submit(handle, |_| Ok(())).unwrap();
         },
     );
+}
+
+// Defensive poison tests deliberately swallow the unwind; real Storage re-raises it.
+fn task_cleanup_unwind<T>(
+    state: &FailureState,
+    work: impl FnOnce() -> Result<T>,
+) -> Box<crate::sqlite::writer::contain::CleanupUnwind> {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::sqlite::writer::contain::contain(state, work)
+    }))
+    .err()
+    .expect("cleanup must unwind");
+    payload
+        .downcast::<crate::sqlite::writer::contain::CleanupUnwind>()
+        .expect("typed cleanup unwind")
 }

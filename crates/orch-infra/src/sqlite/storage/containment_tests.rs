@@ -1062,3 +1062,6 @@ async fn atr_successful_cleanup_returns_error_and_keeps_writer_usable() {
     drop(read);
     storage.close().await.unwrap();
 }
+
+#[path = "task_cleanup_tests.rs"]
+mod task_cleanup_tests;
