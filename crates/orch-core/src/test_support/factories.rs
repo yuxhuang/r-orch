@@ -14,7 +14,7 @@ use orch_domain::{
 };
 
 /// The timestamp the task and run factories hard-code.
-pub const FACTORY_TIMESTAMP: &str = "2025-01-01T00:00:00Z";
+pub const FACTORY_TIMESTAMP: &str = "2025-01-01T00:00:00.000Z";
 
 pub fn make_task() -> Task {
     Task {
@@ -114,8 +114,8 @@ mod tests {
         assert_eq!(task.priority, 3);
         assert!(task.labels.is_empty());
         assert!(task.depends_on.is_empty());
-        assert_eq!(task.created_at, "2025-01-01T00:00:00Z");
-        assert_eq!(task.updated_at, "2025-01-01T00:00:00Z");
+        assert_eq!(task.created_at, "2025-01-01T00:00:00.000Z");
+        assert_eq!(task.updated_at, "2025-01-01T00:00:00.000Z");
         assert_eq!(task.attempts, 0);
         assert_eq!(task.max_attempts, 3);
         // Everything optional is unset, so the serialized shape is minimal.
@@ -146,7 +146,7 @@ mod tests {
         assert_eq!(run.agent_id, "agt_test1");
         assert_eq!(run.attempt, 1);
         assert_eq!(run.status, RunStatus::Preparing);
-        assert_eq!(run.started_at, "2025-01-01T00:00:00Z");
+        assert_eq!(run.started_at, "2025-01-01T00:00:00.000Z");
         assert_eq!(run.workspace_path, "/tmp/ws");
         assert_eq!(run.prompt, "do stuff");
         assert_eq!(run.pid, None);

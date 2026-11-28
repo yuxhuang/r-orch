@@ -1,5 +1,5 @@
 //! Issue 441: caller representability is a typed, content-free refusal on every port.
-//! Synthetic fixtures only. SQLite failures remain active until its public mapping is wired.
+//! Synthetic fixtures only. Provenance checks do not grant caller authority.
 use orch_core::storage::ContextEntry;
 use orch_core::store::{
     Caller, Entity, EntityKind, Lane, Principal, Record, Storage, StorageExt, StoreError,
@@ -48,6 +48,8 @@ enum Adapter {
     Sqlite,
 }
 
+type Provenance = (String, Option<String>, Option<String>, Option<String>);
+
 struct Fixture {
     root: tempfile::TempDir,
     data: Option<Arc<DataDir>>,
@@ -86,6 +88,16 @@ impl Fixture {
             storage,
             adapter,
         }
+    }
+
+    fn provenance(&self) -> Option<Provenance> {
+        let data = self.data.as_ref()?;
+        let conn = open_connection(data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
+        Some(conn.query_row(
+            "SELECT set_by_kind,set_by_identity,set_by_agent_id,set_by_run_id FROM context_entries WHERE project_id='p' AND key='context'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        ).unwrap())
     }
 
     async fn get(&self, kind: EntityKind, id: &str) -> Option<Record> {
@@ -283,7 +295,6 @@ async fn rollback(adapter: Adapter) {
 }
 
 async fn context_provenance(adapter: Adapter, worker: bool) {
-    let fixture = Fixture::new(adapter);
     let mut caller = owner();
     caller.principal = if worker {
         Principal::Worker {
@@ -294,6 +305,25 @@ async fn context_provenance(adapter: Adapter, worker: bool) {
             identity: "é".repeat(32_768),
         }
     };
+    context_provenance_for(adapter, caller, false).await;
+}
+
+async fn task_context_provenance(adapter: Adapter, bound_run: bool) {
+    let caller = Caller {
+        project: "p".into(),
+        principal: Principal::Task {
+            identity: "é".repeat(32_768),
+            task: "task-binding".into(),
+            run: "é".repeat(32_768),
+            lineage: "synthetic-lineage".into(),
+            epoch: 1,
+        },
+    };
+    context_provenance_for(adapter, caller, bound_run).await;
+}
+
+async fn context_provenance_for(adapter: Adapter, mut caller: Caller, bound_run: bool) {
+    let fixture = Fixture::new(adapter);
     fixture
         .storage
         .transaction(caller.clone(), Lane::Entities, |unit| {
@@ -301,9 +331,24 @@ async fn context_provenance(adapter: Adapter, worker: bool) {
         })
         .await
         .unwrap();
+    let provenance = fixture.provenance();
+    if let Some(actual) = &provenance {
+        let (kind, identity, run) = match &caller.principal {
+            Principal::Owner { identity } => ("owner", identity, None),
+            Principal::Worker { identity } => ("worker", identity, None),
+            Principal::Task { identity, run, .. } => ("task", identity, Some(run.clone())),
+        };
+        assert_eq!(actual, &(kind.into(), Some(identity.clone()), None, run));
+    }
     match &mut caller.principal {
         Principal::Owner { identity } | Principal::Worker { identity } => identity.push('x'),
-        Principal::Task { .. } => unreachable!(),
+        Principal::Task { identity, run, .. } => {
+            if bound_run {
+                run.push('x');
+            } else {
+                identity.push('x');
+            }
+        }
     }
     let before = fixture.get(EntityKind::Context, "context").await.unwrap();
     let error = fixture
@@ -339,6 +384,7 @@ async fn context_provenance(adapter: Adapter, worker: bool) {
         fixture.get(EntityKind::Context, "context").await,
         Some(updated)
     );
+    assert_eq!(fixture.provenance(), provenance);
     refusal(error);
 }
 
@@ -450,6 +496,14 @@ macro_rules! matrix {
             #[tokio::test]
             async fn worker_context_creation_bounds_provenance_and_update_preserves_it() {
                 context_provenance($adapter, true).await;
+            }
+            #[tokio::test]
+            async fn task_context_creation_bounds_identity_and_update_preserves_it() {
+                task_context_provenance($adapter, false).await;
+            }
+            #[tokio::test]
+            async fn task_context_creation_bounds_run_and_update_preserves_it() {
+                task_context_provenance($adapter, true).await;
             }
         }
     };

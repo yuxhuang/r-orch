@@ -27,8 +27,8 @@ fn request() -> ClaimRequest {
 fn task(id: &str) -> Task {
     serde_json::from_value(serde_json::json!({
         "id": id, "title": "Synthetic claim", "description": "", "status": "todo",
-        "priority": 2, "labels": [], "depends_on": [], "created_at": "old",
-        "updated_at": "old", "attempts": 0, "max_attempts": 3
+        "priority": 2, "labels": [], "depends_on": [], "created_at": "1970-01-01T00:00:00.000Z",
+        "updated_at": "1970-01-01T00:00:00.000Z", "attempts": 0, "max_attempts": 3
     }))
     .expect("synthetic task")
 }
@@ -90,7 +90,7 @@ async fn success(storage: &dyn Storage) {
     assert_eq!(task_data.status, TaskStatus::InProgress);
     assert_eq!(task_data.attempts, 1);
     assert_eq!(task_data.updated_at, "1970-01-01T00:00:01.234Z");
-    assert_eq!(task_data.created_at, "old");
+    assert_eq!(task_data.created_at, "1970-01-01T00:00:00.000Z");
     assert_eq!(task_data.assignee.as_deref(), Some(lease.agent.as_str()));
     assert_eq!(task.revision.get(), 2);
     let Entity::Run(run_data) = &run.entity else {
@@ -477,8 +477,8 @@ fn old_run() -> Run {
         agent_id: "agent-selected".into(),
         attempt: 3,
         status: RunStatus::Failed,
-        started_at: "old".into(),
-        finished_at: Some("old".into()),
+        started_at: "1970-01-01T00:00:00.000Z".into(),
+        finished_at: Some("1970-01-01T00:00:00.000Z".into()),
         workspace_path: String::new(),
         prompt: String::new(),
         pid: None,
@@ -544,7 +544,7 @@ async fn rerun_success(storage: &dyn Storage, status: TaskStatus, attempts: u32)
     );
     assert_eq!(task_data.max_attempts, 3);
     assert_eq!(task_data.updated_at, "1970-01-01T00:00:01.234Z");
-    assert_eq!(task_data.created_at, "old");
+    assert_eq!(task_data.created_at, "1970-01-01T00:00:00.000Z");
     assert_eq!(task_data.feedback.as_deref(), Some("synthetic feedback"));
     assert_eq!(task_data.assignee.as_deref(), Some("agent-selected"));
     assert_eq!(task.revision, revision.next().unwrap());
@@ -954,7 +954,7 @@ async fn due_success(storage: &dyn Storage) {
         "the budget is kept and one more is spent, not reset"
     );
     assert_eq!(task_data.updated_at, "1970-01-01T00:00:01.234Z");
-    assert_eq!(task_data.created_at, "old");
+    assert_eq!(task_data.created_at, "1970-01-01T00:00:00.000Z");
     assert_eq!(task_data.feedback.as_deref(), Some("synthetic feedback"));
     assert_eq!(task_data.assignee.as_deref(), Some("agent-selected"));
     assert_eq!(task.revision, revision.next().unwrap());
