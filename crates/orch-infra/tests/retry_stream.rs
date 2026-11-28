@@ -817,9 +817,12 @@ async fn all_adapters_limit_1000_large_inline_bounded_resource_recovery() {
         }
         assert_eq!((accepted, total), (1001, 1001 * 65_536));
         assert_eq!(trace.limits[0], 1000);
-        assert!(trace.limits.len() <= 20, "finite recovery and traversal");
-        if kind == "sqlite" {
-            assert!(trace.limits.starts_with(&[1000, 500, 250, 125]));
+        // Retaining the reduced limit bounds the complete traversal by at
+        // most 1001 nonempty pages plus nine failed reductions. Admission may
+        // improve in any adapter without changing this recovery contract.
+        assert!(trace.limits.len() <= 1010, "finite recovery and traversal");
+        for limits in trace.limits.windows(2) {
+            assert!(limits[1] == limits[0] || limits[1] == (limits[0] / 2).max(1));
         }
         eprintln!(
             "{kind}: limit1000 traversal rows={accepted} bytes={total} limits={:?}",

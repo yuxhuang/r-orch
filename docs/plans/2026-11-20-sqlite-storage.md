@@ -524,7 +524,7 @@ signature changed. Every piece below is written. Where the table says "unit", th
 | The disk-fault observation: `DiskBlobStore` records the kind of a native I/O error at its open, length lookup and window reads in a crate-private variant of its bounded read (a `NotFound` is not recorded, it stays `Corrupt`); the SQLite adapter wraps the disk store for one row's objects, forwards a recorded kind as an outer I/O error, and leaves a sink's error alone | `crates/orch-infra/src/blob/store.rs` (`read_windowed_observed`, a `cfg(test)` one-shot fault `fail_next_stream_read`), `.../sqlite/retry_message/retries.rs` (`ObservedRetryDisk`, `bounded_retry_page`) | Unit, `sqlite::storage::ports::retry_stream_io_tests::object_io_retires_the_snapshot_but_sink_io_is_only_its_own_error` (below) |
 | The file reference: confined descriptor-length preflight of every selected object with no payload read, repeated occurrences counted, reopen and recheck at stream time, `RetryTextRead` on its session | `crates/orch-infra/src/storage/v2/{retries,text}.rs`, `.../storage/v2.rs` | Unit, `storage::v2::retries::stream_preflight_tests::file_page_preflight_reads_no_payload_and_stream_rechecks_metadata_and_same_length_substitution` (defect 0: a last reference that fails preflight, zero payload reads and zero `begin`; defects 1 and 2: an object replaced after the preflight by one of the same length and by a shorter one, failing in the stream); public matrix |
 | The memory fake in its logical and disk-backed forms (recorded chunk sizes, one counter per `FakeStorage`) | `crates/orch-core/src/store/{fake,retries/fake}.rs` | Unit, `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read`; public matrix |
-| The three-adapter public-port matrix, four registrations: `memory`, `backed` (the disk-backed fake), `file`, `sqlite` | `crates/orch-infra/tests/retry_stream.rs` | 10 tests (below) |
+| The three-adapter public-port matrix, four registrations: `memory`, `backed` (the disk-backed fake), `file`, `sqlite` | `crates/orch-infra/tests/retry_stream.rs` | 12 tests (below): 10 on the PR 551 head and the two of #554 |
 | A production caller | the T12 engine | Not authorized. The first read is released only by the trigger below |
 
 **Evidence for the first production read.** Each row is Linux, from the task checkout that built the head named above, and
@@ -544,6 +544,8 @@ counter per adapter, and a parser charge of eight times the encoded document plu
 | SQLite preflights every selected JSON document before any callback, keeps the lookahead row opaque, and accepts what the existing decoder accepts (optional null members) | `sqlite_preflights_selected_json_before_any_callback_and_keeps_lookahead_opaque`; `sqlite_stream_preserves_existing_decoder_acceptance_of_optional_null_members`; the fallible-reader oracle |
 | A valid object whose whole-value hash differs from the stored one (SQLite), and an object whose own hash is right but whose bytes are not UTF-8 (SQLite and the file reference), each end the stream with `Corrupt`, and the whole-value reader refuses the same row | `valid_objects_still_require_the_whole_hash_and_utf8_to_verify` (three defects; test-only commit `761aa2da2`) |
 | A native disk fault on a stored object during the SQLite stream is observed by the snapshot, as the same fault is in the whole-value reads: the call fails with `Store`, that snapshot is retired, a second call on it fails, a fresh snapshot reads the page after the one-shot fault has cleared, and a sink that fails with the same `Store(Backend)` class retires nothing (the next read on its snapshot succeeds and the admission counter is zero at the end) | `sqlite::storage::ports::retry_stream_io_tests::object_io_retires_the_snapshot_but_sink_io_is_only_its_own_error` (the row holds a 65,537-byte text, so one blob object). What it asserts and what it does not: see "Disk-fault observation" below |
+| Recovery from `Resource` (issue 554): 1,001 inline rows of 65,536 bytes read by a test-side halving loop to a full traversal on all four registrations (SQLite refuses 1,000, 500, 250 and serves 125; the others serve 1,000), with task, attempt, due time and declared bytes asserted on every row | `all_adapters_limit_1000_large_inline_bounded_resource_recovery` |
+| A sink `Resource` after bytes were delivered discards the failed page and the retry at the halved limit (8 then 4) returns from the unchanged cursor; a `Resource` at every attempt stops at limit 1 after 1,000, 500, 250, 125, 62, 31, 15, 7, 3, 1; a healthy read at limit 1 then resumes from the same cursor and snapshot | `all_adapters_resource_recovery_discards_provisional_page_and_stops_at_one` |
 | The whole-value reads are unchanged | `storage::v2::tests::retry_*` (12), `sqlite::retry_message` (76, which includes the message tests) |
 
 **Commands that select what exists, and the counts to expect** (Linux, a private checkout, the default Cargo target; a
@@ -551,7 +553,7 @@ selection that matches zero tests, or ignores one, fails the check):
 
 | Command | Expect |
 |---|---|
-| `cargo test -p orch-infra --test retry_stream` | 10 passed, 0 failed |
+| `cargo test -p orch-infra --test retry_stream` | 12 passed, 0 failed (10 on the PR 551 head; the two of #554 are in the producer follow-up) |
 | `cargo test -p orch-infra --lib -- sqlite::retry_message` | 76 passed, 0 failed |
 | `cargo test -p orch-infra --lib -- storage::v2::tests::retry_` | 12 passed, 0 failed |
 | `cargo test -p orch-core --features test-support --lib -- store::retries` | 5 passed, 0 failed |
@@ -627,6 +629,39 @@ fake have no reader to retire and are not changed.
   privileged user, and the first snapshot after the 1,200-row write isolated from the retention assertions.
 - [#546](https://github.com/yuxhuang/r-orch/issues/546): the error returned for a serialized retry manifest over the 4 MiB
   write cap stays as it is, with R97's whole-diagnostic recovery; its disposition is the controller's.
+- [#554](https://github.com/yuxhuang/r-orch/issues/554) (the code review's I1, accepted): SQLite refuses a page of 1,000
+  inline rows of 65,536 bytes that the file reference serves. The admission is kept by this follow-up (the controller's
+  acceptance of that is still pending); the contract for the consumer is the spec's "Recovering from `Resource`" and ADR 0020
+  decision 9. The public proof exists; the consumer's policy does not:
+  1. *The public proof, written and run by the producer* (12 passed, 0 failed on the producer's checkout, and again after four
+     mutations were restored; not yet on the final single commit). Two tests in the matrix
+     `crates/orch-infra/tests/retry_stream.rs`, each on the four registrations (`memory`, `backed`, `file`, `sqlite`), with a
+     test-side loop that stands for the consumer:
+     - `all_adapters_limit_1000_large_inline_bounded_resource_recovery` seeds **1,001** inline rows of 65,536 bytes (the
+       extra row forces a cursor even where limit 1,000 is admitted), 65,601,536 bytes in all, and shows a successful full
+       traversal by bounded reduction: every row once, in order, with every byte verified, the exact cursor, and the
+       counter at zero after each call. It does not assert that the first attempt at 1,000 succeeds or fails. Measured:
+       `memory`, `backed` and `file` call at 1,000 and 1,000; SQLite calls at 1,000, 500, 250 and then at 125 nine times,
+       so limit 125 is **measured served** (the reviewer's probe had not tried it).
+     - `all_adapters_resource_recovery_discards_provisional_page_and_stops_at_one` injects a `Resource` from the sink
+       *after* bytes were delivered (not an injected buffer allocation, and not a held-full counter), and shows that the
+       failed output is discarded, that the retry at 8 then 4 returns from the unchanged nonempty cursor, that a `Resource`
+       at every attempt stops at limit 1 after 1,000, 500, 250, 125, 62, 31, 15, 7, 3, 1 on all four, and that a healthy read
+       at limit 1 then resumes from the same cursor and snapshot.
+  2. *The consumer's policy and proof, still owed*, implemented in the T12 consumer before its first read: `Resource` alone
+     permits `floor(limit / 2)` on the same snapshot and cursor with a fresh provisional sink, the whole failed page is
+     discarded, `Resource` at a limit of 1 is terminal, nothing waits, reopens or resets, and nothing advances or acts
+     before `Ok`. The consumer's own tests must show it on its code; the producer's tests do not stand in for them.
+  Adjacent ordinary items, kept apart from #554. [#555](https://github.com/yuxhuang/r-orch/issues/555): the same test now
+  asserts task, attempt (1 to 7), due time (with ties) and declared bytes of every row on all four registrations, and two
+  mutants of the SQLite adapter (declared bytes forced to 0, attempt forced to 0) fail it at the matching assertion; its
+  independent review and landing are pending. [#556](https://github.com/yuxhuang/r-orch/issues/556) is a separate T12
+  obligation and is **not** complete: a SQLite registration whose size disagrees, and a file reference's short non-final chunk,
+  must each return `Corrupt` before any `begin` callback, with their mutants killed; the next retry-fixture change or an
+  explicit controller disposition supplies it. The two recovery mutants (the retry returning `Resource` without reducing, and a
+  next provisional sink whose first index is reset to 0) also fail the named tests.
+  No code, stored data or admission charge changes with this, and #554 stays open until the consumer's implementation and the
+  controller's acceptance of the consumer evidence. It does not activate the first production read.
 
 **Why this change cannot be split.** The core, the leaf and the integration commits add about 3,160 lines of code and
 tests (832 in the leaf and core, 2,327 in the integration, 596 of them the public matrix). `ReadSnapshot` now requires
@@ -639,7 +674,7 @@ retry stream and its snapshot port, which the stream already edits.
 **Release of the first production read.** It needs all of: the accepted trait and adapter commit is part of the candidate
 that carries the consuming call; that call has passed an independent code review and the security review its surface
 requires; the evidence above, with its actual limits and the commit, is recorded; and the controller has the two
-deferred proofs. The consumer's sink is bounded by the same admission counter or spools provisional bytes and discards
+deferred proofs and has accepted the consumer's own `Resource` recovery policy of #554 with its proof (item 2 of the #554 entry above; the producer's public proof is item 1). The consumer's sink is bounded by the same admission counter or spools provisional bytes and discards
 them on failure; neither the consumer nor any adapter collects an unbounded string or acts on an unverified prefix. The
 security reasoning and evidence stay private. The other #449 items keep their own triggers.
 
@@ -2015,7 +2050,7 @@ this is no mutation matrix.
 | #512 (medium, flaky) | the next retry-conformance change, or a recurrence | one hosted `overloaded` on the first snapshot after the 1,200-row write, before any retention assertion; the cause is unknown and the same-head rerun passed. Keep the row-retention assertions and the production admission deadline |
 | #390 (open) | the next change to `non_task_cursor/tests.rs` | its comment that describes the Run sort as `name` |
 | #441, #465 | #441: T12 before its first Task write or retry classification (the ordinary public input is the change of "Permanent input refusal (issue 441)"; the identity of a claimed Run stays open with T12's claim-allocation lifecycle task). #465: T16 before the first production caller of the generic `reconcile` | #441: the release event of that section (an accepted producer commit in the consumer's base, the three-adapter public matrix on it, and the review and merge dispositions), and for the claimed Run the lifecycle proof on all three adapters before first use. #465: the guard of issue 465 |
-| Bounded retry text read (ADR 0020 decision 9) | T12's first production diagnostic read | the accepted trait and adapter commit in the candidate, the consuming call's independent code and applicable security review, the private Linux evidence of "Bounded retry text read" with its actual limits, and the controller's proofs of #511 and #512 |
+| Bounded retry text read (ADR 0020 decision 9) | T12's first production diagnostic read | the accepted trait and adapter commit in the candidate, the consuming call's independent code and applicable security review, the private Linux evidence of "Bounded retry text read" with its actual limits, the controller's proofs of #511 and #512, and the `Resource` recovery policy of #554 in the consumer with the consumer's own proof (the producer's public proof is in the matrix) |
 | #436 (draft #437), #422 | T16's wiring or the next writer accounting change | the success-path refund guard and the known-error boundaries |
 | #203, #223 | T17 (`commit_seq`); T13 and T24 | their own issue text |
 | #99, #126, #209, #252, #265, #273, #308, #322, #391, #457, #498 | T12, T13, T15, T16, T17, T18, T19, T21 to T24 and T26, as the adjudication of the whole review assigned them | each at its own milestone |
