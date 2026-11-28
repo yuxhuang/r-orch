@@ -147,7 +147,7 @@ separate slices. The v1 runtime stays active.
 |---|---|---|---|---|---|---|
 | T8 | Port v2 in `orch-core`, its fakes, and the v2 file adapter; the suite extended to all of port v2, with the rule that no two task ids of a project differ only in case, kept by the file adapter's own comparison | R7 to R15, R17, R97, R117 (the port and the file adapter), R132 (the caller's lineage in the port) | `crates/orch-core/src/store*`, `crates/orch-infra/src/storage/v2*`, the suite | T7 | Suite (file adapter) | 7 |
 | T9 | Data directory, its lock, the 1.0 owner lock, the network-filesystem check; the confined-directory module and the project record named by hash; schema, migrations, connection settings; the unique index on `tasks` over the project and the id without regard to ASCII case | R18, R19, R21 to R23, R29 to R33, R77 (the lineage column and row), R102, R107 (the record), R117 (the index), R124 (the copy before a migration), R126 (the writer's settings, the sync settings read back on every connection that can write) | `crates/orch-infra/src/sqlite/`, `crates/orch-infra/src/data_dir/`, the workspace `Cargo.toml` and `Cargo.lock` and `crates/orch-infra/Cargo.toml` (`rusqlite` and `rusqlite_migration` exactly as ADR 0017 decision 19 names them, all five features of `rusqlite` at once, with the versions and advisories checked again; the `fs` and `dir` features of `nix`), `crates/orch-infra/tests/confined_dir.rs`, `crates/orch-daemon/tests/daemon_data_dir.rs`, `.cargo/config.toml` | T7 | `cargo test -p orch-infra --test sqlite_schema --test sqlite_migrations --test sqlite_connection --test confined_dir`; `cargo test -p orch-daemon --test daemon_data_dir --test daemon_legacy_lock` | 8 |
-| T10 | SQLite adapter of port v2: the writer with lanes, the read pool, intents | R7 to R15, R24 to R28, R98, R126 (the backlog kept from the commit callback and the checkpoint's result), R127, R128 (with the failed top-level rollback), R130 (the query connection and its authorizer), R137 (the outcome of a checkpoint call), R140 (a failure on any connection), R97 (SQLite row hash and blob bytes) | `crates/orch-infra/src/sqlite/` | T8, T9 | Suite (SQLite); `cargo test -p orch-infra --test sqlite_writer --test sqlite_crash` | 9 |
+| T10 | SQLite adapter of port v2: the writer with lanes, the read pool, intents | R7 to R15, R24 to R28, R98, R126 (the backlog kept from the commit callback and the checkpoint's result), R127, R128 (with the failed top-level rollback), R130 (the query connection and its authorizer), R137 (the outcome of a checkpoint call), R140 (a failure on any connection), R97 (SQLite row hash and blob bytes) | `crates/orch-infra/src/sqlite/` | T8, T9 | Suite (SQLite): `cargo test -p orch-engine --test storage_conformance -- sqlite_` (the eight registrations, 133 cases; require 135 passed, 0 failed, 0 ignored); the writer, pool and storage library tests, `cargo test -p orch-infra --lib -- sqlite::writer:: sqlite::read_pool:: sqlite::storage::` (require a nonzero count, 0 failed, 0 ignored); the integration targets `sqlite_connection`, `sqlite_crash`, `sqlite_storage_crash`, `sqlite_public_writer` and `sqlite_writer_policy`, each `cargo test -p orch-infra --test <target>` (a crash target's one `ignored` test is its private child process, which the other cases run). Counts at `56ecd762e` are in "T10 verification selections" below | 9 |
 | T11 | Blob store on disk, on the confined-directory module: a blob is reached only by a parsed hash; prompts by hash; attachments as blobs | R58, R59, R101, R102 (blobs) | `crates/orch-core/src/store/blob.rs`, `crates/orch-infra/src/blob/` | T9 | `cargo test -p orch-infra --test blob_store` | 10 |
 | T12 | Engine on port v2, part 1: claims, leases, retries, start and finish a run; the workspace found by task id and the branch by its derived name, never by a stored path; workspace ownership: a directory is reused or entered, and a branch merged, only when a listing holds it under exactly the task's name, a new workspace is an exclusive create, and a task id that folds onto an existing one is drawn again; the `orch-peer` facade | R35, R36, R40, R20, R96, R106, R117 (`task.create`), R118 (prepare, reuse, merge), R101 and R129 (the spool is written under the finish file's name and removed after the commit, for any run id: the finish-file vectors of the spec's "Filesystem names", as a name and through both operations, with an outside canary; and what happens when the spool cannot be written), R132 (an earlier lineage is refused and changes no row) | `crates/orch-engine/src/orchestrator/`, `crates/orch-engine/src/peer_facade*`, `crates/orch-infra/src/process/`, `crates/orch-infra/src/workspace/`, `crates/orch-infra/src/data_dir/spool*` (the finish spool, on the confined-directory module of T9), `crates/orch-infra/tests/fs_names.rs` | T8, T10 | `cargo test -p orch-engine --test transactions --test leases --test retries --test task_statuses --test task_ids`; `cargo test -p orch-infra workspace`; `cargo test -p orch-infra --test fs_names`; `cargo test -p orch-peer` | 11 |
 | T13 | Engine on port v2, part 2: cancel, pause, failure cascade; generations and recovery; the intent performer, whose intents hold ids and hashes and never a path, and whose `workspace.remove` and branch delete leave a directory or a branch that a listing holds under another spelling | R37 to R39, R41, R42, R28, R106 (intents), R118 (remove, delete, cleanup), R120, R101 and R129 (recovery applies the spool and removes it, reaching a file only under the finish file's name, for any run id: the same vectors and canary) | `crates/orch-engine/src/orchestrator/`, `crates/orch-engine/src/intents*`, `crates/orch-infra/src/data_dir/spool*` (the read and the removal at recovery) | T12, T4c | `cargo test -p orch-engine --test transactions --test intents --test leases` | 12 |
@@ -195,21 +195,23 @@ Run each bare filter in R8–R15 with
 `cargo test -p orch-engine --test storage_conformance -- <filter>`.
 First list it with the same command plus `--list`: require the named scenario
 under every expected registration below, then run it and require that many
-passing tests, zero failed and zero ignored. Cargo exits successfully for zero
+passing tests, zero failed and zero ignored. Since T10 (issue 450) the expected registrations include the SQLite ones:
+the spec's "The eight SQLite registrations of the conformance suite" lists them, and
+`cargo test -p orch-engine --test storage_conformance -- sqlite_` selects all of them (135 cases at `56ecd762e`; 133 when #385 registered them, 135 since #454 added two lease cases). Cargo exits successfully for zero
 matches; that is a failed verification. `--exact` requires the full listed test
 name, for example `file_leases_v2::one_of_many_concurrent_claims_wins`, and must
 execute exactly one test. Do not prefix a filter with `storage_conformance::`.
 
 | Requirements | Bare filters | Expected registrations per filter |
 |---|---|---|
-| R8, R11 | `revisions_and_positions_for_every_entity_family`, `stale_revision_is_refused_and_changes_nothing`, `deletion_never_reuses_a_position` | 3: `memory_v2`, `queued_memory_v2`, `file_v2` |
-| R9 | `page_bounds_defaults_and_optional_count` | Same 3 entity references |
-| R10 | `cursor_walk_is_stable_under_inserts_and_deletes`, `cursor_is_bound_to_project_filter_and_sort` | Same 3 entity references |
-| R12 | `one_of_many_concurrent_claims_wins`, `an_agent_holds_at_most_one_active_lease` | 2: `memory_leases_v2`, `file_leases_v2` |
-| R13 renew/release | `epochs_only_grow`, `a_stale_epoch_is_refused`, `release_ends_the_lease_and_keeps_the_epoch_counter` | Same 2 lease references |
-| R13 append, R14 | `stale_lineage_epoch_missing_lease_and_task_mismatch_change_nothing`, `duplicate_counts_first_bytes_and_range_tail_order`, `transaction_error_rolls_back_append_gap_prune_and_entities` | 2: `memory_events_v2`, `file_events_v2` |
-| R15 | `caller_selects_the_project_and_keeps_the_principal`, `settings_and_templates_belong_to_their_project` | Same 3 entity references |
-| R97 whole text | `text_over_64_kib_round_trips_through_the_blob_store` | Same 3 entity references; this alone cannot observe blob backing |
+| R8, R11 | `revisions_and_positions_for_every_entity_family`, `stale_revision_is_refused_and_changes_nothing`, `deletion_never_reuses_a_position` | 4: `memory_v2`, `queued_memory_v2`, `file_v2`, `sqlite_v2` |
+| R9 | `page_bounds_defaults_and_optional_count` | Same 4 entity registrations |
+| R10 | `cursor_walk_is_stable_under_inserts_and_deletes`, `cursor_is_bound_to_project_filter_and_sort` | Same 4 entity registrations |
+| R12 | `one_of_many_concurrent_claims_wins`, `an_agent_holds_at_most_one_active_lease` | 3: `memory_leases_v2`, `file_leases_v2`, `sqlite_leases_v2` |
+| R13 renew/release | `epochs_only_grow`, `a_stale_epoch_is_refused`, `release_ends_the_lease_and_keeps_the_epoch_counter` | Same 3 lease registrations |
+| R13 append, R14 | `stale_lineage_epoch_missing_lease_and_task_mismatch_change_nothing`, `duplicate_counts_first_bytes_and_range_tail_order`, `transaction_error_rolls_back_append_gap_prune_and_entities` | 3: `memory_events_v2`, `file_events_v2`, `sqlite_events_v2` |
+| R15 | `caller_selects_the_project_and_keeps_the_principal`, `settings_and_templates_belong_to_their_project` | Same 4 entity registrations |
+| R97 whole text | `text_over_64_kib_round_trips_through_the_blob_store` | Same 4 entity registrations; this alone cannot observe blob backing |
 
 The Task cursor exception of R10 (issue 277, option A) is proved by two `orch-infra`
 unit tests, not by the conformance filters above, so they have no registrations in
@@ -243,8 +245,10 @@ record decoder currently reports a variant mismatch rather than field detail;
 this test records that limitation without changing the reference format.
 
 These are reference checks on Linux, not acceptance of the SQLite backend.
-T10 updates this table's expected registrations when it registers SQLite.
-T10 must register the shared entity, event and lease suites on SQLite and assert
+T10 updated this table's expected registrations when it registered SQLite (issue 450;
+PR #385, squash `964e1144a`): the entity, event and lease rows above count `sqlite_v2`, `sqlite_events_v2`
+and `sqlite_leases_v2`, and the other five suites (operational, intent, request key, retry, attention) are
+registered on SQLite as well. T10 must still assert
 actual SQLite row hashes plus disk bytes for R97. Separate SQLite unit scenarios
 are useful but do not replace those registrations. T12 owns stale-epoch finish
 and runtime restart/renewal proof; T16 consumes SQLite event conformance. T21 owns
@@ -257,6 +261,35 @@ contracts (issue 109)" below; this name reconciliation changes none of them. Ful
 T8 acceptance still requires the accepted operational integration and issue
 109's consumer dispositions. macOS is tracked in After 2.0 under the owner's
 Linux-only direction through 2.0.
+
+### T10 verification selections (issue 450)
+
+The T10 row's "Verify" column names these selections. Each one was listed and run on Linux at `56ecd762e` (code of `main`
+after #480; the documentation change on top touches no code) and executed a nonzero number of tests with 0 failed. A selection
+that matches zero tests or ignores one fails verification, as in the crosswalk above. `sqlite_writer` is not a test target
+(its earlier appearances as one, in the T10 row, in R24's test cell and in the foundation note, were corrected under issue 450); the writer's tests are library tests.
+
+| Selection (all `cargo test --locked`) | Requirements | Result at `56ecd762e` |
+|---|---|---|
+| `-p orch-engine --test storage_conformance -- sqlite_` | R7 to R15 and the operational port on SQLite (the eight registrations) | 135 passed, 0 failed, 0 ignored (346 filtered out); `--list` names the same 135 (481 in the whole target) |
+| `-p orch-infra --test sqlite_connection -- read_connections_cannot_write --exact` | R24 | 1 passed |
+| `-p orch-infra --lib -- sqlite::writer::tests::writes_run_one_at_a_time_on_one_connection --exact` | R24 | 1 passed (it runs its body in a child process and waits for it) |
+| `-p orch-infra --lib -- sqlite::read_pool::tests::a_read_snapshot_does_not_see_a_later_commit --exact` | R25 | 1 passed |
+| `-p orch-infra --lib -- sqlite::writer::tests::claims_precede_queued_work_and_other_lanes_use_deadlines --exact` | R26 (the order only; four of the five names the spec listed bear no test) | 1 passed |
+| `-p orch-infra --lib -- sqlite::read_pool::tests::exhaustion_waits_until_deadline_and_never_opens_an_extra_reader --exact` and `... a_waiting_reader_uses_the_released_slot_before_its_deadline --exact` | R98 | 1 passed each |
+| `-p orch-infra --lib -- sqlite::writer::` | writer foundation, lanes, retained writes | 62 passed |
+| `-p orch-infra --lib -- sqlite::read_pool::` | R25, R98 | 13 passed |
+| `-p orch-infra --lib -- sqlite::storage::` | the composed `Storage` adapter, containment, prior latch, task cleanup | 95 passed |
+| `-p orch-infra --test sqlite_connection` | connection settings, read-only readers, private files; R24 | 8 passed |
+| `-p orch-infra --test sqlite_writer_policy` | R128 | 23 passed |
+| `-p orch-infra --test sqlite_public_writer` | R128, the public writer | 11 passed |
+| `-p orch-infra --test sqlite_crash` | process kill of the production writer at statement, body-return and receipt boundaries, on synthetic tables | 3 passed, 1 ignored (the private child process, `writer_crash_child`, which the three cases start) |
+| `-p orch-infra --test sqlite_storage_crash` | process kill through the composed `Storage` at callback and receipt boundaries, on synthetic config and template rows only (its header) | 5 passed, 1 ignored (`storage_crash_child`, likewise) |
+
+Neither crash target simulates an interruption inside `COMMIT` or a power loss (both headers say so). The whole-adapter review
+found no process-kill test through `Storage` for any family other than config and templates, nor for events, leases or request
+keys; issue 149 owns the follow-up of that harness. A passing selection above is a result of that selection;
+it is not the T10 acceptance, which stays with its own task.
 
 ### T8 consumer contracts (issue 109)
 
@@ -281,7 +314,7 @@ ignored. Each of the three entity registrations is `memory_v2`, `queued_memory_v
 | R117, schema | `cargo test -p orch-infra --test sqlite_schema -- task_ids_are_unique_under_ascii_case_only_within_a_project` | one test |
 | R132, caller fields | `caller_selects_the_project_and_keeps_the_principal` (a task principal's lineage and epoch come back unchanged from both entry points) | 3 entity references |
 | Consumer contracts (ADR 0020 decisions 1 and 2) | `pending_messages_filter_status_recipient_and_lexical_expiry`, `pending_messages_page_matches_before_count_cursor_and_bound`, `run_attempt_order_is_numeric_task_scoped_and_keeps_default`, `run_attempt_pages_keep_snapshot_and_bind_every_query_field`, `run_attempt_sort_refuses_every_unscoped_or_other_family_filter` | 3 entity references each, 15 in all |
-| Whole retry text, conformance (decisions 3 and 4) | `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original`, `retry_chunked_text_survives_restore_without_a_run` | 3 retry references each: `memory_retries_v2`, `blob_memory_retries_v2`, `file_retries_v2` |
+| Whole retry text, conformance (decisions 3 and 4) | `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run`, `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original`, `retry_chunked_text_survives_restore_without_a_run` | 4 retry registrations each: `memory_retries_v2`, `blob_memory_retries_v2`, `file_retries_v2`, `sqlite_retries_v2` (the SQLite one since #385; 3 when the row was written) |
 
 The importer-side R117 rule has an existing unit test in `orch-infra`'s library:
 `import::preflight::tests::two_task_ids_that_differ_only_in_case_are_refused_before_any_write`. The command-level import, export and restore tests that R117 names, and the lineage tests
@@ -289,14 +322,13 @@ of R132 (`leases`, `restore_fencing`), do not exist yet and stay with T21, T12, 
 
 The R7, R117 and R132 rows above are the 12 selections the integration task lists (`--list`) and then runs, each
 required to select its expected count with none failed or ignored: the seven conformance filters (3 registrations
-each), the three `sqlite_crash` selections, the `sqlite_schema` selection and the importer's unit test (one test
+each when they ran; #385 later added a SQLite registration to every shared suite), the three `sqlite_crash` selections, the `sqlite_schema` selection and the importer's unit test (one test
 each). The integration task ran them once on Linux, before the head was frozen, and each selected its expected count
 and exited 0; the receipt is private to the task, the PR's manifest names the head it belongs to, and a reviewer or
 the gate repeats them there. The spellings were also checked against the test sources and against a listing of the
 conformance suite on `07b5f967`. A selection that matches zero tests, or ignores one, fails verification.
 
-The last row of the table above is three scenarios of the retry suite. The suite has 21 scenarios on each of its three
-registrations (63 tests); the three new ones, `retry_chunked_text_survives_restore_without_a_run`,
+The last row of the table above is three scenarios of the retry suite. The suite has 21 scenarios on each of its registrations: 63 tests on the three that existed when this was written, and 84 with `sqlite_retries_v2`, which #385 added; the three new ones, `retry_chunked_text_survives_restore_without_a_run`,
 `retry_whole_text_round_trips_at_the_utf8_boundary_without_a_run` and
 `retry_whole_text_replacement_rolls_back_and_snapshots_keep_original`, are the first three it registers in
 `storage_contract/retries_v2.rs`, and `blob_memory_retries_v2` is a registration that did not exist on `main`. The
@@ -305,8 +337,8 @@ registrations (63 tests); the three new ones, `retry_chunked_text_survives_resto
 **Retry text above one blob object (ADR 0020 decision 4).** The reference implementation meets this mapping and is
 accepted only with these focused Linux checks on both references. Each check is one named test; the integration task
 records its commit, count and platform, and an empty or ignored selection fails it. The tests are in two places:
-the retry suite of `storage_conformance` (`-p orch-engine --test storage_conformance -- <filter>`, 3 registrations
-each), the `orch-infra` library (`-p orch-infra --lib -- storage::v2::tests::<name> --exact`, which must execute
+the retry suite of `storage_conformance` (`-p orch-engine --test storage_conformance -- <filter>`, 4 registrations
+each since #385, 3 when this was written), the `orch-infra` library (`-p orch-infra --lib -- storage::v2::tests::<name> --exact`, which must execute
 one test) and one private unit test of `orch-core`
 (`-p orch-core --features test-support --lib -- store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read --exact`,
 which must execute one test; the module exists only with the `test-support` feature). "Both" in the last column
@@ -397,7 +429,7 @@ absent one), the original `updated_at` text descending, `position`, then the id.
 PR #225 (squash `af0d43acd`, 2026-11-23) carried the reference code and the first text of this paragraph together. The
 memory fake, its queued variant and the file reference meet the orders: the shared scenarios
 `message_and_run_filters_stay_within_their_family` and `declared_secondary_sorts_use_values_then_tie_breakers` are
-registered once and run as `memory_v2`, `queued_memory_v2` and `file_v2` (three registrations each), and hosted Linux
+registered once and run as `memory_v2`, `queued_memory_v2` and `file_v2` (three registrations each at that squash; `sqlite_v2` joined them with #385), and hosted Linux
 check and test succeeded on the head of PR #225 and on the cumulative `main` push. The goal rule changed code in the
 file reference only, because the memory fake already told a present empty `updated_at` from an absent one.
 
@@ -405,15 +437,16 @@ The explicit sort `Sort::Attempt` (T8 consumer contracts, above) is a separate a
 revision, not of PR #225. For a run list whose filter names a task it orders by the same key as the default, so the two
 list the same rows in the same order; with no task it is refused and the default is the `started_at` key.
 
-None of this shows SQLite. T10 registers the same two scenarios, with the five consumer scenarios, on SQLite, and the
-orders are shown there only when those registrations pass.
+At that squash none of this showed SQLite. T10 registered the same two scenarios, with the five consumer scenarios, on SQLite
+(`sqlite_v2`, #385); the orders are shown there by those registrations passing (all eight pass on Linux at `56ecd762e`: 135 of 135, spec "The eight SQLite registrations"), a result of the suite and not an acceptance of T10.
 
 The two shared scenarios are `message_and_run_filters_stay_within_their_family` and
 `declared_secondary_sorts_use_values_then_tie_breakers`, in
 `crates/orch-engine/tests/storage_contract/v2_paging.rs`. Each is registered under `memory_v2`, `queued_memory_v2`
 and `file_v2` and is run by the crosswalk's rule (list, then run with
-`cargo test -p orch-engine --test storage_conformance -- <filter>`, three passing registrations each). T10 registers
-both on SQLite only after that PR has landed, and updates the expected registrations then.
+`cargo test -p orch-engine --test storage_conformance -- <filter>`, three passing registrations each at the time of PR #225).
+T10 registered both on SQLite after that PR landed (`sqlite_v2`, #385), so each now has four passing registrations, and the
+crosswalk's table counts them (issue 450).
 
 ### Non-Task cursors
 
@@ -765,8 +798,9 @@ whose deadline passes while `BEGIN IMMEDIATE` waits for the write reservation is
 never commits. Nothing else of R26 and nothing else of R27, R28, R126 to R128, R130, R137, R139 or R140.
 
 **Module tests.** Unit tests under `crates/orch-infra/src/sqlite/writer/tests/mod.rs` and
-`read_pool/tests/mod.rs`. They are not the `sqlite_writer` and `sqlite_crash` integration tests that T10's
-"Verify" column names; those and the SQLite run of the conformance suite remain T10's. Every receipt wait in the
+`read_pool/tests/mod.rs`. When this foundation was written they were not the `sqlite_writer` and `sqlite_crash` integration
+tests that T10's "Verify" column then named. `sqlite_writer` was never a test target (issue 450): T10's "Verify" column now names
+the targets that exist, and the SQLite run of the conformance suite is built (spec "The eight SQLite registrations"). Every receipt wait in the
 `writer` module gives up after 10 s, and a scoped test closes admission when its body unwinds so that the join of the
 worker cannot hang behind a failed assertion: a regression fails by name instead of hanging. `a_withdrawn_request_is_never_committed` covers a deadline that
 passes during the `BEGIN IMMEDIATE` wait only. It is not the oracle of R128's retry case.
@@ -1283,7 +1317,7 @@ result and the streak's break by another SQL failure). No red is recorded for tw
   built behaviour of `Writer::run` at `53136a969`, not a wording that R128 asks for and not a ruling of the
   owner, and it carries no latency guarantee.
 - *Tests of R128.* The four names that R128 listed (busy, disk full, corrupt, idle) are mapped to the tests that exist, and
-  to the missing coverage, in the spec's "R128's tests". PR #443 (landed as `PR443-SQUASH`) adds WP6's `SQLITE_FULL` exhaustion on a
+  to the missing coverage, in the spec's "R128's tests". PR #443 (landed as `7351003e3`) adds WP6's `SQLITE_FULL` exhaustion on a
   real event producer and a real idle control (`sqlite::events::tests::producer::a_full_disk_is_retried_and_then_fails_the_writer`),
   and the waiting of each non-claim lane (`sqlite::storage::retained::tests::every_nonclaim_lane_waits_for_retirement_and_keeps_its_original_deadline`).
   The `SQLITE_FULL` is injected and no disk is filled; the finite-future-deadline case is issue 445; and the issue 127 closure,
