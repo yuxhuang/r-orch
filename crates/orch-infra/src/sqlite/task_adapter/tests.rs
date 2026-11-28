@@ -635,6 +635,7 @@ fn a_page_hydrates_the_selected_ids_from_one_snapshot_across_a_concurrent_commit
                     write.update(renamed, Revision::ONE)?;
                     write.delete("t1", Revision::ONE)?;
                     write.create(task("t00", TaskStatus::Todo, 1, 1, None))?;
+                    write.create(task("t01", TaskStatus::Todo, 1, 1, None))?;
                     Ok(())
                 })
                 .unwrap();
@@ -669,9 +670,13 @@ fn a_page_hydrates_the_selected_ids_from_one_snapshot_across_a_concurrent_commit
                 },
             )
             .unwrap();
-        assert_eq!(Fixture::ids(&next), ["t7", "t5", "t4", "t8", "t6", "t00"]);
-        assert_eq!(next.total, Some(9));
+        assert_eq!(
+            Fixture::ids(&next),
+            ["t7", "t5", "t4", "t8", "t6", "t00", "t01"]
+        );
+        assert_eq!(next.total, Some(10));
         let fresh = fx.list(&filter(), &request(Sort::Position, 1)).unwrap();
+        assert_eq!(fresh.total, Some(10));
         assert_eq!(fresh.items[0].revision, Revision::ONE.next().unwrap());
     });
 }
