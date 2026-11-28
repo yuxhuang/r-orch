@@ -728,7 +728,7 @@ fn a_blocking_pool_of_one_is_enough_for_yaml_documents() {
 /// The flag reaches a read that is already under way, so a cancel does not wait for an
 /// event file that has no byte bound (R111) to end.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cancel_during_a_long_read_ends_the_check_without_an_io_finding() {
+async fn a_cancel_during_a_long_read_returns_cancelled_after_awaiting_the_worker() {
     let src = Src::new();
     src.put("runs/run_a.jsonl", "");
     let file = fs::OpenOptions::new()
@@ -926,4 +926,76 @@ async fn offline_load_refuses_a_replaced_guard_and_cancellation() {
     .unwrap();
     src.put(".daemon-owner.lock", "replacement holder");
     assert!(prepared.load_template(0).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn required_confirmations_and_assumed_stopped_are_not_truncated_at_the_finding_cap() {
+    let src = Src::new();
+    let count = REPORT_LIMIT + 1;
+    let local: Vec<_> = (0..count).map(|i| entry(&format!("r{i}"), 4242)).collect();
+    let options = || Options {
+        assume_stopped: (0..count).map(|i| format!("r{i}")).collect(),
+        ..Options::default()
+    };
+    src.put("state.json", running(&local));
+    let report = run_with(
+        &src,
+        options(),
+        Arc::new(Table {
+            live: vec![4242],
+            ..Table::default()
+        }),
+    )
+    .await;
+    assert!(!report.refused(), "{:?}", report.refusals);
+    assert_eq!(report.confirmations.len(), count);
+    let ids: std::collections::BTreeSet<_> = report
+        .confirmations
+        .iter()
+        .map(|c| c.run_id.clone())
+        .collect();
+    assert_eq!(ids, options().assume_stopped);
+    assert!(report.assumed_stopped.is_empty());
+    src.put(
+        "state.json",
+        running(
+            &(0..count)
+                .map(|i| remote_entry(&format!("r{i}")))
+                .collect::<Vec<_>>(),
+        ),
+    );
+    let report = run_with(&src, options(), Arc::new(Table::default())).await;
+    assert!(!report.refused(), "{:?}", report.refusals);
+    assert!(report.confirmations.is_empty());
+    assert_eq!(report.assumed_stopped.len(), count);
+    assert_eq!(
+        report
+            .assumed_stopped
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        options().assume_stopped
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_in_flight_facts_survive_long_and_hostile_aliases_and_ids() {
+    let src = Src::new();
+    let mut remote = remote_entry("r1");
+    remote["remote"]["alias"] = json!(format!("peer\n\u{1b}{}", "a".repeat(400)));
+    remote["run_id"] = json!(format!("run\n{}", "r".repeat(400)));
+    remote["task_id"] = json!(format!("task\u{1b}{}", "t".repeat(400)));
+    src.put("state.json", running(&[remote]));
+    let report = run(&src).await;
+    assert_eq!(refusals(&report), [("state.json", "in_flight_remote")]);
+    let detail = &report.refusals.listed[0].detail;
+    assert!(
+        detail.starts_with("recorded on peer peer\\u{a}\\u{1b}"),
+        "{detail}"
+    );
+    assert!(detail.contains("; run run\\u{a}"), "{detail}");
+    assert!(detail.contains("; task task\\u{1b}"), "{detail}");
+    assert!(
+        detail.len() <= 256 && !detail.contains(['\n', '\u{1b}']),
+        "{detail}"
+    );
 }

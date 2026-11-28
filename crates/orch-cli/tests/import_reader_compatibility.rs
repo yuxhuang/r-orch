@@ -566,3 +566,31 @@ fn x_v12_depth_and_node_boundaries_keep_budget_precedence_in_both_modes() {
         }
     }
 }
+
+// Issue 271's full bounded comparison is intentionally opt-in: it is a retained
+// compatibility/resource case, not a new latency promise or a comparison rewrite.
+#[test]
+#[ignore = "bounded issue 271 comparison; run explicitly on Linux"]
+fn issue_271_nested_opaque_comparison_survives_the_real_caller() {
+    let root = fixture();
+    let base = entity("context", "a").to_string();
+    let nested = format!(
+        "{}{}{}",
+        "[".repeat(61),
+        vec!["1e999"; 899_900].join(","),
+        "]".repeat(61)
+    );
+    let document = format!("{{\"ignored\":{nested},{}", &base[1..]);
+    put(root.path(), "context/a.json", &document);
+    put(root.path(), "context/_index.json", format!("[{document}]"));
+    let before = snapshot(&root.path().join("source"), true);
+    let dry = run(root.path(), &["--dry-run"], 0);
+    assert!(!root.path().join("data").exists());
+    let written = run(root.path(), &[], 1);
+    assert_eq!(dry["preflight"], written["preflight"]);
+    assert_eq!(dry["preflight"]["counts"]["context"], 1);
+    assert_eq!(notes(&dry["preflight"], "index_differs").count(), 0);
+    assert_eq!(written["imported"], 1);
+    assert_eq!(written["unfinished"], true);
+    assert_eq!(snapshot(&root.path().join("source"), true), before);
+}
