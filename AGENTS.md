@@ -599,6 +599,13 @@ and a walking skeleton comes before a second revision. The rules are in
 - **"Done" means evidence.** A task is done when a commit exists on its branch and its verify command passed
   there, both stated in the PR or handoff. Status in a tracker is not evidence. A lead releases dependent tasks
   only after checking that evidence.
+- **Recorded flaky tests (28 November 2026).** The supervisor may continue merging after a red push to
+  `main` if the log shows the test run finished, every failure is a test named in an r-orch issue labelled
+  `flaky-test`, and each failing test is outside the code touched by the change. Rerun the failed job once
+  and name each failing test and its issue in the next merge checkpoint. If a test was unrecorded when it
+  failed, or the same recorded test fails twice in a row on one head, apply the stop-on-red rule above.
+  File each new flake in a `flaky-test` issue naming the test. A PR’s own red test still requires a green
+  rerun before merge. Never use `--admin` to bypass branch protection.
 - **Reviewers write the verdict skeleton first** (scope, what will be checked), then fill it in, so an
   interrupted review still leaves a report. A diff over about 800 lines is reviewed in slices.
 - **Checkpoints change something.** A lead checkpoint must produce or change a deliverable (code, test, doc) or
