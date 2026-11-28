@@ -118,3 +118,158 @@ async fn a_missing_config_cannot_become_present_after_preflight() {
     fs::write(root.path().join(".orchestry/config.yml"), "{}\n").unwrap();
     assert!(load(prepared, 0).await.is_err());
 }
+
+#[tokio::test]
+async fn native_load_refuses_same_length_changes_after_prepare() {
+    let root = tempfile::tempdir().unwrap();
+    let tasks = root.path().join(".orchestry/tasks");
+    fs::create_dir_all(&tasks).unwrap();
+    let path = tasks.join("retained.yml");
+    let original = "id: retained\ntitle: original\ndescription: source file\nstatus: todo\npriority: 1\ncreated_at: '2025-01-01T00:00:00.000Z'\nupdated_at: '2025-01-01T00:00:00.000Z'\nattempts: 0\nmax_attempts: 3\n";
+    fs::write(&path, original).unwrap();
+    let prepared = Arc::new(
+        prepare(
+            root.path().to_owned(),
+            Options::default(),
+            Arc::new(SystemProbe),
+        )
+        .await
+        .unwrap(),
+    );
+    assert!(!prepared.report.refused());
+    let row = load(prepared.clone(), 0).await.unwrap();
+    assert!(matches!(row.entity, Entity::Task(ref task) if task.title == "original"));
+    let changed = original.replace("original", "modified");
+    assert_eq!(changed.len(), original.len());
+    fs::write(&path, changed).unwrap();
+    assert!(
+        matches!(load(prepared, 0).await, Err(PreflightError::Source(detail)) if detail == "entity changed since preflight")
+    );
+}
+
+#[tokio::test]
+async fn missing_indexed_file_and_unlisted_files_resume_with_dense_ranks() {
+    use crate::data_dir::{DataDir, Holder, LockKind};
+    use crate::import::ImportBatch;
+    use crate::sqlite::{SqliteStorage, StorageOptions, WriteOutcome};
+    use orch_core::store::{Caller, Principal, Revision, Storage};
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    let tasks = source.join(".orchestry/tasks");
+    fs::create_dir_all(&tasks).unwrap();
+    for id in ["zulu", "alpha", "unlisted_z", "unlisted_a"] {
+        fs::write(tasks.join(format!("{id}.yml")), format!("id: {id}\ntitle: synthetic\ndescription: source file\nstatus: todo\npriority: 1\ncreated_at: '2025-01-01T00:00:00.000Z'\nupdated_at: '2025-01-01T00:00:00.000Z'\nattempts: 0\nmax_attempts: 3\n")).unwrap();
+    }
+    fs::write(
+        tasks.join("_index.json"),
+        r#"[{"id":"zulu"},{"id":"missing"},{"id":"alpha"}]"#,
+    )
+    .unwrap();
+    let prepared = Arc::new(
+        prepare(source.clone(), Options::default(), Arc::new(SystemProbe))
+            .await
+            .unwrap(),
+    );
+    assert!(!prepared.report.refused());
+    let caller = Caller {
+        project: "synthetic".into(),
+        principal: Principal::Owner {
+            identity: "local_owner".into(),
+        },
+    };
+    let data = Arc::new(
+        DataDir::acquire(
+            &root.path().join("destination"),
+            &Holder {
+                kind: LockKind::Import,
+                pid: std::process::id(),
+                started_at: "synthetic".into(),
+                binary_version: "test".into(),
+                executable: "orch import".into(),
+            },
+        )
+        .unwrap(),
+    );
+    let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+    let ids = ["zulu", "alpha", "unlisted_a", "unlisted_z"];
+    for (index, id) in ids.iter().enumerate() {
+        let row = load(prepared.clone(), index).await.unwrap();
+        assert_eq!(row.entity.id(), *id);
+        let attempt = storage
+            .import_batch(
+                caller.clone(),
+                ImportBatch {
+                    source: source.to_string_lossy().into_owned(),
+                    rows: vec![row],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(attempt.outcome, WriteOutcome::Committed);
+        attempt.result.unwrap();
+    }
+    drop(prepared);
+    let resumed = Arc::new(
+        prepare(source.clone(), Options::default(), Arc::new(SystemProbe))
+            .await
+            .unwrap(),
+    );
+    assert!(!resumed.report.refused());
+    let inventory = resumed.inventory();
+    assert!(!inventory.contains_key(&(EntityKind::Task, "missing".into())));
+    // Use the actual preflight inventory, so raw index gaps cannot pass resume.
+    let checked = storage
+        .check_import_source(
+            caller.clone(),
+            source.to_string_lossy().into_owned(),
+            inventory.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(checked.outcome, WriteOutcome::Committed);
+    checked.result.unwrap();
+    let view = storage.read(caller.clone()).await.unwrap();
+    let mut before = Vec::new();
+    for (index, id) in ids.iter().enumerate() {
+        assert_eq!(
+            inventory[&(EntityKind::Task, (*id).into())].1,
+            Some(index as u64 + 1)
+        );
+        let record = view.get(EntityKind::Task, id).await.unwrap().unwrap();
+        assert_eq!(record.position, index as u64 + 1);
+        assert_eq!(record.revision, Revision::ONE);
+        before.push(record);
+    }
+    assert!(
+        view.get(EntityKind::Task, "missing")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    drop(view);
+    for index in 0..ids.len() {
+        let row = load(resumed.clone(), index).await.unwrap();
+        let attempt = storage
+            .import_batch(
+                caller.clone(),
+                ImportBatch {
+                    source: source.to_string_lossy().into_owned(),
+                    rows: vec![row],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(attempt.outcome, WriteOutcome::Committed);
+        attempt.result.unwrap();
+    }
+    let view = storage.read(caller).await.unwrap();
+    for (id, before) in ids.iter().zip(before) {
+        assert_eq!(
+            view.get(EntityKind::Task, id).await.unwrap().unwrap(),
+            before
+        );
+    }
+    drop(view);
+    storage.close().await.unwrap();
+}
