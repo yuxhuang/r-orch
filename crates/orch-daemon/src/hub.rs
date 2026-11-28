@@ -958,9 +958,51 @@ mod tests {
             assert!(output.register(id, Id::new("daemon_test").unwrap(), baseline, args(stores)));
             output.activate(id);
         }
+        let window = std::time::Duration::from_secs(5);
+        let (started_tx, mut started_rx) = watch::channel(None::<tokio::time::Instant>);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let publications = observed.clone();
         let sink = output.clone();
-        boundary.set_publisher(Some(Arc::new(move |p| sink.publish(p))));
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        boundary.set_publisher(Some(Arc::new(move |p| {
+            if let Publication::Commit(record) = p {
+                let now = tokio::time::Instant::now();
+                // Anchor at a publication, rather than an arbitrary phase of
+                // the peer's one-second poll plus 250ms timer quantum.
+                started_tx.send_if_modified(|started| {
+                    if started.is_none() {
+                        *started = Some(now);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                let elapsed = now - started_tx.borrow().unwrap();
+                lock(&publications).push((elapsed, record.commit_seq));
+                // Sample at publication time. A late observer must neither
+                // extend the five-second window nor wait for a missing event.
+                if elapsed < window {
+                    sink.publish(p);
+                }
+            }
+        })));
+        let started = tokio::time::timeout(window, async {
+            loop {
+                if let Some(started) = *started_rx.borrow_and_update() {
+                    break started;
+                }
+                started_rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("idle controller never published its first heartbeat");
+        tokio::time::sleep_until(started + window).await;
+        // Fence a callback that entered the window just before its deadline.
+        boundary.run(false, async {}).await;
+        eprintln!(
+            "idle heartbeat publications: {:?}; observer elapsed: {:?}",
+            lock(&observed),
+            started.elapsed(),
+        );
         let mut counts = [0; 4];
         let mut resyncs = 0;
         while let Some(frame) = output.pop() {
