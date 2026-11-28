@@ -529,6 +529,10 @@ impl UnitOfWork for Session {
                 requested: id.to_owned(),
             });
         }
+        entity.validate_storage_input()?;
+        if entity.kind() == EntityKind::Context {
+            self.caller.validate_context_provenance()?;
+        }
         let position = self.next_position(kind)?;
         Ok(self.put(Record {
             entity,
@@ -539,6 +543,7 @@ impl UnitOfWork for Session {
 
     fn update(&mut self, entity: Entity, expected: Revision) -> Result<Record> {
         let old = self.current(entity.kind(), entity.id(), expected)?;
+        entity.validate_storage_input()?;
         let revision = old.revision.next()?;
         Ok(self.put(Record {
             entity,
@@ -864,5 +869,106 @@ impl AttentionWrite for Session {
         let count = self.project.attention.expire(cutoff, limit)?;
         self.dirty |= count > 0;
         Ok(count)
+    }
+}
+
+#[cfg(test)]
+mod permanent_input_tests {
+    use super::*;
+    use orch_core::store::{Principal, StorageExt};
+    use orch_core::test_support::make_task;
+
+    #[tokio::test]
+    async fn permanent_input_refusal_preserves_operations_and_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let storage = FileStorage::new(directory.path());
+        let caller = Caller {
+            project: "synthetic".into(),
+            principal: Principal::Owner {
+                identity: "owner".into(),
+            },
+        };
+        let mut task = make_task();
+        task.created_at = "2026-01-01T00:00:00.000Z".into();
+        task.updated_at = task.created_at.clone();
+        task.id = "first".into();
+        let saved = storage
+            .transaction(caller.clone(), Lane::Entities, move |unit| {
+                let first = unit.create(Entity::Task(Box::new(task.clone())))?;
+                task.id = "refused".into();
+                task.assignee = Some("secret".repeat(10923));
+                assert!(matches!(
+                    unit.create(Entity::Task(Box::new(task.clone()))),
+                    Err(StoreError::Unrepresentable)
+                ));
+                task.id = "first".into();
+                assert!(matches!(
+                    unit.update(Entity::Task(Box::new(task.clone())), first.revision),
+                    Err(StoreError::Unrepresentable)
+                ));
+                assert_eq!(unit.get(EntityKind::Task, "first")?, Some(first.clone()));
+                task.id = "second".into();
+                task.assignee = None;
+                let second = unit.create(Entity::Task(Box::new(task)))?;
+                assert_eq!(second.position, first.position + 1);
+                Ok(first)
+            })
+            .await
+            .unwrap();
+        let snapshot = storage.read(caller.clone()).await.unwrap();
+        assert_eq!(
+            snapshot.get(EntityKind::Task, "first").await.unwrap(),
+            Some(saved.clone())
+        );
+        assert!(
+            snapshot
+                .get(EntityKind::Task, "refused")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let result: Result<()> = storage
+            .transaction(caller.clone(), Lane::Entities, move |unit| {
+                let Entity::Task(mut task) = saved.entity else {
+                    panic!("task expected")
+                };
+                task.id = "rolled-back".into();
+                unit.create(Entity::Task(task.clone()))?;
+                task.id = "invalid".into();
+                task.updated_at = "private-input".into();
+                unit.create(Entity::Task(task))?;
+                Ok(())
+            })
+            .await;
+        assert!(matches!(result, Err(StoreError::Unrepresentable)));
+        assert!(
+            storage
+                .read(caller)
+                .await
+                .unwrap()
+                .get(EntityKind::Task, "rolled-back")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[tokio::test]
+    async fn backend_fault_is_distinct_from_permanent_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("not-a-directory");
+        std::fs::write(&root, b"synthetic canary").unwrap();
+        let storage = FileStorage::new(&root);
+        let caller = Caller {
+            project: "synthetic".into(),
+            principal: Principal::Owner {
+                identity: "owner".into(),
+            },
+        };
+        let error = match storage.read(caller).await {
+            Ok(_) => panic!("file used as storage directory"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, StoreError::Backend(_)));
+        assert_eq!(std::fs::read(root).unwrap(), b"synthetic canary");
     }
 }

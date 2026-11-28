@@ -304,6 +304,10 @@ impl UnitOfWork for View {
                 requested: id.into(),
             });
         }
+        entity.validate_storage_input()?;
+        if entity.kind() == EntityKind::Context {
+            self.caller.validate_context_provenance()?;
+        }
         let position = self.next_position(kind)?;
         self.project.positions.insert(kind, position);
         Ok(self.store_row(Record {
@@ -315,6 +319,7 @@ impl UnitOfWork for View {
 
     fn update(&mut self, entity: Entity, expected: Revision) -> Result<Record> {
         let old = self.checked(entity.kind(), entity.id(), expected)?;
+        entity.validate_storage_input()?;
         let revision = old.revision.next()?;
         Ok(self.store_row(Record {
             entity,
@@ -762,3 +767,84 @@ impl AttentionWrite for View {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod permanent_input_tests {
+    use super::*;
+    use crate::store::{Principal, StorageExt};
+    use crate::test_support::make_task;
+
+    #[tokio::test]
+    async fn permanent_input_refusal_preserves_operations_and_transaction() {
+        let storage = FakeStorage::default();
+        let caller = Caller {
+            project: "synthetic".into(),
+            principal: Principal::Owner {
+                identity: "owner".into(),
+            },
+        };
+        let mut task = make_task();
+        task.created_at = "2026-01-01T00:00:00.000Z".into();
+        task.updated_at = task.created_at.clone();
+        task.id = "first".into();
+        let saved = storage
+            .transaction(caller.clone(), Lane::Entities, move |unit| {
+                let first = unit.create(Entity::Task(Box::new(task.clone())))?;
+                task.id = "refused".into();
+                task.assignee = Some("secret".repeat(10923));
+                assert!(matches!(
+                    unit.create(Entity::Task(Box::new(task.clone()))),
+                    Err(StoreError::Unrepresentable)
+                ));
+                task.id = "first".into();
+                assert!(matches!(
+                    unit.update(Entity::Task(Box::new(task.clone())), first.revision),
+                    Err(StoreError::Unrepresentable)
+                ));
+                assert_eq!(unit.get(EntityKind::Task, "first")?, Some(first.clone()));
+                task.id = "second".into();
+                task.assignee = None;
+                let second = unit.create(Entity::Task(Box::new(task)))?;
+                assert_eq!(second.position, first.position + 1);
+                Ok(first)
+            })
+            .await
+            .unwrap();
+        let snapshot = storage.read(caller.clone()).await.unwrap();
+        assert_eq!(
+            snapshot.get(EntityKind::Task, "first").await.unwrap(),
+            Some(saved.clone())
+        );
+        assert!(
+            snapshot
+                .get(EntityKind::Task, "refused")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let result: Result<()> = storage
+            .transaction(caller.clone(), Lane::Entities, move |unit| {
+                let Entity::Task(mut task) = saved.entity else {
+                    panic!("task expected")
+                };
+                task.id = "rolled-back".into();
+                unit.create(Entity::Task(task.clone()))?;
+                task.id = "invalid".into();
+                task.updated_at = "private-input".into();
+                unit.create(Entity::Task(task))?;
+                Ok(())
+            })
+            .await;
+        assert!(matches!(result, Err(StoreError::Unrepresentable)));
+        assert!(
+            storage
+                .read(caller)
+                .await
+                .unwrap()
+                .get(EntityKind::Task, "rolled-back")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+}

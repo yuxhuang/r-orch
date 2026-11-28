@@ -32,6 +32,21 @@ pub struct Caller {
     pub project: String,
 }
 
+impl Caller {
+    /// Validate the bounded provenance columns written when creating Context.
+    /// Updates preserve existing provenance and do not call this check.
+    pub fn validate_context_provenance(&self) -> Result<()> {
+        let (identity, run) = match &self.principal {
+            Principal::Owner { identity } | Principal::Worker { identity } => (identity, None),
+            Principal::Task { identity, run, .. } => (identity, Some(run)),
+        };
+        if identity.len() > 65_536 || run.is_some_and(|run| run.len() > 65_536) {
+            return Err(StoreError::Unrepresentable);
+        }
+        Ok(())
+    }
+}
+
 /// A task authority includes both parts of its fencing token (R132).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -96,6 +111,10 @@ pub enum StoreError {
         expected: Revision,
         actual: Option<Revision>,
     },
+    /// The caller value is outside the storage representation contract.
+    /// Retrying the same value cannot succeed; no input or diagnostic is retained.
+    #[error("input cannot be represented by storage")]
+    Unrepresentable,
     #[error("storage counter exhausted")]
     CounterExhausted,
     #[error(transparent)]
