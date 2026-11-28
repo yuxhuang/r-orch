@@ -1,8 +1,8 @@
 use super::*;
 use crate::sqlite::{ConnectionRole, SqliteError, Synchronous, open_connection, test_data};
 use failure::{Failure, Role};
-use std::fs::File;
-use std::io::Read;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::process::{Child, Command};
 use std::sync::mpsc;
@@ -15,9 +15,13 @@ const BOUND: Duration = Duration::from_secs(10);
 // nor interrupt a stuck callback/commit. Contain each scenario in its own process:
 // Rust must join scoped threads on unwind, but the parent can kill and reap that
 // entire process. The child creates no subprocesses. Its temp data is under a
-// parent-owned directory, so killing it cannot leak fixtures or lock holders.
+// parent-owned directory, removed after reaping on ordinary exit/unwind. If the
+// parent itself dies, the child and fixtures can survive; this is not a
+// parent-death/process-group or uninterruptible-I/O cleanup guarantee.
 const SCENARIO_BOUND: Duration = Duration::from_secs(20);
 const CHILD_SCENARIO: &str = "ORCH_WRITER_TEST_SCENARIO";
+const SCENARIO_ENTRY: &str = "ORCH_WRITER_TEST_ENTRY";
+const OUTPUT_TAIL_BYTES: u64 = 64 * 1024;
 
 struct ScenarioChild(Child);
 
@@ -26,35 +30,73 @@ impl Drop for ScenarioChild {
         // Child::kill only targets the child we own. Kill is harmless if it
         // already exited; wait reaps it before the parent removes its fixtures.
         let _ = self.0.kill();
-        self.0.wait().expect("reap writer scenario child");
+        check_reap(self.0.wait().map(|_| ()));
+    }
+}
+
+fn check_reap(result: std::io::Result<()>) {
+    if let Err(error) = result {
+        // Preserve the original panic instead of aborting on a second panic.
+        if !std::thread::panicking() {
+            panic!("reap writer scenario child: {error}");
+        }
     }
 }
 
 fn scenario_output(path: &Path) -> String {
-    let mut output = String::new();
-    File::open(path)
-        .unwrap()
-        .take(64 * 1024)
-        .read_to_string(&mut output)
-        .unwrap();
-    output
+    let read = || -> std::io::Result<Vec<u8>> {
+        let mut file = File::open(path)?;
+        let end = file.metadata()?.len();
+        let start = end.saturating_sub(OUTPUT_TAIL_BYTES);
+        file.seek(SeekFrom::Start(start))?;
+        let mut output = Vec::new();
+        file.take(end - start).read_to_end(&mut output)?;
+        Ok(output)
+    };
+    match read() {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => format!("<scenario output unavailable: {error}>"),
+    }
+}
+
+fn scenario_ran_once(name: &str, entry: &[u8], output: &str) -> bool {
+    entry == format!("{name}\n").as_bytes()
+        && output
+            .lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;"))
 }
 
 #[track_caller]
 fn in_scenario_child(name: &str) -> bool {
     if std::env::var(CHILD_SCENARIO).as_deref() == Ok(name) {
+        let path = std::env::var_os(SCENARIO_ENTRY).expect("parent entry path");
+        let mut entry = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(entry, "{name}").unwrap();
         return true;
     }
+    run_scenario_child(name).unwrap_or_else(|error| panic!("{error}"));
+    false
+}
+
+fn run_scenario_child(name: &str) -> std::result::Result<(), String> {
     let root = tempfile::tempdir().unwrap();
     // Keep nested libtest summaries out of the outer gate's test inventory.
     // A regular file avoids a pipe filling and blocking the child's failure path.
+    let entry_path = root.path().join("entry");
     let output_path = root.path().join("scenario.log");
+    // The diagnostic read is byte-bounded; the retained file can still grow
+    // throughout SCENARIO_BOUND. This is not a disk-usage quota.
     let output = File::create(&output_path).unwrap();
     let mut child = ScenarioChild(
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", name, "--nocapture", "--test-threads=1"])
             .env_clear()
             .env(CHILD_SCENARIO, name)
+            .env(SCENARIO_ENTRY, &entry_path)
             .env("HOME", root.path())
             .env("TMPDIR", root.path())
             .env("XDG_CONFIG_HOME", root.path())
@@ -73,21 +115,124 @@ fn in_scenario_child(name: &str) -> bool {
     let deadline = Instant::now() + SCENARIO_BOUND;
     loop {
         if let Some(status) = child.0.try_wait().expect("poll writer scenario child") {
-            assert!(
-                status.success(),
-                "{name}: scenario failed: {status}\n{}",
-                scenario_output(&output_path)
-            );
-            return false;
+            let output = scenario_output(&output_path);
+            let entry = std::fs::read(&entry_path).unwrap_or_default();
+            return if status.success() && scenario_ran_once(name, &entry, &output) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{name}: expected exactly one named scenario; status {status}\n{output}"
+                ))
+            };
         }
-        assert!(
-            Instant::now() < deadline,
-            "{name}: scenario exceeded {SCENARIO_BOUND:?}; killing stuck worker\n{}",
-            scenario_output(&output_path)
-        );
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{name}: scenario exceeded {SCENARIO_BOUND:?}; killing stuck worker\n{}",
+                scenario_output(&output_path)
+            ));
+        }
         // Poll process liveness only; no correctness oracle depends on this delay.
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn scenario_parent_accepts_one_correct_child() {
+    run_scenario_child("sqlite::writer::tests::writes_run_one_at_a_time_on_one_connection")
+        .unwrap();
+}
+
+#[test]
+fn scenario_parent_rejects_a_stale_filter_even_when_libtest_succeeds() {
+    assert!(run_scenario_child("sqlite::writer::tests::nonexistent_stale_scenario").is_err());
+}
+
+#[test]
+fn scenario_proof_rejects_missing_duplicate_and_wrong_entries() {
+    let summary = "test result: ok. 1 passed; 0 failed; 0 ignored;";
+    for entry in [b"".as_slice(), b"expected\nexpected\n", b"other\n"] {
+        assert!(!scenario_ran_once("expected", entry, summary));
+    }
+}
+
+#[test]
+fn scenario_proof_rejects_zero_or_multiple_tests() {
+    for summary in [
+        "test result: ok. 0 passed; 0 failed;",
+        "test result: ok. 2 passed; 0 failed;",
+    ] {
+        assert!(!scenario_ran_once("expected", b"expected\n", summary));
+    }
+}
+
+#[test]
+fn scenario_diagnostics_keep_the_byte_tail_and_decode_a_split_character_lossily() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("output");
+    let mut bytes = vec![b'x'; OUTPUT_TAIL_BYTES as usize];
+    bytes.extend_from_slice("€".as_bytes());
+    bytes.extend(std::iter::repeat_n(b'y', OUTPUT_TAIL_BYTES as usize - 2));
+    std::fs::write(&path, bytes).unwrap();
+    let output = scenario_output(&path);
+    assert_eq!(
+        output,
+        format!("��{}", "y".repeat(OUTPUT_TAIL_BYTES as usize - 2))
+    );
+}
+
+#[test]
+fn scenario_diagnostics_handle_empty_short_and_invalid_utf8_output() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("output");
+    for bytes in [b"".as_slice(), b"short", b"failure: \xff"] {
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(scenario_output(&path), String::from_utf8_lossy(bytes));
+    }
+}
+
+#[test]
+fn scenario_diagnostic_tail_does_not_cap_the_retained_file() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("output");
+    std::fs::write(&path, vec![b'a'; OUTPUT_TAIL_BYTES as usize + 1]).unwrap();
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(b"later failure").unwrap();
+    assert!(scenario_output(&path).ends_with("later failure"));
+    assert!(file.metadata().unwrap().len() > OUTPUT_TAIL_BYTES);
+}
+
+#[test]
+fn scenario_reap_error_during_unwind_preserves_the_original_panic() {
+    if !in_scenario_child(
+        "sqlite::writer::tests::scenario_reap_error_during_unwind_preserves_the_original_panic",
+    ) {
+        return;
+    }
+    struct FailedReap;
+    impl Drop for FailedReap {
+        fn drop(&mut self) {
+            check_reap(Err(std::io::Error::other("synthetic reap failure")));
+        }
+    }
+    let panic = std::panic::catch_unwind(|| {
+        let _reap = FailedReap;
+        panic!("original scenario failure");
+    })
+    .unwrap_err();
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"original scenario failure")
+    );
+}
+
+#[test]
+fn scenario_reap_error_outside_unwind_is_reported() {
+    assert!(
+        std::panic::catch_unwind(|| {
+            check_reap(Err(std::io::Error::other("synthetic reap failure")));
+        })
+        .is_err()
+    );
 }
 
 trait WaitBounded<T> {
@@ -467,13 +612,23 @@ fn a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body() {
         .execute_batch("CREATE TABLE sample(id INTEGER) STRICT")
         .unwrap();
     let limit = Instant::now() + Duration::from_secs(60);
-    // First read (before BEGIN): in time. Second (reservation held): expired.
-    let reads = std::cell::Cell::new(0);
-    let clock = || {
-        reads.set(reads.get() + 1);
-        if reads.get() == 1 {
+    // A second connection probes the physical write reservation without waiting.
+    // Two pre-BEGIN reads would both acquire it and leave the deadline unexpired.
+    let observer = open_connection(&data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    observer.busy_timeout(Duration::ZERO).unwrap();
+    let held = std::cell::RefCell::new(Vec::new());
+    let clock = || match observer.execute_batch("BEGIN IMMEDIATE") {
+        Ok(()) => {
+            held.borrow_mut().push(false);
+            observer.execute_batch("ROLLBACK").unwrap();
             limit - Duration::from_secs(1)
-        } else {
+        }
+        Err(error) => {
+            assert_eq!(
+                error.sqlite_error_code(),
+                Some(rusqlite::ErrorCode::DatabaseBusy)
+            );
+            held.borrow_mut().push(true);
             limit
         }
     };
@@ -486,7 +641,11 @@ fn a_deadline_that_passes_while_begin_waits_is_rechecked_before_the_body() {
         Ok(())
     });
     assert!(matches!(outcome, Err(SqliteError::Overloaded)));
-    assert_eq!(reads.get(), 2, "deadline read before and after BEGIN");
+    assert_eq!(
+        *held.borrow(),
+        [false, true],
+        "reservation before and after BEGIN"
+    );
     assert!(
         !ran.get(),
         "the body must not run after the recheck refuses it"
@@ -518,6 +677,8 @@ fn a_withdrawn_request_is_never_committed() {
         .unwrap();
     let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // 600 ms is scheduling allowance, not proof of entry into BEGIN. SQLite's
+    // configured 5 s busy timeout is a safety net, longer than this deadline.
     let limit = Instant::now() + Duration::from_millis(600);
     let (ran_tx, ran_rx) = mpsc::channel();
     let receipt = handle
@@ -530,7 +691,8 @@ fn a_withdrawn_request_is_never_committed() {
     std::thread::scope(|scope| {
         let worker = scope.spawn(|| writer.run());
         let _close = CloseOnDrop(&handle);
-        // Still blocked in BEGIN: it passed the pre-BEGIN check and has no answer.
+        // No early answer while contended; the worker may still be unscheduled.
+        // The deterministic reservation probe above proves post-BEGIN ordering.
         assert!(
             receipt
                 .response
