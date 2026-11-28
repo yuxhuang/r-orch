@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use orch_core::store::{events::SequencedEvent, fake::FakeStorage, leases::*, *};
+use orch_domain::{RunEvent, RunEventType};
 use std::sync::Arc;
 
 #[async_trait]
@@ -32,7 +33,6 @@ pub async fn memory_backend() -> Fixture {
         initial_lineage: "initial-lineage".into(),
     }
 }
-use orch_domain::{RunEvent, RunEventType};
 
 fn owner(project: &str) -> Caller {
     Caller {
