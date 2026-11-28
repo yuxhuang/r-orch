@@ -53,16 +53,11 @@ fn command(root: &std::path::Path) -> Command {
 
 #[cfg(target_os = "linux")]
 fn controlling_terminal() -> i64 {
-    let stat = fs::read_to_string("/proc/self/stat").unwrap();
-    // comm is parenthesized and may contain spaces; tty_nr is field 7.
-    stat.rsplit_once(')')
-        .unwrap()
-        .1
-        .split_whitespace()
-        .nth(4)
-        .unwrap()
-        .parse()
-        .unwrap()
+    match fs::File::open("/dev/tty") {
+        Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ENXIO as i32) => 0,
+        Ok(_) => 1,
+        Err(error) => panic!("cannot check the controlling terminal: {error}"),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -109,7 +104,7 @@ fn descriptor_opens_never_acquire_a_controlling_terminal() {
         // or an extra dependency. Keep its master open across exec, so the slave
         // is live when the real confined operation opens and refuses it.
         let child = command(root.path());
-        let mut launcher = Command::new("python3");
+        let mut launcher = Command::new("/usr/bin/python3");
         launcher.args(["-c", "import os, pty, sys\nm,s=pty.openpty()\nos.environ['FOUNDATION_TERMINAL']=os.ttyname(s)\nos.close(s)\nos.set_inheritable(m,True)\nos.setsid()\nos.execv(sys.argv[1],sys.argv[1:])"])
             .arg(child.get_program())
             .args(["--exact", "terminal_open_child", "--ignored", "--nocapture", "--test-threads=1"])
@@ -235,7 +230,9 @@ fn interrupted_project_records_refuse_without_retargeting() {
                 .unwrap(),
         );
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !root.path().join("ready").exists() {
+        while fs::read(root.path().join("ready")).ok().as_deref()
+            != Some(b"foundation-record-written")
+        {
             assert!(
                 child.0.try_wait().unwrap().is_none(),
                 "record child exited before boundary"
