@@ -282,11 +282,17 @@ async fn rollback(adapter: Adapter) {
     refusal(error);
 }
 
-async fn context_provenance(adapter: Adapter) {
+async fn context_provenance(adapter: Adapter, worker: bool) {
     let fixture = Fixture::new(adapter);
     let mut caller = owner();
-    caller.principal = Principal::Owner {
-        identity: "é".repeat(32_768),
+    caller.principal = if worker {
+        Principal::Worker {
+            identity: "é".repeat(32_768),
+        }
+    } else {
+        Principal::Owner {
+            identity: "é".repeat(32_768),
+        }
     };
     fixture
         .storage
@@ -295,9 +301,10 @@ async fn context_provenance(adapter: Adapter) {
         })
         .await
         .unwrap();
-    caller.principal = Principal::Owner {
-        identity: "é".repeat(32_768) + "x",
-    };
+    match &mut caller.principal {
+        Principal::Owner { identity } | Principal::Worker { identity } => identity.push('x'),
+        Principal::Task { .. } => unreachable!(),
+    }
     let before = fixture.get(EntityKind::Context, "context").await.unwrap();
     let error = fixture
         .storage
@@ -438,7 +445,11 @@ macro_rules! matrix {
             }
             #[tokio::test]
             async fn context_creation_bounds_provenance_and_update_preserves_it() {
-                context_provenance($adapter).await;
+                context_provenance($adapter, false).await;
+            }
+            #[tokio::test]
+            async fn worker_context_creation_bounds_provenance_and_update_preserves_it() {
+                context_provenance($adapter, true).await;
             }
         }
     };
