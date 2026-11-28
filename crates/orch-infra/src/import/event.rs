@@ -79,6 +79,9 @@ impl<R: Read, T: DeserializeOwned> Iterator for EventStream<R, T> {
                 Some(line) => line,
                 None => {
                     self.finished = true;
+                    // Defensive internal diagnostic, not an input-size budget. The
+                    // generic refusal keeps its historical zero limit; reaching
+                    // it requires more than u64::MAX physical lines.
                     return Some(Err(Refusal::invalid("lines", "line count overflow")));
                 }
             };
@@ -107,5 +110,22 @@ impl<R: Read, T: DeserializeOwned> Iterator for EventStream<R, T> {
                 },
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod overflow_tests {
+    use super::*;
+
+    #[test]
+    fn theoretical_line_counter_overflow_is_a_terminal_lines_diagnostic() {
+        // No filesystem fixture can practically contain 2^64 physical lines.
+        // Seed only the counter; use the actual line reader and refusal path.
+        let mut stream = EventStream::<_, serde_json::Value>::new(&b"0\n1\n"[..], Limits::EVENT);
+        stream.line = u64::MAX;
+        let error = stream.next().unwrap().unwrap_err();
+        assert_eq!(error.rule, "lines");
+        assert_eq!(error.limit, 0);
+        assert!(stream.next().is_none());
     }
 }

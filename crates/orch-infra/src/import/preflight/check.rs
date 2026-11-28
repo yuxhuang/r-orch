@@ -177,7 +177,8 @@ enum Listed {
 }
 
 /// A reader that stops at the next call once the flag is set, so a long file or
-/// attachment cannot hold a cancelled check.
+/// attachment stops between reads. A read already blocked in the kernel must
+/// return before the flag is observed; cancellation gives no shutdown deadline.
 struct Cancelable<'a, R> {
     inner: R,
     flag: &'a AtomicBool,

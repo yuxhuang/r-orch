@@ -116,6 +116,9 @@ pub struct Report {
     pub refusals: Capped<Finding>,
     /// Listed and not a stop: no rule for a path, an unclaimed workspace, event gaps.
     pub notes: Capped<Finding>,
+    /// Not truncated by REPORT_LIMIT: every required confirmation is retained.
+    /// Both run lists are bounded by the accepted state.json (16 MiB, depth 64,
+    /// 1,000,000 JSON nodes). Escaped identities are separately cut at 1,024 bytes.
     pub confirmations: Vec<Confirmation>,
     /// Run ids the owner said have ended and that the check accepted.
     pub assumed_stopped: Vec<String>,
