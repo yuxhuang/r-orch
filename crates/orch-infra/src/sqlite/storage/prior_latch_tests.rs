@@ -110,6 +110,49 @@ async fn a_prior_latch_serves_a_new_snapshot_entity_and_operational_reads() {
 }
 
 #[tokio::test]
+async fn a_prior_latch_serves_agent_get_and_page_with_operational_reads() {
+    let (_temp, _data, storage) = seeded().await;
+    storage
+        .transaction(owner(), Lane::Entities, |u| {
+            u.create(Entity::Agent(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "id":"a","name":"kept agent","adapter":"shell","config":{},
+                    "status":"idle","stats":{"tasks_completed":0,"tasks_failed":0,
+                    "total_runs":0,"total_runtime_ms":0}
+                }))
+                .unwrap(),
+            )))
+        })
+        .await
+        .unwrap();
+    latch(&storage);
+    let snapshot = storage.read(owner()).await.unwrap();
+    for _ in 0..2 {
+        let Some(record) = snapshot.get(EntityKind::Agent, "a").await.unwrap() else {
+            panic!("the pooled Agent read must return its stored value after a prior latch")
+        };
+        let Entity::Agent(agent) = record.entity else {
+            panic!("an Agent read must keep its entity kind")
+        };
+        assert_eq!(agent.name, "kept agent");
+        assert_eq!(
+            snapshot
+                .list(&Filter::Agents, &PageRequest::default())
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+        assert_eq!(snapshot.read_leases().await.unwrap().len(), 1);
+        assert!(snapshot.read_agent_lease("a").await.unwrap().is_some());
+    }
+    assert!(storage.failure_state().failure().is_some());
+    drop(snapshot);
+    storage.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn a_fatal_observation_since_a_snapshot_was_requested_refuses_its_calls() {
     let (_temp, _data, storage) = seeded().await;
     let before = storage.read(owner()).await.unwrap();
