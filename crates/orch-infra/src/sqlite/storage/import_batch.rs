@@ -5,14 +5,14 @@ use orch_core::store::{Principal, UnitOfWork};
 use rusqlite::{OptionalExtension, params};
 
 impl SqliteStorage {
-    /// Validate the complete checked source against every retained template before
+    /// Validate the complete checked source against every retained entity before
     /// admitting new rows. Missing files and changed native rows cannot be hidden
     /// by processing a newly added name first. This transaction changes no rows.
     pub async fn check_import_source(
         &self,
         caller: Caller,
         source: String,
-        templates: std::collections::BTreeMap<String, String>,
+        inventory: crate::import::ImportInventory,
     ) -> store::Result<WriteAttempt> {
         if !matches!(caller.principal, Principal::Owner { .. })
             || !std::path::Path::new(&source).is_absolute()
@@ -21,7 +21,7 @@ impl SqliteStorage {
         }
         self.retained_write(caller, store::Lane::Entities, None)
             .attempt_unit(Box::new(move |unit| {
-                unit.check_import_source(source, templates)
+                unit.check_import_source(source, inventory)
             }))
             .await
     }
@@ -35,6 +35,25 @@ impl SqliteStorage {
         &self,
         caller: Caller,
         batch: ImportBatch,
+    ) -> store::Result<WriteAttempt> {
+        self.submit_import_batch(caller, batch, false).await
+    }
+
+    /// Validate retained native values before any new row is admitted on resume.
+    /// Unseen rows are checked again by the eventual writing transaction.
+    pub async fn validate_import_batch(
+        &self,
+        caller: Caller,
+        batch: ImportBatch,
+    ) -> store::Result<WriteAttempt> {
+        self.submit_import_batch(caller, batch, true).await
+    }
+
+    async fn submit_import_batch(
+        &self,
+        caller: Caller,
+        batch: ImportBatch,
+        check_only: bool,
     ) -> store::Result<WriteAttempt> {
         if !matches!(caller.principal, Principal::Owner { .. }) {
             return Err(backend("import requires an owner"));
@@ -56,7 +75,9 @@ impl SqliteStorage {
             }
         }
         self.retained_write(caller, store::Lane::Entities, None)
-            .attempt_unit(Box::new(move |unit| unit.apply_import_batch(batch)))
+            .attempt_unit(Box::new(move |unit| {
+                unit.apply_import_batch(batch, check_only)
+            }))
             .await
     }
 }
@@ -65,9 +86,8 @@ impl Unit<'_, '_> {
     fn check_import_source(
         &mut self,
         source: String,
-        templates: std::collections::BTreeMap<String, String>,
+        inventory: crate::import::ImportInventory,
     ) -> store::Result<()> {
-        use sha2::{Digest, Sha256};
         port(self.ensure_committable())?;
         let result: Result<()> = (|| {
             let project = self.caller().project.clone();
@@ -100,23 +120,33 @@ impl Unit<'_, '_> {
             })?;
             for row in rows {
                 let (family, id, hash) = row?;
-                if family != "template" || templates.get(&id) != Some(&hash) {
+                let kind = match family.as_str() {
+                    "task" => EntityKind::Task,
+                    "agent" => EntityKind::Agent,
+                    "goal" => EntityKind::Goal,
+                    "message" => EntityKind::Message,
+                    "context" => EntityKind::Context,
+                    "config" => EntityKind::Config,
+                    "template" => EntityKind::Template,
+                    _ => return Err(backend("unsupported retained import family").into()),
+                };
+                let Some((expected_hash, position)) = inventory.get(&(kind, id.clone())) else {
+                    return Err(
+                        backend("imported source changed or is missing; resume refused").into(),
+                    );
+                };
+                if expected_hash != &hash {
                     return Err(
                         backend("imported source changed or is missing; resume refused").into(),
                     );
                 }
-                let native = self.get(EntityKind::Template, &id)?;
-                let Some(Record {
-                    entity: Entity::Template(template),
-                    ..
-                }) = native
-                else {
+                let native = self
+                    .get(kind, &id)?
+                    .ok_or_else(|| backend("imported native entity is missing; resume refused"))?;
+                if position.is_some_and(|position| position != native.position) {
                     return Err(
-                        backend("imported native template is missing; resume refused").into(),
+                        backend("imported source or native order changed; resume refused").into(),
                     );
-                };
-                if format!("{:x}", Sha256::digest(template.body.as_bytes())) != hash {
-                    return Err(backend("imported native template changed; resume refused").into());
                 }
             }
             Ok(())
@@ -124,7 +154,7 @@ impl Unit<'_, '_> {
         self.observed(result)
     }
 
-    fn apply_import_batch(&mut self, batch: ImportBatch) -> store::Result<()> {
+    fn apply_import_batch(&mut self, batch: ImportBatch, check_only: bool) -> store::Result<()> {
         port(self.ensure_committable())?;
         let result: Result<()> = (|| {
             let project = self.caller().project.clone();
@@ -170,8 +200,14 @@ impl Unit<'_, '_> {
                     }
                     continue;
                 }
+                if check_only {
+                    continue;
+                }
                 self.create(row.entity)?;
                 self.tx.execute("INSERT INTO import_manifest(project_id,entity,entity_id,source_sha256,imported_at) VALUES(?1,?2,?3,?4,?5)", params![project,family,id,row.source_sha256,self.now])?;
+            }
+            if check_only {
+                return Ok(());
             }
             self.tx.execute("INSERT INTO daemon_config(key,value,revision) VALUES(?1,?2,1) ON CONFLICT(key) DO UPDATE SET value=excluded.value,revision=daemon_config.revision+1", params![key,progress])?;
             Ok(())
@@ -391,6 +427,112 @@ mod tests {
                 .result
                 .is_err()
         );
+        assert_eq!(manifest_count(&data), 1);
+        storage.close().await.unwrap();
+    }
+    #[tokio::test]
+    async fn source_inventory_checks_family_hash_missing_rows_and_retained_order() {
+        let (_root, data) = crate::sqlite::test_data();
+        let data = Arc::new(data);
+        let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+        let mut task = orch_core::test_support::make_task();
+        task.id = "synthetic_task".into();
+        task.created_at = "2025-01-01T00:00:00.000Z".into();
+        task.updated_at = task.created_at.clone();
+        let task_row = ImportRow {
+            entity: Entity::Task(Box::new(task)),
+            source_sha256: "a".repeat(64),
+        };
+        storage
+            .import_batch(caller(), batch(vec![task_row.clone()]))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let source = "/synthetic/source".to_owned();
+        let inventory = crate::import::ImportInventory::from([(
+            (EntityKind::Task, "synthetic_task".into()),
+            ("a".repeat(64), Some(1)),
+        )]);
+        storage
+            .check_import_source(caller(), source.clone(), inventory.clone())
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        let mut changed = inventory.clone();
+        changed.values_mut().next().unwrap().1 = Some(2);
+        let refused = storage
+            .check_import_source(caller(), source.clone(), changed)
+            .await
+            .unwrap();
+        assert!(refused.result.is_err());
+        assert_eq!(
+            refused.outcome,
+            super::super::super::WriteOutcome::RolledBack
+        );
+        assert!(
+            storage
+                .check_import_source(caller(), source.clone(), Default::default())
+                .await
+                .unwrap()
+                .result
+                .is_err()
+        );
+        let mut changed = inventory;
+        changed.values_mut().next().unwrap().0 = "b".repeat(64);
+        assert!(
+            storage
+                .check_import_source(caller(), source, changed)
+                .await
+                .unwrap()
+                .result
+                .is_err()
+        );
+        assert_eq!(manifest_count(&data), 1);
+        storage.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prewrite_validation_detects_native_drift_and_never_creates_unseen_rows() {
+        let (_root, data) = crate::sqlite::test_data();
+        let data = Arc::new(data);
+        let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+        let retained = row("retained", 'a');
+        storage
+            .import_batch(caller(), batch(vec![retained.clone()]))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        storage
+            .validate_import_batch(caller(), batch(vec![row("unseen", 'b'), retained.clone()]))
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert_eq!(manifest_count(&data), 1);
+        let mut drift = retained;
+        if let Entity::Template(template) = &mut drift.entity {
+            template.body.push_str("changed");
+        }
+        let refused = storage
+            .validate_import_batch(caller(), batch(vec![row("unseen", 'b'), drift]))
+            .await
+            .unwrap();
+        assert!(refused.result.is_err());
+        assert_eq!(
+            refused.outcome,
+            super::super::super::WriteOutcome::RolledBack
+        );
+        let view = storage.read(caller()).await.unwrap();
+        assert!(
+            view.get(EntityKind::Template, "unseen")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(view);
         assert_eq!(manifest_count(&data), 1);
         storage.close().await.unwrap();
     }

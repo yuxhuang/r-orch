@@ -1,5 +1,4 @@
-//! Issue 146: synthetic reader decisions through the native template caller.
-//! These checks do not claim that non-template entities are imported.
+//! Issue 146: synthetic reader decisions through the unfinished native caller.
 #![cfg(target_os = "linux")]
 
 use serde_json::{Value, json};
@@ -9,6 +8,11 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+// Frozen config defaults contribute 18 settings plus inert legacy.config.
+// The base fixture also contains one template.
+const DEFAULT_CONFIG_ROWS: usize = 19;
+const FIXTURE_ROWS: usize = DEFAULT_CONFIG_ROWS + 1;
 
 const STORES: [&str; 5] = ["tasks", "agents", "goals", "messages", "context"];
 
@@ -180,7 +184,7 @@ fn refusal_parity(root: &Path, existing: bool) -> Value {
 fn prepare(existing: bool) -> tempfile::TempDir {
     let root = fixture();
     if existing {
-        assert_eq!(run(root.path(), &[], 1)["imported"], 1);
+        assert_eq!(run(root.path(), &[], 1)["imported"], FIXTURE_ROWS);
     }
     root
 }
@@ -265,7 +269,7 @@ fn c_v1_v7_v8_v14_defaults_and_explicit_caps_match_before_template_writes() {
             usize::from(inherited)
         );
         assert_eq!(dry["preflight"]["refusals"]["listed"], json!([]));
-        assert_eq!(write["imported"], 1);
+        assert_eq!(write["imported"], FIXTURE_ROWS);
         assert_eq!(write["unfinished"], true);
         assert_eq!(snapshot(&root.path().join("source"), true), before);
     }
@@ -401,7 +405,10 @@ fn x_v1_to_v3_v8_to_v11_index_order_is_previewed_identically_before_template_wri
                 usize::from(unreadable)
             );
             assert_eq!(snapshot(&root.path().join("source"), true), before);
-            assert_eq!(write["imported"], 1);
+            // Each populated family has exactly three native rows, in addition
+            // to the default settings and the fixture template.
+            assert_eq!(report["counts"][store], 3, "{store}: {report}");
+            assert_eq!(write["imported"], FIXTURE_ROWS + 3, "{store}: {write}");
         }
     }
 }
@@ -575,19 +582,44 @@ fn terminal_index_open_error_is_io_and_never_an_unreadable_index() {
 
 #[test]
 fn dry_run_auto_policy_is_a_confirmation_preview_and_creates_nothing() {
-    let root = fixture();
-    let mut agent = entity("agents", "a");
-    agent["config"]["approval_policy"] = json!("auto");
-    put(root.path(), "agents/a.yml", agent.to_string());
-    let before = snapshot(&root.path().join("source"), true);
-    let dry = run(root.path(), &["--dry-run"], 0);
-    let report = &dry["preflight"];
-    assert_eq!(report["preapproval_requires_confirmation"], true);
-    assert_eq!(notes(report, "preapproval_confirmation").count(), 1);
-    assert_eq!(report["refusals"]["listed"], json!([]));
-    assert_eq!(dry["imported"], 0);
-    assert!(!root.path().join("data").exists());
-    assert_eq!(snapshot(&root.path().join("source"), true), before);
+    for existing in [false, true] {
+        let root = prepare(existing);
+        let mut agent = entity("agents", "a");
+        agent["config"]["approval_policy"] = json!("auto");
+        put(root.path(), "agents/a.yml", agent.to_string());
+        let source = snapshot(&root.path().join("source"), true);
+        let destination = snapshot(&root.path().join("data"), false);
+        let modes: &[&[&str]] = if existing {
+            &[&["--resume", "--dry-run"], &["--resume"]]
+        } else {
+            &[&["--dry-run"], &[]]
+        };
+        let dry = run(root.path(), modes[0], 0);
+        let report = &dry["preflight"];
+        assert_eq!(report["preapproval_requires_confirmation"], true);
+        assert_eq!(notes(report, "preapproval_confirmation").count(), 1);
+        assert_eq!(report["refusals"]["listed"], json!([]));
+        assert_eq!(dry["imported"], 0);
+        assert_eq!(dry["unfinished"], false);
+        assert_eq!(snapshot(&root.path().join("source"), true), source);
+        assert_eq!(snapshot(&root.path().join("data"), false), destination);
+
+        let write = run(root.path(), modes[1], 2);
+        assert_eq!(write["preflight"], *report);
+        assert!(
+            write["detail"]
+                .as_str()
+                .unwrap()
+                .contains("owner confirmation")
+        );
+        assert_eq!(write["imported"], 0);
+        assert_eq!(write["unfinished"], false);
+        assert_eq!(snapshot(&root.path().join("source"), true), source);
+        assert_eq!(snapshot(&root.path().join("data"), false), destination);
+        if !existing {
+            assert!(!root.path().join("data").exists());
+        }
+    }
 }
 
 #[test]

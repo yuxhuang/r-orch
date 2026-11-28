@@ -3,7 +3,7 @@ use serde_json::{Value, value::RawValue};
 use std::collections::BTreeMap;
 
 /// A YAML-only ignored key cannot be represented in any JSON index entry.
-pub(super) struct DocumentContent(pub(super) Option<Box<RawValue>>);
+pub(super) struct DocumentContent(pub(super) Option<Box<RawValue>>, pub(super) String);
 
 impl DocumentContent {
     pub(super) fn matches(&self, index: &RawValue) -> bool {

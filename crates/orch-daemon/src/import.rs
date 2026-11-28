@@ -314,21 +314,25 @@ async fn execute(request: ImportRequest, cancel: Arc<AtomicBool>) -> ImportOutco
         result.detail = "dry run; no import batches admitted".into();
         return result;
     }
+    if prepared.report.preapproval_requires_confirmation {
+        result.detail =
+            "owner confirmation of preapproval is required; this candidate cannot enable it".into();
+        return result;
+    }
     if existing.is_some() && !request.resume {
         result.detail = "existing destination requires --resume; no import batches admitted".into();
         return result;
     }
-    if prepared.template_count() == 0 {
-        result.detail =
-            "bounded caller has no templates to import; other families remain unsupported".into();
+    if prepared.row_count() == 0 {
+        result.detail = "bounded caller has no supported rows to import".into();
         return result;
     }
-    // Perform the first second-read before creating the destination.
+    // Perform the first verified second read before creating the destination.
     let input = prepared.clone();
-    let first = match tokio::task::spawn_blocking(move || input.load_template(0)).await {
+    let first = match tokio::task::spawn_blocking(move || input.load_row(0)).await {
         Ok(Ok(row)) => row,
         _ => {
-            result.detail = "template changed or load was cancelled before writing".into();
+            result.detail = "source changed or load was cancelled before writing".into();
             return result;
         }
     };
@@ -395,7 +399,7 @@ async fn execute(request: ImportRequest, cancel: Arc<AtomicBool>) -> ImportOutco
         .check_import_source(
             caller.clone(),
             source.to_string_lossy().into_owned(),
-            prepared.template_inventory(),
+            prepared.inventory(),
         )
         .await;
     if !matches!(checked, Ok(ref attempt) if attempt.outcome == WriteOutcome::Committed && attempt.result.is_ok())
@@ -406,8 +410,42 @@ async fn execute(request: ImportRequest, cancel: Arc<AtomicBool>) -> ImportOutco
         }
         return result;
     }
+    // Validate every retained payload before admitting any newly added source row.
+    // Each load remains bounded and the source guards survive every awaited receipt.
+    for index in 0..prepared.row_count() {
+        let input = prepared.clone();
+        let row = match tokio::task::spawn_blocking(move || input.load_row(index)).await {
+            Ok(Ok(row)) if !cancelled(&cancel) => row,
+            _ => {
+                result.detail =
+                    "source changed or load cancelled during resume validation; import unfinished"
+                        .into();
+                break;
+            }
+        };
+        let checked = storage
+            .validate_import_batch(
+                caller.clone(),
+                ImportBatch {
+                    source: source.to_string_lossy().into_owned(),
+                    rows: vec![row],
+                },
+            )
+            .await;
+        if !matches!(checked, Ok(ref attempt) if attempt.outcome == WriteOutcome::Committed && attempt.result.is_ok())
+        {
+            result.detail = "native payload check refused resume; import unfinished".into();
+            break;
+        }
+    }
+    if !result.detail.is_empty() {
+        if storage.close().await.is_err() {
+            result.detail.push_str("; writer shutdown failed");
+        }
+        return result;
+    }
     let mut first = Some(first);
-    for index in 0..prepared.template_count() {
+    for index in 0..prepared.row_count() {
         if cancelled(&cancel) {
             result.detail = "cancelled; import unfinished".into();
             break;
@@ -416,7 +454,7 @@ async fn execute(request: ImportRequest, cancel: Arc<AtomicBool>) -> ImportOutco
             row
         } else {
             let input = prepared.clone();
-            match tokio::task::spawn_blocking(move || input.load_template(index)).await {
+            match tokio::task::spawn_blocking(move || input.load_row(index)).await {
                 Ok(Ok(row)) => row,
                 _ => {
                     result.detail = "source changed or load cancelled; import unfinished".into();
@@ -456,11 +494,55 @@ async fn execute(request: ImportRequest, cancel: Arc<AtomicBool>) -> ImportOutco
         result.detail = "writer shutdown failed; import unfinished".into();
     }
     if result.detail.is_empty() {
-        result.detail = "templates retained; import unfinished: config, state, other entity families, events, attachments, R121 and R125 are not implemented".into();
+        result.detail = "supported native rows retained; import unfinished: state, other entity families, events, attachments, R121 and R125 are not implemented".into();
     }
     // `storage.close` has drained before these held guards leave scope.
     drop(storage);
     drop(data);
     drop(prepared);
     result
+}
+
+#[cfg(test)]
+mod native_tests {
+    use super::*;
+    #[tokio::test]
+    async fn config_and_indexed_files_are_retained_without_templates() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        std::fs::create_dir_all(source.join(".orchestry/tasks")).unwrap();
+        for id in ["alpha", "zulu"] {
+            std::fs::write(source.join(format!(".orchestry/tasks/{id}.yml")), format!(
+                "id: {id}\ntitle: synthetic\ndescription: source file\nstatus: todo\npriority: 1\ncreated_at: '2025-01-01T00:00:00.000Z'\nupdated_at: '2025-01-01T00:00:00.000Z'\nattempts: 0\nmax_attempts: 3\n"
+            )).unwrap();
+        }
+        std::fs::write(
+            source.join(".orchestry/tasks/_index.json"),
+            r#"[{"id":"zulu"},{"id":"alpha"}]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            source.join(".orchestry/config.yml"),
+            "scheduling: {max_concurrent_agents: 2}\ncustom: {preapproval: true}\n",
+        )
+        .unwrap();
+        let dest = root.path().join("destination");
+        let result = import_offline(
+            ImportRequest {
+                source,
+                data_home: root.path().join("unused"),
+                data_dir: Some(dest.clone()),
+                tmp_dir: root.path().join("tmp"),
+                socket: None,
+                dry_run: false,
+                resume: false,
+                assume_stopped: vec![],
+            },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+        assert_eq!(result.exit_code, 1, "{}", result.detail);
+        assert!(result.unfinished);
+        assert_eq!(result.imported, 21, "{}", result.detail);
+    }
 }
