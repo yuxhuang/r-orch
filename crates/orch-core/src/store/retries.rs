@@ -48,6 +48,8 @@ use async_trait::async_trait;
 
 use super::Result;
 
+pub mod stream;
+
 #[cfg(feature = "test-support")]
 pub mod fake;
 
