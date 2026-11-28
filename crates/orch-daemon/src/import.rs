@@ -545,4 +545,121 @@ mod native_tests {
         assert!(result.unfinished);
         assert_eq!(result.imported, 21, "{}", result.detail);
     }
+
+    #[tokio::test]
+    async fn retained_config_drift_refuses_resume_before_new_tasks() {
+        use orch_core::store::StorageExt;
+        use orch_infra::sqlite::{ConnectionRole, Synchronous, open_connection};
+
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let tasks = source.join(".orchestry/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(
+            source.join(".orchestry/config.yml"),
+            "scheduling: {max_concurrent_agents: 2}\n",
+        )
+        .unwrap();
+        let write_task = |id: &str| {
+            std::fs::write(tasks.join(format!("{id}.yml")), format!("id: {id}\ntitle: synthetic\ndescription: source file\nstatus: todo\npriority: 1\ncreated_at: '2025-01-01T00:00:00.000Z'\nupdated_at: '2025-01-01T00:00:00.000Z'\nattempts: 0\nmax_attempts: 3\n")).unwrap();
+        };
+        write_task("alpha");
+        let dest = root.path().join("destination");
+        let request = |resume| ImportRequest {
+            source: source.clone(),
+            data_home: root.path().join("unused"),
+            data_dir: Some(dest.clone()),
+            tmp_dir: root.path().join("tmp"),
+            socket: None,
+            dry_run: false,
+            resume,
+            assume_stopped: vec![],
+        };
+        let first = import_offline(request(false), Arc::new(AtomicBool::new(false))).await;
+        assert_eq!(first.exit_code, 1, "{}", first.detail);
+        assert!(first.unfinished);
+        assert_eq!(first.imported, 20, "{}", first.detail);
+        let holder = Holder {
+            kind: LockKind::Import,
+            pid: std::process::id(),
+            started_at: "synthetic".into(),
+            binary_version: "test".into(),
+            executable: "orch import".into(),
+        };
+        // Snapshot all entity, manifest and progress columns, including revisions.
+        let snapshot = |data: &DataDir| {
+            let conn = open_connection(data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
+            [
+                "tasks",
+                "project_config",
+                "import_manifest",
+                "daemon_config",
+            ]
+            .map(|table| {
+                let mut statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
+                let columns = statement.column_count();
+                let mut rows: Vec<Vec<String>> = statement
+                    .query_map([], |row| {
+                        Ok((0..columns)
+                            .map(|index| format!("{:?}", row.get_ref(index).unwrap()))
+                            .collect())
+                    })
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect();
+                rows.sort();
+                rows
+            })
+        };
+        let before = {
+            let data = Arc::new(DataDir::acquire(&dest, &holder).unwrap());
+            let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+            let caller = Caller {
+                project: paths::default_name(&source).unwrap(),
+                principal: Principal::Owner {
+                    identity: "local_owner".into(),
+                },
+            };
+            // Use a normal native update so detail/column integrity remains
+            // valid; only comparison with the retained source can find drift.
+            storage
+                .transaction(caller, orch_core::store::Lane::Entities, |unit| {
+                    use orch_core::store::{Entity, EntityKind};
+                    let mut record = unit.get(EntityKind::Config, "run_cap")?.unwrap();
+                    let Entity::Config(config) = &mut record.entity else {
+                        panic!("config row");
+                    };
+                    assert_eq!(config.value, "2");
+                    config.value = "999".into();
+                    unit.update(record.entity, record.revision)
+                })
+                .await
+                .unwrap();
+            storage.close().await.unwrap();
+            drop(storage);
+            snapshot(&data)
+        };
+        // Tasks load before config: without the all-retained pass this new task
+        // would commit before the later run_cap drift is noticed.
+        write_task("zulu_new");
+        let resumed = import_offline(request(true), Arc::new(AtomicBool::new(false))).await;
+        assert_eq!(resumed.exit_code, 1, "{}", resumed.detail);
+        assert!(resumed.unfinished);
+        assert_eq!(resumed.imported, 0, "{}", resumed.detail);
+        assert_eq!(
+            resumed.detail,
+            "native payload check refused resume; import unfinished"
+        );
+        let data = DataDir::acquire(&dest, &holder).unwrap();
+        assert_eq!(snapshot(&data), before);
+        let conn = open_connection(&data, ConnectionRole::Reader, Synchronous::Normal).unwrap();
+        let new_tasks: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE id='zulu_new'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_tasks, 0);
+    }
 }
