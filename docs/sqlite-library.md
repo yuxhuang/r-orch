@@ -206,6 +206,11 @@ implementation task, not this probe. Existing rows are backfilled in the numbere
 transaction, or through an explicitly resumable plan if too large; never rewrite applied SQL.
 Rollback means restoring the pre-migration backup with its matching binary, not a down migration.
 
+*Status at `8df7ba9a0` (2026-11-28).* The shipped ledger has two columns, `version` and `applied_at`, and a start
+checks that the version numbers are exactly 1 to `user_version`; it stores and checks no identity or checksum of a
+migration's SQL. The stronger ledger described above is not built, and whether to build it is open (the spec's "What
+the stored format does not version (issue 485)").
+
 Use a dedicated read-only source connection and separate destination for incremental online backup.
 The probe pins a WAL read snapshot, commits a writer update, and backs up the old snapshot correctly.
 Production backup also needs deadlines/retry bounds and coordination of blobs/repos; SQLite's API

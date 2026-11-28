@@ -900,7 +900,8 @@ change (R49):
 | teams | `created_at`, `id` (1.0's order came from the filesystem and was not a contract) | `name` |
 | runs | `started_at` descending, `id` (1.0 broke equal start times by directory order, which was not a contract); when the filter names a task, with or without an `agent` filter beside it: `attempt` numerically descending, then `id` ("Run and goal default order" below) | when the filter names a task: `attempt` (`Sort::Attempt`, below). `Run` has no `run_no` field |
 
-**Index coverage of the Task sorts, as built** (issue 165; read at `58d3f7fb5`, tree `c4b5eba99`, from the source and from
+**Index coverage of the Task sorts, as built** (issue 165; read at `58d3f7fb5`, tree `c4b5eba99`, and run again at `8df7ba9a0`, tree `2dd73fb05`, where the recorder
+printed the same plans; from the source and from
 the `#[ignore]` recorder `sqlite::task_adapter::tests::record_page_costs`, which prints `EXPLAIN QUERY PLAN` for the
 statements it mirrors from `task_page::query`; it asserts nothing). The accepted contract is the order and not an
 index: the first four lines below are what the SQLite adapter does, and no text of this spec promises more.
