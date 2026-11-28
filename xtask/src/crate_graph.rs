@@ -171,6 +171,10 @@ const ENGINE_INFRA_SITES: &[(&str, &str)] = &[
         "rehydrating remote runs at startup reads the persisted RemoteAgentDirectory snapshot, as message_service.rs does",
     ),
     (
+        "orchestrator/claim_v2/tests/sqlite.rs",
+        "cfg(test) reservation fixture opens the concrete SQLite backend",
+    ),
+    (
         "orchestrator/claim_v2/tests.rs",
         "file-reference scenario assembly for reservation commit, rollback and approval refusal",
     ),
