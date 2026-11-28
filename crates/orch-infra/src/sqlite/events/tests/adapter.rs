@@ -637,3 +637,117 @@ fn disk_blob_size_refusal_rolls_back_prior_events_metadata_and_gaps() {
         });
     });
 }
+
+#[test]
+fn caught_event_whole_transaction_rollback_refuses_later_work_and_reopens_empty() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (fx, data) = fixture();
+    let blobs = Arc::new(DiskBlobStore::open(data.root()).unwrap());
+    let large = sized_event(1, 65_537);
+    let bytes = serde_json::to_vec(&large.event).unwrap();
+    let hash = BlobHash::of(&bytes);
+    let reached = Arc::new(AtomicBool::new(false));
+    let later = Arc::clone(&reached);
+    with_writer(&data, |w| {
+        submit(w, Lane::Entities, |tx| {
+            tx.execute_batch("CREATE TRIGGER end_second BEFORE INSERT ON run_events WHEN NEW.seq = 2 BEGIN SELECT RAISE(ROLLBACK,'event whole rollback'); END;")?;
+            Ok(())
+        }).unwrap();
+        let pool = pool(&data);
+        let adapter = EventAdapter {
+            writer: w,
+            readers: &pool,
+            caller: owner("p"),
+            blobs: &blobs,
+        };
+        let lineage = fx.lineage.clone();
+        let result = adapter.write(None, move |unit| {
+            unit.gap("run", 10, 2)?;
+            assert!(matches!(
+                unit.append("run", &lineage, 2, &[large, event(2)]),
+                Err(StoreError::Backend(_))
+            ));
+            later.store(true, Ordering::SeqCst);
+            // Even a read-only empty append is refused by the poisoned batch.
+            assert!(unit.append("another", &lineage, 3, &[]).is_err());
+            assert!(unit.append("another", &lineage, 3, &[event(9)]).is_err());
+            assert!(unit.gap("another", 20, 2).is_err());
+            Ok(())
+        });
+        assert!(matches!(result, Err(StoreError::Backend(_))));
+    });
+    assert!(reached.load(Ordering::SeqCst));
+    drop(data);
+    let reopened = acquire(&fx.path);
+    let pool = pool(&reopened);
+    snapshot(&pool, |tx| {
+        let state = ["run_events", "run_event_gaps", "blobs"].map(|table| {
+            tx.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        });
+        assert_eq!(state, [0, 0, 0]);
+    });
+    // F7 is a separate filesystem outcome: publication precedes the SQL row.
+    // No sweep/retention acceptance is implied by this orphan characterization.
+    let reopened_blobs = DiskBlobStore::open(reopened.root()).unwrap();
+    assert_eq!(
+        reopened_blobs
+            .get(&hash)
+            .expect("F7: unswept publication remains until the T15 orphan sweep"),
+        bytes
+    );
+}
+
+#[test]
+fn caught_raw_event_rollback_blocks_an_attempted_later_entity_write() {
+    let (fx, data) = fixture();
+    with_writer(&data, |w| {
+        submit(w, Lane::Entities, |tx| {
+            tx.execute_batch("CREATE TRIGGER end_second BEFORE INSERT ON run_events WHEN NEW.seq = 2 BEGIN SELECT RAISE(ROLLBACK,'raw event rollback'); END;")?;
+            Ok(())
+        }).unwrap();
+        let lineage = fx.lineage.clone();
+        let receipt = submit(w, Lane::Events, move |tx| {
+            record_event_gap(tx, "p", "run", 10, 2).unwrap();
+            let error = append_events(tx, &owner("p"), "run", &lineage, 2, &[event(1), event(2)]);
+            assert!(
+                matches!(error, Err(EventsError::Sql(ref e)) if e.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::ConstraintViolation))
+            );
+            assert!(tx.is_autocommit(), "RAISE(ABORT) is not this failure mode");
+            // Catch the original failure and actually issue a new SQL write.
+            // Returning its error would also test only an early-return path.
+            let _caught = tx.execute(
+                "INSERT INTO daemon_config(key,value,revision) VALUES('later','x',1)",
+                [],
+            );
+            Ok(())
+        });
+        assert!(
+            matches!(receipt, Err(SqliteError::TransactionAborted)),
+            "{receipt:?}"
+        );
+    });
+    drop(data);
+    let reopened = acquire(&fx.path);
+    snapshot(&pool(&reopened), |tx| {
+        let state = (
+            tx.query_row("SELECT count(*) FROM run_events", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            tx.query_row("SELECT count(*) FROM run_event_gaps", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap(),
+            tx.query_row(
+                "SELECT count(*) FROM daemon_config WHERE key='later'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap(),
+        );
+        assert_eq!(state, (0, 0, 0));
+    });
+}
