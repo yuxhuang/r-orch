@@ -713,8 +713,9 @@ async fn a_real_corrupt_statement_of_each_pooled_read_latches_the_public_storage
             _ => snapshot.get(EntityKind::Goal, "seed").await.map(drop),
         }
         .expect_err(name);
-        assert_eq!(backend_text(&error), UNAVAILABLE, "{name}");
-        drop(snapshot);
+        // Check while the snapshot is still held: caller cleanup must not
+        // supply the shared latch. The worker may already have retired before
+        // replying; this public postcondition does not prove observation timing.
         let failure = env.storage.failure_state().failure().expect(name);
         assert_eq!(failure.source, FailureSource::Reader, "{name}");
         assert_eq!(
@@ -722,6 +723,8 @@ async fn a_real_corrupt_statement_of_each_pooled_read_latches_the_public_storage
             [(Role::Operation, FatalCause::SqliteCorrupt)],
             "{name}"
         );
+        assert_eq!(backend_text(&error), UNAVAILABLE, "{name}");
+        drop(snapshot);
         let later = env.try_commit(|_| ()).await;
         assert_eq!(backend_text(&later.unwrap_err()), UNAVAILABLE, "{name}");
         // Issue 389: a new healthy read is allowed after the incident.
