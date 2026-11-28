@@ -198,7 +198,8 @@ writing modes, checks exit 2, zero imported batches and `unfinished: false`, and
 source bytes, inventory, inodes, modes, link counts and write times. It tests both an absent
 destination and a native destination seeded by a real template import; a refused resume
 must preserve the destination's bytes, inventory and all observed metadata, including
-access time. Source access time is excluded because reading may advance it. No timestamp
+access time; the observer uses `O_NOATIME` for file reads and directory descriptor
+enumeration. Source access time is excluded because reading may advance it. No timestamp
 is restored to hide a change.
 
 | Vectors | Command test |
