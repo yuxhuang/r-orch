@@ -120,9 +120,10 @@ pub async fn cursor_walk_is_stable_under_inserts_and_deletes(b: Backend) {
         Lane::Entities,
         Box::new(move |u| {
             // Remove the cursor anchor, insert before and after it, and update an
-            // already visited row: offset paging or fetching the anchor loses rows.
+            // already visited row. Two inserts before one deleted anchor shift offsets
+            // by +1, so offset paging returns c instead of continuing at e.
             u.delete(EntityKind::Task, "d", Revision::ONE)?;
-            for id in ["a", "e", "z"] {
+            for id in ["a", "c", "e", "z"] {
                 u.create(entity(id))?;
             }
             u.update(
