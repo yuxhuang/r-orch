@@ -47,6 +47,11 @@ const EXCEPTIONS: &[(&str, usize, &str)] = &[
         "cfg(test) ETXTBSY-safe version-probe script writer",
     ),
     (
+        "orch-infra/src/data_dir/spool.rs",
+        1,
+        "cfg(test) synthetic SIGKILL child; parent reaps it before fixture cleanup",
+    ),
+    (
         "orch-infra/src/sqlite/writer/tests/mod.rs",
         1,
         "cfg(test) bounded writer scenario; child is killed and reaped before fixture cleanup",
