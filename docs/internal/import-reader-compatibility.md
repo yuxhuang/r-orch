@@ -19,10 +19,13 @@ bounded bytes it measured:
 | `config.yml` | Missing, a stream of no document, one null or non-mapping document, two documents or more, unknown keys, the effective `run_cap`, and whether the owner must confirm preapproval |
 | `tasks/_index.json`, `agents/_index.json`, `goals/_index.json`, `messages/_index.json`, `context/_index.json` | Missing or unreadable, a bad entry, a repeated identity, an entry with no file, a file the index does not list, an entry that differs from its file, and a preview of the order |
 
-`teams/` and `runs/` have no index. Nothing in the product calls the preflight: there is
-no `orch import` command, no writer and no resume, and the tests are its only callers.
-The preflight creates, changes and removes nothing, and opens no path built from a value
-inside a document or an index.
+`teams/` and `runs/` have no index. The first offline `orch import` caller runs this
+preflight before its native template writer. It writes templates only, supports resume
+of those templates, and reports every writing run as unfinished. The spec's
+[offline caller contract](../specs/2026-11-20-sqlite-storage.md#offline-importer-first-caller-as-built)
+lists the unsupported families and remaining obligations. The preflight itself creates,
+changes and removes nothing, and opens no path built from a value inside a document or
+an index.
 
 ## Config
 
@@ -77,7 +80,7 @@ JSON of the unknown keys. Above 65,536 bytes the check refuses under `legacy_con
 value and the report has no such field. R93 and R133 still decide the trust: only an owner
 session turns the policy on, and a command that would do it must name the policy in what
 the owner confirms, because a source's agent files are input and input alone never grants
-trust. That command does not exist yet.
+trust. The bounded template caller reports this preview but does not import settings or enable the policy. Owner confirmation before enabling it remains final T21 work (R93/R133).
 
 ## Indexes
 
@@ -186,21 +189,67 @@ These reader-level checks pre-date the wiring and still stand.
 | N6 | The preflight acquires and budgets every document on one blocking thread, never on an async executor thread, and a flag stops it between reads. It does not prove cancellation of a blocked kernel read, or that a caller holds the 1.0 lock for as long as it relies on the answer; both wait for the first importer caller (issue 192). |
 | N7 | Existing generated corpus test parses 50 documents and 76 event lines and verifies 73 files unchanged. Existing typed Task, Agent, state and RunEvent examples remain. Production-limit child outcomes and RSS are in `source_budget`. Integrated dry run, resume, writer and no-write acceptance remain T21 acceptance work (issue 146). No live project was read. |
 
+## Command-level synthetic checks
+
+`crates/orch-cli/tests/import_reader_compatibility.rs` runs the actual offline command,
+with a synthetic source, private process environment and native template destination.
+For a source refusal it compares the complete preflight report between dry-run and
+writing modes, checks exit 2, zero imported batches and `unfinished: false`, and observes
+source bytes, inventory, inodes, modes, link counts and write times. It tests both an absent
+destination and a native destination seeded by a real template import; a refused resume
+must preserve the destination's bytes, inventory and all observed metadata, including
+access time; the observer uses `O_NOATIME` for file reads and directory descriptor
+enumeration. Source access time is excluded because reading may advance it. No timestamp
+is restored to hide a change.
+
+| Vectors | Command test |
+|---|---|
+| C-V2–6, C-V9, C-V12–13; bare document-end marker | `c_v2_to_v6_v9_v12_v13_refusals_match_in_both_modes_without_writes` |
+| C-V1, C-V7–8, C-V14 | `c_v1_v7_v8_v14_defaults_and_explicit_caps_match_before_template_writes` |
+| C-V11 | `c_v11_empty_typed_documents_keep_zero_document_wording_without_writes` |
+| X-V4–7, including identity-only and complete duplicates in all five stores | `x_v4_to_v7_bad_entries_precede_both_duplicate_shapes_without_writes` |
+| X-V1–3, X-V8–11 | `x_v1_to_v3_v8_to_v11_index_order_is_previewed_identically_before_template_writes` |
+| C-V10; X-V12 bytes, depth and nodes | `c_v10_and_x_v12_byte_limits_refuse_before_creating_or_changing_destination`, `x_v12_depth_and_node_boundaries_keep_budget_precedence_in_both_modes` |
+| X-V14 | `x_v14_symlinks_fifos_and_hard_links_are_terminal_prewrite_refusals` |
+| Terminal confined open error | `terminal_index_open_error_is_io_and_never_an_unreadable_index` |
+| Bounded escaped duplicate identity | `hostile_duplicate_diagnostics_are_bounded_and_escaped_in_both_modes` |
+| Tab-led content, vertical tab, ESC, BOM then tab | `tab_led_content_vertical_tab_escape_and_bom_tab_refuse_without_legacy_defaults` |
+| R111 adjacent physical gaps | `r111_adjacent_blank_and_malformed_lines_form_one_gap_in_both_mode_reports` |
+| Preapproval preview only | `dry_run_auto_policy_is_a_confirmation_preview_and_creates_nothing` |
+
+The X-V5 legacy comparisons remain in
+`import_index_reference::typed_duplicates` and the preflight test
+`both_duplicate_shapes_and_missing_files_stop_in_all_five_directories`: a complete typed
+duplicate is served twice and an identity-only array is rebuilt. These command tests
+reuse those two shapes to prove native caller refusal, without rerunning legacy startup
+against the import source. The original one-field fixture still has only the scope stated
+under N2. X-V13 interrupted and mid-stream terminal reads remain injected unit tests;
+the command-level open-error test does not replace that proof.
+
+Successful checks compare the same preflight preview before writing a template; they
+prove neither persistence of the previewed index order nor import of config settings or
+other entities. R111 checks report two events and one adjacent physical gap; storing their
+line numbers remains the full event importer's obligation. The existing
+`import_offline` command suite separately checks native template rollback, retained
+manifest/hash validation and resume. None of this is live-copy evidence.
+
 ## Still open
 
-The four regression vectors of issue 270 and the tab-only vector of PR 239 are checks of the whole-source
-preflight on synthetic sources. They add no runtime behavior and no acceptance claim. Every item below stays
-open.
+Issue 146 remains open for final T21 acceptance. Its bounded template caller tests
+supply config/index preflight parity and refusal evidence, not a complete import.
 
-- The importer, the `orch import` command, the writer, dry run and resume. Integrated
-  dry-run/import parity and zero writes on refusal are acceptance of issue 146, not of
-  this check. The authorization of the importing session is not proved by these tests either.
-- The lock held across the check and cancellation of a blocked read (issue 192).
-- The reader-level `import::index::reconcile` and its test are an older, unwired
-  classifier, kept as historical evidence. It disagrees with the contract on a repeated
-  identity, and its signature takes every entity document of a directory at once. The
-  preflight reads one index and one entity document at a time and must not gather all
-  the payloads, so it does not call it. Until it is removed, two classifiers exist.
+- Full-family import, config and index-order persistence, R93/R133 owner confirmation
+  before enabling preapproval, state/events/attachments, large-body registration,
+  R121/R125 and completion stay with T21. A successful preview imports no policy.
+- The full importer still needs its integrated production-budget child-process time
+  and peak-RSS evidence, terminal-read rollback, checkpoint/resume equivalence and
+  source immutability. `source_budget` measures the preflight, not the full importer.
+- First-caller blocked-read cancellation and lock-lifetime acceptance stay with issue
+  192. The bounded caller's native-writer cancellation tests cover their stated surface.
+- The reader-level `import::index::reconcile` remains an older, unwired classifier. It
+  disagrees with the contract on a repeated identity and gathers every entity document
+  of a directory; the actual preflight does neither. Until removed, two classifiers exist.
+- A copy of the owner's live project requires separate permission. No test here reads it.
 
-Rollback is reverting the wiring. There is no database migration, backfill, source
-transformation or format cutover, and no new command.
+This test change adds no format cutover or runtime behavior. The template caller's
+unfinished destination is not a usable imported project, and it writes no project pointer.
