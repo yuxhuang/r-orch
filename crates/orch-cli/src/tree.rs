@@ -20,15 +20,15 @@ use clap::{Args, Parser, Subcommand};
 ///
 /// Used by the pre-parse routing guard, which has to decide whether the first
 /// non-flag token is a real subcommand *before* clap sees the argv.
-pub const ALL_KNOWN_COMMANDS: [&str; 20] = [
+pub const ALL_KNOWN_COMMANDS: [&str; 21] = [
     "task", "agent", "status", "logs", "config", "context", "msg", "goal", "team", "org", "run",
-    "doctor", "tui", "serve", "web", "init", "update", "remote", "mcp", "daemon",
+    "doctor", "tui", "serve", "web", "init", "update", "remote", "mcp", "daemon", "import",
 ];
 
 /// Commands that bypass the legacy container guard. `daemon` performs its
 /// own discovery after parsing; `doctor` also
 /// takes a container when a project exists.
-pub const CONTAINER_LESS_COMMANDS: [&str; 4] = ["init", "update", "doctor", "daemon"];
+pub const CONTAINER_LESS_COMMANDS: [&str; 5] = ["init", "update", "doctor", "daemon", "import"];
 
 /// The version `--version` prints and the dashboard reports: this crate's own
 /// release version.
@@ -183,6 +183,8 @@ pub enum Command {
     Mcp(McpCmd),
     /// Initialize .orchestry/ in the current directory
     Init(InitCmd),
+    /// Check a stopped legacy project and retain a bounded unfinished template import
+    Import(crate::commands::import::ImportCmd),
     /// Check for updates and install the latest version
     Update(UpdateCmd),
 }
@@ -210,6 +212,7 @@ impl Command {
             Command::Web(_) => "web",
             Command::Mcp(_) => "mcp",
             Command::Init(_) => "init",
+            Command::Import(_) => "import",
             Command::Update(_) => "update",
         }
     }

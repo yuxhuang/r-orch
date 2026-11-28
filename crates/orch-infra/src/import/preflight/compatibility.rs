@@ -308,6 +308,7 @@ mod tests {
                 tasks: BTreeMap::new(),
                 auto_agent: false,
                 inherited_agent_policy: false,
+                templates: Vec::new(),
             };
             let fault = Fault {
                 bytes: br#"[{"id":"b"}]"#,

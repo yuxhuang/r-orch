@@ -4888,6 +4888,133 @@ The new operations are in no MCP allowlist.
   it brings no workspace: a directory that already stands in the project's `workspaces/` under one of its
   tasks' names, in any spelling, refuses the import before the database is published and is left as it is.
 
+### Offline importer first caller (as built)
+
+Status: a first slice, bounded and unfinished. `orch import` is registered and runs end to end on a stopped
+1.0 project directory, but it writes **templates only** and never reports a finished import. This text
+applies from the change that lands that code. It does not complete T21 and closes no gate: the rows above stay
+the target, and "Not yet built" lists what is missing.
+
+- Command: `orch [--json] import [--from <project directory>] [--dry-run] [--resume] [--assume-stopped <run id>]...`.
+  `--from` takes a 1.0 project directory (default: the current directory); an export file is not accepted yet.
+  The command is container-less: it sends no protocol operation and starts no daemon. It is owner-only and exits 2
+  under `--agent` or with `ORCH_TASK_ID` or `ORCH_AGENT_ID` set.
+- Destination: `ORCH_DATA_DIR` when set; otherwise the target of the project's existing record under the data
+  home; otherwise `<data home>/<default name of the canonical source>`. The data home is `ORCH_DATA_HOME`, else
+  `$HOME/.orchestry/daemons`. The destination must be outside the source: it is compared after the deepest
+  existing part of its path is resolved, so an alias above a missing destination counts. A destination whose
+  deepest existing entry is itself a symbolic link is refused (exit 2) before that entry is resolved. When the
+  entry is the destination itself, dangling or not, the link's metadata, its read time included, is not
+  touched. When the destination is absent and the entry is a link above it, finding that the destination is
+  absent has already followed the link, so the link's read time may advance (on Linux, as the mount's
+  access-time options allow). The refusal still writes no byte, in the source or at any destination, and
+  creates nothing. An existing destination below an aliased ancestor is not refused for the alias: it resumes
+  as any existing destination does. The data home must always be absolute, as must `ORCH_DATA_DIR`. The data
+  home is used only to find or create the default destination: when `ORCH_DATA_DIR` selects the destination,
+  the command neither creates nor otherwise touches the data home, wherever it points, even inside the
+  source. A project record that is present but invalid refuses (exit 2) and is never read as "no record".
+- Output: `--json` prints one object, `{"preflight": <report>, "imported": n, "unfinished": bool,
+  "procedural_exclusion": bool, "detail": "...", "exit_code": n}`. Without `--json` the command prints
+  `detail` (escaped, because source names are untrusted terminal text) and then the same object. The report
+  is the whole-source check of R65 and R112, with each path prefixed `.orchestry/`.
+
+| Exit | When | What was written |
+|---|---|---|
+| 0 | `--dry-run`, and the source check found no refusal and no confirmation. The destination's database is not opened, so this says nothing about it (see "Dry run is source-only") | Nothing, anywhere |
+| 2 | A known stop before any write, with `unfinished: false`: the check refuses or asks for a confirmation, a non-UTF-8 template stem or body (rule `utf8`), a template over 65,536 bytes (rule `bytes`), a listener on a daemon socket, a destination inside the source or whose deepest existing entry is a symbolic link, an existing destination without `--resume` (writing run only), an existing destination the guard refuses (held, unsafe, or lacking `orch.lock`: see "Interrupted destination"), a missing parent of an explicit destination (writing run only), a source with no template, cancellation before writing, a held or unsafe source lock, and a destination setup that failed before its first successful `mkdir` or holder publication | Nothing at the destination or in the source |
+| 1 | A run that wrote, or that cannot show it did not: `unfinished` is `true`. Setup records the first successful `mkdir` (a data-home ancestor or the destination) or holder publication, so a setup failure after one of them is exit 1; so is a setup or worker task that failed with an unknown outcome (`offline import worker failed; write outcome unknown`, `destination setup failed; write outcome unknown`); every later stop, successful or not, is exit 1 too | Templates, their manifest rows and the progress record (below), plus any directory the run created and the holder it published on `orch.lock` |
+
+- Order, which is the reason a refusal leaves nothing behind: (1) resolve the canonical source and the
+  destination; (2) for an existing destination, open it through the import guard, which locks `orch.lock`
+  without writing, reading the holder or changing any metadata, and checks ownership, mode and a local
+  filesystem. The guard resolves the destination path to its canonical form first and only then checks that
+  the opened root and lock are the inodes that path names, so a destination reached through a symbolic link
+  or alias in an ancestor resumes, and a root replaced between the open and the check refuses. The locked open
+  description itself is handed on to the writer, as before; (3) run the whole-source check, with the 1.0 owner lock (`.orchestry/.daemon-owner.lock`) taken
+  from the same pinned descriptor that the check and every later read use; (4) refuse while a daemon may be
+  listening; (5) stop at `--dry-run`, or at an existing destination without `--resume`; (6) read the first
+  template a second time, by descriptor and against the hash the check took; (7) only then create a missing
+  destination and lock it, publishing the holder on the same locked inode; the missing ancestors of the data
+  home are created here too, but only when `ORCH_DATA_DIR` is not set, and the parent of an explicit
+  `ORCH_DATA_DIR` must already exist (exit 2 otherwise). Each directory is created with `mkdirat` so that its
+  success is recorded before the open and the mode change that follow, and an existing entry is never
+  repaired; (8) open the native writer, after a free-space check against the disk floor of decision 11 (5 GiB or 5%, whichever is larger), repeated before each batch.
+- Locks. A held 1.0 owner lock, or a destination that another process holds, stops the command with exit 2 and
+  a generic `detail`; neither names its holder. This is a bounded divergence from R30, which asks for exit 4
+  and the holder's kind, pid and start time: the first caller does not build that, and the final T21 work must
+  either build it or amend R30. When `.daemon-owner.lock` is absent the command cannot lock the
+  source, says so with `"procedural_exclusion": true`, and relies on its refusal while a socket answers: the
+  project's default socket, `ORCH_SOCKET` and the socket that `daemon.json` records. An absent or stale socket
+  passes. Project, `.orchestry/` and lock identities are compared again before each load and each batch.
+- Dry run is source-only. `--dry-run` runs the whole-source check (and, for an existing destination, the guard
+  of step 2), then stops. It never opens the destination's SQLite database, so it does not read the progress
+  record or the manifest rows, and it cannot tell whether a later `--resume` will accept the destination.
+  `--dry-run` can exit 0 and the writing `--resume` that follows can still exit 1 with "native source/manifest
+  check refused resume; import unfinished": a retained template that the source has since changed or lost, or
+  a native row that no longer matches its manifest, is found only by the resume's own check, after the
+  destination is locked and the writer is open.
+- Interrupted destination (fail-closed by design). The guard of step 2 is not a repair. An existing destination
+  that lacks its `orch.lock`, or whose owner, mode or filesystem the guard refuses, stops with exit 2 and
+  `cannot acquire existing destination without modification`, for a plain import, `--resume` and `--dry-run`
+  alike. That includes the empty directory that a crash or SIGKILL leaves between the exclusive `mkdir` of the
+  destination and the creation of its lock, and a directory that holds other entries but no lock. The command
+  never removes, completes or retries such a directory: repairing an existing entry is what the guard exists to
+  prevent, and its rule allows no automatic repair. Recovery is by hand and only
+  for the empty directory: check that no process holds it (no running `orch` import or daemon names it as its
+  data directory) and that `ls -A <destination>` prints nothing, then `rmdir <destination>` (which itself refuses
+  a directory that is not empty), and run the import again; with the directory gone it creates the destination
+  from the start. For a directory that holds entries but no lock, the command offers no recovery: leave it as it
+  is and choose another destination, or have the owner inspect it. A destination that has its lock and is merely
+  unfinished is not this case: it resumes.
+- Templates. The stem is the file name without `.md` and is kept as the template name; the body is UTF-8 text of
+  at most 65,536 bytes (R99, issue 192). Both rules are part of the check, so `--dry-run` and a real import
+  refuse the same source in the same way. Each template is read twice, the second time under the hash of the
+  first, and a mismatch stops the import as a change.
+- Atomicity. For each template one writer transaction commits three things together or none: the `templates`
+  row, an `import_manifest` row (entity `template`, the stem, the SHA-256 of the body) and the
+  `daemon_config` record `import:<project>` holding `{"source": <canonical source>, "status": "unfinished"}`.
+  The command never retries a batch whose receipt is unknown.
+- Resume. An existing destination needs `--resume`. Before any new row, one transaction that changes nothing
+  checks that the progress record names this source, that every retained manifest row is a template that the
+  source still has under the same hash, and that its native body still hashes the same. A missing or changed
+  template, or a native row that no longer matches, stops with exit 1 and the `detail` "native
+  source/manifest check refused resume; import unfinished", before any new template is written. A template already imported is not written again, but it is
+  counted in `imported`, which is the number of batches the writer committed.
+- Cancellation. SIGINT and SIGTERM set a flag and the command keeps waiting: it finishes the blocking read,
+  waits for the receipt of a batch the writer has admitted, closes the writer and only then releases both
+  locks. Before the first write that is exit 2; after it, exit 1.
+- The source is never written, and the command creates nothing it does not use: the tests compare bytes,
+  inodes, modes and write times before and after a dry run, an import, a resume and each refusal (access times of
+  the source are excluded because reading it advances them), and show that an explicit destination leaves an
+  unused data home inside the source uncreated. A refused destination that is itself a symbolic link keeps even
+  its own access time; a link above an absent destination is not covered by that test (see "Destination").
+
+Not yet built, so that no reader takes this slice for the importer of R64 to R70, R99 and R112: every family
+but templates (tasks, agents, goals, teams, messages, context, runs, run events, attachments, `config.yml`
+and its settings, `state.json` and the retry queue, the `legacy.config` object, the order of each
+`_index.json`); the pre-approval policy (R93) and the closing of in-flight state (R69, R105); imported
+leases and intents; the record of `state.json` and index hashes (R121); the pointer file, the project record
+and the repair of R125; completion and the second-project refusal (R68); an export file as `--from` (R115);
+a holder named on a held lock with exit 4 (R30); and the refusal of the 1.1 daemon to start on an unfinished
+import (R67, T24). A source that holds other families still reaches exit 1 with its templates written; those
+rows are not a usable project, and nothing reads them until the daemon switches to SQLite (T24). The bounded
+memory, hostile-corpus and live-copy rows (R66, issue 146, issue 192 integrated acceptance) stay open and are
+owned by T21.
+
+Tests of this slice, all on synthetic sources and none naming a row above as satisfied:
+`crates/orch-cli/tests/import_offline.rs` (dry run, refusals, import, resume, guards, source and destination
+metadata, native rollback, cancellation with a blocked writer, and two regressions for the destination rules
+above, `explicit_destination_never_initializes_an_unused_home_in_the_source` and
+`refused_destination_symlink_preserves_even_its_read_time`, and the two setup regressions
+`existing_destination_with_an_aliased_parent_resumes_on_the_native_writer` and
+`missing_explicit_parent_is_a_prewrite_refusal_without_initializing_home`),
+`crates/orch-infra/src/sqlite/storage/import_batch.rs` (batch, manifest and progress atomicity),
+`crates/orch-infra/src/import/preflight/tests.rs` and `crates/orch-infra/src/data_dir/mod.rs` (the guards),
+and `xtask/src/crate_graph.rs` (the facade boundary, "Crate graph" in ARCHITECTURE §3.1, including
+`offline_import_cannot_add_public_types_or_reexports`). Nothing tests the manual recovery of an interrupted
+destination or the setup's exit 1 after a successful `mkdir`; the refusal itself is checked by hand on a
+synthetic directory (not a repository test), and the exit 1 path rests on the code.
+
 ## Import bounds
 
 What its input can make `orch import` do (R109 to R116). The security review's finding S1: the first bounds

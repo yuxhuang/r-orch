@@ -66,6 +66,40 @@ fn parse_record(bytes: &[u8]) -> Result<PathBuf, DataDirError> {
 }
 
 pub fn read_project_record(data_home: &Path, id: &str) -> Result<PathBuf, DataDirError> {
+    read_project_record_with(data_home, id, false)
+}
+
+/// Import refusals preserve the auxiliary record's metadata, including atime.
+/// Use the ordinary confined reader and parser, but refuse if reads cannot be
+/// made without updating access time. No ordinary-read fallback is permitted.
+pub fn read_project_record_for_import(data_home: &Path, id: &str) -> Result<PathBuf, DataDirError> {
+    read_project_record_with(data_home, id, true)
+}
+
+fn preserve_access_time(file: &std::fs::File) -> Result<(), DataDirError> {
+    #[cfg(target_os = "linux")]
+    {
+        use nix::fcntl::{FcntlArg, OFlag, fcntl};
+        let flags = fcntl(file, FcntlArg::F_GETFL).map_err(std::io::Error::from)?;
+        fcntl(
+            file,
+            FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NOATIME),
+        )
+        .map_err(std::io::Error::from)?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        Err(invalid("project record read cannot preserve access time"))
+    }
+}
+
+fn read_project_record_with(
+    data_home: &Path,
+    id: &str,
+    preserve_atime: bool,
+) -> Result<PathBuf, DataDirError> {
     let name = record_name(id)?;
     let read = || -> Result<PathBuf, DataDirError> {
         let home = ConfinedDir::open(data_home)?;
@@ -73,10 +107,13 @@ pub fn read_project_record(data_home: &Path, id: &str) -> Result<PathBuf, DataDi
         let projects = home.open_dir("projects")?;
         private_dir(&projects)?;
         let mut bytes = Vec::new();
-        projects
-            .open_file(&name, FileAccess::Untrusted)?
-            .take(4097)
-            .read_to_end(&mut bytes)?;
+        let file = projects.open_file(&name, FileAccess::Untrusted)?;
+        if preserve_atime {
+            // Opening and fstat do not read bytes. Set the flag on this same
+            // checked descriptor before the first read, retaining confinement.
+            preserve_access_time(&file)?;
+        }
+        file.take(4097).read_to_end(&mut bytes)?;
         parse_record(&bytes)
     };
     read().map_err(|e| invalid(format!("project record projects/{name}: {e}")))

@@ -1,6 +1,7 @@
 //! Owned SQLite storage composition. The daemon continues using files until T24.
 #[cfg(test)]
 mod containment_tests;
+mod import_batch;
 mod page;
 #[cfg(test)]
 mod page_tests;

@@ -216,6 +216,7 @@ async fn dispatch(cli: &Cli, env: EnvFlags, shape: &ArgvShape) -> Result<ExitCod
 
     match &cli.command {
         Some(Command::Init(args)) => run_init(cli, env, &cwd, args).await,
+        Some(Command::Import(args)) => Ok(commands::import::run(cli, args, &cwd).await),
         // Container-less: the version check reads no project state, so it
         // needs neither a project nor a daemon.
         Some(Command::Update(args)) => {

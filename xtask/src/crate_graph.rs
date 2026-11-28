@@ -962,6 +962,10 @@ const CLI_DAEMON_SITES: &[(&str, &[&str])] = &[
             "DaemonError",
         ],
     ),
+    (
+        "commands/import.rs",
+        &["import_offline", "ImportRequest", "ImportOutcome"],
+    ),
 ];
 const CLI_TEST_ROOTS: &[(&str, &str, &str)] = &[
     (
@@ -1451,6 +1455,18 @@ fn bootstrap_contracts(repo_root: &Path) -> Result<Vec<String>> {
     let mut problems = Vec::new();
     for (file, contract) in [
         (
+            "import.rs",
+            "pub struct ImportRequest { pub source: PathBuf, pub data_home: PathBuf, pub data_dir: Option<PathBuf>, pub tmp_dir: PathBuf, pub socket: Option<PathBuf>, pub dry_run: bool, pub resume: bool, pub assume_stopped: Vec<String>, }",
+        ),
+        (
+            "import.rs",
+            "pub struct ImportOutcome { pub exit_code: u8, pub report_json: String, pub imported: u64, pub unfinished: bool, pub procedural_exclusion: bool, pub detail: String, }",
+        ),
+        (
+            "import.rs",
+            "pub async fn import_offline(request: ImportRequest, cancel: Arc<AtomicBool>) -> ImportOutcome",
+        ),
+        (
             "bootstrap.rs",
             "pub struct InitOptions { pub project_root: PathBuf, pub name: Option<String>, pub adapter: Option<String>, pub prompt_mode: Option<orch_domain::PromptMode>, pub interactive: bool, }",
         ),
@@ -1509,6 +1525,7 @@ fn bootstrap_contracts(repo_root: &Path) -> Result<Vec<String>> {
         ("bootstrap.rs", &["initialize", "is_initialized"][..]),
         ("lifecycle.rs", &["start", "prepare_start", "run"][..]),
         ("discovery.rs", &["select_project_root"][..]),
+        ("import.rs", &["import_offline"][..]),
     ] {
         let text = std::fs::read_to_string(repo_root.join("crates/orch-daemon/src").join(file))?;
         let tokens = production_tokens(&rust_tokens(&text));
@@ -1524,6 +1541,78 @@ fn bootstrap_contracts(repo_root: &Path) -> Result<Vec<String>> {
             {
                 problems.push(format!("crates/orch-daemon/src/{file}:{}: unreviewed public bootstrap function or method; no store/engine escape or generic execution facade", token.line));
             }
+        }
+    }
+    let lib = std::fs::read_to_string(repo_root.join("crates/orch-daemon/src/lib.rs"))?;
+    let tokens = production_tokens(&rust_tokens(&lib));
+    for expected in [
+        "mod import;",
+        "pub use import::{ImportOutcome, ImportRequest, import_offline};",
+    ] {
+        let expected = rust_tokens(expected);
+        if !tokens
+            .windows(expected.len())
+            .any(|w| same_tokens(w, &expected))
+        {
+            problems.push("offline import module/export boundary changed".into());
+        }
+    }
+    for (i, token) in tokens.iter().enumerate() {
+        if token.text == "mod"
+            && tokens.get(i + 1).is_some_and(|t| t.text == "import")
+            && i > 0
+            && matches!(tokens[i - 1].text, "pub" | ")")
+        {
+            problems.push("offline import module must remain private".into());
+        }
+    }
+    let expected_export =
+        rust_tokens("pub use import::{ImportOutcome, ImportRequest, import_offline};");
+    let mut import_exports = 0;
+    for (i, token) in tokens.iter().enumerate() {
+        if token.literal || token.text != "pub" || tokens.get(i + 1).is_none_or(|t| t.text != "use")
+        {
+            continue;
+        }
+        let end = declaration_separator(&tokens, i + 2, &[";"]);
+        let declaration = &tokens[i..end.saturating_add(1).min(tokens.len())];
+        if declaration.iter().any(|t| !t.literal && t.text == "import") {
+            if same_tokens(declaration, &expected_export) {
+                import_exports += 1;
+            } else {
+                problems
+                    .push("offline import reexports must retain the exact reviewed symbols".into());
+            }
+        }
+    }
+    if import_exports != 1 {
+        problems.push("offline import must have exactly one reviewed reexport".into());
+    }
+    let import = std::fs::read_to_string(repo_root.join("crates/orch-daemon/src/import.rs"))?;
+    let import = production_tokens(&rust_tokens(&import));
+    let mut depth = 0usize;
+    for (i, token) in import.iter().enumerate().filter(|(_, t)| !t.literal) {
+        if depth == 0 && token.text == "pub" {
+            let allowed = import.get(i + 1).is_some_and(|t| t.text == "struct")
+                && import
+                    .get(i + 2)
+                    .is_some_and(|t| ["ImportRequest", "ImportOutcome"].contains(&t.text))
+                || import.get(i + 1).is_some_and(|t| t.text == "async")
+                    && import.get(i + 2).is_some_and(|t| t.text == "fn")
+                    && import
+                        .get(i + 3)
+                        .is_some_and(|t| t.text == "import_offline");
+            if !allowed {
+                problems.push(format!(
+                    "offline import contains an unreviewed public declaration at line {}",
+                    token.line
+                ));
+            }
+        }
+        match token.text {
+            "{" => depth += 1,
+            "}" => depth = depth.saturating_sub(1),
+            _ => {}
         }
     }
     problems.extend(bootstrap_enums(repo_root)?);
@@ -1583,6 +1672,8 @@ fn bootstrap_enums(repo_root: &Path) -> Result<Vec<String>> {
 /// by prepare_start. Recognized impls must match the reviewed table; foreign
 /// same-named re-exports are not resolved to their outside definitions.
 const BOOTSTRAP_TYPES: &[&str] = &[
+    "ImportRequest",
+    "ImportOutcome",
     "InitOutcome",
     "InitOptions",
     "StartOptions",
@@ -1816,6 +1907,7 @@ fn bootstrap_declarations(
             {
                 let home = match name.text {
                     "InitOutcome" | "InitOptions" => "bootstrap.rs",
+                    "ImportRequest" | "ImportOutcome" => "import.rs",
                     "DaemonError" => "error.rs",
                     _ => "lifecycle.rs",
                 };
@@ -1863,6 +1955,18 @@ fn bootstrap_declarations(
                     "Path",
                     "std",
                 ],
+                "import.rs" => &[
+                    "PathBuf",
+                    "Path",
+                    "Option",
+                    "Vec",
+                    "String",
+                    "Arc",
+                    "AtomicBool",
+                    "bool",
+                    "u8",
+                    "u64",
+                ],
                 "lifecycle.rs" => &["PathBuf", "Option", "String", "bool", "i32", "Result"],
                 "discovery.rs" => &["Option", "Path", "Result", "PathBuf"],
                 "error.rs" => &[
@@ -1897,7 +2001,7 @@ fn bootstrap_declarations(
                                 && imports.get(j + 1).is_none_or(|next| next.text != ":"))
                     });
                 let reviewed = match file.as_str() {
-                    "bootstrap.rs" | "lifecycle.rs" | "discovery.rs" => {
+                    "bootstrap.rs" | "lifecycle.rs" | "discovery.rs" | "import.rs" => {
                         "use std::path::{Path, PathBuf}"
                     }
                     "error.rs" => "use orch_proto::error::{ErrorBody, exit}",
@@ -1905,6 +2009,11 @@ fn bootstrap_declarations(
                 };
                 if pinned
                     && !same_tokens(imports, &rust_tokens(reviewed))
+                    && !(file == "import.rs"
+                        && same_tokens(
+                            imports,
+                            &rust_tokens("use std::sync::{Arc, atomic::{AtomicBool, Ordering},}"),
+                        ))
                     && !(same_tokens(imports, &rust_tokens("use super::*"))
                         && !production
                             .iter()
@@ -2432,6 +2541,106 @@ mod tests {
     }
 
     #[test]
+    fn offline_import_facade_has_one_exact_cli_site() {
+        for name in ["import_offline", "ImportRequest", "ImportOutcome"] {
+            assert!(
+                cli_file_problems("commands/import.rs", &format!("orch_daemon::{name}")).is_empty()
+            );
+            assert!(
+                !cli_file_problems("commands/status.rs", &format!("orch_daemon::{name}"))
+                    .is_empty()
+            );
+        }
+        assert!(!cli_file_problems("commands/import.rs", "orch_daemon::SqliteStorage").is_empty());
+    }
+
+    #[test]
+    fn offline_import_signature_and_payloads_cannot_widen() {
+        let fixture = daemon_fixture();
+        assert!(bootstrap_contracts(&fixture.0).unwrap().is_empty());
+        let file = fixture.0.join("crates/orch-daemon/src/import.rs");
+        let original = std::fs::read_to_string(&file).unwrap();
+        for (old, new) in [
+            (
+                "request: ImportRequest, cancel: Arc<AtomicBool>",
+                "request: ImportRequest, cancel: Arc<AtomicBool>, execute: fn()",
+            ),
+            (
+                "pub source: PathBuf,",
+                "pub source: PathBuf, pub store: Storage,",
+            ),
+            (
+                "pub imported: u64,",
+                "pub imported: u64, pub store: Storage,",
+            ),
+        ] {
+            assert!(original.contains(old), "{old}");
+            std::fs::write(&file, original.replace(old, new)).unwrap();
+            assert!(
+                !bootstrap_contracts(&fixture.0).unwrap().is_empty(),
+                "{new}"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_import_module_and_type_ownership_cannot_escape() {
+        let fixture = daemon_fixture();
+        let src = fixture.0.join("crates/orch-daemon/src");
+        let lib = src.join("lib.rs");
+        let original = std::fs::read_to_string(&lib).unwrap();
+        std::fs::write(&lib, original.replace("mod import;", "pub mod import;")).unwrap();
+        assert!(!bootstrap_contracts(&fixture.0).unwrap().is_empty());
+        std::fs::write(&lib, &original).unwrap();
+        let import = src.join("import.rs");
+        let original = std::fs::read_to_string(&import).unwrap();
+        for extra in [
+            "impl ImportRequest { pub fn execute(&self, callback: fn()) {} }",
+            "impl ImportOutcome { pub fn storage(&self) -> Storage { todo!() } }",
+            "impl Into<Storage> for ImportOutcome { fn into(self) -> Storage { todo!() } }",
+            "type Other = ImportRequest; impl Other { fn widen(&self) {} }",
+        ] {
+            std::fs::write(&import, format!("{original}\n{extra}")).unwrap();
+            assert!(
+                !bootstrap_contracts(&fixture.0).unwrap().is_empty(),
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn offline_import_cannot_add_public_types_or_reexports() {
+        let fixture = daemon_fixture();
+        let src = fixture.0.join("crates/orch-daemon/src");
+        let import = src.join("import.rs");
+        let lib = src.join("lib.rs");
+        let original_import = std::fs::read_to_string(&import).unwrap();
+        let original_lib = std::fs::read_to_string(&lib).unwrap();
+        for (declaration, export) in [
+            (
+                "pub struct Extra { pub storage: SqliteStorage }",
+                "pub use import::Extra;",
+            ),
+            (
+                "pub enum Extra { Storage(SqliteStorage) }",
+                "pub use crate::import::Extra;",
+            ),
+            (
+                "pub type Extra = SqliteStorage;",
+                "pub use self::import::Extra;",
+            ),
+            ("", "pub use import::ImportRequest as Extra;"),
+        ] {
+            std::fs::write(&import, format!("{original_import}\n{declaration}")).unwrap();
+            std::fs::write(&lib, format!("{original_lib}\n{export}")).unwrap();
+            assert!(
+                !bootstrap_contracts(&fixture.0).unwrap().is_empty(),
+                "{declaration} {export}"
+            );
+        }
+    }
+
+    #[test]
     fn cfg_classification_is_item_local_and_strings_are_not_imports() {
         for text in [
             "#[cfg(test)] mod tests { use orch_infra::Paths; }",
@@ -2475,8 +2684,8 @@ mod tests {
                 fixture.write(root, "use orch_infra::Paths;");
                 fixture.write(parent, declaration);
             }
-            for (file, _) in CLI_DAEMON_SITES {
-                fixture.write(file, "orch_daemon::DaemonError");
+            for (file, names) in CLI_DAEMON_SITES {
+                fixture.write(file, &format!("orch_daemon::{}", names[0]));
             }
             fixture
         }
@@ -2649,7 +2858,14 @@ mod tests {
             .join("crates/orch-daemon/src");
         let dest = fixture.0.join("crates/orch-daemon/src");
         std::fs::create_dir_all(&dest).unwrap();
-        for file in ["bootstrap.rs", "lifecycle.rs", "discovery.rs", "error.rs"] {
+        for file in [
+            "bootstrap.rs",
+            "lifecycle.rs",
+            "discovery.rs",
+            "error.rs",
+            "import.rs",
+            "lib.rs",
+        ] {
             std::fs::copy(src.join(file), dest.join(file)).unwrap();
         }
         std::fs::create_dir_all(dest.join("testing")).unwrap();

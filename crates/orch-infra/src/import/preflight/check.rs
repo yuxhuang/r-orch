@@ -11,6 +11,7 @@ use crate::import::document::{
 use crate::import::event::{EventItem, EventStream};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 #[path = "compatibility.rs"]
 mod compatibility;
 use compatibility::{legacy_defaults, unknown_config};
@@ -232,13 +233,6 @@ pub(super) fn run(
     options: &Options,
     probe: &dyn ProcessProbe,
 ) -> Result<Report, PreflightError> {
-    // The guarded legacy YAML reader parks its parse on a blocking thread and awaits it.
-    // This thread is itself a worker of the caller's blocking pool, so a pool of one would
-    // wait for itself. The decode therefore runs on a runtime of its own, whose blocking
-    // pool the caller cannot exhaust.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .map_err(PreflightError::Io)?;
     let root = ConfinedDir::open(project).map_err(source_error)?;
     let orch = match root.open_dir(".orchestry") {
         Ok(dir) => dir,
@@ -247,6 +241,21 @@ pub(super) fn run(
         }
         Err(e) => return Err(source_error(e)),
     };
+    Ok(run_on(&orch, options, probe)?.0)
+}
+
+pub(super) fn run_on(
+    orch: &ConfinedDir,
+    options: &Options,
+    probe: &dyn ProcessProbe,
+) -> Result<(Report, Vec<super::TemplateSource>), PreflightError> {
+    // The guarded legacy YAML reader parks its parse on a blocking thread and awaits it.
+    // This thread is itself a worker of the caller's blocking pool, so a pool of one would
+    // wait for itself. The decode therefore runs on a runtime of its own, whose blocking
+    // pool the caller cannot exhaust.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .map_err(PreflightError::Io)?;
     let mut check = Check {
         options,
         probe,
@@ -256,12 +265,13 @@ pub(super) fn run(
         tasks: BTreeMap::new(),
         auto_agent: false,
         inherited_agent_policy: false,
+        templates: Vec::new(),
     };
-    if let Some(plan) = check.plan(&orch)? {
-        check.examine(&orch, plan)?;
+    if let Some(plan) = check.plan(orch)? {
+        check.examine(orch, plan)?;
     }
     check.report.counts.entries = check.listed;
-    Ok(check.report)
+    Ok((check.report, check.templates))
 }
 
 pub(super) struct Check<'a> {
@@ -270,6 +280,7 @@ pub(super) struct Check<'a> {
     runtime: &'a tokio::runtime::Runtime,
     pub(super) report: Report,
     listed: u64,
+    templates: Vec<super::TemplateSource>,
     /// One fold key for each task id of the listing (R117): fold key to the id.
     tasks: BTreeMap<Vec<u8>, Vec<u8>>,
     auto_agent: bool,
@@ -629,7 +640,21 @@ impl Check<'_> {
                     let Some(file) = self.acquire(&level.dir, name, &path) else {
                         continue;
                     };
-                    if self.read(file, TEMPLATE_BYTES, &path)?.is_some() {
+                    if let Some(bytes) = self.read(file, TEMPLATE_BYTES, &path)? {
+                        if name.to_str().is_none() || std::str::from_utf8(&bytes).is_err() {
+                            self.refuse(
+                                &path,
+                                "utf8",
+                                None,
+                                None,
+                                "template stem and body must be UTF-8",
+                            );
+                            continue;
+                        }
+                        self.templates.push(super::TemplateSource {
+                            name: name.to_owned(),
+                            hash: format!("{:x}", Sha256::digest(&bytes)),
+                        });
                         self.counts().templates += 1;
                     }
                 }
