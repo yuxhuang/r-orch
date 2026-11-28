@@ -368,6 +368,15 @@ fn a_real_corrupt_statement_of_each_pooled_read_latches_the_shared_state_as_the_
                     let mut read =
                         EntityRead::reader(tx, &caller, disk, pool.failure_state().clone());
                     seen = Some((op.run)(&mut read, seed).expect_err("the statement fails"));
+                    // Observe before returning: pool cleanup must not supply the latch.
+                    let failure = handle.failure_state().failure().expect(op.name);
+                    assert_eq!(failure.source, FailureSource::Reader, "{}", op.name);
+                    assert_eq!(
+                        failure.causes,
+                        [(Role::Operation, FatalCause::SqliteCorrupt)],
+                        "{}",
+                        op.name
+                    );
                     // Caught, and the callback goes on to succeed.
                     Ok(())
                 });
