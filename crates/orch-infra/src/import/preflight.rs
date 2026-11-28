@@ -25,9 +25,9 @@
 //! Left to the slices that wire what they depend on, and listed here so that nothing
 //! reads this module as a finished importer:
 //! - nothing is written: no database, no blob, no `.orch-project`, no resume.
-//! - nothing outside the tests calls this check: no `orch import` command, and the lock
-//!   held across it and the cancellation of a blocked read wait for the first caller
-//!   (#192).
+//! - the offline daemon facade retains this check for its bounded template writer;
+//!   full-family loading, existing-destination resume and integrated #146/#192
+//!   qualification remain separate obligations.
 mod check;
 mod inflight;
 mod names;
@@ -94,3 +94,174 @@ pub async fn preflight(
 
 #[cfg(test)]
 mod tests;
+
+struct TemplateSource {
+    name: std::ffi::OsString,
+    hash: String,
+}
+
+/// A check and its confined source, retained until all admitted work drains.
+/// Only templates are loadable in this bounded first-writer slice.
+pub struct PreparedImport {
+    pub report: Report,
+    orch: crate::data_dir::confined::ConfinedDir,
+    root: crate::data_dir::confined::ConfinedDir,
+    project: PathBuf,
+    legacy: Option<crate::data_dir::LegacyGuard>,
+    templates: Vec<TemplateSource>,
+    cancel: Arc<AtomicBool>,
+}
+impl PreparedImport {
+    pub fn procedural_exclusion(&self) -> bool {
+        self.legacy.is_none()
+    }
+
+    /// A by-name replacement must not detach the check from its owner guard.
+    pub fn verify_source(&self) -> Result<(), PreflightError> {
+        use crate::data_dir::confined::ConfinedDir;
+        use nix::sys::stat::fstat;
+        let same = |a: &ConfinedDir, b: &ConfinedDir| -> Result<(), PreflightError> {
+            let a = fstat(a).map_err(std::io::Error::from)?;
+            let b = fstat(b).map_err(std::io::Error::from)?;
+            if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino) {
+                return Err(PreflightError::Source("source directory changed".into()));
+            }
+            Ok(())
+        };
+        let named = ConfinedDir::open(&self.project)
+            .map_err(|_| PreflightError::Source("source directory changed".into()))?;
+        same(&self.root, &named)?;
+        let orch = named
+            .open_dir(".orchestry")
+            .map_err(|_| PreflightError::Source("source state directory changed".into()))?;
+        same(&self.orch, &orch)?;
+        if let Some(legacy) = &self.legacy {
+            legacy
+                .verify(&self.orch)
+                .map_err(|_| PreflightError::Source("source owner lock changed".into()))?;
+        }
+        Ok(())
+    }
+
+    /// Bounded names and hashes already measured by whole-source preflight.
+    pub fn template_inventory(&self) -> std::collections::BTreeMap<String, String> {
+        self.templates
+            .iter()
+            .filter_map(|input| {
+                input
+                    .name
+                    .to_str()
+                    .and_then(|name| name.strip_suffix(".md"))
+                    .map(|name| (name.to_owned(), input.hash.clone()))
+            })
+            .collect()
+    }
+
+    pub fn template_count(&self) -> usize {
+        self.templates.len()
+    }
+
+    /// Blocking descriptor-relative second read, with the preflight hash.
+    /// Never call this on the async runtime and never drop its blocking waiter.
+    pub fn load_template(&self, index: usize) -> Result<super::ImportRow, PreflightError> {
+        use crate::data_dir::confined::FileAccess;
+        use sha2::{Digest, Sha256};
+        use std::sync::atomic::Ordering;
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(PreflightError::Cancelled);
+        }
+        self.verify_source()?;
+        let input = self
+            .templates
+            .get(index)
+            .ok_or_else(|| PreflightError::Source("template index out of range".into()))?;
+        let dir = self
+            .orch
+            .open_dir("templates")
+            .map_err(|_| PreflightError::Source("template directory changed".into()))?;
+        let file = dir
+            .open_file(&input.name, FileAccess::Untrusted)
+            .map_err(|_| {
+                PreflightError::Source("template is no longer a plain singly linked file".into())
+            })?;
+        let bytes = super::document::read_bounded(file, 65_536)
+            .map_err(|_| PreflightError::Source("template load exceeded its bound".into()))?;
+        let hash = format!("{:x}", Sha256::digest(&bytes));
+        if hash != input.hash {
+            return Err(PreflightError::Source(
+                "template changed since preflight".into(),
+            ));
+        }
+        let name = input
+            .name
+            .to_str()
+            .and_then(|s| s.strip_suffix(".md"))
+            .ok_or_else(|| PreflightError::Source("template stem is not UTF-8".into()))?;
+        let body = String::from_utf8(bytes)
+            .map_err(|_| PreflightError::Source("template body is not UTF-8".into()))?;
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(PreflightError::Cancelled);
+        }
+        Ok(super::ImportRow {
+            entity: orch_core::store::Entity::Template(orch_core::store::TemplateEntry {
+                name: name.into(),
+                body,
+            }),
+            source_sha256: hash,
+        })
+    }
+}
+
+/// Run the same whole-source preflight while retaining the source descriptor and
+/// hashes of the bytes measured there. No destination is opened or created.
+pub async fn prepare(
+    project: PathBuf,
+    options: Options,
+    probe: Arc<dyn ProcessProbe>,
+) -> Result<PreparedImport, PreflightError> {
+    prepare_inner(project, options, probe, false).await
+}
+
+/// The genuine offline caller acquires the legacy guard from the same pinned
+/// state directory that the check and all subsequent loads use.
+pub async fn prepare_offline(
+    project: PathBuf,
+    options: Options,
+    probe: Arc<dyn ProcessProbe>,
+) -> Result<PreparedImport, PreflightError> {
+    prepare_inner(project, options, probe, true).await
+}
+
+async fn prepare_inner(
+    project: PathBuf,
+    options: Options,
+    probe: Arc<dyn ProcessProbe>,
+    guarded: bool,
+) -> Result<PreparedImport, PreflightError> {
+    tokio::task::spawn_blocking(move || {
+        use crate::data_dir::confined::ConfinedDir;
+        let root = ConfinedDir::open(&project)
+            .map_err(|_| PreflightError::Source("source is not a plain directory".into()))?;
+        let orch = root
+            .open_dir(".orchestry")
+            .map_err(|_| PreflightError::NotInitialised)?;
+        let legacy = if guarded {
+            crate::data_dir::LegacyGuard::acquire_from(&orch)
+                .map_err(|_| PreflightError::Source("cannot acquire source owner lock".into()))?
+        } else {
+            None
+        };
+        let (report, templates) = check::run_on(&orch, &options, probe.as_ref())?;
+        Ok(PreparedImport {
+            report,
+            orch,
+            root,
+            project,
+            legacy,
+            templates,
+            cancel: options.cancel,
+        })
+    })
+    .await
+    .map_err(|e| PreflightError::Io(std::io::Error::other(e)))?
+}

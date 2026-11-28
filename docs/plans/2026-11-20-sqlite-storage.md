@@ -2254,7 +2254,7 @@ lock for as long as it relies on an answer (R119 means something only while no 1
 does not stop the blocking thread. The YAML decode runs on a runtime of the check's own, so a caller's
 blocking pool of one is enough. A task id of `.` or `..` stops the check (R104); a template stem is stored as it is when it
 is UTF-8 and stops the check when it is not (issue 192). The check on `main` does not yet refuse one, nor a template
-body that is not UTF-8; the first importer caller of issue 192 adds both refusals, and the spec's R99 names its test.
+body that is not UTF-8; the first importer caller of issue 192 adds both refusals (see "T21 first offline caller slice" below), and the spec's R99 names its test.
 
 Where the check goes beyond the spec's wording, it is stricter and says so: a `running` set of `state.json`
 that 1.0 would read as empty because one entry does not decode stops the check, because that set is what
@@ -2334,7 +2334,44 @@ zero-write acceptance (issue 146), and the lock held across the check and the ca
 (issue 192). The reader-level `import::index::reconcile` is unwired, is kept as historical evidence and still
 names a repeated identity `index_entry`; it is not the preflight's classifier, and it takes every entity
 document of a directory at once, which the check does not gather. No changelog fragment is added: nothing a user can run or notice changes, and
-the check has no caller outside its tests (AGENTS.md, "Changelog fragments").
+the check has no caller outside its tests (AGENTS.md, "Changelog fragments"). The first offline caller below is the
+first to run it outside its tests.
+
+### T21 first offline caller slice
+
+Status: a first, bounded slice that applies from the change that lands it. It activates nothing and uses no live
+copy. The spec's "Offline importer first caller (as built)" has the contract: `orch import` checks a whole
+stopped 1.0 project, can write only templates, and ends every run that wrote, or may have written, with exit 1
+and `unfinished: true`; exit 2 is a known refusal that wrote nothing. This slice does not complete T21 and closes no gate.
+
+What the slice adds, by crate:
+
+| Crate | Addition |
+|---|---|
+| `orch-cli` | `commands/import.rs` (`ImportCmd`; builds an `ImportRequest`, calls `orch_daemon::import_offline`, sets the cancel flag on SIGINT or SIGTERM and keeps waiting, prints the `ImportOutcome`); `import` in `ALL_KNOWN_COMMANDS` and `CONTAINER_LESS_COMMANDS` (`tree.rs`); the dispatch arm in `lib.rs` |
+| `orch-daemon` | `import.rs`: `import_offline`, `ImportRequest`, `ImportOutcome`, re-exported from `lib.rs` behind a private `mod import`; composes the preflight, the guards and the native writer; no storage handle, protocol operation or callback leaves it. It resolves the destination outside the source, refuses a destination whose deepest existing entry is a symbolic link before resolving it, and creates the data home only when no explicit destination is set. Setup records each successful `mkdirat` and the holder publication, so a refusal before either is exit 2 and a failure after either, or a setup or worker task that fails with an unknown outcome, is exit 1 |
+| `orch-infra` | `import::preflight::{prepare_offline, PreparedImport}` (the check keeps its source descriptor, the 1.0 owner lock and the hash of each template; `verify_source`, `template_inventory`, `load_template`); the `utf8` refusal of a template stem or body; `data_dir::ImportGuard` (canonical path first, then the inode check; `into_data_dir` reports through `ImportTransitionError` whether the failure may already have written); `sqlite::storage::import_batch` (`check_import_source`, `import_batch`); `import::{ImportRow, ImportBatch}` |
+| `xtask` | `CLI_DAEMON_SITES` gains `commands/import.rs` with exactly `import_offline`, `ImportRequest` and `ImportOutcome`; the bootstrap contracts pin the facade's signature, both payload structs, the private module and its one `pub use`, and reject any other `pub use` that names the import module, a renamed one, and any public declaration in `import.rs` other than the two structs and the function (an added public struct, enum or type alias carrying a storage handle, or its reexport, fails); `ImportRequest` and `ImportOutcome` join `BOOTSTRAP_TYPES`. `ARCHITECTURE.md` §3.1 states the allowlist |
+
+What it proves, on synthetic sources only (a 1.0 directory with one template): the dry run and the real import
+share one check and one refusal set (the dry run checks the source only and does not open the destination's database, so a later resume can still refuse it); a dry run, or a refusal, creates nothing and leaves an existing
+destination byte-identical; an existing destination reached through an aliased parent resumes, and a missing parent of an explicit destination refuses with exit 2 and creates nothing, the data home included; a source's bytes, inodes, modes and write times survive every mode; a template
+row, its manifest row and the progress record commit or roll back together, including on a conflict; a resume
+checks every retained hash before it admits a new row, and refuses a changed or missing source; a SIGTERM
+that arrives while the writer is blocked waits for the writer and for both guards to drain; an explicit
+`ORCH_DATA_DIR` never creates a data home inside the source, and a destination that is a symbolic link is
+refused without touching its metadata. Linux only.
+
+Not proven, and carried by T21 unchanged: every other family and its order; `config.yml`,
+`state.json`, events, attachments and the large-body registration of T11; R121 and R125; completion and the
+pointer file; the bounded-memory and hostile-corpus rows of R66; the integrated acceptance of issues 146 and
+192, which stay open; and the exit 4 and the holder of R30, which the caller replaces with exit 2 and a generic
+message, a bounded divergence that T21 must close by building R30 or amending it. Also open for T21: the
+fail-closed handling of an existing destination without its lock (an empty directory left by an interrupted
+creation is refused with exit 2 and removed by hand only after the owner has checked that it is empty and
+that nothing holds it; no automatic repair is allowed under the guard decision), which the manual and RUNBOOK
+must carry when the importer is complete. Issue 104 stays with T23 and
+T24 and issue 127 with the owner. Activation and the full-importer acceptance of T21 stay outstanding.
 
 ### T8c complete retry enumeration follow-up
 

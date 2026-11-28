@@ -196,6 +196,7 @@ const DISPOSITION: &[(&str, Disposition)] = &[
         "init",
         Excluded("bootstraps a project; MCP requires an existing one"),
     ),
+    ("import", Excluded("offline import is restricted to the owner")),
     ("update", Excluded("host software management")),
 ];
 
@@ -522,6 +523,11 @@ LEAF init
   --adapter
   --name
   --prompt-mode alias=mode
+LEAF import
+  --assume-stopped multi
+  --dry-run flag
+  --from
+  --resume flag
 LEAF update
   --check flag
 ";

@@ -756,3 +756,174 @@ async fn a_cancel_during_a_long_read_ends_the_check_without_an_io_finding() {
         started.elapsed()
     );
 }
+
+#[tokio::test]
+async fn non_utf8_templates_are_refused_before_destination_creation() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join(".orchestry/templates");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("invalid-body.md"), [0xff]).unwrap();
+    std::fs::write(
+        dir.join(std::ffi::OsString::from_vec(b"bad\xff.md".to_vec())),
+        "body",
+    )
+    .unwrap();
+    let report = super::preflight(
+        root.path().to_owned(),
+        super::Options::default(),
+        std::sync::Arc::new(super::SystemProbe),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.refusals.total(), 2);
+    assert!(report.refusals.listed.iter().all(|f| f.rule == "utf8"));
+    assert_eq!(report.counts.templates, 0);
+}
+
+#[tokio::test]
+async fn retained_template_load_refuses_same_length_changes_and_links() {
+    use std::sync::Arc;
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join(".orchestry/templates");
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join(".md");
+    std::fs::write(&file, "first").unwrap();
+    let prepared = Arc::new(
+        super::prepare(
+            root.path().to_owned(),
+            super::Options::default(),
+            Arc::new(super::SystemProbe),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(prepared.template_count(), 1);
+    let input = prepared.clone();
+    let original = tokio::task::spawn_blocking(move || input.load_template(0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(original.entity, orch_core::store::Entity::Template(ref t) if t.name.is_empty() && t.body == "first")
+    );
+    std::fs::write(&file, "other").unwrap();
+    let input = prepared.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || input.load_template(0))
+            .await
+            .unwrap()
+            .is_err()
+    );
+    std::fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(root.path().join("outside"), &file).unwrap();
+    assert!(
+        tokio::task::spawn_blocking(move || prepared.load_template(0))
+            .await
+            .unwrap()
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn retained_template_load_preserves_utf8_control_stems_and_honours_cancel() {
+    use std::sync::{Arc, atomic::Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join(".orchestry/templates");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("\n名前.md"), "body").unwrap();
+    let options = super::Options::default();
+    let cancel = options.cancel.clone();
+    let prepared = Arc::new(
+        super::prepare(
+            root.path().to_owned(),
+            options,
+            Arc::new(super::SystemProbe),
+        )
+        .await
+        .unwrap(),
+    );
+    let input = prepared.clone();
+    let row = tokio::task::spawn_blocking(move || input.load_template(0))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(row.entity, orch_core::store::Entity::Template(ref t) if t.name == "\n名前" && t.body == "body")
+    );
+    cancel.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        tokio::task::spawn_blocking(move || prepared.load_template(0))
+            .await
+            .unwrap(),
+        Err(super::PreflightError::Cancelled)
+    ));
+}
+
+#[tokio::test]
+async fn offline_source_guard_and_load_share_the_same_state_descriptor() {
+    use nix::fcntl::{Flock, FlockArg};
+    let src = Src::new();
+    src.put("templates/.md", "original");
+    src.put(".daemon-owner.lock", "synthetic holder");
+    let prepared = prepare_offline(
+        src.project().to_owned(),
+        Options::default(),
+        Arc::new(SystemProbe),
+    )
+    .await
+    .unwrap();
+    assert!(!prepared.procedural_exclusion());
+    assert!(
+        Flock::lock(
+            fs::File::open(src.orch().join(".daemon-owner.lock")).unwrap(),
+            FlockArg::LockExclusiveNonblock
+        )
+        .is_err()
+    );
+    fs::rename(src.orch(), src.project().join("old-state")).unwrap();
+    src.put("templates/.md", "replacement");
+    src.put(".daemon-owner.lock", "replacement lock");
+    assert!(prepared.load_template(0).is_err());
+    // Replacement cannot make the held old description disappear.
+    assert!(
+        Flock::lock(
+            fs::File::open(src.project().join("old-state/.daemon-owner.lock")).unwrap(),
+            FlockArg::LockExclusiveNonblock
+        )
+        .is_err()
+    );
+    drop(prepared);
+    assert!(
+        Flock::lock(
+            fs::File::open(src.project().join("old-state/.daemon-owner.lock")).unwrap(),
+            FlockArg::LockExclusiveNonblock
+        )
+        .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn offline_load_refuses_a_replaced_guard_and_cancellation() {
+    let src = Src::new();
+    src.put("templates/.md", "original");
+    src.put(".daemon-owner.lock", "synthetic holder");
+    let options = Options::default();
+    let cancel = options.cancel.clone();
+    let prepared = prepare_offline(src.project().to_owned(), options, Arc::new(SystemProbe))
+        .await
+        .unwrap();
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(matches!(
+        prepared.load_template(0),
+        Err(PreflightError::Cancelled)
+    ));
+    cancel.store(false, std::sync::atomic::Ordering::Relaxed);
+    fs::rename(
+        src.orch().join(".daemon-owner.lock"),
+        src.orch().join("old.lock"),
+    )
+    .unwrap();
+    src.put(".daemon-owner.lock", "replacement holder");
+    assert!(prepared.load_template(0).is_err());
+}

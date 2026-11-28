@@ -102,7 +102,7 @@ impl<'a, 'conn> ReadView<'a, 'conn> {
 pub(in crate::sqlite) struct Unit<'a, 'conn> {
     pub(super) router: EntityWrite<'a, 'conn>,
     native: cctg::NativeSql<'a, 'conn>,
-    tx: &'a Transaction<'conn>,
+    pub(super) tx: &'a Transaction<'conn>,
     caller: &'a Caller,
     shared: &'a Shared,
     pub(super) now: i64,

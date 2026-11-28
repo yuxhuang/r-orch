@@ -7,7 +7,9 @@
 //! The public surface is deliberately narrow: [`prepare_start`] (and its
 //! async wrapper [`start`]), [`initialize`], the runtime `.gitignore` entries
 //! `orch init` shares ([`RUNTIME_GITIGNORE_ENTRIES`]) and, behind the `testing`
-//! feature, [`testing::DaemonHarness`]. Nothing here re-exports a store implementation or an arbitrary execute closure.
+//! feature, [`testing::DaemonHarness`]. [`import_offline`] is the typed offline
+//! importer operation; its request and outcome carry no storage handle. Nothing
+//! here re-exports a store implementation or an arbitrary execute closure.
 //!
 
 // Stricter than the workspace lints, for library code only (integration tests are separate crates and
@@ -32,6 +34,8 @@ mod error;
 mod gitignore;
 mod guard;
 mod hub;
+mod import;
+pub use import::{ImportOutcome, ImportRequest, import_offline};
 pub mod lifecycle;
 mod listener;
 pub mod ops;
