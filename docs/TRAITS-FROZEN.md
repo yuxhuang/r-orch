@@ -631,6 +631,23 @@ pub trait BlobStore: Send + Sync {
   returned, which can exceed the request. The counter does not cover allocator bookkeeping, what the database or the
   existing snapshots already hold, or the control allocations of a call, and the `Arc` of `new` is not allocated
   fallibly. It is a count of charged payload bytes, not process memory (RSS).
+- **Recovering from `Resource` (issue 554).** `Resource` says that this call's working memory was refused, never that the
+  text is damaged, and an adapter may refuse a `limit` that another serves: SQLite charges each selected row eight times
+  its encoded document plus its task key plus 4,096 bytes, so 1,000 inline rows of 65,536 bytes are refused there (the
+  reviewed probe: limit 126 served, 128, 200 and 1,000 refused) and served by the file reference. The admission is
+  unchanged and the port never retries. A consumer recovers as the spec's "Recovering from `Resource`" and ADR 0020
+  decision 9 state: only `Resource` permits another call, with `floor(limit / 2)`, on the same snapshot and with the
+  unchanged `after` cursor, with a fresh provisional sink; it discards the whole failed page; it does not sleep, wait,
+  reopen the snapshot, reset the counter or advance the cursor; a `Resource` at a limit of 1 is terminal (at most
+  `1 + floor(log2(limit))` calls, 10 for 1,000) and is returned as `Resource`; every other error, `Cancelled` included,
+  propagates at once; and it acts or advances only after `Ok(RetryTextPage)`. `Resource` itself does not retire a snapshot;
+  the existing retirement rules still apply (expiry, a panic of the read operation, a fresh fatal or native SQL error, and
+  a disk fault, below), and a later call on a retired snapshot fails with `Store(Backend)`. The signatures above do not
+  change. The producer's public matrix shows the policy on a test-side loop on all four registrations
+  (`all_adapters_limit_1000_large_inline_bounded_resource_recovery`: 1,001 inline rows, SQLite serves a page of 125;
+  `all_adapters_resource_recovery_discards_provisional_page_and_stops_at_one`: a sink `Resource` after bytes, 8 then 4, and
+  a terminal `Resource` at limit 1 after 1,000 down to 1). No production consumer implements the policy yet, and the
+  consumer's own proof and the controller's acceptance are owed.
 - **Cancellation.** The adapter derives a child token of `cancellation`, holds its drop guard for the whole await,
   checks it before every read, before every callback and before it returns success, and keeps the snapshot and the
   admission charged until its worker has exited. A latched sink error is never turned into success.

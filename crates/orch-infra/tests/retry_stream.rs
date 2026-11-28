@@ -656,3 +656,236 @@ async fn valid_objects_still_require_the_whole_hash_and_utf8_to_verify() {
         rig.close().await;
     }
 }
+
+// A synthetic consumer example, not the T12 production implementation. It keeps
+// only counters: diagnostic payload is checked as it arrives, never accumulated.
+#[derive(Default)]
+struct LargeInlineSeen {
+    rows: usize,
+    row_bytes: usize,
+    bytes: u64,
+    admission: Option<RetryStreamAdmission>,
+}
+struct LargeInlineSink {
+    first: usize,
+    seen: Arc<Mutex<LargeInlineSeen>>,
+    refuse: bool,
+}
+impl RetryTextSink for LargeInlineSink {
+    fn begin(&mut self, row: RetryTextRow<'_>, admission: &RetryStreamAdmission) -> Result<()> {
+        let mut seen = self.seen.lock().unwrap();
+        if seen.rows > 0 {
+            assert_eq!(seen.row_bytes, 65_536);
+        }
+        let index = self.first + seen.rows;
+        assert_eq!(row.task, format!("inline-{index:04}"));
+        assert_eq!(row.attempt, (index % 7 + 1) as u32);
+        assert_eq!(row.due_at, (index / 3) as i64);
+        assert_eq!(row.bytes, 65_536);
+        assert!(admission.used_bytes() <= 64 * 1024 * 1024);
+        seen.admission = Some(admission.clone());
+        seen.rows += 1;
+        seen.row_bytes = 0;
+        Ok(())
+    }
+    fn write(&mut self, bytes: &[u8], admission: &RetryStreamAdmission) -> Result<()> {
+        let mut seen = self.seen.lock().unwrap();
+        assert!(!bytes.is_empty());
+        assert!(bytes.len() <= RETRY_STREAM_WINDOW_BYTES);
+        for (offset, byte) in bytes.iter().enumerate() {
+            assert_eq!(*byte, [0xc3, 0xa9][(seen.row_bytes + offset) % 2]);
+        }
+        seen.row_bytes += bytes.len();
+        seen.bytes += bytes.len() as u64;
+        assert!(admission.used_bytes() <= 64 * 1024 * 1024);
+        if self.refuse {
+            return Err(RetryStreamError::Resource);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecoveryTrace {
+    limits: Vec<usize>,
+    discarded_bytes: u64,
+}
+// Resource alone reduces the limit; the snapshot and committed cursor never
+// change on failure. Every attempt owns fresh provisional state.
+async fn recover_inline_page(
+    snapshot: &dyn ReadSnapshot,
+    after: Option<&RetryCursor>,
+    first: usize,
+    mut limit: usize,
+    mut refused_attempts: usize,
+    trace: &mut RecoveryTrace,
+) -> Result<RetryTextPage> {
+    loop {
+        trace.limits.push(limit);
+        let seen = Arc::new(Mutex::new(LargeInlineSeen::default()));
+        let result = snapshot
+            .read_retry_text(
+                after,
+                limit,
+                Box::new(LargeInlineSink {
+                    first,
+                    seen: seen.clone(),
+                    refuse: refused_attempts > 0,
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        refused_attempts = refused_attempts.saturating_sub(1);
+        let provisional = seen.lock().unwrap();
+        if let Some(admission) = &provisional.admission {
+            assert_eq!(admission.used_bytes(), 0);
+        }
+        match result {
+            Ok(page) => {
+                assert_eq!(page.rows, provisional.rows);
+                assert_eq!(page.bytes, provisional.bytes);
+                assert_eq!(provisional.row_bytes, 65_536);
+                return Ok(page);
+            }
+            Err(RetryStreamError::Resource) => {
+                trace.discarded_bytes += provisional.bytes;
+                if limit == 1 {
+                    return Err(RetryStreamError::Resource);
+                }
+                limit = (limit / 2).max(1);
+            }
+            Err(error) => return Err(error),
+        }
+        // No provisional counters or payload survive into the next attempt.
+    }
+}
+async fn put_large_inline(rig: &Fixture, count: usize) {
+    rig.storage
+        .transaction(caller(), Lane::Entities, move |u| {
+            for index in 0..count {
+                u.put_retry(&Retry {
+                    task: format!("inline-{index:04}"),
+                    attempt: (index % 7 + 1) as u32,
+                    due_at: (index / 3) as i64,
+                    error: "é".repeat(32_768),
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn all_adapters_limit_1000_large_inline_bounded_resource_recovery() {
+    for kind in ["memory", "backed", "file", "sqlite"] {
+        let rig = Fixture::new(kind);
+        // One extra row forces a continuation even on adapters admitting 1000.
+        put_large_inline(&rig, 1001).await;
+        let snapshot = rig.snapshot().await;
+        let mut cursor = None;
+        let mut accepted = 0;
+        let mut total = 0;
+        let mut limit = 1000;
+        let mut trace = RecoveryTrace::default();
+        loop {
+            let page = recover_inline_page(
+                snapshot.as_ref(),
+                cursor.as_ref(),
+                accepted,
+                limit,
+                0,
+                &mut trace,
+            )
+            .await
+            .unwrap();
+            limit = *trace.limits.last().unwrap();
+            assert!(page.rows > 0);
+            accepted += page.rows;
+            total += page.bytes;
+            assert_eq!(
+                page.next,
+                (accepted < 1001).then(|| RetryCursor {
+                    task: format!("inline-{:04}", accepted - 1),
+                    due_at: ((accepted - 1) / 3) as i64,
+                })
+            );
+            cursor = page.next;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!((accepted, total), (1001, 1001 * 65_536));
+        assert_eq!(trace.limits[0], 1000);
+        // Retaining the reduced limit bounds the complete traversal by at
+        // most 1001 nonempty pages plus nine failed reductions. Admission may
+        // improve in any adapter without changing this recovery contract.
+        assert!(trace.limits.len() <= 1010, "finite recovery and traversal");
+        for limits in trace.limits.windows(2) {
+            assert!(limits[1] == limits[0] || limits[1] == (limits[0] / 2).max(1));
+        }
+        eprintln!(
+            "{kind}: limit1000 traversal rows={accepted} bytes={total} limits={:?}",
+            trace.limits
+        );
+        drop(snapshot);
+        rig.close().await;
+    }
+}
+
+#[tokio::test]
+async fn all_adapters_resource_recovery_discards_provisional_page_and_stops_at_one() {
+    for kind in ["memory", "backed", "file", "sqlite"] {
+        let rig = Fixture::new(kind);
+        put_large_inline(&rig, 9).await;
+        let snapshot = rig.snapshot().await;
+        let cursor = RetryCursor {
+            task: "inline-0000".into(),
+            due_at: 0,
+        };
+        let mut trace = RecoveryTrace::default();
+        let page = recover_inline_page(snapshot.as_ref(), Some(&cursor), 1, 8, 1, &mut trace)
+            .await
+            .unwrap();
+        assert_eq!(trace.limits, [8, 4]);
+        assert!(trace.discarded_bytes > 0);
+        assert_eq!((page.rows, page.bytes), (4, 4 * 65_536));
+        assert_eq!(
+            page.next,
+            Some(RetryCursor {
+                task: "inline-0004".into(),
+                due_at: 1
+            })
+        );
+        let mut terminal = RecoveryTrace::default();
+        assert!(matches!(
+            recover_inline_page(
+                snapshot.as_ref(),
+                Some(&cursor),
+                1,
+                1000,
+                usize::MAX,
+                &mut terminal,
+            )
+            .await,
+            Err(RetryStreamError::Resource)
+        ));
+        assert_eq!(terminal.limits, [1000, 500, 250, 125, 62, 31, 15, 7, 3, 1]);
+        assert!(terminal.discarded_bytes > 0);
+        // The failed page did not advance the cursor or poison the snapshot.
+        let mut recovered = RecoveryTrace::default();
+        let page = recover_inline_page(snapshot.as_ref(), Some(&cursor), 1, 1, 0, &mut recovered)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.next,
+            Some(RetryCursor {
+                task: "inline-0001".into(),
+                due_at: 0
+            })
+        );
+        assert_eq!((page.rows, page.bytes), (1, 65_536));
+        drop(snapshot);
+        rig.close().await;
+    }
+}

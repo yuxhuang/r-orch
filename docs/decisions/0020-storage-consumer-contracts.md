@@ -10,7 +10,8 @@
   and 11 to the retry row, and is the ADR that `docs/TRAITS-FROZEN.md` requires for its record of the landed v2
   port. It supersedes no accepted ADR.
 - Amended: decision 8 (28 November 2026) adds the permanent input refusal of issue 441, and decision 9 (2026-11-28)
-  adds a bounded, verified streaming read of a retry's whole text for its first production consumer (T12). Decisions 1
+  adds a bounded, verified streaming read of a retry's whole text for its first production consumer (T12) and records
+  how that consumer recovers from `Resource` (issue 554). Decisions 1
   to 7 stand as written; decision 9 adds a port trait and a supertrait edge and changes no signature of decisions 1 to 4.
 - Scope of the decision: contracts, and the memory and file references that meet them. The change that carries this
   ADR implements decisions 1 to 4 in `orch-core`, the memory fake and the file reference and registers the shared
@@ -309,6 +310,30 @@ reference conformance reconciliation (#196) landed and #130 closed:
      implement them refuses the stream with `Store(Backend)` and a constant text, and the stream never falls back to
      the whole `get`. The hasher is lent to a closure on the stack, so no boxed hasher is allocated. `DiskBlobStore`
      implements all three.
+   - *Recovering from `Resource` (issue [#554](https://github.com/yuxhuang/r-orch/issues/554)).* The admission above stays
+     conservative: SQLite's charge of eight times the encoded document plus the task key plus 4,096 bytes is kept, as are the
+     64 MiB shared counter, the 65,536-byte window and the whole text. The reviewer's probe showed what that costs: 1,000
+     synthetic inline rows of 65,536 bytes are served on the file reference and refused with `Resource` on SQLite at limits
+     128, 200 and 1,000, while limit 126 succeeds (127 was not probed; the producer's proof below measured limit 125 served). The reviewer's alternative, a charge close to the decoded
+     footprint, is not adopted here: this follow-up retains the conservative admission, and the controller's acceptance of that choice is still pending. The review's other
+     option, a stated recovery for a refused page, is what this bullet records. The contract is therefore the consumer's, and the port does not retry. A `Resource`, and only a `Resource`, permits a call
+     again with `floor(limit / 2)` on the same snapshot and the unchanged cursor, with a fresh provisional sink each time.
+     The consumer discards the whole failed page, does not sleep, wait, reopen the snapshot, reset the counter or advance
+     the cursor, and acts only after an `Ok`. A `Resource` at a limit of 1 is terminal (the sequence is finite: at most
+     `1 + floor(log2(limit))` attempts, 10 for 1,000), and is returned as `Resource`. Every other error, `Cancelled`
+     included, propagates at once. The full statement is the spec's "Recovering from `Resource`" under "Bounded read of a
+     retry's text". Its proof is two tests of the public matrix `retry_stream.rs`, each on the four
+     registrations (the plan's "Bounded retry text read"; 12 passed, 0 failed in the producer's run). The first,
+     `all_adapters_limit_1000_large_inline_bounded_resource_recovery`, seeds 1,001 inline rows of 65,536 bytes (the extra
+     row forces a cursor even where 1,000 is admitted) and shows a successful full traversal by bounded reduction: the memory
+     fake, its disk-backed form and the file reference serve limit 1,000, and SQLite refuses 1,000, 500 and 250 and then serves
+     limit 125, which is measured. It does not require one attempt to succeed at 1,000 on any adapter. The second,
+     `all_adapters_resource_recovery_discards_provisional_page_and_stops_at_one`, injects a sink `Resource` after bytes have
+     been delivered, replays 8 then 4 from the unchanged cursor, shows a terminal `Resource` at limit 1 after 1,000, 500, 250,
+     125, 62, 31, 15, 7, 3, 1 on all four, and then reads healthily at limit 1 from the same cursor and snapshot. Both loops
+     are the tests' own and stand for the consumer. No production code implements the policy and no consumer exists, so this
+     records a contract and its producer proof and releases nothing; the consumer's own implementation and proof, and the
+     controller's acceptance, are owed.
    - *What stays as it was.* No stored format, schema or setting changes. The 4 MiB serialized-manifest limit on the
      SQLite write side, and the error a write over it returns, are not changed here: that disposition is the
      controller's, under open issue [#546](https://github.com/yuxhuang/r-orch/issues/546), and the cap is no logical
@@ -318,8 +343,9 @@ reference conformance reconciliation (#196) landed and #130 closed:
      trait and adapter commit is part of the consumer's candidate, the consuming call has passed the independent code
      review and the security review that its surface requires (the security reasoning and evidence stay private), the
      private Linux evidence that the plan's "Bounded retry text read" lists is recorded against that commit, with
-     its actual limits, and the controller has the proofs of the two deferred fixtures named there ([#511](https://github.com/yuxhuang/r-orch/issues/511),
-     [#512](https://github.com/yuxhuang/r-orch/issues/512)). The other #449 items keep their own triggers.
+     its actual limits, the controller has the proofs of the two deferred fixtures named there ([#511](https://github.com/yuxhuang/r-orch/issues/511),
+     [#512](https://github.com/yuxhuang/r-orch/issues/512)), and the controller has accepted the `Resource` recovery
+     policy in the consumer's own code and proof (the producer's public proof is named under *Recovering from `Resource`*). The other #449 items keep their own triggers.
 
 ## Alternatives considered
 
@@ -411,7 +437,9 @@ reference conformance reconciliation (#196) landed and #130 closed:
   caller), and T14 must keep dispatching in candidate order and not due-row order.
 - A consumer of decision 9's stream has three things to do that the whole-value reads did not ask of it: hold its output
   as provisional until `read_retry_text` returns, discard it on every error including `Cancelled`, and treat `Resource`
-  as a statement about this call's memory and never about the stored text (`Corrupt` is the statement about the text).
+  as a statement about this call's memory and never about the stored text (`Corrupt` is the statement about the text). On
+  `Resource` it halves the limit and tries again on the same snapshot and cursor, as the "Recovering from `Resource`"
+  bullet of decision 9 states, and an adapter may refuse a limit that another adapter serves.
   The stream has no end-of-row callback: a row ends where the next `begin` is called or the page returns. Its
   cursor is the returned page's `next`, valid only on success. Which consumer policy follows each error is T12's.
 - On SQLite a disk fault during the stream ends that snapshot, as it does for the whole-value reads. A consumer that

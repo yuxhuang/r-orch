@@ -293,6 +293,14 @@ capacity of 64 MiB. It releases no production read: the first one waits for the 
 text read" states. A later revision of the same day records that SQLite observes a disk fault during the stream (item 7 of
 "Bounded read of a retry's text"), and nothing else. No independent review had read either revision when it was written.
 
+The revision that carries this paragraph records the contract for recovering from `Resource` of the bounded retry read
+(issue 554; "Recovering from `Resource`" under "Bounded read of a retry's text"; ADR 0020 decision 9) and changes
+nothing else. It states a consumer policy only: halve the limit, on the same snapshot and cursor, with a fresh
+provisional sink, discard the whole failed page, stop at a terminal `Resource` at a limit of 1, and act only after `Ok`.
+It changes no admission charge, no signature, no stored data, no schema and no setting, and it adds no production code
+(its producer follow-up adds two tests to the public matrix). No production consumer exists, so nothing is released, and
+issue 554 stays open until the consumer implements the policy and the controller accepts the consumer's evidence. No independent review had read this revision when it was written.
+
 ## Source
 
 Verbatim excerpts of the owner's request as recorded in the goal "orch 2.0 phase 1: SQLite storage (release
@@ -1477,11 +1485,66 @@ nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or
 
   The consumer shall not collect the stream into an unbounded string and shall not act on a prefix that was not
   verified. `Resource`, `Cancelled`, `Corrupt` and ordinary store errors are distinct results; the consumer's policy for
-  each is T12's. Each adapter's counter has the default capacity of 64 MiB (67,108,864 bytes); the contract adds no
+  `Resource` is the bounded recovery below, and its policy for each of the others is T12's. Each adapter's counter has the default capacity of 64 MiB (67,108,864 bytes); the contract adds no
   setting, and the counter is not a limit on the length of a text. What the contract and its tests cover is
   stated in the plan's "Bounded retry text read": that section lists the evidence that is required before a first
   production read, the tests that exist, and what is still owed. The security reasoning behind the requirements, and the evidence
   for them, are kept private.
+
+  *Recovering from `Resource`* (issue [#554](https://github.com/yuxhuang/r-orch/issues/554); the contract is settled
+  here, no production code implements it yet, and no production consumer exists). The adapter's admission stays as item 4 states it:
+  conservative, one 64 MiB counter per adapter, windows of 65,536 bytes, and the whole text of a stored retry. It is not
+  loosened, and no setting is added. On SQLite the conservatism is visible: the charge for a selected row is eight times
+  its encoded document plus its task key plus 4,096 bytes, so a page of 1,000 inline rows of 65,536 bytes is refused
+  although the memory fake, the file reference and the whole-value read of the same rows serve it (the reviewed probe
+  measured success at limit 126 and `Resource` at 128, 200 and 1,000; 127 was not probed; the proof below observed `Resource` at
+  1,000, 500 and 250 and success at 125). A caller therefore cannot
+  assume that any `limit` in 1..=1,000 is served, and the consumer shall recover as follows:
+  1. *Only `Resource` recovers.* `Cancelled`, `Corrupt`, `Store(..)` (a sink's own error included) and every other
+     result end the call and propagate unchanged. No attempt follows a fired cancellation token.
+  2. *Halve the limit.* After a `Resource` the consumer may call again with `floor(limit / 2)` (1,000, 500, 250, 125,
+     62, 31, 15, 7, 3, 1: at most 10 attempts for a limit of 1,000, and in general `1 + floor(log2(limit))`). The
+     reduction is the only recovery: no other parameter changes.
+  3. *Same snapshot, same cursor.* Every attempt uses the first attempt's snapshot and its `after` cursor. `Resource`
+     itself does not retire a snapshot, so while the snapshot lives a retry sees the same rows in the same order, and the
+     cursor does not move between attempts. The existing retirement rules still apply (expiry, a panic of the read
+     operation, a fresh fatal or native SQL error, and a disk fault, item 7): a later call on a retired snapshot fails
+     with `Store(Backend)`, which item 1 propagates.
+  4. *A fresh provisional sink for each attempt.* The consumer passes a new sink, bounded by the same admission
+     counter or spooling provisional bytes. The failed attempt's sink is dropped when its call returns, which is after the
+     adapter's worker has exited and its charge has been released. The consumer discards **all** of a failed
+     attempt's output, including bytes of rows delivered before the refusal, and keeps none of it.
+  5. *No other action.* The consumer does not sleep, spin on a timer, wait for the counter to drain, reopen or replace the
+     snapshot, reset or resize the counter, or construct a second adapter between attempts. A retry follows its
+     predecessor immediately.
+  6. *A terminal `Resource`.* A `Resource` at a limit of 1 ends the call: `floor(1 / 2)` is 0, which the port refuses as an
+     invalid limit, so the sequence is finite. The consumer returns `Resource` to its caller, still content-free and never
+     mapped to `Corrupt` or to a statement about the text. Reasons it can happen: other reads of the same adapter hold the
+     shared counter, or the sink's own retention does. It says nothing about the stored text, and the row stays.
+  7. *Nothing happens before `Ok`.* The consumer advances its cursor, publishes output and acts on a row only after a
+     call returned `Ok(RetryTextPage)`. The page's `next` is the cursor for the page it describes: the reduced one, not the
+     one first requested. A reduced page returns fewer rows with a `next` when more follow, so a full traversal of the
+     retries is the sequence of successful pages, and each page's recovery is bounded as above. Whether the next page
+     starts again at the original limit or at the reduced one is the consumer's choice; the contract carries no
+     state between pages.
+
+  The contract does not promise that a call at the maximum limit succeeds on one attempt, on any adapter. Its public proof
+  is two tests of the matrix `crates/orch-infra/tests/retry_stream.rs`, each on the memory fake in its logical and
+  disk-backed forms, the file reference and SQLite (the plan's "Bounded retry text read", "Held and deferred"; 12 passed,
+  0 failed in the producer's run). `all_adapters_limit_1000_large_inline_bounded_resource_recovery` seeds 1,001 inline rows
+  of 65,536 bytes (1,001 and not 1,000: the extra row forces a cursor on an adapter that admits 1,000), applies the policy
+  above through a test-side loop, and shows a successful full traversal by bounded reduction, never an assertion that the
+  first attempt at 1,000 is served. Observed: the memory fake, its disk-backed form and the file reference serve limit 1,000
+  (calls at 1,000 and 1,000); SQLite refuses 1,000, 500 and 250 and serves 125, in 9 pages (calls at 1,000, 500, 250
+  and then 125 nine times). The test checks every row's task, attempt, due time and declared bytes, its order and ties, every
+  byte of the text, the exact cursor and a counter back at zero.
+  `all_adapters_resource_recovery_discards_provisional_page_and_stops_at_one` injects a `Resource` from the sink after bytes
+  were delivered, and shows that the failed attempt's output is discarded and that the next attempt at the halved limit (8 then
+  4) returns the same rows from the unchanged cursor. It shows too that a `Resource` refused at every attempt ends at limit 1
+  after 1,000, 500, 250, 125, 62, 31, 15, 7, 3, 1 on all four adapters, and that a healthy read at limit 1 then resumes from the same
+  cursor on the same snapshot. The port itself never retries. The loop belongs to the consumer: these tests prove the policy
+  on test-side code, not on the consumer's, whose own implementation and tests (and the controller's acceptance of them) are
+  owed before the first read is released.
 
   Tests required on both references, with the test that carries each item. The first three rows are scenarios of the
   conformance suite's `retry_suite` (21 scenarios), registered as `memory_retries_v2` (logical fake),
