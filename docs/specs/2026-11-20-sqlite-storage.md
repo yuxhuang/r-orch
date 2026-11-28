@@ -3121,19 +3121,24 @@ owner, and it is not a latency guarantee.
   after the retirement and its row is stored. Since PR #455 (issue 445) a third case has a finite deadline 3,600 s ahead when
   the request is admitted: it runs once after the retirement, its row is stored and nothing is left suppressed. No test advances
   a clock across the original deadline, so none shows a deadline that falls due while the request waits for the retirement. The unit test
-  `sqlite::writer::policy::tests::expiry_withdraws_before_another_attempt_and_drop_releases_claims` calls
-  `Schedule::pop_allowed(false)`, a gate that skips claims alone and lets the other lanes through, which the worker does
-  not use: it shows the episode's suppression flag and not the worker's queue rule.
+  `sqlite::writer::policy::tests::expiry_withdraws_before_another_attempt_and_drop_releases_claims` shows the episode's
+  suppression flag (`claims_suppressed()` while the retry is registered, and again after the drop); since #459 it no longer
+  calls `Schedule::pop_allowed(false)`, a gate that skips claims alone and lets the other lanes through, which the worker did
+  not use. Its `Schedule` still takes part in no gate, so the test does not prove the worker's queue rule: that rule is in
+  `writer::run` (while a retry is registered the worker takes the continuation and nothing from the queue), and the retained
+  tests above show it (issue 461 item 4).
 
 **One retained producer per writer (issue 448, issue 461 item 5, issue 456; the contract that T16 follows before it wires
 the event producer).** This is read from the source and its tests, not a ruling of the owner, and it is a contract of the
-adapter that a design must change explicitly. It was read on Linux at `77376bc6c` (`main`, after #442) and at `fd81eacc3`,
-the frozen head of the draft PR #459 (tree `b97ab7722`, on `5b382b296`). `writer.rs`, `storage/retained.rs` and
-`events/producer.rs` are byte-identical at the two (`git diff` of the three paths is empty), so every rule below that
-names them holds on `main` today. PR #459 changes `writer/policy.rs` (the module header that states the cardinality, and
-the identity of an episode by its own flag instead of the time of its first failure), `writer/failure.rs` and
-`storage/mod.rs` (the reply of a queued sibling after a fresh fatal read), and tests. Where a sentence below needs #459
-it says so. Nothing here is wired to the daemon, which uses files until T24.
+adapter that a design must change explicitly. It was first read on Linux at `77376bc6c` (`main`, after #442) and at
+`fd81eacc3`, the frozen head of PR #459, and it is read again on `main` at `23ffdc838` (after #459, #466, #486 and #488),
+which is what the rules below describe. #459 landed as `930d32585`: it changed `writer/policy.rs` (the module header that
+states the cardinality, and the identity of an episode by its own flag instead of the time of its first failure),
+`writer/failure.rs` and `storage/mod.rs` (the reply of a queued sibling after a fresh fatal read), and tests. Between
+`fd81eacc3` and `23ffdc838` `writer.rs`, `events/producer.rs`, `writer/policy.rs` and `storage/mod.rs` do not change
+(`git diff` of each is empty). `storage/retained.rs` changes only in its test module, `writer/failure.rs` only in the
+visibility of `writer_retry`, and `events/adapter.rs` in how a reader's failure is classified, which is no rule of this
+contract. Nothing here is wired to the daemon, which uses files until T24.
 
 - *Cardinality.* One retained producer per writer, and it is the event producer. `EventProducer::drive`
   (`events/producer.rs`) opens one `retained_write(.., Lane::Events, None)` per logical transaction and runs one
@@ -3162,18 +3167,22 @@ it says so. Nothing here is wired to the daemon, which uses files until T24.
   `retryable()` is not consulted: the rule of `retryable()` (a confirmed `RolledBack` or `NotStarted` outcome with a retryable
   code and a nonterminal answer) applies only to an attempt that ran. After `Overloaded` at admission the token keeps
   `may_submit` when it has no deadline or its deadline is still ahead, and the episode stays registered; a refusal that
-  leaves the deadline passed, or any other error, finishes the episode. The word is not one thing: `overloaded` at
+  leaves the deadline passed, or any other error of `submit_episode`, finishes the episode. (The check of the latch that
+  precedes the submission returns the latch and closes the token's gate, and does not finish the episode: dropping the
+  token does.) The word is not one thing: `overloaded` at
   admission leaves the token usable, and `overloaded` in a receipt (the deadline passed while the job was queued) is a
   terminal answer of an attempt that the writer withdrew and will never commit. The producer tells them apart by where
   the answer comes from: its `attempt_unit` error arm sees only admission errors (and a latch), and treats `overloaded`
-  with no failure latched as pressure: it waits 25 ms, doubling to 250 ms, and submits the same input again, with no limit
+  with no failure latched as pressure (`admission_pressure` reads the error's text, since `port` gives the refusal no type;
+  a test provokes the real refusal): it waits 25 ms, doubling to 250 ms, and submits the same input again, with no limit
   on the count (`ADMISSION_WAIT`, `ADMISSION_WAIT_MAX`). What bounds the wait is the episode: a registered episode that
   gets no commit for sixty seconds latches `RetryWithoutCommit`, which only a restart ends; an episode that was never
   registered (its first submission was refused at the lane) has no bound of its own, and has taken nothing from anyone.
   The producer's deadline is `None`, so `check_retry_timeout` never withdraws its episode; a retained write that is given a
   deadline is withdrawn at it once its last outcome is a known noncommit, and a refusal after `prepare` leaves that outcome
   `NotStarted`.
-- *The occupied slot, measured.* At `fd81eacc3` a throwaway test (not kept; the plan's "One retained producer per writer"
+- *The occupied slot, measured.* At `fd81eacc3`, and again on `main` at `23ffdc838` (the same patch applied unchanged and
+  printed the same states), a throwaway test (not kept; the plan's "One retained producer per writer"
   lists it) registered an episode that had a 200 ms deadline, a COMMIT reached and an unknown outcome, and a second
   registered episode in the slot. Before a reconciliation the unknown episode is fenced: `check_retry_timeout` after the
   deadline kept it registered. After the outcome was set to `RolledBack`, as `reconcile(false)` does, a resubmission was
@@ -3182,9 +3191,12 @@ it says so. Nothing here is wired to the daemon, which uses files until T24.
   permanent test `a_second_retained_rebuild_is_refused_until_the_continuation_slot_is_taken` (`sqlite::writer::tests`, added by
   #459) shows the refusal and the resubmission at the writer, with two episodes that fail at one instant. The review of #459
   found it a characterization of the one-slot behaviour and not the regression test of the identity fix, which two tests of
-  `writer::policy::tests` pin (the PR's description says the same). The reuse of a `RetainedWrite` token
-  after such a refusal is still untested at the token. The first-submission refusal at the lane is tested through the producer
-  (`an_admission_the_writer_refuses_is_kept_and_committed_later`).
+  `writer::policy::tests` pin (the PR's description says the same); the test's own comment does not say so yet (issue 461
+  item 3). The reuse of a `RetainedWrite` token
+  after such a refusal is still untested at the token. A first submission that the writer refuses because its queue is full
+  (capacity 1) is tested through the producer (`an_admission_the_writer_refuses_is_kept_and_committed_later`); a refusal at the
+  continuation slot needs a second retained write, because the one producer submits one transaction at a time and so finds the
+  slot empty when its rebuild arrives; no test reaches it through the producer.
 - *The uncertain COMMIT boundary (issue 456; issue 461 item 5).* An unknown COMMIT is fenced by three things that
   stand together: the attempt's outcome is `Unknown`, which `rebuild` excludes, so `may_submit` is false and the token's
   `unknown` is set; `attempt_unit` refuses a new submission with "write requires its prior receipt or outcome
@@ -3199,17 +3211,31 @@ it says so. Nothing here is wired to the daemon, which uses files until T24.
   probe above is that case). `commit_attempted` is per attempt: the executor sets it when it issues COMMIT, `prepare`
   clears it for every submission, and `reconcile_encoded` reads it to refuse a reading of a callback that never reached COMMIT
   (an empty expected set or rows that were already there) as a commit. It answers false without reading the database in
-  that case. Two things are not as safe as that sounds. First, no permanent test pins the reset: at `fd81eacc3`, with the line
-  `p.commit_attempted = false;` removed from `prepare`, the 136 tests of `sqlite::writer`, `sqlite::storage::retained` and
-  `sqlite::events::tests::producer` still pass, which is the survivor that issue 456 reports as M2; its tests, and those
-  of the closure of intake after two uncertain commits (M6, M7), are the fix of issue 456, not on `main`. Second, the generic
-  `RetainedWrite::reconcile` has no `commit_attempted` guard; only `reconcile_encoded` has (issue 456 N1). The event
-  producer uses the guarded one, and a first production caller of the generic one must add the guard or an equivalent
-  enforced precondition before it ships.
-- *Not covered by this contract.* A queued sibling of a pinned read snapshot (issue 448 C) is a reader matter and is
-  in #459 and the spec's "Reader snapshots on SQLite". The three writer cleanups that #459 split off (issue 457) change no
-  contract here. Issue 461 items 1, 2 and 4 (a test of the fresh-fatal baseline, a softened comment, the vestigial queue in a
-  test) are test and comment work that follows #459 and changes no sentence above.
+  that case. Two things need a closer look. First, the reset is pinned since #466 (issue 456, closed):
+  `sqlite::storage::retained::tests::refused_commit_does_not_mark_the_next_callback_only_failure_as_committed` makes a
+  first attempt end at a refused COMMIT and a second attempt end before COMMIT, and asserts that `reconcile_encoded` of an
+  empty expected set answers false. On `23ffdc838` the selection of `sqlite::writer`, `sqlite::storage::retained` and
+  `sqlite::events::tests::producer` is 147 tests and passes; with the line `p.commit_attempted = false;` commented out of
+  `prepare`, 146 pass and that test alone fails (at `fd81eacc3`, before #466, the 136 tests of the same selection all passed
+  without the line: the survivor that issue 456 reports as M2). The same PR added
+  `sqlite::events::tests::producer::two_uncertain_commits_reconciled_absent_report_storage_unavailable_and_close_intake`
+  (issue 456's M6 and M7): with the branch of `Reconciled::NotStored` that fails the producer when a failure is latched
+  disabled (M6), it fails at its assertion that intake is closed, and with the latch check removed from the `Rebuild` guard
+  of `reconcile` (M7), at its assertion of the public error. Second, the generic `RetainedWrite::reconcile` has no
+  `commit_attempted` guard; only `reconcile_encoded` has (issue 456 N1, now issue 465, open). Its three callers are tests of
+  `storage/retained.rs`, and the event producer uses the guarded one. A first production caller of the generic one must add
+  the guard or an equivalent enforced precondition before it ships, and test that a durable identity that already exists
+  cannot turn a callback that never reached COMMIT into a commit, and that a genuine uncertain COMMIT still reconciles
+  (issue 465). Nothing of this contract waives that.
+- *Not covered by this contract.* A queued sibling of a pinned read snapshot (issue 448 C) is a reader matter and landed
+  in #459; the spec's "Reader snapshots on SQLite" has it. The three writer cleanups that #459 split off (issue 457) change no
+  contract here. Issue 461 stays open and is not discharged by this text. Item 5 (the supported-cardinality paragraph) is
+  answered here: the header of `writer/policy.rs` on `main` still says that a refused rebuild keeps its episode live as
+  "retryable contention" without the qualification above (an unknown COMMIT is never in that position before a
+  reconciliation, and after one the episode is an ordinary known noncommit that its deadline may withdraw), and that
+  comment is code, not this text. Items 1 and 2 (the prior-latch expiry test and the wording of the snapshot comment),
+  3 (the comment of the occupied-slot test) and 4 (the vestigial queue of a policy test) are test and comment work, and
+  none changes a sentence above.
 
 **As built: the event producer (issue 127, T16's first slice, record P item 2; a development input, not the T10 freeze).**
 `EventProducer` (`crates/orch-infra/src/sqlite/events/producer.rs`, exported from `orch_infra::sqlite`) is the first caller of
