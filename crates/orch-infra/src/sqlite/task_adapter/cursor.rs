@@ -116,7 +116,8 @@ impl Fallback {
         let end = next.ceil_char_boundary(k + 1);
         let tail = next.as_bytes()[k..end].to_vec();
         let prefix = id.floor_char_boundary(room.checked_sub(FROM_FIXED + tail.len())?);
-        if k <= prefix && u16::try_from(k).is_ok() {
+        // `prefix <= MAX_RAW`, so a reachable `k` fits the u16 encoding.
+        if k <= prefix {
             return Some(Self::From { k, tail });
         }
         Some(Self::Successor {

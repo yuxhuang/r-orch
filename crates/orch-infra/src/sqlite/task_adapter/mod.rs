@@ -15,7 +15,7 @@ use super::{FailureSource, ReadPool, Result, SqliteError};
 use crate::blob::DiskBlobStore;
 pub(super) use cursor::TaskCursors;
 use orch_core::clock::Clock;
-use orch_core::store::{Filter, Page, PageRequest, Record};
+use orch_core::store::{Cursor, Filter, Page, PageRequest, Record};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -87,19 +87,6 @@ pub(super) fn page(
     filter: &Filter,
     request: &PageRequest,
 ) -> Result<Page<Record>> {
-    page_between(sql, cursors, now_ms, filter, request, || {})
-}
-
-/// `between` runs after the IDs are selected and before they are hydrated, to
-/// let a test commit from another connection at exactly that point.
-fn page_between(
-    sql: &TaskSql<'_, '_>,
-    cursors: &TaskCursors,
-    now_ms: i64,
-    filter: &Filter,
-    request: &PageRequest,
-    between: impl FnOnce(),
-) -> Result<Page<Record>> {
     task_page::validate_request(filter, request)?;
     let after = request
         .cursor
@@ -111,25 +98,35 @@ fn page_between(
         cursor: None,
         ..request.clone()
     };
-    let TaskIdPage {
-        ids,
-        next,
-        following,
-        total,
-    } = task_page::query(sql.tx, sql.project, filter, &walk, after.as_ref()).map_err(selected)?;
-    between();
-    let items = sql.hydrate(&ids)?;
-    let next_cursor = next
-        .zip(following)
-        .map(|(next, following)| {
-            cursors.issue(sql.project, filter, request.sort, &next, &following, now_ms)
-        })
-        .transpose()?;
+    let selected =
+        task_page::query(sql.tx, sql.project, filter, &walk, after.as_ref()).map_err(selected)?;
+    let items = sql.hydrate(&selected.ids)?;
+    let next_cursor = issue(cursors, sql.project, filter, request, now_ms, &selected)?;
     Ok(Page {
         items,
         next_cursor,
-        total,
+        total: selected.total,
     })
+}
+
+fn issue(
+    cursors: &TaskCursors,
+    project: &str,
+    filter: &Filter,
+    request: &PageRequest,
+    now_ms: i64,
+    selected: &TaskIdPage,
+) -> Result<Option<Cursor>> {
+    selected
+        .next
+        .as_ref()
+        .map(|next| {
+            let following = selected.following.as_ref().ok_or_else(|| {
+                SqliteError::Unrepresentable("Task page continuation has no following tuple".into())
+            })?;
+            cursors.issue(project, filter, request.sort, next, following, now_ms)
+        })
+        .transpose()
 }
 
 #[cfg(test)]

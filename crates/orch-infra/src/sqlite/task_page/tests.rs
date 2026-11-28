@@ -993,6 +993,10 @@ fn ids_with_prefix_are_the_projects_rows_of_that_prefix_and_byte_length() {
     }
     insert(&db, "other", &task("abc9", TaskStatus::Todo, 1, 1, None), 1);
     let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+    pool.configure_test_readers(|conn| {
+        conn.pragma_update(None, "reverse_unordered_selects", true)
+            .unwrap();
+    });
     let find = |project: &str, prefix: &str, len: usize| {
         let mut got = Vec::new();
         let found = pool
@@ -1006,7 +1010,6 @@ fn ids_with_prefix_are_the_projects_rows_of_that_prefix_and_byte_length() {
             .unwrap();
         // Refusing every candidate reads each one and finds none.
         assert_eq!(found, None);
-        got.sort();
         got
     };
     assert_eq!(find("p", "abc", 4), ["abc1", "abc2", "abcd"]);
