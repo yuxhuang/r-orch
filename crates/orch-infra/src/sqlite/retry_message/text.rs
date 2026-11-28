@@ -250,80 +250,17 @@ pub(super) fn reconstruct(objects: &dyn Objects, blob: &Blob) -> Result<String> 
     String::from_utf8(bytes).map_err(|_| TextError::Corrupt("text encoding"))
 }
 
-/// Private streaming failures. The continuation must map Resource separately
-/// from persisted-data damage; cancellation never supplies a completed page.
+/// Test-only oracle for the original isolated verification leaf. The public
+/// adapter uses the shared core verifier and its resource/cancellation errors.
 #[derive(Debug)]
-#[allow(
-    dead_code,
-    reason = "private streaming leaf awaits port and disk-reader integration"
-)]
+#[cfg(test)]
 pub(in crate::sqlite) enum StreamError {
     Text(TextError),
     Resource,
     Cancelled,
 }
 
-/// One shared admission counter per adapter, retained across concurrent reads.
-/// Charges cover the caller's entire live window, not the logical text length.
-#[allow(
-    dead_code,
-    reason = "private streaming leaf awaits port and disk-reader integration"
-)]
-pub(in crate::sqlite) struct StreamBudget {
-    limit: usize,
-    used: std::sync::atomic::AtomicUsize,
-}
-
-#[allow(
-    dead_code,
-    reason = "private streaming leaf awaits port and disk-reader integration"
-)]
-pub(in crate::sqlite) struct StreamPermit<'a> {
-    budget: &'a StreamBudget,
-    bytes: usize,
-}
-
-#[allow(
-    dead_code,
-    reason = "private streaming leaf awaits port and disk-reader integration"
-)]
-impl StreamBudget {
-    pub(in crate::sqlite) fn new(limit: usize) -> Self {
-        Self {
-            limit,
-            used: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    pub(in crate::sqlite) fn acquire(
-        &self,
-        bytes: usize,
-    ) -> std::result::Result<StreamPermit<'_>, StreamError> {
-        use std::sync::atomic::Ordering;
-        self.used
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                used.checked_add(bytes).filter(|next| *next <= self.limit)
-            })
-            .map_err(|_| StreamError::Resource)?;
-        Ok(StreamPermit {
-            budget: self,
-            bytes,
-        })
-    }
-}
-
-impl Drop for StreamPermit<'_> {
-    fn drop(&mut self) {
-        self.budget
-            .used
-            .fetch_sub(self.bytes, std::sync::atomic::Ordering::AcqRel);
-    }
-}
-
-#[allow(
-    dead_code,
-    reason = "private streaming leaf awaits selected-page integration"
-)]
+#[cfg(test)]
 pub(in crate::sqlite) fn checked_page_bytes(
     total: u64,
     bytes: u64,
@@ -334,12 +271,14 @@ pub(in crate::sqlite) fn checked_page_bytes(
 // Incremental UTF-8 validation needs at most three pending bytes. Use the
 // standard decoder so overlong forms, surrogates and out-of-range scalars
 // receive exactly the same validation as a complete String.
+#[cfg(test)]
 #[derive(Default)]
 struct Utf8Carry {
     bytes: [u8; 4],
     len: usize,
 }
 
+#[cfg(test)]
 impl Utf8Carry {
     fn feed(&mut self, mut bytes: &[u8]) -> std::result::Result<(), StreamError> {
         let invalid = || StreamError::Text(TextError::Corrupt("text encoding"));
@@ -374,10 +313,7 @@ impl Utf8Carry {
 /// error or cancellation, and publish only after the enclosing page succeeds.
 /// Neither callback may retain windows without charging shared admission.
 /// This leaf deliberately does not call the existing infallible disk reader.
-#[allow(
-    dead_code,
-    reason = "private streaming leaf awaits port and disk-reader integration"
-)]
+#[cfg(test)]
 pub(in crate::sqlite) fn verify_stream(
     blob: &Blob,
     mut read: impl FnMut(
@@ -452,6 +388,268 @@ pub(in crate::sqlite) fn verify_stream(
         return Err(StreamError::Text(TextError::Corrupt("text encoding")));
     }
     Ok(())
+}
+
+// serde_json's owned String/Vec decoding uses infallible allocation. This
+// bounded reader needs fallible allocation instead; no maintained parser in
+// the current dependency set provides that contract. This small reader accepts
+// the existing document grammar (including escaped strings/keys), not a new
+// format. All output capacities are admitted before this function is entered.
+pub(super) fn parse_stream(stored: &str) -> orch_core::store::retries::stream::Result<Stored> {
+    use orch_core::store::retries::stream::RetryStreamError as E;
+    if stored.len() > MAX_STORED_BYTES {
+        return Err(E::Corrupt);
+    }
+    let mut json = StreamJson {
+        bytes: stored.as_bytes(),
+        at: 0,
+    };
+    json.expect(b'{')?;
+    let mut version = None;
+    let mut inline = None;
+    let mut blob = None;
+    let mut fields = 0u8;
+    while !json.take(b'}') {
+        let key = json.string()?;
+        json.expect(b':')?;
+        match key.as_str() {
+            "v" if version.is_none() => version = Some(json.number()?),
+            "inline" if fields & 1 == 0 => {
+                fields |= 1;
+                if !json.null() {
+                    inline = Some(json.string()?);
+                }
+            }
+            "blob" if fields & 2 == 0 => {
+                fields |= 2;
+                if !json.null() {
+                    blob = Some(json.blob()?);
+                }
+            }
+            _ => return Err(E::Corrupt),
+        }
+        if json.take(b'}') {
+            break;
+        }
+        json.expect(b',')?;
+        if json.peek() == Some(b'}') {
+            return Err(E::Corrupt);
+        }
+    }
+    if version != Some(FORMAT as u64) || json.peek().is_some() {
+        return Err(E::Corrupt);
+    }
+    match (inline, blob) {
+        (Some(text), None) if text.len() <= INLINE_TEXT_MAX_BYTES => Ok(Stored::Inline(text)),
+        (None, Some(blob)) => {
+            check(&blob).map_err(|_| E::Corrupt)?;
+            Ok(Stored::Blob(blob))
+        }
+        _ => Err(E::Corrupt),
+    }
+}
+struct StreamJson<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+type StreamResult<T> = orch_core::store::retries::stream::Result<T>;
+use orch_core::store::retries::stream::RetryStreamError as StreamFailure;
+impl StreamJson<'_> {
+    fn null(&mut self) -> bool {
+        self.peek();
+        if self.bytes.get(self.at..self.at.saturating_add(4)) == Some(b"null") {
+            self.at += 4;
+            true
+        } else {
+            false
+        }
+    }
+    fn peek(&mut self) -> Option<u8> {
+        while self
+            .bytes
+            .get(self.at)
+            .is_some_and(|c| matches!(c, b' ' | b'\t' | b'\r' | b'\n'))
+        {
+            self.at += 1;
+        }
+        self.bytes.get(self.at).copied()
+    }
+    fn take(&mut self, token: u8) -> bool {
+        if self.peek() == Some(token) {
+            self.at += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn expect(&mut self, token: u8) -> StreamResult<()> {
+        if self.take(token) {
+            Ok(())
+        } else {
+            Err(StreamFailure::Corrupt)
+        }
+    }
+    fn number(&mut self) -> StreamResult<u64> {
+        self.peek();
+        let start = self.at;
+        while self.bytes.get(self.at).is_some_and(u8::is_ascii_digit) {
+            self.at += 1;
+        }
+        let bytes = &self.bytes[start..self.at];
+        if bytes.is_empty() || (bytes.len() > 1 && bytes[0] == b'0') {
+            return Err(StreamFailure::Corrupt);
+        }
+        std::str::from_utf8(bytes)
+            .map_err(|_| StreamFailure::Corrupt)?
+            .parse()
+            .map_err(|_| StreamFailure::Corrupt)
+    }
+    fn string(&mut self) -> StreamResult<String> {
+        self.expect(b'"')?;
+        let start = self.at;
+        let mut end = start;
+        loop {
+            match self.bytes.get(end) {
+                Some(b'"') => break,
+                Some(b'\\') => end = end.checked_add(2).ok_or(StreamFailure::Resource)?,
+                Some(0..=31) | None => return Err(StreamFailure::Corrupt),
+                _ => end += 1,
+            }
+        }
+        let mut out = String::new();
+        out.try_reserve_exact(end - start)
+            .map_err(|_| StreamFailure::Resource)?;
+        while self.at < end {
+            let begin = self.at;
+            while self.at < end && self.bytes[self.at] != b'\\' {
+                self.at += 1;
+            }
+            out.push_str(
+                std::str::from_utf8(&self.bytes[begin..self.at])
+                    .map_err(|_| StreamFailure::Corrupt)?,
+            );
+            if self.at == end {
+                break;
+            }
+            self.at += 1;
+            let escape = *self.bytes.get(self.at).ok_or(StreamFailure::Corrupt)?;
+            self.at += 1;
+            match escape {
+                b'"' => out.push('"'),
+                b'\\' => out.push('\\'),
+                b'/' => out.push('/'),
+                b'b' => out.push('\u{8}'),
+                b'f' => out.push('\u{c}'),
+                b'n' => out.push('\n'),
+                b'r' => out.push('\r'),
+                b't' => out.push('\t'),
+                b'u' => {
+                    let mut scalar = self.hex()?;
+                    if (0xd800..=0xdbff).contains(&scalar) {
+                        if self.bytes.get(self.at..self.at + 2) != Some(b"\\u") {
+                            return Err(StreamFailure::Corrupt);
+                        }
+                        self.at += 2;
+                        let low = self.hex()?;
+                        if !(0xdc00..=0xdfff).contains(&low) {
+                            return Err(StreamFailure::Corrupt);
+                        }
+                        scalar = 0x10000 + ((scalar - 0xd800) << 10) + low - 0xdc00;
+                    }
+                    out.push(char::from_u32(scalar).ok_or(StreamFailure::Corrupt)?);
+                }
+                _ => return Err(StreamFailure::Corrupt),
+            }
+        }
+        if self.at != end {
+            return Err(StreamFailure::Corrupt);
+        }
+        self.at += 1;
+        Ok(out)
+    }
+    fn hex(&mut self) -> StreamResult<u32> {
+        let mut scalar = 0;
+        for _ in 0..4 {
+            let byte = *self.bytes.get(self.at).ok_or(StreamFailure::Corrupt)?;
+            self.at += 1;
+            scalar = scalar * 16
+                + match byte {
+                    b'0'..=b'9' => (byte - b'0') as u32,
+                    b'a'..=b'f' => (byte - b'a' + 10) as u32,
+                    b'A'..=b'F' => (byte - b'A' + 10) as u32,
+                    _ => return Err(StreamFailure::Corrupt),
+                };
+        }
+        Ok(scalar)
+    }
+    fn blob(&mut self) -> StreamResult<Blob> {
+        self.expect(b'{')?;
+        let mut hash = None;
+        let mut bytes = None;
+        let mut chunks = None;
+        while !self.take(b'}') {
+            let key = self.string()?;
+            self.expect(b':')?;
+            match key.as_str() {
+                "sha256" if hash.is_none() => hash = Some(self.string()?),
+                "bytes" if bytes.is_none() => bytes = Some(self.number()?),
+                "chunks" if chunks.is_none() => {
+                    self.expect(b'[')?;
+                    let mut values = Vec::new();
+                    while !self.take(b']') {
+                        values.try_reserve(1).map_err(|_| StreamFailure::Resource)?;
+                        values.push(self.chunk()?);
+                        if self.take(b']') {
+                            break;
+                        }
+                        self.expect(b',')?;
+                        if self.peek() == Some(b']') {
+                            return Err(StreamFailure::Corrupt);
+                        }
+                    }
+                    chunks = Some(values);
+                }
+                _ => return Err(StreamFailure::Corrupt),
+            }
+            if self.take(b'}') {
+                break;
+            }
+            self.expect(b',')?;
+            if self.peek() == Some(b'}') {
+                return Err(StreamFailure::Corrupt);
+            }
+        }
+        Ok(Blob {
+            sha256: hash.ok_or(StreamFailure::Corrupt)?,
+            bytes: bytes.ok_or(StreamFailure::Corrupt)?,
+            chunks: chunks.ok_or(StreamFailure::Corrupt)?,
+        })
+    }
+    fn chunk(&mut self) -> StreamResult<Chunk> {
+        self.expect(b'{')?;
+        let mut hash = None;
+        let mut size = None;
+        while !self.take(b'}') {
+            let key = self.string()?;
+            self.expect(b':')?;
+            match key.as_str() {
+                "sha256" if hash.is_none() => hash = Some(self.string()?),
+                "size" if size.is_none() => size = Some(self.number()?),
+                _ => return Err(StreamFailure::Corrupt),
+            }
+            if self.take(b'}') {
+                break;
+            }
+            self.expect(b',')?;
+            if self.peek() == Some(b'}') {
+                return Err(StreamFailure::Corrupt);
+            }
+        }
+        Ok(Chunk {
+            sha256: hash.ok_or(StreamFailure::Corrupt)?,
+            size: size.ok_or(StreamFailure::Corrupt)?,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -610,28 +808,85 @@ mod streaming_tests {
 
     #[test]
     fn streaming_admission_is_shared_between_threads() {
-        let budget = StreamBudget::new(8);
+        let budget = orch_core::store::retries::stream::RetryStreamAdmission::new(8);
         std::thread::scope(|scope| {
-            let _permit = budget.acquire(8).unwrap();
+            let _permit = budget.reserve(8).unwrap();
             scope
-                .spawn(|| assert!(budget.acquire(1).is_err()))
+                .spawn(|| assert!(budget.reserve(1).is_err()))
                 .join()
                 .unwrap();
         });
-        assert!(budget.acquire(8).is_ok());
+        assert!(budget.reserve(8).is_ok());
     }
 
     #[test]
     fn streaming_admission_is_checked_shared_and_released() {
-        let budget = StreamBudget::new(8);
-        let permit = budget.acquire(5).unwrap();
-        assert!(budget.acquire(4).is_err());
-        assert!(budget.acquire(usize::MAX).is_err());
-        let other = budget.acquire(3).unwrap();
+        let budget = orch_core::store::retries::stream::RetryStreamAdmission::new(8);
+        let permit = budget.reserve(5).unwrap();
+        assert!(budget.reserve(4).is_err());
+        assert!(budget.reserve(usize::MAX).is_err());
+        let other = budget.reserve(3).unwrap();
         drop(permit);
-        assert!(budget.acquire(5).is_ok());
+        assert!(budget.reserve(5).is_ok());
         drop(other);
-        assert!(budget.acquire(8).is_ok());
+        assert!(budget.reserve(8).is_ok());
         assert!(checked_page_bytes(u64::MAX, 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod fallible_document_tests {
+    use super::*;
+    #[test]
+    fn fallible_reader_matches_existing_writer_and_reader_for_escaped_text_and_manifests() {
+        // Other side's real reader, not a re-read using the new decoder.
+        for text in [
+            String::new(),
+            "plain é🙂".into(),
+            "\0\u{1}\u{8}\u{c}\n\r\t\"\\/".into(),
+            "é".repeat(32_768),
+        ] {
+            let document = Document {
+                v: FORMAT,
+                inline: Some(text),
+                blob: None,
+            };
+            let encoded = serialize(&document).unwrap();
+            assert_eq!(parse_stream(&encoded).unwrap(), parse(&encoded).unwrap());
+        }
+        let encoded = r#"{"inline":"\uD83D\uDE42\u00e9","v":1}"#;
+        assert_eq!(parse_stream(encoded).unwrap(), parse(encoded).unwrap());
+        let bytes = MAX_BLOB_BYTES + 1;
+        let blob = Blob {
+            sha256: BlobHash::of(b"whole").to_string(),
+            bytes,
+            chunks: vec![
+                Chunk {
+                    sha256: BlobHash::of(b"one").to_string(),
+                    size: MAX_BLOB_BYTES,
+                },
+                Chunk {
+                    sha256: BlobHash::of(b"two").to_string(),
+                    size: 1,
+                },
+            ],
+        };
+        let encoded = serialize(&Document {
+            v: FORMAT,
+            inline: None,
+            blob: Some(blob),
+        })
+        .unwrap();
+        assert_eq!(parse_stream(&encoded).unwrap(), parse(&encoded).unwrap());
+        for bad in [
+            r#"{"v":1,"inline":"x",}"#,
+            r#"{"v":1,"inline":"\uD800"}"#,
+            r#"{"v":1,"inline":"\q"}"#,
+            r#"{"v":01,"inline":"x"}"#,
+            r#"{"v":1,"v":1,"inline":"x"}"#,
+        ] {
+            assert!(parse_stream(bad).is_err());
+            assert!(parse(bad).is_err());
+        }
     }
 }

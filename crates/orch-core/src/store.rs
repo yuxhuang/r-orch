@@ -126,7 +126,8 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 /// All reads share one committed state, including repeated page reads.
 #[async_trait]
 pub trait ReadSnapshot:
-    attention::AttentionRead
+    retries::stream::RetryTextRead
+    + attention::AttentionRead
     + events::EventRead
     + intents::IntentRead
     + leases::LeaseRead

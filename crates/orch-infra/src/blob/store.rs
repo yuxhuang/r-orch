@@ -228,6 +228,45 @@ fn tmp_name() -> String {
     nanoid::nanoid!(32, &HEX)
 }
 
+use orch_core::store::blob::BlobStreamHasher;
+use orch_core::store::retries::stream::{
+    RETRY_STREAM_WINDOW_BYTES, Result as StreamResult, RetryStreamError,
+};
+use tokio_util::sync::CancellationToken;
+
+fn stream_access(error: BlobError) -> RetryStreamError {
+    match error {
+        BlobError::Io(e) | BlobError::Confined(ConfinedError::Io(e))
+            if e.kind() != io::ErrorKind::NotFound =>
+        {
+            RetryStreamError::Store(orch_core::store::StoreError::Backend(
+                orch_core::Error::other("retry object access failed"),
+            ))
+        }
+        _ => RetryStreamError::Corrupt,
+    }
+}
+
+struct StreamHasher(Sha256);
+impl BlobStreamHasher for StreamHasher {
+    fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+    fn matches(&self, expected: &str) -> bool {
+        let hash = BlobHash::from_digest(self.0.clone().finalize().into());
+        // Avoid allocating a formatted hash, including on malformed input.
+        expected.len() == 64
+            && hash
+                .as_bytes()
+                .iter()
+                .zip(expected.as_bytes().as_chunks::<2>().0)
+                .all(|(byte, pair)| {
+                    const HEX: &[u8] = b"0123456789abcdef";
+                    *pair == [HEX[(byte >> 4) as usize], HEX[(byte & 15) as usize]]
+                })
+    }
+}
+
 impl orch_core::store::blob::BlobStore for DiskBlobStore {
     type Hash = BlobHash;
     type Error = BlobError;
@@ -239,6 +278,80 @@ impl orch_core::store::blob::BlobStore for DiskBlobStore {
     }
     fn remove(&self, hash: &BlobHash) -> Result<bool> {
         DiskBlobStore::remove(self, hash)
+    }
+    fn stream_len(&self, hash: &BlobHash) -> StreamResult<u64> {
+        let (ab, cd, name) = names(hash);
+        let file = self
+            .shard(&ab, &cd)
+            .and_then(|dir| dir.open_file(&name, FileAccess::Read))
+            .map_err(|e| stream_access(missing(hash, e)))?;
+        let length = file.metadata().map_err(|e| stream_access(e.into()))?.len();
+        if length > MAX_BLOB_BYTES {
+            return Err(RetryStreamError::Corrupt);
+        }
+        Ok(length)
+    }
+    fn read_windowed(
+        &self,
+        hash: &BlobHash,
+        window: &mut [u8],
+        cancel: &CancellationToken,
+        consume: &mut dyn FnMut(&[u8]) -> StreamResult<()>,
+    ) -> StreamResult<()> {
+        if cancel.is_cancelled() {
+            return Err(RetryStreamError::Cancelled);
+        }
+        if window.is_empty() || window.len() > RETRY_STREAM_WINDOW_BYTES {
+            return Err(RetryStreamError::Resource);
+        }
+        let (ab, cd, name) = names(hash);
+        let mut file = self
+            .shard(&ab, &cd)
+            .and_then(|dir| dir.open_file(&name, FileAccess::Read))
+            .map_err(|e| stream_access(missing(hash, e)))?;
+        let length = file.metadata().map_err(|e| stream_access(e.into()))?.len();
+        if length > MAX_BLOB_BYTES {
+            return Err(RetryStreamError::Corrupt);
+        }
+        let mut digest = Sha256::new();
+        let mut seen = 0u64;
+        loop {
+            if cancel.is_cancelled() {
+                return Err(RetryStreamError::Cancelled);
+            }
+            let n = match file.read(window) {
+                Ok(n) => n,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(stream_access(e.into())),
+            };
+            if n == 0 {
+                break;
+            }
+            seen = seen
+                .checked_add(n as u64)
+                .ok_or(RetryStreamError::Resource)?;
+            if seen > length {
+                return Err(RetryStreamError::Corrupt);
+            }
+            digest.update(&window[..n]);
+            if cancel.is_cancelled() {
+                return Err(RetryStreamError::Cancelled);
+            }
+            consume(&window[..n])?;
+        }
+        if seen != length || BlobHash::from_digest(digest.finalize().into()) != *hash {
+            return Err(RetryStreamError::Corrupt);
+        }
+        if cancel.is_cancelled() {
+            return Err(RetryStreamError::Cancelled);
+        }
+        Ok(())
+    }
+    fn with_stream_hasher(
+        &self,
+        work: &mut dyn FnMut(&mut dyn BlobStreamHasher) -> StreamResult<()>,
+    ) -> StreamResult<()> {
+        work(&mut StreamHasher(Sha256::new()))
     }
 }
 
@@ -372,5 +485,55 @@ mod tests {
         assert!(rig.store.put(b"dirs").is_err());
         // The caller got no hash, so no row names it; the bytes are whole and a later put must retry the directory sync.
         assert_eq!(rig.store.get(&rig.hash).unwrap(), b"dirs");
+    }
+}
+
+#[cfg(test)]
+mod retry_stream_tests {
+    use super::*;
+    use orch_core::store::blob::BlobStore;
+    use orch_core::store::retries::stream::{RetryStreamAdmission, RetryStreamError};
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn confined_stream_verifies_without_whole_get_and_honors_cancellation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = ConfinedDir::open(tmp.path()).unwrap();
+        let store = DiskBlobStore::open(&root).unwrap();
+        let bytes = "é🙂".repeat(22_000).into_bytes();
+        let hash = store.put(&bytes).unwrap();
+        assert_eq!(store.stream_len(&hash).unwrap(), bytes.len() as u64);
+        let admission = RetryStreamAdmission::new(65_536);
+        let mut window = admission.buffer(65_536).unwrap();
+        let token = CancellationToken::new();
+        let mut seen = 0;
+        store
+            .read_windowed(&hash, window.as_mut_slice(), &token, &mut |part| {
+                assert!(part.len() <= 65_536);
+                assert_eq!(part, &bytes[seen..seen + part.len()]);
+                seen += part.len();
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(seen, bytes.len());
+        token.cancel();
+        assert!(matches!(
+            store.read_windowed(&hash, window.as_mut_slice(), &token, &mut |_| panic!(
+                "cancelled callback"
+            )),
+            Err(RetryStreamError::Cancelled)
+        ));
+        let (ab, cd, name) = names(&hash);
+        let path = tmp.path().join("blobs/sha256").join(ab).join(cd).join(name);
+        std::fs::write(path, vec![b'x'; bytes.len()]).unwrap();
+        assert!(matches!(
+            store.read_windowed(
+                &hash,
+                window.as_mut_slice(),
+                &CancellationToken::new(),
+                &mut |_| Ok(())
+            ),
+            Err(RetryStreamError::Corrupt)
+        ));
     }
 }

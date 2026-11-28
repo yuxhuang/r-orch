@@ -108,6 +108,7 @@ impl Default for StorageOptions {
 struct Shared {
     state: FailureState,
     disk: DiskBlobStore,
+    retry_admission: orch_core::store::retries::stream::RetryStreamAdmission,
     task_cursors: TaskCursors,
     cursors: NonTaskCursors,
     clock: Arc<dyn Clock>,
@@ -229,6 +230,7 @@ impl SqliteStorage {
                     let shared = Arc::new(Shared {
                         disk: DiskBlobStore::open(data.root())
                             .map_err(SqliteError::EntityPublication)?,
+                        retry_admission: Default::default(),
                         state: state.clone(),
                         task_cursors: TaskCursors::new(&options.generation),
                         cursors: NonTaskCursors::new(options.generation),

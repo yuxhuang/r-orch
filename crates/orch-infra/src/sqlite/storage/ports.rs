@@ -288,3 +288,62 @@ impl RetryWrite for Unit<'_, '_> {
         self.observed(result)
     }
 }
+
+#[async_trait]
+impl orch_core::store::retries::stream::RetryTextRead for Snapshot {
+    async fn read_retry_text(
+        &self,
+        after: Option<&RetryCursor>,
+        limit: usize,
+        mut sink: Box<dyn orch_core::store::retries::stream::RetryTextSink>,
+        cancellation: tokio_util::sync::CancellationToken,
+    ) -> orch_core::store::retries::stream::Result<orch_core::store::retries::stream::RetryTextPage>
+    {
+        use crate::sqlite::retry_message::{BoundedRetryError, bounded_retry_page};
+        use orch_core::store::retries::stream::*;
+        let cancel = cancellation.child_token();
+        let _guard = cancel.clone().drop_guard();
+        check_cancel(&cancel)?;
+        let admission = self.owner.shared.retry_admission.clone();
+        let permit = admission.reserve(
+            1024usize
+                .checked_add(self.caller.project.len())
+                .and_then(|n| n.checked_add(after.map_or(0, |c| c.task.len())))
+                .ok_or(RetryStreamError::Resource)?,
+        )?;
+        let project = copy_text(&self.caller.project)?;
+        let after = after
+            .map(|c| {
+                Ok::<_, RetryStreamError>(RetryCursor {
+                    task: copy_text(&c.task)?,
+                    due_at: c.due_at,
+                })
+            })
+            .transpose()?;
+        let owner = self.owner.clone();
+        let worker_cancel = cancel.clone();
+        let result = self
+            .call(move |view| {
+                let _owner = owner;
+                let _permit = permit;
+                match bounded_retry_page(
+                    view.tx,
+                    &project,
+                    &view.shared.disk,
+                    after.as_ref(),
+                    limit,
+                    &admission,
+                    sink.as_mut(),
+                    &worker_cancel,
+                ) {
+                    Ok(page) => Ok(Ok(page)),
+                    Err(BoundedRetryError::Public(error)) => Ok(Err(error)),
+                    Err(BoundedRetryError::Sql(error)) => Err(error),
+                }
+            })
+            .await
+            .map_err(RetryStreamError::Store)?;
+        check_cancel(&cancel)?;
+        result
+    }
+}
