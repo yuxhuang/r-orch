@@ -119,21 +119,33 @@ impl<'a> RetryReader<'a> {
         after: Option<&RetryCursor>,
         limit: usize,
     ) -> Result<RetryPage> {
+        let (rows, more) = self.selected_retries(after, limit)?;
+        let rows = self.hydrate(rows)?;
+        let next = rows.last().filter(|_| more).map(RetryCursor::after);
+        Ok(RetryPage { rows, next })
+    }
+
+    fn selected_retries(
+        &self,
+        after: Option<&RetryCursor>,
+        limit: usize,
+    ) -> Result<(Vec<Raw>, bool)> {
         check_limit(limit)?;
         if let Some(cursor) = after {
             cursor.validate()?;
         }
         // One more row than the page tells whether a row follows it.
         let fetch = limit as i64 + 1;
-        let mut rows = match after {
-            None => self.select(
+        let (rows, more) = match after {
+            None => self.select_stream_page(
                 &format!(
                     "SELECT {COLUMNS} FROM retry_queue INDEXED BY retries_due WHERE project_id=?1
                      ORDER BY due_at,task_id LIMIT ?3"
                 ),
                 params![self.project, text::MAX_STORED_BYTES as i64, fetch],
+                limit,
             )?,
-            Some(cursor) => self.select(
+            Some(cursor) => self.select_stream_page(
                 &format!(
                     "SELECT {COLUMNS} FROM retry_queue INDEXED BY retries_due
                      WHERE project_id=?1 AND due_at >= ?3 AND (due_at > ?3 OR task_id > ?4)
@@ -146,13 +158,53 @@ impl<'a> RetryReader<'a> {
                     cursor.task,
                     fetch
                 ],
+                limit,
             )?,
         };
-        let more = rows.len() > limit;
-        rows.truncate(limit);
-        let rows = self.hydrate(rows)?;
-        let next = rows.last().filter(|_| more).map(RetryCursor::after);
-        Ok(RetryPage { rows, next })
+        Ok((rows, more))
+    }
+
+    /// Select and validate only the returned rows, with checked logical-byte
+    /// accounting before any object is opened. The enclosing snapshot must
+    /// remain alive through streaming. This is a preparation leaf, not the
+    /// public bounded API: selection/JSON allocation still needs admission in
+    /// the continuation before it can be used by a production caller.
+    #[allow(
+        dead_code,
+        reason = "private streaming plan awaits bounded public-port integration"
+    )]
+    pub(in crate::sqlite) fn preflight_stream_retries(
+        &self,
+        after: Option<&RetryCursor>,
+        limit: usize,
+    ) -> Result<RetryStreamPage> {
+        let (rows, more) = self.selected_retries(after, limit)?;
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(rows.len())
+            .map_err(|_| stream_resource())?;
+        let mut bytes = 0u64;
+        for row in rows {
+            let (attempt, stored) = self.parse(&row)?;
+            let length = match &stored {
+                Stored::Inline(text) => text.len() as u64,
+                Stored::Blob(blob) => blob.bytes,
+            };
+            bytes = text::checked_page_bytes(bytes, length).map_err(|_| stream_resource())?;
+            prepared.push((row, attempt, stored));
+        }
+        let next = prepared
+            .last()
+            .filter(|_| more)
+            .map(|(row, _, _)| RetryCursor {
+                task: row.task.clone(),
+                due_at: row.due_at,
+            });
+        Ok(RetryStreamPage {
+            rows: prepared,
+            bytes,
+            next,
+        })
     }
 
     /// Every object the project's retry rows name, by task and position. Damage
@@ -184,6 +236,29 @@ impl<'a> RetryReader<'a> {
         Ok(statement
             .query_map(args, raw)?
             .collect::<rusqlite::Result<_>>()?)
+    }
+
+    // The lookahead row is used only for existence. Do not decode any of its
+    // fields: even a malformed native column beyond the page is unselected.
+    fn select_stream_page(
+        &self,
+        sql: &str,
+        args: impl rusqlite::Params,
+        limit: usize,
+    ) -> Result<(Vec<Raw>, bool)> {
+        let mut statement = self.conn.prepare_cached(sql)?;
+        let mut query = statement.query(args)?;
+        let mut selected = Vec::new();
+        selected
+            .try_reserve_exact(limit)
+            .map_err(|_| stream_resource())?;
+        while let Some(row) = query.next()? {
+            if selected.len() == limit {
+                return Ok((selected, true));
+            }
+            selected.push(raw(row)?);
+        }
+        Ok((selected, false))
     }
 
     /// The structural checks of one row: its native columns and its document.
@@ -398,5 +473,107 @@ impl<'a, 'conn> Retries<'a, 'conn> {
     pub(in crate::sqlite) fn named_objects(&self) -> Result<Vec<NamedObject>> {
         self.active()?;
         self.reader().named_objects()
+    }
+}
+
+fn stream_resource() -> SqliteError {
+    SqliteError::Io(std::io::ErrorKind::OutOfMemory.into())
+}
+
+/// Selected rows from one caller-owned snapshot. No cursor is released until
+/// all selected text has passed final verification. All output is provisional
+/// until this method succeeds; a sink must discard it on any error.
+#[allow(
+    dead_code,
+    reason = "private streaming plan awaits bounded public-port integration"
+)]
+pub(in crate::sqlite) struct RetryStreamPage {
+    rows: Vec<(Raw, u32, Stored)>,
+    bytes: u64,
+    next: Option<RetryCursor>,
+}
+
+#[allow(
+    dead_code,
+    reason = "private streaming plan awaits bounded public-port integration"
+)]
+impl RetryStreamPage {
+    pub(in crate::sqlite) fn declared_bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub(in crate::sqlite) fn stream(
+        self,
+        mut read: impl FnMut(
+            &crate::blob::BlobHash,
+            &mut dyn FnMut(&[u8]) -> std::result::Result<(), text::StreamError>,
+        ) -> std::result::Result<(), text::StreamError>,
+        mut begin: impl FnMut(&str, u32, i64) -> std::result::Result<(), text::StreamError>,
+        mut consume: impl FnMut(&[u8]) -> std::result::Result<(), text::StreamError>,
+    ) -> std::result::Result<Option<RetryCursor>, text::StreamError> {
+        for (row, attempt, stored) in self.rows {
+            begin(&row.task, attempt, row.due_at)?;
+            match stored {
+                Stored::Inline(value) => {
+                    for part in value.as_bytes().chunks(64 * 1024) {
+                        consume(part)?;
+                    }
+                }
+                Stored::Blob(blob) => text::verify_stream(&blob, &mut read, &mut consume)?,
+            }
+        }
+        Ok(self.next)
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use crate::sqlite::retry_message::tests::{retry, rig};
+
+    #[test]
+    fn streaming_preflight_selects_ordered_rows_without_resolving_lookahead() {
+        let mut rig = rig();
+        rig.put("p", &retry("b", 2, 1, "second"));
+        rig.put("p", &retry("a", 1, 1, "first"));
+        rig.put("p", &retry("z", 1, 2, "later"));
+        rig.conn
+            .execute(
+                "UPDATE retry_queue SET error='damaged' WHERE task_id='z'",
+                [],
+            )
+            .unwrap();
+        let plan = rig.reader("p").preflight_stream_retries(None, 2).unwrap();
+        assert_eq!(plan.declared_bytes(), 11);
+        let mut tasks = Vec::new();
+        let mut bytes = Vec::new();
+        let next = plan
+            .stream(
+                |_, _| panic!("inline rows open no objects"),
+                |task, attempt, deadline| {
+                    tasks.push((task.to_owned(), attempt, deadline));
+                    Ok(())
+                },
+                |part| {
+                    bytes.extend_from_slice(part);
+                    Ok(())
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(tasks, [("a".to_owned(), 1, 1), ("b".to_owned(), 2, 1)]);
+        assert_eq!(bytes, b"firstsecond");
+        assert_eq!(
+            next,
+            RetryCursor {
+                task: "b".into(),
+                due_at: 1
+            }
+        );
+        assert!(
+            rig.reader("p")
+                .preflight_stream_retries(Some(&next), 2)
+                .is_err()
+        );
     }
 }
