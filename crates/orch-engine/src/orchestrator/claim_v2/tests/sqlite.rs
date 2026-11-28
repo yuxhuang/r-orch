@@ -36,7 +36,7 @@ fn fixture() -> Fixture {
 }
 async fn reopened(f: Fixture) {
     let before = retry_state(&f.storage).await;
-    drop(f.storage);
+    f.storage.close().await.unwrap();
     let storage = SqliteStorage::open(f.data, StorageOptions::default()).unwrap();
     assert_eq!(retry_state(&storage).await, before);
 }
@@ -98,7 +98,7 @@ scenario!(
 );
 scenario!(
     concurrent_due_retries_have_one_winner_and_spend_one_attempt,
-    due_race
+    sqlite_due_race
 );
 scenario!(
     a_leased_idle_candidate_does_not_prevent_the_next_reservation,
@@ -157,7 +157,7 @@ async fn an_unavailable_agent_or_an_exhausted_counter_keeps_the_row_and_the_budg
 async fn distinct_agents_contending_for_one_task_have_one_winner() {
     for mode in [Mode::Dispatch, Mode::ExplicitRerun, Mode::DueRetry] {
         let f = fixture();
-        distinct_agent_contention(&f.storage, mode).await;
+        distinct_agent_contention(&f.storage, mode, RaceLoser::SqliteClaims).await;
         reopened(f).await;
     }
 }
@@ -193,7 +193,7 @@ async fn a_corrupt_retry_error_chunk_prevents_reservation_without_partial_writes
             .is_err()
     );
     // Reopen also detects a partial commit or an epoch spent on failure.
-    drop(f.storage);
+    f.storage.close().await.unwrap();
     std::fs::write(&path, b"z").unwrap();
     let storage = SqliteStorage::open(f.data, StorageOptions::default()).unwrap();
     assert_eq!(state(&storage).await, before);
@@ -343,7 +343,7 @@ async fn interrupted_reservations_reopen_atomically_and_keep_epoch_and_lineage()
             })
             .await
             .unwrap();
-        drop(storage);
+        storage.close().await.unwrap();
         let storage = SqliteStorage::open(data, StorageOptions::default()).unwrap();
         let next = storage
             .transaction(caller(), Lane::Claims, |u| {
@@ -363,5 +363,137 @@ async fn interrupted_reservations_reopen_atomically_and_keep_epoch_and_lineage()
         };
         assert_eq!(next.epoch, 2);
         assert_eq!(next.lineage, lease.lineage);
+    }
+}
+
+async fn sqlite_due_race(storage: &dyn Storage) {
+    due_race(storage, RaceLoser::SqliteClaims).await;
+}
+async fn sqlite_duplicate_claim(storage: &dyn Storage) {
+    duplicate_claim(storage, RaceLoser::SqliteClaims).await;
+}
+async fn sqlite_rerun_race(storage: &dyn Storage) {
+    rerun_race(storage, RaceLoser::SqliteClaims).await;
+}
+scenario!(
+    missing_selected_record_does_not_substitute_another_candidate,
+    missing_selected
+);
+scenario!(
+    existing_run_aborts_the_new_lease_and_preserves_all_rows,
+    existing_run
+);
+scenario!(
+    held_agent_refuses_another_task_without_creating_a_run,
+    held_agent
+);
+scenario!(
+    attempt_overflow_aborts_without_issuing_a_lease,
+    attempt_overflow
+);
+scenario!(
+    a_lease_on_the_selected_task_refuses_without_changes,
+    held_task
+);
+scenario!(
+    an_exhausted_counter_does_not_stop_an_explicit_rerun,
+    rerun_exhausted
+);
+scenario!(
+    concurrent_duplicate_claim_has_one_winner,
+    sqlite_duplicate_claim
+);
+scenario!(
+    concurrent_explicit_reruns_have_one_winner_and_spend_one_attempt,
+    sqlite_rerun_race
+);
+#[tokio::test]
+async fn stale_task_or_agent_revision_changes_nothing() {
+    for kind in [EntityKind::Task, EntityKind::Agent] {
+        let f = fixture();
+        stale_revision(&f.storage, kind).await;
+        reopened(f).await;
+    }
+}
+#[tokio::test]
+async fn unavailable_task_and_agent_refuse_without_writes() {
+    for task_unavailable in [true, false] {
+        let f = fixture();
+        unavailable(&f.storage, task_unavailable).await;
+        reopened(f).await;
+    }
+}
+#[tokio::test]
+async fn assignment_and_capability_mismatch_refuse_the_selected_agent() {
+    for capability in [false, true] {
+        let f = fixture();
+        mismatch(&f.storage, capability).await;
+        reopened(f).await;
+    }
+}
+#[tokio::test]
+async fn only_failed_and_cancelled_tasks_can_be_rerun_and_the_ordinary_claim_refuses_them() {
+    for status in [
+        TaskStatus::Todo,
+        TaskStatus::InProgress,
+        TaskStatus::Retrying,
+        TaskStatus::Review,
+        TaskStatus::Done,
+        TaskStatus::Failed,
+        TaskStatus::Cancelled,
+    ] {
+        let f = fixture();
+        rerun_status(
+            &f.storage,
+            status,
+            matches!(status, TaskStatus::Failed | TaskStatus::Cancelled),
+        )
+        .await;
+        reopened(f).await;
+    }
+}
+#[tokio::test]
+async fn a_held_lease_stale_revision_or_unavailable_agent_keeps_the_spent_budget() {
+    let f = fixture();
+    rerun_held(&f.storage).await;
+    reopened(f).await;
+    let f = fixture();
+    rerun_stale(&f.storage).await;
+    reopened(f).await;
+    for disable in [true, false] {
+        let f = fixture();
+        rerun_unavailable(&f.storage, disable).await;
+        reopened(f).await;
+    }
+}
+
+#[test]
+fn claims_loser_accepts_only_a_stale_task_revision_or_the_exact_overload_error() {
+    let overloaded = Err(StoreError::Backend(orch_core::Error::other("overloaded")));
+    assert!(RaceLoser::SqliteClaims.accepts(&overloaded));
+    assert!(!RaceLoser::RevisionOnly.accepts(&overloaded));
+    for outcome in [
+        Err(StoreError::Backend(orch_core::Error::other(
+            "storage_unavailable",
+        ))),
+        Err(StoreError::Backend(orch_core::Error::other(
+            "SQLite storage operation failed",
+        ))),
+        Err(StoreError::Backend(orch_core::Error::other(
+            "not overloaded",
+        ))),
+        Err(StoreError::Backend(orch_core::Error::invalid_arguments(
+            "overloaded",
+        ))),
+        Err(StoreError::CounterExhausted),
+        Ok(ClaimResult::Refused(Refusal::TaskUnavailable)),
+        Err(StoreError::StaleRevision {
+            kind: EntityKind::Agent,
+            id: "agent-selected".into(),
+            expected: Revision::ONE,
+            actual: None,
+        }),
+    ] {
+        assert!(!RaceLoser::SqliteClaims.accepts(&outcome), "{outcome:?}");
     }
 }
