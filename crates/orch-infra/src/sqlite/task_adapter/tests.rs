@@ -595,41 +595,62 @@ fn rejected_cursor_leaves_the_writer_and_its_state_usable() {
 fn a_page_hydrates_the_selected_ids_from_one_snapshot_across_a_concurrent_commit() {
     scenario(2, |fx| {
         fx.seed(tasks());
-        let (disk, state) = (fx.disk.clone(), fx.state.clone());
-        let cursors = TaskCursors::new("generation-1");
-        let now = fx.clock.now_ms();
-        let page = fx
-            .pool
-            .read(Instant::now() + Duration::from_secs(15), |tx| {
-                let sql = TaskSql {
-                    tx,
-                    project: "p",
-                    state: state.clone(),
-                    source: FailureSource::Reader,
-                    disk: &disk,
-                };
-                // After the IDs and the count are selected, another connection
-                // updates one selected task, deletes another and adds a row.
-                page_between(
-                    &sql,
-                    &cursors,
-                    now,
-                    &filter(),
-                    &request(Sort::Position, 4),
-                    || {
-                        fx.write(|write| {
-                            let mut renamed = task("t3", TaskStatus::Todo, 2, 3, Some("g1"));
-                            renamed.title = "renamed after selection".into();
-                            write.update(renamed, Revision::ONE)?;
-                            write.delete("t1", Revision::ONE)?;
-                            write.create(task("t00", TaskStatus::Todo, 1, 1, None))?;
-                            Ok(())
-                        })
+        let (selected, selection) = mpsc::sync_channel(1);
+        let (committed, commit) = mpsc::sync_channel(1);
+        let commit = Arc::new(std::sync::Mutex::new(commit));
+        fx.pool.configure_test_readers(|conn| {
+            let selected = selected.clone();
+            let commit = commit.clone();
+            let mut waited = false;
+            conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                // The selection and count have executed when hydration first
+                // prepares the native title. Pause the real list at that boundary.
+                if !waited
+                    && matches!(
+                        ctx.action,
+                        rusqlite::hooks::AuthAction::Read {
+                            table_name: "tasks",
+                            column_name: "title",
+                        }
+                    )
+                {
+                    waited = true;
+                    selected.send(()).unwrap();
+                    commit
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(15))
                         .unwrap();
-                    },
-                )
-            })
+                }
+                rusqlite::hooks::Authorization::Allow
+            }))
             .unwrap();
+        });
+        let page = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || {
+                selection.recv_timeout(Duration::from_secs(15)).unwrap();
+                fx.write(|write| {
+                    let mut renamed = task("t3", TaskStatus::Todo, 2, 3, Some("g1"));
+                    renamed.title = "renamed after selection".into();
+                    write.update(renamed, Revision::ONE)?;
+                    write.delete("t1", Revision::ONE)?;
+                    write.create(task("t00", TaskStatus::Todo, 1, 1, None))?;
+                    write.create(task("t01", TaskStatus::Todo, 1, 1, None))?;
+                    Ok(())
+                })
+                .unwrap();
+                committed.send(()).unwrap();
+            });
+            let result = fx.list(&filter(), &request(Sort::Position, 4)).unwrap();
+            writer.join().unwrap();
+            result
+        });
+        fx.pool.configure_test_readers(|conn| {
+            conn.authorizer(
+                None::<fn(rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization>,
+            )
+            .unwrap();
+        });
         // The old snapshot, in the order selected: both rows as they were, the
         // original count, and no row that was added later.
         assert_eq!(Fixture::ids(&page), ["t3", "t1", "t9", "t2"]);
@@ -649,9 +670,13 @@ fn a_page_hydrates_the_selected_ids_from_one_snapshot_across_a_concurrent_commit
                 },
             )
             .unwrap();
-        assert_eq!(Fixture::ids(&next), ["t7", "t5", "t4", "t8", "t6", "t00"]);
-        assert_eq!(next.total, Some(9));
+        assert_eq!(
+            Fixture::ids(&next),
+            ["t7", "t5", "t4", "t8", "t6", "t00", "t01"]
+        );
+        assert_eq!(next.total, Some(10));
         let fresh = fx.list(&filter(), &request(Sort::Position, 1)).unwrap();
+        assert_eq!(fresh.total, Some(10));
         assert_eq!(fresh.items[0].revision, Revision::ONE.next().unwrap());
     });
 }
@@ -674,6 +699,18 @@ fn one_damaged_record_fails_the_whole_page_and_the_shared_state() {
         assert!(
             matches!(error, SqliteError::TaskCorrupt { .. }),
             "{error:?}"
+        );
+        let failure = fx
+            .state
+            .failure()
+            .expect("list corruption latches the live reader");
+        assert_eq!(failure.source, FailureSource::Reader);
+        assert_eq!(
+            failure.causes,
+            vec![(
+                crate::sqlite::Role::Operation,
+                crate::sqlite::FatalCause::LogicalCorruption
+            )]
         );
         assert!(fx.state.ensure_available().is_err());
     });
@@ -1192,6 +1229,72 @@ fn delete_rows(fx: &Fixture<'_>, ids: &[&str]) {
 }
 
 #[test]
+fn from_fallback_pins_each_sorts_prefix_edge_and_multibyte_tails() {
+    for sort in SORTS {
+        // 256 raw bytes minus header, reference fields, From fixed fields,
+        // its one-byte ASCII tail, and this sort's integer keys.
+        let edge = inline_capacity(sort) - 25;
+        let cases = [
+            ("ascii-edge", "x".repeat(edge), "b", 1),
+            ("ascii-beyond", "x".repeat(edge + 1), "b", 2),
+            ("four-inside", "x".repeat(edge - 3), "😀", 1),
+            ("four-straddles", "x".repeat(edge - 2), "😀", 2),
+            ("three-inside", "x".repeat(edge - 2), "€", 1),
+            ("three-straddles", "x".repeat(edge - 1), "€", 2),
+            (
+                "shared-three-inside",
+                format!("{}€", "x".repeat(edge - 3)),
+                "b",
+                1,
+            ),
+            (
+                "shared-three-straddles",
+                format!("{}€", "x".repeat(edge - 2)),
+                "b",
+                2,
+            ),
+        ];
+        for (case, shared, tail, kind) in cases {
+            scenario(1, |fx| {
+                let anchor = format!("{shared}a{}", "z".repeat(300));
+                let following = format!("{shared}{tail}{}", "z".repeat(300));
+                fx.seed(vec![
+                    task(&anchor, TaskStatus::Todo, 1, 1, None),
+                    task(&following, TaskStatus::Todo, 1, 1, None),
+                ]);
+                // Force every sort's integer keys to tie; only IDs differ.
+                submit(fx.handle, |tx| {
+                    tx.execute("UPDATE tasks SET position = 7", [])?;
+                    Ok(())
+                })
+                .unwrap();
+                let first = fx.list(&filter(), &request(sort, 1)).unwrap();
+                assert_eq!(
+                    Fixture::ids(&first),
+                    std::slice::from_ref(&anchor),
+                    "{sort:?} {case}"
+                );
+                let token = first.next_cursor.unwrap();
+                assert_eq!(fallback_kind(&token, sort), kind, "{sort:?} {case}");
+                delete_rows(fx, &[&anchor]);
+                let resumed = fx
+                    .list(
+                        &filter(),
+                        &PageRequest {
+                            cursor: Some(token),
+                            ..request(sort, 1)
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(Fixture::ids(&resumed), [following], "{sort:?} {case}");
+                assert!(resumed.next_cursor.is_none());
+                fx.state.ensure_available().unwrap();
+            });
+        }
+    }
+}
+
+#[test]
 fn a_deleted_row_is_resumed_at_the_shortest_fallback_and_without_one_it_is_refused() {
     scenario(1, |fx| {
         let near = |tag: &str| format!("{}{tag}{}", "v".repeat(100), "x".repeat(300));
@@ -1469,12 +1572,75 @@ fn record_page_costs() {
 
 #[test]
 fn a_reference_token_for_another_sort_is_refused() {
-    scenario(1, |fx| {
-        let (good, _) = reference_token(fx);
-        // Sort::Id's token under every other sort.
-        for sort in SORTS.into_iter().filter(|s| *s != Sort::Id) {
+    for sort in SORTS.into_iter().filter(|s| *s != Sort::Id) {
+        scenario(1, |fx| {
+            let (good, _) = reference_token(fx);
+            let mut large = task(
+                &format!("{}b", "q".repeat(65_535)),
+                TaskStatus::Todo,
+                1,
+                1,
+                None,
+            );
+            large.description = "blob-boundary".repeat(6_000);
+            let hash = crate::blob::BlobHash::of(large.description.as_bytes());
+            fx.write(move |write| write.update(large, Revision::ONE))
+                .unwrap();
+            assert!(fx.disk.remove(&hash).unwrap());
+            let selects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            fx.pool.configure_test_readers(|conn| {
+                let selects = selects.clone();
+                conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+                    if matches!(ctx.action, rusqlite::hooks::AuthAction::Select) {
+                        selects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    rusqlite::hooks::Authorization::Allow
+                }))
+                .unwrap();
+            });
+            // Sort::Id's token under every other sort.
             invalid_cursor(fx.list(&filter(), &resumed(&cursor(hex(&good)), sort)));
-        }
-        fx.state.ensure_available().unwrap();
+            assert_eq!(
+                selects.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "sort mismatch must precede candidate, metadata and blob reads"
+            );
+            fx.state.ensure_available().unwrap();
+            // This token really would hydrate the missing object if accepted.
+            // The wrong-sort calls above must refuse before that access.
+            let error = fx
+                .list(&filter(), &resumed(&cursor(hex(&good)), Sort::Id))
+                .unwrap_err();
+            assert!(
+                matches!(error, SqliteError::TaskCorrupt { .. }),
+                "{error:?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn a_next_tuple_without_its_following_tuple_cannot_silently_end_a_walk() {
+    scenario(1, |fx| {
+        fx.seed(tasks());
+        fx.pool
+            .read(Instant::now() + Duration::from_secs(15), |tx| {
+                let request = request(Sort::Id, 1);
+                let mut selected = task_page::query(tx, "p", &filter(), &request, None)
+                    .map_err(super::selected)?;
+                assert!(selected.next.is_some());
+                assert!(selected.following.is_some());
+                let cursors = TaskCursors::new("generation-1");
+                assert!(issue(&cursors, "p", &filter(), &request, 0, &selected)?.is_some());
+                selected.following = None;
+                assert!(matches!(
+                    issue(&cursors, "p", &filter(), &request, 0, &selected),
+                    Err(SqliteError::Unrepresentable(_))
+                ));
+                selected.next = None;
+                assert!(issue(&cursors, "p", &filter(), &request, 0, &selected)?.is_none());
+                Ok(())
+            })
+            .unwrap();
     });
 }
