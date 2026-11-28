@@ -594,3 +594,63 @@ async fn sqlite_stream_preserves_existing_decoder_acceptance_of_optional_null_me
     drop(snapshot);
     rig.close().await;
 }
+
+#[tokio::test]
+async fn valid_objects_still_require_the_whole_hash_and_utf8_to_verify() {
+    for defect in 0..3 {
+        let kind = if defect == 2 { "file" } else { "sqlite" };
+        let rig = Fixture::new(kind);
+        rig.put("a", 1, "x".repeat(65_537)).await;
+        if kind == "sqlite" {
+            let conn = rusqlite::Connection::open(rig.objects.join("orch.db")).unwrap();
+            let encoded: String = conn
+                .query_row("SELECT error FROM retry_queue WHERE task_id='a'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            let mut doc: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            if defect == 0 {
+                doc["blob"]["sha256"] = BlobHash::of(b"different whole value").to_string().into();
+            } else {
+                let disk = DiskBlobStore::open(&ConfinedDir::open(&rig.objects).unwrap()).unwrap();
+                let mut invalid = vec![b'x'; 65_537];
+                invalid[0] = 0xff;
+                let hash = disk.put(&invalid).unwrap().to_string();
+                conn.execute("INSERT INTO blobs(project_id,sha256,size,storage_location,created_at) VALUES('p',?1,65537,'disk',0)",[&hash]).unwrap();
+                doc["blob"]["sha256"] = hash.clone().into();
+                doc["blob"]["chunks"][0]["sha256"] = hash.into();
+            }
+            conn.execute(
+                "UPDATE retry_queue SET error=?1 WHERE task_id='a'",
+                [serde_json::to_string(&doc).unwrap()],
+            )
+            .unwrap();
+        } else {
+            let disk = DiskBlobStore::open(&ConfinedDir::open(&rig.objects).unwrap()).unwrap();
+            let mut invalid = vec![b'x'; 65_537];
+            invalid[0] = 0xff;
+            let hash = disk.put(&invalid).unwrap().to_string();
+            let path = rig.objects.join("state.json");
+            let mut doc: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            doc["retries"]["rows"]["a"]["error"]["sha256"] = hash.into();
+            std::fs::write(path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        }
+        let snapshot = rig.snapshot().await;
+        assert!(
+            matches!(
+                snapshot
+                    .read_retry_text(None, 1, Box::new(Discard), CancellationToken::new())
+                    .await,
+                Err(RetryStreamError::Corrupt)
+            ),
+            "defect {defect}"
+        );
+        assert!(
+            snapshot.read_retry("a").await.is_err(),
+            "existing whole reader"
+        );
+        drop(snapshot);
+        rig.close().await;
+    }
+}
