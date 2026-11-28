@@ -890,3 +890,80 @@ fn caught_savepoint_failure_restores_goal_state(delete: bool) {
             .unwrap();
     });
 }
+
+/// Issue 127 (R140): the goal adapter hands its error to the writer and the pool
+/// as the driver's own. A real `SQLITE_CORRUPT` in `goals` latches the shared
+/// state as the writer's, and as the reader's for a pooled read.
+#[test]
+fn a_real_corrupt_goal_statement_latches_the_state_with_its_cause() {
+    use crate::sqlite::{FailureSource, FatalCause, Role};
+    for reading in [false, true] {
+        let (_temp, data) = test_data();
+        setup(&data);
+        {
+            let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+            let pool = ReadPool::open(&data, Synchronous::Normal, 1).unwrap();
+            std::thread::scope(|scope| {
+                scope.spawn(move || writer.run());
+                let _close = Close(&handle);
+                adapter_for(&handle, &pool, &data)
+                    .write("p".into(), deadline(), |unit| unit.create(goal("g")))
+                    .unwrap()
+                    .wait()
+                    .unwrap();
+            });
+        }
+        crate::sqlite::corrupt_root_page(&data, "goals");
+        let (writer, handle) = Writer::open(&data, Synchronous::Normal, 8).unwrap();
+        let pool = ReadPool::open_with_state(&data, Synchronous::Normal, 1, handle.failure_state())
+            .unwrap();
+        std::thread::scope(|scope| {
+            scope.spawn(move || writer.run());
+            let _close = Close(&handle);
+            let adapter = adapter_for(&handle, &pool, &data);
+            let answer = if reading {
+                adapter
+                    .read("p", deadline(), |read| read.get("g"))
+                    .map(drop)
+            } else {
+                adapter
+                    .write("p".into(), deadline(), |unit| unit.create(goal("g")))
+                    .unwrap()
+                    .wait()
+                    .map(drop)
+            };
+            assert!(
+                matches!(
+                    &answer,
+                    Err(SqliteError::Sql(rusqlite::Error::SqliteFailure(f, _)))
+                        if f.code == rusqlite::ErrorCode::DatabaseCorrupt
+                ),
+                "reading {reading}: {answer:?}"
+            );
+            let failure = handle.failure_state().failure().expect("latched");
+            assert_eq!(
+                failure.source,
+                if reading {
+                    FailureSource::Reader
+                } else {
+                    FailureSource::Writer
+                }
+            );
+            assert_eq!(
+                failure.causes,
+                [(Role::Operation, FatalCause::SqliteCorrupt)]
+            );
+            assert!(matches!(
+                handle.submit(crate::sqlite::Lane::Entities, None, |_| Ok(())),
+                Err(SqliteError::StorageUnavailable(_))
+            ));
+            assert_eq!(
+                pool.read(deadline(), |tx| Ok(
+                    tx.query_row("SELECT 7", [], |r| r.get::<_, i64>(0))?
+                ))
+                .unwrap(),
+                7
+            );
+        });
+    }
+}

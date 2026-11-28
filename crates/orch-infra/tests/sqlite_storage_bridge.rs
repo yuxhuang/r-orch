@@ -495,3 +495,245 @@ async fn the_operation_cause_and_the_rollback_cause_keep_their_own_class() {
     );
     env.close().await;
 }
+
+// ---------------------------------------------------------------------------
+// Issue 127 (R140; PR 202 review I2): a statement that really fails in each
+// adapter, through the public `Storage`, reaches the shared failure state with
+// its SQLite code. The database is damaged on disk with the adapter closed, so
+// the first statement that reads the table answers SQLITE_CORRUPT.
+// ---------------------------------------------------------------------------
+
+use orch_core::store::events::SequencedEvent;
+use orch_core::store::leases::{ClaimOutcome, NewLease};
+use orch_core::store::request_keys::RequestScope;
+
+fn sequenced(seq: u64) -> SequencedEvent {
+    SequencedEvent {
+        seq,
+        event: orch_domain::RunEvent {
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            event_type: orch_domain::RunEventType::AgentOutput,
+            data: json!({ "seq": seq }),
+        },
+    }
+}
+
+fn key_hash() -> String {
+    "a".repeat(64)
+}
+
+fn key_scope(key: &str) -> RequestScope {
+    RequestScope::of(&owner(), key).unwrap()
+}
+
+/// Overwrite the first byte of the root page of `table`: not a valid b-tree page.
+fn damage(data: &DataDir, table: &str) {
+    use std::io::{Seek, SeekFrom, Write};
+    let conn = open_connection(data, ConnectionRole::Writer, Synchronous::Normal).unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    let root: i64 = conn
+        .query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name=?1",
+            [table],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let size: i64 = conn
+        .query_row("PRAGMA page_size", [], |r| r.get(0))
+        .unwrap();
+    let path = conn.path().unwrap().to_owned();
+    drop(conn);
+    let mut file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.seek(SeekFrom::Start(((root - 1) * size) as u64))
+        .unwrap();
+    file.write_all(&[0xFF]).unwrap();
+    file.sync_all().unwrap();
+}
+
+/// A storage over a database that holds one lease, two events, a gap, a request
+/// key and a goal, with `table` damaged and the adapter reopened over it.
+async fn damaged(table: &str) -> Env {
+    let env = Env::new();
+    env.commit(|unit| {
+        let ClaimOutcome::Granted(lease) = unit.claim_lease(
+            &NewLease {
+                task: "t".into(),
+                agent: "a".into(),
+                run: "r".into(),
+            },
+            0,
+        )?
+        else {
+            panic!("the seed lease is granted")
+        };
+        unit.append_events(
+            "r",
+            &lease.lineage,
+            lease.epoch,
+            &[sequenced(1), sequenced(2)],
+        )?;
+        unit.record_event_gap("r", 2, 1)?;
+        unit.store_request_key(
+            &key_scope("0123456789abcdef"),
+            "task.update",
+            &key_hash(),
+            "r",
+            0,
+        )?;
+        unit.create(goal("seed"))?;
+        Ok(())
+    })
+    .await;
+    let Env {
+        _root,
+        data,
+        storage,
+    } = env;
+    storage.close().await.unwrap();
+    damage(&data, table);
+    let storage = SqliteStorage::open(data.clone(), StorageOptions::default()).unwrap();
+    Env {
+        _root,
+        data,
+        storage,
+    }
+}
+
+type WriteOp = fn(&mut dyn UnitOfWork) -> orch_core::store::Result<()>;
+
+#[tokio::test]
+async fn a_real_corrupt_statement_of_each_adapter_latches_the_public_writer_with_its_cause() {
+    let ops: [(&str, &str, WriteOp); 8] = [
+        ("request key check", "request_keys", |u| {
+            u.check_request_key(
+                &key_scope("fedcba9876543210"),
+                "task.update",
+                &key_hash(),
+                0,
+            )
+            .map(drop)
+        }),
+        ("request key store", "request_keys", |u| {
+            u.store_request_key(
+                &key_scope("fedcba9876543210"),
+                "task.update",
+                &key_hash(),
+                "x",
+                0,
+            )
+        }),
+        ("lease claim", "leases", |u| {
+            u.claim_lease(
+                &NewLease {
+                    task: "t2".into(),
+                    agent: "a2".into(),
+                    run: "r2".into(),
+                },
+                0,
+            )
+            .map(drop)
+        }),
+        ("lease get", "leases", |u| u.get_lease("t").map(drop)),
+        ("event append", "run_events", |u| {
+            let lease = u.get_lease("t")?.expect("the seed lease");
+            u.append_events("r", &lease.lineage, lease.epoch, &[sequenced(3)])
+                .map(drop)
+        }),
+        ("event prune", "run_events", |u| {
+            u.prune_events("r", 10).map(drop)
+        }),
+        ("event gap", "run_event_gaps", |u| {
+            u.record_event_gap("r", 3, 1)
+        }),
+        ("goal create", "goals", |u| {
+            u.create(goal("fresh")).map(drop)
+        }),
+    ];
+    for (name, table, op) in ops {
+        let env = damaged(table).await;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let slot = seen.clone();
+        let outcome = env
+            .storage
+            .write(
+                owner(),
+                Lane::Entities,
+                Box::new(move |unit| {
+                    *slot.lock().unwrap() = Some(op(unit));
+                    // Caught, and the callback goes on to succeed.
+                    Ok(())
+                }),
+            )
+            .await;
+        let caught = seen.lock().unwrap().take().unwrap();
+        assert_eq!(
+            backend_text(&caught.expect_err(name)),
+            UNAVAILABLE,
+            "{name}: the first fatal observation answers unavailable"
+        );
+        assert_eq!(backend_text(&outcome.unwrap_err()), UNAVAILABLE, "{name}");
+        let failure = env.storage.failure_state().failure().expect(name);
+        assert_eq!(failure.source, FailureSource::Writer, "{name}");
+        assert_eq!(
+            failure.causes,
+            [(Role::Operation, FatalCause::SqliteCorrupt)],
+            "{name}"
+        );
+        let later = env.try_commit(|_| ()).await;
+        assert_eq!(backend_text(&later.unwrap_err()), UNAVAILABLE, "{name}");
+        // Issue 389: a new healthy read is allowed after the incident.
+        let healthy = env.storage.read(owner()).await.unwrap();
+        assert!(
+            healthy
+                .get(EntityKind::Agent, "absent")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(healthy);
+        env.close().await;
+    }
+}
+
+#[tokio::test]
+async fn a_real_corrupt_statement_of_each_pooled_read_latches_the_public_storage_as_the_readers() {
+    for (name, table) in [
+        ("lease", "leases"),
+        ("events", "run_events"),
+        ("event gaps", "run_event_gaps"),
+        ("goal", "goals"),
+    ] {
+        let env = damaged(table).await;
+        let snapshot = env.storage.read(owner()).await.unwrap();
+        let error = match name {
+            "lease" => snapshot.read_lease("t").await.map(drop),
+            "events" => snapshot.read_events("r", 0, 10).await.map(drop),
+            "event gaps" => snapshot.read_event_gaps("r").await.map(drop),
+            _ => snapshot.get(EntityKind::Goal, "seed").await.map(drop),
+        }
+        .expect_err(name);
+        assert_eq!(backend_text(&error), UNAVAILABLE, "{name}");
+        drop(snapshot);
+        let failure = env.storage.failure_state().failure().expect(name);
+        assert_eq!(failure.source, FailureSource::Reader, "{name}");
+        assert_eq!(
+            failure.causes,
+            [(Role::Operation, FatalCause::SqliteCorrupt)],
+            "{name}"
+        );
+        let later = env.try_commit(|_| ()).await;
+        assert_eq!(backend_text(&later.unwrap_err()), UNAVAILABLE, "{name}");
+        // Issue 389: a new healthy read is allowed after the incident.
+        let healthy = env.storage.read(owner()).await.unwrap();
+        assert!(
+            healthy
+                .get(EntityKind::Agent, "absent")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        drop(healthy);
+        env.close().await;
+    }
+}

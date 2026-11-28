@@ -263,3 +263,6 @@ mod adapter;
 mod contract_tests;
 #[cfg(test)]
 mod executor_tests;
+
+#[cfg(test)]
+mod classifier_tests;
