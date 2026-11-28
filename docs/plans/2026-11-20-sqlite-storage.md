@@ -506,20 +506,25 @@ diagnostic read, calls a second port trait, `RetryTextRead::read_retry_text`, th
 sink. Nothing is stored differently, no schema changes, no whole-value signature changes, and no daemon path calls the
 stream. A test result is a receipt of the PR that carries the change, not a statement of this plan.
 
-**What exists.** Read at the code commit `b85df7a1a` (tree `81efeb15`). It is the integration commit `80a986cd3` on the
+**What exists.** Read at the code commit `bdf99d96c` (tree `9c41bb6f`). It is the integration commit `80a986cd3` on the
 merge `3d54ae800` of the #441 producer (`deb18c4cb`, tree `361ed8e8`) into the bounded-stream core `c60515b69`, which sits on
-the SQLite leaf `aca0ae9a6` and on the landed `7800f65a7`; `b85df7a1a` adds the #441 documentation. Every piece below is
-written. Where the table says "unit", the test lives in the file's own `#[cfg(test)]` module.
+the SQLite leaf `aca0ae9a6` and on the landed `7800f65a7`. Three commits follow it: `b85df7a1a` (the #441 documentation),
+`761aa2da2` (one test, the whole-value hash and the text check, below) and `bdf99d96c` (the disk-fault observation on SQLite,
+below, with a test and a repair of a cancellation fixture). The earlier integration head `b85df7a1a` (tree `81efeb15`) is
+the head of the nine-case run kept below as history; production source changed after it only in `bdf99d96c`, and no public
+signature changed. Every piece below is written. Where the table says "unit", the test lives in the file's own
+`#[cfg(test)]` module.
 
 | Piece | Where | Test that carries it |
 |---|---|---|
 | The trait, the sink, the error enum, the page result, the shared admission counter with its `Default` (64 MiB), permits, the fallible charged buffer, and the helpers `copy_text`, `check_cancel`, `select_retry_keys`, `RetryStreamUtf8`, `verify_retry_objects` | `crates/orch-core/src/store/retries/stream.rs` | Unit, `store::retries::stream::tests` (4): `shared_admission_checks_overflow_and_releases_on_worker_exit`, `fallible_buffer_failure_returns_resource_and_releases_admission`, `a_buffer_holds_its_charge_until_drop`, `request_drop_cancels_only_its_child_and_keeps_worker_admission`. The primitives; the adapter behaviour is in the public matrix |
 | `ReadSnapshot: RetryTextRead + ...`; the three provided `BlobStore` methods and `BlobStreamHasher` (unsupported means `Store(Backend)`, and the stream never falls back to `get`) | `crates/orch-core/src/store.rs`, `.../store/blob.rs` | The public matrix compiles every adapter against the supertrait. The provided bodies that refuse an unsupported store are one-line defaults that no test calls: that refusal is read from the code, not run |
 | A confined, windowed, hash-verifying reader of one object, its descriptor-length lookup and its stack hasher | `crates/orch-infra/src/blob/store.rs` | Unit, `blob::store::retry_stream_tests::confined_stream_verifies_without_whole_get_and_honors_cancellation` |
-| SQLite: page preflight (selected rows only, checked page sum, registered chunk sizes, the lookahead row never decoded), the charge of eight times the encoded document plus task plus 4,096 bytes before a fallible decode, the verifier, and `RetryTextRead` on its snapshot (one counter for the instance, child token with a drop guard, the worker holds the snapshot and the charge) | `crates/orch-infra/src/sqlite/retry_message/{retries,text}.rs`, `.../sqlite/storage/{mod,ports}.rs` | Units: `sqlite::retry_message::text::streaming_tests` (7), `sqlite::retry_message::retries::streaming_tests` (1), the JSON oracle `...text::fallible_document_tests` (1); public matrix |
+| SQLite: page preflight (selected rows only, checked page sum, registered chunk sizes, the lookahead row never decoded), the charge of eight times the encoded document plus task plus 4,096 bytes before a fallible decode, the verifier, and `RetryTextRead` on its snapshot (one counter for the instance, child token with a drop guard, the worker holds the snapshot and the charge) | `crates/orch-infra/src/sqlite/retry_message/{retries,text}.rs`, `.../sqlite/storage/{mod,ports}.rs` | Units: `sqlite::retry_message::text::streaming_tests` (7), `sqlite::retry_message::retries::streaming_tests` (1), the JSON oracle `...text::fallible_document_tests` (1); `sqlite::storage::ports::retry_stream_io_tests` (1, the disk-fault observation below); public matrix |
+| The disk-fault observation: `DiskBlobStore` records the kind of a native I/O error at its open, length lookup and window reads in a crate-private variant of its bounded read (a `NotFound` is not recorded, it stays `Corrupt`); the SQLite adapter wraps the disk store for one row's objects, forwards a recorded kind as an outer I/O error, and leaves a sink's error alone | `crates/orch-infra/src/blob/store.rs` (`read_windowed_observed`, a `cfg(test)` one-shot fault `fail_next_stream_read`), `.../sqlite/retry_message/retries.rs` (`ObservedRetryDisk`, `bounded_retry_page`) | Unit, `sqlite::storage::ports::retry_stream_io_tests::object_io_retires_the_snapshot_but_sink_io_is_only_its_own_error` (below) |
 | The file reference: confined descriptor-length preflight of every selected object with no payload read, repeated occurrences counted, reopen and recheck at stream time, `RetryTextRead` on its session | `crates/orch-infra/src/storage/v2/{retries,text}.rs`, `.../storage/v2.rs` | Unit, `storage::v2::retries::stream_preflight_tests::file_page_preflight_reads_no_payload_and_stream_rechecks_metadata_and_same_length_substitution` (defect 0: a last reference that fails preflight, zero payload reads and zero `begin`; defects 1 and 2: an object replaced after the preflight by one of the same length and by a shorter one, failing in the stream); public matrix |
 | The memory fake in its logical and disk-backed forms (recorded chunk sizes, one counter per `FakeStorage`) | `crates/orch-core/src/store/{fake,retries/fake}.rs` | Unit, `store::retries::fake::tests::reordered_retry_chunks_fail_every_memory_retry_read`; public matrix |
-| The three-adapter public-port matrix, four registrations: `memory`, `backed` (the disk-backed fake), `file`, `sqlite` | `crates/orch-infra/tests/retry_stream.rs` | 9 tests (below) |
+| The three-adapter public-port matrix, four registrations: `memory`, `backed` (the disk-backed fake), `file`, `sqlite` | `crates/orch-infra/tests/retry_stream.rs` | 10 tests (below) |
 | A production caller | the T12 engine | Not authorized. The first read is released only by the trigger below |
 
 **Evidence for the first production read.** Each row is Linux, from the task checkout that built the head named above, and
@@ -530,13 +535,15 @@ counter per adapter, and a parser charge of eight times the encoded document plu
 |---|---|
 | An inline text, a single-object text, an ordered multi-object text, a repeated chunk (once per position) and a character split across a window and across an object boundary, each delivered whole and in order, from the committed snapshot (a write after the snapshot is not seen); a page that ends and the next page from its cursor; an empty page; a limit of 0 refused | `all_adapters_stream_inline_single_objects_order_and_committed_snapshot` (four registrations); `backed_adapters_stream_every_repeated_object_and_split_utf8_boundary` (`backed`, `file`, `sqlite`) |
 | A selected row whose object is missing, or is corrupt at its stored length, fails with `Corrupt` and completes no page, while the page before it succeeds and an unselected damaged row is never read | `selected_missing_or_corrupt_objects_fail_but_unselected_damage_does_not` (`backed`, `file`, `sqlite`; the damaged object is the second row, reached by the second page) |
-| A short, long or wrong-hash object, a wrong whole-value hash or length, invalid or truncated UTF-8, an object replaced after the preflight, including by one of the same length | `sqlite::retry_message::text::streaming_tests::streaming_verifier_refuses_object_hash_length_whole_hash_and_encoding`; for the file reference, the unit `storage::v2::retries::stream_preflight_tests` (replaced by a same-length and by a shorter object). The shared verifier `verify_retry_objects` carries the check for the memory fake and the file reference; no matrix test mutates a stored text to a wrong whole-value hash on those two |
+| A short, long or wrong-hash object, a wrong whole-value hash or length, invalid or truncated UTF-8, an object replaced after the preflight, including by one of the same length | `sqlite::retry_message::text::streaming_tests::streaming_verifier_refuses_object_hash_length_whole_hash_and_encoding`; for the file reference, the unit `storage::v2::retries::stream_preflight_tests` (replaced by a same-length and by a shorter object). The shared verifier `verify_retry_objects` carries the check for the memory fake and the file reference; no matrix test mutates a stored text to a wrong whole-value hash on those two. The matrix does that on SQLite and does the invalid-UTF-8 case on SQLite and on the file reference: `valid_objects_still_require_the_whole_hash_and_utf8_to_verify` |
 | Page order and `next` equal `read_retries`; a later page that reaches the damaged row fails | The same test, and `sqlite::retry_message::retries::streaming_tests::streaming_preflight_selects_ordered_rows_without_resolving_lookahead` |
 | Bounded live memory across one page: five synthetic 2 MiB retries (10 MiB in all) with the highest charge seen in sink callbacks at most 128 KiB; the charge observed was 66,710 bytes on `memory` and `backed`, 67,245 on `file`, 96,157 on `sqlite` | `all_adapters_bound_live_work_across_a_page`. These are charged bytes sampled at the callbacks. They exclude the existing snapshots, the database and the control bookkeeping, and they are not resident memory |
 | A sink that asks for more than the counter holds gets `Resource` and no further callback; a token fired before the call is `Cancelled`; the same snapshot then reads normally | `all_adapters_bound_shared_admission_and_propagate_sink_failure`; SQLite units `streaming_admission_is_checked_shared_and_released`, `streaming_admission_is_shared_between_threads` and `streaming_verifier_cannot_swallow_resource_or_sink_failure` |
 | An injected allocation refusal is `Resource`, no page completes and the charge is released. The refusal is injected at the counter's buffer boundary (`fail_next_buffer_allocation`); it is not a process out-of-memory and not the global allocator | `all_adapters_return_resource_for_injected_buffer_allocation_and_release_charges` |
 | A cancelled or dropped read returns no completed page; the counter stays full and a second read is refused while the worker still holds its callback, and it returns to zero only after the worker has exited; dropping one read does not cancel another | `all_adapters_hold_actual_worker_memory_after_future_drop_and_cancel_without_success` |
 | SQLite preflights every selected JSON document before any callback, keeps the lookahead row opaque, and accepts what the existing decoder accepts (optional null members) | `sqlite_preflights_selected_json_before_any_callback_and_keeps_lookahead_opaque`; `sqlite_stream_preserves_existing_decoder_acceptance_of_optional_null_members`; the fallible-reader oracle |
+| A valid object whose whole-value hash differs from the stored one (SQLite), and an object whose own hash is right but whose bytes are not UTF-8 (SQLite and the file reference), each end the stream with `Corrupt`, and the whole-value reader refuses the same row | `valid_objects_still_require_the_whole_hash_and_utf8_to_verify` (three defects; test-only commit `761aa2da2`) |
+| A native disk fault on a stored object during the SQLite stream is observed by the snapshot, as the same fault is in the whole-value reads: the call fails with `Store`, that snapshot is retired, a second call on it fails, a fresh snapshot reads the page after the one-shot fault has cleared, and a sink that fails with the same `Store(Backend)` class retires nothing (the next read on its snapshot succeeds and the admission counter is zero at the end) | `sqlite::storage::ports::retry_stream_io_tests::object_io_retires_the_snapshot_but_sink_io_is_only_its_own_error` (the row holds a 65,537-byte text, so one blob object). What it asserts and what it does not: see "Disk-fault observation" below |
 | The whole-value reads are unchanged | `storage::v2::tests::retry_*` (12), `sqlite::retry_message` (76, which includes the message tests) |
 
 **Commands that select what exists, and the counts to expect** (Linux, a private checkout, the default Cargo target; a
@@ -544,20 +551,70 @@ selection that matches zero tests, or ignores one, fails the check):
 
 | Command | Expect |
 |---|---|
-| `cargo test -p orch-infra --test retry_stream` | 9 passed, 0 failed |
+| `cargo test -p orch-infra --test retry_stream` | 10 passed, 0 failed |
 | `cargo test -p orch-infra --lib -- sqlite::retry_message` | 76 passed, 0 failed |
 | `cargo test -p orch-infra --lib -- storage::v2::tests::retry_` | 12 passed, 0 failed |
 | `cargo test -p orch-core --features test-support --lib -- store::retries` | 5 passed, 0 failed |
 | `cargo test -p orch-infra --lib -- blob::store::retry_stream_tests` and `-- storage::v2::retries::stream_preflight_tests` | 1 and 1 passed |
 | `cargo test -p orch-infra --lib -- sqlite::retry_message::text::streaming_tests` and `-- sqlite::retry_message::retries::streaming_tests` | 7 and 1 passed |
 | `cargo test -p orch-infra --lib -- sqlite::retry_message::text::fallible_document_tests` | 1 passed (the JSON oracle) |
+| `cargo test -p orch-infra --lib -- sqlite::storage::ports::retry_stream_io_tests` | 1 passed |
 | `cargo clippy -p orch-core -p orch-infra --all-targets` | no warning |
 
-The integration owner's own run on the same head recorded the matrix at 9 passed, SQLite at 76, the whole-value reads at 12,
-the core at 5 and the JSON oracle at 1, and a name-filtered library run of 15 passed (`leaf-focused1.log`; its command line
-was not recorded, and it also selects tests that merely have "stream" in their names, so the two file and disk units above
-are the reproducible selection). The development fast gate is separate and its result is not part of this section. The
-hosted check and test of the merge that lands this change are owed.
+**Runs, kept apart.** Two heads have results, and neither replaces the other.
+
+- *History, on `b85df7a1a`.* The integration owner's run recorded the matrix at 9 passed, SQLite at 76, the whole-value
+  reads at 12, the core at 5 and the JSON oracle at 1, and a name-filtered library run of 15 passed (`leaf-focused1.log`;
+  its command line was not recorded, and it also selects tests that merely have "stream" in their names, so the two file
+  and disk units above are the reproducible selection). The development fast gate of that head is a separate task and a
+  separate result.
+- *Repaired head, `bdf99d96c`.* The producer recorded the matrix at 10 passed, 0 failed (`io-matrix2.log`) and the
+  observation test at 1 passed, 0 failed (`io-green2.log`), with the core at 5 and clippy clean. The documentation writer
+  re-ran every command in the table above on the head that carries this text, whose code is that of `bdf99d96c`: 10, 76,
+  12, 5, 1, 1, 7, 1, 1 and 1 passed, 0 failed, and the matrix again charged 66,710, 66,710, 67,245 and 96,157 bytes. The
+  fast gate of the repaired head and the hosted check and test of the merge that lands this change are owed.
+- *Red runs kept.* The first compile of the observation test failed on an ambiguous `Result` (two glob imports in the test
+  module; a test-only import was added). The observation test, run against the code before the repair, failed at its
+  second read: the faulted snapshot was still live, which is the defect it exists to show. The matrix run after the
+  repair's first test edit failed 9 passed, 1 failed, in `all_adapters_hold_actual_worker_memory_after_future_drop_and_cancel_without_success`:
+  aborting a task only requests cancellation, so the fixture released the worker before the child-future's drop guard had
+  run. The fixture now awaits the aborted task's join before it releases the worker (test change only; the 10 passed above
+  are after it).
+
+**Disk-fault observation (SQLite).** The decision of the controller of 2026-11-28 required the stream to treat a native disk
+fault as the whole-value reads already do, before the final freeze; ADR 0020 decision 9 records it. Where each piece is:
+`DiskBlobStore::read_windowed_observed` records the kind of an I/O error (not `NotFound`) at the open, the length lookup
+and each window read, through one closure; the trait method `read_windowed` calls it and discards the record; `ObservedRetryDisk`
+in `sqlite/retry_message/retries.rs` wraps the disk store for the objects of one selected row, and `bounded_retry_page`
+returns the recorded kind as `SqliteError::Io`, which takes precedence over that row's public result; `Snapshot::read_retry_text` (`sqlite/storage/ports.rs`) passes a public stream error (a sink's, `Corrupt`,
+`Resource`, `Cancelled`) as an outer success and a `SqliteError` as an outer failure, so only the second reaches
+`Snapshot::call`'s classifier.
+
+| Step | What the source establishes | Who asserts it |
+|---|---|---|
+| Disk helper's own error | `stream_access` gives `Store(Backend)` text `retry object access failed` for an I/O error that is not `NotFound`, and `Corrupt` otherwise | read from the source; no test asserts this text |
+| Classification | `SqliteError::Io` is in the transient arm of `classify` (`sqlite/writer/failure.rs`): it latches nothing. The pool observes it, drops the reader connection, and the snapshot's job answers `SQLite storage operation failed`, or `storage_unavailable` when `fatal_observations` has moved since the snapshot was requested | read from the source; no test makes a fatal observation during the stream |
+| Retirement | the worker leaves the snapshot; a later call is refused at `try_send` and answers `snapshot_expired` | the observation test asserts that the second call fails (`Store(_)`) |
+| Sink error | the sink's `Err` returns from `bounded_retry_page` as a public error, so the outer call is a success carrying it, the reader stays live, and the caller gets the sink's own error | the test asserts that the next read on that snapshot succeeds |
+
+What the test asserts: after one injected `PermissionDenied` at the disk store's bounded read, (1) the first read on the
+snapshot is `Err(Store(_))`; (2) a second read on the same snapshot is `Err(Store(_))`, which fails if the fault is swallowed
+and the snapshot stays live; (3) a snapshot taken after the one-shot fault has been consumed, with a sink whose `write`
+returns a `Store(Backend)` I/O error, returns `Err(Store(_))`; (4) a healthy read on that same snapshot returns the page;
+(5) the admission counter is back to zero. It asserts classes, never texts, and it cannot tell the sink's error from the disk
+fault by class: the difference is the outcome of (4). The fresh snapshot's first read is the failing-sink read, so a clean
+first read on a fresh snapshot is shown only by (4). The literal diagnostics rest on the source and on a one-off probe by
+the documentation writer, a copy of the test that printed the three errors of (1), (2) and (3) on this head and was not
+kept: `SQLite storage operation failed`, `snapshot_expired`, and the sink's own error (`synthetic sink failure`,
+`PermissionDenied`). The inner `retry object access failed` did not appear on SQLite.
+
+Evidence limits of the observation. The fault is injected by a `cfg(test)` one-shot flag, once, after the cancellation
+check and before the open, through the same closure that real open, length and read errors use; the three disk operations
+are one code path in the source and one test, not three, and a real kernel fault (permission, I/O error, a vanished mount)
+is not exercised. Only `PermissionDenied` is injected. No test faults the second object of a chunked text or a later
+window, a fatal observation during the stream, or two reads on two snapshots at once. The retirement of a snapshot by
+the whole-value reads for the same fault is read from the source here, not run. The file reference and the disk-backed
+fake have no reader to retire and are not changed.
 
 **Held and deferred.** None of these is closed by this change.
 
@@ -575,7 +632,9 @@ hosted check and test of the merge that lands this change are owed.
 tests (832 in the leaf and core, 2,327 in the integration, 596 of them the public matrix). `ReadSnapshot` now requires
 `RetryTextRead`, so the trait, the supertrait edge and the memory, file and SQLite implementations must compile together,
 and the three provided `BlobStore` methods are what the disk-backed fake and the file reference call. The #441 producer
-(1,167 more lines) is a separate prerequisite commit stack that edits the same registry files.
+(1,167 more lines) is a separate prerequisite commit stack that edits the same registry files. The test and the disk-fault observation add 328 insertions and 46 deletions
+in four code files after it (`git diff --shortstat b85df7a1a bdf99d96c -- crates`); the observation touches the disk store, the SQLite
+retry stream and its snapshot port, which the stream already edits.
 
 **Release of the first production read.** It needs all of: the accepted trait and adapter commit is part of the candidate
 that carries the consuming call; that call has passed an independent code review and the security review its surface

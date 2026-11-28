@@ -290,7 +290,8 @@ three provided methods and one trait to `BlobStore`. The memory fake, the file r
 changes no signature of the whole-value reads, no stored data, no schema, no requirement row, no cursor text and no
 read bound, and it adds no logical size ceiling and no setting; each adapter's working-memory counter has a default
 capacity of 64 MiB. It releases no production read: the first one waits for the trigger that the plan's "Bounded retry
-text read" states. No independent review had read this revision when it was written.
+text read" states. A later revision of the same day records that SQLite observes a disk fault during the stream (item 7 of
+"Bounded read of a retry's text"), and nothing else. No independent review had read either revision when it was written.
 
 ## Source
 
@@ -1459,12 +1460,20 @@ nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or
   5. verify each object's hash and length, the whole-value hash and length, and the UTF-8 of the whole value
      incrementally across windows and objects, and treat the output as provisional until the last of these has passed.
      A missing, short, long, reordered or damaged selected object, an object that is not a regular file, or an invalid
-     or truncated UTF-8 sequence, fails the call with `Corrupt` (an I/O fault on a present object is `Store`); an
+     or truncated UTF-8 sequence, fails the call with `Corrupt` (an I/O fault on a present object is `Store`, item 7); an
      object replaced between the preflight and the read, also by one of the same length, fails the same way; success is the returned `RetryTextPage`, and only then may the consumer publish its output or advance its
      cursor. After any failure the consumer discards the page's provisional bytes and keeps its cursor;
   6. hold the snapshot and the charge until its blocking work has exited, cancel that work when the future is dropped or
      the caller's token fires, never cancel another read, and never return success after a cancellation or a sink
      error.
+  7. on SQLite, treat a native I/O fault (any kind but `NotFound`) on a stored object, at its open, its length lookup or a
+     window read, as the snapshot already treats the same fault in the whole-value reads: the fault is observed by the
+     snapshot's reader as an I/O error of the call, the reader connection is retired, and the caller gets `Store`, with the
+     snapshot's ordinary retired-reader text (`SQLite storage operation failed`, or `storage_unavailable` after a new
+     fatal observation) instead of the disk helper's `retry object access failed`. A later call on that snapshot
+     answers `snapshot_expired`, and a snapshot taken after the fault clears reads the page. The origin is recorded at
+     the disk operation only; a sink's own error of the same class is returned as it is and does not retire the
+     snapshot. The file reference and the disk-backed fake have no reader to retire and return the disk helper's text.
 
   The consumer shall not collect the stream into an unbounded string and shall not act on a prefix that was not
   verified. `Resource`, `Cancelled`, `Corrupt` and ordinary store errors are distinct results; the consumer's policy for

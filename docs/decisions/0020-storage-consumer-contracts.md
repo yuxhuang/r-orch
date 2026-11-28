@@ -285,8 +285,25 @@ reference conformance reconciliation (#196) landed and #130 closed:
      `Cancelled`, `Corrupt` (persisted data that fails verification) and `Store`
      (any ordinary `StoreError`, so the classifications of decision 3 and of #441 survive). A selected object that is
      missing, is not a regular file, has the wrong length or the wrong hash is `Corrupt`; an input or output fault on
-     an object that is present is `Store(Backend)` with a constant text. A sink's error is latched: an implementation
-     never returns success after a callback failed, and stops calling the sink once it sees cancellation.
+     an object that is present is `Store(Backend)`. The disk helper's own text for it is the constant
+     `retry object access failed`, which the file reference and the disk-backed fake return as it is; the SQLite reply is
+     given under *A disk fault on SQLite*. A sink's error is latched: an implementation never returns success after a
+     callback failed, and stops calling the sink once it sees cancellation.
+   - *A disk fault on SQLite.* The snapshot's failure policy already retires a reader whose legacy retry read met a native
+     I/O error on a stored object, so the stream does the same, or one disk fault would leave a snapshot usable through
+     one public entry point and retired through the other. The public `Store(Backend)` error alone cannot say where it
+     came from, because a sink can return the same class. The origin is therefore kept privately at the disk operation
+     (the open, the length lookup and each window read of `DiskBlobStore`'s bounded read, for one selected row's
+     objects) and forwarded to the SQLite adapter as an I/O error of the outer call. Only an I/O error of any kind but
+     `NotFound` is forwarded (`NotFound` stays `Corrupt`); the missing, wrong-length and wrong-hash classifications,
+     cancellation, `Resource`, the retry of an interrupted read and a sink's error are unchanged. The outer snapshot
+     classifies the error as transient (it latches nothing), retires the reader connection and replies `Store(Backend)`
+     with the snapshot's ordinary retired-reader text, `SQLite storage operation failed`, or `storage_unavailable` when
+     a fatal observation was made since the snapshot was requested. The disk helper's inner text is replaced by it. A
+     later call on the retired snapshot answers `snapshot_expired`; a snapshot taken after the fault clears reads the page.
+     A sink's own error, even one of the same `Store(Backend)` class, is returned as the sink made it and retires
+     nothing: the next read on that snapshot succeeds. No signature, stored form or setting changes; the observation is
+     crate-private.
    - *The blob port.* `BlobStore` gains three provided methods (`stream_len`, `read_windowed`, `with_stream_hasher`) and
      the trait `BlobStreamHasher`, so a store written against the earlier port compiles unchanged. A store that does not
      implement them refuses the stream with `Store(Backend)` and a constant text, and the stream never falls back to
@@ -360,6 +377,12 @@ reference conformance reconciliation (#196) landed and #130 closed:
 - **Add an end-of-row callback.** The row's declared length arrives with `begin`, and the whole page is provisional,
   so a sink has nothing to learn from an end marker that it cannot also learn from the next `begin` or the returned
   page. Rejected: not needed.
+- **Classify a disk fault from the public error.** The stream's `Store(Backend)` for an unreadable object and a sink's
+  own `Store(Backend)` are the same class, so a mapping at the snapshot would retire a healthy reader for a failing sink,
+  or leave a faulted one live. Rejected for a private observation at the disk operation, forwarded only from there.
+- **Leave the stream's disk fault unobserved and defer the repair.** The legacy retry read already retires the snapshot on
+  the same fault, so the two public entry points would disagree about one disk. Rejected by the controller's ruling of
+  2026-11-28 before the final freeze.
 - **Map a refused serialized-manifest write to `Resource`.** `Resource` is this read's statement about its own live
   memory; the write-side 4 MiB cap is a different contract, left to issue #546.
 
@@ -391,6 +414,10 @@ reference conformance reconciliation (#196) landed and #130 closed:
   as a statement about this call's memory and never about the stored text (`Corrupt` is the statement about the text).
   The stream has no end-of-row callback: a row ends where the next `begin` is called or the page returns. Its
   cursor is the returned page's `next`, valid only on success. Which consumer policy follows each error is T12's.
+- On SQLite a disk fault during the stream ends that snapshot, as it does for the whole-value reads. A consumer that
+  sees `Store(Backend)` from `read_retry_text` can retry on a fresh snapshot, and must not read a different cause from
+  the text: the texts above are diagnostics, and the same class also carries a sink's own error, which retires nothing.
+  How the first consumer reacts is T12's.
 - The stream is a port contract with three implementations and a public three-adapter test matrix (four registrations:
   the memory fake in its logical and disk-backed forms, the file reference and SQLite). The plan's "Bounded retry text
   read" lists the tests and the commands that select them. No daemon path calls it, so the evidence is synthetic and

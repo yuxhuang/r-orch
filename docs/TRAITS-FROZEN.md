@@ -538,7 +538,9 @@ in `orch_core::store::blob`. They are additive: no earlier method signature chan
 listed above, and nothing is removed. One edge is not additive for an implementor of `ReadSnapshot`: it now has
 `RetryTextRead` as a supertrait, so every implementation must provide the stream (the memory fake, the file reference
 and SQLite do). The `test-support` fakes are not part of the contract and are not listed, except the two
-`test-support` methods named below. Facts read at commit `b85df7a1a` (tree `81efeb15`), which carries the three adapters.
+`test-support` methods named below. Signatures read at commit `bdf99d96c` (tree `9c41bb6f`), which carries the three adapters
+and the SQLite disk-fault observation described under "Errors on a stored object"; none of the signatures below differs from the
+earlier integration commit `b85df7a1a`, because the repair added crate-private items only.
 
 ```rust
 // store::retries::stream
@@ -644,6 +646,25 @@ it reads through that one.
 - **Errors on a stored object.** With `DiskBlobStore`, a selected object that is missing, is a symbolic link, is not a
   regular file, has the wrong length or has the wrong hash is `Corrupt`; any other I/O error on it is
   `Store(Backend)` whose text is the constant `retry object access failed`. Neither carries a path, a hash or text.
+  That is the disk helper's own error, and the file reference and the disk-backed fake return it as it is. On SQLite the
+  same I/O error is also an observation of the snapshot's reader, and the reply the caller sees differs (no signature
+  changes):
+  - *A native I/O fault on a stored object* (any I/O kind except `NotFound`, which is `Corrupt`, raised while the bounded
+    read opens the object, asks for its length or reads a window) is raised to the snapshot as a SQLite I/O error. The
+    snapshot classifies it with the failure policy of the legacy retry reads (an ordinary, transient class that latches
+    nothing), retires that snapshot's reader connection and answers the call with `Store(Backend)` whose text is the
+    snapshot's ordinary retired-reader text, `SQLite storage operation failed`; if a fatal observation was made since the
+    snapshot was requested the text is `storage_unavailable` instead. The disk helper's text above is replaced, not
+    passed on. A later call on that snapshot is refused with `Store(Backend)` text `snapshot_expired`, the text of a snapshot
+    whose worker has left. A snapshot taken after the fault clears reads the page.
+  - *A sink's own error* is returned to the caller as the sink made it, including a `Store(Backend)` of the same class as
+    a disk fault. It does not retire the snapshot, and the next read on that snapshot succeeds.
+  - The origin is recorded privately and only at the disk operation, for one selected row's operation; the public error
+    alone cannot tell the two apart. Cancellation, `Resource`, the `Corrupt` cases and interrupted-read retries are not
+    observed and do not retire the snapshot.
+  The test that shows reader retirement, recovery on a fresh snapshot and reuse after a sink error asserts the class of
+  each error (`Store`) and the sequence of outcomes; the literal texts above are established by the source and by a one-off
+  probe recorded in the plan's "Bounded retry text read", not by an assertion of that test.
 - **Compatibility.** The whole-value reads of `RetryRead` and `RetryWrite` keep their signatures, orders and errors. The
   trait does not change what is stored: a row is the version-1 document and the chunk mapping of ADR 0020 decision 4.
   No format, schema or setting changes.
