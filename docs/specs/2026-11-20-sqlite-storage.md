@@ -274,6 +274,14 @@ R63 or R128 that this spec gave, no trait, no schema, no authorization and no de
 is not the T10 freeze, not the acceptance of issue 127 and not a readiness claim, and no independent review had read this
 revision when it was written.
 
+The revision that carries this paragraph records the lead's T12 first-use decision of 28 November 2026 on permanent
+input refusal (issue 441) and changes nothing else. It adds one payload-free port error, `StoreError::Unrepresentable`,
+and states the Task and Context input that the memory fake, the file reference and SQLite refuse alike ("Permanent
+input refusal (issue 441)" under "Storage port v2"; [ADR 0020](../decisions/0020-storage-consumer-contracts.md)
+decision 8). It changes no stored data, schema, protocol, requirement row, cursor or dependency, and it releases no
+consumer. It does not claim parity for the identity of a claimed Run, which stays held with T12, and issue 441 stays
+open for it. No independent review had read this revision when it was written.
+
 ## Source
 
 Verbatim excerpts of the owner's request as recorded in the goal "orch 2.0 phase 1: SQLite storage (release
@@ -1462,6 +1470,104 @@ nothing in them is wired into the daemon, and none accepts T10, T12, T14, T21 or
   second-host peer check (R89). The plan's "T8 consumer contracts (issue 109)" lists the verification names and the
   follow-ups N-a to N-c.
 
+**Permanent input refusal (issue 441; the lead's T12 first-use decision of 28 November 2026;
+[ADR 0020](../decisions/0020-storage-consumer-contracts.md) decision 8).** T12's first Task write and its retry
+classification must tell a caller value that storage can never hold from a fault that may clear. On SQLite both were
+`StoreError::Backend` with a fixed message, and the memory and file references accepted values that SQLite refuses.
+This contract adds one error variant and makes the three adapters refuse the same ordinary entity input. It changes no
+stored data, schema, protocol, requirement row, cursor or dependency, and nothing here is wired into the daemon.
+
+- *The variant.* `StoreError::Unrepresentable` is a unit variant (`docs/TRAITS-FROZEN.md`, "Added for issue 441"). Its
+  text is exactly `input cannot be represented by storage`, its `Debug` is `Unrepresentable`, and it has no source. It
+  carries no input, field name, bound or backend text (R101). It means that retrying the same value cannot succeed.
+- *Task input.* A `Task`'s `id`, `assignee` (when present), `goal_id` (when present), `created_at` and `updated_at` are
+  at most 65,536 UTF-8 bytes each, an empty value being valid, and `created_at` and `updated_at` are the canonical
+  `YYYY-MM-DDTHH:MM:SS.sssZ` from `0000-01-01T00:00:00.000Z` to `9999-12-30T22:00:00.999Z`, inclusive. These are the
+  rules of "Task format v1 (SQLite)", "Fields that are keys" and "Time", and the range of "Staged SQLite goal timestamp
+  and position limits". No other field of a `Task` has a bound: a title of 32,769 two-byte characters and a description
+  of 65,537 bytes are stored.
+- *Context provenance.* `create` of a Context entry refuses a caller whose identity, or, for a Task principal, whose
+  `run`, is over 65,536 UTF-8 bytes, because both are stored beside the entry ("Context provenance"). A Task
+  principal's `task`, `lineage` and `epoch` are not stored there and are not checked. `update` and `move_to_end`
+  preserve the stored provenance and never consult the caller for it, so an update by a caller whose identity is over
+  the bound succeeds and changes none of the four `set_by_*` columns. The check validates what is about to be stored; it
+  grants no authority and does not replace R132's authorization.
+- *Atomic and quiet.* A refusal happens before any object is published and before any write, so the row, its revision
+  and its position are unchanged and the refused `create` takes no position. Inside a unit of work the callback receives
+  the error and may catch it; the operation wrote nothing, and the unit's other work commits. A callback that returns
+  the error rolls the unit back.
+- *Faults and damaged data are other results.* An I/O failure of the file reference is `Backend(Error::Io)`; a
+  statement failure on SQLite is `Backend` (`SQLite storage operation failed`), latches nothing, and the same call
+  succeeds after the fault clears; a persisted file document that does not decode is `Backend(Error::Serde)` and is not
+  rewritten; and SQLite's stored-data damage is the fatal logical-corruption cause of R140 (`storage_unavailable`). None of them
+  is `Unrepresentable`, and a consumer never reads the variant from their text.
+- *SQLite's mapping.* The public converters (`port` in `sqlite/storage/mod.rs` and in `sqlite/entity_router.rs`) map the
+  native `SqliteError::Unrepresentable(_)` to the variant after the failure state has observed the native error, and
+  drop its text. That class is ordinary: it retires nothing. Every other arm is as it was. The mapping is wider than the
+  rules above: any native `Unrepresentable` that reaches a converter becomes the variant, among them an entity
+  encoding refusal of Agent, Team, Run and the four families of R143, a message outside the schema's bounds on write, a
+  cursor shape, a retry diagnostic whose stored document is over its bound, and the claimed-Run guard below. The
+  memory and file references enforce none of those, so the three adapters are required to agree only on the Task and
+  Context rules above.
+- *The consumer.* T12 matches the variant exhaustively, does not reschedule the refused input, and never reads
+  permanence from the text of an error or from `Backend`. A consumer's refusal policy for the rest of `StoreError`
+  stays T12's.
+- *Held, not covered: the identity of a claimed Run.* SQLite's native update of a Run whose claim tuple (`run_no`,
+  `counted`, `epoch`, `attempt_no`; "Run claim tuple") is stored refuses a changed `task_id` or `agent_id`, and that
+  refusal is now the same public variant. The memory and file references do not: ordinary creation produces no tuple,
+  the port has no durable claim allocation, and the references drop a lease when it is released, so lease presence cannot
+  show that a Run was claimed. The lead's decision of 28 November 2026 (option A) keeps the native guard as it is, adds
+  no reference metadata and no production scope, and gives the case to T12's claim-allocation lifecycle task. Before the
+  first path that relies on a claimed Run's identity is enabled, that task shows the same typed refusal, the same Run,
+  revision and claim identity, and the valid same-identity update on all three adapters, varying `task_id` and
+  `agent_id` separately with a current revision, during the claim and after the lease is released, with a reopen for the
+  persistent stores and an unclaimed Run as the control. Issue 441 stays open for it. This text claims no parity for a
+  claimed Run and no acceptance of the first use of any consumer.
+- *Not decided here.* Which refusal wins when several apply is not part of the contract, except that all three adapters
+  answer `AlreadyExists` and `IdAlias` before a representability refusal on `create` and a stale revision before it on
+  `update`. On `update` of a row at the revision ceiling SQLite answers the exhausted counter first and the references the
+  refusal (issue 545). The 65,536 and canonical-time rules are written twice, in `orch-core` and in the SQLite codec
+  (issue 544). Whether a retry diagnostic whose stored document is over its bound (4 MiB on SQLite) needs a refusal on the
+  references, or a disposition that keeps R97's whole-text promise, is issue 546. The references validate on write only:
+  a stored Task whose times are not canonical can still be read, and an update that keeps them is refused.
+
+  Tests required, the public matrix `crates/orch-infra/tests/permanent_input.rs` (66 tests: the 20 scenarios below
+  run on each of the memory fake, the file reference and SQLite as `memory::`, `file::` and `sqlite::`, then three
+  tests of the file reference and three of SQLite). Each refusal is checked for the exact variant, the exact text and
+  `Debug`, and no source; each is also run as an update where the field is not `id`, inside a unit that catches it and
+  continues, and the state, revisions and positions are compared afterwards.
+
+  | Required | Test (in each of the three modules) |
+  |---|---|
+  | An empty value and one of exactly 65,536 UTF-8 bytes (32,768 two-byte characters) in `id`, `assignee` and `goal_id` round trip | `empty_and_maximum_utf8_keys_round_trip` |
+  | The two time extremes, `0000-01-01T00:00:00.000Z` and `9999-12-30T22:00:00.999Z`, round trip | `canonical_time_extrema_round_trip` |
+  | A title of 32,769 two-byte characters and a description of 65,537 bytes round trip | `non_key_text_over_inline_limit_round_trips` |
+  | One byte over in `id`, `assignee` or `goal_id` is refused with nothing created and the next position unused | `oversized_id_is_refused_without_mutation`, `oversized_assignee_is_refused_without_mutation`, `oversized_goal_is_refused_without_mutation` |
+  | A time of 65,537 bytes is refused in `created_at` and in `updated_at` | `oversized_created_time_is_refused`, `oversized_updated_time_is_refused` |
+  | An empty time, a second-precision time, an offset, an expanded year, a day that does not exist, month 13 and the millisecond after the maximum are refused | `empty_time_is_refused`, `second_precision_created_time_is_refused`, `offset_updated_time_is_refused`, `expanded_year_is_refused`, `impossible_date_is_refused`, `invalid_month_is_refused`, `time_after_storage_maximum_is_refused` |
+  | An update, a create and an invalid create in one unit: the unit rolls back every row, revision and position when the refusal is returned | `returned_refusal_rolls_back_rows_revisions_and_positions` |
+  | A Context created by an Owner, a Worker and a Task principal at exactly 65,536 bytes of identity (and of run) is accepted; one byte more is refused with nothing created; an update by that over-bound caller succeeds and preserves provenance (on SQLite, the four native `set_by_*` columns are read before and after) | `context_creation_bounds_provenance_and_update_preserves_it` (Owner), `worker_context_creation_bounds_provenance_and_update_preserves_it`, `task_context_creation_bounds_identity_and_update_preserves_it`, `task_context_creation_bounds_run_and_update_preserves_it` |
+
+  | Required | Test (one each) |
+  |---|---|
+  | After a refusal the durable rows and the position survive a reopen | `file_refusal_preserves_durable_rows_and_position_after_reopen`, `sqlite_refusal_preserves_durable_rows_and_position_after_reopen` |
+  | A backend fault is not an input refusal and leaves the evidence it was given | `file_io_failure_is_backend_and_preserves_the_canary`; `sqlite_statement_fault_is_backend_without_latching_and_can_be_retried` (a trigger aborts the insert; the same create succeeds after it is dropped) |
+  | Damaged persisted data is not an input refusal | `file_stored_damage_is_a_decode_error_and_is_not_overwritten`; `sqlite_stored_damage_is_fatal_corruption_instead_of_input_refusal` (the detail row is deleted; the read answers `storage_unavailable` and the failure state holds the logical-corruption cause) |
+
+  Private unit tests of the same change: `store::entity::permanent_input_tests` (2: the exact boundaries of
+  `validate_storage_input` and of `validate_context_provenance`) and `store::fake::permanent_input_tests` (1) in
+  `orch-core` (feature `test-support`), and `storage::v2::permanent_input_tests` (2) in the file reference's module.
+  The fixtures that the new rule invalidated were migrated: the shared factory's time is
+  `2025-01-01T00:00:00.000Z`, the `claim_v2` tests' Task helper and three expectations use `1970-01-01T00:00:00.000Z`,
+  and `mixed_timestamp_precision_is_a_documented_incompatible_representation` keeps its deliberately invalid
+  second-precision string, asserts that the reference port refuses it, and shows the native ordering difference by
+  seeding SQLite directly. The expected counts and the commands that select them are in the plan's "Permanent input
+  refusal (issue 441)"; a result is a receipt of the PR that carries the change, not a statement of this spec.
+
+  Owners. One storage-port builder, outside T12's engine scope, owns the variant, the shared rules, the converters and
+  the parity of the references. T12 owns the first consumer and the claimed-Run lifecycle proof above. The first T12
+  Task write or retry classification that depends on the variant waits for the release event of ADR 0020 decision 8.
+
 **Amendment 3: the unit of work stays on the writer's thread** (2026-11-26; the owner's ruling, record M of "Owner's
 answers"; [ADR 0023](../decisions/0023-unit-of-work-on-the-writer-thread.md)). The port's write traits were `Send`, and
 no consumer needs that. The SQLite adapter's unit of work borrows the writer's open transaction, and a borrow of it
@@ -1874,7 +1980,9 @@ the same rule. No other value is moved to make it fit, so the same task always h
 **Fields that are keys.** `id`, `goalId`, `assignee`, `created_at` and `updated_at` are copied into native key and sort
 columns and must be inline and at most 65,536 bytes. A task with one over the bound is refused as `Unrepresentable`
 before any write, because an oversized key cannot be kept out of its projection. Every other string, `title`,
-`description` and `feedback` included, may be referenced.
+`description` and `feedback` included, may be referenced. Through the public port that refusal is the payload-free
+`StoreError::Unrepresentable`, and the memory fake and the file reference refuse the same values ("Permanent input
+refusal (issue 441)" under "Storage port v2").
 
 **Time.** `created_at` and `updated_at` are stored in the detail as the exact strings and projected to UTC
 milliseconds. Format v1 accepts only the canonical form `YYYY-MM-DDTHH:MM:SS.sssZ` in the range that "Staged SQLite goal
@@ -1883,7 +1991,10 @@ the core formatter, given the milliseconds, returns the same bytes. Any other sp
 offset, an expanded year, a month 13) is `Unrepresentable`, the operation changes nothing and nothing is
 normalized. Reading checks the same equality between the detail's string and the column. This keeps the native
 order equal to the file reference's bytewise order on every value the format accepts. What the importer does with a
-1.0 value that is not canonical is T21's decision to record in "Import rules"; format v1 does not widen the form.
+1.0 value that is not canonical is T21's decision to record in "Import rules"; format v1 does not widen the form. The
+public port reports the refusal as `StoreError::Unrepresentable`, and the memory fake and the file reference apply the
+same canonical form and range on `create` and `update` (issue 441), so a test that builds a Task through them uses
+canonical times.
 
 **Projections.** One operation writes all of them from the typed task. A read checks every row of the table
 against the same derivation.
@@ -2568,7 +2679,10 @@ authoritative agent binding, so `create` never writes `set_by_agent_id`; the col
 adapter binds an authenticated caller is that adapter's prerequisite for composition (item 6 of "Open in this section").
 A `create` of a context entry with no principal (the goal adapter passes none) is refused as
 `Unrepresentable` before any write, and so is a principal whose identity or run is over 65,536 UTF-8 bytes, whose column
-is bounded; nothing is written, and no position is consumed. Config, Template and Goal creation need no principal.
+is bounded; nothing is written, and no position is consumed. Config, Template and Goal creation need no principal. At the
+public port the identity and run bounds are the payload-free `StoreError::Unrepresentable` on `create` of a Context
+entry, and the memory fake and the file reference refuse the same values; an `update` never consults the caller's
+identity or run ("Permanent input refusal (issue 441)" under "Storage port v2").
 `update` and `move_to_end` never write the four `set_by_*` columns; a row whose kind is another word (`agent`, with a
 NULL identity) from an earlier source is kept byte for byte in the columns. The crate-private accessor that reads a row's provenance back, meant for export, reports a NULL identity as `None`, which it keeps apart from a stored empty identity (`Some("")`), reports a missing row as no provenance, and reports as stored-data damage (`EntityCorrupt`, family `context`, check `provenance`) a row whose kind is NULL or not a text, whose identity, agent or run is neither text nor NULL, or that does not hold the four columns; any text kind is valid, a legacy `agent` included (`a_null_identity_is_kept_apart_from_an_empty_one` and `a_provenance_row_that_is_not_kind_and_text_columns_is_damage`; the columns themselves are unchanged). Composing or consuming Context, which the staged Goal adapter does not do, has one prerequisite that this text records and does not decide: the combined adapter must bind the caller's provenance from an independently asserted, authenticated caller (open item 6), and the driver stays inactive until that composition is reviewed.
 
