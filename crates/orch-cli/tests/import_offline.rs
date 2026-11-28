@@ -195,8 +195,7 @@ fn missing_destination_below_a_source_alias_is_refused_before_creation() {
     assert!(!root.path().join("source/ordinary/new-data-home").exists());
 }
 
-// Capture bytes without changing file atime. Directory listings are completed
-// before their metadata is recorded, so the observer's own read is not a delta.
+// Capture bytes and metadata without changing file or directory atime.
 #[cfg(target_os = "linux")]
 fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, (Vec<u8>, Vec<i128>)> {
     use std::io::Read;
@@ -207,9 +206,22 @@ fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, (Vec<
         out: &mut std::collections::BTreeMap<std::path::PathBuf, (Vec<u8>, Vec<i128>)>,
     ) {
         let mut bytes = Vec::new();
-        if path.is_dir() {
-            for entry in std::fs::read_dir(path).unwrap() {
-                walk(base, &entry.unwrap().path(), out);
+        if std::fs::symlink_metadata(path).unwrap().is_dir() {
+            use std::os::unix::ffi::OsStrExt;
+            let fd = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_NOATIME | nix::libc::O_NOFOLLOW | nix::libc::O_DIRECTORY)
+                .open(path)
+                .unwrap();
+            // Enumerate this open description itself: reopening the path (or
+            // /proc/self/fd) would lose O_NOATIME on the directory reader.
+            let mut dir = nix::dir::Dir::from_fd(fd.into()).unwrap();
+            for entry in dir.iter() {
+                let entry = entry.unwrap();
+                let name = std::ffi::OsStr::from_bytes(entry.file_name().to_bytes());
+                if name != "." && name != ".." {
+                    walk(base, &path.join(name), out);
+                }
             }
         } else {
             std::fs::OpenOptions::new()
@@ -241,6 +253,100 @@ fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, (Vec<
     let mut out = std::collections::BTreeMap::new();
     walk(root, root, &mut out);
     out
+}
+
+// Old atime makes an ordinary directory enumeration observable even on relatime.
+#[test]
+#[cfg(target_os = "linux")]
+fn snapshots_and_cli_refusals_preserve_old_destination_directory_and_file_timestamps() {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::time::{Duration, SystemTime};
+
+    fn times(path: &Path) -> (i64, i64, i64, i64, i64, i64) {
+        let m = std::fs::symlink_metadata(path).unwrap();
+        (
+            m.atime(),
+            m.atime_nsec(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        )
+    }
+    fn seed(path: &Path, paths: &mut Vec<std::path::PathBuf>) {
+        if path.is_dir() {
+            for entry in std::fs::read_dir(path).unwrap() {
+                seed(&entry.unwrap().path(), paths);
+            }
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOATIME | nix::libc::O_NOFOLLOW)
+            .open(path)
+            .unwrap();
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(SystemTime::UNIX_EPOCH + Duration::new(946684800, 123456789))
+                .set_modified(SystemTime::UNIX_EPOCH + Duration::new(946684801, 987654321)),
+        )
+        .unwrap();
+        paths.push(path.to_owned());
+    }
+
+    let root = fixture();
+    assert_eq!(run(root.path(), &[]).status.code(), Some(1));
+    let data = root.path().join("data");
+    let nested = database(root.path()).parent().unwrap().join("nested/child");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("payload"), [0, 255, 1, 2]).unwrap();
+    std::fs::write(nested.parent().unwrap().join("empty"), []).unwrap();
+    std::fs::write(root.path().join("source/.orchestry/templates/.md"), [0xff]).unwrap();
+    let mut paths = Vec::new();
+    seed(&data, &mut paths);
+    // Stat every seeded object BEFORE the first snapshot: the observer must
+    // not hide its own first read by recording metadata after enumeration.
+    let before: Vec<_> = paths.iter().map(|path| times(path)).collect();
+    for t in &before {
+        assert_eq!(
+            (t.0, t.1, t.2, t.3),
+            (946684800, 123456789, 946684801, 987654321)
+        );
+    }
+    let first = snapshot(&data);
+    assert_eq!(first.len(), paths.len());
+    assert_eq!(
+        first[nested.join("payload").strip_prefix(&data).unwrap()].0,
+        [0, 255, 1, 2]
+    );
+    assert!(
+        first[nested
+            .parent()
+            .unwrap()
+            .join("empty")
+            .strip_prefix(&data)
+            .unwrap()]
+        .0
+        .is_empty()
+    );
+    assert_eq!(
+        paths.iter().map(|path| times(path)).collect::<Vec<_>>(),
+        before,
+        "snapshot alone must preserve all directory and file timestamps"
+    );
+    assert_eq!(snapshot(&data), first);
+    for args in [&["--resume", "--dry-run"][..], &["--resume"][..]] {
+        let output = run(root.path(), args);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert_eq!(
+            snapshot(&data),
+            first,
+            "refusal must preserve the entire destination"
+        );
+        assert_eq!(
+            paths.iter().map(|path| times(path)).collect::<Vec<_>>(),
+            before
+        );
+    }
 }
 
 #[test]
