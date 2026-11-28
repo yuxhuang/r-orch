@@ -230,7 +230,7 @@ async fn execute(request: ImportRequest, cancel: Arc<AtomicBool>) -> ImportOutco
             format!("{:x}", Sha256::digest(project.as_bytes()))
         };
         match std::fs::symlink_metadata(records.join(hash)) {
-            Ok(_) => match paths::read_project_record(&request.data_home, &project) {
+            Ok(_) => match paths::read_project_record_for_import(&request.data_home, &project) {
                 Ok(path) => path,
                 Err(_) => return outcome(2, "project record is invalid; refusing to retarget it"),
             },

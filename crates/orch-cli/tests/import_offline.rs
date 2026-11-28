@@ -440,15 +440,28 @@ fn interrupted_project_record_is_not_reinterpreted_as_an_absent_destination() {
     let home = root.path().join("data");
     let record = home.join("projects");
     std::fs::create_dir(&record).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o700)).unwrap();
     use sha2::{Digest, Sha256};
     let project = orch_infra::data_dir::paths::default_name(&root.path().join("source")).unwrap();
     let hash = format!("{:x}", Sha256::digest(project.as_bytes()));
-    std::fs::write(record.join(hash), "interrupted").unwrap();
+    let record_file = record.join(hash);
+    std::fs::write(&record_file, "interrupted").unwrap();
+    std::fs::set_permissions(&record_file, std::fs::Permissions::from_mode(0o600)).unwrap();
     let before = snapshot(&home);
     for args in [&["--resume", "--dry-run"][..], &["--resume"][..]] {
         let output = run(root.path(), args);
         assert_eq!(output.status.code(), Some(2), "{output:?}");
-        assert_eq!(snapshot(&home), before);
+        let after = snapshot(&home);
+        assert_eq!(
+            after.keys().collect::<Vec<_>>(),
+            before.keys().collect::<Vec<_>>()
+        );
+        for (path, (bytes, metadata)) in &before {
+            let (actual_bytes, actual_metadata) = &after[path];
+            assert!(actual_bytes == bytes, "bytes changed at {path:?}");
+            assert_eq!(actual_metadata, metadata, "metadata changed at {path:?}");
+        }
     }
 }
 
