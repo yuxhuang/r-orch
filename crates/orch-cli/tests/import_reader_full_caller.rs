@@ -509,16 +509,17 @@ fn terminal_index_open_error_is_io_and_never_an_unreadable_index() {
         let root = prepare(existing);
         put(root.path(), "tasks/_index.json", "[]");
         let index = root.path().join("source/.orchestry/tasks/_index.json");
-        // A privileged process can bypass mode 000 (tracked in issue 533).
-        // Do not label a successful open as an injected kernel permission error.
-        if fs::File::open(&index).is_ok() {
-            fs::set_permissions(&index, fs::Permissions::from_mode(0o600)).unwrap();
-            eprintln!("mode-000 scenario unavailable to a privileged reader");
-            continue;
-        }
-        // Unlike the unit-level mid-stream injected error, this exercises the
-        // real confined open in the CLI. Restore mode only after all assertions.
         fs::set_permissions(&index, fs::Permissions::from_mode(0o000)).unwrap();
+        // A capability-bearing process can bypass mode 000 (issue 533).
+        // Ordinary users must actually observe the intended kernel EACCES.
+        match fs::File::open(&index) {
+            Ok(_) => {
+                fs::set_permissions(&index, fs::Permissions::from_mode(0o600)).unwrap();
+                eprintln!("mode-000 scenario unavailable to a privileged reader");
+                continue;
+            }
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        }
         // The snapshot cannot read the intentionally unreadable file. Keep the
         // metadata and inode separately, and use the kernel error as the input.
         let meta = fs::metadata(&index).unwrap();
